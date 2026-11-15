@@ -1,0 +1,58 @@
+Issue-Severity: HIGH
+Issue-Commit: 2de9869ac15499f72a3a9a80cfa18082252ec30f
+
+# ecs__elbv2__logs: 2 net-new causes — an ALB-fronted Fargate service never serves its container's bytes (nor logs them), and the network-mode refusals (ClientException on RegisterTaskDefinition, InvalidParameterException on UpdateService) are never reached
+
+> _Note: this issue was identified against the code base at commit `2de9869ac15499f72a3a9a80cfa18082252ec30f`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+UpdateService
+
+## Description
+Two net-new root causes under the `ecs__elbv2__logs` heading, grounded in two failing checks that the replay report marks NEITHER 'ALREADY FILED' NOR 'OWNED by' — both survive as live failures, each reported as `[mismatch] ... Error: Check timed out after 60.0s`.
+
+Both kills are the emulator's: every graded wait polls an emulator read API (ecs DescribeServices runningCount/desiredCount/status, ecs DescribeTasks attachments privateIPv4Address, elbv2 DescribeTargetHealth State, logs DescribeLogStreams/GetLogEvents) or an HTTP GET to the load balancer's own published DNS name. The calls answer; the state behind them never advances to a terminal value, so the loop runs to the ceiling. No live account, token or runner tool is involved.
+
+Cause 1 of 2: an ALB-attached awsvpc Fargate service never converges into a serving target — the request through the load balancer never returns the body the container wrote, and the same container's stdout never reaches CloudWatch Logs.
+AWS: Smithy (ecs) DescribeServices -> services[].{status,runningCount,desiredCount} and DescribeTasks -> tasks[].attachments[].details (awsvpc privateIPv4Address); Smithy (elasticloadbalancingv2) DescribeTargetHealth -> TargetHealthDescriptions[].TargetHealth.State with TargetHealthStateEnum [initial, healthy, unhealthy, unhealthy.draining, unused, draining, unavailable]. The end-to-end effect is recorded behavior only: on AWS a service created with loadBalancers=[{targetGroupArn, containerName, containerPort}] reaches status ACTIVE with runningCount == desiredCount, its task exposes an awsvpc private IP, that IP appears in the bound target group and reaches State 'healthy', a GET to the load balancer's DNS name then answers HTTP 200 with the container's own response (the marker the container wrote plus its hostname), and the container's stdout appears in the awslogs group under the stream 'ecs/<container>/<task id>'.
+Emulator: 'Check timed out after 60.0s'. None of the graded waits settles — not 'one RUNNING service task', not 'runningCount == desiredCount == 1', not 'target <ip> healthy', not 'HTTP 200 through the load balancer', not the awslogs stream/first line.
+Why: this is the single most common container deployment on AWS. A client gets a load balancer that never serves and logs that never appear, with nothing in any response to distinguish 'still converging' from 'permanently broken'; any readiness or smoke-test gate hangs instead of passing or failing.
+Fix: the ECS service scheduler/placement path (a service task must reach RUNNING and expose its awsvpc address), the ECS -> ELBv2 target registration for each loadBalancers entry, the ELBv2 target-health state machine plus the listener's data-plane forwarding (the load balancer must return the target's own response), and the awslogs driver delivery path (stream creation + the container's stdout events).
+Traces: ecs__elbv2__logs.ecs-service-behind-alb-serves-http-request.
+
+Cause 2 of 2: the network-mode refusal pair is never reached, because the scenario cannot get a live service to refuse the update against — so neither modeled rejection is graded.
+AWS: Smithy (ecs) RegisterTaskDefinition errors include ClientException (400) and UpdateService errors include InvalidParameterException (400) and ServiceNotActiveException/ClientException; UpdateService input carries `taskDefinition`. Per the recording, the two refusals are: (a) RegisterTaskDefinition with requiresCompatibilities=['FARGATE'] and networkMode='bridge' is refused with code ClientException and the message 'Fargate only supports network mode \u2018awsvpc\u2019.' — that whole sentence is fixed text, including the typographic quotes around awsvpc; and (b) UpdateService moving a live FARGATE service onto an EC2/bridge revision is refused with code InvalidParameterException and the message 'Task definition does not support launch_type FARGATE.' — also entirely fixed text. After the refusal the service must be unchanged: DescribeServices still reports the original taskDefinition ARN and one RUNNING task, and the load balancer keeps answering HTTP 200 with the original revision's body. The only variable parts of the surrounding scenario are per-run names/ARNs, which are not requirements.
+Emulator: 'Check timed out after 60.0s'. The check never gets past its first graded wait (one RUNNING task, then the target 'healthy', then HTTP 200 carrying the revision-A marker), so neither refusal code/message pair is ever exercised and the 'rejected update changed nothing' invariant is never checked. Whether the emulator would answer those two errors correctly is therefore unknown and untested — the convergence gap masks the whole negative class.
+Why: a client relying on these refusals to catch a network-mode mistake gets no signal at all; worse, the masking means an incorrect or missing refusal here would never be detected, and a client could believe a live Fargate service had been moved onto a bridge revision.
+Fix: the same ECS/ELBv2 convergence path as Cause 1 (so the scenario can reach its refusal steps), plus RegisterTaskDefinition's Fargate/network-mode validation and UpdateService's launch-type-compatibility validation, which must answer the codes and exact messages above and leave the service and its data plane untouched.
+Traces: ecs__elbv2__logs.ecs-update-service-to-a-different-network-mode-rejected.
+
+Related open filings that the replay report did NOT mark as owning these two ids, and that therefore must not be assumed to cover them: 20261110T220525Z-ecs-elbv2-logs-2-net-new-causes-the.md, 20261111T010150Z-ecs-elbv2-logs-alb-fail-open-with-a-single-unhealthy-ecs.md, 20261114T200121Z-ecs-elbv2-logs-a-fargate-service-with-a.md.
+
+## Evidence
+Replay of suite simparity-behavioral-aws-v1 against the booted emulator. Heading `ecs__elbv2__logs` 0/6 (0%), 4 failed (2 unloadable); two failures are marked OWNED, the two below are not.
+
+Cause 1
+[mismatch] ecs__elbv2__logs.ecs-service-behind-alb-serves-http-request
+  Error: Check timed out after 60.0s
+  Body: VPC + 2 subnets, ALB security group open on 80 to the client CIDRs, task security group open on 80 from the ALB group, log group, exec role allowing logs:CreateLogStream/logs:PutLogEvents, cluster, awsvpc task definition (public busybox httpd writing a marker, awslogs, containerPort 80), target group + HTTP listener, CreateService(desiredCount=1, loadBalancers=[{tg,'app',80}], healthCheckGracePeriodSeconds=120). Graded waits: 1 RUNNING task (600 s), DescribeServices status ACTIVE and runningCount==desiredCount==1 (300 s), the task's awsvpc private IP non-empty, DescribeTargetHealth[ip]=='healthy' (600 s), HTTP 200 at http://<DNSName>/ (420 s) with the marker in the body and >= 2 whitespace-separated fields, then the awslogs stream 'ecs/app/<task id>' and a line containing '<marker> httpd-start'.
+  Expected (AWS): all of the above settle; the load balancer returns the container's own bytes and the container's stdout is readable from the log group.
+  Actual (emulator): the check is cut off at 60 s with none of them satisfied.
+
+Cause 2
+[mismatch] ecs__elbv2__logs.ecs-update-service-to-a-different-network-mode-rejected
+  Error: Check timed out after 60.0s
+  Body: the same ALB-attached awsvpc Fargate service serving revision A, then: RegisterTaskDefinition(requiresCompatibilities=['FARGATE'], networkMode='bridge') asserted to fail with exactly ('ClientException', 'Fargate only supports network mode \u2018awsvpc\u2019.'); register an EC2/bridge revision of the same family; UpdateService(taskDefinition=<bridge revision>) asserted to fail with exactly ('InvalidParameterException', 'Task definition does not support launch_type FARGATE.'); then DescribeServices must still report the original taskDefinition ARN with one RUNNING task and the load balancer must still serve revision A.
+  Expected (AWS): both refusals with those codes and those exact message sentences, and no control-plane or data-plane effect from the rejected update.
+  Actual (emulator): the check never reaches the refusal steps — it is cut off at its 60 s budget while still waiting for one RUNNING task / a healthy target / HTTP 200 for revision A, so the two refusals are untested.
+
+Smithy consulted (via smithy_query): ecs UpdateService input {service required, cluster, taskDefinition, networkConfiguration, loadBalancers, ...} errors [AccessDeniedException 403, ClientException 400, ClusterNotFoundException 400, InvalidParameterException 400, PlatformTaskDefinitionIncompatibilityException 400, ServiceNotActiveException 400, ServiceNotFoundException 400, ServerException 500, ...]; ecs DescribeServices output {services[], failures[]}; elasticloadbalancingv2 DescribeTargetHealth output TargetHealthDescriptions[].TargetHealth {State, Reason, Description} with TargetHealthStateEnum [initial, healthy, unhealthy, unhealthy.draining, unused, draining, unavailable]. Models: services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/smithy-model/... and services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10/smithy-model/...
+
+## Steps to Reproduce
+1. Clone the repo and replay the behavioral suite; both ids in trace_ids reproduce as 'Check timed out after 60.0s'.
+2. Create two subnets' worth of shared VPC networking, an ALB security group with ingress on 80 from the client CIDRs and a task security group with ingress on 80 from the ALB group; create a log group and an execution role allowing logs:CreateLogStream and logs:PutLogEvents; create an ECS cluster.
+3. RegisterTaskDefinition: awsvpc / FARGATE, one essential container on port 80 whose command serves a known marker and logs to the log group via awslogs.
+4. Create an ip-type target group in that VPC, an ALB across the two subnets, and an HTTP:80 listener forwarding to the group; CreateService(desiredCount=1, loadBalancers=[{targetGroupArn, containerName, containerPort=80}], healthCheckGracePeriodSeconds=120).
+5. Cause 1: poll DescribeServices for status ACTIVE and runningCount==desiredCount==1, read the task's awsvpc private IP, poll DescribeTargetHealth until that IP is 'healthy', GET http://<DNSName>/ expecting 200 with the marker body, then read the awslogs stream 'ecs/<container>/<task id>' for the container's start line. Actual: none of these resolve; the check is killed at its budget.
+6. Cause 2: with that service live, call RegisterTaskDefinition(requiresCompatibilities=['FARGATE'], networkMode='bridge') and expect ClientException with the message 'Fargate only supports network mode \u2018awsvpc\u2019.'; register an EC2/bridge revision of the same family and call UpdateService(taskDefinition=<that revision>) expecting InvalidParameterException with the message 'Task definition does not support launch_type FARGATE.'; then verify DescribeServices still reports the original taskDefinition with one RUNNING task and the load balancer still serves the original revision's body.
+7. Re-replay both ids in trace_ids to confirm the fix.
