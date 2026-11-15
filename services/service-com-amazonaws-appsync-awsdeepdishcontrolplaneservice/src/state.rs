@@ -82,8 +82,9 @@ pub use data_source_introspection::*;
 mod introspected_cluster;
 pub use introspected_cluster::*;
 
-/// Whether the certificate a custom domain is created with covers the name the domain is
-/// created under, read in the service that holds the certificate.
+/// Where the certificate a custom domain is created with came from and whether it covers the
+/// name the domain is created under, read in the services that hold a certificate for this
+/// account.
 mod domain_certificate;
 pub use domain_certificate::*;
 

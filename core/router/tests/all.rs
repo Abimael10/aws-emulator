@@ -1612,3 +1612,21 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 // one that lands past the declarations — which is what concurrent landings appending to this
 // file kept producing — is `E0753` and compiles no suite of this target. With no inner doc
 // every service crate's `tests/all.rs`.
+//! Single integration-test target for the router: the declaration list of its
+//! cross-service suites.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, keeping the list sorted by name. A
+//! suite no `mod` names compiles nowhere and its tests never run; a suite left at the top
+//! level of `tests/` fails the build.
+//! The list holds PAIRS AND NOTHING ELSE — no prose between them, no blank line, no
+//! visibility, no trailing comment — so two branches landing at once insert two lines in two
+//! places and have nothing to duplicate, re-word or mistype. Two rules make that mandatory,
+//! and breaking either takes every suite in this target down: a module declared twice is
+//! `E0428`, and an inner doc comment (`//!`) past the first item is `E0753`, so THIS HEADER
+//! is the only place one may stand. `all/all_rs_declares_each_suite_once.rs`,
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check all of it, for this file and for
+//! every service crate's `tests/all.rs`, so a rule or a note belongs there rather than here.
+//! WHAT a suite covers, and WHY it lives in this target rather than in a service crate's own,
+//! belongs in that suite's own module header, where it is read beside the test it explains;
+//! the notes landings had appended to the tail of this file live in `all/appended_notes.rs`.
+//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of
+//! this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each

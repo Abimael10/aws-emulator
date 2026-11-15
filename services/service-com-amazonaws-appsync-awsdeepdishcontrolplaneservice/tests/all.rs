@@ -195,3 +195,5 @@ mod flush_api_cache;
 mod api_cache_authorization;
 #[path = "all/domain_certificate_provenance.rs"]
 mod domain_certificate_provenance;
+#[path = "all/domain_certificate_issuing_authority.rs"]
+mod domain_certificate_issuing_authority;

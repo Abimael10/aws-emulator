@@ -175,6 +175,132 @@ pub struct ServerCertificateRecord {
     pub tags: Option<Vec<Tag>>,
 }
 
+impl ServerCertificateRecord {
+    /// Whether the uploaded certificate SIGNED ITSELF: its issuer is its own subject (RFC
+    /// 5280 sections 4.1.2.4 and 4.1.2.6), so no authority stands above it and no trust
+    /// store can carry one for it.
+    ///
+    /// It is a fact of the certificate this account HOLDS, so it is answered here — beside
+    /// the record `UploadServerCertificate` wrote and `GetServerCertificate` reports —
+    /// rather than decided again by whichever service is handed the certificate's ARN.
+    ///
+    /// Read off the stored `CertificateBody` with the SAME decoder the upload admitted it
+    /// through, so a body that parsed there parses here. A body this decoder cannot read
+    /// says nothing about who signed it and is not reported as self-signed.
+    #[must_use]
+    pub fn is_self_signed(&self) -> bool {
+        let Some(certificate) = self.decoded() else {
+            return false;
+        };
+        certificate.tbs_certificate.issuer == certificate.tbs_certificate.subject
+    }
+
+    /// Whether the uploaded certificate covers the host `server_name` — so a service that
+    /// serves a hostname under a certificate of this account can ask whether this one would
+    /// terminate that host's handshake.
+    ///
+    /// WHICH hosts the certificate serves is the certificate's own fact, read out of the
+    /// stored `CertificateBody` ([`Self::served_names`]), and the match is the one a TLS
+    /// client applies to a certificate's names — the SHARED
+    /// [`::service_common::acm_certificate_key_material::name_covers`], so this service and
+    /// every other one that decides whether a certificate serves a hostname decides alike.
+    ///
+    /// A body this decoder cannot read states no name, and covers no host.
+    #[must_use]
+    pub fn covers(&self, server_name: &str) -> bool {
+        self.served_names().iter().any(|name| {
+            ::service_common::acm_certificate_key_material::name_covers(name, server_name)
+        })
+    }
+
+    /// Every host name the uploaded certificate serves: its subject common name first, then
+    /// the DNS names of its Subject Alternative Name extension, each name once however often
+    /// the certificate carries it.
+    ///
+    /// A subject alternative name of any other kind (an IP address, an email address) names
+    /// no host a hostname can be matched against, so it is left out.
+    #[must_use]
+    pub fn served_names(&self) -> Vec<String> {
+        let Some(certificate) = self.decoded() else {
+            return Vec::new();
+        };
+        let common_name = common_name(&certificate.tbs_certificate.subject);
+        let mut names: Vec<String> = Vec::new();
+        for name in common_name.into_iter().chain(dns_names(&certificate)) {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    /// The stored `CertificateBody`, decoded, or `None` for one this decoder cannot read.
+    fn decoded(&self) -> Option<::x509_cert::Certificate> {
+        use ::x509_cert::der::DecodePem;
+        ::x509_cert::Certificate::from_pem(self.certificate_body.as_bytes()).ok()
+    }
+}
+
+/// The value of the first common-name attribute a distinguished name carries, as the text
+/// its `DirectoryString` (RFC 5280 appendix A.1) holds — the attribute an X.500 name carries
+/// an entity's own name in, which for a server certificate's subject is the host it was
+/// issued for.
+fn common_name(name: &::x509_cert::name::Name) -> Option<String> {
+    use ::x509_cert::der::asn1::{Ia5StringRef, PrintableStringRef, Utf8StringRef};
+    /// The X.500 attribute type `commonName`: RFC 4519 section 2.3.
+    const COMMON_NAME: ::x509_cert::spki::ObjectIdentifier =
+        ::x509_cert::spki::ObjectIdentifier::new_unwrap("2.5.4.3");
+    let value = &name
+        .0
+        .iter()
+        .flat_map(|rdn| rdn.0.iter())
+        .find(|pair| pair.oid == COMMON_NAME)?
+        .value;
+    value
+        .decode_as::<Utf8StringRef<'_>>()
+        .map(|text| text.as_str().to_string())
+        .or_else(|_| {
+            value
+                .decode_as::<PrintableStringRef<'_>>()
+                .map(|text| text.as_str().to_string())
+        })
+        .or_else(|_| {
+            value
+                .decode_as::<Ia5StringRef<'_>>()
+                .map(|text| text.as_str().to_string())
+        })
+        .ok()
+}
+
+/// The DNS names of a certificate's Subject Alternative Name extension, in the order the
+/// extension lists them.
+fn dns_names(certificate: &::x509_cert::Certificate) -> Vec<String> {
+    use ::x509_cert::der::oid::AssociatedOid;
+    use ::x509_cert::der::Decode;
+    use ::x509_cert::ext::pkix;
+    certificate
+        .tbs_certificate
+        .extensions
+        .as_ref()
+        .and_then(|extensions| {
+            extensions
+                .iter()
+                .find(|extension| extension.extn_id == pkix::SubjectAltName::OID)
+        })
+        .and_then(|extension| pkix::SubjectAltName::from_der(extension.extn_value.as_bytes()).ok())
+        .map(|names| {
+            names
+                .0
+                .iter()
+                .filter_map(|name| match name {
+                    pkix::name::GeneralName::DnsName(dns) => Some(dns.as_str().to_string()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// A FIDO security key the account holds as an MFA device, as `GetMFADevice` reports it.
 ///
 /// `GetMFADevice` is the read that serves this kind of device and only this kind — "for

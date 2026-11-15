@@ -5,10 +5,10 @@
 //! endpoint AppSync serves the domain through, minted from this service's own state,
 //! plus the certificate and description the request named. The certificate side of the
 //! rule lives in [`crate::state::certificate_region_refusal`] (the one Region a custom
-//! domain's distribution reads a certificate from),
-//! [`crate::state::certificate_provenance_refusal`] (whether Certificate Manager issued
-//! that certificate at all) and [`crate::state::certificate_coverage_refusal`] (whether
-//! that certificate covers the name the domain is created under).
+//! domain's distribution reads a certificate from) and
+//! [`crate::state::certificate_refusal`] (whether the certificate the account holds at that
+//! ARN is one Certificate Manager issued from its public authority, and whether it covers
+//! the name the domain is created under).
 //!
 //! ## Shape of an operation
 //!
@@ -184,30 +184,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Nor can a certificate this account did not get from Certificate Manager: the
-        // distribution serving the domain presents only certificates that service ISSUED,
-        // so one a client imported — whoever signed it — could never terminate the
-        // handshake on this name. Read in the service that holds the certificate
-        // ([`crate::state::certificate_provenance_refusal`]), before the coverage of the
-        // name is asked about: a certificate that cannot be attached at all is refused
-        // whatever names it carries.
-        if let Some(message) =
-            crate::state::certificate_provenance_refusal(&*self.engine, &input.certificate_arn)
-        {
-            return Err(CreateDomainNameErrorModeled::BadRequestException(BadRequestException {
-                message: Some(message),
-                ..Default::default()
-            })
-            .into());
-        }
-
-        // Nor can a certificate that does not COVER the requested name: the domain
-        // answers HTTPS on that name, and this certificate is what would terminate the
-        // handshake. Read in the service that holds the certificate
-        // ([`crate::state::certificate_coverage_refusal`]), with this service's own store
-        // not yet held, and judged before anything is stored — so the refused pair leaves
-        // no domain behind.
-        if let Some(message) = crate::state::certificate_coverage_refusal(
+        // Nor can a certificate the account did not get from Certificate Manager's own
+        // public authority, nor one that does not COVER the requested name: the domain
+        // answers HTTPS on that name and this certificate is what would terminate the
+        // handshake, so the certificate is resolved in the services that hold one for this
+        // account ([`crate::state::certificate_refusal`]) rather than taken on the request's
+        // word. Asked with this service's own store not yet held, and judged before anything
+        // is stored — so the refused pair leaves no domain behind.
+        if let Some(message) = crate::state::certificate_refusal(
             &*self.engine,
             &input.domain_name,
             &input.certificate_arn,

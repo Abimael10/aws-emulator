@@ -23,7 +23,9 @@
 //! reports for the certificate is asserted before the create is tried, so no row rests on a
 //! provenance this file assumed. The two ARNs that resolve to NOTHING — a well-formed
 //! certificate ARN of this account and an Identity and Access Management server certificate
-//! — pin the other half of the rule: nothing is refused on evidence that is not there.
+//! ARN the account holds nothing under — pin the other half of the rule: nothing is refused
+//! on evidence that is not there. Which certificates the account holds in that OTHER service
+//! is `crate::domain_certificate_issuing_authority`'s subject.
 
 use std::sync::Arc;
 
@@ -34,21 +36,21 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region a custom domain's certificate is read from, which is the Region every
 /// certificate here is created in. Source: the service's own `state::CERTIFICATE_REGION`.
-const REGION: &str = "us-east-1";
+pub const REGION: &str = "us-east-1";
 
 /// The account id every emulated ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub const ACCOUNT: &str = "000000000000";
 
 /// AppSync's fixed sentence for a certificate it will not serve a custom domain with:
 /// recorded behavior, interpolating no value of the request.
-const CERTIFICATE_INVALID: &str = "Certificate is invalid.";
+pub const CERTIFICATE_INVALID: &str = "Certificate is invalid.";
 
 /// AppSync's fixed text for a custom domain this account does not hold, on the operations
 /// that READ one — what a refused create leaves behind.
-const DOMAIN_NOT_FOUND_ON_READ: &str = "Domain name not found";
+pub const DOMAIN_NOT_FOUND_ON_READ: &str = "Domain name not found";
 
 /// `CreateDomainName`'s path.
-const DOMAIN_NAMES_PATH: &str = "/v1/domainnames";
+pub const DOMAIN_NAMES_PATH: &str = "/v1/domainnames";
 
 /// The two values `CertificateDetail$Type` carries for a certificate this account holds:
 /// one Certificate Manager issued, and one a client imported.
@@ -58,11 +60,11 @@ const TYPE_IMPORTED: &str = "IMPORTED";
 
 /// One answer from the emulator: the parts a case branches on.
 #[derive(Debug, Clone)]
-struct Answer {
-    status: u16,
+pub struct Answer {
+    pub status: u16,
     /// The `x-amzn-errortype` header the error shape is resolved from.
-    error_type: String,
-    body: Value,
+    pub error_type: String,
+    pub body: Value,
 }
 
 /// A router with this service and Certificate Manager mounted over ONE engine, so the
@@ -79,7 +81,7 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Read one answer off the router.
-async fn dispatch(router: &MultiServiceRouter, request: http::Request<Bytes>) -> Answer {
+pub async fn dispatch(router: &MultiServiceRouter, request: http::Request<Bytes>) -> Answer {
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     let error_type = response
@@ -102,7 +104,7 @@ async fn dispatch(router: &MultiServiceRouter, request: http::Request<Bytes>) ->
 }
 
 /// Call this service the way an SDK does: restJson1 over its own paths.
-async fn appsync_call(
+pub async fn appsync_call(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -130,7 +132,7 @@ async fn appsync_call(
 /// Call `operation` of the Certificate Manager service mounted on the same router, the way
 /// an SDK drives it: `POST /` with `X-Amz-Target: CertificateManager.<Op>`, signed for that
 /// service in the Region its certificates live in.
-async fn acm_call(router: &MultiServiceRouter, operation: &str, body: Value) -> Answer {
+pub async fn acm_call(router: &MultiServiceRouter, operation: &str, body: Value) -> Answer {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -152,7 +154,7 @@ async fn acm_call(router: &MultiServiceRouter, operation: &str, body: Value) -> 
 /// A real self-signed certificate covering `names`, as the PEM pair `ImportCertificate`
 /// takes: the leaf and the private key that matches it. The first name is also the subject
 /// common name, which is the name Certificate Manager reports as the certificate's own.
-fn minted(names: &[&str]) -> (String, String) {
+pub fn minted(names: &[&str]) -> (String, String) {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("a key pair");
     let mut params = rcgen::CertificateParams::new(
         names
@@ -178,7 +180,7 @@ fn minted(names: &[&str]) -> (String, String) {
 
 /// Request a certificate covering `names` from Certificate Manager, and answer the ARN it
 /// was stored under: a certificate that service ISSUES.
-async fn requested(router: &MultiServiceRouter, names: &[&str]) -> String {
+pub async fn requested(router: &MultiServiceRouter, names: &[&str]) -> String {
     let (domain_name, alternatives) = names
         .split_first()
         .expect("a certificate covers at least one name");
@@ -198,7 +200,11 @@ async fn requested(router: &MultiServiceRouter, names: &[&str]) -> String {
 /// Import a certificate covering `names` into Certificate Manager, with `chain` as the
 /// certificate chain the request carries, and answer the ARN it was stored under: a
 /// certificate the CLIENT brought in, whichever authority the chain names.
-async fn imported(router: &MultiServiceRouter, names: &[&str], chain: Option<String>) -> String {
+pub async fn imported(
+    router: &MultiServiceRouter,
+    names: &[&str],
+    chain: Option<String>,
+) -> String {
     let (certificate, private_key) = minted(names);
     let mut request = json!({
         "Certificate": ::aws_smithy_types::base64::encode(certificate.as_bytes()),
@@ -217,7 +223,7 @@ async fn imported(router: &MultiServiceRouter, names: &[&str], chain: Option<Str
 }
 
 /// The `CertificateArn` a create answered with.
-fn certificate_arn(answer: &Answer, case: &str) -> String {
+pub fn certificate_arn(answer: &Answer, case: &str) -> String {
     answer.body["CertificateArn"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case}: expected a CertificateArn, got {:?}", answer.body))
@@ -226,7 +232,7 @@ fn certificate_arn(answer: &Answer, case: &str) -> String {
 
 /// The `Type` Certificate Manager reports for the certificate at `arn`, or `None` for an
 /// ARN it resolves nothing for.
-async fn reported_type(router: &MultiServiceRouter, arn: &str) -> Option<String> {
+pub async fn reported_type(router: &MultiServiceRouter, arn: &str) -> Option<String> {
     let read = acm_call(router, "DescribeCertificate", json!({"CertificateArn": arn})).await;
     if read.status != 200 {
         return None;
@@ -254,8 +260,8 @@ enum CertificateChoice {
     ImportedWildcard,
     /// A well-formed certificate ARN of this account and Region that nothing resolves for.
     Unresolvable,
-    /// An Identity and Access Management server certificate, the other form
-    /// `certificateArn` admits and one Certificate Manager holds nothing for.
+    /// An Identity and Access Management server certificate ARN, the other form
+    /// `certificateArn` admits, which the account holds no server certificate under.
     IamServerCertificate,
 }
 
@@ -399,7 +405,7 @@ fn rows() -> Vec<Row> {
             accepted: true,
         },
         Row {
-            label: "an IAM server certificate, which Certificate Manager holds none of",
+            label: "an IAM server certificate ARN the account holds nothing under",
             domain_name: "server-cert.appsync-provenance-test.com".to_string(),
             certificate: CertificateChoice::IamServerCertificate,
             provenance: None,
@@ -409,7 +415,7 @@ fn rows() -> Vec<Row> {
 }
 
 /// `CreateDomainName` for `domain_name` with `certificate_arn`.
-async fn create_domain(
+pub async fn create_domain(
     router: &MultiServiceRouter,
     domain_name: &str,
     certificate_arn: &str,
@@ -424,7 +430,7 @@ async fn create_domain(
 }
 
 /// `GetDomainName` for `domain_name`.
-async fn read_domain(router: &MultiServiceRouter, domain_name: &str) -> Answer {
+pub async fn read_domain(router: &MultiServiceRouter, domain_name: &str) -> Answer {
     appsync_call(
         router,
         "GET",
@@ -435,7 +441,7 @@ async fn read_domain(router: &MultiServiceRouter, domain_name: &str) -> Answer {
 }
 
 /// The `message` member of an answer's body, or `""` when it carries none.
-fn message(answer: &Answer) -> &str {
+pub fn message(answer: &Answer) -> &str {
     answer.body["message"].as_str().unwrap_or_default()
 }
 
