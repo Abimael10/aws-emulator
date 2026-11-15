@@ -29,6 +29,8 @@ mod directory_registration_lifecycle;
 mod harness;
 #[path = "all/identity_authorization.rs"]
 mod identity_authorization;
+#[path = "all/not_found_after_deletion.rs"]
+mod not_found_after_deletion;
 #[path = "all/pagination_token_refusals.rs"]
 mod pagination_token_refusals;
 #[path = "all/pattern_refusal_messages.rs"]

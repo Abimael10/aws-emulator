@@ -172,7 +172,11 @@ fn set_settle_due(
 
 /// Assert one not-found refusal: the status, the code, and all three required members
 /// of the modelled shape.
-fn assert_not_found(case: &str, answered: (u16, String, Value), kind: &str, identifier: &str) {
+///
+/// `pub(crate)` because the sentence is the SERVICE's and not this suite's: a sibling
+/// suite asserting the same refusal shares this one spelling of it rather than keeping a
+/// second copy that could drift from it.
+pub(crate) fn assert_not_found(case: &str, answered: (u16, String, Value), kind: &str, identifier: &str) {
     let (status, code, parsed) = answered;
     assert_eq!(
         status, 404,
