@@ -219,6 +219,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(&ctx.parts().headers);
+        // IAM decides whether this caller may issue at all before the service looks at the
+        // request's own values, and an issuance publishes the certificate template it named
+        // ([`crate::state::authorization::TEMPLATE_ARN_KEY`]), so a statement conditioned on
+        // that key decides this call. A request that names no template publishes no value for
+        // the key, which it is answered under the default template for.
+        crate::state::authorization::authorize_with(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.certificate_authority_arn,
+            input
+                .template_arn
+                .iter()
+                .map(|template_arn| {
+                    (
+                        crate::state::authorization::TEMPLATE_ARN_KEY.to_string(),
+                        template_arn.clone(),
+                    )
+                })
+                .collect(),
+        )?;
         // How long the issuance takes is what the CA's `Time` series observes, so it is
         // measured over the work itself — from here, where the request has arrived, to the
         // instant the issuance is complete.
@@ -440,9 +461,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> IssueCertificate<
                  certificate's validity period",
             ));
         }
-        // "Short-lived certificate validity is limited to seven days."
-        // (`CreateCertificateAuthorityRequest$UsageMode` docs.)
+        // "Specifies whether the CA issues general-purpose certificates ... or short-lived
+        // certificates that may optionally omit revocation because they expire quickly.
+        // Short-lived certificate validity is limited to seven days."
+        // (`CreateCertificateAuthorityRequest$UsageMode` docs.) The mode is about the
+        // certificates the CA ISSUES to a subject, so the seven-day limit bounds those and
+        // no CA certificate the CA is asked to sign: a CA certificate is bounded only by
+        // the limit its parents in the hierarchy set
+        // (`IssueCertificateRequest$Validity`), which is what lets the documented
+        // activation of a short-lived-mode CA install a multi-year certificate of its own.
+        // A request under a CA-certificate template
+        // ([`crate::state::names_ca_certificate_template`]) therefore carries the validity
+        // it asks for whatever the issuing CA's usage mode is.
         if record.usage_mode == "SHORT_LIVED_CERTIFICATE"
+            && !crate::state::names_ca_certificate_template(input.template_arn.as_deref())
             && window > crate::state::SHORT_LIVED_MAX_VALIDITY
         {
             return Err(invalid_args(

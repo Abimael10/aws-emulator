@@ -180,6 +180,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides before this service acts: the action is `acm-pca:<OperationName>` on
+        // the private CA the request names ([`crate::state::authorization`]).
+        crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.certificate_authority_arn,
+        )?;
         // Nothing here is read off the request's metadata: the CA a grant is made on is
         // the one the request names by ARN, not one derived from the signed region.
         let _ = ctx;

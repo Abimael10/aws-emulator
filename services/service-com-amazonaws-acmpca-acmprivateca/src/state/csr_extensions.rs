@@ -55,14 +55,17 @@ fn requested_extensions(csr_extensions: Option<&CsrExtensions>) -> Option<Extens
     (!extensions.is_empty()).then_some(extensions)
 }
 
-/// The `keyUsage` extension (RFC 5280 section 4.2.1.3) a configured `KeyUsage` asks for:
-/// the named bits its members set, marked critical as that section has a conforming
-/// authority mark this extension ("When present, conforming CAs SHOULD mark this extension
-/// as critical").
+/// The `keyUsage` extension (RFC 5280 section 4.2.1.3) that asserts the named bits
+/// `configured` sets, marked critical as that section has a conforming authority mark this
+/// extension ("When present, conforming CAs SHOULD mark this extension as critical").
+///
+/// The ONE encoder of those bits: the extensions a CA's certification request ASKS FOR are
+/// built from it, and so are the ones a certificate template DEFINES
+/// ([`super::KeyUsageDefinition`]).
 ///
 /// `None` when no member is set: a key usage that permits nothing is not a purpose to ask
 /// for, and RFC 5280 forbids an extension whose bit string asserts no bit.
-fn key_usage_extension(configured: &KeyUsage) -> Option<Extension> {
+pub(crate) fn key_usage_extension(configured: &KeyUsage) -> Option<Extension> {
     let mut usage = KeyUsageExtension(Default::default());
     for (asked_for, bit) in [
         (configured.digital_signature, KeyUsages::DigitalSignature),

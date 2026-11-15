@@ -1,5 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router.
+//
+// This file is a CANONICAL DECLARATION LIST: this header, then one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted by name, and no other
+// line. Two branches landing at once then insert two lines in two places and have no prose
+// to duplicate, re-word or mistype — which is what had happened here: the tail of this file
+// had grown thousands of re-typed copies of its header, hundreds of them written as inner
+// doc comments past the first item (`E0753`), so no suite of this target compiled at all.
+//
+// EVERY comment in this file is an ORDINARY one, this block included, and that is
+// deliberate: an inner doc comment (`//!`) is legal only before the first item, so with no
+// `//!` anywhere, no merge of two landings can put one past the first item.
+//
+// A suite no `mod` names compiles nowhere and its tests never run; a suite left at the top
+// level of `tests/` fails the build; and a suite declared twice is `E0428`. Each fails every
+// suite in this target. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves
+// to a SIBLING (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what
+// points each declaration into `tests/all/`.
+//
+// `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`
+// check those rules, for this file and for every service crate's `tests/all.rs`, so check
+// there rather than leaving a note here. What a suite covers, and why it belongs to this
+// cross-service target rather than to one service crate's own, is stated in that suite's own
+// module header; the notes earlier landings had appended to the tail of this file live in
+// `all/appended_notes.rs`, declared below like any other module.
 //! Single integration-test target for the router: the declaration list, and nothing else.
 //!
 //! Put a new suite at `tests/all/<name>.rs` and declare it below with a

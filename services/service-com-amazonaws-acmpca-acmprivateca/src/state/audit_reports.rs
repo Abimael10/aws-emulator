@@ -109,15 +109,12 @@ pub fn audit_report_content_type(format: &str) -> &'static str {
 /// format the request asked for: a JSON array of objects, or a CSV with those columns in
 /// the same order and a header row.
 ///
-/// A certificate the CA has accepted but not finished issuing is not in it: the report
-/// lists what the CA has DONE with its key, and that issuance completes on the clock like
-/// every other.
-pub fn audit_report_body(
-    ca: &CertificateAuthorityRecord,
-    format: &str,
-    now: SystemTime,
-) -> Vec<u8> {
-    let entries = audited_certificates(ca, now);
+/// A certificate the CA has issued is in the report from the issuance that allocated its
+/// serial: the report lists what the CA has done with its KEY, and the key was used by that
+/// call. Whether the certificate has become retrievable through `GetCertificate` is a
+/// separate, retrieval-side delay and decides nothing here.
+pub fn audit_report_body(ca: &CertificateAuthorityRecord, format: &str) -> Vec<u8> {
+    let entries = audited_certificates(ca);
     if format == "CSV" {
         return audit_report_csv(&entries).into_bytes();
     }
@@ -150,15 +147,13 @@ const AUDIT_REPORT_COLUMNS: &[&str] = &[
 
 /// One entry per certificate the CA's key has been used for, as the (column, value) pairs
 /// the report states, ordered by the serial the CA allocated.
-fn audited_certificates(
-    ca: &CertificateAuthorityRecord,
-    now: SystemTime,
-) -> Vec<Vec<(&'static str, String)>> {
-    let mut issued: Vec<&IssuedCertificate> = ca
-        .certificates
-        .values()
-        .filter(|certificate| certificate.is_available(now))
-        .collect();
+///
+/// Every certificate the CA has issued is one such use — "the `IssueCertificate` and
+/// `RevokeCertificate` actions use the private key"
+/// (`CreateCertificateAuthorityAuditReport` docs) — so the report states a row for each of
+/// them as of the instant it is produced.
+fn audited_certificates(ca: &CertificateAuthorityRecord) -> Vec<Vec<(&'static str, String)>> {
+    let mut issued: Vec<&IssuedCertificate> = ca.certificates.values().collect();
     issued.sort_by(|left, right| (left.issued_at, &left.serial).cmp(&(right.issued_at, &right.serial)));
     issued
         .into_iter()

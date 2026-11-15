@@ -9,27 +9,37 @@
 //! indicated by the PathLenN portion of the ARN, where N is the CA depth."
 //! (`IssueCertificateRequest$TemplateArn` docs.)
 //!
-//! A template is a named set of X.509 extensions, and the one every published template
-//! definition turns on is `basicConstraints` (RFC 5280 section 4.2.1.9): it is what makes a
-//! CA certificate usable as an issuer, what bounds the hierarchy below it, and what tells a
-//! CA certificate apart from an end-entity one. The template's NAME says which certificate
-//! it defines, so the definition is read off that name:
+//! A template is a named set of X.509 extensions, and the template's NAME says which
+//! certificate it defines, so the definition is read off that name. Every published
+//! definition turns on `basicConstraints` (RFC 5280 section 4.2.1.9) — what makes a CA
+//! certificate usable as an issuer, what bounds the hierarchy below it, and what tells a CA
+//! certificate apart from an end-entity one — and `keyUsage` (section 4.2.1.3), the purposes
+//! the certified key may be used for; the kinds that certify a key for a NAMED purpose add
+//! `extendedKeyUsage` (section 4.2.1.12):
 //!
 //! * `RootCACertificate` — a CA certificate: `cA` TRUE with no `pathLenConstraint`, so the
-//!   depth under a root is bounded by its subordinates' own constraints;
-//! * `SubordinateCACertificate_PathLenN` — a CA certificate whose `pathLenConstraint` is
-//!   the CA depth N the name publishes;
-//! * every other kind (`EndEntityCertificate`, `EndEntityClientAuthCertificate`,
-//!   `EndEntityServerAuthCertificate`, `CodeSigningCertificate`, `OCSPSigningCertificate`)
-//!   — an end-entity certificate: `cA` FALSE, which is what forbids issuing under it;
+//!   depth under a root is bounded by its subordinates' own constraints, and a key usage of
+//!   certificate signing, CRL signing and digital signature — what an authority does with
+//!   its key;
+//! * `SubordinateCACertificate_PathLenN` — the same CA certificate, with the
+//!   `pathLenConstraint` the name's depth N publishes;
+//! * the end-entity kinds — `cA` FALSE, which is what forbids issuing under them, with the
+//!   key usage and the key purposes each kind is for:
+//!   * `EndEntityCertificate` — digital signature and key encipherment, for TLS server and
+//!     TLS client authentication;
+//!   * `EndEntityServerAuthCertificate` / `EndEntityClientAuthCertificate` — the same key
+//!     usage for one side of that handshake alone;
+//!   * `CodeSigningCertificate` — digital signature, for code signing;
+//!   * `OCSPSigningCertificate` — digital signature, for OCSP signing;
 //! * the `Blank…` kinds define no extensions of their own, which is what makes them blank:
 //!   an `ApiPassthrough` is what fills such a certificate in. The one exception is the
 //!   `…CriticalBasicConstraints…` variants, whose name says the single extension they do
 //!   define — which is why the plain blank kinds cannot be defining it too.
 //!
-//! The extension is critical, as the basic constraints of a CA certificate must be (RFC
-//! 5280 section 4.2.1.9) and as the published definitions state for the end-entity kinds.
-//! A name's `_APIPassthrough` / `_APICSRPassthrough` suffix selects where the REST of the
+//! `basicConstraints` and `keyUsage` are critical, as the published definitions state and as
+//! RFC 5280 has a conforming authority mark them; `extendedKeyUsage` is not, so a relying
+//! party that does not know a purpose may still accept the certificate. A name's
+//! `_APIPassthrough` / `_APICSRPassthrough` suffix selects where the REST of the
 //! certificate's content is taken from rather than what the template defines, so it changes
 //! none of the above; a template name outside these kinds defines nothing this service
 //! knows, and the certificate issued under it carries no extension of the template's.
@@ -40,14 +50,19 @@
 use super::*;
 
 use ::x509_cert::der::oid::AssociatedOid;
-use ::x509_cert::ext::pkix::BasicConstraints;
+use ::x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage};
 
 /// The extensions a certificate issued under one template carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CertificateTemplate {
     /// The basic constraints the template defines, or `None` for a template that defines
-    /// no extensions of its own.
+    /// none.
     pub basic_constraints: Option<BasicConstraintsDefinition>,
+    /// The key usage the template defines, or `None` for a template that defines none.
+    pub key_usage: Option<KeyUsageDefinition>,
+    /// The key purposes the template's `extendedKeyUsage` names, as their object
+    /// identifiers; empty for a template that names none.
+    pub extended_key_usage: &'static [ObjectIdentifier],
 }
 
 /// A template's `basicConstraints` definition: whether the certificate issued under it is a
@@ -60,6 +75,50 @@ pub struct BasicConstraintsDefinition {
     /// publishes one.
     pub path_length: Option<u8>,
 }
+
+/// A template's `keyUsage` definition: what the certified key may be used for (the module
+/// docs). Every published definition asserts digital signature; what the kinds differ in is
+/// what they assert beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyUsageDefinition {
+    /// A CA certificate's: it signs the certificates it issues and the CRLs it publishes.
+    CertificateAndCrlSigning,
+    /// An end-entity certificate whose key also establishes keys — the TLS kinds.
+    SignatureAndKeyEncipherment,
+    /// An end-entity certificate whose key only signs — the code-signing and OCSP-signing
+    /// kinds.
+    Signature,
+}
+
+impl KeyUsageDefinition {
+    /// The named `keyUsage` bits this definition asserts, as the service's own key-usage
+    /// shape — so the extension is encoded by the one encoder of those bits
+    /// ([`super::key_usage_extension`]).
+    fn bits(self) -> KeyUsage {
+        let mut usage = KeyUsage {
+            digital_signature: true,
+            ..KeyUsage::default()
+        };
+        match self {
+            Self::CertificateAndCrlSigning => {
+                usage.key_cert_sign = true;
+                usage.crl_sign = true;
+            }
+            Self::SignatureAndKeyEncipherment => usage.key_encipherment = true,
+            Self::Signature => {}
+        }
+        usage
+    }
+}
+
+/// The key purposes of `extendedKeyUsage` the published template definitions name, by the
+/// object identifiers RFC 5280 section 4.2.1.12 assigns them (`id-kp-*`).
+const TLS_SERVER_AUTHENTICATION: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.1");
+const TLS_CLIENT_AUTHENTICATION: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.2");
+const CODE_SIGNING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3");
+const OCSP_SIGNING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.9");
 
 /// The template name a request that names none is answered under: "If this parameter is not
 /// provided, Amazon Web Services Private CA defaults to the `EndEntityCertificate/V1`
@@ -90,14 +149,35 @@ const ROOT_CA_TEMPLATE_KIND: &str = "RootCACertificate";
 const SUBORDINATE_CA_TEMPLATE_KIND: &str = "SubordinateCACertificate";
 
 /// The template kinds that define an END-ENTITY certificate, from the `TemplateArn` values
-/// Amazon Web Services Private CA publishes. A name carrying none of these and no CA marker
-/// is a kind this service does not know, and defines nothing (the module docs).
-const END_ENTITY_TEMPLATE_KINDS: &[&str] = &[
-    "EndEntityCertificate",
-    "EndEntityClientAuthCertificate",
-    "EndEntityServerAuthCertificate",
-    "CodeSigningCertificate",
-    "OCSPSigningCertificate",
+/// Amazon Web Services Private CA publishes, each with the key usage and the key purposes
+/// its published definition states (the module docs). A name carrying none of these and no CA
+/// marker is a kind this service does not know, and defines nothing.
+const END_ENTITY_TEMPLATE_KINDS: &[(&str, KeyUsageDefinition, &[ObjectIdentifier])] = &[
+    (
+        "EndEntityCertificate",
+        KeyUsageDefinition::SignatureAndKeyEncipherment,
+        &[TLS_SERVER_AUTHENTICATION, TLS_CLIENT_AUTHENTICATION],
+    ),
+    (
+        "EndEntityClientAuthCertificate",
+        KeyUsageDefinition::SignatureAndKeyEncipherment,
+        &[TLS_CLIENT_AUTHENTICATION],
+    ),
+    (
+        "EndEntityServerAuthCertificate",
+        KeyUsageDefinition::SignatureAndKeyEncipherment,
+        &[TLS_SERVER_AUTHENTICATION],
+    ),
+    (
+        "CodeSigningCertificate",
+        KeyUsageDefinition::Signature,
+        &[CODE_SIGNING],
+    ),
+    (
+        "OCSPSigningCertificate",
+        KeyUsageDefinition::Signature,
+        &[OCSP_SIGNING],
+    ),
 ];
 
 /// The portion of a template name that publishes the CA depth of the certificate it
@@ -117,9 +197,23 @@ pub fn certificate_template(template_arn: Option<&str>) -> CertificateTemplate {
     let name = template_arn
         .and_then(template_name)
         .unwrap_or(DEFAULT_TEMPLATE_NAME);
-    CertificateTemplate {
-        basic_constraints: basic_constraints_of(name),
-    }
+    definition_of(name)
+}
+
+/// Whether the template a request names defines a CA's OWN certificate — the certificate
+/// an authority of the hierarchy holds and signs with — rather than a certificate the CA
+/// issues to a subject.
+///
+/// The KIND portion of the template's name is what says so: the `RootCACertificate` and
+/// `SubordinateCACertificate` kinds define a CA certificate, including their `Blank…`
+/// variants, which take the rest of their content from an `ApiPassthrough` but still define
+/// the certificate of a CA. Every other published kind defines an end-entity certificate,
+/// and a request that names no template is answered under the default end-entity template
+/// ([`DEFAULT_TEMPLATE_NAME`]), so neither of those is one.
+pub fn names_ca_certificate_template(template_arn: Option<&str>) -> bool {
+    template_arn.and_then(template_name).is_some_and(|name| {
+        name.contains(ROOT_CA_TEMPLATE_KIND) || name.contains(SUBORDINATE_CA_TEMPLATE_KIND)
+    })
 }
 
 /// The template name the ARN `arn:<partition>:acm-pca:::template/<name>/<version>` carries,
@@ -130,30 +224,49 @@ fn template_name(template_arn: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
-/// The basic constraints the template called `name` defines (the module docs), or `None`
-/// when it defines none — a blank kind, or a kind this service does not know.
-fn basic_constraints_of(name: &str) -> Option<BasicConstraintsDefinition> {
-    if name.starts_with(BLANK_TEMPLATE_PREFIX)
-        && !name.contains(CRITICAL_BASIC_CONSTRAINTS_SEGMENT)
-    {
-        return None;
+/// The extensions the template called `name` defines (the module docs), which is nothing at
+/// all for a plain blank kind or a kind this service does not know.
+fn definition_of(name: &str) -> CertificateTemplate {
+    let blank = name.starts_with(BLANK_TEMPLATE_PREFIX);
+    // A blank kind defines nothing of its own — an `ApiPassthrough` fills the certificate in
+    // — except the variants whose name says they define critical basic constraints, and
+    // those define that one extension and no other.
+    let basic_constraints_only = blank && name.contains(CRITICAL_BASIC_CONSTRAINTS_SEGMENT);
+    if blank && !basic_constraints_only {
+        return CertificateTemplate::default();
     }
     // A CA kind's name is what publishes the depth below it, so the depth is read only for
     // a kind this service knows: a name outside the published kinds defines nothing,
     // whatever portions it carries.
     if name.contains(ROOT_CA_TEMPLATE_KIND) || name.contains(SUBORDINATE_CA_TEMPLATE_KIND) {
-        return Some(BasicConstraintsDefinition {
-            ca: true,
-            path_length: path_length_in(name),
-        });
+        return CertificateTemplate {
+            basic_constraints: Some(BasicConstraintsDefinition {
+                ca: true,
+                path_length: path_length_in(name),
+            }),
+            key_usage: (!basic_constraints_only)
+                .then_some(KeyUsageDefinition::CertificateAndCrlSigning),
+            extended_key_usage: &[],
+        };
     }
-    END_ENTITY_TEMPLATE_KINDS
+    let Some((_, key_usage, extended_key_usage)) = END_ENTITY_TEMPLATE_KINDS
         .iter()
-        .any(|kind| name.contains(kind))
-        .then_some(BasicConstraintsDefinition {
+        .find(|(kind, _, _)| name.contains(kind))
+    else {
+        return CertificateTemplate::default();
+    };
+    CertificateTemplate {
+        basic_constraints: Some(BasicConstraintsDefinition {
             ca: false,
             path_length: None,
-        })
+        }),
+        key_usage: (!basic_constraints_only).then_some(*key_usage),
+        extended_key_usage: if basic_constraints_only {
+            &[]
+        } else {
+            extended_key_usage
+        },
+    }
 }
 
 /// The CA depth the `PathLenN` portion of `name` publishes, when the name carries one.
@@ -178,10 +291,37 @@ pub fn certificate_extensions(
 }
 
 /// The DER extensions a certificate issued under `template` carries, or `None` for a
-/// template that defines none.
+/// template that defines none: the basic constraints, the key usage and the key purposes its
+/// definition states (the module docs), in that order.
 pub fn template_extensions(template: &CertificateTemplate) -> Option<Extensions> {
-    let constraints = template.basic_constraints?;
-    basic_constraints_extension(constraints).map(|extension| vec![extension])
+    let mut extensions: Extensions = Vec::new();
+    if let Some(constraints) = template.basic_constraints {
+        extensions.extend(basic_constraints_extension(constraints));
+    }
+    if let Some(key_usage) = template.key_usage {
+        extensions.extend(super::key_usage_extension(&key_usage.bits()));
+    }
+    extensions.extend(extended_key_usage_extension(template.extended_key_usage));
+    (!extensions.is_empty()).then_some(extensions)
+}
+
+/// The `extendedKeyUsage` extension (RFC 5280 section 4.2.1.12) naming `purposes`, or `None`
+/// for a template that names none.
+///
+/// Not marked critical, as the published definitions state it: "if the extension is present,
+/// then the certificate MUST only be used for one of the purposes indicated" is the
+/// certificate's claim either way, and a non-critical extension leaves a relying party that
+/// does not recognise a purpose free to accept the certificate.
+fn extended_key_usage_extension(purposes: &[ObjectIdentifier]) -> Option<Extension> {
+    if purposes.is_empty() {
+        return None;
+    }
+    let value = ExtendedKeyUsage(purposes.to_vec());
+    Some(Extension {
+        extn_id: ExtendedKeyUsage::OID,
+        critical: false,
+        extn_value: OctetString::new(value.to_der().ok()?).ok()?,
+    })
 }
 
 /// The `subjectAltName` extension (RFC 5280 section 4.2.1.6) the certification request asks

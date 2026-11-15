@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/audit_report_deposits.rs"]
 mod audit_report_deposits;
+#[path = "all/audit_report_key_use.rs"]
+mod audit_report_key_use;
 #[path = "all/audit_report_rows.rs"]
 mod audit_report_rows;
 #[path = "all/ca_arn_resolution_stages.rs"]
@@ -37,6 +39,8 @@ mod certificate_authority_tags;
 mod certificate_issuance_rules;
 #[path = "all/certificate_revocation.rs"]
 mod certificate_revocation;
+#[path = "all/certificate_template_key_purposes.rs"]
+mod certificate_template_key_purposes;
 #[path = "all/constraint_refusal_messages.rs"]
 mod constraint_refusal_messages;
 #[path = "all/create_idempotency.rs"]
@@ -49,6 +53,8 @@ mod crl_publication;
 mod delete_certificate_authority;
 #[path = "all/enum_value_set_order.rs"]
 mod enum_value_set_order;
+#[path = "all/issuance_authorization.rs"]
+mod issuance_authorization;
 #[path = "all/issuance_metrics.rs"]
 mod issuance_metrics;
 #[path = "all/issued_certificate_reads.rs"]
@@ -75,6 +81,8 @@ mod resource_policy_statement_set;
 mod restore_certificate_authority;
 #[path = "all/root_ca_self_signing.rs"]
 mod root_ca_self_signing;
+#[path = "all/short_lived_ca_certificate_validity.rs"]
+mod short_lived_ca_certificate_validity;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_listing.rs"]

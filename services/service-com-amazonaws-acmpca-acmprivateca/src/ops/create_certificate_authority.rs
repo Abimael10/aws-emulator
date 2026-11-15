@@ -203,6 +203,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides before this service acts. Creating a CA addresses no CA of its own
+        // yet, so the action is judged against the resource IAM writes for such a request
+        // ([`crate::state::authorization::ANY_RESOURCE`]).
+        crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::state::authorization::ANY_RESOURCE,
+        )?;
         // Modeled constraints (the enums, the tag key pattern, the member lengths) are
         // refused before this handler runs; what is left are the rules the SERVICE
         // enforces over a combination of members.

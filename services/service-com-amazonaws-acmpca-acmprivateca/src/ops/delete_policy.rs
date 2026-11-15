@@ -189,6 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides before this service acts: the action is `acm-pca:<OperationName>` on
+        // the private CA the request names, which a policy operation names by its
+        // `ResourceArn` ([`crate::state::authorization`]).
+        crate::state::authorization::authorize(&*self.engine, ctx, Self::NAME, &input.resource_arn)?;
         let _ = ctx;
         let arn = input.resource_arn;
         if crate::state::parse_certificate_authority_arn(&arn).is_none() {

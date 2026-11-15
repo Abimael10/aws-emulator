@@ -167,6 +167,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides before this service acts: the action is `acm-pca:<OperationName>` on
+        // the private CA the request names ([`crate::state::authorization`]).
+        crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.certificate_authority_arn,
+        )?;
         let region = crate::state::request_region(&ctx.parts().headers);
         let arn = input.certificate_authority_arn.clone();
         let Some(parsed) = crate::state::parse_certificate_authority_arn(&arn) else {
@@ -295,7 +303,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
             bucket: input.s3_bucket_name.clone(),
             key: crate::state::audit_report_key(certificate_authority_id, &report_id, format),
             content_type: crate::state::audit_report_content_type(format),
-            body: crate::state::audit_report_body(record, format, now),
+            body: crate::state::audit_report_body(record, format),
         };
         Ok((report_id, deposit))
     }

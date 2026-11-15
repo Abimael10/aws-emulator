@@ -17,6 +17,7 @@
 //! certificates it issues ([`issuance_metrics`]).
 
 mod audit_reports;
+pub mod authorization;
 mod certificate_chain;
 mod certificate_templates;
 mod csr_extensions;
