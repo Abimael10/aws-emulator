@@ -1438,3 +1438,7 @@ mod apigateway_cognito_authorizer_spares_the_proxy_lambda;
 // above each declaration is what points it into `tests/all/`.
 #[path = "all/sts_session_context_keys.rs"]
 mod sts_session_context_keys;
+// The lint allowed here is for the suite files this root compiles: a wrapped paragraph in a
+// module header is a note rather than a build failure. An inner attribute is legal only
+// BEFORE the first item, so it stands here, ahead of the declaration list, rather than among
+// or after the declarations, where it is a build error that compiles no suite of this target.

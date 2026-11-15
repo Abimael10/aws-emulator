@@ -91,7 +91,13 @@
 //!   nor IAM holds a record for speaks for the account itself — the position AWS account root
 //!   credentials are in, which no identity-based policy bounds — so it is allowed where no
 //!   readable document denies it. This is also what every in-process call another emulated
-//!   service makes against S3 presents.
+//!   service makes against S3 presents. It is the standing of the identity whose DOCUMENTS are
+//!   in force (`sts_store::identity_is_account_credential`), so a session that credential
+//!   minted stands in the same position: nothing identity-based withholds its actions, and
+//!   what it may do is what the scope its mint passed allows — which is what a refusal of a
+//!   request outside that scope names. Standing in for the account's ROOT USER is a different
+//!   question, asked of the principal rather than of the identity in force, and only the three
+//!   bucket-policy operations ask it ([`policy_operation_denial`]).
 //! * **A principal holding an attachment this emulator cannot read.** An AWS-managed policy
 //!   is owned by AWS rather than by the account, so the account's store holds no document for
 //!   it; refusing on a grant this emulator cannot see would deny access AWS permits. An
@@ -301,9 +307,20 @@ pub struct Caller {
     /// registry recorded it (`sts_store::Caller::token_issue_time`), and `None` for a
     /// long-term access key, which belongs to no session and carries no value for the key.
     pub token_issue_time: Option<String>,
-    /// Set when this request presents the account's own published credential, which holds no
-    /// IAM policies (see the module docs).
+    /// Set when the identity whose documents are in force for this request is the account's
+    /// own published credential, which holds no IAM policies (see the module docs) — the
+    /// credential itself, and a session it minted, whose permissions are the intersection of
+    /// that identity's policies and the scope the mint passed.
     pub account_credential: bool,
+    /// Set when the PRINCIPAL this request speaks for is that credential ITSELF rather than a
+    /// session minted with it: the position AWS's account root user is in, which is what the
+    /// three bucket-policy operations are never refused ([`policy_operation_denial`]).
+    ///
+    /// Held beside [`Self::account_credential`] because the two questions have different
+    /// answers for one credential: a session the account's own credential minted is judged on
+    /// that identity's (unbounded) documents, and is still a principal of its own — scoped by
+    /// the session policies its mint passed — so it is not the root principal of anything.
+    pub account_root_principal: bool,
     /// Set when the principal carries a policy whose document the IAM store does not hold —
     /// an AWS-managed policy (see the module docs).
     pub unreadable_attachment: bool,
@@ -471,7 +488,18 @@ pub fn request_caller<Eng: Send + Sync + 'static>(
         };
     };
     let mut caller = Caller {
-        account_credential: arn == sts_store::ambient_identity().arn,
+        // Whether NOTHING identity-based bounds this request is a question about the identity
+        // whose documents are in force for the credential presented, not about the principal
+        // it speaks for: a federated-user session is judged on the IAM user whose long-term
+        // credentials minted it, so a session the account's own published credential minted is
+        // bounded by no document exactly as that credential itself is, while the principal a
+        // refusal names stays the federated user
+        // (`sts_store::identity_is_account_credential`).
+        account_credential: sts_store::identity_is_account_credential(&policies_arn),
+        // Whether the request presents that credential ITSELF is the other question, asked of
+        // the principal: a session it minted speaks for a principal of its own and is capped by
+        // the scope the mint passed, so it is not AWS's account root user.
+        account_root_principal: sts_store::identity_is_account_credential(&arn),
         principals: vec![arn.clone()],
         account_principals: iam::account_principals(&arn),
         arn,
@@ -933,6 +961,13 @@ fn request_over<'a>(
 /// module docs), so those three are never refused it — which is what keeps a document that
 /// denies everything from making the bucket's policy unreadable and unremovable. Every other
 /// principal is judged by the rule above.
+///
+/// It is the credential ITSELF that stands in for the root user
+/// ([`Caller::account_root_principal`]), not a session it minted: a temporary credential
+/// speaks for a principal of its own and may do only what the session policies its mint
+/// passed allow — "if you do not pass any session policies, then the resulting federated user
+/// session has no permissions" (`GetFederationTokenRequest$Policy`) — so these three
+/// operations are decided for it by the rule above, scope and all.
 #[must_use]
 pub fn policy_operation_denial(
     caller: &Caller,
@@ -942,7 +977,7 @@ pub fn policy_operation_denial(
     resource: &str,
     conditions: &[(String, String)],
 ) -> Option<String> {
-    if caller.account_credential {
+    if caller.account_root_principal {
         return None;
     }
     denial(caller, policy, addressed_tags, action, resource, conditions)
@@ -1218,6 +1253,7 @@ mod tests {
                 Caller {
                     arn: sts_store::ambient_identity().arn,
                     account_credential: true,
+                    account_root_principal: true,
                     ..Caller::default()
                 },
             ),

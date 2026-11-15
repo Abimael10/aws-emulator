@@ -55,13 +55,17 @@ const REGION: &str = "us-east-1";
 /// The access-key id standing for the account's own published credential, which writes this
 /// suite's fixtures: neither STS nor IAM holds a record of it, so it resolves to the account's
 /// ambient identity.
-const ACCOUNT_KEY: &str = "AKIDEMULATOR";
+///
+/// `pub(crate)`, like the harness below it: the suite that pins what a session MINTED BY that
+/// credential may do ([`super::account_credential_federation_sessions`]) drives its rows
+/// through this one harness rather than standing up a second one.
+pub(crate) const ACCOUNT_KEY: &str = "AKIDEMULATOR";
 
 /// The bucket the object and listing rows address.
-const BUCKET: &str = "federated-session-subject";
+pub(crate) const BUCKET: &str = "federated-session-subject";
 
 /// The object every object row addresses.
-const KEY: &str = "reports/held.csv";
+pub(crate) const KEY: &str = "reports/held.csv";
 
 /// The bytes that object holds. A policy is about who may reach an object, not about what is
 /// in it, so one payload serves every row.
@@ -69,7 +73,7 @@ const BODY: &[u8] = b"federated-session-subject";
 
 /// The code S3 answers an authorization refusal with, and the status it carries (Amazon S3
 /// "Error responses": `AccessDenied`, HTTP 403).
-const ACCESS_DENIED: &str = "AccessDenied";
+pub(crate) const ACCESS_DENIED: &str = "AccessDenied";
 
 /// How long a minted federation session lasts here — inside the modelled range
 /// (`GetFederationTokenRequest$DurationSeconds`, 900..129600) and comfortably longer than the
@@ -82,31 +86,31 @@ const MINT_ACTION: &str = "sts:GetFederationToken";
 
 /// An emulator holding S3 beside the two services a decision about a federated session reads
 /// from: IAM (the minting user and its identity-based documents) and STS (the session).
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 /// What a dispatched request answered: the status, and the body as text.
-struct Answer {
-    status: u16,
-    body: String,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: String,
 }
 
 impl Answer {
     /// The `<Code>` of S3's restXml error document (the model sets `noErrorWrapping`, so it is
     /// the document's own child).
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         element(&self.body, "Code").unwrap_or_else(|| self.body.clone())
     }
 
     /// The `<Message>` of that same document.
-    fn error_message(&self) -> String {
+    pub(crate) fn error_message(&self) -> String {
         element(&self.body, "Message").unwrap_or_default()
     }
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing: the `Authorization` header carries only the credential
@@ -130,7 +134,13 @@ impl Emulator {
 
     /// One S3 request, presented as signed with `access_key_id` — which is where this emulator
     /// reads which principal a request speaks for.
-    async fn s3(&self, access_key_id: &str, method: &str, uri: &str, body: &[u8]) -> Answer {
+    pub(crate) async fn s3(
+        &self,
+        access_key_id: &str,
+        method: &str,
+        uri: &str,
+        body: &[u8],
+    ) -> Answer {
         let host = format!("s3.{REGION}.amazonaws.com");
         let request = http::Request::builder()
             .method(method)
@@ -155,7 +165,7 @@ impl Emulator {
     }
 
     /// One awsQuery call to IAM or STS, presented as signed with `access_key_id`.
-    async fn query(
+    pub(crate) async fn query(
         &self,
         access_key_id: &str,
         signing_name: &str,
@@ -192,7 +202,7 @@ impl Emulator {
     }
 
     /// Create [`BUCKET`] and write [`KEY`] into it, as the account's own credential.
-    async fn seeded_bucket(&self) {
+    pub(crate) async fn seeded_bucket(&self) {
         let created = self.s3(ACCOUNT_KEY, "PUT", &format!("/{BUCKET}"), b"").await;
         assert_eq!(
             created.status, 200,
@@ -211,7 +221,7 @@ impl Emulator {
 
     /// The account's own `ListBuckets`, which is how a row checks whether a create left a
     /// bucket behind.
-    async fn account_buckets(&self) -> String {
+    pub(crate) async fn account_buckets(&self) -> String {
         let listed = self.s3(ACCOUNT_KEY, "GET", "/", b"").await;
         assert_eq!(
             listed.status, 200,
@@ -224,7 +234,7 @@ impl Emulator {
     /// An IAM user carrying exactly `actions` as its inline policy's grant, a federation
     /// session minted with its long-term key, and the session policy `scope` (when the row
     /// passes one).
-    async fn federated_session(
+    pub(crate) async fn federated_session(
         &self,
         name: &str,
         actions: &[&str],
@@ -279,6 +289,21 @@ impl Emulator {
         );
         let long_term = element(&body, "AccessKeyId")
             .unwrap_or_else(|| panic!("CreateAccessKey must answer an AccessKeyId, got {body}"));
+        self.minted_federation_session(&long_term, name, scope).await
+    }
+
+    /// A federation session minted with the long-term credential `minting_key`, for the
+    /// federated user `name` and with the session policy `scope` (when the mint passes one).
+    ///
+    /// `pub(crate)`: a mint made with the ACCOUNT's own published credential rather than with
+    /// an IAM user's key is the same mint through the same operation, so the suite that pins
+    /// what such a session may do asks for it here.
+    pub(crate) async fn minted_federation_session(
+        &self,
+        minting_key: &str,
+        name: &str,
+        scope: Option<&str>,
+    ) -> Session {
         let mut params = vec![
             ("Name", name.to_string()),
             ("DurationSeconds", SESSION_SECONDS.to_string()),
@@ -288,7 +313,7 @@ impl Emulator {
         }
         let (status, body) = self
             .query(
-                &long_term,
+                minting_key,
                 "sts",
                 "2011-06-15",
                 "GetFederationToken",
@@ -314,9 +339,9 @@ impl Emulator {
 
 /// One minted federation session: the access key id its requests are signed with, and the ARN
 /// a refusal names it by.
-struct Session {
-    access_key_id: String,
-    federated_user_arn: String,
+pub(crate) struct Session {
+    pub(crate) access_key_id: String,
+    pub(crate) federated_user_arn: String,
 }
 
 /// WHICH call a row makes: the IAM action it is authorized under, and the resource that

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/access_point_data_plane.rs"]
 mod access_point_data_plane;
+#[path = "all/account_credential_federation_sessions.rs"]
+mod account_credential_federation_sessions;
 #[path = "all/account_public_access_block.rs"]
 mod account_public_access_block;
 #[path = "all/account_wide_listing_authorization.rs"]

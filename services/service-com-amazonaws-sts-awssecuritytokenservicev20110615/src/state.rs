@@ -1177,6 +1177,15 @@ impl Caller {
             .unwrap_or(self.identity.arn.as_str())
     }
 
+    /// Whether the identity whose identity-based policies are IN FORCE for a request this
+    /// credential signs ([`Caller::identity_policies_arn`]) is the account's own published
+    /// credential, which no identity-based policy bounds
+    /// ([`identity_is_account_credential`]).
+    #[must_use]
+    pub fn identity_is_account_credential(&self) -> bool {
+        identity_is_account_credential(self.identity_policies_arn())
+    }
+
     /// What the global condition key `aws:TokenIssueTime` answers for a request this
     /// credential signs: the instant its session was issued, as the timestamp a `Date…`
     /// condition operator compares — and `None` for a credential that belongs to no session,
@@ -1858,6 +1867,43 @@ pub fn ambient_identity() -> Identity {
         account: ::engine::emulator_account_id().to_string(),
         arn: ::service_common::caller_principal::ambient_user_arn(),
     }
+}
+
+/// Whether `identity_arn` names the account's OWN published credential — the long-term key
+/// this emulator publishes at start ([`ambient_identity`]) — rather than an IAM identity of
+/// the account.
+///
+/// It is the question a gate asks to learn that NOTHING identity-based bounds a request: the
+/// IAM store holds no document for that identity and no policy is attached to it, which is
+/// the position AWS account root credentials are in, so a request judged on its documents is
+/// refused only by a document that DENIES the action.
+///
+/// For the identity-based standing, ask it of the identity whose documents are in force for
+/// the credential presented ([`Caller::identity_policies_arn`]) rather than of the principal
+/// that credential speaks for: the two are not the same identity for every credential. A
+/// federated-user session is
+/// judged on the documents of the IAM user whose long-term credentials minted it — "the
+/// session permissions are the intersection of the IAM user policies and the session policies
+/// that you pass" (`GetFederationToken`) — so a session the account's own credential minted is
+/// judged on an identity no document bounds, exactly as that credential itself is, while the
+/// principal it speaks for is the federated user. [`Caller::identity_is_account_credential`]
+/// is this question asked of a resolved caller.
+///
+/// ONE answer, so every service that decides a request signed with a credential this registry
+/// resolves reads the same standing out of it; a gate that still spells the comparison itself
+/// is to be migrated onto this one rather than copied again.
+///
+/// It says what nothing identity-based WITHHOLDS, never what the credential may do: a gate that
+/// reads it has to cap the request by the scope the mint passed as well
+/// ([`ScopingPolicies::decision`]), since a session minted with no session policy at all has no
+/// permissions however unbounded the identity behind it is.
+///
+/// Where a rule is instead about the credential that SIGNED — AWS's account root user, which a
+/// session minted with that credential is not — ask it of the principal's own ARN
+/// ([`Caller::identity`]'s `arn`), and never of the identity in force.
+#[must_use]
+pub fn identity_is_account_credential(identity_arn: &str) -> bool {
+    identity_arn == ambient_identity().arn
 }
 
 /// An AWS unique id: `prefix` plus 17 characters derived from `seed`.
