@@ -321,6 +321,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
 
             let last_event_id = execution.last_event_id();
+            // The event the PRESERVED history holds that state's entry at, which this
+            // continuation does not record again.
+            let state_entered_at = execution.entered_event_id(&state_name);
             let execution_input = execution.input.clone();
             let execution_name = execution.name.clone();
             let start_date = execution.start_date;
@@ -420,6 +423,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 machine.arn.clone(),
                 context,
                 crate::state::asl::CallbackReply {
+                    entered_event_id: state_entered_at,
                     state_name,
                     state_input,
                     // "The error code of the failure" and "a more detailed explanation

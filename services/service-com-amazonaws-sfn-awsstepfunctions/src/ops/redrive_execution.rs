@@ -204,7 +204,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Phase 1, under the lock: resolve the execution, refuse what cannot be
         // redriven, and read what the re-run needs. The lock is released before the
         // walk, so no other request waits on an interpretation.
-        let (definition, execution_input, previous_event_id, machine_arn, context, redrive_step) = {
+        let (
+            definition,
+            execution_input,
+            previous_event_id,
+            machine_arn,
+            context,
+            redrive_step,
+            step_entered_at,
+        ) = {
             let mut store = state.lock();
             // Settle first: an execution whose terminal status the clock already owed
             // is terminal when this call decides whether it can be redriven.
@@ -308,6 +316,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // with, which is not what the state machine — or the version it was
             // published from — may hold by now.
             let definition = execution.ran.definition.clone();
+            // The event the PRESERVED history holds the entry of that step at: the
+            // attempt this redrive continues entered it, and "Step Functions preserves
+            // the results and execution history of the successful steps", so it is not
+            // entered again — which is the event that step's own diagnoses name.
+            let step_entered_at = execution
+                .redrive_step
+                .as_ref()
+                .and_then(|step| execution.entered_event_id(&step.state_name));
             (
                 definition,
                 execution.input.clone(),
@@ -315,6 +331,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 machine.arn.clone(),
                 context,
                 execution.redrive_step.clone(),
+                step_entered_at,
             )
         };
 
@@ -371,6 +388,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         previous_event_id,
                     },
                     redrive_step.as_ref(),
+                    step_entered_at,
                     tasks,
                 )
             })

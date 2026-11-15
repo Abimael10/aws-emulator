@@ -381,11 +381,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // CARRIED the token — whose `Retry` may make that call again.
                 match activity_arn {
                     Some(_) => Answered::Activity(crate::state::asl::ActivityReply {
+                        // The event the PRESERVED history holds that state's entry at,
+                        // which this continuation does not record again.
+                        entered_event_id: execution.entered_event_id(&state_name),
                         state_name,
                         state_input,
                         result,
                     }),
                     None => Answered::Callback(crate::state::asl::CallbackReply {
+                        entered_event_id: execution.entered_event_id(&state_name),
                         state_name,
                         state_input,
                         outcome: Ok(result),

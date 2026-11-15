@@ -2228,6 +2228,31 @@ impl Execution {
         self.history.last().map_or(0, |event| event.id)
     }
 
+    /// The id of the event this execution's history holds the ENTRY of the state
+    /// `state_name` at, which is the LAST such event it holds.
+    ///
+    /// Every diagnosis the interpreter raises about a state's own expression names the
+    /// event that state was entered at, and a call that CONTINUES this execution — a
+    /// redrive, a worker's reply, a job that ended, an answered token — begins at a
+    /// state the attempt it continues already entered: that entry is in this history,
+    /// recorded once, so what continues the execution names the id it carries here
+    /// rather than one of the events the continuation is about to append. A state the
+    /// definition re-enters records one entry per entry, and the continuation continues
+    /// the most recent of them, which is why this reads the history from its end.
+    ///
+    /// `None` for a state this history holds no entry of, where what the continuation
+    /// records for it is all there is.
+    pub fn entered_event_id(&self, state_name: &str) -> Option<i64> {
+        self.history
+            .iter()
+            .rev()
+            .find(|event| {
+                event.event_type.ends_with(STATE_ENTERED_SUFFIX)
+                    && event.state_name.as_deref() == Some(state_name)
+            })
+            .map(|event| event.id)
+    }
+
     /// The `redriveDate` a successful redrive under `client_token` already answered,
     /// when that token is still one of the remembered, unexpired ones.
     ///

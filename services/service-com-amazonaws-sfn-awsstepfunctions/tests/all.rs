@@ -53,6 +53,8 @@ mod client_error_wrappers;
 mod client_refusal_status;
 #[path = "all/completed_map_run_refusal.rs"]
 mod completed_map_run_refusal;
+#[path = "all/continued_attempt_entered_event.rs"]
+mod continued_attempt_entered_event;
 #[path = "all/concurrent_activity_bound_isolation.rs"]
 mod concurrent_activity_bound_isolation;
 #[path = "all/control_plane_pass_role.rs"]

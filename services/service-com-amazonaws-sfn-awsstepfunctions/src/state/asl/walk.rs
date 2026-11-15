@@ -306,7 +306,9 @@ impl Interpreter<'_> {
     /// A diagnosis the interpreter raises about this state's own expression is
     /// reported under the state's name and the id of the event it was ENTERED at
     /// ([`diagnosed`]), which is read here — before the state records anything — so
-    /// the state that failed can be followed back to its place in the history.
+    /// the state that failed can be followed back to its place in the history. For the
+    /// state a walk CONTINUES an execution at, that event is one the preserved history
+    /// already holds, so its own id is what the diagnosis names ([`ContinuedEntry`]).
     pub(super) fn step(
         &mut self,
         name: &str,
@@ -315,7 +317,13 @@ impl Interpreter<'_> {
         at: Duration,
         scope: &Scope,
     ) -> Result<StateStep, Fault> {
-        let entered = self.next_event_id();
+        let entered = match self.continued_entry.take() {
+            Some(continued) => {
+                self.skipping_entry = !continued.recorded;
+                continued.event_id
+            }
+            None => self.next_event_id(),
+        };
         // Where this state's own events begin, so a failure of its EXPRESSIONS is
         // recorded at the point it happened rather than after the event that records
         // the state failing ([`Interpreter::push_evaluation_failure`]).
@@ -325,7 +333,11 @@ impl Interpreter<'_> {
         // ([`super::super::jsonata::take_failed_field`]), so this state starts with
         // none.
         super::super::jsonata::clear_failed_field();
-        match self.run_state(name, state, raw, at, scope, entered) {
+        let ran = self.run_state(name, state, raw, at, scope, entered);
+        // Whatever this state's turn reached, the entry it was not to record is behind
+        // it: the next state the walk enters records its own.
+        self.skipping_entry = false;
+        match ran {
             Ok(step) => Ok(step),
             Err(fault) => {
                 let fault = diagnosed(name, entered, fault);
@@ -1131,6 +1143,11 @@ impl Interpreter<'_> {
     /// entered WITH: "the string that contains the JSON input data for the state",
     /// which is the raw input the state received, before its own `InputPath` selects
     /// from it.
+    ///
+    /// A state this walk RE-RUNS from its entry records none: "Step Functions preserves
+    /// the results and execution history of the successful steps", so the entry the
+    /// attempt this walk continues recorded is the one event of it the history holds
+    /// ([`ContinuedEntry`]).
     pub(super) fn push_entered(
         &mut self,
         event_type: &'static str,
@@ -1138,6 +1155,9 @@ impl Interpreter<'_> {
         after: Duration,
         input: &Value,
     ) {
+        if std::mem::take(&mut self.skipping_entry) {
+            return;
+        }
         let input = self.echo(input);
         self.push_detailed(
             event_type,

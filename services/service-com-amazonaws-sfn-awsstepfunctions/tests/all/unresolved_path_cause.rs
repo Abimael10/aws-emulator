@@ -53,7 +53,12 @@ const FAILING: &str = "JobComplete";
 
 /// Which diagnosis the service words for an unresolvable path, which depends on the
 /// member the path was written in.
-enum Diagnosis {
+///
+/// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so the suite
+/// that asserts the SAME sentences for an attempt that CONTINUES an execution
+/// (`crate::continued_attempt_entered_event`) words them through this one rather than
+/// carrying a second copy of them.
+pub(crate) enum Diagnosis {
     /// The path as written and the path that was resolved, which every member of a
     /// state reports.
     Path,
@@ -72,7 +77,6 @@ enum Diagnosis {
         searched: &'static str,
     },
 }
-
 /// One row: the state that fails, how many `Pass` states run before it, and the path
 /// it could not resolve.
 struct Row {
@@ -263,7 +267,14 @@ fn definition(row: &Row) -> String {
 /// referencing an input value, a NAMED FIELD of a state is reported with the field the
 /// path was written for and the whole document it was looked for in, and every other
 /// member of a state is reported with the path that was RESOLVED, in bracket notation.
-fn expected_cause(name: &str, entered: i64, path: &str, diagnosis: &Diagnosis) -> String {
+///
+/// `pub(crate)` for the reason [`Diagnosis`] is.
+pub(crate) fn expected_cause(
+    name: &str,
+    entered: i64,
+    path: &str,
+    diagnosis: &Diagnosis,
+) -> String {
     let prefix =
         format!("An error occurred while executing the state '{name}' (entered at the event id #{entered}). ");
     let diagnosis = match diagnosis {

@@ -1567,6 +1567,26 @@ pub struct JobReply {
     pub frames: Vec<ParkedFrame>,
     /// What the job ended as.
     pub outcome: Result<Value, Failure>,
+    /// The id of the event the PRESERVED history holds the ENTRY of the state this
+    /// continuation begins at — the outermost frame's state where the task parked
+    /// inside concurrent states, and the state that started the job where it did not
+    /// ([`ContinuedEntry`]).
+    pub entered_event_id: Option<i64>,
+}
+
+/// The state a continuation of a parked job BEGINS at, given the state that started the
+/// job and the concurrent states it is nested inside.
+///
+/// A job the task of a `Parallel` BRANCH started is answered one level in: the walk
+/// re-enters the concurrent states the parked record names, outermost first
+/// ([`ParkedFrame`]), so the state it begins at is the outermost of those frames and the
+/// state that started the job only where there are none. The ONE statement of that
+/// choice, read by the walk that continues ([`interpret`]) and by the caller that reads
+/// the event the preserved history holds that state's entry at.
+pub fn job_entry_state<'a>(state_name: &'a str, frames: &'a [ParkedFrame]) -> &'a str {
+    frames
+        .first()
+        .map_or(state_name, |frame| frame.state_name.as_str())
 }
 
 /// A worker's reply to the activity task an execution SUSPENDED at.
@@ -1585,6 +1605,10 @@ pub struct ActivityReply {
     pub state_input: String,
     /// "The JSON output of the task", as the worker reported it.
     pub result: Value,
+    /// The id of the event the PRESERVED history holds that state's ENTRY at: the call
+    /// that scheduled the task recorded it, and this continuation does not record it a
+    /// second time ([`ContinuedEntry`]).
+    pub entered_event_id: Option<i64>,
 }
 
 /// What a `SendTaskSuccess` or `SendTaskFailure` reported for the callback
@@ -1611,6 +1635,10 @@ pub struct CallbackReply {
     /// `MaxAttempts` counts every attempt the EXECUTION has made at it rather than
     /// restarting at each answer.
     pub retries_taken: Vec<u64>,
+    /// The id of the event the PRESERVED history holds that state's ENTRY at: the call
+    /// whose integration handed out the token recorded it, and this continuation does
+    /// not record it a second time ([`ContinuedEntry`]).
+    pub entered_event_id: Option<i64>,
 }
 
 /// The step a redrive continues an execution from: the state the attempt stopped at,
@@ -2295,6 +2323,12 @@ pub fn run(
 /// service-integration call again, or schedules its activity task again, rather than
 /// being handed a result ([`resume`] is the walk that is handed one). `tasks` is the
 /// same seam [`run`] takes, so that call is made exactly as the first attempt's was.
+///
+/// `entered_at` is the id of the event the PRESERVED history holds that step's entry
+/// at: "Step Functions preserves the results and execution history of the successful
+/// steps", so the step is not entered a second time — this walk records no entered
+/// event for it ([`ContinuedEntry`]) and its diagnoses name the event the history
+/// already carries.
 #[allow(clippy::too_many_arguments)]
 pub fn redrive(
     definition: &str,
@@ -2302,36 +2336,24 @@ pub fn redrive(
     start: SystemTime,
     context: &Context,
     from: &RedriveStep,
+    entered_at: Option<i64>,
     first_event_id: i64,
     settle: Duration,
     tasks: &dyn Tasks,
 ) -> Run {
     let state_input = serde_json::from_str(&from.state_input).unwrap_or(Value::Null);
-    let mut run = interpret(
+    interpret(
         definition,
         input,
         start,
         context,
-        Entry::At(from.state_name.clone(), state_input),
+        Entry::At(from.state_name.clone(), state_input, entered_at),
         Duration::ZERO,
         first_event_id,
         settle,
         tasks,
     )
-    .0;
-    // "Step Functions preserves the results and execution history of the successful
-    // steps, and doesn't rerun these steps": the step this attempt continues FROM was
-    // already ENTERED in the attempt whose history the redrive preserves, so its
-    // entered event is not recorded a second time. What this attempt records is the
-    // work that step does from there on — the outcome it reaches, and every state
-    // after it.
-    if run.steps.first().is_some_and(|step| {
-        step.state_name.as_deref() == Some(from.state_name.as_str())
-            && step.event_type.ends_with(STATE_ENTERED)
-    }) {
-        run.steps.remove(0);
-    }
-    run
+    .0
 }
 
 /// Walk `definition` on from the activity task `reply` answers, and report what
@@ -2475,7 +2497,8 @@ pub fn resume_callback(
 }
 
 /// Where a walk of a definition begins, and what it does when it gets there.
-enum Entry {    /// At the definition's `StartAt`, with the execution's own input: an attempt of
+enum Entry {
+    /// At the definition's `StartAt`, with the execution's own input: an attempt of
     /// its own.
     Start,
     /// At the state whose activity task a worker's reply answers, with the raw input
@@ -2493,8 +2516,48 @@ enum Entry {    /// At the definition's `StartAt`, with the execution's own inpu
     Callback(CallbackReply, Value),
     /// At the state a redriven execution did not get past, with the raw input that
     /// state was entered with: the state RUNS, because it is the step the attempt
-    /// stopped at.
-    At(String, Value),
+    /// stopped at. The id is the event the PRESERVED history holds that state's entry
+    /// at, which this walk does not record again ([`ContinuedEntry`]).
+    At(String, Value, Option<i64>),
+}
+
+/// How a walk that CONTINUES an execution is placed in the history it appends to: the
+/// id of the event the PRESERVED history holds the ENTRY of the state it continues at.
+///
+/// Every diagnosis the interpreter raises about a state's own expression names the
+/// event that state was ENTERED at ([`executing_state`]), and a walk that continues an
+/// execution begins at a state the attempt it continues ALREADY entered: that entry is
+/// one event of the history, recorded once, so the diagnoses of that state name the id
+/// it carries there rather than an id this walk is about to use for an event of its
+/// own.
+#[derive(Debug, Clone, Copy)]
+struct ContinuedEntry {
+    /// The id of that event, as the preserved history holds it.
+    event_id: i64,
+    /// Whether this walk RECORDS that entry again. A walk that REPLAYS the state up to
+    /// the point it applies an answer does, and the steps it replayed are dropped once
+    /// the answer is placed ([`Resumed::index`]); a walk that RE-RUNS the state from
+    /// its entry ([`redrive`]) does not, because the attempt it continues already
+    /// recorded it.
+    recorded: bool,
+}
+
+impl ContinuedEntry {
+    /// The entry of a state a walk REPLAYS up to the answer it applies there.
+    fn replayed(event_id: i64) -> Self {
+        Self {
+            event_id,
+            recorded: true,
+        }
+    }
+
+    /// The entry of a state a walk RE-RUNS, which it does not record again.
+    fn rerun(event_id: i64) -> Self {
+        Self {
+            event_id,
+            recorded: false,
+        }
+    }
 }
 
 /// The definition-level `TimeoutSeconds` `document` declares, as a span.
@@ -2611,45 +2674,95 @@ fn interpret(
     // execution's input. A state the definition no longer declares — the state machine
     // an execution started through an unqualified ARN has been updated since — is no
     // step to continue from, so such a walk is an attempt of its own.
-    let (reply, job_reply, callback_reply, resume_frames, start_at, first_input) = match entry {
-        Entry::Reply(reply, state_input) => {
-            let state_name = reply.state_name.clone();
-            (Some(reply), None, None, Vec::new(), state_name, state_input)
-        }
-        // A job the task of a `Parallel` BRANCH started is answered one level in:
-        // the walk re-enters the concurrent states the parked record names, outermost
-        // first, and the frames are what it picks up at each of them
-        // ([`ParkedFrame`]).
-        Entry::Job(reply, state_input) => {
-            let frames = reply.frames.clone();
-            match frames.first() {
-                Some(frame) => {
-                    let state_name = frame.state_name.clone();
-                    let state_input = frame.state_input.clone();
-                    (None, Some(reply), None, frames, state_name, state_input)
-                }
-                None => {
-                    let state_name = reply.state_name.clone();
-                    (None, Some(reply), None, Vec::new(), state_name, state_input)
+    //
+    // And where a walk CONTINUES an execution, the entry of the state it continues at
+    // is one event the preserved history already holds ([`ContinuedEntry`]); a walk
+    // that is an attempt of its own records every entry it makes, so it continues
+    // nothing.
+    let (reply, job_reply, callback_reply, resume_frames, start_at, first_input, continued_entry) =
+        match entry {
+            Entry::Reply(reply, state_input) => {
+                let state_name = reply.state_name.clone();
+                let entered = reply.entered_event_id.map(ContinuedEntry::replayed);
+                (
+                    Some(reply),
+                    None,
+                    None,
+                    Vec::new(),
+                    state_name,
+                    state_input,
+                    entered,
+                )
+            }
+            // A job the task of a `Parallel` BRANCH started is answered one level in:
+            // the walk re-enters the concurrent states the parked record names, outermost
+            // first, and the frames are what it picks up at each of them
+            // ([`ParkedFrame`]).
+            Entry::Job(reply, state_input) => {
+                let frames = reply.frames.clone();
+                let entered = reply.entered_event_id.map(ContinuedEntry::replayed);
+                match frames.first() {
+                    Some(frame) => {
+                        let state_name = frame.state_name.clone();
+                        let state_input = frame.state_input.clone();
+                        (
+                            None,
+                            Some(reply),
+                            None,
+                            frames,
+                            state_name,
+                            state_input,
+                            entered,
+                        )
+                    }
+                    None => {
+                        let state_name = reply.state_name.clone();
+                        (
+                            None,
+                            Some(reply),
+                            None,
+                            Vec::new(),
+                            state_name,
+                            state_input,
+                            entered,
+                        )
+                    }
                 }
             }
-        }
-        Entry::Callback(reply, state_input) => {
-            let state_name = reply.state_name.clone();
-            (None, None, Some(reply), Vec::new(), state_name, state_input)
-        }
-        Entry::At(state_name, state_input) if states.contains_key(&state_name) => {
-            (None, None, None, Vec::new(), state_name, state_input)
-        }
-        Entry::At(..) | Entry::Start => (
-            None,
-            None,
-            None,
-            Vec::new(),
-            start_at.to_string(),
-            input_value.clone(),
-        ),
-    };
+            Entry::Callback(reply, state_input) => {
+                let state_name = reply.state_name.clone();
+                let entered = reply.entered_event_id.map(ContinuedEntry::replayed);
+                (
+                    None,
+                    None,
+                    Some(reply),
+                    Vec::new(),
+                    state_name,
+                    state_input,
+                    entered,
+                )
+            }
+            Entry::At(state_name, state_input, entered) if states.contains_key(&state_name) => (
+                None,
+                None,
+                None,
+                Vec::new(),
+                state_name,
+                state_input,
+                entered.map(ContinuedEntry::rerun),
+            ),
+            // A walk that begins at `StartAt` enters that state itself, whatever record
+            // sent it here: there is no preserved entry of it to name.
+            Entry::At(..) | Entry::Start => (
+                None,
+                None,
+                None,
+                Vec::new(),
+                start_at.to_string(),
+                input_value.clone(),
+                None,
+            ),
+        };
 
     // The documents this walk was GIVEN as text, each with the bytes it is reported
     // in: the caller's own input, and every document the definition itself writes
@@ -2715,6 +2828,11 @@ fn interpret(
         // The execution's own input, as the caller wrote it: a state's data that IS
         // that document is echoed in the caller's bytes rather than re-encoded.
         supplied: supplied.clone(),
+        // The entry the preserved history already holds for the state this walk
+        // continues at, which that state's own diagnoses name.
+        continued_entry,
+        // Decided when that entry is taken, for the state that takes it.
+        skipping_entry: false,
     };
     // And the same documents for the diagnoses this walk's own expressions word, which
     // quote the document they could not be applied to ([`GivenDocuments`]).
@@ -3309,6 +3427,21 @@ struct Interpreter<'tasks> {
     /// The documents this walk was GIVEN as text, with the bytes each is reported in:
     /// what [`Interpreter::echo`] answers instead of re-encoding a parsed copy.
     supplied: Supplied,
+    /// How the state this walk CONTINUES at was already ENTERED, for a walk that
+    /// continues an execution ([`ContinuedEntry`]); `None` for an attempt of its own.
+    ///
+    /// TAKEN by the first state the walk enters, which is that state: every state the
+    /// walk reaches afterwards is entered by this walk itself, and names the event this
+    /// walk records for it.
+    continued_entry: Option<ContinuedEntry>,
+    /// Whether the entered event of the state being run is one this walk does NOT
+    /// record: the entry of a state it RE-RUNS is already in the preserved history, and
+    /// an attempt appends its events rather than writing one twice.
+    ///
+    /// Set when [`ContinuedEntry`] is taken for such a state and cleared when that
+    /// state's turn ends, so it suppresses exactly that one event
+    /// ([`Interpreter::push_entered`]).
+    skipping_entry: bool,
 }
 
 /// Where a walk applied an [`ActivityReply`]: the step its own events begin at, and
@@ -4345,6 +4478,10 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
             supplied.supplied(test.input);
             supplied
         },
+        // `TestState` continues no execution either, so the state under test is entered
+        // by this walk and names the event this walk numbers for it.
+        continued_entry: None,
+        skipping_entry: false,
     };
     // And the same document for the diagnoses the trial's own expressions word, which
     // quote the document they could not be applied to ([`GivenDocuments`]).

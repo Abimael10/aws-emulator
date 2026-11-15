@@ -71,9 +71,14 @@ pub fn plan_run(
 /// `tasks` is the seam [`plan_run`] takes: the step the redrive continues from, and
 /// every state after it, makes its service-integration call exactly as the first
 /// attempt's did.
+///
+/// `entered_at` is the id of the event the preserved history holds that step's ENTRY
+/// at, which that step's own diagnoses name: its entry is not recorded again, so the
+/// attempt appends the work it does from there on.
 pub fn plan_redrive(
     attempt: &RunAttempt<'_>,
     from: Option<&asl::RedriveStep>,
+    entered_at: Option<i64>,
     tasks: &dyn integration::Tasks,
 ) -> Planned {
     let Some(from) = from else {
@@ -93,6 +98,7 @@ pub fn plan_redrive(
         start,
         context,
         from,
+        entered_at,
         first_walked_event_id(previous_event_id, true),
         EXECUTION_SETTLE_DELAY,
         tasks,

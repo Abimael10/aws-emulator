@@ -8,9 +8,11 @@
 //! The rule under test: a run the function's own timeout ended is a FAILED invocation,
 //! named by the error Lambda reports for it, and not the STATE's own timeout. So the task
 //! reports `TaskFailed` carrying that error name and the error document the run produced
-//! as its cause; a `Retry` naming the state's timeout error does not match it, so the
-//! function is scheduled exactly ONCE and no `TaskTimedOut` event is written; and the
-//! execution ends `FAILED` under the same name a client would retry or catch on.
+//! as its cause — which, for a run the SANDBOX ended, is the platform's own document: the
+//! message and the class of the failure, and none of the members a runtime's serialized
+//! exception adds beside them. A `Retry` naming the state's timeout error does not match
+//! it, so the function is scheduled exactly ONCE and no `TaskTimedOut` event is written;
+//! and the execution ends `FAILED` under the same name a client would retry or catch on.
 //!
 //! The rows differ along what the rule generalises over: the function's own `Timeout`
 //! (which is also the figure its error message states), and what the state declares about
@@ -232,6 +234,19 @@ async fn a_function_timeout_is_a_failed_task_and_not_the_states_own_timeout() {
         assert!(
             message.contains(&stated),
             "case {case:?}: expected the message to state {stated:?}, got {message:?}"
+        );
+        // The members the PLATFORM's own error document carries, and no others: the
+        // sandbox ended the run, so no runtime serialized an exception for it and the
+        // document a `Catch` or an operator parses names neither the invocation's id nor
+        // a stack.
+        let members: Vec<&str> = document
+            .as_object()
+            .map(|members| members.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            members,
+            vec!["errorMessage", "errorType"],
+            "case {case:?}: expected the platform's own two members, got {document}"
         );
     }
 }

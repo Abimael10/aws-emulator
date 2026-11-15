@@ -190,19 +190,11 @@ async fn resolve<Eng: Send + Sync + 'static>(
     };
     let now = super::now();
     let failed = outcome.is_err();
-    let reply = asl::JobReply {
-        state_name: task.state_name.clone(),
-        state_input: task.state_input.clone(),
-        // The concurrent states that state is nested inside, as the parked record
-        // kept them: the continuation re-enters them to reach it.
-        frames: task.frames.clone(),
-        outcome,
-    };
 
     // Phase 1, under the lock: read what the continuation needs, and stop if there is
     // nothing left to continue. The lock is RELEASED before the walk, so no other
     // request waits on an interpretation.
-    let Some((definition, input, start_date, machine_arn, context, previous_event_id)) = ({
+    let Some((definition, input, start_date, machine_arn, context, previous_event_id, entered_at)) = ({
         let mut store = state.lock();
         store.settle(now);
         let execution = store
@@ -249,10 +241,26 @@ async fn resolve<Eng: Send + Sync + 'static>(
                 machine.arn.clone(),
                 context,
                 execution.last_event_id(),
+                // The event the PRESERVED history holds the entry of the state this
+                // continuation begins at, which it does not record again.
+                execution.entered_event_id(asl::job_entry_state(
+                    &task.state_name,
+                    &task.frames,
+                )),
             )
         })
     }) else {
         return;
+    };
+
+    let reply = asl::JobReply {
+        state_name: task.state_name.clone(),
+        state_input: task.state_input.clone(),
+        // The concurrent states that state is nested inside, as the parked record
+        // kept them: the continuation re-enters them to reach it.
+        frames: task.frames.clone(),
+        outcome,
+        entered_event_id: entered_at,
     };
 
     // Phase 2, OUTSIDE the lock: the continuation is interpreted, from the state that

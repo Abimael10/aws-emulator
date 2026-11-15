@@ -1072,27 +1072,21 @@ fn answered(
         // SANDBOX reports an invocation with carries, `RequestId: <id> Error: <what
         // happened>`, which is the same frame the runtime's own kill is reported in below.
         Completion::Stopped(Stop::Deadline) => (
-            error_document(
+            sandbox_error_document(
                 &format!(
                     "RequestId: {request_id} Error: Task timed out after {:.2} seconds",
                     budget.wall_clock.as_secs_f64()
                 ),
-                Some(SANDBOX_TIMEDOUT),
-                request_id,
-                &[],
-                engine,
+                SANDBOX_TIMEDOUT,
             ),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
         // A run the memory ceiling ended is one whose runtime was killed, which is what
         // AWS reports it as: "Runtime exited with error: signal: killed".
         Completion::Stopped(Stop::Memory) => (
-            error_document(
+            sandbox_error_document(
                 &format!("RequestId: {request_id} Error: {RUNTIME_KILLED}"),
-                Some(RUNTIME_EXIT_ERROR),
-                request_id,
-                &[],
-                engine,
+                RUNTIME_EXIT_ERROR,
             ),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
@@ -1101,26 +1095,17 @@ fn answered(
         // runtime that exited: the error names the response-size class and states the
         // quota the response passed.
         Completion::Stopped(Stop::Response) => (
-            error_document(
+            sandbox_error_document(
                 &format!(
                     "Response payload size exceeded maximum allowed payload size ({} bytes).",
                     budget.response_bytes
                 ),
-                Some(RESPONSE_SIZE_TOO_LARGE),
-                request_id,
-                &[],
-                engine,
+                RESPONSE_SIZE_TOO_LARGE,
             ),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
         Completion::Stopped(stop) => (
-            error_document(
-                stop.reason(),
-                Some(RUNTIME_EXIT_ERROR),
-                request_id,
-                &[],
-                engine,
-            ),
+            sandbox_error_document(stop.reason(), RUNTIME_EXIT_ERROR),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
         Completion::Internal(why) => (
@@ -1271,6 +1256,24 @@ fn error_document(
         ),
     );
     ::serde_json::Value::Object(document).to_string().into_bytes()
+}
+
+/// The error payload an invocation the SANDBOX ended answers with: the message and the
+/// class of the failure, and nothing besides.
+///
+/// A run the sandbox ended — at the function's `Timeout`, at its memory ceiling, at the
+/// size of the answer it produced, at a runtime that exited — raised no exception in the
+/// function: the runtime serialized nothing for it, so the document is the PLATFORM's
+/// rather than a runtime's ([`error_document`] is a runtime's). It carries neither the
+/// invocation's id nor a stack, whatever runtime the function is configured for: the
+/// platform states what happened in the message and what class of failure it was, and
+/// there is no handler frame to report because no handler raised.
+fn sandbox_error_document(message: &str, error_type: &str) -> Vec<u8> {
+    let document = ::serde_json::json!({
+        "errorMessage": message,
+        "errorType": error_type,
+    });
+    document.to_string().into_bytes()
 }
 
 /// The LOG of one run, as Lambda writes it: the invocation's start and end lines around
@@ -1831,6 +1834,67 @@ mod tests {
                 Some(expected.as_str()),
                 "case {case}: expected the message {expected:?}, got {parsed}"
             );
+        }
+    }
+
+    /// A run the SANDBOX ended carries exactly two members: the message and the class of
+    /// the failure. No runtime serialized the failure, so the document names neither the
+    /// request id nor the stack a runtime's own error payload reports beside them — one
+    /// row per bound a run can be stopped by, per engine, so the member set is neither
+    /// one bound's nor one runtime's.
+    #[test]
+    fn a_sandbox_ended_runs_document_carries_only_the_message_and_the_class() {
+        let request_id = "11111111-2222-3333-4444-555555555555";
+        // The bound the run was stopped by, and the class the platform reports it under.
+        let stops: &[(Stop, &str)] = &[
+            (Stop::Deadline, SANDBOX_TIMEDOUT),
+            (Stop::Memory, RUNTIME_EXIT_ERROR),
+            (Stop::Response, RESPONSE_SIZE_TOO_LARGE),
+            (Stop::Steps, RUNTIME_EXIT_ERROR),
+            (Stop::HostCeiling, RUNTIME_EXIT_ERROR),
+        ];
+        for (stop, class) in stops {
+            for engine in [Engine::Python, Engine::Node] {
+                let budget = run_budget(3, MIN_MEMORY_SIZE_MB as i32);
+                let finished = Finished {
+                    completion: Completion::Stopped(*stop),
+                    log: String::new(),
+                    elapsed: budget.wall_clock,
+                    max_memory_bytes: None,
+                };
+                let invoked = answered(
+                    finished,
+                    request_id,
+                    &probe_invocation(),
+                    budget,
+                    engine,
+                    SystemTime::UNIX_EPOCH,
+                );
+                let parsed: ::serde_json::Value =
+                    ::serde_json::from_slice(&invoked.payload).expect("the document is JSON");
+                let case = format!("{engine:?} stopped by {stop:?}");
+                let members: Vec<&str> = parsed
+                    .as_object()
+                    .map(|document| document.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                assert_eq!(
+                    members,
+                    vec!["errorMessage", "errorType"],
+                    "case {case}: expected the platform's own two members, got {parsed}"
+                );
+                assert_eq!(
+                    parsed.get("errorType").and_then(::serde_json::Value::as_str),
+                    Some(*class),
+                    "case {case}: expected the class {class}, got {parsed}"
+                );
+                assert!(
+                    parsed
+                        .get("errorMessage")
+                        .and_then(::serde_json::Value::as_str)
+                        .is_some_and(|message| !message.is_empty()),
+                    "case {case}: expected the message to state what happened, got {parsed}"
+                );
+            }
         }
     }
 
