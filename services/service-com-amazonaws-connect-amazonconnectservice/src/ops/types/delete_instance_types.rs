@@ -11,7 +11,13 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-connect-amazonconnectservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connect#DeleteInstanceRequest")]
+// `skip_validation = ["InstanceId"]`: the same label as `describe_instance_types`, and
+// the same reason — this operation addresses an instance, so it checks the label itself
+// before resolving anything. `ClientToken` keeps its boundary checks.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.connect#DeleteInstanceRequest",
+    skip_validation = ["InstanceId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct DeleteInstanceInput {
     pub instance_id: String,

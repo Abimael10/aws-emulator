@@ -25,6 +25,8 @@ mod hours_of_operation_lifecycle;
 mod instance_default_resources;
 #[path = "all/instance_not_found_refusal.rs"]
 mod instance_not_found_refusal;
+#[path = "all/instance_plane_refusals.rs"]
+mod instance_plane_refusals;
 #[path = "all/instance_queue_lifecycle.rs"]
 mod instance_queue_lifecycle;
 #[path = "all/instance_registry_seam.rs"]

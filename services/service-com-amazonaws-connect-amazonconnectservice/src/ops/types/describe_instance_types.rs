@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-connect-amazonconnectservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connect#DescribeInstanceRequest")]
+// `skip_validation = ["InstanceId"]`: this operation checks its path label itself,
+// before it resolves anything, so a label it cannot read as an identifier is refused as
+// the client-input fault it is in the service's own modelled `InvalidRequestException`
+// (`crate::state::instance_label_refusal`) rather than with a framework
+// `ValidationException` the model does not declare for it. `skip_validation` drops only
+// that member's constraint traits.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.connect#DescribeInstanceRequest",
+    skip_validation = ["InstanceId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct DescribeInstanceInput {
     pub instance_id: String,

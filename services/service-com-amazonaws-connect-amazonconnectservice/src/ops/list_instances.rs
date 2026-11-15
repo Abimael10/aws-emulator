@@ -3,8 +3,11 @@
 //! @op ListInstances
 //!
 //! Projects every stored instance onto an `InstanceSummary`, in instance-id order, one
-//! `MaxResults`-sized page at a time. The `NextToken` it returns carries the last id on
-//! the page, so the next call resumes immediately after it; the last page carries none.
+//! page at a time, and always serializes `InstanceSummaryList` — the empty list when the
+//! account holds no instances. The page is `MaxResults` items, bounded by that member's
+//! modelled maximum; a `MaxResults` below its modelled minimum is refused. The
+//! `NextToken` it returns carries the last id on the page, so the next call resumes
+//! immediately after it; the last page carries none.
 //!
 //! ## Shape of an operation
 //!
@@ -141,6 +144,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The two ends of `MaxResults`'s modelled `@range` are applied HERE, because
+        // Connect does not apply them the same way, and the recorded responses are what
+        // say so: a `ListInstances` carrying `maxResults=11` — one past the modelled
+        // maximum of 10 — is answered HTTP 200 with `InstanceSummaryList`, while one
+        // carrying a value below 1 is answered HTTP 400 with this service's own
+        // `InvalidRequestException` and the sentence
+        // `crate::state::page_size_below_minimum` builds. So the minimum is a server-side
+        // check on the REQUEST, and the maximum bounds the PAGE this operation builds: a
+        // larger page size is clamped to it rather than refused. The bound comes off the
+        // request boundary for both (`skip_validation` in
+        // `super::types::list_instances_types`), which is what stops the framework
+        // answering either end with a `ValidationException` this operation does not model.
+        if input
+            .max_results
+            .is_some_and(|requested| requested < crate::state::LIST_INSTANCES_MAX_RESULTS_MIN)
+        {
+            return Err(ListInstancesErrorModeled::InvalidRequestException(
+                crate::state::page_size_below_minimum(
+                    crate::state::MAX_RESULTS_PARAMETER,
+                    crate::state::LIST_INSTANCES_MAX_RESULTS_MIN,
+                ),
+            )
+            .into());
+        }
+        let page_size = input
+            .max_results
+            .map(|requested| requested.min(crate::state::LIST_INSTANCES_MAX_RESULTS_MAX));
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListInstancesErrorModeled::InternalServiceException(InternalServiceException {
                 message: Some("the Amazon Connect store is unavailable".to_string()),
@@ -169,11 +200,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (summaries, next_token) = crate::state::paginate(
             entries,
             cursor.as_deref(),
-            input.max_results,
+            page_size,
             crate::state::LIST_INSTANCES_DEFAULT_PAGE_SIZE,
         );
 
         Ok(ListInstancesOutput {
+            // Always serialized, so an account holding no instances is reported as the
+            // empty list rather than as an absent member.
             instance_summary_list: Some(summaries),
             next_token,
         })

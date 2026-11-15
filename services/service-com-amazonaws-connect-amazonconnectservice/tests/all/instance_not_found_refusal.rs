@@ -190,7 +190,9 @@ const RESOURCE_NOT_FOUND: &str = "Resource not found";
 /// anything: the queue plane does, so a label that is not an identifier this service
 /// could have minted is a 400 there and never reaches the lookup this suite is about
 /// (`queue_crud_refusals` pins that half). Every other operation below resolves the
-/// label as sent.
+/// label as sent — the instance plane included: it refuses only a label carrying no
+/// identifier at all, or one longer than the modelled bound, neither of which any row
+/// here sends (`instance_plane_refusals` pins that half).
 fn checks_the_labels_form(operation: &str) -> bool {
     matches!(
         operation,

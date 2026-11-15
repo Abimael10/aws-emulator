@@ -167,6 +167,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The path label is checked BEFORE any state is resolved, by the same rule
+        // `DescribeInstance` applies (`crate::state::instance_label_refusal`): this
+        // operation addresses an instance too, so a label carrying no identifier at all —
+        // or one the identifier's modelled bound cannot admit — is the client-input fault
+        // it is rather than a resource that happens to be missing. The constraints come
+        // off the request boundary for this (`skip_validation` in
+        // `super::types::delete_instance_types`).
+        if let Some(refusal) = crate::state::instance_label_refusal(&input.instance_id) {
+            return Err(DeleteInstanceErrorModeled::InvalidRequestException(refusal).into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteInstanceErrorModeled::InternalServiceException(InternalServiceException {
                 message: Some("the Amazon Connect store is unavailable".to_string()),

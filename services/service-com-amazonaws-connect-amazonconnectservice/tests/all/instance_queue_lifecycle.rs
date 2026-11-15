@@ -765,9 +765,18 @@ async fn walk_queues(
     (seen, pages)
 }
 
-/// RULE: a `MaxResults` inside the modelled range is served and one outside it is
-/// refused, and a `NextToken` this service did not issue is refused rather than
-/// silently restarting the scan.
+/// RULE: `ListInstances` applies the two ends of its `MaxResults` range differently — a
+/// value below the minimum is refused, one above the maximum is served with the page
+/// bounded at that maximum — while `ListQueues` refuses both ends; and a `NextToken`
+/// neither issued is refused rather than silently restarting the scan.
+///
+/// The asymmetry is the recorded one: a `ListInstances` call carrying a `maxResults` of 11
+/// — one past the modelled maximum of 10 — is answered HTTP 200 with
+/// `InstanceSummaryList`, while a `maxResults` below 1 is answered 400 with Connect's own
+/// `InvalidRequestException`. `instance_plane_refusals` owns that half as its own table;
+/// the rows here are the two published bounds of each operation, one past the top, and one
+/// below the bottom, so the difference between the two operations stays pinned beside the
+/// pagination suites.
 #[tokio::test]
 async fn page_size_bounds_and_foreign_tokens_are_refused() {
     let connect = Connect::new();
@@ -776,11 +785,15 @@ async fn page_size_bounds_and_foreign_tokens_are_refused() {
     assert_eq!(status, 200);
 
     // MaxResult10 range 1..10 for ListInstances; MaxResult1000 range 1..1000 for
-    // ListQueues — both published bounds, then one past the top.
+    // ListQueues — both published bounds, then one past the top. A ListInstances past the
+    // top is SERVED, and one below the bottom is REFUSED: its maximum bounds the page the
+    // service builds, while its minimum is the check it applies to the request (see
+    // `crate::ops::list_instances`).
     for (case, max_results, expected) in [
         ("ListInstances lower bound", 1, 200),
         ("ListInstances upper bound", 10, 200),
-        ("ListInstances past the upper bound", 11, 400),
+        ("ListInstances past the upper bound", 11, 200),
+        ("ListInstances below the lower bound", 0, 400),
     ] {
         let (status, body) = connect.list_instances(Some(max_results), None).await;
         assert_eq!(status, expected, "case {case:?}: got {status} {body}");

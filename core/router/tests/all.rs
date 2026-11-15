@@ -1829,3 +1829,5 @@ mod default_vpc_internet_path_runs_ecs_tasks;
 // `tests/`, which the layout check refuses: the `#[path]` above each `mod` is what points the
 // The lint allowed here is for the suite files this root compiles: a wrapped paragraph in one
 // of their module headers is a note rather than a build failure.
+// `all/appended_notes.rs`, `all/appended_notes_tail.rs`, `all/appended_header_notes.rs` and
+// `all/appended_prose.rs`, each declared below like any other suite.

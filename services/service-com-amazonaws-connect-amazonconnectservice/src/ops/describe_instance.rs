@@ -2,9 +2,10 @@
 
 //! @op DescribeInstance
 //!
-//! Looks the instance up by id and projects the stored record onto the modelled
-//! `Instance` shape. Its `InstanceStatus` is derived from the stored activation
-//! instant, so this read writes nothing.
+//! Checks the `InstanceId` path label before resolving anything, then looks the instance
+//! up by id and projects the stored record onto the modelled `Instance` shape. Its
+//! `InstanceStatus` is derived from the stored activation instant, so this read writes
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -148,6 +149,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The path label is checked BEFORE any state is resolved, by the one rule every
+        // operation addressing an instance applies
+        // (`crate::state::instance_label_refusal`): a label carrying no identifier at
+        // all, and one longer than the identifier's modelled `@length` maximum, are both
+        // client-input faults, answered as the modelled `InvalidRequestException` (HTTP
+        // 400) whatever the store holds. Resolving first would report a 404 for a request
+        // that was never valid, which reclassifies a client fault as a missing resource.
+        // The constraints come off the request boundary for this (`skip_validation` in
+        // `super::types::describe_instance_types`) so the refusal is this service's own
+        // modelled error rather than the framework's.
+        if let Some(refusal) = crate::state::instance_label_refusal(&input.instance_id) {
+            return Err(DescribeInstanceErrorModeled::InvalidRequestException(refusal).into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeInstanceErrorModeled::InternalServiceException(InternalServiceException {
                 message: Some("the Amazon Connect store is unavailable".to_string()),

@@ -48,9 +48,11 @@ pub use chat_contacts::{
 /// `crate::state` like everything else here.
 mod refusals;
 pub use refusals::{
-    invalid_parameter, resource_not_found, value_above_maximum_length,
-    value_below_minimum_length, QUEUE_NAME_MAX_LENGTH, QUEUE_NAME_MIN_LENGTH,
-    QUEUE_NAME_PARAMETER, RESOURCE_NOT_FOUND_MESSAGE,
+    instance_id_is_not_valid, instance_label_refusal, invalid_parameter, invalid_request,
+    page_size_below_minimum, resource_not_found, value_above_maximum_length,
+    value_below_minimum_length, INSTANCE_ID_MAX_LENGTH, INSTANCE_ID_NOT_VALID_MESSAGE,
+    INVALID_REQUEST_MESSAGE, QUEUE_NAME_MAX_LENGTH, QUEUE_NAME_MIN_LENGTH, QUEUE_NAME_PARAMETER,
+    RESOURCE_NOT_FOUND_MESSAGE,
 };
 
 use crate::ops::types::{
@@ -94,6 +96,25 @@ pub const INSTANCE_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 pub const LIST_INSTANCES_DEFAULT_PAGE_SIZE: usize = 10;
 /// See [`LIST_INSTANCES_DEFAULT_PAGE_SIZE`].
 pub const LIST_QUEUES_DEFAULT_PAGE_SIZE: usize = 1000;
+
+/// The member name `ListInstances` publishes for its page size, as the model spells it
+/// (`smithy_query(query="operation",operation="ListInstances")` -> `MaxResults`): what a
+/// refusal of that member names.
+pub const MAX_RESULTS_PARAMETER: &str = "MaxResults";
+
+/// The modelled `@range` bounds of `com.amazonaws.connect#MaxResult10`, the shape
+/// `ListInstances`'s `MaxResults` targets
+/// (`smithy_query(query="operation",operation="ListInstances")` -> range min 1 max 10).
+///
+/// `ListInstances` applies these two ends DIFFERENTLY, which is why they are named here
+/// rather than left to the request boundary: the minimum is a server-side check on the
+/// request, and the maximum bounds the page the service builds. The recorded responses
+/// are what say so — a call carrying a `maxResults` one past the maximum is answered 200
+/// with the page, and one below the minimum is answered 400 with this service's own
+/// modelled error. See `crate::ops::list_instances`.
+pub const LIST_INSTANCES_MAX_RESULTS_MIN: i32 = 1;
+/// See [`LIST_INSTANCES_MAX_RESULTS_MIN`].
+pub const LIST_INSTANCES_MAX_RESULTS_MAX: i32 = 10;
 
 /// The page size `ListContactFlows` uses when the caller sends no `MaxResults`: the
 /// value its `MaxResults` member documents — "The maximum number of results to return

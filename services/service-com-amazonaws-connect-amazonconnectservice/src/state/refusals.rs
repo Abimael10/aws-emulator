@@ -9,7 +9,7 @@
 //! from echoing the request back: the sentences below take only what the error class
 //! itself carries.
 //!
-//! Three refusal classes live here:
+//! Five refusal classes live here:
 //!
 //! * a resource that does not exist ([`resource_not_found`]), whose message is FIXED —
 //!   it names no resource kind and quotes no identifier;
@@ -17,7 +17,13 @@
 //!   which names the offending member;
 //! * a value longer (or shorter) than the maximum (minimum) the model declares for it
 //!   ([`value_above_maximum_length`] / [`value_below_minimum_length`]), which names the
-//!   parameter and the violated bound.
+//!   parameter and the violated bound;
+//! * an instance-plane path label the service cannot read as an identifier
+//!   ([`instance_label_refusal`]), which is a blank label — a request that addresses
+//!   nothing at all ([`invalid_request`]) — or one longer than the identifier's modelled
+//!   `@length` maximum ([`instance_id_is_not_valid`]);
+//! * a page size below the minimum its member's modelled `@range` declares
+//!   ([`page_size_below_minimum`]), which names the member and that minimum.
 //!
 //! Beside them is the identifier form a path label must have, which lives on
 //! [`super::is_resource_id`] beside the minter it is the companion of. A handler asks
@@ -25,7 +31,9 @@
 //! answered as the bad parameter it is rather than as a resource that happens not to be
 //! there.
 
-use crate::ops::types::{InvalidParameterException, ResourceNotFoundException};
+use crate::ops::types::{
+    InvalidParameterException, InvalidRequestException, ResourceNotFoundException,
+};
 
 /// The `Message` every `ResourceNotFoundException` of this service carries.
 ///
@@ -87,12 +95,95 @@ pub fn value_below_minimum_length(parameter: &str, minimum: usize) -> InvalidPar
     }
 }
 
+/// The `Message` Connect gives a request it cannot read as addressing anything at all —
+/// a `@required` path label that is present but holds nothing but whitespace.
+///
+/// Entirely fixed text: it names neither the label nor the operation, and quotes nothing
+/// the request carried.
+pub const INVALID_REQUEST_MESSAGE: &str = "Invalid request";
+
+/// The `Message` Connect's instance plane gives an instance identifier it cannot read as
+/// one — a label longer than the identifier's modelled `@length` maximum.
+///
+/// Also entirely fixed text: the rejected identifier is NOT quoted back.
+pub const INSTANCE_ID_NOT_VALID_MESSAGE: &str = "Instance id is not valid";
+
+/// The modelled `@length` maximum of `com.amazonaws.connect#InstanceId`, the shape every
+/// `InstanceId` member targets
+/// (`smithy_query(query="shape",shape="InstanceId")` -> length min 1 max 100).
+pub const INSTANCE_ID_MAX_LENGTH: usize = 100;
+
+/// Connect's refusal for a request whose form it cannot act on: the modelled
+/// `InvalidRequestException` (HTTP 400) carrying [`INVALID_REQUEST_MESSAGE`].
+pub fn invalid_request() -> InvalidRequestException {
+    InvalidRequestException {
+        message: Some(INVALID_REQUEST_MESSAGE.to_string()),
+        reason: None,
+    }
+}
+
+/// Connect's refusal for an instance identifier it cannot read as one: the modelled
+/// `InvalidRequestException` (HTTP 400) carrying [`INSTANCE_ID_NOT_VALID_MESSAGE`].
+pub fn instance_id_is_not_valid() -> InvalidRequestException {
+    InvalidRequestException {
+        message: Some(INSTANCE_ID_NOT_VALID_MESSAGE.to_string()),
+        reason: None,
+    }
+}
+
+/// How an operation whose addressed resource IS an instance refuses the `InstanceId`
+/// path label `label`, or `None` for a label it has to resolve against state.
+///
+/// One function, so every such operation applies ONE rule in ONE order, ahead of any
+/// lookup — which is the point: a label that was never valid has to be answered as the
+/// client-input fault it is rather than as a resource that happens to be missing, and
+/// only a check in front of the lookup can do that.
+///
+/// The two classes are the two ends of the identifier's own modelled `@length` bound,
+/// each in the sentence Connect states it in:
+///
+/// * a label holding nothing but whitespace carries no identifier at all, so the request
+///   addresses nothing and is the malformed request it is ([`invalid_request`]);
+/// * a label longer than [`INSTANCE_ID_MAX_LENGTH`] is not an identifier this service
+///   could read, whatever the store holds ([`instance_id_is_not_valid`]).
+///
+/// Anything between those ends is an identifier as far as the model is concerned, so it
+/// is RESOLVED — and answered [`resource_not_found`] when nothing holds it, however
+/// unlike a minted id it looks. (That is the narrower companion check
+/// [`super::is_resource_id`], which the queue plane applies to its own labels in its own
+/// wording; the instance plane's recorded refusals are the two above.)
+///
+/// Both sentences are fixed, so neither refusal carries the label back to the caller.
+pub fn instance_label_refusal(label: &str) -> Option<InvalidRequestException> {
+    if label.trim().is_empty() {
+        return Some(invalid_request());
+    }
+    if label.chars().count() > INSTANCE_ID_MAX_LENGTH {
+        return Some(instance_id_is_not_valid());
+    }
+    None
+}
+
+/// Connect's refusal for a page size below the minimum its member's modelled `@range`
+/// declares: `Invalid <member>. <member> should have minimum value of <minimum>.`
+///
+/// `member` is the page-size member's own name as the model spells it and `minimum` is
+/// that member's modelled lower bound, so the sentence states the member the caller sent
+/// and the limit the value actually broke. The rejected value itself is not quoted.
+pub fn page_size_below_minimum(member: &str, minimum: i32) -> InvalidRequestException {
+    InvalidRequestException {
+        message: Some(format!(
+            "Invalid {member}. {member} should have minimum value of {minimum}."
+        )),
+        reason: None,
+    }
+}
+
 /// The parameter name Connect publishes for a queue's `Name` member: the member is
 /// `Name`, but the service calls it `QueueName` when it refuses one — so a refusal of
 /// that member names `QueueName`, while a refusal of a path label names the label
 /// (`InstanceId`, `QueueId`).
 pub const QUEUE_NAME_PARAMETER: &str = "QueueName";
-
 /// The modelled `@length` bound of `com.amazonaws.connect#CommonNameLength127`, the
 /// shape `CreateQueue`'s `Name` targets
 /// (`smithy_query(query="operation",operation="CreateQueue")` -> length min 1 max 127).
@@ -185,6 +276,85 @@ mod tests {
             assert_eq!(
                 actual, accepted,
                 "case {case:?}: expected accepted={accepted}, got {actual}"
+            );
+        }
+    }
+
+    /// An instance-plane label is placed in one of three classes, in one order: blank
+    /// (the malformed request), longer than the identifier's modelled `@length` maximum
+    /// (the identifier the service cannot read), or a label it resolves against state.
+    #[test]
+    fn an_instance_label_is_refused_by_its_class() {
+        let id = "11111111-2222-3333-4444-555555555555";
+        let cases: Vec<(&str, String, Option<&str>)> = vec![
+            ("a minted identifier", id.to_string(), None),
+            ("upper-case hex", id.to_ascii_uppercase(), None),
+            ("empty", String::new(), Some(INVALID_REQUEST_MESSAGE)),
+            ("one space", " ".to_string(), Some(INVALID_REQUEST_MESSAGE)),
+            (
+                "several spaces",
+                "   ".to_string(),
+                Some(INVALID_REQUEST_MESSAGE),
+            ),
+            ("a tab", "\t".to_string(), Some(INVALID_REQUEST_MESSAGE)),
+            // Inside the modelled bound, so resolved however unlike a minted id it
+            // looks: the instance plane states no refusal for these.
+            ("a name, not an identifier", "support".to_string(), None),
+            ("a truncated id", id[..8].to_string(), None),
+            ("one character, the modelled minimum", "a".to_string(), None),
+            (
+                "an identifier with whitespace around it",
+                format!(" {id} "),
+                None,
+            ),
+            // Both sides of the modelled maximum.
+            (
+                "the modelled maximum length",
+                "i".repeat(INSTANCE_ID_MAX_LENGTH),
+                None,
+            ),
+            (
+                "one past the modelled maximum",
+                "i".repeat(INSTANCE_ID_MAX_LENGTH + 1),
+                Some(INSTANCE_ID_NOT_VALID_MESSAGE),
+            ),
+            (
+                "far past the modelled maximum",
+                "i".repeat(INSTANCE_ID_MAX_LENGTH * 3),
+                Some(INSTANCE_ID_NOT_VALID_MESSAGE),
+            ),
+        ];
+        for (case, label, expected) in cases {
+            let actual = instance_label_refusal(&label).and_then(|refusal| refusal.message);
+            assert_eq!(
+                actual.as_deref(),
+                expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// A page-size refusal names the member the caller sent and the minimum its model
+    /// declares, and quotes no value.
+    #[test]
+    fn a_page_size_refusal_names_the_member_and_the_minimum() {
+        for (member, minimum, expected) in [
+            (
+                "MaxResults",
+                1,
+                "Invalid MaxResults. MaxResults should have minimum value of 1.",
+            ),
+            (
+                "PageSize",
+                5,
+                "Invalid PageSize. PageSize should have minimum value of 5.",
+            ),
+        ] {
+            let actual = page_size_below_minimum(member, minimum).message;
+            assert_eq!(
+                actual.as_deref(),
+                Some(expected),
+                "member {member:?}: expected {expected:?}, got {actual:?}"
             );
         }
     }
