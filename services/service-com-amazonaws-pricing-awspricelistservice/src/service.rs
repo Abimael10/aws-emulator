@@ -41,9 +41,15 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+mod enum_value_set;
+mod error_message_member;
+mod stated_error_bodies;
+
+pub use enum_value_set::enumerated_value_refusal;
 
 /// The error code this service answers an input-constraint violation with.
 ///
@@ -61,6 +67,12 @@ const INVALID_PARAMETER_EXCEPTION: &str = "InvalidParameterException";
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The same modelled operations the generated table holds, each wrapped so that the
+    /// error bodies it answers with are the ones this service answers with
+    /// ([`stated_error_bodies`]). Keyed by the routing key the protocol resolves — the key
+    /// the generated table uses — and built from the SAME shared engine, so a wrapped
+    /// operation reads and writes the one store.
+    stated_error_bodies: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -69,6 +81,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
+            stated_error_bodies: stated_error_bodies::stated_error_bodies(&engine),
             entry: crate::ServiceDefinition::new(engine),
         }
     }
@@ -96,12 +109,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: the key is the one the generated table's own protocol resolves,
+        // and the operation it names is the one served — wrapped so that every error body
+        // reports its text in the member this model declares ([`error_message_member`]).
+        // A key the model does not name resolves to `None` here exactly as it does in the
+        // generated table, so the router's routing-error path is unchanged.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.stated_error_bodies.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -127,8 +141,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // still runs the model's pattern as written; only the quoting changes. Only the
         // CODE is this service's, so the two cannot drift. That one call also decides
         // WHICH refusals are restated — it answers `None` for anything that is not a
-        // constraint refusal — so no second guard is spelled here.
-        let stated = ::service_common::validation_message::aws_validation_refusal(refusal)?;
+        // constraint refusal — so the only guard spelled here is the destructuring the
+        // restatement below needs, which declines exactly what that call declines.
+        //
+        // The one thing restated BEFORE that call is the value set an enumerated member's
+        // clause quotes, which this service states as it publishes it rather than as the
+        // model declares it ([`enum_value_set`], which holds only this service's data and
+        // defers the restatement itself to the same shared home). The check is untouched
+        // there too: only the quoting moves.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        let stated = Refusal::Invalid(
+            violations
+                .iter()
+                .map(enum_value_set::as_this_service_states_it)
+                .collect(),
+        );
+        let stated = ::service_common::validation_message::aws_validation_refusal(&stated)?;
         Some(Refused {
             code: INVALID_PARAMETER_EXCEPTION.to_string(),
             message: stated.message,

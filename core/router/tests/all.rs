@@ -6921,3 +6921,9 @@ mod all_rs_is_a_canonical_declaration_list;
 //! so append a declaration below, never a note about one.
 // (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each `mod` is
 // what points the declaration into `tests/all/`.
+//! sorted: one `#[path]` / `mod` pair per suite and NOTHING else, so a landing has one
+//! item, so THIS header is the only place one may stand — a note appended further down is
+//! `E0753` and compiles no suite of this target either.
+//! leaving a note below. Add a declaration, not a note about one.
+//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of it
+//! (`tests/<name>.rs`), which the layout check refuses: the `#[path]` line is what points

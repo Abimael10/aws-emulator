@@ -57,6 +57,25 @@ pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "NextToken is invalid. ";
 pub const CURRENCY_NOT_AUTHORIZED_MESSAGE: &str =
     "Caller is not authorized to access requested price lists";
 
+/// The `FormatVersion` member as this API spells a parameter on the wire: lowerCamel, the
+/// spelling every member path of this API's refusals carries.
+pub const FORMAT_VERSION_PARAMETER: &str = "formatVersion";
+
+/// The message this API refuses a parameter whose value it does not accept with: the
+/// parameter as the API spells it, and the value that parameter has to carry.
+///
+/// This is the OTHER refusal class of the Price List API, beside the boundary envelope the
+/// framework words a constraint violation in (`<N> validation error(s) detected: …`): a
+/// value the model's own constraints ADMIT and the service still does not accept — the one
+/// format version this catalog publishes — is refused with this sentence rather than with a
+/// constraint clause, because no declared constraint was broken. The sentence is the fixed
+/// half; the parameter it names and the value it requires are the request's and this
+/// catalog's, so one place words it for every operation that takes such a parameter.
+#[must_use]
+pub fn invalid_input_parameter_message(parameter: &str, required: &str) -> String {
+    format!("Input Parameters are invalid. {parameter} should be {required}")
+}
+
 /// Page size used when a request names no `MaxResults`.
 ///
 /// The model declares the member nullable with no server-side default, and the API

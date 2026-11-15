@@ -176,10 +176,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if requested != state.format_version {
                 return Err(DescribeServicesErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(format!(
-                            "FormatVersion '{requested}' is not supported; this service \
-                             publishes '{}'",
-                            state.format_version
+                        message: Some(crate::state::invalid_input_parameter_message(
+                            crate::state::FORMAT_VERSION_PARAMETER,
+                            &state.format_version,
                         )),
                     },
                 )

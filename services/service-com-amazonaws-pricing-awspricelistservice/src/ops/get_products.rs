@@ -171,10 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if requested != state.format_version {
                 return Err(GetProductsErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(format!(
-                            "FormatVersion '{requested}' is not supported; this service \
-                             publishes '{}'",
-                            state.format_version
+                        message: Some(crate::state::invalid_input_parameter_message(
+                            crate::state::FORMAT_VERSION_PARAMETER,
+                            &state.format_version,
                         )),
                     },
                 )
@@ -195,15 +194,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The model declares `Filter.Type` as an enum, so the framework's constraint
         // validation refuses an unknown type before this handler runs. Refusing it here
         // too keeps the operation's own answer a modelled error rather than a silent
-        // "matches nothing" if the member is ever widened.
-        for filter in filters {
+        // "matches nothing" if the member is ever widened — stated through the one place
+        // that words that refusal (`crate::service::enumerated_value_refusal`), so this
+        // layer cannot name a different value set or a different sentence from the
+        // boundary's.
+        for (position, filter) in filters.iter().enumerate() {
             if !FILTER_TYPE_VALUES.contains(&filter.r#type.as_str()) {
+                // The path spelling is the framework's own, lowerCamel casing included
+                // (`path::member` applies it), so the handler cannot name a member
+                // differently from the boundary.
+                let path = ::aws_smithy_schema_server::constraints::path::join(&[
+                    ::aws_smithy_schema_server::constraints::path::member("Filters"),
+                    // The walk names an element by its 1-based position.
+                    ::aws_smithy_schema_server::constraints::path::element(position + 1),
+                    ::aws_smithy_schema_server::constraints::path::member("Type"),
+                ]);
                 return Err(GetProductsErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(format!(
-                            "filter Type '{}' is not one of {}",
-                            filter.r#type,
-                            FILTER_TYPE_VALUES.join(", ")
+                        message: Some(crate::service::enumerated_value_refusal(
+                            &path,
+                            &filter.r#type,
+                            FILTER_TYPE_VALUES,
                         )),
                     },
                 )

@@ -25,5 +25,7 @@ mod pricing_fidelity;
 mod pricing_support;
 #[path = "all/published_catalog.rs"]
 mod published_catalog;
+#[path = "all/refusal_message_member.rs"]
+mod refusal_message_member;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
