@@ -2144,3 +2144,18 @@ mod zz_probe_whole_emulator;
 // `clippy::doc_lazy_continuation` asks of a doc list item, so the lint is allowed here; an
 // inner attribute, like an inner doc comment, is legal only before the first item, so it
 // stands here rather than in the list below.
+// `mod <name>;` pair below, in the one place its name sorts to. The list holds those pairs
+// and no other line, so two branches landing at once insert two lines in two places and
+// have no prose to duplicate, re-word or mistype.
+// the declarations is `E0753` and compiles no suite of this target — with none in the file,
+// no merge of two landings can leave one there. NOTHING goes after the last pair, for the
+// same reason.
+// A suite no `mod` here names is compiled nowhere and its tests never run; a suite left at
+// the top level of `tests/` fails the build; and a suite declared twice is `E0428`. Each of
+// those fails EVERY suite in this target. `tests/all.rs` is a test-target CRATE ROOT, so a
+// bare `mod` would resolve to a SIBLING of this file, which the layout check refuses: the
+// belongs in that suite's own module doc, where it is read beside the test it explains; the
+// notes earlier landings appended here live in `all/appended_notes.rs`,
+// `all/appended_notes_tail.rs`, `all/appended_header_notes.rs` and `all/appended_prose.rs`.
+// `all/declaration_roots_are_canonical_and_complete.rs` check those rules, for this file and
+// for every service crate's `tests/all.rs`, so a note about any of them belongs there.

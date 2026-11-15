@@ -50,17 +50,28 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::{Violation, ViolationKind};
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, ServerHttpProtocol,
 };
 use std::sync::Arc;
 
+use crate::ops::types::{BadRequestException, SCHEMA_BAD_REQUEST_EXCEPTION};
+
 /// How this service refuses a request body it cannot read into the operation's
 /// modelled input at all — a layer in FRONT of the generated walk, because the
 /// framework states that failure in its own codec's words under an error code
 /// this model does not declare.
 mod request_layer;
+
+/// The refusals a maintenance put states itself in front of dispatch: the task
+/// its path addresses, and the configuration value its body must carry.
+mod maintenance_put;
+
+/// Where a maintenance put's path carries the task it addresses, and which tasks
+/// each resource has.
+mod maintenance_type;
 
 /// The Iceberg REST catalog this service serves beside its control plane, at a
 /// path space the model binds no operation to.
@@ -86,6 +97,35 @@ mod parameter_validation;
 /// validator's, and `service_common::validation_message` is what states it.
 const BAD_REQUEST_CODE: &str = "BadRequestException";
 
+/// The HTTP status the model gives that error (`@httpError(400)`) — the status
+/// the framework's own refusal renderer answers the class with too, so stating
+/// the refusal here changes the error code and the sentence and nothing else.
+const BAD_REQUEST_STATUS: u16 = 400;
+
+/// How this service answers a request one of its layers in FRONT of dispatch
+/// refuses: the one client-input error its model declares, carrying `message`,
+/// rendered by the service's own codec.
+///
+/// Every such layer ([`request_layer`], [`maintenance_put`]) answers in this ONE
+/// envelope, so what a caller is told differs between them in the sentence alone
+/// — and neither can drift to an error code this model does not carry.
+fn bad_request_response(svc: &dyn Service, req: &RtRequest, message: String) -> RtResponse {
+    let protocol = svc
+        .override_protocol()
+        .unwrap_or_else(|| svc.definition().protocol());
+    let refusal = BadRequestException {
+        message: Some(message),
+    };
+    protocol
+        .serialize_error(
+            &refusal,
+            &SCHEMA_BAD_REQUEST_EXCEPTION,
+            BAD_REQUEST_CODE,
+            BAD_REQUEST_STATUS,
+        )
+        .unwrap_or_else(|error| svc.definition().framework_error_response(error, req))
+}
+
 /// `TableBucketName`'s character set and length
 /// (`smithy_query(query="shape", shape="TableBucketName")`).
 const TABLE_BUCKET_NAME_PATTERN: &str = "^[0-9a-z-]*$";
@@ -108,6 +148,35 @@ const TABLE_NAME_MAX: i64 = 255;
 /// NAME shape is bounded at 255 — so a list longer than this is the only
 /// refusal that reaches the multipart clause below.
 const NAMESPACE_PARTS_MAX: i64 = 1;
+
+/// The two values a configuration's `status` member takes: `MaintenanceStatus`
+/// and `TableRecordExpirationStatus` are each an enum of exactly these
+/// (`smithy_query(query="shape",
+/// shape="MaintenanceStatus,TableRecordExpirationStatus")`), and they are the
+/// two the sentence for that class names — so the clause below reads the class
+/// off the SET the member's enum declares rather than off the operation that
+/// carried it.
+const STATUS_VALUES: [&str; 2] = ["enabled", "disabled"];
+
+/// The members a configuration of this service COUNTS in: every member the
+/// model targets at `PositiveInteger` (`@range(1, 2147483647)`)
+/// (`smithy_query(query="shape", shape="IcebergSnapshotManagementSettings,
+/// IcebergUnreferencedFileRemovalSettings,TableRecordExpirationSettings")`
+/// reports the target on each), and so the members the positive-integer sentence
+/// is stated for.
+///
+/// `targetFileSizeMB` is the one other member of that shape, and it is
+/// deliberately absent: S3 Tables compacts towards a narrower window of its own,
+/// and the sentence for a size outside it states that window, so the clause
+/// above this list is what states it. A bounded member of any OTHER shape (a
+/// page size, which the model bounds at a thousand) is not one of these either.
+const POSITIVE_INTEGER_MEMBERS: [&str; 5] = [
+    "minSnapshotsToKeep",
+    "maxSnapshotAgeHours",
+    "unreferencedDays",
+    "nonCurrentDays",
+    "days",
+];
 
 /// The input member a violation path names: its FIRST segment, so a value
 /// refused inside a collection (`namespace.1.member`) is named by the input
@@ -151,6 +220,34 @@ fn encryption_sentence(violation: &Violation) -> Option<&'static str> {
     }
 }
 
+/// The fixed sentence this service states a refused member of a CONFIGURATION's
+/// value with, or `None` when the violation is of another member or of another
+/// constraint.
+///
+/// Read off the LEAF member, because each of these sits inside a different
+/// structure in each operation that configures something — a table's
+/// maintenance, a table bucket's maintenance, a table's record expiration —
+/// while the member that failed, and the reason it failed, are the same in all
+/// of them.
+fn configuration_sentence(violation: &Violation) -> Option<&'static str> {
+    match (violated_leaf(&violation.path), &violation.kind) {
+        // Whether the task runs: the two enums a `status` member of this model
+        // targets declare the same pair of values, and the sentence names that
+        // pair, so the class is read off the SET rather than off the operation
+        // that carried the member.
+        ("status", ViolationKind::EnumValue(allowed)) if allowed.as_slice() == STATUS_VALUES => {
+            Some(crate::state::INVALID_CONFIGURATION_STATUS_MESSAGE)
+        }
+        // The strategy names how compaction rewrites a table's files: the model
+        // targets this member at the `IcebergCompactionStrategy` enum, so a
+        // value outside that set names no compaction this service runs.
+        ("strategy", ViolationKind::EnumValue(_)) => {
+            Some(crate::state::INVALID_COMPACTION_STRATEGY_MESSAGE)
+        }
+        _ => None,
+    }
+}
+
 /// The fixed sentence this service states `violation` with, or `None` when the
 /// member it refused is not one of the classes this service words itself.
 ///
@@ -159,6 +256,9 @@ fn encryption_sentence(violation: &Violation) -> Option<&'static str> {
 /// value, so one arm covers every operation that takes the member.
 fn fixed_sentence(violation: &Violation) -> Option<&'static str> {
     if let Some(sentence) = encryption_sentence(violation) {
+        return Some(sentence);
+    }
+    if let Some(sentence) = configuration_sentence(violation) {
         return Some(sentence);
     }
     let member = violated_member(&violation.path);
@@ -219,6 +319,35 @@ fn fixed_sentence(violation: &Violation) -> Option<&'static str> {
     }
 }
 
+/// The sentence this service states `violation` with, or `None` when the member
+/// it refused is not one of the classes this service words itself.
+///
+/// Most of those sentences are fixed text ([`fixed_sentence`]); the one below is
+/// built instead, because it quotes a window of this SERVICE's own, and building
+/// it from the constants that window is enforced from is what keeps the sentence
+/// and the refusal in step.
+fn stated_sentence(violation: &Violation) -> Option<String> {
+    match (violated_leaf(&violation.path), &violation.kind) {
+        // The file size compaction rewrites a table's files towards: the window
+        // S3 Tables compacts towards is narrower than the model's own bound on
+        // the member, and a size outside EITHER is one this service does not
+        // compact towards — so the boundary states the sentence the put states
+        // for the rest of that class.
+        ("targetFileSizeMB", ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)) => {
+            Some(crate::state::invalid_compaction_file_size_message())
+        }
+        // Every other member a configuration counts in: the model bounds each at
+        // the positive-integer range, and this service states a value outside
+        // that range by naming the member it was carried in.
+        (member, ViolationKind::MinValue(_) | ViolationKind::MaxValue(_))
+            if POSITIVE_INTEGER_MEMBERS.contains(&member) =>
+        {
+            Some(crate::state::invalid_positive_integer_message(member))
+        }
+        _ => fixed_sentence(violation).map(str::to_string),
+    }
+}
+
 /// How this service answers a request the boundary refused for breaking a
 /// modelled constraint.
 ///
@@ -227,9 +356,10 @@ fn fixed_sentence(violation: &Violation) -> Option<&'static str> {
 ///
 /// * a class this service validates itself — the names a create gives a
 ///   resource, the ARNs an operation is addressed by, the encryption, format and
-///   metadata members it will not act on — is the service's own refusal: its
-///   modelled `BadRequestException`, worded with the one fixed sentence it
-///   states that class with;
+///   metadata members it will not act on, and the members of a configuration's
+///   value (its status, its compaction strategy, the numbers it counts in) — is
+///   the service's own refusal: its modelled `BadRequestException`, worded with
+///   the one sentence it states that class with;
 /// * every other class is refused by the parameter validator in front of the
 ///   service, which answers under its own code and envelope — the code is not
 ///   one of this model's shapes precisely because the refusal is not the
@@ -238,10 +368,10 @@ fn fixed_sentence(violation: &Violation) -> Option<&'static str> {
 ///
 /// `None` when there is nothing to state, which leaves the framework's wording.
 fn constraint_refusal(refusal: &Refusal, violations: &[Violation]) -> Option<Refused> {
-    match violations.iter().find_map(fixed_sentence) {
+    match violations.iter().find_map(stated_sentence) {
         Some(sentence) => Some(Refused {
             code: BAD_REQUEST_CODE.to_string(),
-            message: sentence.to_string(),
+            message: sentence,
         }),
         None => parameter_validation::refusal(refusal),
     }
@@ -270,6 +400,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// member the operation LOOKS UP (see [`name_lookups`]). Held on the service
     /// for the same reason as the two layers above.
     name_lookups: name_lookups::NameLookups<Eng>,
+    /// Refuses a maintenance put for what its path or its body states (see
+    /// [`maintenance_put`]). Held on the service for the same reason as the
+    /// layers above.
+    maintenance_put: maintenance_put::MaintenancePutRefusal<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -283,6 +417,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             unreadable_body: request_layer::UnreadableBody::new(),
             iceberg_catalog: iceberg_rest::IcebergCatalog::new(Arc::clone(&engine)),
             name_lookups: name_lookups::NameLookups::new(engine),
+            maintenance_put: maintenance_put::MaintenancePutRefusal::new(),
         }
     }
 }
@@ -336,6 +471,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let routing = self.entry.protocol();
         let codec: &dyn ServerHttpProtocol = &self.protocol;
         if let Ok(key) = routing.routing_key(req) {
+            // A maintenance put whose path addresses a task the resource does
+            // not have, or whose body carries no configuration value at all, is
+            // refused with the sentence this service states that class with, in
+            // front of the layer below: the settings a maintenance
+            // configuration carries are a union whose members are the tasks
+            // themselves, so a request naming an unknown task usually carries
+            // that task's settings too — a body this service cannot read into
+            // the input at all — and the caller would be told about its body
+            // where the path is what named no task.
+            if maintenance_put::refuses::<Eng>(key, codec, req) {
+                return Some(&self.maintenance_put);
+            }
             if request_layer::body_is_unreadable::<Eng>(key, codec, req) {
                 return Some(&self.unreadable_body);
             }

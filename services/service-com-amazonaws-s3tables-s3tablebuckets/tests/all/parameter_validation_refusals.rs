@@ -12,10 +12,12 @@
 //! request breaks more than one. The clause states WHERE the value sat and WHAT
 //! it had to satisfy, and echoes no value, so the same refusal reads identically
 //! whatever was sent. The members the service DOES word itself — a name a create
-//! gives a resource, an ARN an operation is addressed by, a table format, an
-//! encryption configuration — are the other layer: they carry this model's
+//! gives a resource, an ARN an operation is addressed by, a table format, a
+//! configuration's status, an encryption configuration — are the other layer:
+//! they carry this model's
 //! `BadRequestException` and a fixed sentence, which `constraint_refusals.rs`,
-//! `invalid_input_refusals.rs` and `encryption_configuration_refusals.rs` pin.
+//! `invalid_input_refusals.rs`, `maintenance_request_refusals.rs` and
+//! `encryption_configuration_refusals.rs` pin.
 //!
 //! Each table spans the class the rule generalises over rather than one recorded
 //! request: which CONSTRAINT the value broke (a character set, a length bound at
@@ -26,7 +28,7 @@
 //! quoted below are the model's own
 //! (`smithy_query(query="shape", shape="TableBucketReplicationConfiguration,
 //! ReplicationDestination,TableRecordExpirationSettings,
-//! TableRecordExpirationStatus,StorageClass,VersionToken,IAMRole")`).
+//! StorageClass,VersionToken,IAMRole")`).
 //!
 //! The accepted rows keep the refusals honest: the value AT each published bound
 //! is served, so what is refused is the values outside the bound and not the
@@ -109,7 +111,7 @@ fn configuration(role: &str, destinations: &[&str]) -> Value {
 
 /// Every refusal the parameter validator makes, across the constraint classes
 /// and the depths the rule generalises over.
-fn cases(bucket: &str, table_arn: &str) -> Vec<Case> {
+fn cases(bucket: &str) -> Vec<Case> {
     let mut cases = Vec::new();
 
     // A `@pattern` on a member sat two collections deep: the destination of a
@@ -171,40 +173,9 @@ fn cases(bucket: &str, table_arn: &str) -> Vec<Case> {
     });
 
     // A `@range` minimum on a member two structures deep: the days a table
-    // retains its records. `PositiveInteger` is `@range(1, 2147483647)`, so zero
-    // and every negative value is below it.
-    for days in [0, -1, -365] {
-        cases.push(Case {
-            label: format!("a retention of {days} days"),
-            method: "PUT",
-            path: format!(
-                "/table-record-expiration{}",
-                query_string(&[("tableArn", table_arn.to_string())])
-            ),
-            body: Some(json!({ "value": { "status": "enabled", "settings": { "days": days } } })),
-            member_path: "value.settings.days",
-            requirement: "Member must have value greater than or equal to 1".to_string(),
-            sent: vec![days.to_string()],
-        });
-    }
-
-    // An enumerated set on a member of a nested structure: the status a record
-    // expiration configuration carries (`enabled`, `disabled`), in a spelling
-    // outside it.
-    for status in ["ENABLED", "Disabled", "on"] {
-        cases.push(Case {
-            label: format!("a record expiration status spelled {status:?}"),
-            method: "PUT",
-            path: format!(
-                "/table-record-expiration{}",
-                query_string(&[("tableArn", table_arn.to_string())])
-            ),
-            body: Some(json!({ "value": { "status": status } })),
-            member_path: "value.status",
-            requirement: "Member must satisfy enum value set: [enabled, disabled]".to_string(),
-            sent: vec![status.to_string()],
-        });
-    }
+    // retains its records. Removed from this table: the positive-integer range
+    // is a bound this service words a sentence of its own for, which
+    // `maintenance_request_refusals.rs` is what pins.
 
     // An enumerated set on a member of a create's own nested structure: the
     // storage class a table bucket's tables are stored in (`STANDARD`,
@@ -284,9 +255,9 @@ async fn fixture(emulator: &Emulator) -> (String, String) {
 #[tokio::test]
 async fn a_parameter_the_service_words_no_sentence_for_is_refused_by_the_validator() {
     let emulator = Emulator::new();
-    let (bucket, table_arn) = fixture(&emulator).await;
+    let (bucket, _) = fixture(&emulator).await;
 
-    for case in cases(&bucket, &table_arn) {
+    for case in cases(&bucket) {
         let refused = emulator
             .call(case.method, &case.path, REGION, case.body.as_ref())
             .await;

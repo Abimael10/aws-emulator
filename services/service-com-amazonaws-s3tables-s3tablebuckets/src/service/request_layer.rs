@@ -50,14 +50,6 @@ use smithy_server_runtime::{
     ServerHttpProtocol, Service,
 };
 
-use crate::ops::types::{BadRequestException, SCHEMA_BAD_REQUEST_EXCEPTION};
-
-/// The HTTP status the model gives `BadRequestException` (`@httpError(400)`) —
-/// the status the framework's own refusal renderer answers this class with too,
-/// so restating the refusal changes the error code and the sentence and nothing
-/// else.
-const BAD_REQUEST_STATUS: u16 = 400;
-
 /// Whether the body of `req` is one this service cannot read into the input of
 /// the operation `O`.
 ///
@@ -180,21 +172,13 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for UnreadableBody<Eng> {
     ) -> BoxFuture<'r, RtResponse> {
         // Rendered before the future, so no borrow of the service's definition
         // is held across an await: the refusal is one fixed sentence and needs
-        // nothing from the request.
-        let protocol = svc
-            .override_protocol()
-            .unwrap_or_else(|| svc.definition().protocol());
-        let refusal = BadRequestException {
-            message: Some(crate::state::INVALID_INPUT_MESSAGE.to_string()),
-        };
-        let response = protocol
-            .serialize_error(
-                &refusal,
-                &SCHEMA_BAD_REQUEST_EXCEPTION,
-                super::BAD_REQUEST_CODE,
-                BAD_REQUEST_STATUS,
-            )
-            .unwrap_or_else(|e| svc.definition().framework_error_response(e, req));
+        // nothing from the request. The envelope is the one every layer in front
+        // of dispatch answers in (`super::bad_request_response`).
+        let response = super::bad_request_response(
+            svc,
+            req,
+            crate::state::INVALID_INPUT_MESSAGE.to_string(),
+        );
         Box::pin(async move { response })
     }
 

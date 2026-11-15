@@ -273,8 +273,10 @@ impl PutCase {
 /// The rows the put is graded on. Every settings member the model declares
 /// appears, each modeled `IcebergCompactionStrategy` value is covered
 /// (`com.amazonaws.s3tables#IcebergCompactionStrategy`: auto, binpack, sort,
-/// z-order), and so are both `MaintenanceStatus` values and the `@range(1,
-/// 2147483647)` bounds of `PositiveInteger`.
+/// z-order), and so are both `MaintenanceStatus` values, the `@range(1,
+/// 2147483647)` bounds of `PositiveInteger` on the snapshot-management members
+/// and the bounds of the narrower window S3 Tables compacts towards (64 MB to
+/// 512 MB, which `maintenance_request_refusals.rs` is what pins).
 fn put_cases() -> Vec<PutCase> {
     let (_, default_target, default_strategy) = DEFAULT_COMPACTION;
     let (_, default_minimum, default_age) = DEFAULT_SNAPSHOT_MANAGEMENT;
@@ -294,30 +296,30 @@ fn put_cases() -> Vec<PutCase> {
             ),
         },
         PutCase {
-            label: "compaction at the smallest target file size the model allows",
+            label: "compaction at the smallest file size S3 Tables compacts towards",
             region: "eu-west-1",
             kind: TableMaintenanceType::IcebergCompaction,
             status: Some("enabled"),
             settings: Some(json!({
-                "icebergCompaction": { "targetFileSizeMB": 1, "strategy": "sort" }
+                "icebergCompaction": { "targetFileSizeMB": 64, "strategy": "sort" }
             })),
             expected: Reported::Compaction(
                 Some("enabled".to_string()),
-                Some(1),
+                Some(64),
                 Some("sort".to_string()),
             ),
         },
         PutCase {
-            label: "compaction at the largest target file size the model allows",
+            label: "compaction at the largest file size S3 Tables compacts towards",
             region: "ap-south-1",
             kind: TableMaintenanceType::IcebergCompaction,
             status: Some("enabled"),
             settings: Some(json!({
-                "icebergCompaction": { "targetFileSizeMB": 2147483647, "strategy": "z-order" }
+                "icebergCompaction": { "targetFileSizeMB": 512, "strategy": "z-order" }
             })),
             expected: Reported::Compaction(
                 Some("enabled".to_string()),
-                Some(2_147_483_647),
+                Some(512),
                 Some("z-order".to_string()),
             ),
         },
@@ -682,9 +684,9 @@ async fn a_configuration_the_model_refuses_is_not_persisted() {
         create_table(&emulator, region, "maintenance-refusals", namespace, table).await;
 
     // `PositiveInteger` is `@range(1, 2147483647)`, so each settings member is
-    // refused one step past its bounds; the settings union also names the task
-    // it configures, so settings of the other task are not a configuration of
-    // the one addressed.
+    // refused one step past its bounds — and the compaction file size is refused
+    // outside the narrower window S3 Tables compacts towards, which
+    // `maintenance_request_refusals.rs` is what pins.
     //
     // The last element is the error code the refusal must carry, where THIS
     // operation is the layer that refuses: the handler words a configuration it
@@ -694,6 +696,14 @@ async fn a_configuration_the_model_refuses_is_not_persisted() {
     // violation carries is one rule for every operation of this service, and
     // belongs to the suite that covers it (`constraint_refusals.rs`), not here.
     let refused: Vec<(&str, TableMaintenanceType, Value, Option<&str>)> = vec![
+        (
+            "a target file size under the window S3 Tables compacts towards",
+            TableMaintenanceType::IcebergCompaction,
+            json!({ "status": "enabled", "settings": {
+                "icebergCompaction": { "targetFileSizeMB": 63 }
+            }}),
+            Some("BadRequestException"),
+        ),
         (
             "a target file size below the modeled minimum",
             TableMaintenanceType::IcebergCompaction,
@@ -739,16 +749,6 @@ async fn a_configuration_the_model_refuses_is_not_persisted() {
             TableMaintenanceType::IcebergSnapshotManagement,
             json!({ "status": "paused" }),
             None,
-        ),
-        (
-            "settings of the other maintenance task",
-            TableMaintenanceType::IcebergCompaction,
-            json!({ "status": "enabled", "settings": {
-                "icebergSnapshotManagement": { "minSnapshotsToKeep": 3 }
-            }}),
-            // Refused by the handler itself, so the modeled client-input error
-            // is part of what this suite grades.
-            Some("BadRequestException"),
         ),
     ];
 

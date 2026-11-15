@@ -1629,6 +1629,93 @@ pub const INVALID_METADATA_MESSAGE: &str = "The specified metadata is not valid"
 pub const INVALID_METADATA_LOCATION_MESSAGE: &str =
     "The specified metadata location is not valid.";
 
+/// How this service states a maintenance put that carries no configuration
+/// value at all — the `value` member the model makes `@required` on both
+/// maintenance puts. FIXED text: it names the member by WHAT it is and takes
+/// nothing from the request.
+pub const MAINTENANCE_VALUE_MISSING_MESSAGE: &str =
+    "The table maintenance configuration value is not specified.";
+
+/// How this service states a value outside the positive-integer range the model
+/// bounds a counted member of a configuration at (`PositiveInteger`,
+/// `@range(1, 2147483647)`): the member names ITSELF, under the name the wire
+/// carries it by, and the requirement is that range stated in words.
+///
+/// `member` is a member name of the model, taken from the path of the violation
+/// the boundary reported, so nothing of the request reaches the sentence.
+pub fn invalid_positive_integer_message(member: &str) -> String {
+    format!("The specified {member} is invalid. Value must be a positive integer.")
+}
+
+/// The smallest and largest file size S3 Tables compacts a table towards, in MB.
+///
+/// The model bounds `IcebergCompactionSettings.targetFileSizeMB` only as a
+/// `PositiveInteger` (`@range(1..2147483647)`), so this window is the SERVICE's
+/// own: the recorded refusal of a size outside it states both of these bounds,
+/// which is where they come from, and [`invalid_compaction_file_size_message`]
+/// is the one sentence that quotes them.
+pub const COMPACTION_TARGET_FILE_SIZE_MIN_MB: i32 = 64;
+pub const COMPACTION_TARGET_FILE_SIZE_MAX_MB: i32 = 512;
+
+/// Whether `target_file_size_mb` is a file size S3 Tables compacts towards: one
+/// inside the window above.
+pub fn compaction_file_size_is_supported(target_file_size_mb: i32) -> bool {
+    (COMPACTION_TARGET_FILE_SIZE_MIN_MB..=COMPACTION_TARGET_FILE_SIZE_MAX_MB)
+        .contains(&target_file_size_mb)
+}
+
+/// How this service states a compaction file size outside the window it
+/// compacts towards.
+///
+/// The sentence names the window's two bounds and takes NOTHING from the
+/// request — the numbers are this service's constants, interpolated from the
+/// constants above so the sentence cannot state a window other than the one
+/// that is enforced.
+pub fn invalid_compaction_file_size_message() -> String {
+    format!(
+        "The specified compaction file size is invalid. Minimum value: \
+         {COMPACTION_TARGET_FILE_SIZE_MIN_MB} MB, maximum value: \
+         {COMPACTION_TARGET_FILE_SIZE_MAX_MB} MB."
+    )
+}
+
+/// How this service states a compaction strategy that names none of the ones S3
+/// Tables compacts under — the `strategy` member of an `icebergCompaction`
+/// maintenance setting, which the model targets at the
+/// `IcebergCompactionStrategy` enum. FIXED text, as
+/// [`INVALID_OPEN_TABLE_FORMAT_MESSAGE`]: it names the member class and neither
+/// echoes the value nor lists the strategies this service does compact under.
+pub const INVALID_COMPACTION_STRATEGY_MESSAGE: &str =
+    "The compaction strategy specified is not valid.";
+
+/// How this service states a status that is neither of the two a configuration's
+/// `status` member takes: the members the model targets at `MaintenanceStatus`
+/// (a maintenance configuration's) and at `TableRecordExpirationStatus` (a record
+/// expiration configuration's), each an enum of `enabled` and `disabled`
+/// (`smithy_query(query="shape",
+/// shape="MaintenanceStatus,TableRecordExpirationStatus")`). FIXED text, as
+/// [`INVALID_OPEN_TABLE_FORMAT_MESSAGE`]: it names the member and the two values
+/// it takes, and echoes nothing of the request.
+pub const INVALID_CONFIGURATION_STATUS_MESSAGE: &str =
+    "The specified status is invalid. Value must be either 'enabled' or 'disabled.'";
+
+/// How this service states a maintenance type that names no maintenance task of
+/// the resource the request addresses — the `type` label of the maintenance
+/// puts, which the model targets at `TableMaintenanceType` for a table's tasks
+/// and at `TableBucketMaintenanceType` for a table bucket's.
+///
+/// The prefix is FIXED and the type is the one the request's path carried, so a
+/// caller reads back which of its own words named no task. The echo is quoted to
+/// the ceiling every clause of this workspace quotes a submitted value to
+/// ([`::service_common::validation::quoted_echo`]), so no refusal is sized by
+/// the request.
+pub fn invalid_maintenance_type_message(addressed: &str) -> String {
+    format!(
+        "Invalid table maintenance type: {addressed}",
+        addressed = ::service_common::validation::quoted_echo(addressed)
+    )
+}
+
 /// How this service states a request body it cannot read into the operation's
 /// modelled input at all — a member carrying a value of a JSON type the model
 /// does not declare for it, or a body that is not the operation's input. FIXED

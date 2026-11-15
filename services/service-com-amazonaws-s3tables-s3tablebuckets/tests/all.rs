@@ -35,6 +35,8 @@ mod list_namespaces;
 mod list_tags_for_resource;
 #[path = "all/list_tables_summary_members.rs"]
 mod list_tables_summary_members;
+#[path = "all/maintenance_request_refusals.rs"]
+mod maintenance_request_refusals;
 #[path = "all/metrics_configuration_not_found_message.rs"]
 mod metrics_configuration_not_found_message;
 #[path = "all/minted_value_forms.rs"]

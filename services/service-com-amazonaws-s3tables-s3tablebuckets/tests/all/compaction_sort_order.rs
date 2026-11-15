@@ -212,7 +212,7 @@ async fn a_strategy_that_sorts_records_needs_a_sort_order_in_the_table_metadata(
             Metadata::None,
             IcebergCompactionStrategy::ZOrder,
             "enabled",
-            Some(1),
+            Some(128),
         ),
         // The strategies that reorder nothing need no sort order.
         (
@@ -250,7 +250,7 @@ async fn a_strategy_that_sorts_records_needs_a_sort_order_in_the_table_metadata(
             Metadata::Sorted,
             IcebergCompactionStrategy::ZOrder,
             "enabled",
-            Some(2_147_483_647),
+            Some(64),
         ),
         (
             "sa-east-1",

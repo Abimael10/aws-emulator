@@ -178,9 +178,7 @@ fn stored_settings(
         }
     };
     if stored.maintenance_type() != kind {
-        return Err(bad_request(
-            "The maintenance settings must be the settings of the maintenance type.".to_string(),
-        ));
+        return Ok(None);
     }
     Ok(Some(stored))
 }
@@ -231,20 +229,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // The task this configuration settles. A value outside the modeled enum
-        // is refused at the boundary, so reaching here with an unknown one would
-        // mean the model changed under us; it is refused as client input rather
-        // than silently stored.
+        // The task this configuration settles. A type the resource does not have
+        // is refused in front of dispatch with the sentence this service states
+        // that class with, so reaching here with an unknown one would mean the
+        // model changed under us; it is refused as the same class rather than
+        // silently stored.
         let kind = TableBucketMaintenanceType::from_wire(&input.r#type).ok_or_else(|| {
-            bad_request(format!(
-                "The maintenance type {wire} is not supported.",
-                wire = input.r#type
+            bad_request(crate::state::invalid_maintenance_type_message(
+                &input.r#type,
             ))
         })?;
         let status = match input.value.status.as_deref() {
             None => None,
             Some(wire) => Some(MaintenanceStatus::from_wire(wire).ok_or_else(|| {
-                bad_request(format!("The maintenance status {wire} is not supported."))
+                bad_request(crate::state::INVALID_CONFIGURATION_STATUS_MESSAGE.to_string())
             })?),
         };
         let settings = stored_settings(kind, input.value.settings.as_ref())?;

@@ -165,11 +165,16 @@ fn bad_request(message: String) -> PutTableMaintenanceConfigurationError {
 }
 
 /// The stored form of the settings the request carries, or `None` when it
-/// carries none.
+/// carries none this put configures.
 ///
 /// The settings are a union, so they name the maintenance task they configure
-/// themselves: settings for one task cannot be filed under another, which is
-/// what the mismatch refusal below states.
+/// themselves, while the request's PATH is what addresses the configuration this
+/// put replaces. Settings naming another task than the path does configure
+/// nothing: the request is one S3 Tables acts on — the recorded response to it is
+/// the modelled 204, and the read that follows in the same recording reports the
+/// addressed task still under the service's own defaults — so the status settles
+/// the task the path named and the task the settings named keeps the settings it
+/// had.
 fn stored_settings(
     kind: crate::state::TableMaintenanceType,
     settings: Option<&TableMaintenanceSettings>,
@@ -181,20 +186,33 @@ fn stored_settings(
     };
     let stored = match settings {
         TableMaintenanceSettings::icebergCompaction(compaction) => {
+            // The file size compaction rewrites towards is bounded by the
+            // SERVICE rather than by the model, so a size the model admits can
+            // still be one S3 Tables does not compact towards: it is refused
+            // here, before anything is written.
+            if compaction
+                .target_file_size_mb
+                .is_some_and(|size| !crate::state::compaction_file_size_is_supported(size))
+            {
+                return Err(bad_request(
+                    crate::state::invalid_compaction_file_size_message(),
+                ));
+            }
             MaintenanceSettings::IcebergCompaction(CompactionSettings {
                 target_file_size_mb: compaction.target_file_size_mb,
                 // A strategy outside the modeled enum is refused at the
-                // boundary, so reaching here with an unknown one would mean the
-                // model changed under us; it is refused as client input rather
-                // than silently stored.
+                // boundary with the sentence this service states that class
+                // with, so reaching here with an unknown one would mean the
+                // model changed under us; it is refused as the same client
+                // input class rather than silently stored.
                 strategy: match compaction.strategy.as_deref() {
                     None => None,
                     Some(wire) => Some(
                         crate::state::IcebergCompactionStrategy::from_wire(wire).ok_or_else(
                             || {
-                                bad_request(format!(
-                                    "The compaction strategy {wire} is not supported."
-                                ))
+                                bad_request(
+                                    crate::state::INVALID_COMPACTION_STRATEGY_MESSAGE.to_string(),
+                                )
                             },
                         )?,
                     ),
@@ -209,9 +227,7 @@ fn stored_settings(
         }
     };
     if stored.maintenance_type() != kind {
-        return Err(bad_request(
-            "The maintenance settings must be the settings of the maintenance type.".to_string(),
-        ));
+        return Ok(None);
     }
     Ok(Some(stored))
 }
@@ -262,20 +278,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // The task this configuration settles. A value outside the modeled enum
-        // is refused at the boundary, so reaching here with an unknown one would
-        // mean the model changed under us; it is refused as client input rather
-        // than silently stored.
+        // The task this configuration settles. A type the resource does not have
+        // is refused in front of dispatch with the sentence this service states
+        // that class with, so reaching here with an unknown one would mean the
+        // model changed under us; it is refused as the same class rather than
+        // silently stored.
         let kind = TableMaintenanceType::from_wire(&input.r#type).ok_or_else(|| {
-            bad_request(format!(
-                "The maintenance type {wire} is not supported.",
-                wire = input.r#type
+            bad_request(crate::state::invalid_maintenance_type_message(
+                &input.r#type,
             ))
         })?;
         let status = match input.value.status.as_deref() {
             None => None,
             Some(wire) => Some(MaintenanceStatus::from_wire(wire).ok_or_else(|| {
-                bad_request(format!("The maintenance status {wire} is not supported."))
+                bad_request(crate::state::INVALID_CONFIGURATION_STATUS_MESSAGE.to_string())
             })?),
         };
         let settings = stored_settings(kind, input.value.settings.as_ref())?;
