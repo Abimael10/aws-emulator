@@ -73,7 +73,7 @@ fn engine_with_two_endpoints() -> (Arc<InMemoryEngine>, String, String) {
                 connection_id.clone(),
                 mgmt::state::Identity {
                     source_ip: "127.0.0.1".to_string(),
-                    user_agent: "scope/1".to_string(),
+                    user_agent: Some("scope/1".to_string()),
                 },
                 connected_at(),
                 Some(endpoint.to_string()),

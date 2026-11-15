@@ -322,6 +322,21 @@ fn resource(api_id: &str, method: &str) -> String {
     )
 }
 
+/// The resource a REFUSAL of that call NAMES: the same ARN with the account masked down to
+/// its last four digits, which is how an `execute-api` endpoint reports a resource in the
+/// sentence it refuses an unauthorized call with — it does not publish the whole account id
+/// to a caller it just refused. Spelled out here rather than taken from the emulator.
+fn reported_resource(api_id: &str, method: &str) -> String {
+    let account = engine::emulator_account_id();
+    let last_four = account
+        .get(account.len().saturating_sub(4)..)
+        .expect("the account id's last four digits");
+    format!(
+        "arn:aws:execute-api:{REGION}:********{last_four}:{api_id}/{STAGE}/{method}/@connections/\
+         {{connectionId}}"
+    )
+}
+
 const ROWS: &[Row] = &[
     Row {
         case: "no document at all",
@@ -487,7 +502,7 @@ fn register(engine: &Arc<InMemoryEngine>) {
             CONNECTION_ID,
             mgmt::state::Identity {
                 source_ip: "192.0.2.30".to_string(),
-                user_agent: "pusher/1".to_string(),
+                user_agent: Some("pusher/1".to_string()),
             },
             SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         ),
@@ -562,7 +577,7 @@ fn a_connections_call_is_served_only_where_iam_allows_manage_connections() {
                         let expected = format!(
                             "User: {principal} is not authorized to perform: \
                              {MANAGE_CONNECTIONS} on resource: {} {reason}",
-                            resource(&api_id, method)
+                            reported_resource(&api_id, method)
                         );
                         assert_eq!(
                             answered.error_message(),
@@ -693,7 +708,7 @@ fn a_call_at_the_apis_own_socket_is_authorized_on_that_apis_stage() {
                     let expected = format!(
                         "User: {principal} is not authorized to perform: {MANAGE_CONNECTIONS} \
                          on resource: {} {}",
-                        resource(&second_id, "POST"),
+                        reported_resource(&second_id, "POST"),
                         no_grant()
                     );
                     assert_eq!(

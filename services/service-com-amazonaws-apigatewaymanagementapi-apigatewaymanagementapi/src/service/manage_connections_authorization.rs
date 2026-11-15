@@ -39,6 +39,11 @@
 //! this surface, the spelling the recorded refusal of it names, and one a
 //! `…/@connections/*` statement covers.
 //!
+//! What a REFUSAL names is that same resource with the ACCOUNT masked down to its last four
+//! digits ([`reported_resource`]): the endpoint does not publish the whole account id in a
+//! sentence it hands a caller it just refused, while the decision itself is taken about the
+//! ARN a policy statement names the resource by.
+//!
 //! WHICH api and stage that is comes from the service that owns apis and stages, through the
 //! same shared cell that judges whether the addressing serves anything at all
 //! (`crate::state::connections_endpoint_authority`): this service cannot read those records.
@@ -303,22 +308,38 @@ pub fn refusal(caller: &Caller, resource: &str) -> Option<String> {
 }
 
 /// The sentence the `execute-api` endpoint refuses an unauthorized `@connections` call with:
-/// the principal that asked, the action it asked for, the resource it asked for and `reason`.
+/// the principal that asked, the action it asked for, the resource it asked for as the
+/// endpoint REPORTS it ([`reported_resource`]) and `reason`.
 fn not_authorized(principal: &str, resource: &str, reason: &str) -> String {
     iam::not_authorized_by_identity_policy(
         principal,
         MANAGE_CONNECTIONS_ACTION,
-        resource,
+        &reported_resource(resource),
         reason,
     )
+}
+
+/// The resource a REFUSAL names: the ARN the decision was taken about with its ACCOUNT masked
+/// down to the last four digits.
+///
+/// WHY only the reported one: an `execute-api` endpoint does not publish the whole account id
+/// in a sentence it hands a caller it just refused, while the ARN the decision rests on
+/// ([`managed_resource`]) carries the account itself, because that is the ARN a policy
+/// statement names the resource by. The masking is the shared
+/// [`iam::with_masked_account`], so every endpoint that reports a resource this way words it
+/// the same.
+fn reported_resource(resource: &str) -> String {
+    iam::with_masked_account(resource)
 }
 
 /// The sentence THIS request is refused with, or `None` when the caller may manage the
 /// connections of the stage it addressed.
 ///
 /// The one entry point the three operations take, so all three apply one decision at the same
-/// point of their own walk: before the `ConnectionId` is judged and before the connection
-/// store is consulted, which is where the endpoint takes it.
+/// point of their own walk: after the `ConnectionId`'s own SHAPE is judged — a value that
+/// could never have been minted is a malformed request, which the endpoint reads off the path
+/// it was addressed with and refuses without asking IAM anything — and before the connection
+/// store is consulted, which is the only thing the decision guards.
 ///
 /// `None` is also the answer for everything this gate cannot decide — no owner of apis and
 /// stages mounted, an addressing that resolves no stage, a request carrying no SigV4
@@ -392,6 +413,21 @@ mod tests {
             documents: documents.iter().map(|d| (*d).to_string()).collect(),
             ..Caller::default()
         }
+    }
+
+    /// The resource a REFUSAL of a call reached by `method` names: the route's own ARN with
+    /// the account masked the way an `execute-api` refusal reports it — eight `*` and the
+    /// account's last four digits. Spelled out here rather than taken from the code under
+    /// test.
+    fn reported(method: &str) -> String {
+        let account = ::engine::emulator_account_id();
+        let last_four = account
+            .get(account.len().saturating_sub(4)..)
+            .expect("the account id's last four digits");
+        format!(
+            "arn:aws:execute-api:{REGION}:********{last_four}:{API_ID}/{STAGE}/{method}/\
+             @connections/{{connectionId}}"
+        )
     }
 
     /// A document allowing `action` on `resource`.
@@ -518,8 +554,9 @@ mod tests {
                 Some(
                     format!(
                         "User: {} is not authorized to perform: {MANAGE_CONNECTIONS_ACTION} on \
-                         resource: {resource} {}",
+                         resource: {} {}",
                         bounded.arn,
+                        reported("GET"),
                         iam::PERMISSIONS_BOUNDARY_EXPLICIT_DENY
                     )
                     .as_str()
@@ -538,8 +575,9 @@ mod tests {
                 Some(
                     format!(
                         "User: {} is not authorized to perform: {MANAGE_CONNECTIONS_ACTION} on \
-                         resource: {resource} {}",
+                         resource: {} {}",
                         unstated.arn,
+                        reported("GET"),
                         iam::no_permissions_boundary_allows(MANAGE_CONNECTIONS_ACTION)
                     )
                     .as_str()
@@ -562,7 +600,8 @@ mod tests {
         );
         let sentence = format!(
             "User: arn:aws:sts::000000000000:assumed-role/pusher/session is not authorized to \
-             perform: {MANAGE_CONNECTIONS_ACTION} on resource: {resource}"
+             perform: {MANAGE_CONNECTIONS_ACTION} on resource: {}",
+            reported("DELETE")
         );
         // The rows span the boundary readings this gate reaches.
         let rows: &[(&str, Option<&str>, Option<String>)] = &[
@@ -616,7 +655,8 @@ mod tests {
         );
         let sentence = format!(
             "User: arn:aws:sts::000000000000:assumed-role/pusher/session is not authorized to \
-             perform: {MANAGE_CONNECTIONS_ACTION} on resource: {resource}"
+             perform: {MANAGE_CONNECTIONS_ACTION} on resource: {}",
+            reported("POST")
         );
         // Every row's ROLE allows the action on every resource, so what decides each is the
         // scope its own mint passed: none at all, one allowing the call, one allowing only
@@ -669,7 +709,8 @@ mod tests {
             .expect("case \"no document at all\": the call must be refused");
         let expected = format!(
             "User: arn:aws:sts::000000000000:assumed-role/pusher/session is not authorized to \
-             perform: {MANAGE_CONNECTIONS_ACTION} on resource: {resource} {}",
+             perform: {MANAGE_CONNECTIONS_ACTION} on resource: {} {}",
+            reported("POST"),
             iam::no_identity_policy_allows(MANAGE_CONNECTIONS_ACTION)
         );
         assert_eq!(

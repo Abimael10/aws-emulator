@@ -165,20 +165,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::state::registry_unavailable(Self::NAME));
         };
+        // A `ConnectionId` that is not of the shape this service issues names no connection
+        // anywhere, so it is refused from the VALUE alone — the request is malformed, which
+        // the endpoint reads off the path it was addressed with before it asks IAM anything
+        // (`crate::state::invalid_connection_id`).
+        if !crate::state::is_well_formed_connection_id(&input.connection_id) {
+            return Err(crate::state::invalid_connection_id(&input.connection_id));
+        }
         // Every `@connections` call is authorized by IAM on the stage it addressed, and that
-        // decision is taken BEFORE the request it carries is read at all: a caller holding no
+        // decision is taken BEFORE the connection store is consulted: a caller holding no
         // `execute-api:ManageConnections` grant learns nothing about which connections exist
         // (`crate::service::manage_connections_authorization`).
         if let Some(denied) =
             crate::service::manage_connections_authorization::denial(&*self.engine, ctx)
         {
             return Err(crate::scaffolded::Scaffolded::access_denied(denied));
-        }
-        // A `ConnectionId` that is not of the shape this service issues names no connection
-        // anywhere, so it is refused from the VALUE alone, before anything is removed
-        // (`crate::state::invalid_connection_id`).
-        if !crate::state::is_well_formed_connection_id(&input.connection_id) {
-            return Err(crate::state::invalid_connection_id(&input.connection_id));
         }
         // Which api's connections this request addresses is decided by the endpoint it
         // reached; see `crate::state`.

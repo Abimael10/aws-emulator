@@ -817,6 +817,44 @@ pub fn not_authorized_to_access_resource(principal: &str) -> String {
     format!("User: {principal} is not authorized to access this resource")
 }
 
+/// How many trailing digits of the account a refusal that masks it reports unmasked.
+const UNMASKED_ACCOUNT_DIGITS: usize = 4;
+
+/// The character the masked part of an account id is reported as.
+const ACCOUNT_MASK: char = '*';
+
+/// `arn` with all but the last [`UNMASKED_ACCOUNT_DIGITS`] of its ACCOUNT field replaced by
+/// [`ACCOUNT_MASK`].
+///
+/// WHAT IT IS FOR: an `execute-api` endpoint REPORTS the resource of an authorization refusal
+/// with the account masked that way, so the sentence it hands an unauthorized caller does not
+/// publish the whole account id to whoever reached the endpoint. Only what a refusal reports
+/// is masked: the ARN a DECISION is taken about carries the account itself, because that is
+/// the ARN a policy statement names the resource by.
+///
+/// The account is the fifth of the six fields an ARN is written in, so the resource that
+/// follows it — which may carry colons of its own — is left exactly as it was, and a value
+/// that is not an ARN at all is answered unchanged.
+#[must_use]
+pub fn with_masked_account(arn: &str) -> String {
+    let mut fields: Vec<&str> = arn.splitn(6, ':').collect();
+    let Some(account) = fields.get(4).copied() else {
+        return arn.to_string();
+    };
+    let masked: String = account
+        .char_indices()
+        .map(|(index, digit)| {
+            if index + UNMASKED_ACCOUNT_DIGITS < account.len() {
+                ACCOUNT_MASK
+            } else {
+                digit
+            }
+        })
+        .collect();
+    fields[4] = &masked;
+    fields.join(":")
+}
+
 /// Whether `pattern` matches `value`, with IAM's `*` (any run of characters, including
 /// none) and `?` (exactly one character) wildcards.
 ///
@@ -2672,6 +2710,41 @@ mod tests {
                 matched, expected,
                 "case {case:?}: {pattern:?} against {value:?} (case_sensitive={case_sensitive}) \
                  expected {expected}, got {matched}"
+            );
+        }
+    }
+
+    /// RULE: masking replaces every digit of the ACCOUNT field but the last four, and leaves
+    /// every other field — including a resource carrying colons and slashes of its own —
+    /// exactly as it was.
+    #[test]
+    fn masking_an_arn_hides_all_but_the_last_four_account_digits() {
+        // The rows span what the rule generalises over: the resource form after the account,
+        // an account shorter than the unmasked tail, an empty account field, and a value that
+        // is not an ARN at all.
+        let rows: &[(&str, &str, &str)] = &[
+            (
+                "a resource with slashes",
+                "arn:aws:execute-api:us-west-2:123456789012:abc123/dev/GET/@connections/{connectionId}",
+                "arn:aws:execute-api:us-west-2:********9012:abc123/dev/GET/@connections/{connectionId}",
+            ),
+            (
+                "a resource with colons of its own",
+                "arn:aws:logs:eu-west-1:000000000000:log-group:/aws/lambda/fn:*",
+                "arn:aws:logs:eu-west-1:********0000:log-group:/aws/lambda/fn:*",
+            ),
+            (
+                "an account shorter than the unmasked tail",
+                "arn:aws:s3:::bucket/key",
+                "arn:aws:s3:::bucket/key",
+            ),
+            ("not an ARN at all", "execute-api:/dev/GET/x", "execute-api:/dev/GET/x"),
+        ];
+        for (case, arn, expected) in rows {
+            let masked = with_masked_account(arn);
+            assert_eq!(
+                masked, *expected,
+                "case {case:?}: expected {expected:?}, got {masked:?}"
             );
         }
     }

@@ -222,13 +222,32 @@ pub fn register(
     user_agent: &str,
     connected_at: SystemTime,
 ) {
+    register_identity(
+        engine,
+        connection_id,
+        source_ip,
+        Some(user_agent),
+        connected_at,
+    );
+}
+
+/// As [`register`], for a connection whose opening handshake may have named NO user agent:
+/// `user_agent` is `None` for a client that sent no `User-Agent` field, which is a connection
+/// with no user agent to report rather than one whose user agent is the empty string.
+pub fn register_identity(
+    engine: &Arc<InMemoryEngine>,
+    connection_id: &str,
+    source_ip: &str,
+    user_agent: Option<&str>,
+    connected_at: SystemTime,
+) {
     assert!(
         mgmt::state::register_connection(
             &**engine,
             connection_id,
             mgmt::state::Identity {
                 source_ip: source_ip.to_string(),
-                user_agent: user_agent.to_string(),
+                user_agent: user_agent.map(str::to_string),
             },
             connected_at,
         ),

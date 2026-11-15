@@ -394,7 +394,7 @@ fn a_websocket_api_deploys_and_its_connections_endpoint_serves_the_registry() {
                             row.connection_id,
                             mgmt::state::Identity {
                                 source_ip: row.source_ip.to_string(),
-                                user_agent: row.user_agent.to_string(),
+                                user_agent: Some(row.user_agent.to_string()),
                             },
                             connected_at,
                         ),

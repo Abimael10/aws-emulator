@@ -9,7 +9,9 @@
 //!
 //! A `ConnectionId` of the shape API Gateway ISSUES whose connection is not open at the
 //! endpoint the request reached answers the modeled `GoneException` (HTTP 410) and delivers
-//! nothing. A `ConnectionId` that could never have been issued is refused HTTP 400
+//! nothing. A delivery to a connection whose client has stopped reading its socket answers the
+//! modeled `LimitExceededException` (HTTP 429) carrying [`CLIENT_BUFFER_FULL_MESSAGE`]. A
+//! `ConnectionId` that could never have been issued is refused HTTP 400
 //! `BadRequestException` naming the id;
 //! see [`crate::state`] for the encoding rule, for the endpoint a
 //! connection is addressed through, and for why the two refusals are split. A
@@ -83,6 +85,19 @@ use super::types::*;
 /// refused by the endpoint in front of this operation (`crate::service::OversizedPayload`);
 /// nothing is delivered.
 pub const MAX_DATA_BYTES: usize = 131_072;
+
+/// The sentence API Gateway refuses a delivery to a connection whose client is NOT reading
+/// its socket with.
+///
+/// Recorded behaviour, not a wording of this emulator's own: a `@connections` delivery to a
+/// connection whose client side buffer is full is answered HTTP 429 with exactly this
+/// sentence. It is fixed text naming the client's BUFFER rather than a request rate, which is
+/// what tells a sender which of the two conditions the modelled `LimitExceededException`
+/// covers — "the client is sending more than the allowed number of requests per unit of time
+/// or the WebSocket client side buffer is full"
+/// (`smithy_query(query="shape", shape="LimitExceededException")`) — it was refused for. It
+/// names neither the connection nor the api: there is nothing in it taken from one request.
+pub const CLIENT_BUFFER_FULL_MESSAGE: &str = "Too Many Requests. WebSocket client buffer full";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -182,22 +197,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::state::registry_unavailable(Self::NAME));
         };
+        // A `ConnectionId` that is not of the shape this service issues names no connection
+        // anywhere, so the request is refused from the VALUE alone — it is malformed, which
+        // the endpoint reads off the path it was addressed with before it asks IAM anything.
+        // A caller prunes its own record of a connection on the 410, so answering that for a
+        // value that could never have been issued would make it delete a record it should
+        // keep (`crate::state::invalid_connection_id`).
+        if !crate::state::is_well_formed_connection_id(&input.connection_id) {
+            return Err(crate::state::invalid_connection_id(&input.connection_id));
+        }
         // Every `@connections` call is authorized by IAM on the stage it addressed, and that
-        // decision is taken BEFORE the request it carries is read at all: a caller holding no
+        // decision is taken BEFORE the connection store is consulted: a caller holding no
         // `execute-api:ManageConnections` grant learns nothing about which connections exist
         // (`crate::service::manage_connections_authorization`).
         if let Some(denied) =
             crate::service::manage_connections_authorization::denial(&*self.engine, ctx)
         {
             return Err(crate::scaffolded::Scaffolded::access_denied(denied));
-        }
-        // A `ConnectionId` that is not of the shape this service issues names no connection
-        // anywhere, so the request is refused from the VALUE alone, before the registry is
-        // consulted: a caller prunes its own record of a connection on the 410, so
-        // answering that for a value that could never have been issued would make it delete
-        // a record it should keep (`crate::state::invalid_connection_id`).
-        if !crate::state::is_well_formed_connection_id(&input.connection_id) {
-            return Err(crate::state::invalid_connection_id(&input.connection_id));
         }
         // Which api's connections this request addresses is decided by the endpoint it
         // reached; see `crate::state`.
@@ -236,10 +252,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     connection_id = %input.connection_id,
                     "refusing a PostToConnection: the connection's client side buffer is full"
                 );
-                return Err(PostToConnectionErrorModeled::LimitExceededException(
-                    LimitExceededException {},
-                )
-                .into());
+                // The modelled error's own status (429) and code, carrying the sentence the
+                // endpoint words THIS of its two conditions in: the memberless shape has
+                // nothing to serialize one into, so it is worded through the error channel
+                // (`crate::scaffolded::Worded`).
+                return Err(crate::scaffolded::Scaffolded::worded(
+                    PostToConnectionErrorModeled::LimitExceededException(
+                        LimitExceededException {},
+                    ),
+                    CLIENT_BUFFER_FULL_MESSAGE,
+                ));
             }
         }
         // Counts the delivery and keeps it in the connection's BOUNDED observation

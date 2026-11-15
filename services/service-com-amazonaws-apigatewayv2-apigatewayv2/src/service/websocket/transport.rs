@@ -962,10 +962,10 @@ async fn carry_frames<S>(
         connection_id.clone(),
         connections::Identity {
             source_ip: LOOPBACK_SOURCE_IP.to_string(),
-            user_agent: connection
-                .user_agent()
-                .unwrap_or_default()
-                .to_string(),
+            // What the client named itself as in its own handshake, and NOTHING for a client
+            // that named nothing: the registry reports the member only where the handshake
+            // carried one, so no value is invented for a field the client never sent.
+            user_agent: connection.user_agent().map(str::to_string),
         },
         SystemTime::now(),
         endpoint,

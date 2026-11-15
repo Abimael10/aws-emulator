@@ -10,8 +10,11 @@
 //! > allows `execute-api:ManageConnections` on the resource it addresses —
 //! > `arn:aws:execute-api:{region}:{account}:{api-id}/{stage}/{method}/@connections/{connectionId}`,
 //! > the route within the stage — and every other call is refused `403` with the error code
-//! > `AccessDeniedException` and the sentence IAM words an authorization failure in, taken
-//! > BEFORE the `ConnectionId` is judged and before the connection store is consulted.**
+//! > `AccessDeniedException` and the sentence IAM words an authorization failure in — whose
+//! > resource is reported with the account masked down to its last four digits — taken BEFORE
+//! > the connection store is consulted. The `ConnectionId`'s own SHAPE is judged ahead of
+//! > that decision: a value that could never have been minted is a malformed request, which
+//! > the endpoint refuses `400` without asking IAM anything.**
 //!
 //! WHO the api and the stage are comes from the service that owns them, through the shared
 //! cell this service asks (`mgmt::state::connections_endpoint_authority`) — the same cell
@@ -31,8 +34,9 @@
 //! on every resource, on this very route, on the stage's connections by wildcard, on another
 //! stage of the same api, another action of the same service, and an explicit deny beside a
 //! grant of everything), the PRINCIPAL the credential speaks for (an assumed-role session and
-//! the account's own published credential), and the `ConnectionId` the refused call carries
-//! (a live one, a well-formed one nothing holds, and one that could never have been minted).
+//! the account's own published credential), and the `ConnectionId` the refused call carries (a
+//! live one and a well-formed one nothing holds, plus one that could never have been minted,
+//! which is refused as the malformed request it is).
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -227,14 +231,29 @@ fn resource(method: &str) -> String {
     )
 }
 
-/// The sentence a refused call must carry: the principal, the action, the resource and the
-/// clause IAM closes an authorization failure with.
+/// The resource a REFUSAL of that call NAMES: the same ARN with the account masked down to
+/// its last four digits, which is how an `execute-api` endpoint reports a resource in the
+/// sentence it refuses an unauthorized call with — a caller it just refused is not told the
+/// whole account id. Spelled out here rather than taken from the code under test.
+fn reported_resource(method: &str) -> String {
+    let account = engine::emulator_account_id();
+    let last_four = account
+        .get(account.len().saturating_sub(4)..)
+        .expect("the account id's last four digits");
+    format!(
+        "arn:aws:execute-api:{REGION}:********{last_four}:{API_ID}/{STAGE}/{method}/@connections/\
+         {{connectionId}}"
+    )
+}
+
+/// The sentence a refused call must carry: the principal, the action, the resource as the
+/// endpoint reports it and the clause IAM closes an authorization failure with.
 fn refusal_sentence(method: &str, reason: &str) -> String {
     format!(
         "User: {principal} is not authorized to perform: {MANAGE_CONNECTIONS} on resource: \
          {resource} {reason}",
         principal = session_arn(),
-        resource = resource(method),
+        resource = reported_resource(method),
     )
 }
 
@@ -391,20 +410,33 @@ async fn each_operation_is_served_only_where_the_caller_may_manage_connections()
 }
 
 /// The decision precedes the connection store: a refused call touches no connection, whatever
-/// `ConnectionId` it carried — a live one, a well-formed one nothing holds, or one that could
-/// never have been minted (which an allowed caller is refused `400` for).
+/// `ConnectionId` it carried — a live one or a well-formed one nothing holds. A value that
+/// could never have been minted is judged AHEAD of the decision, so the same unprivileged
+/// caller is told its request is malformed (`400`) rather than that it may not invoke the
+/// endpoint: the id is read off the path, and no record is consulted to refuse it either.
 #[tokio::test]
 async fn an_unauthorized_call_is_refused_before_the_connection_is_read() {
     let malformed = crate::support::ids_api_gateway_does_not_mint();
-    let (_, malformed_id) = malformed[0].clone();
-    // The ids span the three classes a request can carry.
+    let (malformed_form, malformed_id) = malformed[0].clone();
+    // The ids span the three classes a request can carry, with the status and error code the
+    // endpoint answers each class in for a caller holding no grant.
     let ids = [
-        ("a live connection", MINTED_IDS[0].1.to_string()),
-        ("a well-formed id nothing holds", MINTED_IDS[1].1.to_string()),
-        ("an id that could never have been minted", malformed_id),
+        ("a live connection", MINTED_IDS[0].1.to_string(), 403, ACCESS_DENIED),
+        (
+            "a well-formed id nothing holds",
+            MINTED_IDS[1].1.to_string(),
+            403,
+            ACCESS_DENIED,
+        ),
+        (
+            "an id that could never have been minted",
+            malformed_id,
+            400,
+            "BadRequestException",
+        ),
     ];
     for (method, payload, _) in OPERATIONS {
-        for (id_case, connection_id) in &ids {
+        for (id_case, connection_id, expected_status, expected_code) in &ids {
             let engine = engine_with_a_session();
             // No document at all: the caller holds no grant.
             given_policy(&engine, None);
@@ -422,17 +454,27 @@ async fn an_unauthorized_call_is_refused_before_the_connection_is_read() {
             )
             .await;
             assert_eq!(
-                status, 403,
-                "case {case:?}: the authorization decision precedes the ConnectionId, so \
-                 expected HTTP 403, got {status} {}",
+                status, *expected_status,
+                "case {case:?}: expected HTTP {expected_status}, got {status} {}",
                 rendered(&body)
             );
             assert_eq!(
                 error_code(&headers),
-                ACCESS_DENIED,
-                "case {case:?}: expected {ACCESS_DENIED}, got {}",
+                *expected_code,
+                "case {case:?}: expected {expected_code}, got {}",
                 error_code(&headers)
             );
+            if *expected_status == 400 {
+                // The malformed refusal says what was wrong with the request and names the
+                // value, which is the whole reason it is not the authorization refusal.
+                let expected = mgmt::state::invalid_connection_id_message(connection_id);
+                assert_eq!(
+                    error_message(&body),
+                    expected,
+                    "case {case:?} ({malformed_form}): expected {expected:?}, got {}",
+                    rendered(&body)
+                );
+            }
 
             // Nothing about the connection changed, which is what "before the store is
             // consulted" means on the wire.

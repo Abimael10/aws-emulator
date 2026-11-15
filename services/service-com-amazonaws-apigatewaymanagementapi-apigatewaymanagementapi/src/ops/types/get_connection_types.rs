@@ -124,9 +124,77 @@ impl ::aws_smithy_schema::serde::SerializableStruct for GetConnectionOutput {
     }
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.apigatewaymanagementapi#Identity")]
+/// `Identity`, with its schema written out instead of derived.
+///
+/// WHY it is not `#[smithy_macros::smithy(shape = ...)]`: both members are
+/// `@required` in the model (`smithy_query(query="shape", shape="Identity")`), and the
+/// derive forces a `@required` member to a NON-`Option` field, which would make
+/// `UserAgent` a value this service always reports. Recorded behaviour is that it is
+/// not: a `GetConnection` for a connection whose opening handshake carried no
+/// `User-Agent` field answers an `identity` with NO `userAgent` member — AWS does not
+/// synthesise an empty string for a field the client never sent, and the member's own
+/// documentation is "The User Agent of the API caller", of which there is none. The two
+/// member schemas below are the model's, member for member: same shape ids, same
+/// `@jsonName`s, same order.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced, for the
+/// reason [`GetConnectionOutput`] gives: this shape is reached only through an
+/// operation OUTPUT, which the server only ever serializes.
 #[derive(Debug, Clone, Default)]
 pub struct Identity {
+    /// The address the connection was established from, which every connection has.
     pub source_ip: String,
-    pub user_agent: String,
+    /// What the client named itself as in the opening handshake, or `None` for a client
+    /// that named nothing — in which case the member is absent from the answer.
+    pub user_agent: Option<String>,
+}
+
+#[allow(non_upper_case_globals)]
+impl Identity {
+    const M_SOURCE_IP: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.apigatewaymanagementapi#Identity$SourceIp",
+            "com.amazonaws.apigatewaymanagementapi",
+            "SourceIp",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "SourceIp",
+        0,
+    )
+    .with_json_name("sourceIp");
+
+    const M_USER_AGENT: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.apigatewaymanagementapi#Identity$UserAgent",
+            "com.amazonaws.apigatewaymanagementapi",
+            "UserAgent",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "UserAgent",
+        1,
+    )
+    .with_json_name("userAgent");
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.apigatewaymanagementapi#Identity",
+            "com.amazonaws.apigatewaymanagementapi",
+            "Identity",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_SOURCE_IP, &Self::M_USER_AGENT],
+    );
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for Identity {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        serializer.write_string(&Self::M_SOURCE_IP, self.source_ip.as_str())?;
+        if let Some(value) = self.user_agent.as_deref() {
+            serializer.write_string(&Self::M_USER_AGENT, value)?;
+        }
+        Ok(())
+    }
 }

@@ -410,35 +410,15 @@ pub(crate) fn not_authorized(action: &str, principal: &str, method_arn: &str) ->
 /// resource-based deny differently.
 pub(crate) const RESOURCE_EXPLICIT_DENY: &str = "with an explicit deny in a resource-based policy";
 
-/// How many trailing digits of the account an `execute-api` refusal reports unmasked.
-const UNMASKED_ACCOUNT_DIGITS: usize = 4;
-
-/// The character the masked part of the account is reported as.
-const ACCOUNT_MASK: char = '*';
-
-/// `arn` with all but the last [`UNMASKED_ACCOUNT_DIGITS`] of its ACCOUNT field replaced by
-/// [`ACCOUNT_MASK`], which is how the `execute-api` endpoint reports a resource in the
-/// sentence it refuses an unauthorized call with ([`Call::reported_resource`]).
+/// `arn` as a refusal REPORTS it: the account masked down to its last four digits, which is
+/// how the `execute-api` endpoint names a resource in the sentence it refuses an unauthorized
+/// call with ([`Call::reported_resource`]).
 ///
-/// The field is the fifth of the six an ARN is written in, so the resource that follows it —
-/// which may carry colons of its own — is left exactly as it was.
+/// The masking itself is `::service_common::iam_authorization::with_masked_account` — the one
+/// place in the tree that owns how a refusal reports an account — so this endpoint and the
+/// `@connections` endpoint of the WebSocket management API cannot mask one differently.
 fn masked_account(arn: &str) -> String {
-    let mut fields: Vec<&str> = arn.splitn(6, ':').collect();
-    let Some(account) = fields.get(4).copied() else {
-        return arn.to_string();
-    };
-    let masked: String = account
-        .char_indices()
-        .map(|(index, digit)| {
-            if index + UNMASKED_ACCOUNT_DIGITS < account.len() {
-                ACCOUNT_MASK
-            } else {
-                digit
-            }
-        })
-        .collect();
-    fields[4] = &masked;
-    fields.join(":")
+    ::service_common::iam_authorization::with_masked_account(arn)
 }
 
 #[cfg(test)]

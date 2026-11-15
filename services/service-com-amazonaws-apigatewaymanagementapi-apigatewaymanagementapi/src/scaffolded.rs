@@ -310,6 +310,73 @@ impl SerializableStruct for AccessDeniedException {
     }
 }
 
+/// The `message` member a MODELLED refusal carries its sentence under ([`Worded`]).
+///
+/// In the `smithy.framework` namespace for the same reason as the shapes above: the member is
+/// not in this service's model. The shape the wire names is the MODELLED one — only the
+/// sentence is written here.
+static WORDED_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#Worded$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// A MODELLED refusal together with the sentence the emulated endpoint words it in.
+///
+/// WHY it exists: several of this service's modelled errors declare NO members
+/// (`smithy_query(query="shape", shape="GoneException,ForbiddenException,LimitExceededException")`),
+/// so there is nothing to serialize a sentence into, while API Gateway's `execute-api`
+/// endpoint words some of those refusals in one. The status and the error code stay the
+/// MODEL's — they are read off the modelled error itself, not restated here — and the body
+/// gains the sentence the endpoint sends. A refusal the endpoint words no sentence in is
+/// returned as the plain modelled error instead, which renders the empty body the model
+/// implies.
+#[derive(Debug, Clone)]
+pub struct Worded<E> {
+    /// The modelled error, which decides the status, the error code and the shape.
+    pub modeled: E,
+    /// The sentence the endpoint refuses the call with.
+    pub message: String,
+}
+
+impl<E> Worded<E> {
+    /// `modeled` worded with `message`.
+    ///
+    /// Word it the way the emulated endpoint words that refusal class, and take every
+    /// variable part from the request and from stored state.
+    pub fn new(modeled: E, message: impl Into<String>) -> Self {
+        Self {
+            modeled,
+            message: message.into(),
+        }
+    }
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for Worded<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.modeled, self.message)
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for Worded<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.modeled.source()
+    }
+}
+
+impl<E> SerializableStruct for Worded<E> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&WORDED_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -318,6 +385,10 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// A modeled error the endpoint words a SENTENCE in, where the modelled shape has no
+    /// member to carry one. Renders with the model's own status and error code and that
+    /// sentence as the body's `message`; see [`Worded`].
+    WordedModeled(Worded<E>),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -385,6 +456,16 @@ impl<E> Scaffolded<E> {
     pub fn access_denied(message: impl Into<String>) -> Self {
         Self::AccessDenied(AccessDeniedException::new(message))
     }
+
+    /// Refuse the request with `modeled`'s own status and error code, carrying `message`.
+    ///
+    /// Reach for this where the emulated endpoint words a refusal in a sentence the MODELLED
+    /// shape has no member to carry — every error shape of this service but one is memberless
+    /// — so the status and the code stay the model's and only the body gains the sentence.
+    /// A refusal the endpoint words no sentence in stays a plain [`Scaffolded::Modeled`].
+    pub fn worded(modeled: E, message: impl Into<String>) -> Self {
+        Self::WordedModeled(Worded::new(modeled, message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -392,6 +473,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::WordedModeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::BadRequest(e) => write!(f, "{e}"),
             Self::AccessDenied(e) => write!(f, "{e}"),
@@ -406,6 +488,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::WordedModeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
             Self::BadRequest(e) => e.source(),
             Self::AccessDenied(e) => e.source(),
@@ -422,6 +505,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::WordedModeled(e) => e,
             Self::ValidationException(e) => e,
             Self::BadRequest(e) => e,
             Self::AccessDenied(e) => e,
@@ -432,6 +516,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            // The shape is the MODELLED one: only the sentence in the body is this
+            // service's, so the wire names the error the model declares.
+            Self::WordedModeled(e) => e.modeled.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::BadRequest(_) => &BAD_REQUEST_SCHEMA,
             Self::AccessDenied(_) => &ACCESS_DENIED_SCHEMA,
@@ -446,6 +533,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            Self::WordedModeled(e) => e.modeled.shape_name(),
             Self::ValidationException(_) => "ValidationException",
             Self::BadRequest(_) => "BadRequestException",
             Self::AccessDenied(_) => "AccessDeniedException",
@@ -460,6 +548,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            Self::WordedModeled(e) => e.modeled.http_status(),
             Self::ValidationException(_) => 400,
             Self::BadRequest(_) => 400,
             // The status every `execute-api` endpoint refuses an unauthorized call with.
@@ -474,6 +563,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
+            Self::WordedModeled(e) => e.modeled.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
             Self::BadRequest(_) => None,

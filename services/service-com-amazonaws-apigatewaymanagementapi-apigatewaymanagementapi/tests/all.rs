@@ -19,6 +19,8 @@ mod connection_error_envelope;
 mod connection_id_provenance;
 #[path = "all/connection_id_validity.rs"]
 mod connection_id_validity;
+#[path = "all/connection_identity_members.rs"]
+mod connection_identity_members;
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
 #[path = "all/connections_error_layer.rs"]
@@ -35,3 +37,5 @@ mod state_roundtrip;
 // as `crate::support`. It is declared here because every file under `tests/all/` must be.
 #[path = "all/support.rs"]
 mod support;
+#[path = "all/unread_connection_refusal.rs"]
+mod unread_connection_refusal;

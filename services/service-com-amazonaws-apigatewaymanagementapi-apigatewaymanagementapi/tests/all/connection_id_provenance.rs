@@ -278,7 +278,7 @@ async fn only_a_value_the_rule_accepts_can_be_registered() {
                 connection_id.clone(),
                 mgmt::state::Identity {
                     source_ip: "192.0.2.4".to_string(),
-                    user_agent: "encoding/1".to_string(),
+                    user_agent: Some("encoding/1".to_string()),
                 },
                 connected_at(),
             ),
