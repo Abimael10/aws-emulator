@@ -53,13 +53,13 @@ const PRESENT_KEY: &str = "/2020-05-31/distribution";
 const ABSENT_KEY: &str = "/2020-05-31/distribution/E0NOSUCHDISTRIB";
 
 /// The `X-Cache` of an answer the edge cache held.
-const CACHE_HIT: &str = "Hit from cloudfront";
+pub(crate) const CACHE_HIT: &str = "Hit from cloudfront";
 
 /// The `X-Cache` of an answer an origin produced for this very request.
-const CACHE_MISS: &str = "Miss from cloudfront";
+pub(crate) const CACHE_MISS: &str = "Miss from cloudfront";
 
 /// The `X-Cache` of an answer CloudFront produced itself, reaching no origin.
-const CACHE_ERROR: &str = "Error from cloudfront";
+pub(crate) const CACHE_ERROR: &str = "Error from cloudfront";
 
 /// The period the series are folded at, in seconds: the granularity CloudFront reports a
 /// distribution's traffic at.
@@ -147,34 +147,39 @@ async fn subscribe(router: &MultiServiceRouter, case: &str, id: &str) {
 
 /// What the edge answered one viewer request with, as this suite records it.
 #[derive(Debug)]
-struct Outcome {
-    status: u16,
-    x_cache: String,
+pub(crate) struct Outcome {
+    pub(crate) status: u16,
+    pub(crate) x_cache: String,
 }
 
 impl Outcome {
     /// Whether this answer is one of the CACHEABLE requests the hit rate is a rate of: a
     /// reading method answered below the error classes by the cache or an origin. An answer
     /// CloudFront produced itself came from neither, so it is not one.
-    fn cacheable(&self) -> bool {
+    pub(crate) fn cacheable(&self) -> bool {
         self.status < 400 && self.x_cache != CACHE_ERROR
     }
 
     /// Whether the edge CACHE produced this answer.
-    fn served_by_cache(&self) -> bool {
+    pub(crate) fn served_by_cache(&self) -> bool {
         self.x_cache == CACHE_HIT
     }
 
     /// Whether an ORIGIN produced this answer, which is what an origin latency is measured
     /// for.
-    fn served_by_origin(&self) -> bool {
+    pub(crate) fn served_by_origin(&self) -> bool {
         self.x_cache == CACHE_MISS
     }
 }
 
 /// One VIEWER request: no AWS credential, addressed at the name the distribution published,
 /// exactly as a browser reaches a distribution. Answers what the edge served it with.
-async fn viewed(router: &MultiServiceRouter, method: &str, domain: &str, path: &str) -> Outcome {
+pub(crate) async fn viewed(
+    router: &MultiServiceRouter,
+    method: &str,
+    domain: &str,
+    path: &str,
+) -> Outcome {
     let request = ::http::Request::builder()
         .method(method)
         .uri(path)

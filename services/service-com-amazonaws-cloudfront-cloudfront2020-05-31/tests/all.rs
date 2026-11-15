@@ -14,6 +14,8 @@
 mod absent_identifier_namespaces;
 #[path = "all/additional_metrics_gating.rs"]
 mod additional_metrics_gating;
+#[path = "all/additional_metrics_opt_in_boundary.rs"]
+mod additional_metrics_opt_in_boundary;
 #[path = "all/admission_preconditions.rs"]
 mod admission_preconditions;
 #[path = "all/alias_viewer_certificate.rs"]

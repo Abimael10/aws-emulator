@@ -2608,3 +2608,20 @@ mod autoscaling_plans_delete_withdraws_its_registration;
 // at once insert two lines in two places and have no prose to duplicate, re-word or mistype.
 // name is `E0428` and fails every suite in this target. A suite file no `mod` here names is
 // compiled nowhere, and a suite left at the top level of `tests/` fails the build.
+//! This file carries this header and then one `#[path = "all/<name>.rs"]` / `mod <name>;`
+//! pair per suite under `tests/all/`, sorted by name, and no other line — the shape
+//! `all/all_rs_is_a_canonical_declaration_list.rs` pins. Put a new suite at
+//! `tests/all/<name>.rs` and insert its pair into the sorted list; what that suite covers,
+//! and why it drives the assembled router rather than one service crate, belongs in its own
+//! module header, and a note about THIS file belongs in `all/appended_notes.rs`.
+//! Three rules fail every suite of this target rather than one, which is why nothing else
+//! stands here. A suite no `mod` names compiles nowhere and its tests never run, and a suite
+//! left at the top level of `tests/` fails the build. A suite declared twice is `E0428`,
+//! which compiles neither copy (`all/all_rs_declares_each_suite_once.rs`). An inner doc
+//! comment (`//!`) is legal only BEFORE the first item, so these header lines are the only
+//! place one may stand: past the first item it is `E0753`
+//! (`all/all_rs_inner_doc_comments_precede_the_first_item.rs`).
+//! Those three suites check both this root and every service crate's own `tests/all.rs`, so
+//! check there rather than restating a rule below. `tests/all.rs` is a test-target CRATE
+//! ROOT, where a bare `mod` would resolve to a sibling of this file (`tests/<name>.rs`),
+//! which the layout check refuses: the `#[path]` is what points each declaration into

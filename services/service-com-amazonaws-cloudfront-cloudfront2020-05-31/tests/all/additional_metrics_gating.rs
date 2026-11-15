@@ -153,7 +153,7 @@ async fn read_subscription(
 
 /// One `GetMetricStatistics` read of one of a distribution's series, answering the raw
 /// `Datapoints` list: what a client sees, emptiness included.
-async fn datapoints(
+pub(crate) async fn datapoints(
     router: &MultiServiceRouter,
     case: &str,
     distribution_id: &str,
@@ -184,7 +184,7 @@ async fn datapoints(
 
 /// What `ListMetrics` reports for ONE of a distribution's series, narrowed by the series' own
 /// name and dimensions — the filter a client uses to ask whether a series exists at all.
-async fn listed(
+pub(crate) async fn listed(
     router: &MultiServiceRouter,
     case: &str,
     distribution_id: &str,
@@ -354,7 +354,7 @@ impl Expected {
 }
 
 /// The basic statistics every read of a series asks for here.
-fn basic_statistics() -> Value {
+pub(crate) fn basic_statistics() -> Value {
     json!(["SampleCount", "Sum", "Average"])
 }
 
