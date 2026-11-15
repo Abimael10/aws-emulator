@@ -1318,3 +1318,180 @@ async fn every_request_a_web_acl_does_not_allow_is_worded_the_one_way() {
         );
     }
 }
+
+/// One refused request, beside every name the pool it addresses, that pool's web ACL and
+/// the rule in it were given: the values the refusal's sentence is held against.
+struct Worded {
+    case: &'static str,
+    /// The pool's own name, which also names its app client and its users.
+    pool_name: &'static str,
+    web_acl_name: &'static str,
+    /// The one rule the web ACL carries, named differently in every case.
+    rule_name: &'static str,
+    operation: &'static str,
+    default_action: Value,
+    rules: Value,
+    /// Whether the call carries the header the rule hunts for.
+    probe: bool,
+    /// The body addressing this case's own pool, built once that pool exists.
+    body: fn(&Pool) -> Value,
+}
+
+/// The refused requests whose wording is compared, each against a pool, a web ACL and a
+/// rule named nothing like the others', and each refused a different way: by a rule's
+/// `Block`, by the `DefaultAction` after a rule only counted the request, and by a
+/// `Captcha` action this endpoint's caller has no browser to solve.
+fn worded_rows() -> Vec<Worded> {
+    vec![
+        Worded {
+            case: "a rule blocks the sign-in entry point",
+            pool_name: "wording-alpha",
+            web_acl_name: "wording-alpha-web-acl",
+            rule_name: "alpha-refuses-the-probe",
+            operation: "InitiateAuth",
+            default_action: json!({ "Allow": {} }),
+            rules: json!([rule(
+                "alpha-refuses-the-probe",
+                0,
+                probe_header_match(),
+                json!({ "Block": {} }),
+            )]),
+            probe: true,
+            body: |pool| {
+                json!({
+                    "ClientId": pool.client_id,
+                    "AuthFlow": "USER_PASSWORD_AUTH",
+                    "AuthParameters": {
+                        "USERNAME": pool.username,
+                        "PASSWORD": GOOD_PASSWORD,
+                    },
+                })
+            },
+        },
+        Worded {
+            case: "the default action refuses a self-service read no rule matched",
+            pool_name: "wording-bravo",
+            web_acl_name: "wording-bravo-web-acl",
+            rule_name: "bravo-counts-the-probe",
+            operation: "GetUser",
+            default_action: json!({ "Block": {} }),
+            rules: json!([rule(
+                "bravo-counts-the-probe",
+                0,
+                probe_header_match(),
+                json!({ "Count": {} }),
+            )]),
+            probe: false,
+            body: |pool| json!({ "AccessToken": pool.access_token }),
+        },
+        Worded {
+            case: "a captcha action refuses a password reset",
+            pool_name: "wording-charlie",
+            web_acl_name: "wording-charlie-web-acl",
+            rule_name: "charlie-puzzles-the-probe",
+            operation: "ForgotPassword",
+            default_action: json!({ "Allow": {} }),
+            rules: json!([rule(
+                "charlie-puzzles-the-probe",
+                0,
+                probe_header_match(),
+                json!({ "Captcha": {} }),
+            )]),
+            probe: true,
+            body: |pool| {
+                json!({ "ClientId": pool.client_id, "Username": pool.challenged_username })
+            },
+        },
+    ]
+}
+
+/// RULE: the sentence the refusal carries is FIXED TEXT for that error class — it is
+/// built from nothing in the request, nothing in the web ACL that decided and nothing in
+/// the pool's state — so two pools whose names, ids, app clients, web ACLs and rules have
+/// nothing in common are refused with byte-identical messages, and none of those names
+/// appears anywhere in them.
+///
+/// The axis the previous test does not cover: that one varies which operation was called
+/// and which action refused it against ONE pool, while this one varies the state the
+/// message could have leaked and holds the sentence against every identifier in it.
+#[tokio::test]
+async fn the_refusal_sentence_carries_nothing_from_the_pool_the_web_acl_or_the_rule() {
+    let edge = Edge::new();
+    let mut messages: Vec<(&'static str, String)> = Vec::new();
+
+    for row in worded_rows() {
+        let pool = Pool::build(&edge, row.pool_name).await;
+        let web_acl = create_web_acl(
+            &edge,
+            row.web_acl_name,
+            row.default_action.clone(),
+            row.rules.clone(),
+        )
+        .await;
+        associate(&edge, &web_acl.arn, &pool.arn).await;
+
+        let headers: &[(&str, &str)] = if row.probe {
+            &[(PROBE_HEADER, PROBE_VALUE)]
+        } else {
+            &[]
+        };
+        let refused = edge.cognito(row.operation, &(row.body)(&pool), headers).await;
+        assert_eq!(
+            refused.outcome(),
+            (FORBIDDEN_STATUS, FORBIDDEN_EXCEPTION.to_string()),
+            "case {:?} ({}): expected the web ACL's refusal, got {} with {}",
+            row.case,
+            row.operation,
+            refused.status,
+            refused.body
+        );
+        assert_eq!(
+            refused.message(),
+            WAF_REFUSAL_MESSAGE,
+            "case {:?} ({}): expected the one sentence this refusal is worded with, got {:?}",
+            row.case,
+            row.operation,
+            refused.message()
+        );
+
+        // Every value this refusal COULD have been worded with, had the sentence been
+        // built from the request, from the web ACL or from the pool's state.
+        let carried: Vec<(&str, &str)> = vec![
+            ("the pool's name", row.pool_name),
+            ("the pool's id", &pool.id),
+            ("the pool's ARN", &pool.arn),
+            ("the app client the call was made through", &pool.client_id),
+            ("the user signing in", &pool.username),
+            ("the web ACL's name", row.web_acl_name),
+            ("the web ACL's id", &web_acl.id),
+            ("the web ACL's ARN", &web_acl.arn),
+            ("the rule's name", row.rule_name),
+            ("the operation called", row.operation),
+            ("the header the rule inspects", PROBE_HEADER),
+        ];
+        for (what, value) in carried {
+            assert!(
+                !refused.message().contains(value),
+                "case {:?} ({}): the refusal's sentence is fixed text, so it must not carry \
+                 {what} ({value:?}), got {:?}",
+                row.case,
+                row.operation,
+                refused.message()
+            );
+        }
+
+        messages.push((row.case, refused.message().to_string()));
+    }
+
+    let (first_case, first) = messages
+        .first()
+        .cloned()
+        .expect("the table refuses at least one request");
+    for (case, message) in &messages {
+        assert_eq!(
+            message, &first,
+            "case {case:?}: every request a web ACL does not allow is worded exactly as \
+             case {first_case:?} was ({first:?}), got {message:?}"
+        );
+    }
+}

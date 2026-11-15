@@ -4825,3 +4825,10 @@ mod appended_notes;
 //! declaration — never a note about one. `all/all_rs_declares_each_suite_once.rs` and
 //! this file and for every service crate's `tests/all.rs`, so leave a note THERE rather than
 //! here.
+//! THIS HEADER IS THE ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE:
+//! past the first item one is `E0753` and compiles no suite of this target, so a note
+//! added further down is an ordinary `//` comment. Below, add a declaration — not a note
+//! about one. `all/all_rs_declares_each_suite_once.rs` and
+//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING
+//! of this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what
+//! points each module into `tests/all/`.
