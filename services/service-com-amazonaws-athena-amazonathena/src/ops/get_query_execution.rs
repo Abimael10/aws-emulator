@@ -3,7 +3,9 @@
 //! @op GetQueryExecution
 //! IMPLEMENTED: answers with the stored query execution the id names, its state derived
 //! from the clock and the outcome the run recorded, and refuses an id this account holds
-//! no execution for.
+//! no execution for. Beside the modelled `QueryExecution` it reports the flattened
+//! `QueryExecutionDetail` view of the same record, which is recorded behaviour rather than
+//! modelled (see `types::recorded_member_wire`).
 //!
 //! ## Shape of an operation
 //!
@@ -55,6 +57,8 @@
 //! ## Output
 //!
 //! * `QueryExecution` (QueryExecution) — Information about the query execution.
+//! * `QueryExecutionDetail` — NOT in the model: the same execution flattened, which every
+//!   recorded 200 carries beside `QueryExecution`.
 //!
 //! ## Errors
 //!
@@ -147,6 +151,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exactly what it saw before this call. The STATE the execution reports is
         // derived from the clock and the stored outcome, not moved by this read.
         let store = state.lock();
+        // ONE instant for both views of the execution below.
+        let now = ::std::time::SystemTime::now();
 
         let Some(record) = store.query_execution(&input.query_execution_id) else {
             // Athena models no not-found error for this operation; naming an execution
@@ -160,8 +166,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        let execution = record.to_query_execution(now);
         Ok(GetQueryExecutionOutput {
-            query_execution: Some(record.to_query_execution(::std::time::SystemTime::now())),
+            // The same execution in the flattened form this read also reports, projected
+            // from the modelled view built just above, so the two agree member for member.
+            query_execution_detail: Some(record.to_query_execution_detail(&execution, now)),
+            query_execution: Some(execution),
         })
     }
 }

@@ -64,12 +64,68 @@ pub struct QueryExecution {
     pub query_results_s3_access_grants_configuration: Option<QueryResultsS3AccessGrantsConfiguration>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.athena#ManagedQueryResultsConfiguration")]
+/// The configuration a workgroup keeps its query results in Athena-owned storage under.
+///
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="ManagedQueryResultsConfiguration")`, plus
+/// `TimeToLive`, which is RECORDED BEHAVIOUR rather than modelled: a read of an execution
+/// whose results Athena holds in its own storage reports how long it keeps them. It is
+/// REPORTED and never read off the wire (`out`), because the retention is the service's own
+/// rather than a parameter of the request — see
+/// [`crate::state::managed_query_results_time_to_live`] — and
+/// `types::recorded_member_wire` for why this shape is hand-written.
 #[derive(Debug, Clone, Default)]
 pub struct ManagedQueryResultsConfiguration {
     pub enabled: bool,
     pub encryption_configuration: Option<ManagedQueryResultsEncryptionConfiguration>,
+    pub time_to_live: Option<ManagedQueryResultsTimeToLive>,
 }
+
+ath_schema_and_codec!(
+    ManagedQueryResultsConfiguration,
+    MANAGED_QUERY_RESULTS_CONFIGURATION_SCHEMA,
+    "com.amazonaws.athena#ManagedQueryResultsConfiguration",
+    "com.amazonaws.athena",
+    "ManagedQueryResultsConfiguration",
+    (M_ENABLED, enabled, "Enabled", 0, req, boolean),
+    (
+        M_ENCRYPTION_CONFIGURATION,
+        encryption_configuration,
+        "EncryptionConfiguration",
+        1,
+        opt,
+        struct_of(ManagedQueryResultsEncryptionConfiguration)
+    ),
+    (
+        M_TIME_TO_LIVE,
+        time_to_live,
+        "TimeToLive",
+        2,
+        out,
+        recorded(struct_of(ManagedQueryResultsTimeToLive))
+    ),
+);
+
+/// How long Athena keeps a query's results when it holds them in its own storage: the unit
+/// the retention is counted in and how many of them.
+///
+/// Wholly RECORDED behaviour — the on-disk model declares no such shape — so both members
+/// sit in the recorded namespace; see `types::recorded_member_wire`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManagedQueryResultsTimeToLive {
+    pub unit: String,
+    pub value: i32,
+}
+
+ath_schema_and_codec!(
+    ManagedQueryResultsTimeToLive,
+    MANAGED_QUERY_RESULTS_TIME_TO_LIVE_SCHEMA,
+    "com.amazonaws.athena.recorded#ManagedQueryResultsTimeToLive",
+    "com.amazonaws.athena.recorded",
+    "ManagedQueryResultsTimeToLive",
+    (M_UNIT, unit, "Unit", 0, req, string),
+    (M_VALUE, value, "Value", 1, req, integer),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.athena#ManagedQueryResultsEncryptionConfiguration")]
 #[derive(Debug, Clone, Default)]

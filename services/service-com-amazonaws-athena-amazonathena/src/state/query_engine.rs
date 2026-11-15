@@ -462,6 +462,11 @@ pub enum Outcome {
         update_count: Option<i64>,
         /// How many bytes of data the engine read to answer, for `DataScannedInBytes`.
         data_scanned_bytes: i64,
+        /// How many rows the run READ from the stored objects its statement named: the
+        /// rows materialised in the engine database for it (see [`materialised_rows`]).
+        /// Counted beside the bytes, because what a run read is reported as a row count
+        /// as well as a byte count.
+        input_rows: i64,
     },
     /// The statement did not run to completion, with the message for why.
     Failed {
@@ -626,6 +631,7 @@ pub fn run_over(
         };
     }
 
+    let input_rows = materialised_rows(objects);
     let started = Instant::now();
     guard.arm(MAX_QUERY_DEADLINE, step_budget());
     database.reads_stored_data.store(false, Ordering::SeqCst);
@@ -659,6 +665,7 @@ pub fn run_over(
             } else {
                 scanned_bytes
             },
+            input_rows,
         },
         Ok(Produced::Affected(rows)) => Outcome::Succeeded {
             result: StoredResultSet::default(),
@@ -668,6 +675,7 @@ pub fn run_over(
             // it rather than one it did not produce.
             update_count: counts_rows.then_some(rows),
             data_scanned_bytes: 0,
+            input_rows,
         },
         Err(failure) => Outcome::Failed {
             message: failure.message(),
@@ -683,6 +691,24 @@ pub fn run_over(
         // by the resolution that did it (see `super::catalog_sql::execute`).
         planning_time: std::time::Duration::ZERO,
     }
+}
+
+/// How many rows one run READ from the stored objects it was handed: the rows materialised
+/// in the engine database for it, which for a statement over catalog tables is the data the
+/// run read.
+///
+/// A view contributes none of its own: its rows come from the tables it reads, which are
+/// counted where they are materialised. A run handed no object read no stored rows at all.
+fn materialised_rows(objects: &[LocalObject]) -> i64 {
+    let rows: usize = objects
+        .iter()
+        .map(|object| match object {
+            LocalObject::Table(table) => table.rows.len(),
+            LocalObject::Filtered { table, .. } => table.rows.len(),
+            LocalObject::View { .. } => 0,
+        })
+        .sum();
+    i64::try_from(rows).unwrap_or(i64::MAX)
 }
 
 /// Either the rows a query returned, or the row count a statement that returns no

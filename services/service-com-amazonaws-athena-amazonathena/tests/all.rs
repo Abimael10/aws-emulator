@@ -47,6 +47,9 @@ mod notebook_import_export;
 #[path = "all/prepared_statement_lifecycle.rs"]
 mod prepared_statement_lifecycle;
 
+#[path = "all/query_execution_detail.rs"]
+mod query_execution_detail;
+
 #[path = "all/query_execution_identity.rs"]
 mod query_execution_identity;
 

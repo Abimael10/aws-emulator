@@ -17,9 +17,237 @@ pub struct GetQueryExecutionInput {
     pub query_execution_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.athena#GetQueryExecutionOutput")]
+/// What `GetQueryExecution` reports: the modelled `QueryExecution`, plus the flattened view
+/// of the same execution the service publishes beside it.
+///
+/// Member set and order from
+/// `smithy_query(query="shape", shape="GetQueryExecutionOutput")`, which models exactly one
+/// member, plus `QueryExecutionDetail` — RECORDED BEHAVIOUR rather than modelled; see
+/// [`QueryExecutionDetail`] and `types::recorded_member_wire` for why the shape is
+/// hand-written.
 #[derive(Debug, Clone, Default)]
 pub struct GetQueryExecutionOutput {
     pub query_execution: Option<QueryExecution>,
+    pub query_execution_detail: Option<QueryExecutionDetail>,
 }
+
+ath_schema_and_codec!(
+    GetQueryExecutionOutput,
+    GET_QUERY_EXECUTION_OUTPUT_SCHEMA,
+    "com.amazonaws.athena#GetQueryExecutionOutput",
+    "com.amazonaws.athena",
+    "GetQueryExecutionOutput",
+    (
+        M_QUERY_EXECUTION,
+        query_execution,
+        "QueryExecution",
+        0,
+        opt,
+        struct_of(QueryExecution)
+    ),
+    (
+        M_QUERY_EXECUTION_DETAIL,
+        query_execution_detail,
+        "QueryExecutionDetail",
+        1,
+        opt,
+        recorded(struct_of(QueryExecutionDetail))
+    ),
+);
+
+/// One query execution in the FLATTENED form a read of it also reports: the same execution
+/// the modelled `QueryExecution` describes, with its identity, its statement, where its
+/// results went, its workgroup, its status and its counters at the top level.
+///
+/// Wholly RECORDED behaviour — the on-disk model declares no such shape — so it and every
+/// member of it sit in the recorded namespace; see `types::recorded_member_wire`. Every value
+/// is projected from the stored execution
+/// ([`crate::state::QueryExecutionRecord::to_query_execution_detail`]), so the two views of
+/// one execution can never disagree.
+#[derive(Debug, Clone, Default)]
+pub struct QueryExecutionDetail {
+    pub query_execution_id: Option<String>,
+    pub query: Option<String>,
+    pub query_execution_context: Option<QueryExecutionContext>,
+    pub result_configuration: Option<ResultConfiguration>,
+    pub output_location: Option<String>,
+    pub work_group: Option<String>,
+    pub status: Option<QueryExecutionDetailStatus>,
+    pub stats: Option<QueryExecutionDetailStats>,
+}
+
+ath_schema_and_codec!(
+    QueryExecutionDetail,
+    QUERY_EXECUTION_DETAIL_SCHEMA,
+    "com.amazonaws.athena.recorded#QueryExecutionDetail",
+    "com.amazonaws.athena.recorded",
+    "QueryExecutionDetail",
+    (
+        M_QUERY_EXECUTION_ID,
+        query_execution_id,
+        "QueryExecutionId",
+        0,
+        opt,
+        string
+    ),
+    (M_QUERY, query, "Query", 1, opt, string),
+    (
+        M_QUERY_EXECUTION_CONTEXT,
+        query_execution_context,
+        "QueryExecutionContext",
+        2,
+        opt,
+        struct_of(QueryExecutionContext)
+    ),
+    (
+        M_RESULT_CONFIGURATION,
+        result_configuration,
+        "ResultConfiguration",
+        3,
+        opt,
+        struct_of(ResultConfiguration)
+    ),
+    (
+        M_OUTPUT_LOCATION,
+        output_location,
+        "OutputLocation",
+        4,
+        opt,
+        string
+    ),
+    (M_WORK_GROUP, work_group, "WorkGroup", 5, opt, string),
+    (
+        M_STATUS,
+        status,
+        "Status",
+        6,
+        opt,
+        struct_of(QueryExecutionDetailStatus)
+    ),
+    (
+        M_STATS,
+        stats,
+        "Stats",
+        7,
+        opt,
+        struct_of(QueryExecutionDetailStats)
+    ),
+);
+
+/// The status of an execution as its flattened view reports it: the state it is in, when it
+/// was submitted, when it completed and why it is in that state.
+///
+/// Wholly RECORDED behaviour, like [`QueryExecutionDetail`] itself.
+#[derive(Debug, Clone, Default)]
+pub struct QueryExecutionDetailStatus {
+    pub state: Option<String>,
+    pub state_change_reason: Option<String>,
+    pub submission_date_time: Option<::aws_smithy_types::DateTime>,
+    pub completion_date_time: Option<::aws_smithy_types::DateTime>,
+}
+
+ath_schema_and_codec!(
+    QueryExecutionDetailStatus,
+    QUERY_EXECUTION_DETAIL_STATUS_SCHEMA,
+    "com.amazonaws.athena.recorded#QueryExecutionDetailStatus",
+    "com.amazonaws.athena.recorded",
+    "QueryExecutionDetailStatus",
+    (M_STATE, state, "State", 0, opt, string),
+    (
+        M_STATE_CHANGE_REASON,
+        state_change_reason,
+        "StateChangeReason",
+        1,
+        opt,
+        string
+    ),
+    (
+        M_SUBMISSION_DATE_TIME,
+        submission_date_time,
+        "SubmissionDateTime",
+        2,
+        opt,
+        date_time
+    ),
+    (
+        M_COMPLETION_DATE_TIME,
+        completion_date_time,
+        "CompletionDateTime",
+        3,
+        opt,
+        date_time
+    ),
+);
+
+/// What one execution cost, as its flattened view reports it: the engine's own span, the
+/// bytes and the rows the run moved, and whether it reused an earlier result.
+///
+/// Wholly RECORDED behaviour, like [`QueryExecutionDetail`] itself. Every counter is the same
+/// measure the modelled `QueryExecutionStatistics` reports, under the name the flattened form
+/// gives it.
+#[derive(Debug, Clone, Default)]
+pub struct QueryExecutionDetailStats {
+    pub engine_execution_time_in_millis: Option<i64>,
+    pub processed_bytes: Option<i64>,
+    pub processed_input_bytes: Option<i64>,
+    pub processed_input_rows: Option<i64>,
+    pub processed_rows: Option<i64>,
+    pub result_reuse_information: Option<ResultReuseInformation>,
+}
+
+ath_schema_and_codec!(
+    QueryExecutionDetailStats,
+    QUERY_EXECUTION_DETAIL_STATS_SCHEMA,
+    "com.amazonaws.athena.recorded#QueryExecutionDetailStats",
+    "com.amazonaws.athena.recorded",
+    "QueryExecutionDetailStats",
+    (
+        M_ENGINE_EXECUTION_TIME_IN_MILLIS,
+        engine_execution_time_in_millis,
+        "EngineExecutionTimeInMillis",
+        0,
+        opt,
+        long
+    ),
+    (
+        M_PROCESSED_BYTES,
+        processed_bytes,
+        "ProcessedBytes",
+        1,
+        opt,
+        long
+    ),
+    (
+        M_PROCESSED_INPUT_BYTES,
+        processed_input_bytes,
+        "ProcessedInputBytes",
+        2,
+        opt,
+        long
+    ),
+    (
+        M_PROCESSED_INPUT_ROWS,
+        processed_input_rows,
+        "ProcessedInputRows",
+        3,
+        opt,
+        long
+    ),
+    (
+        M_PROCESSED_ROWS,
+        processed_rows,
+        "ProcessedRows",
+        4,
+        opt,
+        long
+    ),
+    (
+        M_RESULT_REUSE_INFORMATION,
+        result_reuse_information,
+        "ResultReuseInformation",
+        5,
+        opt,
+        struct_of(ResultReuseInformation)
+    ),
+);
 

@@ -6998,3 +6998,21 @@ mod all_rs_is_a_canonical_declaration_list;
 //! never to a line below the list.
 //! (`tests/boot_serve.rs`), which the layout check refuses. The `#[path]` attribute is what
 //! points each declaration into `tests/all/`.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, keeping the list sorted: one pair per
+//! suite and NOTHING else, so a landing has one place to insert and nothing to keep
+//! consistent. A suite no `mod` names compiles nowhere and its tests never run; a suite left
+//! fails every suite in this target.
+//! never a note about one, and never a copy of this header.
+//! this file and for every service crate's `tests/all.rs`, so leave no note here.
+//! WHY a suite belongs to this cross-service target rather than to one service crate's own is
+//! stated in that suite's OWN module doc, where it is read beside the test it explains and
+//! stays correct when the suite moves. This file is the declaration list and nothing else:
+//! the tail had grown thousands of lines of notes about the file itself — copies of this
+//! header re-typed with `//!` (`E0753`, so no suite of this target compiled) and bookkeeping
+//! about declarations that are no longer duplicated — and they are gone rather than re-typed.
+//! Some files under `tests/all/` are shared harnesses rather than suites (`query_wire`,
+//! `eks_wire`) and some are probes; every file there is declared, because a file no
+//! declaration names is compiled nowhere.
+// A new suite's declaration goes in the sorted list above, as its own `#[path]` / `mod` pair
+// and nothing else. Anything written below this line must be an ordinary `//` comment: past
+// the first item an inner doc comment (`//!`) is `E0753` and compiles no suite of this target.

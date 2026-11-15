@@ -114,10 +114,12 @@ use ::service_com_amazonaws_glue_awsglue::ops::types::Column as GlueColumn;
 use ::service_com_amazonaws_glue_awsglue::state as glue_state;
 
 use crate::ops::types::{
-    Column, DataCatalog, EngineVersion, ManagedQueryResultsConfiguration, QueryExecution,
-    QueryExecutionContext, QueryExecutionStatistics, QueryExecutionStatus, ResultConfiguration,
-    ResultReuseConfiguration, ResultReuseInformation, TableMetadata, Tag, WorkGroup,
-    WorkGroupConfiguration, WorkGroupSummary, CONNECTION_TYPE_VALUES, DATA_CATALOG_TYPE_VALUES,
+    Column, DataCatalog, EngineVersion, ManagedQueryResultsConfiguration,
+    ManagedQueryResultsTimeToLive, QueryExecution, QueryExecutionContext, QueryExecutionDetail,
+    QueryExecutionDetailStats, QueryExecutionDetailStatus, QueryExecutionStatistics,
+    QueryExecutionStatus, ResultConfiguration, ResultReuseConfiguration, ResultReuseInformation,
+    TableMetadata, Tag, WorkGroup, WorkGroupConfiguration, WorkGroupSummary,
+    CONNECTION_TYPE_VALUES, DATA_CATALOG_TYPE_VALUES,
 };
 
 /// The `WorkGroupState` a freshly created workgroup is in. One of
@@ -1504,8 +1506,12 @@ impl QueryExecutionRecord {
             query: Some(self.query_string.clone()),
             statement_type: self.statement_type.clone(),
             // The configuration a query whose results Athena keeps in its own storage ran
-            // under; a query that wrote them at an output location ran under none.
-            managed_query_results_configuration: self.managed_query_results.clone(),
+            // under, carrying how long that storage keeps them; a query that wrote them at
+            // an output location ran under none.
+            managed_query_results_configuration: self
+                .managed_query_results
+                .clone()
+                .map(reported_managed_query_results),
             result_configuration: (self.managed_query_results.is_none()
                 || self.result_configuration.output_location.is_some())
             .then(|| self.reported_result_configuration(now)),
@@ -1529,6 +1535,74 @@ impl QueryExecutionRecord {
                 .then(|| self.execution_parameters.clone()),
             substatement_type: self.substatement_type.clone(),
             query_results_s3_access_grants_configuration: None,
+        }
+    }
+
+    /// The record as the flattened `QueryExecutionDetail` a read answers with BESIDE the
+    /// modelled `QueryExecution` it is handed.
+    ///
+    /// Projected from the same stored execution and the same measures as that view — which is
+    /// why the view itself is a parameter rather than built again here, so both are of ONE
+    /// instant by construction: the id, the statement, the context, where the results went,
+    /// the workgroup, the state and the counters are each the one the modelled view reports,
+    /// under the name the flattened form gives it.
+    pub fn to_query_execution_detail(
+        &self,
+        execution: &QueryExecution,
+        now: SystemTime,
+    ) -> QueryExecutionDetail {
+        let status = execution.status.clone().unwrap_or_default();
+        let statistics = execution.statistics.clone().unwrap_or_default();
+        let result_configuration = execution.result_configuration.clone();
+        QueryExecutionDetail {
+            query_execution_id: execution.query_execution_id.clone(),
+            query: execution.query.clone(),
+            query_execution_context: execution.query_execution_context.clone(),
+            // The flattened view reports where the results went twice: as the configuration
+            // the query ran under, and on its own at the top level.
+            output_location: result_configuration
+                .as_ref()
+                .and_then(|configuration| configuration.output_location.clone()),
+            result_configuration,
+            work_group: execution.work_group.clone(),
+            status: Some(QueryExecutionDetailStatus {
+                state: status.state,
+                state_change_reason: status.state_change_reason,
+                submission_date_time: status.submission_date_time,
+                completion_date_time: status.completion_date_time,
+            }),
+            stats: Some(QueryExecutionDetailStats {
+                engine_execution_time_in_millis: statistics.engine_execution_time_in_millis,
+                // What the run read at the objects its statement named, which is the one
+                // measure this service takes of the data a run processed — and the number
+                // the modelled view reports as `DataScannedInBytes`.
+                processed_bytes: statistics.data_scanned_in_bytes,
+                // The bytes of input a run is handed BESIDE the data it reads itself: what
+                // another stage of the same query, or a source that accounts for its own
+                // reads, passes it. This engine runs a statement as ONE stage over the
+                // objects it reads itself, so no run is handed any such input, and
+                // everything it did read is reported as `ProcessedBytes` above.
+                processed_input_bytes: Some(0),
+                processed_input_rows: Some(self.input_rows_at(now)),
+                // The rows the run PROCESSED are the rows it read: the engine processes
+                // every input row, whatever the statement then projects or aggregates them
+                // into, so this counter is the same measure as the input one rather than a
+                // count of what came out.
+                processed_rows: Some(self.input_rows_at(now)),
+                result_reuse_information: statistics.result_reuse_information,
+            }),
+        }
+    }
+
+    /// How many rows this run READ from the objects its statement named, reported from the
+    /// moment the query is terminal — exactly as the engine's own span is, and for the same
+    /// reason: only then is the run over as far as a caller can see.
+    fn input_rows_at(&self, now: SystemTime) -> i64 {
+        match (self.outcome.as_ref(), self.is_terminal_at(now)) {
+            (Some(query_engine::Outcome::Succeeded { input_rows, .. }), true) => *input_rows,
+            // A run that failed completed no read, and one still running has not reported
+            // what it read.
+            _ => 0,
         }
     }
 
@@ -1688,6 +1762,38 @@ pub fn resolved_managed_query_results(
     work_group
         .and_then(|record| record.configuration.managed_query_results_configuration.clone())
         .filter(|managed| managed.enabled)
+}
+
+/// The unit the retention Athena applies to results it holds in its own storage is counted
+/// in; see [`managed_query_results_time_to_live`].
+pub const MANAGED_QUERY_RESULTS_TTL_UNIT: &str = "DAYS";
+
+/// How many [`MANAGED_QUERY_RESULTS_TTL_UNIT`] that retention is.
+pub const MANAGED_QUERY_RESULTS_TTL_VALUE: i32 = 1;
+
+/// How long Athena keeps the results of a query whose workgroup holds them in Athena-owned
+/// storage, as a read of that query reports it.
+///
+/// RECORDED behaviour, and the SERVICE's own: a read of an execution in such a workgroup
+/// reports a retention of one day, whatever the request asked for — nothing in
+/// `StartQueryExecution` or in a workgroup's configuration sets it, which is why the member
+/// is never taken off the wire (see `ManagedQueryResultsConfiguration` in
+/// [`crate::ops::types`]).
+pub fn managed_query_results_time_to_live() -> ManagedQueryResultsTimeToLive {
+    ManagedQueryResultsTimeToLive {
+        unit: MANAGED_QUERY_RESULTS_TTL_UNIT.to_string(),
+        value: MANAGED_QUERY_RESULTS_TTL_VALUE,
+    }
+}
+
+/// The managed-results configuration a READ of a query execution reports: the one the query
+/// ran under, with the retention the service applies to those results on it
+/// ([`managed_query_results_time_to_live`]).
+fn reported_managed_query_results(
+    mut managed: ManagedQueryResultsConfiguration,
+) -> ManagedQueryResultsConfiguration {
+    managed.time_to_live = Some(managed_query_results_time_to_live());
+    managed
 }
 
 /// The message a query with nowhere to write its results is refused with: the error the

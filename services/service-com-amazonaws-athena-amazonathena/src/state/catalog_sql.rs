@@ -61,10 +61,19 @@ pub const ERROR_CATEGORY_SYSTEM: i32 = 1;
 /// see [`ERROR_CATEGORY_SYSTEM`].
 pub const ERROR_CATEGORY_USER: i32 = 2;
 
+/// The `AthenaError$ErrorType` Athena publishes for a failure the data catalog LAYER
+/// raises rather than the query engine: a task the catalog's own metastore refused, and a
+/// catalog name the statement's context addresses that the account has not registered.
+///
+/// RECORDED behaviour: a wire fixture submits a statement whose `QueryExecutionContext`
+/// names a catalog nothing registered, and the execution settles FAILED with this type
+/// beside [`ERROR_CATEGORY_USER`].
+pub const ERROR_TYPE_CATALOG_LAYER: i32 = 1006;
+
 /// The `AthenaError$ErrorType` Athena publishes for a DDL TASK the catalog's own
 /// metastore refused: a statement that would define an object the catalog already holds,
 /// and one that would drop a database that still holds tables.
-pub const ERROR_TYPE_DDL_TASK: i32 = 1006;
+pub const ERROR_TYPE_DDL_TASK: i32 = ERROR_TYPE_CATALOG_LAYER;
 
 /// The `AthenaError$ErrorType` Athena publishes for the NOT-FOUND class: a statement
 /// naming a table or a database the data catalog does not hold.
@@ -342,13 +351,25 @@ impl Failure {
     }
 
     /// The statement names a data catalog this account has not registered.
+    ///
+    /// A classified failure, not an unclassified user one: the catalog layer is what
+    /// cannot resolve the name, so the execution carries the error type Athena publishes
+    /// for that layer ([`ERROR_TYPE_CATALOG_LAYER`]) and a client can branch on the
+    /// category and the type instead of reading the message. The `CATALOG_NOT_FOUND: `
+    /// prefix and "Catalog '"/"' does not exist" are fixed text; the catalog is the one
+    /// the request named, folded the way the catalog folds a name, and the line and column
+    /// are where the statement addressed it.
     pub fn catalog_not_found(at: Position, catalog: &str) -> Self {
-        Self::user(format!(
-            "CATALOG_NOT_FOUND: line {}:{}: Catalog '{}' does not exist",
-            at.line,
-            at.column,
-            catalog.to_ascii_lowercase()
-        ))
+        Self::classified(
+            format!(
+                "CATALOG_NOT_FOUND: line {}:{}: Catalog '{}' does not exist",
+                at.line,
+                at.column,
+                catalog.to_ascii_lowercase()
+            ),
+            ERROR_CATEGORY_USER,
+            ERROR_TYPE_CATALOG_LAYER,
+        )
     }
 
     /// A `CREATE EXTERNAL TABLE` declares a `LOCATION` that denotes a single OBJECT
@@ -461,6 +482,9 @@ pub fn execute<Eng: Send + Sync + 'static>(
                     result,
                     update_count: None,
                     data_scanned_bytes: 0,
+                    // A catalog statement names no relation and materialises no object, so
+                    // it read no rows of stored data.
+                    input_rows: 0,
                 },
                 Err(failure) => failure.outcome(),
             };
