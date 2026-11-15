@@ -363,13 +363,11 @@ async fn an_unknown_parameter_group_name_is_refused_with_not_found() {
             "case {absent:?}: describe of an absent group must be 400 \
              ParameterGroupNotFoundFault, got {status} {body:?}"
         );
-        assert!(
-            !body["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains(absent)
-                || absent.is_empty(),
-            "case {absent:?}: the not-found message must not echo the request, got {body:?}"
+        assert_eq!(
+            body["message"].as_str().unwrap_or_default(),
+            state::parameter_group_not_found_message(),
+            "case {absent:?}: a read of a group it addresses answers that path's own \
+             template, got {body:?}"
         );
 
         let (status, body) = call(

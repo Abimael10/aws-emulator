@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/dax_account_network.rs"]
+mod dax_account_network;
 #[path = "all/dax_client_fault_wire_status.rs"]
 mod dax_client_fault_wire_status;
 #[path = "all/dax_cluster_lifecycle.rs"]
@@ -19,6 +21,8 @@ mod dax_cluster_lifecycle;
 mod dax_default_parameters;
 #[path = "all/dax_describe_parameters.rs"]
 mod dax_describe_parameters;
+#[path = "all/dax_parameter_group_resolution.rs"]
+mod dax_parameter_group_resolution;
 #[path = "all/dax_parameter_groups.rs"]
 mod dax_parameter_groups;
 #[path = "all/dax_rejection_paths.rs"]

@@ -255,16 +255,17 @@ async fn every_modeled_client_fault_answers_the_json_protocol_client_status() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule: a not-found fault's message is built in one place per fault, and names the
-// identifier that resolved to nothing exactly where it was raised while resolving one
-// element of a requested LIST of names — the only case in which the request does not
-// already say which name failed. The name it reports is the identity the resource is
-// stored by (`CreateCluster$ClusterName` documents that it "is stored as a lowercase
-// string"), not the spelling the request used.
+// Rule: a not-found fault's message is built in one place per fault, and its variable
+// parts come from the request and from the store — the identifier that resolved to
+// nothing, in the form the resource is addressed by (a cluster or subnet group is stored
+// lower-cased, `CreateCluster$ClusterName`: "stored as a lowercase string"; a parameter
+// group is stored as spelled), with the fixed text of the template unchanged.
 // Source: the recorded DAX answers — "Cluster <name> not found." from the describe
 // taking `ClusterNames`, "Cluster not found." from the single-`ClusterName` paths,
-// "Subnet group <name> not found." from the describe taking `SubnetGroupNames`, and
-// "Parameter Group not found." for the parameter-group family.
+// "Subnet group <name> not found." from the describe taking `SubnetGroupNames` against
+// "Subnet Group not found." from a create that references one, and "Parameter Group not
+// found." from the parameter-group reads against "ParameterGroup not found: <name>" from
+// a cluster that references one.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -340,7 +341,9 @@ async fn a_not_found_fault_names_the_resource_its_template_names() {
          got {body:?}"
     );
 
-    // The subnet-group template names its group the same way.
+    // The subnet-group templates: the describe taking a LIST names the group that
+    // resolved to nothing, and a create that merely REFERENCES one does not, because the
+    // request already carries the only group it could mean.
     for asked in ["absent-sg", "Absent-SG"] {
         let (status, body) = call(
             &router,
@@ -359,10 +362,23 @@ async fn a_not_found_fault_names_the_resource_its_template_names() {
             "case DescribeSubnetGroups {asked:?}: the fault must name the group asked for, \
              got {body:?}"
         );
+
+        let mut request = create_cluster_body(&format!("sg-{}", asked.to_lowercase()), 1);
+        request["SubnetGroupName"] = json!(asked);
+        let (status, body) = call(&router, "CreateCluster", request).await;
+        assert_eq!(
+            status, CLIENT_FAULT_STATUS,
+            "case CreateCluster {asked:?}: expected {CLIENT_FAULT_STATUS}, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_message(&body),
+            "Subnet Group not found.",
+            "case CreateCluster {asked:?}: this template names no identifier, got {body:?}"
+        );
     }
 
-    // The parameter-group template names nothing, so the same text answers whichever
-    // name was asked for and whichever operation resolved it.
+    // The parameter-group templates: a path that ADDRESSES the group names none, and a
+    // cluster that REFERENCES one names the group it could not be given.
     for asked in ["absent-group", "ABSENT-GROUP"] {
         for (operation, request) in [
             (
@@ -371,6 +387,10 @@ async fn a_not_found_fault_names_the_resource_its_template_names() {
             ),
             (
                 "DeleteParameterGroup",
+                json!({ "ParameterGroupName": asked }),
+            ),
+            (
+                "DescribeParameters",
                 json!({ "ParameterGroupName": asked }),
             ),
         ] {
@@ -383,10 +403,24 @@ async fn a_not_found_fault_names_the_resource_its_template_names() {
             assert_eq!(
                 error_message(&body),
                 "Parameter Group not found.",
-                "case {operation} {asked:?}: this fault's template names no identifier, \
+                "case {operation} {asked:?}: this path's template names no identifier, \
                  got {body:?}"
             );
         }
+
+        let mut request = create_cluster_body(&format!("pg-{}", asked.to_lowercase()), 1);
+        request["ParameterGroupName"] = json!(asked);
+        let (status, body) = call(&router, "CreateCluster", request).await;
+        assert_eq!(
+            status, CLIENT_FAULT_STATUS,
+            "case CreateCluster {asked:?}: expected {CLIENT_FAULT_STATUS}, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("ParameterGroup not found: {asked}"),
+            "case CreateCluster {asked:?}: the fault must name the group the cluster asked \
+             for, got {body:?}"
+        );
     }
 }
 

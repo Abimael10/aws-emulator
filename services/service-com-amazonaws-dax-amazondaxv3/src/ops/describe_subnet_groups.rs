@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let name = name.to_lowercase();
                 if !store.subnet_groups.contains_key(&name) {
                     return Err(DescribeSubnetGroupsErrorModeled::SubnetGroupNotFoundFault(
-                        crate::state::subnet_group_not_found(&name),
+                        crate::state::subnet_group_not_found_named(&name),
                     )
                     .into());
                 }

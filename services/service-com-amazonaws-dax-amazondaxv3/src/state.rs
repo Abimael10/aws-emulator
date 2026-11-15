@@ -8,19 +8,18 @@
 //! view of one stored resource instead of building its own. It also owns the message
 //! each fault answers with, so one fault reads the same whatever raises it.
 //!
-//! It carries one thing DAX does not own: the Region's NETWORK, against which a
-//! subnet group's identifiers are resolved ([`region_subnets`]). The emulator's EC2
-//! service models no subnets yet; when it does, `resolve_subnet` is the one place that
-//! should read them from it instead. FSx's `state.rs` applies the SAME derivation to
-//! `CreateFileSystem$SubnetIds`, both written against the contract
-//! `services/common/src/network.rs` states, so the two report one account network; the
-//! derivation moves into that shared module once one change may carry both service
-//! crates' manifests.
+//! One thing a subnet group reports is NOT this service's to hold: the account's
+//! network. The subnets a group names belong to Amazon EC2, so they are resolved against
+//! the service that owns them ([`ec2_subnets`]) and the VPC and Availability Zone this
+//! service reports for them are the ones EC2 answered with — the contract
+//! `services/common/src/network.rs` states for every service that places a resource in a
+//! subnet.
+
+/// The subnets the ACCOUNT has, as Amazon EC2 reports them.
+pub mod ec2_subnets;
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     Cluster, ClusterNotFoundFault, Endpoint, Event, InvalidClusterStateFault,
@@ -224,12 +223,9 @@ pub const DEFAULT_EVENT_DURATION: i32 = 24 * 60;
 /// requests grows the event log without limit.
 pub const MAX_EVENTS: usize = 500;
 
-/// How many hex characters an EC2 subnet identifier carries in its long form
-/// (`subnet-0bb1c79de3example`), which is the form the network model below mints.
-const SUBNET_ID_HEX_LEN: usize = 17;
-
-/// A subnet of the account's network in one Region: the identifier a request names,
-/// the VPC it belongs to and the Availability Zone it sits in.
+/// A subnet of the account's network in one Region, as the service that OWNS subnets
+/// reports it ([`ec2_subnets`]): the identifier a request names, the VPC it belongs to
+/// and the Availability Zone it sits in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubnetRecord {
     /// The EC2 subnet identifier, as a request names it.
@@ -238,51 +234,6 @@ pub struct SubnetRecord {
     pub vpc_id: String,
     /// The Availability Zone this subnet sits in.
     pub availability_zone: String,
-}
-
-/// The id of the account's default VPC in `region`.
-///
-/// AWS gives an account a default VPC in every Region and this emulator models no
-/// other, so the id is DERIVED from the Region name — stable, so every read reports
-/// the same VPC — in EC2's short `vpc-<8 hex>` form.
-pub fn default_vpc_id(region: &str) -> String {
-    format!("vpc-{}", hex::encode(&Sha256::digest(region.as_bytes())[..4]))
-}
-
-/// The subnets that exist in `region`: the default VPC's default subnet in each
-/// Availability Zone of that Region.
-///
-/// AWS creates the default VPC with "a size /16 IPv4 CIDR block and a default subnet
-/// in each Availability Zone" (EC2's `CreateDefaultVpc`), so these subnets are facts
-/// of the account's Region rather than resources a DAX request creates — the same
-/// reasoning EC2's own state module gives for deriving a Region's Availability Zones
-/// instead of storing them. Each identifier is derived from its zone name in EC2's
-/// long `subnet-<17 hex>` form, so a Region always reports the same subnets and
-/// [`resolve_subnet`] can tell an identifier that names one from an identifier that
-/// names nothing at all.
-pub fn region_subnets(region: &str) -> Vec<SubnetRecord> {
-    let vpc_id = default_vpc_id(region);
-    AZ_SUFFIXES
-        .iter()
-        .map(|suffix| {
-            let availability_zone = format!("{region}{suffix}");
-            let digest = hex::encode(Sha256::digest(availability_zone.as_bytes()));
-            SubnetRecord {
-                subnet_id: format!("subnet-{}", &digest[..SUBNET_ID_HEX_LEN]),
-                vpc_id: vpc_id.clone(),
-                availability_zone,
-            }
-        })
-        .collect()
-}
-
-/// The subnet `subnet_id` names in `region`, or `None` when no subnet of that Region
-/// carries that identifier — which is what lets a request naming it be refused
-/// instead of stored.
-pub fn resolve_subnet(region: &str, subnet_id: &str) -> Option<SubnetRecord> {
-    region_subnets(region)
-        .into_iter()
-        .find(|subnet| subnet.subnet_id == subnet_id)
 }
 
 /// A stored `Endpoint`: a DNS name, a port and the URL a DAX client dials.
@@ -574,8 +525,8 @@ pub struct SubnetGroupRecord {
     pub name: String,
     pub description: Option<String>,
     pub vpc_id: String,
-    /// The subnets this group names, as [`resolve_subnet`] resolved them when the
-    /// group was created, in the order the request named them.
+    /// The subnets this group names, as [`ec2_subnets::resolve_requested_subnets`]
+    /// resolved them when the group was created, in the order the request named them.
     pub subnets: Vec<SubnetRecord>,
     /// The Region whose network the group's subnets were resolved in.
     pub region: String,
@@ -1015,11 +966,20 @@ pub fn max_results_out_of_range_message() -> String {
     )
 }
 
-/// The message `ParameterGroupNotFoundFault` carries. This fault has one template and
-/// it names no identifier: the requested name is NOT echoed back, on any path that
-/// raises it.
+/// The message `ParameterGroupNotFoundFault` carries on a path that READS or REMOVES a
+/// parameter group the request addresses by name: one fixed template, naming no
+/// identifier.
 pub fn parameter_group_not_found_message() -> String {
     "Parameter Group not found.".to_string()
+}
+
+/// The message `ParameterGroupNotFoundFault` carries when a request names a parameter
+/// group as a REFERENCE from another resource — a cluster's `ParameterGroupName`: the
+/// fixed text `ParameterGroup not found: ` followed by that name, so the caller is told
+/// which group the cluster could not be given. DAX words the two paths differently, and
+/// each is taken from its own recorded answer.
+pub fn parameter_group_not_found_named_message(name: &str) -> String {
+    format!("ParameterGroup not found: {name}")
 }
 
 /// The page of `names` to answer, and the token that continues it.
@@ -1081,11 +1041,12 @@ pub fn from_date_time(at: ::aws_smithy_types::DateTime) -> Option<SystemTime> {
 // The message each fault answers with
 //
 // A fault's wording is built here and nowhere else, so every site raising it answers
-// the same text. Most DAX faults have ONE template, which makes the message a property
-// of the FAULT rather than of the operation; the exception is a fault raised while
-// resolving one element of a LIST of requested identifiers, where the text names the
-// element that resolved to nothing — that is the only case in which the caller cannot
-// tell from the request which name failed.
+// the same text. A fault raised on more than one KIND of path has one template per kind,
+// each taken from that path's own recorded answer and each named for it: a request that
+// ADDRESSES one resource, one that names it as one element of a requested LIST, and one
+// that REFERENCES it from another resource word their not-found differently. A template's
+// variable parts come from the request and from this store, never from where the fault
+// happened to be raised.
 // ---------------------------------------------------------------------------
 
 /// `ClusterNotFoundFault` for a request addressed to ONE cluster: the template names no
@@ -1107,9 +1068,22 @@ pub fn cluster_not_found_named(name: &str) -> ClusterNotFoundFault {
     }
 }
 
-/// `SubnetGroupNotFoundFault` for a subnet group this store does not hold. This
-/// fault's template DOES name the group it was asked for.
-pub fn subnet_group_not_found(name: &str) -> SubnetGroupNotFoundFault {
+/// `SubnetGroupNotFoundFault` for a request that REFERENCES one subnet group — a cluster
+/// placed in it: the template names no identifier, because the request already carries
+/// the only group it could mean.
+pub fn subnet_group_not_found() -> SubnetGroupNotFoundFault {
+    SubnetGroupNotFoundFault {
+        message: Some("Subnet Group not found.".to_string()),
+    }
+}
+
+/// `SubnetGroupNotFoundFault` for one element of a requested LIST of subnet group names:
+/// the template NAMES that element, so a caller that asked for several groups can tell
+/// which of them is missing. `name` is the identifier as this service holds it —
+/// `CreateSubnetGroup$SubnetGroupName` documents that it "is stored as a lowercase
+/// string", so the lower-cased form is the group's identity rather than a rewrite of the
+/// request.
+pub fn subnet_group_not_found_named(name: &str) -> SubnetGroupNotFoundFault {
     SubnetGroupNotFoundFault {
         message: Some(format!("Subnet group {name} not found.")),
     }
@@ -1165,11 +1139,20 @@ pub fn events_beyond_retention() -> InvalidParameterCombinationException {
     }
 }
 
-/// `ParameterGroupNotFoundFault` for a parameter group this store does not hold,
-/// carrying [`parameter_group_not_found_message`].
+/// `ParameterGroupNotFoundFault` for a parameter group this store does not hold, on a
+/// path that ADDRESSES that group, carrying [`parameter_group_not_found_message`].
 pub fn parameter_group_not_found() -> ParameterGroupNotFoundFault {
     ParameterGroupNotFoundFault {
         message: Some(parameter_group_not_found_message()),
+    }
+}
+
+/// `ParameterGroupNotFoundFault` for a parameter group a cluster REFERENCES and this
+/// store does not hold, carrying [`parameter_group_not_found_named_message`] for the name
+/// the request carried.
+pub fn parameter_group_not_found_named(name: &str) -> ParameterGroupNotFoundFault {
+    ParameterGroupNotFoundFault {
+        message: Some(parameter_group_not_found_named_message(name)),
     }
 }
 

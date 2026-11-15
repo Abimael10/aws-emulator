@@ -21,18 +21,26 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Derives a subnet group's VPC id and a subnet's AZ placement from the subnet
-# identifiers, so one set of subnets always reports one VPC.
-sha2 = { workspace = true }
-# Renders that digest as the hex an EC2 `vpc-` identifier carries.
-hex = { workspace = true }
+# The AWS SDK for EC2, driven over the in-process callback into this same
+# emulator: the subnets a subnet group is built from are EC2's resources, so
+# `src/state/ec2_subnets.rs` asks EC2 what the account has rather than deciding
+# it here. Only the generated client is needed — the emulator supplies the
+# transport — and `behavior-version-latest` is what `BehaviorVersion::latest()`
+# in that module is gated behind.
+aws-sdk-ec2 = { version = "1", default-features = false, features = ["behavior-version-latest"] }
+# `arn::region_label`: the ONE reading of a caller-supplied Region as a Region
+# LABEL, which is what the endpoint the EC2 call above is made at is built from.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# The EC2 service, mounted beside this one in the test harness: that a subnet
+# group can be built from the subnets the account HAS can only be driven end to
+# end with the owner of subnets on the same engine. DEV-ONLY: this crate depends
+# on no other service's crate outside its tests.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true

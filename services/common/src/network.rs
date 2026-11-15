@@ -43,11 +43,10 @@
 //!     skip.
 //!     Either way the refusal that IS served is the one EC2's answer grounds.
 //!
-//! `dax`'s `state.rs` still DERIVES a default network of its own (`region_subnets` /
-//! `resolve_subnet` / `default_vpc_id`, from SHA-256 of the Region and zone names), which
-//! EC2 holds no subnet for: it has its own open issue, and the fix for it is this contract —
-//! resolve against EC2, in that service's own `resolve_subnet`. `elasticache` did the same
-//! and now asks EC2 (`src/state/ec2_subnets.rs`).
+//! `dax` asked the same question of a default network it DERIVED itself (from SHA-256 of the
+//! Region and zone names), which EC2 held no subnet for, so no client could name a subnet it
+//! would accept; it now resolves `CreateSubnetGroup$SubnetIds` against EC2 in its own
+//! `src/state/ec2_subnets.rs`, as `elasticache` does.
 //!
 //! Nothing should invent a SECOND answer to "which subnets does the account have": ask the
 //! service that owns them.

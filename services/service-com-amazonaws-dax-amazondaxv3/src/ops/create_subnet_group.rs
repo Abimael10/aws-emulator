@@ -7,12 +7,16 @@
 //! stored. A second create of the same name is refused with
 //! `SubnetGroupAlreadyExistsFault`; a request naming no subnet with `InvalidSubnet`.
 //!
-//! Every identifier in `SubnetIds` is RESOLVED against the Region's network
-//! (`crate::state::resolve_subnet`), and a request naming an identifier that resolves
-//! to no subnet is refused with 400 `InvalidParameterValueException` and stores
-//! nothing: a subnet group that points at subnets which do not exist is unusable, and
-//! AWS refuses it rather than answering 200. The group's VPC and each subnet's
-//! Availability Zone come from the resolved subnets, not from the identifier text.
+//! Every identifier in `SubnetIds` is RESOLVED against the subnets the ACCOUNT has, as
+//! the service that owns them reports them (`crate::state::ec2_subnets`), and a request
+//! naming an identifier Amazon EC2 holds no subnet for is refused with 400
+//! `InvalidParameterValueException` and stores nothing: a subnet group that points at
+//! subnets which do not exist is unusable, and AWS refuses it rather than answering 200.
+//! The group's VPC and each subnet's Availability Zone come from the records EC2 answered
+//! with, not from the identifier text — and because the group reports ONE `VpcId`, a
+//! request whose subnets span two VPCs is refused with `InvalidSubnet` ("All of the
+//! subnets that you specify in a subnet group must exist in the same VPC",
+//! `CreateCluster$SubnetGroupName`).
 //!
 //! ## Shape of an operation
 //!
@@ -194,24 +198,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Every identifier must name a subnet that exists in the Region this request
-        // was signed for. An identifier that resolves to nothing cannot be placed in a
-        // VPC or a zone, so the request is refused and NOTHING is stored.
-        let mut resolved = Vec::with_capacity(input.subnet_ids.len());
-        let mut unresolved: Vec<String> = Vec::new();
-        for subnet_id in &input.subnet_ids {
-            match crate::state::resolve_subnet(&region, subnet_id) {
-                Some(subnet) => resolved.push(subnet),
-                None if unresolved.contains(subnet_id) => {}
-                None => unresolved.push(subnet_id.clone()),
+        // Every identifier must name a subnet the ACCOUNT has in the Region this request
+        // was signed for, which only the service that owns subnets can answer. An
+        // identifier it reports no subnet for cannot be placed in a VPC or a zone, so the
+        // request is refused and NOTHING is stored.
+        let requested: Vec<&str> = input.subnet_ids.iter().map(String::as_str).collect();
+        let resolved = match crate::state::ec2_subnets::resolve_requested_subnets(
+            ctx, &region, &requested,
+        )
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(unresolved) => {
+                return Err(CreateSubnetGroupErrorModeled::InvalidParameterValueException(
+                    crate::state::invalid_subnets(&unresolved),
+                )
+                .into());
             }
-        }
-        if !unresolved.is_empty() {
-            return Err(CreateSubnetGroupErrorModeled::InvalidParameterValueException(
-                crate::state::invalid_subnets(&unresolved),
-            )
+        };
+
+        // "All of the subnets that you specify in a subnet group must exist in the same
+        // VPC" (`CreateCluster$SubnetGroupName`): the group reports ONE `VpcId`, so a
+        // request spanning two VPCs names no VPC the group could be placed in.
+        let Some(vpc_id) = crate::state::ec2_subnets::common_vpc(&resolved) else {
+            return Err(CreateSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
+                message: Some(
+                    "All of the subnets that you specify in a subnet group must exist in \
+                     the same VPC."
+                        .to_string(),
+                ),
+            })
             .into());
-        }
+        };
+        let vpc_id = vpc_id.to_string();
 
         let name = input.subnet_group_name.to_lowercase();
         let mut store = state.lock();
@@ -240,12 +259,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::SubnetGroupRecord {
             name: name.clone(),
             description: input.description,
-            // Every subnet of this emulator's network sits in the Region's one VPC, so
-            // the group's VPC is the VPC its resolved subnets belong to.
-            vpc_id: resolved
-                .first()
-                .map(|subnet| subnet.vpc_id.clone())
-                .unwrap_or_else(|| crate::state::default_vpc_id(&region)),
+            // The one VPC the subnets EC2 resolved all belong to.
+            vpc_id,
             subnets: resolved,
             region,
         };

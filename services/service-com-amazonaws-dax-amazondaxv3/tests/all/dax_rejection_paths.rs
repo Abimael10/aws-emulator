@@ -6,21 +6,21 @@
 //!
 //! Every case drives `POST /` with `X-Amz-Target: AmazonDAXV3.<Operation>` through the
 //! same `MultiServiceRouter` the production router builds, so what is asserted is the
-//! HTTP behaviour a DAX SDK client sees.
+//! HTTP behaviour a DAX SDK client sees. The harness and the account's network come from
+//! `crate::dax_account_network`, the suite that owns them, because a subnet group is
+//! built from the subnets the owner of subnets really holds.
 //!
 //! The tables below span the CLASS each rule covers; the one request the issue reported
 //! is a single row.
 
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_dax_amazondaxv3::{state, EmulatedService};
-use smithy_server_runtime::MultiServiceRouter;
+use service_com_amazonaws_dax_amazondaxv3::state;
 
-/// The region every request below is signed for: the Region whose network a subnet
-/// identifier is resolved in.
-const REGION: &str = "us-west-2";
+use crate::dax_account_network::{
+    an_account_subnet, call, emulator, error_code, error_message,
+};
 
 /// A role ARN to pass as the required `IamRoleArn`.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/DAXRole";
@@ -31,72 +31,6 @@ const NODE_TYPE: &str = "dax.r4.large";
 /// Wait until every clock-owed status move started before the call is due.
 async fn settle() {
     tokio::time::sleep(state::STATUS_SETTLE_DELAY + Duration::from_millis(400)).await;
-}
-
-/// A router carrying only this service, over its own engine, so each test starts from
-/// an empty store.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// Call one operation and return its HTTP status and parsed JSON body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", format!("AmazonDAXV3.{operation}"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/dax/aws4_request, \
-                 SignedHeaders=host;x-amz-target, Signature=0000"
-            ),
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(&body).expect("the request body serializes"),
-        ))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    (status, parsed)
-}
-
-/// The wire error code of a failed call: the `__type` member, without any namespace.
-fn error_code(body: &Value) -> String {
-    body["__type"]
-        .as_str()
-        .unwrap_or_default()
-        .rsplit('#')
-        .next()
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// The wire error message of a failed call, under either casing an error envelope uses.
-fn error_message(body: &Value) -> String {
-    body["message"]
-        .as_str()
-        .or_else(|| body["Message"].as_str())
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// The subnets that exist in `region`'s network.
-fn subnets_in(region: &str) -> Vec<String> {
-    state::region_subnets(region)
-        .into_iter()
-        .map(|subnet| subnet.subnet_id)
-        .collect()
 }
 
 /// A `CreateCluster` body with the required members filled in.
@@ -120,131 +54,13 @@ fn seconds_ago(ago: Duration) -> f64 {
 
 // ---------------------------------------------------------------------------
 // Cause 1. Rule: `CreateSubnetGroup` resolves every identifier in `SubnetIds` against
-// the subnets that exist in the Region the request was signed for, and refuses a
+// the subnets the ACCOUNT has in the Region the request was signed for, and refuses a
 // request naming any identifier that resolves to no subnet — HTTP 400
 // `InvalidParameterValueException`, listing the identifiers it could not resolve —
-// storing nothing.
-// Source: `state::region_subnets` (the Region's network) and the recorded AWS answer
-// for a subnet identifier that names nothing.
+// storing nothing. The subnets the account has belong to the service that OWNS subnets,
+// so that rule and its table live in `crate::dax_account_network`, beside the harness
+// that asks it.
 // ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn a_subnet_group_is_refused_unless_every_identifier_names_an_existing_subnet() {
-    let router = emulator();
-    let here = subnets_in(REGION);
-    let elsewhere = subnets_in("eu-west-1");
-
-    // Rows differ in WHY an identifier resolves to nothing: the long EC2 form that
-    // names no subnet (the reported request), the short EC2 form, a string that is not
-    // a subnet id at all, a real subnet of ANOTHER Region, and one bad identifier
-    // hidden among good ones. The accepted rows span one subnet, every subnet of the
-    // Region, and a repeated identifier.
-    let accepted: [(&str, Vec<String>); 3] = [
-        ("one-subnet", vec![here[0].clone()]),
-        ("every-subnet", here.clone()),
-        ("repeated", vec![here[1].clone(), here[1].clone()]),
-    ];
-    let refused: [(&str, Vec<String>, Vec<String>); 5] = [
-        (
-            "bogus-long",
-            vec!["subnet-0000000000deadbee".to_string()],
-            vec!["subnet-0000000000deadbee".to_string()],
-        ),
-        (
-            "bogus-short",
-            vec!["subnet-0a1b2c3d".to_string()],
-            vec!["subnet-0a1b2c3d".to_string()],
-        ),
-        (
-            "not-a-subnet-id",
-            vec!["potato".to_string()],
-            vec!["potato".to_string()],
-        ),
-        (
-            "other-region",
-            vec![elsewhere[0].clone()],
-            vec![elsewhere[0].clone()],
-        ),
-        (
-            "one-bad-among-good",
-            vec![
-                here[0].clone(),
-                "subnet-0000000000deadbee".to_string(),
-                here[1].clone(),
-            ],
-            vec!["subnet-0000000000deadbee".to_string()],
-        ),
-    ];
-
-    for (case, subnet_ids) in accepted {
-        let (status, body) = call(
-            &router,
-            "CreateSubnetGroup",
-            json!({ "SubnetGroupName": case, "SubnetIds": subnet_ids }),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: an existing subnet is accepted, got {status} {body:?}"
-        );
-        // Round trip: the group must read back out of the store.
-        let (status, read) = call(
-            &router,
-            "DescribeSubnetGroups",
-            json!({ "SubnetGroupNames": [case] }),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: DescribeSubnetGroups got {status} {read:?}"
-        );
-        assert_eq!(
-            read["SubnetGroups"][0], body["SubnetGroup"],
-            "case {case:?}: the stored group must read back as created, got {read:?}"
-        );
-    }
-
-    for (case, subnet_ids, invalid) in refused {
-        let (status, body) = call(
-            &router,
-            "CreateSubnetGroup",
-            json!({ "SubnetGroupName": case, "SubnetIds": subnet_ids.clone() }),
-        )
-        .await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: {subnet_ids:?} names no existing subnet, expected a refusal, \
-             got {status} {body:?}"
-        );
-        assert_eq!(
-            error_code(&body),
-            "InvalidParameterValueException",
-            "case {case:?}: expected InvalidParameterValueException, got {body:?}"
-        );
-        assert_eq!(
-            error_message(&body),
-            format!("Some input subnets in :[{}] are invalid.", invalid.join(", ")),
-            "case {case:?}: the message must list the identifiers that resolve to nothing, \
-             got {body:?}"
-        );
-        // Nothing was stored: the group does not exist.
-        let (status, read) = call(
-            &router,
-            "DescribeSubnetGroups",
-            json!({ "SubnetGroupNames": [case] }),
-        )
-        .await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: a refused create leaves nothing behind, got {status} {read:?}"
-        );
-        assert_eq!(
-            error_code(&read),
-            "SubnetGroupNotFoundFault",
-            "case {case:?}: expected SubnetGroupNotFoundFault, got {read:?}"
-        );
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Cause 2. Rule: `DescribeEvents` reports the events this service recorded for its own
@@ -374,7 +190,7 @@ async fn describe_events_refuses_a_window_past_the_retained_days_and_reads_the_r
 #[tokio::test]
 async fn describe_events_reports_the_events_the_store_recorded() {
     let router = emulator();
-    let subnet = subnets_in(REGION).swap_remove(0);
+    let subnet = an_account_subnet(&router).await;
 
     let (status, body) = call(
         &router,
@@ -632,22 +448,29 @@ async fn one_fault_answers_one_message_whatever_operation_raises_it() {
         }
     }
 
-    // `SubnetGroupNotFoundFault`'s template DOES name the group, lower-cased the way
-    // the group is stored.
+    // `SubnetGroupNotFoundFault` has the two templates its callers need: the describe
+    // taking a LIST names the group that resolved to nothing, lower-cased the way the
+    // group is stored, and a create that merely REFERENCES one names none, because the
+    // request already carries the only group it could mean.
     let groups: [(&str, &str); 2] = [("absent-sg", "absent-sg"), ("Absent-SG", "absent-sg")];
     for (asked, stored) in groups {
-        let cases: [(&str, Value); 2] = [
+        let cases: [(&str, Value, String); 2] = [
             (
                 "DescribeSubnetGroups",
                 json!({ "SubnetGroupNames": [asked] }),
+                format!("Subnet group {stored} not found."),
             ),
-            ("CreateCluster", {
-                let mut body = create_cluster_body("needs-sg");
-                body["SubnetGroupName"] = json!(asked);
-                body
-            }),
+            (
+                "CreateCluster",
+                {
+                    let mut body = create_cluster_body("needs-sg");
+                    body["SubnetGroupName"] = json!(asked);
+                    body
+                },
+                "Subnet Group not found.".to_string(),
+            ),
         ];
-        for (operation, body) in cases {
+        for (operation, body, expected) in cases {
             let (status, answered) = call(&router, operation, body).await;
             assert_eq!(
                 status, 400,
@@ -660,7 +483,7 @@ async fn one_fault_answers_one_message_whatever_operation_raises_it() {
             );
             assert_eq!(
                 error_message(&answered),
-                format!("Subnet group {stored} not found."),
+                expected,
                 "case {operation} {asked:?}: wrong message, got {answered:?}"
             );
         }

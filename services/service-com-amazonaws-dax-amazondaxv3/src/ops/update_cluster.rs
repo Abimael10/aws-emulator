@@ -190,6 +190,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_due(now);
 
+        // A parameter group the request names is RESOLVED against the store — the groups
+        // this account holds, including the default group DAX provides — so a request
+        // naming one that does not exist is refused with the modelled
+        // `ParameterGroupNotFoundFault` and changes nothing.
+        let unknown_parameter_group = input
+            .parameter_group_name
+            .as_deref()
+            .filter(|name| !store.parameter_groups.contains_key(*name))
+            .map(str::to_string);
+
         let Some(cluster) = store.clusters.get_mut(&cluster_name) else {
             return Err(UpdateClusterErrorModeled::ClusterNotFoundFault(
                 crate::state::cluster_not_found(),
@@ -199,6 +209,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if cluster.status != crate::state::CLUSTER_AVAILABLE {
             return Err(UpdateClusterErrorModeled::InvalidClusterStateFault(
                 crate::state::invalid_cluster_state(),
+            )
+            .into());
+        }
+        if let Some(name) = unknown_parameter_group {
+            return Err(UpdateClusterErrorModeled::ParameterGroupNotFoundFault(
+                crate::state::parameter_group_not_found_named(&name),
             )
             .into());
         }

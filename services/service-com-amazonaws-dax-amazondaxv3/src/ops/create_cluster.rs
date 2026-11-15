@@ -13,6 +13,13 @@
 //! [`crate::state::STATUS_SETTLE_DELAY`] after this call, materialised by whichever
 //! reporting operation next reads the store.
 //!
+//! The resources the request NAMES are resolved against stored state before the cluster
+//! is minted, and before the `ClusterName` format rule is applied: `ParameterGroupName`
+//! against the parameter groups this account holds (400 `ParameterGroupNotFoundFault`)
+//! and `SubnetGroupName` against the stored subnet groups (400
+//! `SubnetGroupNotFoundFault`), so no cluster is stored carrying a name that resolves to
+//! nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -234,6 +241,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
+        let mut store = state.lock();
+        // Read the clock's due transitions first, so a name freed by a settled deletion
+        // is available again and a group a settled delete freed is gone.
+        store.settle_due(now);
+
+        // The resources the request NAMES are RESOLVED against the store before any
+        // format rule is applied to another member, which is the order AWS answers in: a
+        // request naming a parameter group or a subnet group that does not exist is
+        // answered with that resource's own not-found fault whatever else it carries.
+        if let Some(requested) = input.parameter_group_name.as_deref() {
+            if !store.parameter_groups.contains_key(requested) {
+                return Err(CreateClusterErrorModeled::ParameterGroupNotFoundFault(
+                    crate::state::parameter_group_not_found_named(requested),
+                )
+                .into());
+            }
+        }
+        // The nodes are placed in the subnet group's zones when the request names none,
+        // so resolving the group is also what reads the pool out of stored state.
+        let subnet_group = match input.subnet_group_name.as_deref() {
+            Some(requested) => {
+                let name = requested.to_lowercase();
+                let Some(group) = store.subnet_groups.get(&name) else {
+                    return Err(CreateClusterErrorModeled::SubnetGroupNotFoundFault(
+                        crate::state::subnet_group_not_found(),
+                    )
+                    .into());
+                };
+                Some((name, group.availability_zones()))
+            }
+            None => None,
+        };
+
         // The name rule the `ClusterName` doc states, refused before anything is stored.
         if let Some(reason) = crate::state::cluster_name_violation(&input.cluster_name) {
             return Err(CreateClusterErrorModeled::InvalidParameterValueException(
@@ -305,10 +345,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let cluster_name = input.cluster_name.to_lowercase();
-        let mut store = state.lock();
-        // Read the clock's due transitions first, so a name freed by a settled deletion
-        // is available again.
-        store.settle_due(now);
         if store.clusters.contains_key(&cluster_name) {
             return Err(CreateClusterErrorModeled::ClusterAlreadyExistsFault(
                 ClusterAlreadyExistsFault {
@@ -333,21 +369,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The nodes are placed in the subnet group's zones when the request names none,
-        // which also resolves `SubnetGroupName` against stored state.
-        let subnet_group = match input.subnet_group_name {
-            Some(name) => {
-                let name = name.to_lowercase();
-                let Some(group) = store.subnet_groups.get(&name) else {
-                    return Err(CreateClusterErrorModeled::SubnetGroupNotFoundFault(
-                        crate::state::subnet_group_not_found(&name),
-                    )
-                    .into());
-                };
-                Some((name, group.availability_zones()))
-            }
-            None => None,
-        };
         let (subnet_group_name, group_zones) = match subnet_group {
             Some((name, zones)) => (Some(name), zones),
             None => (None, Vec::new()),
