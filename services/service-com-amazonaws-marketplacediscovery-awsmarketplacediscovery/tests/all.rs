@@ -29,6 +29,8 @@ mod fulfillment_option_records;
 mod fulfillment_options;
 #[path = "all/iam_authorization.rs"]
 mod iam_authorization;
+#[path = "all/iam_policy_lifecycle.rs"]
+mod iam_policy_lifecycle;
 #[path = "all/keyword_search_and_paging.rs"]
 mod keyword_search_and_paging;
 #[path = "all/purchase_option_badges_and_offer_sets.rs"]

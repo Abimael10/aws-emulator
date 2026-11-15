@@ -38,7 +38,10 @@ const PREFIX: &str = "http://discovery-marketplace.us-east-1.amazonaws.com/2026-
 
 /// This service's IAM action prefix, which is its `arnNamespace` and its signing name
 /// (`smithy_query(query="service_info")`).
-const ACTION_PREFIX: &str = "aws-marketplace";
+///
+/// `pub(crate)` with the rest of this module's harness: `tests/all/iam_policy_lifecycle.rs`
+/// drives the same wire path, so a request is built and read exactly one way.
+pub(crate) const ACTION_PREFIX: &str = "aws-marketplace";
 
 /// The access key id of the account's own published credential: a key neither STS nor IAM
 /// holds a record for, which is the position AWS account root credentials are in.
@@ -71,15 +74,15 @@ fn router_with_identity() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// What one call answered: its HTTP status, the wire error code and the parsed body.
-struct Answer {
-    status: u16,
-    error_code: Option<String>,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) error_code: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// The refusal's `message`, or the empty string when the answer carries none.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         self.body
             .get("message")
             .and_then(Value::as_str)
@@ -88,14 +91,14 @@ impl Answer {
     }
 
     /// Whether this answer is the modelled authorization refusal.
-    fn refused(&self) -> bool {
+    pub(crate) fn refused(&self) -> bool {
         self.error_code.as_deref() == Some("AccessDeniedException")
     }
 }
 
 /// Call one operation of this service signed with `access_key_id` — what names the principal
 /// the request speaks for.
-async fn call_as(
+pub(crate) async fn call_as(
     router: &MultiServiceRouter,
     access_key_id: &str,
     operation: &str,
@@ -203,7 +206,7 @@ fn allow(actions: Value) -> Value {
 
 /// Which of IAM's two refusals a row expects.
 #[derive(Debug, Clone, Copy)]
-enum Refusal {
+pub(crate) enum Refusal {
     /// The default deny of a request no statement allows.
     DefaultDeny,
     /// The explicit deny of a request a `Deny` statement covers.
@@ -212,7 +215,7 @@ enum Refusal {
 
 impl Refusal {
     /// The clause IAM closes the refusal with.
-    fn reason(self, action: &str) -> String {
+    pub(crate) fn reason(self, action: &str) -> String {
         match self {
             Self::DefaultDeny => {
                 format!("because no identity-based policy allows the {action} action")
@@ -288,19 +291,21 @@ fn documents_in_force(
 
 /// One operation of this service, as a client addresses it: the body the rule is judged on,
 /// and the catalog resource its refusal names.
-struct Operation {
-    name: &'static str,
-    route: &'static str,
-    body: Value,
+pub(crate) struct Operation {
+    pub(crate) name: &'static str,
+    pub(crate) route: &'static str,
+    pub(crate) body: Value,
     /// The resource field of the ARN the action is judged against, after
     /// `catalog/<catalog>/`; empty for an operation that addresses the catalog itself.
-    record: String,
+    pub(crate) record: String,
 }
 
 /// The catalog this emulator serves, and a listing, product and offer id it holds — read
 /// back through the service itself with the account's own credential, so no id and no
 /// catalog name is written out here.
-async fn catalog_records(router: &MultiServiceRouter) -> (String, String, String, String) {
+pub(crate) async fn catalog_records(
+    router: &MultiServiceRouter,
+) -> (String, String, String, String) {
     let page = call_as(
         router,
         ACCOUNT_KEY_ID,
@@ -352,7 +357,7 @@ async fn catalog_records(router: &MultiServiceRouter) -> (String, String, String
 /// Every operation this service serves, each with a request of its own and the record its
 /// refusal names. The rule covers all of them, so the table is the whole surface rather than
 /// a sample of it.
-fn operations(listing_id: &str, product_id: &str, offer_id: &str) -> Vec<Operation> {
+pub(crate) fn operations(listing_id: &str, product_id: &str, offer_id: &str) -> Vec<Operation> {
     // An offer-set id of this catalog's own shape that no record carries, so the row gets
     // past authorization into the operation's own not-found answer rather than into a second
     // decision.
@@ -417,7 +422,7 @@ fn operations(listing_id: &str, product_id: &str, offer_id: &str) -> Vec<Operati
 
 /// The resource ARN an operation addressing `record` under `catalog` is judged against: an
 /// AWS Marketplace catalog ARN, which carries no Region and no account.
-fn resource_of(catalog: &str, record: &str) -> String {
+pub(crate) fn resource_of(catalog: &str, record: &str) -> String {
     if record.is_empty() {
         format!("arn:aws:{ACTION_PREFIX}:::catalog/{catalog}")
     } else {
