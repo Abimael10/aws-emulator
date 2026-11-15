@@ -213,14 +213,22 @@ pub(crate) fn refusal_message(answer: &Answer) -> String {
         .to_string()
 }
 
-/// The endpoint THIS emulator answers on, as the framework states it for a router that is
-/// not served on a port — which is what an in-process suite's emulator is, and so the
-/// authority a published data-plane address carries here. Read from the framework rather
-/// than spelled out, so the expectation is "this emulator's own endpoint" and not a literal.
-pub(crate) fn emulator_authority() -> &'static str {
-    ::smithy_server_runtime::UNSERVED_URL_BASE
-        .split_once("://")
-        .map_or(::smithy_server_runtime::UNSERVED_URL_BASE, |(_, authority)| authority)
+/// Whether `address` is an address a client DIALS as published: a bare `host:port` authority
+/// with no scheme and no path, on a loopback host — which is the shape of the listener this
+/// emulator opens for a domain's own data plane, and what `DomainStatus$Endpoint` has to be
+/// for a client that takes the value as the host it is.
+///
+/// The host and the port are per-run values (the port is the operating system's), so what a
+/// case asserts is the SHAPE; that dialling the value reaches that very domain is asserted by
+/// the rows below.
+pub(crate) fn dialable_authority(address: &str) -> bool {
+    let Some((host, port)) = address.rsplit_once(':') else {
+        return false;
+    };
+    !address.contains('/')
+        && !address.contains("://")
+        && port.parse::<u16>().is_ok_and(|port| port != 0)
+        && (host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()))
 }
 
 /// One domain to publish an address for: how it is reached, and which members the rule says
@@ -345,8 +353,9 @@ async fn every_published_domain_address_is_dialled_as_published_and_reaches_that
         );
 
         // The PUBLIC endpoint publishes the address a client of this emulator reaches the
-        // domain at: this emulator's own endpoint, then the reserved path naming this
-        // service's data plane and the domain behind it. The hosts beside it publish the
+        // domain at: the `host:port` of the listener this emulator opened for the domain —
+        // an authority with no path of its own, because the member is an address a client
+        // takes as the HOST it is. The hosts beside it publish the
         // names AWS gives a domain's other addresses — the `search-` label under the
         // service's dual-stack domain for a version 2 endpoint, and the `vpc-endpoint-`
         // shapes `DomainStatus`' own examples name for a domain reached inside a VPC, over
@@ -354,11 +363,10 @@ async fn every_published_domain_address_is_dialled_as_published_and_reaches_that
         // dual-stack domain.
         for (member, address) in &addresses {
             if member == "Endpoint" {
-                assert_eq!(
-                    address,
-                    &format!("{}/_aws/es/{}", emulator_authority(), row.domain),
-                    "case {case:?}: expected {member} to publish this emulator's own endpoint \
-                     with the reserved path naming this plane and the domain"
+                assert!(
+                    dialable_authority(address),
+                    "case {case:?}: expected {member} to publish the host:port of the listener \
+                     this emulator opened for the domain, got {address:?}"
                 );
                 continue;
             }

@@ -249,6 +249,74 @@ impl HeldIdentity {
     }
 }
 
+/// Who the request signed with the access key id `access_key_id` speaks for, and what bounds
+/// it, for a decision taken on a plane with NO operation context to read the request's
+/// credential through — a request that arrived on the LISTENER a domain publishes
+/// ([`super::domain_plane`]), which the core serves rather than the router.
+///
+/// The SAME records [`request_principal_arn`] and [`request_identity`] read — the session STS
+/// minted for the key, else the IAM user that holds it — so the principal a decision names is
+/// the one `sts:GetCallerIdentity` answers for that credential whichever plane the request
+/// reached. What it cannot read is the credential STORE, which only an operation context
+/// vends: a session this registry no longer holds speaks for nobody here, exactly as it does
+/// there, and a session it holds is judged on its own recorded expiry.
+///
+/// Call with NO guard of this service's store held: the STS and IAM stores are read here and
+/// this service's is locked by the caller afterwards, so no two of them are ever held at once.
+#[must_use]
+pub fn key_principal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    access_key_id: &str,
+) -> KeyPrincipal {
+    let Some(iam) = iam_store::service_state(engine) else {
+        // No IAM store on this engine: no principal can hold a policy at all, which is the
+        // position an engine carrying no identity records leaves every caller in.
+        return KeyPrincipal::default();
+    };
+    if let Some(sts) = sts_store::service_state(engine) {
+        let store = sts.lock();
+        if let Some(session) = store.session(access_key_id) {
+            if session.is_expired(SystemTime::now()) {
+                // An expired session speaks for nobody: the layer that authenticates a
+                // request refuses it, and nothing here can be decided for it.
+                return KeyPrincipal::default();
+            }
+            let arn = session.identity.arn.clone();
+            drop(store);
+            return KeyPrincipal {
+                arn: arn.clone(),
+                identity: named_identity(&arn)
+                    .map(|named| HeldIdentity::of_caller(identity_policies(&iam.lock(), named))),
+            };
+        }
+    }
+    let identity = sts_store::long_term_identity(Some(&iam.lock()), access_key_id);
+    if identity.arn == sts_store::ambient_identity().arn {
+        // The account's own published credential carries no identity-based policy at all, so
+        // nothing here bounds it — the posture [`caller`] takes for the same credential.
+        return KeyPrincipal {
+            arn: identity.arn,
+            identity: None,
+        };
+    }
+    KeyPrincipal {
+        identity: named_identity(&identity.arn)
+            .map(|named| HeldIdentity::of_caller(identity_policies(&iam.lock(), named))),
+        arn: identity.arn,
+    }
+}
+
+/// Who one credential speaks for: the principal's ARN as `sts:GetCallerIdentity` reports it,
+/// and what this emulator can show about the identity policies in force on it.
+#[derive(Debug, Clone, Default)]
+pub struct KeyPrincipal {
+    /// The principal's ARN, empty for a credential that speaks for nobody.
+    pub arn: String,
+    /// The documents in force on it, or `None` for a caller this gate does not bound — the
+    /// account's own published credential among them (see the module docs).
+    pub identity: Option<HeldIdentity>,
+}
+
 /// What this emulator can show about the identity-based policies in force on the IAM ROLE
 /// `role_arn` names, or `None` when this emulator holds none for it: an engine carrying no
 /// IAM store, a value that is not a role ARN, or a role the IAM store does not hold.

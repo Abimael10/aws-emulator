@@ -15,6 +15,13 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// the name IS the key. Iterating a `BTreeMap` is order-stable, which is what
     /// lets `ListDomainNames` report the same order twice.
     pub domains: BTreeMap<String, Domain>,
+    /// The data-plane LISTENER opened for each domain, keyed by that domain's name — the
+    /// address `DomainStatus$Endpoint` publishes ([`domain_plane`]). Held beside the domain
+    /// records rather than on the record itself, because a listener is a live socket and a
+    /// [`Domain`] is cloned by every read; dropping the handle closes the port, so a domain
+    /// the store no longer holds stops answering. Bounded by [`DOMAIN_QUOTA`], one per
+    /// domain.
+    pub domain_planes: BTreeMap<String, domain_plane::DomainPlane>,
     /// Every cross-cluster connection, keyed by its `ConnectionId` — unique per
     /// connection, so the id IS the key. Iterating a `BTreeMap` is order-stable,
     /// which is what lets `DescribeOutboundConnections` report the same order twice
@@ -128,6 +135,7 @@ impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
     fn default() -> Self {
         Self {
             domains: BTreeMap::new(),
+            domain_planes: BTreeMap::new(),
             connections: BTreeMap::new(),
             connection_seq: 0,
             endpoint_suffix_seq: 0,

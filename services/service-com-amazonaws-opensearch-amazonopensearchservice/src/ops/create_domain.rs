@@ -607,6 +607,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // CloudFormation created through an in-process call publishes the address a
             // client can reach exactly as a directly created one does.
             published_at: crate::state::emulator_endpoint_authority(ctx),
+            // The listener this emulator opens for the domain's own data plane is opened
+            // once this store is released, and records its address on the stored record
+            // ([`crate::state::domain_plane`]): until then the domain publishes the
+            // prefixed path-style address on this emulator's own endpoint.
+            plane_authority: None,
             // Minted below by the store, which is the one place that decides a
             // VPC-access domain needs a host id of its own.
             vpc_access_suffix: None,
@@ -858,6 +863,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // sampler runs per store, so a later create joins the one already running
         // ([`crate::state::cluster_metrics`]).
         crate::state::cluster_metrics::drive_metric_sampling(&self.engine);
+        // The ADDRESS this domain's data plane is published at: a listener of its own, opened
+        // here — with this store released, as the two steps above are — so the address a
+        // client is handed is one it can dial as the HOST `DomainStatus$Endpoint` is
+        // ([`crate::state::domain_plane`]). A domain publishes no address at all until its
+        // cluster is up, a span after this call, so every read that can report one is later
+        // than this.
+        crate::state::domain_plane::publish_in_background(
+            ::std::sync::Arc::clone(&self.engine),
+            &state,
+            &name,
+        );
         Ok(CreateDomainOutput {
             domain_status: Some(domain_status),
         })

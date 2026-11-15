@@ -152,6 +152,9 @@ pub use service_software::*;
 /// The [`Domain`] record every domain operation reads and writes, the projections the
 /// model asks for it, and where its nodes sit.
 mod domains;
+/// The ADDRESS one domain's own data plane is published at: the listener this emulator opens
+/// for it, and the handle that keeps that port open.
+pub mod domain_plane;
 /// The store every operation reaches this service's records through, and the ids it mints.
 mod store;
 

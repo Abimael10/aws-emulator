@@ -17,22 +17,32 @@
 //! ([`claims_parts`], read by `Service::can_handle`) and the serving ([`serve`], reached
 //! from `Service::override_operation` for a request carrying a SigV4 credential — so the
 //! router verifies that credential before anything is served — and from
-//! `Service::override_routing_error` for one carrying none).
+//! `Service::override_routing_error` for one carrying none), plus the serving of a request
+//! that arrived on the LISTENER one domain publishes ([`serve_published`]), which the core
+//! hands this module rather than the router.
 //!
 //! # What a request addresses
 //!
 //! A client on the machine this emulator runs on resolves a domain's endpoint host nowhere
-//! at all, so it reaches the emulator and carries what it was told; two addressings
+//! at all, so it reaches the emulator and carries what it was told; three addressings
 //! resolve:
 //!
-//! * PREFIXED PATH-STYLE, the addressing `DomainStatus$Endpoint` PUBLISHES: the data plane
-//!   is named by the reserved namespace segment
+//! * THE PUBLISHED ADDRESS, which is what `DomainStatus$Endpoint` carries: the `host:port` of
+//!   the listener this emulator opened for that one domain
+//!   ([`crate::state::domain_plane`]), where the ADDRESS names the domain and the whole path
+//!   of the request stays the client's. That is the form the member has to have, because a
+//!   client takes the value as the HOST it is — it signs it, hands it to an OpenSearch client
+//!   as one, and joins an absolute request path onto it. Such a request arrives on the
+//!   domain's own socket rather than at this front door ([`serve_published`]); it is resolved
+//!   HERE as well, by the authority it addresses, so an in-process client handed that address
+//!   reaches the domain too;
+//! * PREFIXED PATH-STYLE: the data plane is named by the reserved namespace segment
 //!   (`service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE`) and
 //!   [`DATA_PLANE_SEGMENT`], then the domain's name or its endpoint host, then the request
 //!   path — `/_aws/es/{domain-or-host}/{path}`. That segment begins with `_`, which no
 //!   modelled path segment of any service does, so the prefix collides with no
-//!   control-plane route. This is what a client of a published endpoint uses, because the
-//!   published value IS this addressing on the endpoint this emulator answers on (see
+//!   control-plane route. It is what a caller inside this emulator uses, and what a domain
+//!   publishes when no listener of its own could be opened (see
 //!   `crate::state::published_domain_address`);
 //! * HOST-STYLE, the addressing a client that resolves AWS's own hosts uses: the request's
 //!   host IS a host some domain of this store publishes — the public host AWS names its
@@ -462,12 +472,17 @@ pub fn claims_request<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest)
 /// Whether `req` presents a SigV4 credential, which is what decides whether the router
 /// verifies a signature before this plane serves it.
 pub fn carries_sigv4_credential(req: &RtRequest) -> bool {
-    req.headers().get("authorization").is_some_and(|value| {
+    presents_sigv4(req.headers().get("authorization"), req.uri())
+}
+
+/// Whether a request presenting `authorization` and addressing `uri` carries a SigV4
+/// credential: the `Authorization` header's own scheme, or a presigned URL's signature.
+fn presents_sigv4(authorization: Option<&str>, uri: &str) -> bool {
+    authorization.is_some_and(|value| {
         value
             .get(..SIGV4_SCHEME.len())
             .is_some_and(|scheme| scheme.eq_ignore_ascii_case(SIGV4_SCHEME))
-    }) || req
-        .uri()
+    }) || uri
         .split(['?', '&'])
         .any(|parameter| parameter.starts_with("X-Amz-Signature="))
 }
@@ -484,15 +499,15 @@ const BASIC_SCHEME: &str = "Basic ";
 /// names no credential of any domain and is not decoded at all.
 const MAX_CREDENTIAL_BYTES: usize = 1024;
 
-/// The user name and password `req` presents as HTTP Basic credentials — `Basic` followed
-/// by the base64 of `user-id ":" password` (RFC 7617 §2) — or `None` when it presents
-/// none.
+/// The user name and password `authorization` presents as HTTP Basic credentials — `Basic`
+/// followed by the base64 of `user-id ":" password` (RFC 7617 §2) — or `None` when it
+/// presents none.
 ///
 /// A header this reading cannot take apart presents no credential, which is the same
 /// position as carrying none: what the cluster then requires of the request is the
 /// authentication decision's ([`fgac::authentication`]), not this reading's.
-fn presented_credential(req: &RtRequest) -> Option<(String, String)> {
-    let header = req.headers().get("authorization")?;
+fn presented_credential(authorization: Option<&str>) -> Option<(String, String)> {
+    let header = authorization?;
     if header.len() > MAX_CREDENTIAL_BYTES {
         return None;
     }
@@ -575,6 +590,25 @@ fn resolve<Eng: Send + Sync + 'static>(engine: &Eng, addressed: &Addressed<'_>) 
         return None;
     }
     // HOST-STYLE: the host IS a host some domain of this store publishes.
+    //
+    // The ADDRESS a domain's own listener answers at is matched first, and as a whole
+    // `host:port`: the port is what tells one domain's listener from another's, and from this
+    // emulator's own endpoint. It is matched here as well as served on its own socket so an
+    // in-process client handed that address — a running function, another service's handler —
+    // reaches the domain through the front door too, without opening a connection.
+    let addressed_authority = addressed.host.map(str::to_ascii_lowercase);
+    if let Some(authority) = &addressed_authority {
+        if let Some(domain) = store
+            .domains
+            .values()
+            .find(|domain| publishes_authority(domain, authority))
+        {
+            return Some(Resolved {
+                domain_name: domain.domain_name.clone(),
+                request_path: addressed.path.to_string(),
+            });
+        }
+    }
     let host = host_only(addressed.host?);
     let domain = store
         .domains
@@ -584,6 +618,20 @@ fn resolve<Eng: Send + Sync + 'static>(engine: &Eng, addressed: &Addressed<'_>) 
         domain_name: domain.domain_name.clone(),
         request_path: addressed.path.to_string(),
     })
+}
+
+/// Whether `domain` publishes its data plane AT the whole authority `authority` — the
+/// `host:port` of the listener this emulator opened for it
+/// ([`crate::state::domain_plane`]), which is the address `DomainStatus$Endpoint` carries.
+///
+/// Matched as a whole and case-insensitively, because the port is part of what identifies the
+/// listener: another port of the same host is another domain's plane, or this emulator's own
+/// endpoint.
+fn publishes_authority(domain: &Domain, authority: &str) -> bool {
+    domain
+        .plane_authority
+        .as_ref()
+        .is_some_and(|published| published.eq_ignore_ascii_case(authority))
 }
 
 /// Whether `domain` publishes `host`: its public endpoint, the dual-stack public host
@@ -690,15 +738,154 @@ pub fn served<Eng: Send + Sync + 'static>(
     let Some(resolved) = resolve(engine, &Addressed::of_request(req, &uri)) else {
         // The domain was released by another request between the claim and here, so the
         // host it published answers nothing.
-        return Served::of(error(
-            503,
-            "cluster_block_exception",
-            "blocked by: [SERVICE_UNAVAILABLE]",
-        ));
+        return Served::of(unavailable());
     };
-    let method = req.method().to_ascii_uppercase();
-    let body = req.body().bytes().unwrap_or_default();
-    if body.len() > MAX_REQUEST_BODY_BYTES {
+    // The principal the two authorization decisions are taken for. An empty ARN is a
+    // request this emulator can resolve no identity for — an engine carrying no STS or IAM
+    // store, or an expired session — which no role mapping binds, so fine-grained access
+    // control refuses it exactly as it refuses an unmapped one.
+    //
+    // The identity policies live in ANOTHER service's store, so both are read before this
+    // one is locked: no call holds two service stores at once. `None` is a caller this
+    // emulator holds no policy evidence for — the account's own credential — which is the
+    // posture `crate::state::authorization` documents; a caller carrying a grant that cannot
+    // be READ is reported with that grant marked, which is a different thing.
+    let caller = Caller {
+        principal: ctx
+            .and_then(|ctx| state::authorization::request_principal_arn(engine, ctx))
+            .unwrap_or_default(),
+        identity: ctx.and_then(|ctx| state::authorization::request_identity(engine, ctx)),
+    };
+    let authorization = req.headers().get("authorization");
+    answered(
+        engine,
+        &Incoming {
+            resolved,
+            method: req.method().to_ascii_uppercase(),
+            query: uri.query().unwrap_or_default(),
+            body: req.body().bytes().unwrap_or_default(),
+            presented: presented_credential(authorization),
+            sigv4: presents_sigv4(authorization, req.uri()),
+            caller,
+            can_notify: ctx.is_some(),
+        },
+    )
+}
+
+/// Answer a request that arrived on the LISTENER one domain is published on
+/// ([`crate::state::domain_plane`]), where the ADDRESS names the domain and the whole path is
+/// the request path.
+///
+/// The same function serves it as serves the front door's own addressings ([`answered`]), so
+/// the two addressings of one domain cannot diverge in what they answer. What differs is where
+/// each reads the request from: the router hands the front door a runtime-API request and an
+/// operation context, and the core hands this one a plain HTTP request and no context at all —
+/// so the calling principal is resolved from the credential the request PRESENTS
+/// ([`state::authorization::key_principal`]), against the same identity records the front
+/// door's resolution reads.
+pub fn serve_published<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    domain_name: &str,
+    req: &::http::Request<Vec<u8>>,
+) -> ::http::Response<Vec<u8>> {
+    let authorization = req
+        .headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
+    // As at the front door: resolved BEFORE this service's store is locked, and from the
+    // credential the request presents, read by the emulator's OWN reading of a SigV4
+    // `Authorization` header — the one `state::authorization::request_principal_arn` reads at
+    // the front door, so the two paths resolve one credential to one principal.
+    let resolved =
+        state::authorization::key_principal(engine, &::engine::extract_akid(req.headers()));
+    let answered = answered(
+        engine,
+        &Incoming {
+            resolved: Resolved {
+                domain_name: domain_name.to_string(),
+                request_path: req.uri().path().to_string(),
+            },
+            method: req.method().as_str().to_ascii_uppercase(),
+            query: req.uri().query().unwrap_or_default(),
+            body: req.body(),
+            presented: presented_credential(authorization),
+            sigv4: presents_sigv4(authorization, &req.uri().to_string()),
+            caller: Caller {
+                principal: resolved.arn,
+                identity: resolved.identity,
+            },
+            can_notify: false,
+        },
+    );
+    // Nothing on this plane can hand a notification over — reaching another service needs the
+    // operation context the router builds — so a monitor run driven here traces what it owed,
+    // exactly as the front door's anonymous path does ([`serve`]).
+    state::notification_publication::trace_undelivered(&answered.notifications);
+    as_http(answered.response)
+}
+
+/// One answer of this surface as a plain HTTP response, which is what a core HTTP listener
+/// writes — the same status, headers and bytes the front door sends.
+///
+/// Every header the answer carries is copied, not a named few: what this plane answers is one
+/// function's ([`answered`]), so a header it comes to set must reach a client at either address
+/// or the two addressings of one domain diverge again.
+fn as_http(response: RtResponse) -> ::http::Response<Vec<u8>> {
+    let status = response.status().as_u16();
+    let headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    let body = response.body().bytes().unwrap_or_default().to_vec();
+    let mut builder = ::http::Response::builder().status(status);
+    for (name, value) in headers {
+        builder = builder.header(name, value);
+    }
+    builder.body(body).unwrap_or_else(|_| {
+        // Every part came off a response this module built, so the builder cannot fail;
+        // answer a bare 500 rather than panicking if it ever does.
+        let mut fallback = ::http::Response::new(Vec::new());
+        *fallback.status_mut() = ::http::StatusCode::INTERNAL_SERVER_ERROR;
+        fallback
+    })
+}
+
+/// Who a data-plane request speaks for, as both entries resolve it.
+#[derive(Debug, Default)]
+struct Caller {
+    /// The ARN of the principal the request speaks for, empty when none was resolved.
+    principal: String,
+    /// What this emulator can show about the identity policies in force on it, and `None` for
+    /// a caller it holds no evidence about.
+    identity: Option<state::authorization::HeldIdentity>,
+}
+
+/// One data-plane request as it arrives, whichever address it arrived at: what it addresses,
+/// what it asks, what it presents and who it speaks for.
+///
+/// Both entries build one of these — [`served`] from the runtime-API request the router hands
+/// the front door, [`serve_published`] from the plain HTTP request the core hands a domain's
+/// own listener — so [`answered`] below is the ONE reading of what a domain answers.
+struct Incoming<'r> {
+    resolved: Resolved,
+    method: String,
+    query: &'r str,
+    body: &'r [u8],
+    /// The user name and password an HTTP Basic credential presented, if any.
+    presented: Option<(String, String)>,
+    /// Whether the request presents an AWS credential.
+    sigv4: bool,
+    caller: Caller,
+    /// Whether a notification the work this request does owes a channel can be handed over at
+    /// all, which needs the operation context only the router builds.
+    can_notify: bool,
+}
+
+/// The answer this plane gives one request, out of the records the control plane holds.
+fn answered<Eng: Send + Sync + 'static>(engine: &Eng, incoming: &Incoming<'_>) -> Served {
+    let resolved = &incoming.resolved;
+    if incoming.body.len() > MAX_REQUEST_BODY_BYTES {
         return Served::of(error(
             413,
             ingest::ILLEGAL_ARGUMENT_EXCEPTION,
@@ -708,26 +895,9 @@ pub fn served<Eng: Send + Sync + 'static>(
             ),
         ));
     }
-    // The principal the two authorization decisions are taken for. An empty ARN is a
-    // request this emulator can resolve no identity for — an engine carrying no STS or IAM
-    // store, or an expired session — which no role mapping binds, so fine-grained access
-    // control refuses it exactly as it refuses an unmapped one.
-    let principal = ctx
-        .and_then(|ctx| state::authorization::request_principal_arn(engine, ctx))
-        .unwrap_or_default();
-    // The identity policies live in ANOTHER service's store, so they are read before this
-    // one is locked: no call holds two service stores at once. `None` is a caller this
-    // emulator holds no policy evidence for — the account's own credential — which is the
-    // posture `crate::state::authorization` documents; a caller carrying a grant that cannot
-    // be READ is reported with that grant marked, which is a different thing.
-    let held_identity = ctx.and_then(|ctx| state::authorization::request_identity(engine, ctx));
     let now = SystemTime::now();
     let Some(state) = service_state(engine) else {
-        return Served::of(error(
-            503,
-            "cluster_block_exception",
-            "blocked by: [SERVICE_UNAVAILABLE]",
-        ));
+        return Served::of(unavailable());
     };
     // AUTHENTICATION, before anything of the cluster is read: on a domain with
     // fine-grained access control switched on the cluster admits nobody anonymously, and a
@@ -735,41 +905,39 @@ pub fn served<Eng: Send + Sync + 'static>(
     // database holds ([`fgac::authentication`]). The decision is taken under a lock of its
     // own and the store released again, the way the claim above resolves the domain, so the
     // serving below still reads the domain exactly once.
-    let presented = presented_credential(req);
     let authenticated = {
         let store = state.lock();
         let Some(domain) = store.domains.get(&resolved.domain_name) else {
-            return Served::of(error(
-                503,
-                "cluster_block_exception",
-                "blocked by: [SERVICE_UNAVAILABLE]",
-            ));
+            return Served::of(unavailable());
         };
         fgac::authentication(
             domain,
-            presented
+            incoming
+                .presented
                 .as_ref()
                 .map(|(user, password)| (user.as_str(), password.as_str())),
-            carries_sigv4_credential(req),
+            incoming.sigv4,
         )
     };
     // Who the request speaks for: the user the cluster authenticated it as, where it
-    // authenticated one, and otherwise the AWS principal the front door resolved.
+    // authenticated one, and otherwise the AWS principal that was resolved for it.
     let internal_user = matches!(authenticated, fgac::Authentication::User(_));
     let principal = match authenticated {
         fgac::Authentication::Refused => {
-            return Served::of(unauthorized(presented.is_none()));
+            return Served::of(unauthorized(incoming.presented.is_none()));
         }
         fgac::Authentication::User(name) => name,
-        fgac::Authentication::Unauthenticated => principal,
+        fgac::Authentication::Unauthenticated => incoming.caller.principal.clone(),
     };
     let request = Request {
-        method: &method,
+        method: &incoming.method,
         path: &resolved.request_path,
-        query: uri.query().unwrap_or_default(),
-        body,
+        query: incoming.query,
+        body: incoming.body,
         principal: &principal,
-        identity: held_identity
+        identity: incoming
+            .caller
+            .identity
             .as_ref()
             .map(state::authorization::HeldIdentity::policies)
             .unwrap_or_default(),
@@ -779,7 +947,7 @@ pub fn served<Eng: Send + Sync + 'static>(
         notifications: ::std::cell::RefCell::new(Vec::new()),
         pending_run: ::std::cell::RefCell::new(None),
         pending_snapshot: ::std::cell::RefCell::new(None),
-        can_notify: ctx.is_some(),
+        can_notify: incoming.can_notify,
         internal_user,
     };
     let mut store = state.lock();
@@ -794,11 +962,7 @@ pub fn served<Eng: Send + Sync + 'static>(
     // The read materialises any configuration change the clock already owes this domain,
     // which this request neither starts nor changes.
     let Some(domain) = store.settled_mut(&resolved.domain_name, now) else {
-        return Served::of(error(
-            503,
-            "cluster_block_exception",
-            "blocked by: [SERVICE_UNAVAILABLE]",
-        ));
+        return Served::of(unavailable());
     };
     if !domain.created {
         return Served::of(error(
@@ -837,6 +1001,17 @@ pub fn served<Eng: Send + Sync + 'static>(
         response: answer,
         notifications: request.notifications.into_inner(),
     }
+}
+
+/// What a domain whose record this plane cannot read answers: the cluster behind the address
+/// is not there — a domain released between the claim and the serving, or an engine that vends
+/// no store of this service at all.
+fn unavailable() -> RtResponse {
+    error(
+        503,
+        "cluster_block_exception",
+        "blocked by: [SERVICE_UNAVAILABLE]",
+    )
 }
 
 /// Record what an evaluated monitor run came to and answer the report it reports.

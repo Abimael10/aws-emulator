@@ -37,6 +37,14 @@ pub struct Domain {
     /// was created ([`emulator_endpoint_authority`]) — what
     /// [`Self::published_endpoint`] builds the address a client is handed from.
     pub published_at: String,
+    /// The `host:port` of the LISTENER this emulator opened for this domain's own data plane
+    /// ([`domain_plane`]), and `None` for a domain no listener could be opened for.
+    ///
+    /// It is what [`Self::published_endpoint`] publishes where there is one, because
+    /// `DomainStatus$Endpoint` is an address a client takes as a HOST — it signs it, hands it
+    /// to an OpenSearch client as one, and joins an absolute request path onto it — and only
+    /// an address with no path of its own can be used that way.
+    pub plane_authority: Option<String>,
     /// The opaque id the hosts of a VPC-access domain's endpoints carry, minted once
     /// for the domain when it comes to hold `VPCOptions` and `None` while it holds
     /// none — so the hosts such a domain publishes are stable across reads and no two
@@ -954,13 +962,21 @@ impl Domain {
     /// `DomainStatus$Endpoint`, "the domain-specific endpoint used to submit index, search,
     /// and data upload requests to the domain".
     ///
-    /// It is the address a client of this emulator can REACH the domain at
-    /// ([`published_domain_address`]), because a client builds its index and search
-    /// requests on the value it is handed: the host AWS names this endpoint
-    /// ([`Self::endpoint`]) resolves nowhere here, so publishing it would announce a data
-    /// plane nothing answers at. A record that never recorded an emulator endpoint falls
-    /// back to that host rather than to a path naming no host at all.
+    /// It is the address a client of this emulator can REACH the domain at, because a client
+    /// builds its index and search requests on the value it is handed: the host AWS names this
+    /// endpoint ([`Self::endpoint`]) resolves nowhere here, so publishing it would announce a
+    /// data plane nothing answers at.
+    ///
+    /// The address is the `host:port` of the LISTENER this emulator opened for the domain
+    /// ([`Self::plane_authority`]) — an address with no path, which is what lets a client use
+    /// the value as the HOST it is. A domain no listener could be opened for falls back to the
+    /// prefixed path-style address on this emulator's own endpoint
+    /// ([`published_domain_address`]), which the front door serves too, and a record that never
+    /// recorded an emulator endpoint to that host rather than to a path naming no host at all.
     pub fn published_endpoint(&self) -> String {
+        if let Some(authority) = &self.plane_authority {
+            return authority.clone();
+        }
         if self.published_at.is_empty() {
             return self.endpoint.clone();
         }

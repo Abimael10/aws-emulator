@@ -42,7 +42,7 @@
 //!
 //! Two of those seams are taken for a second reason: a DOMAIN this service creates
 //! publishes the endpoint "used to submit index, search, and data upload requests"
-//! (`DomainStatus$Endpoint`), and that host is not this API's endpoint — so the front
+//! (`DomainStatus$Endpoint`), and that address is not this API's endpoint — so the front
 //! door could resolve no target service for a request addressed to it and answered
 //! `404 UnknownService`, for the one address this service told the caller to use.
 //! [`can_handle`](Service::can_handle) also claims a request addressed to a domain this
@@ -50,6 +50,9 @@
 //! for a request presenting a SigV4 credential, so the emulator verifies the signature
 //! and the handler can resolve which principal signed, and from
 //! [`override_routing_error`](Service::override_routing_error) for one presenting none.
+//! What the control plane publishes is a bare `host:port` of the domain's OWN listener
+//! (`crate::state::domain_plane`), which the core serves; these seams claim the addressings a
+//! caller reaches the same domain by at this front door.
 //!
 //! [`override_operation`](Service::override_operation) is taken for a third reason: a
 //! request whose body carries a value the modelled member it is bound to cannot be read

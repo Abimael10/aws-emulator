@@ -371,6 +371,13 @@ fn authorize(
 /// paths into a domain cannot disagree about what IAM allows. What each caller supplies is
 /// the `resource` ITS call is addressed at and what can be shown about the principal's own
 /// grants ([`IdentityPolicies`]).
+///
+/// A request is refused here only where a policy IN FORCE refuses it: an explicit `Deny` on
+/// either side, or a domain access policy none of whose statements allows the request. Where
+/// the domain carries no access policy and the documents in force on the principal say
+/// nothing about the action, nothing in force states anything about the request and the
+/// decision belongs to the cluster it reached — which on a domain with fine-grained access
+/// control is that domain's master user and role mappings ([`super::fgac`]).
 pub fn iam_decision(
     domain: &Domain,
     principal_arn: &str,
@@ -422,14 +429,24 @@ pub fn iam_decision(
     {
         return Ok(());
     }
-    // Neither side states anything and there is no policy on either side to state it: an
-    // engine holding no identity store, and a domain carrying no access policy, is a domain
-    // nothing bounds.
-    if identity.documents.is_none()
-        && access_policy.is_none()
-        && identity_decision == Decision::NotStated
-        && resource_decision == Decision::NotStated
-    {
+    // NO POLICY IN FORCE STATES ANYTHING ABOUT THIS REQUEST: the domain carries no access
+    // policy at all, and the documents in force on the principal — none, or none that is
+    // about this action — do not speak to it either. There is no rule to refuse it by, so
+    // the decision belongs to the CLUSTER the request reached: on a domain with
+    // fine-grained access control switched on that is its master user and its role mappings
+    // ([`super::fgac`]), which is the authorization such a domain's creator asked for and
+    // the only side that can tell the master from a principal no mapping binds; on a domain
+    // without it there is no boundary of its own and the request is served. Refusing here
+    // instead would deny the master user of a domain whose access policy nobody wrote — the
+    // configuration a client provisioning a fine-grained-access-control domain arrives in —
+    // and would answer a principal the cluster refuses with this layer's envelope instead of
+    // the cluster's `security_exception`.
+    //
+    // An explicit `Deny` on either side is not this case — the identity side's is named by
+    // the condition and the resource side can state none where there is no access policy —
+    // and a domain that DOES carry an access policy states a boundary this request has to be
+    // inside, so neither reaches this.
+    if access_policy.is_none() && identity_decision == Decision::NotStated {
         return Ok(());
     }
     Err(WriteRefusal::Rejected {

@@ -367,19 +367,23 @@ pub fn domain_endpoint(domain_name: &str, suffix: &str, region: &str) -> String 
     format!("search-{domain_name}-{suffix}.{region}.{ARN_NAMESPACE}.amazonaws.com")
 }
 
-/// The address `DomainStatus$Endpoint` PUBLISHES for a domain's data plane: the endpoint
-/// THIS emulator answers on, with the reserved path that names this service's data plane
-/// and the domain behind it (`<host>:<port>/_aws/es/<domain-name>`).
+/// The address `DomainStatus$Endpoint` publishes for a domain whose own listener could NOT be
+/// opened: the endpoint THIS emulator answers on, with the reserved path that names this
+/// service's data plane and the domain behind it (`<host>:<port>/_aws/es/<domain-name>`).
 ///
-/// The member is "the domain-specific endpoint used to submit index, search, and data
-/// upload requests to the domain", so a client builds its requests on the value it is
-/// handed and sends them there. The host [`domain_endpoint`] spells is the name AWS gives
-/// that endpoint, and it resolves NOWHERE for a client of this emulator: handing it out
-/// announces an address nothing answers at, so the data plane the control plane says it
-/// provisioned cannot be reached at all. What a client can reach is the one endpoint this
-/// process serves its whole surface at, which is why the domain is named in the PATH —
-/// the addressing `service_common::data_plane_addressing` states for every data plane of
-/// this emulator and [`crate::service::domain_rest`] resolves.
+/// The member is "the domain-specific endpoint used to submit index, search, and data upload
+/// requests to the domain", so a client builds its requests on the value it is handed and
+/// sends them there. The host [`domain_endpoint`] spells is the name AWS gives that endpoint,
+/// and it resolves NOWHERE for a client of this emulator: handing it out announces an address
+/// nothing answers at, so the data plane the control plane says it provisioned cannot be
+/// reached at all.
+///
+/// What a domain publishes where a listener of its OWN is open is that listener's bare
+/// `host:port` ([`crate::state::domain_plane`]), because the member is an address a client
+/// takes as the HOST it is. This addressing is the fallback behind it — and the one a caller
+/// INSIDE this emulator uses — which is why the domain is named in the PATH: the addressing
+/// `service_common::data_plane_addressing` states for every data plane of this emulator and
+/// [`crate::service::domain_rest`] resolves.
 ///
 /// `emulator_endpoint` is that endpoint's `host[:port]`
 /// ([`emulator_endpoint_authority`]); an empty one leaves the path alone, which no claim

@@ -208,21 +208,16 @@ fn assert_rule(status: &Value, row: &Row, name: &str, case: &str) -> Vec<(String
 
     if row.endpoints_keys.is_empty() {
         // A domain reached on a public endpoint publishes that address and no map. The
-        // address is the one a client of this emulator reaches the domain at: this
-        // emulator's own endpoint with the reserved path naming this service's data plane
-        // and the domain behind it, because the host AWS names that endpoint by resolves
-        // nowhere here.
+        // address is the one a client of this emulator reaches the domain at: the
+        // `host:port` of the listener this emulator opened for the domain, with no path of
+        // its own, because the host AWS names that endpoint by resolves nowhere here.
         let endpoint = status["Endpoint"].as_str().unwrap_or_else(|| {
             panic!("case {case:?}: expected a public Endpoint, got {:?}", status["Endpoint"])
         });
-        assert_eq!(
-            endpoint,
-            format!(
-                "{}/_aws/es/{name}",
-                super::published_domain_address::emulator_authority()
-            ),
-            "case {case:?}: expected this emulator's own endpoint with the reserved path \
-             naming this service's data plane and the domain"
+        assert!(
+            super::published_domain_address::dialable_authority(endpoint),
+            "case {case:?}: expected the host:port of the listener this emulator opened for \
+             the domain, got {endpoint:?}"
         );
         // "If IPAddressType [is] set to dualstack, a version 2 domain endpoint is
         // provisioned. This endpoint functions like a normal endpoint, except that it

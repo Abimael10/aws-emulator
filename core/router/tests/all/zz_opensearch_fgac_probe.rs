@@ -7,8 +7,9 @@
 //!
 //! > The address a control-plane answer publishes for a resource's data plane is an address
 //! > a client DIALS as published — it builds `https://{address}{path}` and signs what it
-//! > sends — so the emulator publishes the endpoint it answers on, with the resource named
-//! > in the path, and serves that resource there. A request whose `Host` header is not the
+//! > sends, and it takes the value as the HOST the member is — so the emulator publishes a
+//! > bare `host:port` it answers that resource at, with no path a client would have to be
+//! > told about, and serves the resource there. A request whose `Host` header is not the
 //! > one it was SIGNED for is refused by the verifier before it reaches the resource at all,
 //! > however much its principal is allowed.
 //! > Once it does reach the domain, the cluster decides: on a domain with fine-grained
@@ -420,27 +421,26 @@ fn the_published_domain_host_serves_the_signed_requests_its_master_and_readers_m
                 );
                 settled(&router).await;
 
-                // The published address is one a client DIALS as published: the endpoint
-                // this emulator answers on, with the reserved path naming this service's
-                // data plane and the domain behind it — because the host AWS names a
-                // domain's endpoint by resolves nowhere for a client on this machine.
+                // The published address is one a client DIALS as published, as the HOST
+                // `DomainStatus$Endpoint` is: the `host:port` of the listener this emulator
+                // opened for the domain, with no path of its own — because the host AWS
+                // names a domain's endpoint by resolves nowhere for a client on this machine.
                 let described = describe_domain(&router).await;
                 let host = described.json()["DomainStatus"]["Endpoint"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string();
-                // The authority is read from the framework, which owns what this emulator's
-                // endpoint IS for a router that is not served on a port, rather than
-                // spelled out here.
-                let endpoint = smithy_server_runtime::UNSERVED_URL_BASE;
-                let authority = endpoint
-                    .split_once("://")
-                    .map_or(endpoint, |(_scheme, authority)| authority);
-                assert_eq!(
-                    host,
-                    format!("{authority}/_aws/es/{DOMAIN}"),
-                    "case \"the published address\": expected this emulator's own endpoint \
-                     with the reserved path naming this plane and the domain, got {} ",
+                let (published_host, published_port) =
+                    host.rsplit_once(':').unwrap_or((host.as_str(), ""));
+                assert!(
+                    !host.contains('/')
+                        && published_port.parse::<u16>().is_ok_and(|port| port != 0)
+                        && (published_host == "localhost"
+                            || published_host
+                                .parse::<std::net::IpAddr>()
+                                .is_ok_and(|ip| ip.is_loopback())),
+                    "case \"the published address\": expected the host:port of the listener \
+                     this emulator opened for the domain, got {} ",
                     described.summary()
                 );
 
@@ -587,12 +587,15 @@ fn the_published_domain_host_serves_the_signed_requests_its_master_and_readers_m
                 // And the invariant the verifier holds whatever is published: a request
                 // whose `Host` header is not the one it was SIGNED for is refused, however
                 // much its principal is allowed — which is why a client signs the address it
-                // dials. The request still ADDRESSES the domain (its path names the plane
-                // and the domain), so what refuses it is the signature and nothing else.
+                // dials. The request still ADDRESSES the domain — the prefixed path names the
+                // plane and the domain, so it is claimed whatever host it carries — so what
+                // refuses it is the signature and nothing else.
                 let built = http::Request::builder()
                     .method("GET")
-                    .uri(format!("https://{host}/_cluster/health"))
-                    .header("host", host.split('/').next().unwrap_or(&host))
+                    .uri(format!(
+                        "https://{LOCAL_ENDPOINT}/_aws/es/{DOMAIN}/_cluster/health"
+                    ))
+                    .header("host", LOCAL_ENDPOINT)
                     .body(Vec::new())
                     .expect("the test request is well formed");
                 let mut mis_signed = signed(built, &master);

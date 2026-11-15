@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 
 use super::change_progress::LEAF_PROPERTY_BLOCKS;
 use super::domain_lifecycle::{settled_domain, Emulator, PREFIX};
-use super::published_domain_address::emulator_authority;
+use super::published_domain_address::dialable_authority;
 
 /// The off-peak window start a domain that named none comes up with: the service assigns
 /// every new domain "a custom 10-hour, low-traffic window during which OpenSearch Service
@@ -406,14 +406,12 @@ async fn a_domain_publishes_its_endpoint_host_and_the_software_its_engine_runs()
         let endpoint = status["Endpoint"].as_str().unwrap_or_else(|| {
             panic!("case {case:?}: expected an Endpoint, got {:?}", status["Endpoint"])
         });
-        // The address a client of this emulator reaches the domain at: this emulator's own
-        // endpoint, then the reserved path naming this service's data plane and the domain
-        // behind it.
-        assert_eq!(
-            endpoint,
-            format!("{}/_aws/es/{name}", emulator_authority()),
+        // The address a client of this emulator reaches the domain at: the `host:port` of
+        // the listener this emulator opened for the domain, with no path of its own.
+        assert!(
+            dialable_authority(endpoint),
             "case {case:?}: expected the address this emulator serves the domain's data \
-             plane at"
+             plane at, got {endpoint:?}"
         );
         assert_eq!(
             status["ServiceSoftwareOptions"]["CurrentVersion"].as_str(),

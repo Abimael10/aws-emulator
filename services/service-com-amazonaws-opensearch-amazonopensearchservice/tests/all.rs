@@ -89,6 +89,8 @@ mod data_plane_iam_authorization;
 mod data_plane_identity_evidence;
 #[path = "all/data_plane_identity_grant_evidence.rs"]
 mod data_plane_identity_grant_evidence;
+#[path = "all/data_plane_unpoliced_requests.rs"]
+mod data_plane_unpoliced_requests;
 #[path = "all/data_plane_unreadable_identity_grant.rs"]
 mod data_plane_unreadable_identity_grant;
 #[path = "all/data_source_attachment_authorization.rs"]
@@ -149,6 +151,8 @@ mod domain_maintenance;
 mod domain_nodes;
 #[path = "all/domain_package_listing_cursor.rs"]
 mod domain_package_listing_cursor;
+#[path = "all/domain_plane_address.rs"]
+mod domain_plane_address;
 #[path = "all/domain_rest_bulk_and_index_apis.rs"]
 mod domain_rest_bulk_and_index_apis;
 #[path = "all/domain_rest_data_plane.rs"]

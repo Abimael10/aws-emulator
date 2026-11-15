@@ -157,6 +157,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // The record is gone from the store, so the two read paths no longer find it.
+        // The ADDRESS it published goes with it: dropping the listener handle closes that
+        // port, so nothing answers where the deleted domain did
+        // ([`crate::state::domain_plane`]).
+        store.domain_planes.remove(&input.domain_name);
         // What this call answers with is the domain's final state: deleted, and in the
         // `Deleting` processing status the delete put it in.
         domain.deleted = true;
