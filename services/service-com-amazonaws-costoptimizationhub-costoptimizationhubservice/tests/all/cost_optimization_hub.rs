@@ -432,7 +432,7 @@ fn id(suffix: &str) -> String {
 }
 
 /// Every recommendation the store reports to the caller, in catalog order.
-async fn all_ids(router: &MultiServiceRouter) -> Vec<String> {
+pub(crate) async fn all_ids(router: &MultiServiceRouter) -> Vec<String> {
     let payload = ok(
         router,
         "ListRecommendations",
@@ -478,7 +478,7 @@ pub(crate) async fn enrolled_router_with_discounts_visible() -> MultiServiceRout
 /// savings series this service derives from that service's analysis is served to
 /// an opted-in account alone, so a router that stands for "this account's data
 /// is readable" has to hold that opt-in as well as the enrollment.
-async fn enrolled(router: MultiServiceRouter) -> MultiServiceRouter {
+pub(crate) async fn enrolled(router: MultiServiceRouter) -> MultiServiceRouter {
     opt_into_compute_optimizer(&router).await;
     ok(
         &router,

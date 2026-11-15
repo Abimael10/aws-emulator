@@ -26,8 +26,11 @@
 //!   [`ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState::member_account_discount_visibility`].
 //! * `recommendations` + `recommendation_order` — the recommendation catalog
 //!   `ListRecommendations` pages over and `GetRecommendation` looks ids up in,
-//!   narrowed to what the calling account may read by
-//!   [`ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState::readable_recommendation_view`].
+//!   narrowed to the accounts a read is SCOPED to by
+//!   [`ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState::recommendation_view`]
+//!   (a list read) and
+//!   [`ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState::caller_recommendation_view`]
+//!   (a read that carries no member naming accounts).
 //!   The catalog is part of the store's initial value, so both readers see the
 //!   same rows and neither has to write anything to serve a read.
 //!
@@ -1244,26 +1247,47 @@ impl ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
     }
 
     /// The view a read of ONE recommendation resolves its id over: every
-    /// recommendation this caller may read, in catalog order, whichever account
-    /// owns it, under the caller's effective savings estimation mode — the same
-    /// [`RecommendationView`] the list readers are served, because such a read
-    /// names no account and sets no filter.
+    /// recommendation this caller CAN select, in catalog order, whichever
+    /// account owns it, under the caller's effective savings estimation mode.
     ///
-    /// A read that names no account addresses the caller's own account, widened
-    /// to the organization where the caller is its management account — the
-    /// caller whose reads past its own account are admitted at all, and so the
-    /// caller whose `filter.accountIds` a list reader serves another account's
-    /// rows to ([`Self::recommendation_view`]). The rows are therefore the union
-    /// of what this caller's list reads can select, and an id a list handed it
-    /// reads back.
+    /// This view is wider than the one a list read of the same caller is scoped
+    /// to, and it is for an id lookup alone: the rows are the union of what this
+    /// caller's list reads can select — its own account's, widened to the
+    /// organization's where the caller is its management account and so may name
+    /// another member of it in `filter.accountIds`
+    /// ([`Self::recommendation_view`]) — so an id a list handed this caller
+    /// reads back by id. A read that REPORTS over a set of rows rather than
+    /// resolving one id is scoped to the accounts its own request addresses
+    /// ([`Self::caller_recommendation_view`]), because a union is not the set
+    /// any one list read reports.
     ///
     /// Enrollment is still judged per owning account
     /// ([`Self::visible_recommendations_for`]), so an account that never opted
     /// in, one that opted out, and one that has just opted in hold no readable
     /// recommendation at all.
-    pub fn readable_recommendation_view(&self, account_id: &str) -> RecommendationView {
+    pub fn id_lookup_recommendation_view(&self, account_id: &str) -> RecommendationView {
         let addressed =
             self.addressed_accounts(account_id, &[], self.is_management_account(account_id));
+        self.view_over(account_id, &addressed, None)
+    }
+
+    /// The view a read that carries NO member naming accounts is served: the
+    /// rows of the calling account alone, under that account's effective
+    /// savings estimation mode.
+    ///
+    /// A read of this service is scoped to the accounts its request NAMES, and
+    /// naming none it is scoped to the calling account, whatever organization
+    /// role the store records for that account ([`ReadScope`]) — the scope an
+    /// unfiltered list read resolves to as well
+    /// ([`Self::recommendation_view`]), so an aggregate or time series taken
+    /// over this view reports over exactly the rows the list readers report to
+    /// the same caller.
+    ///
+    /// It cannot be refused: a scope confined to the caller's own account
+    /// reaches past nobody ([`ReadScope::reaches_past`]), so there is no
+    /// organization view for a permission gate to ask about.
+    pub fn caller_recommendation_view(&self, account_id: &str) -> RecommendationView {
+        let addressed = self.addressed_accounts(account_id, &[], false);
         self.view_over(account_id, &addressed, None)
     }
 
@@ -1310,9 +1334,9 @@ impl ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
     ///
     /// Otherwise the rows are the ones the accounts the request ADDRESSES may
     /// be read for (`view_over`) narrowed by every member the filter sets,
-    /// under the account's effective `savingsEstimationMode` — the view the
-    /// reader of ONE recommendation is served too
-    /// ([`Self::readable_recommendation_view`]).
+    /// under the account's effective `savingsEstimationMode` — the view a read
+    /// that can name no account is served too, for the scope naming none
+    /// resolves to ([`Self::caller_recommendation_view`]).
     pub fn recommendation_view(
         &self,
         account_id: &str,

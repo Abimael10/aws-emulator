@@ -2,11 +2,14 @@
 
 //! @op ListEfficiencyMetrics
 //!
-//! Reports cost efficiency as a TIME SERIES over the recommendation catalog the
-//! calling account may read — the same view `ListRecommendations`,
-//! `GetRecommendation` and `ListRecommendationSummaries` are served
-//! (`crate::state::...::readable_recommendation_view`), so no reader of this
-//! service disagrees with another about what the account spends or could save.
+//! Reports cost efficiency as a TIME SERIES over the recommendations this read
+//! is SCOPED to — the calling account's own, which is the scope an unfiltered
+//! `ListRecommendations` or `ListRecommendationSummaries` resolves to as well
+//! (`crate::state::...::caller_recommendation_view`), because this operation
+//! carries no member naming accounts. So no reader of this service disagrees
+//! with another about what the account spends or could save: these figures are
+//! the aggregate of exactly the rows the list readers report to the same
+//! caller, never of rows only a wider read could select.
 //!
 //! The rows are first reduced to ONE recommendation per resource
 //! (`crate::state::dedupe_by_resource`), because a resource's alternatives are
@@ -307,16 +310,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The rows this caller may read, under its effective savings estimation
-        // mode: the one view every recommendation reader of this service is
-        // served, so these metrics are taken over exactly the recommendations
-        // `ListRecommendations` reports. This operation carries no member that
-        // names another account, so its scope is the caller's own record
-        // (widened to the organization where the caller manages it) and reaches
-        // past nobody.
+        // The rows this read is scoped to, under the caller's effective savings
+        // estimation mode: this operation carries no member naming accounts, so
+        // its scope is the calling account alone — the scope an unfiltered list
+        // read of the same caller resolves to — and these metrics are therefore
+        // taken over exactly the recommendations `ListRecommendations` reports
+        // to it, whatever organization role the store records for the account.
         let view = state
             .lock()
-            .readable_recommendation_view(crate::state::caller_account_id());
+            .caller_recommendation_view(crate::state::caller_account_id());
         let mode = view.savings_estimation_mode;
         let mode = mode.as_deref();
 

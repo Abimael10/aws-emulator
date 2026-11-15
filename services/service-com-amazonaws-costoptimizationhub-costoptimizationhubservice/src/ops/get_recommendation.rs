@@ -205,17 +205,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The caller's effective savings estimation mode and the rows it may
         // read are the one rule every recommendation reader applies, written
         // once beside the catalog
-        // (`crate::state::...::readable_recommendation_view`), so this reader
-        // asks for the same view the list readers are served rather than
-        // resolving the mode and the rows again here. The view a read of ONE
-        // recommendation gets is the caller's own account, widened to the
-        // organization where the caller is its management account, with each
-        // owning account's enrollment still judged — so an id the list handed
-        // this caller resolves, and an id of an account that is not enrolled
-        // (or whose analysis is not due yet) is unknown to it.
+        // (`crate::state::...::id_lookup_recommendation_view`), so this reader
+        // asks for that one view rather than resolving the mode and the rows
+        // again here. The view a read of ONE recommendation gets is the caller's
+        // own account, widened to the organization where the caller is its
+        // management account — the union of what this caller's list reads can
+        // select — with each owning account's enrollment still judged, so an id
+        // the list handed this caller resolves, and an id of an account that is
+        // not enrolled (or whose analysis is not due yet) is unknown to it.
         let view = state
             .lock()
-            .readable_recommendation_view(crate::state::caller_account_id());
+            .id_lookup_recommendation_view(crate::state::caller_account_id());
         let mode = view.savings_estimation_mode;
         let row = view
             .rows

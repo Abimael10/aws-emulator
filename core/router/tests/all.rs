@@ -41,19 +41,16 @@
 // that lands past the declarations — which is what concurrent landings appending to this
 // file kept producing — is `E0753` and compiles no suite of this target. With no inner doc
 // comment anywhere in the file, no merge of two landings can put one past the first item.
-//
 // The list below is DECLARATIONS ONLY: one `#[path = "all/<name>.rs"]` / `mod <name>;`
 // pair per suite, in sorted order, and no other line. `tests/all.rs` is a test-target
 // CRATE ROOT, so a bare `mod` would resolve to a SIBLING (`tests/<name>.rs`), which the
 // layout check refuses; the `#[path]` is what points each declaration into `tests/all/`.
 // Declare each suite exactly ONCE: this is one crate root, so a second `mod` for the same
 // name is `E0428` and fails every suite in this target.
-//
 // WHAT a suite covers, and WHY it belongs to this cross-service target rather than to one
 // service crate's own, is stated in that suite's own module doc, where it is read beside
 // the test it explains and cannot collide with a concurrent landing. A note about this
 // file itself belongs in `all/appended_notes.rs`.
-//
 // Three suites check the rules above rather than restating them:
 // `all/all_rs_declares_each_suite_once.rs`,
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
@@ -65,7 +62,6 @@
 // a note here is prose two landing branches duplicate, re-word and mistype.
 // Three rules this file lives or dies by, each pinned by a suite of its own
 // (`all/all_rs_declares_each_suite_once.rs`,
-// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
 // `all/all_rs_is_a_canonical_declaration_list.rs`): one declaration per suite (a second
 // is `E0428`), every comment an ORDINARY `//` one (an inner `//!` past the first item is
 // `E0753`), and nothing in the list but declaration pairs. Each failure compiles no suite
@@ -96,7 +92,6 @@
 // past the declarations — which is what concurrent landings appending to this file kept
 // producing — is `E0753` and compiles no suite of this target. With no inner doc comment
 // anywhere, no merge of two landings can put one past the first item.
-// `all/all_rs_declares_each_suite_once.rs`,
 // `all/all_rs_is_a_canonical_declaration_list.rs` check those rules — the list holds one
 // pair per suite, sorted, and no other line — for this file and for every service crate's
 // `tests/all.rs`, so check there rather than leaving a note here.
@@ -1643,7 +1638,6 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 // which compiles no suite of this target. EVERY comment in this file is an ORDINARY one,
 // this block included: an inner doc comment (`//!`) is legal only before the first item, so
 // one that lands past the declarations — which is what concurrent landings appending to this
-// file kept producing — is `E0753` and compiles no suite of this target. With no inner doc
 // every service crate's `tests/all.rs`.
 //! Single integration-test target for the router: the declaration list of its
 //! cross-service suites.
@@ -1791,3 +1785,12 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 //! * the list holds declaration pairs and no other line — what a suite covers, and why it
 //!   belongs to this cross-service target rather than to one service crate's own, is stated
 //!   in that suite's own module header, where it is read beside the test it explains.
+// pair, inserted into the sorted list: one pair per suite and NOTHING else, so a landing
+// has one place to insert and nothing to keep consistent.
+// which fails every suite in this target.
+// lands past the declarations is `E0753` and compiles no suite of this target. With no
+// inner doc comment anywhere, no merge of two landings can put one past the first item.
+// What a suite covers, and why it has to live in THIS target rather than in a service
+// crate's own, belongs in that suite's own module header, where it is read beside the test
+// it explains — never here, where one note per suite buries the list this file exists to be.
+// every service crate's `tests/all.rs`, so check there rather than leaving a note below.

@@ -82,7 +82,7 @@ fn request(granularity: &str, start: &str, end: &str) -> Value {
 }
 
 /// The groups one answer reports, in the order it carries them.
-fn groups(payload: &Value) -> Vec<Value> {
+pub(crate) fn groups(payload: &Value) -> Vec<Value> {
     payload["efficiencyMetricsByGroup"]
         .as_array()
         .unwrap_or_else(|| panic!("case groups: expected a list of groups in {payload}"))
@@ -91,7 +91,7 @@ fn groups(payload: &Value) -> Vec<Value> {
 
 /// The dimension value a group reports, or `None` where it reports none —
 /// which is what a request that asked for no grouping gets.
-fn label(group: &Value) -> Option<String> {
+pub(crate) fn label(group: &Value) -> Option<String> {
     group["group"].as_str().map(str::to_string)
 }
 
@@ -119,7 +119,7 @@ fn series(group: &Value) -> Vec<Value> {
 }
 
 /// One group's spend and savings totalled over its whole series, in whole cents.
-fn totals(group: &Value) -> (i64, i64) {
+pub(crate) fn totals(group: &Value) -> (i64, i64) {
     let series = series(group);
     let spend = series
         .iter()
@@ -155,7 +155,7 @@ fn score(group: &Value) -> f64 {
 /// The rows every figure of this answer is taken over, as `ListRecommendations`
 /// reports them: ONE recommendation per resource, which is the de-duplicated
 /// view a resource's mutually exclusive alternatives are reduced to.
-async fn deduped(router: &MultiServiceRouter) -> Vec<Value> {
+pub(crate) async fn deduped(router: &MultiServiceRouter) -> Vec<Value> {
     let payload = ok(
         router,
         "ListRecommendations",
@@ -182,7 +182,7 @@ fn member_label(item: &Value, member: &str) -> String {
 /// member is named, over all of them as one group: `(label, spend, savings)` in
 /// whole cents, by label, which is the order the answer carries its groups in
 /// when the request asks for no other.
-fn expected(rows: &[Value], member: Option<&str>) -> Vec<(Option<String>, i64, i64)> {
+pub(crate) fn expected(rows: &[Value], member: Option<&str>) -> Vec<(Option<String>, i64, i64)> {
     let mut totals: Vec<(Option<String>, i64, i64)> = Vec::new();
     for row in rows {
         let label = member.map(|member| member_label(row, member));
@@ -226,7 +226,7 @@ fn last_whole_month() -> (String, String) {
 
 /// A request for one whole reported interval at `granularity`: the month before
 /// this one, or the day before today.
-fn interval_request(granularity: &str) -> Value {
+pub(crate) fn interval_request(granularity: &str) -> Value {
     let (start, end) = if granularity == "Daily" {
         daily_period(1, 1)
     } else {
@@ -236,7 +236,7 @@ fn interval_request(granularity: &str) -> Value {
 }
 
 /// A monthly request over the whole month before this one.
-fn last_month_request() -> Value {
+pub(crate) fn last_month_request() -> Value {
     interval_request("Monthly")
 }
 
