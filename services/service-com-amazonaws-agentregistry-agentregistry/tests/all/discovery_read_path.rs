@@ -4,24 +4,28 @@
 //!
 //! Every request goes through the same `MultiServiceRouter::dispatch` the emulator
 //! serves on its socket, so routing, restJson1 (de)serialization and the modelled
-//! constraints are exercised exactly as a client would exercise them. The store is
-//! seeded once per test through `ComAmazonawsAgentregistryAgentregistryState`, the
-//! only authoring seam this model has: it binds no mutating operation.
+//! constraints are exercised exactly as a client would exercise them.
+//!
+//! This model binds no operation that creates a registry or a record: both are the Agent
+//! Registry CONTROL plane's resources, held in ITS store in the shared engine, and a
+//! discovery read reports that store. So the seeding below writes the OWNER's store
+//! through its own state module ([`seed_record`]) — which is also what makes a seeded
+//! record readable through `GetRegistryRecord` — and a sibling suite drives the same
+//! records in through the control plane's real operations.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use aws_smithy_types::date_time::Format as TimestampFormat;
 use aws_smithy_types::{DateTime, Document};
 use serde_json::{json, Value};
-use service_com_amazonaws_agentregistry_agentregistry::ops::types::{
-    A2aAgentCardDescriptor, AgentSkillsDefinitionDescriptor, Descriptors, HttpDescriptor,
-    McpServerDescriptor, VALIDATION_EXCEPTION_REASON_VALUES,
-};
-use service_com_amazonaws_agentregistry_agentregistry::state::{
-    ComAmazonawsAgentregistryAgentregistryState, RegistryRecord,
-};
+use service_com_amazonaws_agentregistry_agentregistry::ops::types::VALIDATION_EXCEPTION_REASON_VALUES;
 use service_com_amazonaws_agentregistry_agentregistry::EmulatedService;
+use service_com_amazonaws_agentregistrycontrol_agentregistrycontrol::ops::types::{
+    A2aAgentCardDescriptor, AgentSkillsDefinitionDescriptor, Descriptors, HttpDescriptor,
+    McpServerDescriptor,
+};
+use service_com_amazonaws_agentregistrycontrol_agentregistrycontrol::state as owner;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The registry the single-registry cases read.
@@ -54,16 +58,142 @@ pub(crate) fn seeded_router() -> MultiServiceRouter {
     router
 }
 
+/// One record as the control plane stores it, with the members a discovery read reports
+/// spelled by the case and every other member of the owner's record at its empty value.
+///
+/// A test states what the rule under test varies over — ids, name, type, version, status,
+/// descriptors, custom metadata, timestamps — and nothing else: a record's tags,
+/// provenance and compliance status are the control plane's and appear in no discovery
+/// response.
+pub(crate) struct Seeded(owner::RegistryRecord);
+
+impl Seeded {
+    /// A record with the members the model marks `@required`. Both ARNs are derived from
+    /// the stored ids when it is inserted ([`seed_record`]), so a case never spells them.
+    pub(crate) fn new(
+        record_id: impl Into<String>,
+        name: impl Into<String>,
+        record_type: impl Into<String>,
+        record_version: impl Into<String>,
+        status: impl Into<String>,
+        created_at: DateTime,
+    ) -> Self {
+        Self(owner::RegistryRecord {
+            record_id: record_id.into(),
+            record_arn: String::new(),
+            registry_arn: String::new(),
+            name: name.into(),
+            display_name: None,
+            description: None,
+            record_type: record_type.into(),
+            descriptors: None,
+            record_version: record_version.into(),
+            status: status.into(),
+            status_reason: None,
+            provenance: Vec::new(),
+            custom_metadata: None,
+            custom_metadata_schema_compliance_status: None,
+            created_by: None,
+            created_by_auto_detection: None,
+            created_at,
+            updated_at: created_at,
+            tags: BTreeMap::new(),
+            pending: None,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn with_display_name(mut self, display_name: impl Into<String>) -> Self {
+        self.0.display_name = Some(display_name.into());
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.0.description = Some(description.into());
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_descriptors(mut self, descriptors: Descriptors) -> Self {
+        self.0.descriptors = Some(descriptors);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_custom_metadata(mut self, custom_metadata: Document) -> Self {
+        self.0.custom_metadata = Some(custom_metadata);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_updated_at(mut self, updated_at: DateTime) -> Self {
+        self.0.updated_at = updated_at;
+        self
+    }
+}
+
+/// Insert `record` into `registry_id` in the store that OWNS it — the control plane's —
+/// creating that registry there if it is absent, and deriving both ARNs from the stored
+/// ids exactly as `CreateRegistry` and `CreateRegistryRecord` do, so a discovery read and
+/// a control-plane read report the same ARNs for the same resource.
+pub(crate) fn seed_record(
+    engine: &Arc<engine::InMemoryEngine>,
+    registry_id: &str,
+    record: Seeded,
+) {
+    let state = engine.state::<owner::ComAmazonawsAgentregistrycontrolAgentregistrycontrolState>();
+    let mut state = state.lock();
+    let registry_arn = owner::registry_arn(REGION, registry_id);
+    let mut record = record.0;
+    record.registry_arn = registry_arn.clone();
+    record.record_arn = owner::record_arn(&registry_arn, &record.record_id);
+    let created_at = record.created_at;
+    state
+        .registry_name_index
+        .insert(registry_id.to_string(), registry_id.to_string());
+    let registry = state
+        .registries
+        .entry(registry_id.to_string())
+        .or_insert_with(|| owner::Registry {
+            registry_id: registry_id.to_string(),
+            registry_arn,
+            // A registry's name is unique within the account; the id serves as one, so
+            // every seeded registry carries a name no other does.
+            name: registry_id.to_string(),
+            description: None,
+            encryption_configuration: None,
+            discovery_configuration: None,
+            approval_configuration: None,
+            custom_metadata_schema_configuration: None,
+            auto_detection: None,
+            // A registry whose creation has finished: what `CreateRegistry` leaves once
+            // the clock has moved it past `CREATING`.
+            status: owner::REGISTRY_READY.to_string(),
+            status_reason: None,
+            created_at,
+            updated_at: created_at,
+            tags: BTreeMap::new(),
+            records: BTreeMap::new(),
+            pending: None,
+        });
+    registry
+        .records
+        .insert(record.record_id.clone(), record);
+}
+
+/// The Region every seeded ARN is scoped to, and the one every call below signs for.
+pub(crate) const REGION: &str = "us-east-1";
+
 /// Seed one registry with a mix of record types, statuses, descriptor sets and
 /// custom metadata, plus a second registry large enough to see a page default.
 fn seed(engine: &Arc<engine::InMemoryEngine>) {
     let created_at = DateTime::from_secs(CREATED_AT_SECS);
-    let state = engine.state::<ComAmazonawsAgentregistryAgentregistryState>();
-    let mut state = state.lock();
 
-    state.put_record(
+    seed_record(
+        engine,
         REGISTRY,
-        RegistryRecord::new(
+        Seeded::new(
             "rec000000001",
             "payments-mcp",
             "MCP",
@@ -89,9 +219,10 @@ fn seed(engine: &Arc<engine::InMemoryEngine>) {
         .with_updated_at(DateTime::from_secs(UPDATED_AT_SECS)),
     );
 
-    state.put_record(
+    seed_record(
+        engine,
         REGISTRY,
-        RegistryRecord::new(
+        Seeded::new(
             "rec000000002",
             "support-agent",
             "AGENT",
@@ -112,9 +243,10 @@ fn seed(engine: &Arc<engine::InMemoryEngine>) {
 
     // Not discoverable: the model's `RegistryRecordStatus` doc says a DEPRECATED
     // record is not.
-    state.put_record(
+    seed_record(
+        engine,
         REGISTRY,
-        RegistryRecord::new(
+        Seeded::new(
             "rec000000003",
             "old-agent",
             "AGENT",
@@ -124,9 +256,10 @@ fn seed(engine: &Arc<engine::InMemoryEngine>) {
         ),
     );
 
-    state.put_record(
+    seed_record(
+        engine,
         REGISTRY,
-        RegistryRecord::new(
+        Seeded::new(
             "rec000000004",
             "skills-pack",
             "SKILL",
@@ -142,9 +275,10 @@ fn seed(engine: &Arc<engine::InMemoryEngine>) {
     );
 
     // Not discoverable either: DRAFT is "before it is submitted".
-    state.put_record(
+    seed_record(
+        engine,
         REGISTRY,
-        RegistryRecord::new(
+        Seeded::new(
             "rec000000005",
             "draft-gateway",
             "GATEWAY",
@@ -156,9 +290,10 @@ fn seed(engine: &Arc<engine::InMemoryEngine>) {
 
     // REJECTED is not discoverable either, so this registry resolves but answers
     // every discovery read with nothing.
-    state.put_record(
+    seed_record(
+        engine,
         EMPTY_REGISTRY,
-        RegistryRecord::new(
+        Seeded::new(
             "void00000001",
             "void-record",
             "CUSTOM",
@@ -169,9 +304,10 @@ fn seed(engine: &Arc<engine::InMemoryEngine>) {
     );
 
     for index in 1..=BULK_RECORDS {
-        state.put_record(
+        seed_record(
+            engine,
             BULK_REGISTRY,
-            RegistryRecord::new(
+            Seeded::new(
                 format!("bulk{index:08}"),
                 format!("bulk-service-{index:02}"),
                 "CUSTOM",
@@ -526,16 +662,13 @@ async fn list_summaries_carry_the_derived_arns_and_descriptor_keys_but_no_descri
     }
 }
 
-/// Whether `value` denotes the instant `expected_secs`, in either timestamp form
-/// restJson1 may put on the wire: the `date-time` string the model's
-/// `@timestampFormat` asks for, or the protocol's default epoch-seconds number
-/// (what the vendored codegen emits today — `vendor/smithy-macros/src/lib.rs`
-/// builds member schemas without a timestamp format, so the JSON codec falls back
-/// to the restJson1 default). Either way the instant reported must be the one the
-/// store holds.
+/// Whether `value` reports the instant `expected_secs` in the wire form this model
+/// declares for it: the RFC 3339 `date-time` STRING its target timestamp shape
+/// (`DateTimestamp`, `@timestampFormat("date-time")`) asks for — never the
+/// epoch-seconds number the `restJson1` protocol defaults to, which no client bound
+/// to this model can read for such a member.
 fn denotes_instant(value: &Value, expected_secs: i64) -> bool {
     match value {
-        Value::Number(_) => value.as_i64() == Some(expected_secs),
         Value::String(rendered) => DateTime::from_secs(expected_secs)
             .fmt(TimestampFormat::DateTime)
             .is_ok_and(|expected| *rendered == expected),

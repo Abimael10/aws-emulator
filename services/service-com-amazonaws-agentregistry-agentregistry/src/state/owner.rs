@@ -1,0 +1,172 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The store this service's discovery reads report: the one the Agent Registry CONTROL
+//! plane owns.
+//!
+//! This model binds no operation that creates a registry or a registry record —
+//! `CreateRegistry`, `CreateRegistryRecord`, `SubmitRegistryRecordForApproval` and
+//! `UpdateRegistryRecordStatus` are all bound by
+//! `service-com-amazonaws-agentregistrycontrol-agentregistrycontrol` — so the registries
+//! and records a discovery read reports are that service's resources, held in ITS store
+//! in the shared engine. A second map here would be a second copy of one resource: a
+//! record created and approved through the control plane would be invisible to discovery,
+//! and a record seeded here would be invisible to `GetRegistryRecord`.
+//!
+//! So nothing in this crate holds a registry. [`registry`] resolves the registry an
+//! identifier names in the owner's store and PROJECTS it into this model's shapes: the two
+//! models publish separate (if largely parallel) descriptor structures, and the discovery
+//! surface publishes fewer members than the control plane stores — a record's provenance,
+//! its tags and a descriptor source's credential-provider configurations are the control
+//! plane's and appear in no discovery response — so the projection is written out member by
+//! member rather than passed through.
+
+use super::{Registry, RegistryRecord};
+use crate::ops::types as discovery;
+use ::service_com_amazonaws_agentregistrycontrol_agentregistrycontrol::state as control;
+use ::service_com_amazonaws_agentregistrycontrol_agentregistrycontrol::ops::types as owner;
+
+/// This engine carries no Agent Registry store at all, so no discovery read can be
+/// answered from it. Each operation turns it into its own modelled
+/// `InternalServerException`, worded by [`STORE_UNAVAILABLE_MESSAGE`]; it is never a "that
+/// registry does not exist".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreUnavailable;
+
+/// What every discovery read states for [`StoreUnavailable`]: one sentence, in one place,
+/// so the three reads cannot word the same server fault differently. It names no part of
+/// the request — the condition is a property of the engine, not of what was asked.
+pub const STORE_UNAVAILABLE_MESSAGE: &str = "the Agent Registry store is unavailable";
+
+/// The registry the `RegistryIdentifier` `identifier` names (a bare registry id or the
+/// registry's full ARN), as the discovery surface sees it.
+///
+/// `Ok(None)` when the owner's store holds no such registry — which is what every
+/// discovery read answers `ResourceNotFoundException` for — and `Err(StoreUnavailable)`
+/// when this engine carries no store to resolve it in.
+///
+/// The owner's clock-owed status transitions are materialised first, through the owner's
+/// own accessor: a registry whose creation span has elapsed is `READY` and a record whose
+/// creation span has elapsed is `DRAFT` at the same instant whether or not anybody asked,
+/// so a read that materialises them reports what a caller would see either way and writes
+/// nothing else.
+pub fn registry<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    identifier: &str,
+) -> Result<Option<Registry>, StoreUnavailable> {
+    let Some(state) = control::service_state(engine) else {
+        return Err(StoreUnavailable);
+    };
+    let mut state = state.lock();
+    state.materialise_due_transitions();
+    let registry_id = super::registry_id_from_identifier(identifier);
+    Ok(state.registries.get(registry_id).map(discoverable))
+}
+
+/// One registry of the owner's store as the discovery surface sees it: its identity and
+/// every record it holds, each projected by [`record`].
+///
+/// EVERY record is carried over, whatever its status, because which of them a discovery
+/// read may report is the reads' own rule ([`RegistryRecord::is_discoverable`]) and not a
+/// property of the store.
+fn discoverable(held: &control::Registry) -> Registry {
+    Registry {
+        registry_id: held.registry_id.clone(),
+        registry_arn: held.registry_arn.clone(),
+        records: held
+            .records
+            .iter()
+            .map(|(record_id, held)| (record_id.clone(), record(held)))
+            .collect(),
+    }
+}
+
+/// One stored record as the discovery surface publishes it.
+fn record(held: &control::RegistryRecord) -> RegistryRecord {
+    RegistryRecord {
+        record_id: held.record_id.clone(),
+        record_arn: held.record_arn.clone(),
+        registry_arn: held.registry_arn.clone(),
+        name: held.name.clone(),
+        display_name: held.display_name.clone(),
+        description: held.description.clone(),
+        record_type: held.record_type.clone(),
+        record_version: held.record_version.clone(),
+        status: held.status.clone(),
+        descriptors: held.descriptors.as_ref().map(descriptors).unwrap_or_default(),
+        custom_metadata: held.custom_metadata.clone(),
+        created_at: held.created_at,
+        updated_at: held.updated_at,
+    }
+}
+
+/// The record's descriptor set, member by member: the two models declare parallel
+/// descriptor structures, so each entry is rebuilt in this model's own shape.
+fn descriptors(held: &owner::Descriptors) -> discovery::Descriptors {
+    discovery::Descriptors {
+        mcp_server: held.mcp_server.as_ref().map(|held| discovery::McpServerDescriptor {
+            data: held.data.clone(),
+            data_schema_version: held.data_schema_version.clone(),
+            additional_data: held.additional_data.as_ref().map(|held| {
+                discovery::McpServerAdditionalData {
+                    tools: held.tools.as_ref().map(|held| discovery::McpToolsDescriptor {
+                        data: held.data.clone(),
+                        data_schema_version: held.data_schema_version.clone(),
+                    }),
+                }
+            }),
+            source: held.source.as_ref().map(source),
+        }),
+        a2a_agent_card: held
+            .a2a_agent_card
+            .as_ref()
+            .map(|held| discovery::A2aAgentCardDescriptor {
+                data: held.data.clone(),
+                data_schema_version: held.data_schema_version.clone(),
+                source: held.source.as_ref().map(source),
+            }),
+        agent_skills_definition: held.agent_skills_definition.as_ref().map(|held| {
+            discovery::AgentSkillsDefinitionDescriptor {
+                data: held.data.clone(),
+                data_schema_version: held.data_schema_version.clone(),
+                additional_data: held.additional_data.as_ref().map(|held| {
+                    discovery::AgentSkillsAdditionalData {
+                        skill_md: held.skill_md.as_ref().map(|held| {
+                            discovery::AgentSkillsMdDescriptor {
+                                data: held.data.clone(),
+                                data_schema_version: held.data_schema_version.clone(),
+                                source: held.source.as_ref().map(source),
+                            }
+                        }),
+                    }
+                }),
+            }
+        }),
+        custom: held
+            .custom
+            .as_ref()
+            .map(|held| discovery::CustomDescriptor {
+                data: held.data.clone(),
+            }),
+        http: held.http.as_ref().map(|held| discovery::HttpDescriptor {
+            source: held.source.as_ref().map(source),
+        }),
+        agui: held.agui.as_ref().map(|held| discovery::AgUiDescriptor {
+            source: held.source.as_ref().map(source),
+        }),
+    }
+}
+
+/// Where a descriptor was fetched from, as the discovery surface publishes it: the URL
+/// alone. The credential-provider configurations the control plane stores beside it name
+/// the credentials used to FETCH the descriptor, and `DescriptorSourceFromUrl` of this
+/// model declares no member for them, so no discovery response carries them.
+fn source(held: &owner::DescriptorSource) -> discovery::DescriptorSource {
+    discovery::DescriptorSource {
+        from_url: held
+            .from_url
+            .as_ref()
+            .map(|held| discovery::DescriptorSourceFromUrl {
+                url: held.url.clone(),
+            }),
+    }
+}

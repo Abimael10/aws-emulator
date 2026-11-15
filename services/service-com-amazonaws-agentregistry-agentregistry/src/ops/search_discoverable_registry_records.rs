@@ -216,27 +216,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(SearchDiscoverableRegistryRecordsErrorModeled::AccessDeniedException)?;
         }
 
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(
-                SearchDiscoverableRegistryRecordsErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: Some("the Agent Registry store is unavailable".to_string()),
-                    },
-                )
-                .into(),
-            );
-        };
-        let state = state.lock();
-
         let mut ranked: Vec<(usize, RegistryRecordSummary)> = Vec::new();
         for registry_id in &input.registry_ids {
-            let Some(registry) = state.registry(registry_id) else {
-                return Err(
-                    SearchDiscoverableRegistryRecordsErrorModeled::ResourceNotFoundException(
-                        crate::state::registry_not_found(registry_id),
+            let registry = match crate::state::owner::registry(&*self.engine, registry_id) {
+                Err(crate::state::owner::StoreUnavailable) => {
+                    return Err(
+                        SearchDiscoverableRegistryRecordsErrorModeled::InternalServerException(
+                            InternalServerException {
+                                message: Some(
+                                    crate::state::owner::STORE_UNAVAILABLE_MESSAGE.to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
                     )
-                    .into(),
-                );
+                }
+                Ok(None) => {
+                    return Err(
+                        SearchDiscoverableRegistryRecordsErrorModeled::ResourceNotFoundException(
+                            crate::state::registry_not_found(registry_id),
+                        )
+                        .into(),
+                    )
+                }
+                Ok(Some(registry)) => registry,
             };
             for record in registry.discoverable_records() {
                 if !matches_metadata_filter(input.filters.as_ref(), record)? {

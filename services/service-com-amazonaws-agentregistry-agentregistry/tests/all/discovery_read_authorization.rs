@@ -40,15 +40,12 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_agentregistry_agentregistry::state::{
-    ComAmazonawsAgentregistryAgentregistryState, RegistryRecord,
-};
 use service_com_amazonaws_agentregistry_agentregistry::EmulatedService;
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::discovery_read_path::{encode_label, list_path};
+use crate::discovery_read_path::{encode_label, list_path, seed_record, Seeded};
 
 /// The Region every call below is signed for, and so the Region of the registry ARN each
 /// decision is made against.
@@ -90,10 +87,10 @@ const SESSION_SECONDS: i32 = 3_600;
 /// call has something to answer with.
 fn router_with_identity() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let state = engine.state::<ComAmazonawsAgentregistryAgentregistryState>();
-    state.lock().put_record(
+    seed_record(
+        &engine,
         REGISTRY,
-        RegistryRecord::new(
+        Seeded::new(
             RECORD_ID,
             "payments-mcp",
             "MCP",

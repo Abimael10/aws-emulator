@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRegistryRecordStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRegistryRecordStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRegistryRecordStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +165,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRegistryRecordStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRegistryRecordStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRegistryRecordStatus"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateRegistryRecordStatusErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the agent registry store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+        state.materialise_due_transitions();
+
+        // Both labels accept the resource's ARN or its bare id.
+        let registry_id = crate::state::identifier_to_id(&input.registry_id).to_string();
+        let record_id = crate::state::identifier_to_id(&input.record_id).to_string();
+
+        let Some(registry) = state.registries.get(&registry_id) else {
+            return Err(
+                UpdateRegistryRecordStatusErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::registry_not_found_message(
+                            &input.registry_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let Some(record) = registry.records.get(&record_id) else {
+            return Err(
+                UpdateRegistryRecordStatusErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::record_not_found_message(&record_id)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A registry is usable once it reaches READY, so its curation workflow does not
+        // run while it is still being created or is being deleted — the same rule
+        // `SubmitRegistryRecordForApproval` holds a submission to.
+        if registry.status != crate::state::REGISTRY_READY {
+            return Err(UpdateRegistryRecordStatusErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "registry {registry_id} is in status {}; a record's status can be \
+                         updated once it is {}",
+                        registry.status,
+                        crate::state::REGISTRY_READY
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A status this SERVICE sets for its own asynchronous work is not a curator's to
+        // choose, in either direction: a record cannot be moved INTO one, and one whose
+        // asynchronous change is still in flight is not in the workflow yet.
+        if ASYNCHRONOUS_STATUSES.contains(&input.status.as_str()) {
+            return Err(UpdateRegistryRecordStatusErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "status {} reports an asynchronous change this service makes itself \
+                         and is not a curation status a record can be moved to",
+                        input.status
+                    )),
+                },
+            )
+            .into());
+        }
+        if ASYNCHRONOUS_STATUSES.contains(&record.status.as_str()) {
+            return Err(UpdateRegistryRecordStatusErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "record {record_id} is in status {}; its status can be updated once \
+                         that change has finished",
+                        record.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let updated_at = crate::state::now();
+
+        // Resolved under this same lock above, so both are still there; a lookup that
+        // somehow fails is a server error rather than a success for a record whose status
+        // was never written.
+        let record = state
+            .registries
+            .get_mut(&registry_id)
+            .and_then(|registry| registry.records.get_mut(&record_id));
+        let Some(record) = record else {
+            return Err(
+                UpdateRegistryRecordStatusErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(format!(
+                            "record {record_id} disappeared while its status was being updated"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        record.status = input.status;
+        // `statusReason` is `@required` on this request and on its answer — "the reason for
+        // the status change" — so the reason the caller gave is what the record carries
+        // from now on and what every later read reports.
+        record.status_reason = Some(input.status_reason);
+        record.updated_at = updated_at;
+
+        Ok(UpdateRegistryRecordStatusOutput {
+            registry_arn: record.registry_arn.clone(),
+            record_arn: record.record_arn.clone(),
+            record_id: record.record_id.clone(),
+            status: record.status.clone(),
+            status_reason: record.status_reason.clone().unwrap_or_default(),
+            updated_at,
+        })
     }
 }
+
+/// The `RegistryRecordStatus` values that report an ASYNCHRONOUS change this service makes
+/// itself, rather than a step of the registry's curation workflow: a record is `CREATING`
+/// while `CreateRegistryRecord` is in flight and `UPDATING` while `UpdateRegistryRecord`
+/// is, and the two `*_FAILED` values report that one of those did not finish. The curation
+/// values are every other member of the enum
+/// (`crate::ops::types::REGISTRY_RECORD_STATUS_VALUES`), which the framework has already
+/// checked `status` against before this handler runs — so this names the four it withholds
+/// rather than a second copy of the five it admits.
+const ASYNCHRONOUS_STATUSES: &[&str] = &["CREATING", "UPDATING", "CREATE_FAILED", "UPDATE_FAILED"];

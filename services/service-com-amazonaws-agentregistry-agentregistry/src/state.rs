@@ -2,17 +2,21 @@
 
 //! Engine state for the com-amazonaws-agentregistry-agentregistry service.
 //!
-//! The Agent Registry model this crate serves binds only the three *discovery
-//! read* operations (`ListDiscoverableRegistryRecords`,
+//! The Agent Registry model this crate serves binds only the three *discovery read*
+//! operations (`ListDiscoverableRegistryRecords`,
 //! `BatchGetDiscoverableRegistryRecord`, `SearchDiscoverableRegistryRecords`);
-//! registry and record authoring lives in a different model. So the store here is
-//! populated by [`ComAmazonawsAgentregistryAgentregistryState::put_record`] — the
-//! seam a test or a fixture loader seeds through — and every response is computed
-//! from it.
+//! registry and record authoring lives in the Agent Registry CONTROL plane's model.
+//! So this service holds no registry of its own: a discovery read resolves the
+//! registry it was given in the store that OWNS it ([`owner`]) and projects it into
+//! the shapes this model publishes. The types below are that projection, plus the
+//! refusals and identifier readings every discovery read shares.
 
 /// Whether IAM lets a request perform the action it asks for: the decision every
 /// discovery read takes before it resolves the registry the request names.
 pub mod authorization;
+
+/// The store a discovery read reports: the one the Agent Registry control plane owns.
+pub mod owner;
 
 use std::collections::BTreeMap;
 
@@ -149,14 +153,15 @@ pub fn record_id_from_identifier(identifier: &str) -> &str {
     record_identifier_parts(identifier).1
 }
 
-/// One registry record, as the registry stores it.
+/// One registry record, as a discovery read sees it: the members this model publishes,
+/// projected from the record the control plane holds ([`owner`]).
 #[derive(Debug, Clone)]
 pub struct RegistryRecord {
     pub record_id: String,
-    /// Derived by [`ComAmazonawsAgentregistryAgentregistryState::put_record`], so
-    /// every operation reports the same ARN for the same record.
+    /// Minted by the control plane when the record was created, so every operation of
+    /// either plane reports the same ARN for the same record.
     pub record_arn: String,
-    /// The owning registry's ARN, derived the same way.
+    /// The owning registry's ARN, minted the same way.
     pub registry_arn: String,
     pub name: String,
     pub display_name: Option<String>,
@@ -171,64 +176,6 @@ pub struct RegistryRecord {
 }
 
 impl RegistryRecord {
-    /// A record with the members the model marks `@required`. The two ARNs are
-    /// filled in when the record is inserted into a registry, so a caller never
-    /// spells them out (and cannot spell them inconsistently).
-    pub fn new(
-        record_id: impl Into<String>,
-        name: impl Into<String>,
-        record_type: impl Into<String>,
-        record_version: impl Into<String>,
-        status: impl Into<String>,
-        created_at: DateTime,
-    ) -> Self {
-        Self {
-            record_id: record_id.into(),
-            record_arn: String::new(),
-            registry_arn: String::new(),
-            name: name.into(),
-            display_name: None,
-            description: None,
-            record_type: record_type.into(),
-            record_version: record_version.into(),
-            status: status.into(),
-            descriptors: Descriptors::default(),
-            custom_metadata: None,
-            created_at,
-            updated_at: created_at,
-        }
-    }
-
-    #[must_use]
-    pub fn with_display_name(mut self, display_name: impl Into<String>) -> Self {
-        self.display_name = Some(display_name.into());
-        self
-    }
-
-    #[must_use]
-    pub fn with_description(mut self, description: impl Into<String>) -> Self {
-        self.description = Some(description.into());
-        self
-    }
-
-    #[must_use]
-    pub fn with_descriptors(mut self, descriptors: Descriptors) -> Self {
-        self.descriptors = descriptors;
-        self
-    }
-
-    #[must_use]
-    pub fn with_custom_metadata(mut self, custom_metadata: Document) -> Self {
-        self.custom_metadata = Some(custom_metadata);
-        self
-    }
-
-    #[must_use]
-    pub fn with_updated_at(mut self, updated_at: DateTime) -> Self {
-        self.updated_at = updated_at;
-        self
-    }
-
     /// Whether a discovery read may return this record at all.
     pub fn is_discoverable(&self) -> bool {
         self.status == STATUS_APPROVED
@@ -307,78 +254,34 @@ impl Registry {
     }
 }
 
-/// Per-service state for com-amazonaws-agentregistry-agentregistry. A handler reaches it through [`service_state`].
-#[derive(Debug)]
-pub struct ComAmazonawsAgentregistryAgentregistryState {
-    /// Registries keyed by registry id.
-    pub registries: BTreeMap<String, Registry>,
-    /// The region this store's ARNs are scoped to.
-    pub region: String,
-}
-
-impl Default for ComAmazonawsAgentregistryAgentregistryState {
-    fn default() -> Self {
-        Self {
-            registries: BTreeMap::new(),
-            region: DEFAULT_REGION.to_string(),
-        }
-    }
-}
+/// Per-service state for com-amazonaws-agentregistry-agentregistry: NOTHING.
+///
+/// This service's model binds three discovery READS and no operation that creates,
+/// updates or deletes anything, so it owns no resource and keeps no store. The
+/// registries and records its reads report belong to the Agent Registry control plane
+/// and are read out of that service's own store, through [`owner::registry`] — the one
+/// place this crate resolves a registry, so no read of this service can see a registry
+/// the control plane does not hold, and nothing it reports is a second copy of one.
+///
+/// The type is kept because the generated crate root re-exports it: it is the engine's
+/// per-service state slot for this service, and this service's slot is empty.
+#[derive(Debug, Default)]
+pub struct ComAmazonawsAgentregistryAgentregistryState;
 
 impl ComAmazonawsAgentregistryAgentregistryState {
-    /// The account every ARN this store mints carries. There is exactly one source
-    /// of truth for it, in the vendored runtime.
+    /// The account every ARN of this service carries. There is exactly one source of
+    /// truth for it, in the vendored runtime.
     pub fn account_id(&self) -> &'static str {
         ::engine::emulator_account_id()
     }
-
-    /// `arn:aws:agent-registry:<region>:<account>:registry/<registryId>`.
-    pub fn registry_arn(&self, registry_id: &str) -> String {
-        ::engine::emulator_arn(ARN_SERVICE, &self.region, &format!("registry/{registry_id}"))
-    }
-
-    /// `arn:aws:agent-registry:<region>:<account>:registry/<registryId>/record/<recordId>`.
-    pub fn record_arn(&self, registry_id: &str, record_id: &str) -> String {
-        ::engine::emulator_arn(
-            ARN_SERVICE,
-            &self.region,
-            &format!("registry/{registry_id}/record/{record_id}"),
-        )
-    }
-
-    /// The registry a `RegistryIdentifier` names (bare id or full ARN), or `None`
-    /// when this store holds no such registry.
-    pub fn registry(&self, identifier: &str) -> Option<&Registry> {
-        self.registries
-            .get(registry_id_from_identifier(identifier))
-    }
-
-    /// Create the registry if it is absent, and return it.
-    pub fn put_registry(&mut self, registry_id: &str) -> &mut Registry {
-        let registry_arn = self.registry_arn(registry_id);
-        self.registries
-            .entry(registry_id.to_string())
-            .or_insert_with(|| Registry {
-                registry_id: registry_id.to_string(),
-                registry_arn,
-                records: BTreeMap::new(),
-            })
-    }
-
-    /// Insert `record` into `registry_id`, creating that registry if needed, and
-    /// deriving both ARNs from the stored ids, region and account so every response
-    /// reports the same ones.
-    pub fn put_record(&mut self, registry_id: &str, mut record: RegistryRecord) {
-        record.registry_arn = self.registry_arn(registry_id);
-        record.record_arn = self.record_arn(registry_id, &record.record_id);
-        let registry = self.put_registry(registry_id);
-        registry.records.insert(record.record_id.clone(), record);
-    }
 }
 
-/// This service's store in the shared engine: call it with a handler's `&*self.engine`.
+/// This service's (empty) state slot in the shared engine: call it with a handler's
+/// `&*self.engine`.
 ///
-/// Answer `None` with a modelled server error, never with a fresh engine.
+/// Answer `None` with a modelled server error, never with a fresh engine. A discovery
+/// read does not go through here — it resolves the registry it was given in the store
+/// that owns it, [`owner::registry`].
 pub fn service_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<ComAmazonawsAgentregistryAgentregistryState>> {

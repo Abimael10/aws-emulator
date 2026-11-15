@@ -205,23 +205,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(ListDiscoverableRegistryRecordsErrorModeled::AccessDeniedException)?;
 
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(ListDiscoverableRegistryRecordsErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: Some("the Agent Registry store is unavailable".to_string()),
-                },
-            )
-            .into());
-        };
-        let state = state.lock();
-
-        let Some(registry) = state.registry(&input.registry_id) else {
-            return Err(
-                ListDiscoverableRegistryRecordsErrorModeled::ResourceNotFoundException(
-                    crate::state::registry_not_found(&input.registry_id),
+        let registry = match crate::state::owner::registry(&*self.engine, &input.registry_id) {
+            Err(crate::state::owner::StoreUnavailable) => {
+                return Err(
+                    ListDiscoverableRegistryRecordsErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: Some(
+                                crate::state::owner::STORE_UNAVAILABLE_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
                 )
-                .into(),
-            );
+            }
+            Ok(None) => {
+                return Err(
+                    ListDiscoverableRegistryRecordsErrorModeled::ResourceNotFoundException(
+                        crate::state::registry_not_found(&input.registry_id),
+                    )
+                    .into(),
+                )
+            }
+            Ok(Some(registry)) => registry,
         };
 
         // Resume exactly after the record the previous page stopped on, so no record

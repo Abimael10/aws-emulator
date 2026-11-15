@@ -19,6 +19,8 @@ mod error_message_wording;
 mod idempotency_tokens;
 #[path = "all/record_approval.rs"]
 mod record_approval;
+#[path = "all/record_status_curation.rs"]
+mod record_status_curation;
 #[path = "all/registry_lifecycle.rs"]
 mod registry_lifecycle;
 #[path = "all/resource_tagging.rs"]

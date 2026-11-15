@@ -28,6 +28,10 @@ hex = { workspace = true }
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # The IAM store, for the identity-based policy documents in force on that principal.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The Agent Registry CONTROL plane, which owns every registry and registry record:
+# this service binds no operation that creates one, so its discovery reads report that
+# store rather than a second copy of it.
+service-com-amazonaws-agentregistrycontrol-agentregistrycontrol = { workspace = true }
 # The shared home for how a service states the framework's constraint refusal;
 # `iam_authorization`, the shared evaluation of those documents against an action on a
 # resource; and `iam_role`, which IAM entity a principal ARN names.
@@ -38,6 +42,9 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# `time` is for the discovery suite's poll loops past a clock-owed transition; the
+# workspace tokio feature set covers only `#[tokio::test]` itself.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

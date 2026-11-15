@@ -194,18 +194,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(BatchGetDiscoverableRegistryRecordErrorModeled::AccessDeniedException)?;
         }
 
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(
-                BatchGetDiscoverableRegistryRecordErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: Some("the Agent Registry store is unavailable".to_string()),
-                    },
-                )
-                .into(),
-            );
-        };
-        let state = state.lock();
-
         let mut registry_records = Vec::with_capacity(requested_total);
         let mut errors = Vec::new();
 
@@ -216,8 +204,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // call's failure and not a per-record error. Answering 200 there would
             // make a deleted or mistyped registry indistinguishable from one holding
             // none of the requested records.
-            let Some(registry) = state.registry(&entry.registry_id) else {
-                return Err(registry_not_found(&entry.registry_id));
+            let registry = match crate::state::owner::registry(&*self.engine, &entry.registry_id) {
+                Err(crate::state::owner::StoreUnavailable) => {
+                    return Err(
+                        BatchGetDiscoverableRegistryRecordErrorModeled::InternalServerException(
+                            InternalServerException {
+                                message: Some(
+                                    crate::state::owner::STORE_UNAVAILABLE_MESSAGE.to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+                Ok(None) => return Err(registry_not_found(&entry.registry_id)),
+                Ok(Some(registry)) => registry,
             };
             let registry_id = crate::state::registry_id_from_identifier(&entry.registry_id);
             for requested in &entry.record_ids {

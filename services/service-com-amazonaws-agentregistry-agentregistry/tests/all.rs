@@ -15,6 +15,8 @@
 mod discovery_read_authorization;
 #[path = "all/discovery_read_path.rs"]
 mod discovery_read_path;
+#[path = "all/owner_store_is_the_discovery_surface.rs"]
+mod owner_store_is_the_discovery_surface;
 #[path = "all/registry_read_refusals.rs"]
 mod registry_read_refusals;
 #[path = "all/state_roundtrip.rs"]

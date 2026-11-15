@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-// Single integration-test target for the router: one `#[path = "all/<name>.rs"]` /
-// `mod <name>;` pair per file under `tests/all/`, sorted by name, and no other line.
-// `all/all_rs_carries_no_inner_doc_comment.rs`, `all/all_rs_declares_each_suite_once.rs`,
-// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
-// `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`
-// pin that shape; `all/appended_prose.rs` keeps what landings had appended here.
-// Single integration-test target for the router: the declaration list, and nothing else.
-//
-// Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
 // Single integration-test target for the router: the canonical DECLARATION LIST of every
 // cross-service suite under `tests/all/`, and nothing else.
+//
 // Single integration-test target for the router: a declaration list, and nothing else.
 // Past this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
 // file under `tests/all/`, sorted by name, and no other line — no prose between the pairs, no
@@ -71,6 +63,7 @@
 // test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of it, which the layout
 // check refuses: the `#[path]` above each `mod` is what points it into `tests/all/`.
 // Suites of this target pin all of that rather than restate it:
+// Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
 // suite file, sorted by name, and no other line — no prose between the pairs, no blank line,
 // and nothing after the last pair. Two branches landing at once then insert two lines in two
 // places and have no prose to duplicate, re-word or mistype, which is what had gone wrong
@@ -93,6 +86,8 @@
 // What a suite covers, and why it drives the assembled router rather than one service crate,
 // belongs in that suite's OWN module header, where it is read beside the test it explains; a
 // note about THIS file belongs in `all/appended_notes.rs`. The suites
+// `all/all_rs_carries_no_inner_doc_comment.rs`, `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
 // `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs` and
 // `all/declaration_roots_are_canonical_and_complete.rs` check all of the above, for this file
 // The header paragraphs above wrap without the indentation `clippy::doc_lazy_continuation`
@@ -116,25 +111,8 @@
 // An inner attribute, like an inner doc comment, is legal only before the first item, so the
 // one this target needs stands here rather than in the list below.
 #![allow(clippy::doc_lazy_continuation)]
-// suite file under `tests/all/`, sorted by name, and no other line. Put a new suite at
-// `tests/all/<name>.rs` and insert its pair in order; what that suite covers, and why it
-// drives the assembled router rather than one service crate, belongs in its OWN module
-// header, where it is read beside the test it explains.
-// EVERY comment in this file is an ordinary `//` one, this header included, and that is
-// deliberate: an inner doc comment, like an inner attribute, is legal only before the first
-// item, so one that lands past the declarations compiles no suite of this target at all. With
-// none anywhere in the file, no merge of two landings can put one past the first item.
-// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of
-// this file, which the layout check refuses: the `#[path]` is what points each declaration
-// into `tests/all/`. A suite no `mod` here names is compiled nowhere and its tests never run,
-// and a second `mod` for one name fails every suite in this target.
-// `all/all_rs_is_a_canonical_declaration_list.rs`,
-// `all/declaration_roots_are_canonical_and_complete.rs`,
-// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` and
-// `all/every_suite_file_is_declared.rs` pin those rules, for this file and for every service
-// crate's `tests/all.rs`, so check there rather than leaving a note here;
-// `all/appended_header_notes.rs`, `all/appended_notes.rs`, `all/appended_notes_tail.rs` and
-// `all/appended_prose.rs` keep what the notes landings had appended to this file.
+#[path = "all/agent_registry_discovery_routes_probe.rs"]
+mod agent_registry_discovery_routes_probe;
 #[path = "all/agent_registry_signing_name_routing.rs"]
 mod agent_registry_signing_name_routing;
 #[path = "all/all_rs_carries_no_inner_doc_comment.rs"]
@@ -153,6 +131,8 @@ mod aoss_vpc_endpoint_placement_resolves_in_ec2;
 mod apigateway_account_cloudwatch_role;
 #[path = "all/apigateway_cognito_authorizer_app_client_audience.rs"]
 mod apigateway_cognito_authorizer_app_client_audience;
+#[path = "all/apigateway_cognito_authorizer_spares_the_proxy_lambda.rs"]
+mod apigateway_cognito_authorizer_spares_the_proxy_lambda;
 #[path = "all/apigateway_cognito_user_pools_authorizer.rs"]
 mod apigateway_cognito_user_pools_authorizer;
 #[path = "all/apigateway_dynamodb_service_integration.rs"]
@@ -297,6 +277,8 @@ mod cloudformation_apigatewayv2_api_children;
 mod cloudformation_apigatewayv2_resources;
 #[path = "all/cloudformation_appsync_custom_domains.rs"]
 mod cloudformation_appsync_custom_domains;
+#[path = "all/cloudformation_asg_launch_fault_diagnosis.rs"]
+mod cloudformation_asg_launch_fault_diagnosis;
 #[path = "all/cloudformation_asset_bucket_publishing_role.rs"]
 mod cloudformation_asset_bucket_publishing_role;
 #[path = "all/cloudformation_bucket_handles_drive_their_owning_services.rs"]
@@ -413,6 +395,8 @@ mod cloudformation_provisions_acmpca_certificate_authorities;
 mod cloudformation_provisions_agentcore_workload_identities;
 #[path = "all/cloudformation_provisions_amplifyuibuilder_entities.rs"]
 mod cloudformation_provisions_amplifyuibuilder_entities;
+#[path = "all/cloudformation_provisions_appsync_event_and_merged_apis.rs"]
+mod cloudformation_provisions_appsync_event_and_merged_apis;
 #[path = "all/cloudformation_provisions_appsync_resources.rs"]
 mod cloudformation_provisions_appsync_resources;
 #[path = "all/cloudformation_provisions_backup_resources.rs"]
@@ -1157,6 +1141,8 @@ mod s3_deployed_notification_copies_within_its_bucket;
 mod s3_form_post_upload_routes_by_event_bridge_reason;
 #[path = "all/s3_metadata_tables_live_in_s3tables.rs"]
 mod s3_metadata_tables_live_in_s3tables;
+#[path = "all/s3_notification_granted_function_writes_back_into_the_bucket.rs"]
+mod s3_notification_granted_function_writes_back_into_the_bucket;
 #[path = "all/s3_notification_indexes_into_its_opensearch_domain.rs"]
 mod s3_notification_indexes_into_its_opensearch_domain;
 #[path = "all/s3_notification_invokes_its_lambda_target.rs"]
@@ -1311,6 +1297,8 @@ mod ssm_securestring_ciphertext_decrypts_in_kms;
 mod sts_does_not_disclose_an_absent_role;
 #[path = "all/sts_management_events.rs"]
 mod sts_management_events;
+#[path = "all/sts_session_context_keys.rs"]
+mod sts_session_context_keys;
 #[path = "all/sts_session_credential_refusals.rs"]
 mod sts_session_credential_refusals;
 #[path = "all/sts_source_identity_is_audited.rs"]
