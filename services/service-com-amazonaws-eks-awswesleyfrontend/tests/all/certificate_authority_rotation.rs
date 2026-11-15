@@ -55,7 +55,12 @@ const INTERVAL: Duration = Duration::from_millis(25);
 
 /// Poll `read` until `holds` accepts what it answered, and report that answer.
 /// Fails the case with what it last saw if the deadline passes first.
-async fn poll_until<Read, Fut, Holds>(case: &str, what: &str, read: Read, holds: Holds) -> Answer
+pub(crate) async fn poll_until<Read, Fut, Holds>(
+    case: &str,
+    what: &str,
+    read: Read,
+    holds: Holds,
+) -> Answer
 where
     Read: Fn() -> Fut,
     Fut: std::future::Future<Output = Answer>,
@@ -78,7 +83,7 @@ where
 
 /// The cluster `name`, created and polled until it reports `ACTIVE` — the status
 /// every certificate-authority call requires of it.
-async fn active_cluster(router: &MultiServiceRouter, case: &str, name: &str) {
+pub(crate) async fn active_cluster(router: &MultiServiceRouter, case: &str, name: &str) {
     let created = create_cluster(router, REGION, name).await;
     assert_eq!(
         created.status, 200,

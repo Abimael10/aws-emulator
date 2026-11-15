@@ -1737,3 +1737,16 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 //   `#[path]` is what points each declaration into `tests/all/`.
 // The notes successive landings had appended to the tail of this file live in
 // `all/appended_notes.rs`.
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted in sorted order. The list
+// holds nothing else — no blank line, no note, no prose: every comment of this file
+// stands in THIS header, above the first declaration.
+// A suite no `mod` names compiles nowhere and its tests never run; a suite declared
+// twice is `E0428`; and an inner doc comment (`//!`) past the first item is `E0753`.
+// Each of those fails every suite in this target, which is why this file carries
+// declarations only. `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs` check those rules, for this file and
+// for every service crate's `tests/all.rs`.
+// What a suite covers, and why it lives in this cross-service target rather than in one
+// service crate's own, belongs in that suite's own module header, where it is read
+// beside the test it explains; the notes landings had appended to this file live in
+// under `tests/` — which the layout check refuses. The `#[path]` is what points each

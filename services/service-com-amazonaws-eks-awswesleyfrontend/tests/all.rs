@@ -85,6 +85,8 @@ mod certificate_authority_listing_order;
 mod certificate_authority_read_refusal;
 #[path = "all/certificate_authority_rotation.rs"]
 mod certificate_authority_rotation;
+#[path = "all/certificate_authority_rotation_rounds.rs"]
+mod certificate_authority_rotation_rounds;
 #[path = "all/certificate_authority_trust_list.rs"]
 mod certificate_authority_trust_list;
 #[path = "all/child_create_resolves_the_cluster_first.rs"]
