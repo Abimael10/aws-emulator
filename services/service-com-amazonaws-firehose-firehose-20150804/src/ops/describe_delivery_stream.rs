@@ -8,10 +8,11 @@
 //! A member whose default the service documents is reported with that default
 //! MATERIALISED rather than omitted: the stream's SSE state (`DISABLED` for a stream that
 //! was never encrypted), a destination's `CompressionFormat`, `BufferingHints`,
-//! `EncryptionConfiguration`, `S3BackupMode` and `CloudWatchLoggingOptions` (logging off
-//! for a destination that never asked for it). A client comparing desired against actual
-//! configuration, or round-tripping a description back into `UpdateDestination`,
-//! then reads an explicit value where AWS reports one.
+//! `RetryOptions`, `EncryptionConfiguration`, `S3BackupMode`, `AppendOnly` and
+//! `CloudWatchLoggingOptions` (logging off for a destination that never asked for it),
+//! each with the default its own destination kind documents. A client comparing desired
+//! against actual configuration, or round-tripping a description back into
+//! `UpdateDestination`, then reads an explicit value where AWS reports one.
 //!
 //! A destination whose destination IS Amazon S3 is reported through BOTH spellings the
 //! model gives it: the deprecated `DestinationDescription$S3DestinationDescription` mirror
@@ -240,18 +241,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// `CompressionFormat` "If no value is specified, the default is UNCOMPRESSED."
 const DEFAULT_COMPRESSION_FORMAT: &str = "UNCOMPRESSED";
-/// `BufferingHints.SizeInMBs`: "The default value is 5."
+/// `BufferingHints.SizeInMBs`: "The default value is 5." The Elasticsearch, OpenSearch,
+/// Serverless, Splunk and HTTP-endpoint buffering shapes each document the same size, so
+/// their reporters below share this constant rather than restating it.
 const DEFAULT_BUFFERING_SIZE_IN_MBS: i32 = 5;
-/// `BufferingHints.IntervalInSeconds`: "The default value is 300."
+/// `BufferingHints.IntervalInSeconds`: "The default value is 300." The Elasticsearch,
+/// OpenSearch, Serverless and HTTP-endpoint buffering shapes each document the same
+/// interval ("300 (5 minutes)"), so their reporters below share this constant; Splunk and
+/// Snowflake document their own and have constants of their own.
 const DEFAULT_BUFFERING_INTERVAL_IN_SECONDS: i32 = 300;
-/// The `S3BackupMode` of an Iceberg destination created without one: "Describes how Firehose
-/// will backup records. Currently, Firehose only supports `FailedDataOnly`"
-/// (`IcebergDestinationDescription$S3BackupMode`) — so a destination that named no mode backs
-/// up the failed records alone.
-const DEFAULT_ICEBERG_S3_BACKUP_MODE: &str = "FailedDataOnly";
-/// `RetryOptions.DurationInSeconds` when the destination names none: "the default value is
-/// 300 (5 minutes)", the span every `RetryOptions` member of this API documents.
-const DEFAULT_RETRY_DURATION_IN_SECONDS: i32 = 300;
 /// The `S3BackupMode` of an Amazon S3 or Amazon Redshift destination created without one:
 /// "After you create a Firehose stream, you can update it to enable Amazon S3 backup if
 /// it is disabled" (`ExtendedS3DestinationConfiguration$S3BackupMode`,
@@ -265,6 +263,163 @@ const DEFAULT_ELASTICSEARCH_S3_BACKUP_MODE: &str = "FailedDocumentsOnly";
 /// `SplunkDestinationConfiguration$S3BackupMode`: "The default value is
 /// FailedEventsOnly."
 const DEFAULT_SPLUNK_S3_BACKUP_MODE: &str = "FailedEventsOnly";
+/// `IcebergDestinationDescription$S3BackupMode`: "Describes how Firehose will backup
+/// records. Currently, Firehose only supports FailedDataOnly" — the one value the
+/// destination kind backs records up with, so that is the mode it operates under.
+const DEFAULT_ICEBERG_S3_BACKUP_MODE: &str = "FailedDataOnly";
+/// `IcebergDestinationConfiguration$AppendOnly`: "The default value is false."
+const DEFAULT_APPEND_ONLY: bool = false;
+/// `SplunkBufferingHints$IntervalInSeconds`: "The default value is 60 (1 minute)."
+const DEFAULT_SPLUNK_BUFFERING_INTERVAL_IN_SECONDS: i32 = 60;
+/// `SnowflakeBufferingHints$SizeInMBs`: "The default value is 128."
+const DEFAULT_SNOWFLAKE_BUFFERING_SIZE_IN_MBS: i32 = 128;
+/// `SnowflakeBufferingHints$IntervalInSeconds`: "The default value is 0."
+const DEFAULT_SNOWFLAKE_BUFFERING_INTERVAL_IN_SECONDS: i32 = 0;
+/// The retry window a destination whose model documents one reports when its create named
+/// none: `ElasticsearchRetryOptions$DurationInSeconds` and its two OpenSearch counterparts
+/// state "Default value is 300 seconds (5 minutes)". A kind whose retry options document
+/// no default keeps the member unset.
+const DEFAULT_RETRY_DURATION_IN_SECONDS: i32 = 300;
+/// The retry window an Apache Iceberg Tables destination created without `RetryOptions`
+/// reports. That kind uses the service-wide `RetryOptions` shape, whose documentation
+/// states no default; the recorded `DescribeDeliveryStream` response of a stream created
+/// without the member reports a 300-second window. Kept separate from the constant above,
+/// which IS model-documented, so correcting one does not move the other.
+const DEFAULT_ICEBERG_RETRY_DURATION_IN_SECONDS: i32 = 300;
+/// `RedshiftRetryOptions$DurationInSeconds`: "The default value is 3600 seconds (60
+/// minutes)."
+const DEFAULT_REDSHIFT_RETRY_DURATION_IN_SECONDS: i32 = 3600;
+
+/// Declares the "effective buffering hints" reporter of ONE destination kind.
+///
+/// Every destination kind models its own `BufferingHints` shape and documents its own
+/// default buffer size and interval, so each default pair travels with the shape it
+/// belongs to while the rule — report the supplied value, else the documented default,
+/// never nothing — is written once.
+macro_rules! effective_buffering_hints {
+    ($(#[$doc:meta])* $name:ident($shape:ident) = ($size:expr, $interval:expr)) => {
+        $(#[$doc])*
+        fn $name(hints: Option<&$shape>) -> $shape {
+            $shape {
+                size_in_m_bs: hints.and_then(|hints| hints.size_in_m_bs).or(Some($size)),
+                interval_in_seconds: hints
+                    .and_then(|hints| hints.interval_in_seconds)
+                    .or(Some($interval)),
+            }
+        }
+    };
+}
+
+/// Declares the "effective retry options" reporter of ONE destination kind, the same way
+/// [`effective_buffering_hints`] does for buffering: the retry window the destination
+/// actually retries for, which is the documented default when the create named none.
+macro_rules! effective_retry_options {
+    ($(#[$doc:meta])* $name:ident($shape:ident) = $seconds:expr) => {
+        $(#[$doc])*
+        fn $name(options: Option<&$shape>) -> $shape {
+            $shape {
+                duration_in_seconds: options
+                    .and_then(|options| options.duration_in_seconds)
+                    .or(Some($seconds)),
+            }
+        }
+    };
+}
+
+effective_buffering_hints! {
+    /// "The buffering option. If no value is specified, BufferingHints object default
+    /// values are used." — the shape an Amazon S3, extended Amazon S3 and Apache Iceberg
+    /// Tables destination buffers by.
+    buffering_hints(BufferingHints) = (
+        DEFAULT_BUFFERING_SIZE_IN_MBS,
+        DEFAULT_BUFFERING_INTERVAL_IN_SECONDS
+    )
+}
+
+effective_buffering_hints! {
+    /// `ElasticsearchBufferingHints`: "The default value is 5" / "The default value is 300
+    /// (5 minutes)".
+    elasticsearch_buffering_hints(ElasticsearchBufferingHints) = (
+        DEFAULT_BUFFERING_SIZE_IN_MBS,
+        DEFAULT_BUFFERING_INTERVAL_IN_SECONDS
+    )
+}
+
+effective_buffering_hints! {
+    /// `AmazonopensearchserviceBufferingHints`: "The default value is 5" / "The default
+    /// value is 300 (5 minutes)".
+    opensearch_buffering_hints(AmazonopensearchserviceBufferingHints) = (
+        DEFAULT_BUFFERING_SIZE_IN_MBS,
+        DEFAULT_BUFFERING_INTERVAL_IN_SECONDS
+    )
+}
+
+effective_buffering_hints! {
+    /// `AmazonOpenSearchServerlessBufferingHints`: "The default value is 5" / "The default
+    /// value is 300 (5 minutes)".
+    serverless_buffering_hints(AmazonOpenSearchServerlessBufferingHints) = (
+        DEFAULT_BUFFERING_SIZE_IN_MBS,
+        DEFAULT_BUFFERING_INTERVAL_IN_SECONDS
+    )
+}
+
+effective_buffering_hints! {
+    /// `SplunkBufferingHints`: "The default value is 5" / "The default value is 60 (1
+    /// minute)".
+    splunk_buffering_hints(SplunkBufferingHints) = (
+        DEFAULT_BUFFERING_SIZE_IN_MBS,
+        DEFAULT_SPLUNK_BUFFERING_INTERVAL_IN_SECONDS
+    )
+}
+
+effective_buffering_hints! {
+    /// `SnowflakeBufferingHints`: "The default value is 128" / "The default value is 0".
+    snowflake_buffering_hints(SnowflakeBufferingHints) = (
+        DEFAULT_SNOWFLAKE_BUFFERING_SIZE_IN_MBS,
+        DEFAULT_SNOWFLAKE_BUFFERING_INTERVAL_IN_SECONDS
+    )
+}
+
+effective_buffering_hints! {
+    /// `HttpEndpointBufferingHints`: "The default value is 5" / "The default value is 300
+    /// (5 minutes)".
+    http_endpoint_buffering_hints(HttpEndpointBufferingHints) = (
+        DEFAULT_BUFFERING_SIZE_IN_MBS,
+        DEFAULT_BUFFERING_INTERVAL_IN_SECONDS
+    )
+}
+
+effective_retry_options! {
+    /// The retry window of an Apache Iceberg Tables destination, whose `RetryOptions` is
+    /// the service-wide shape.
+    retry_options(RetryOptions) = DEFAULT_ICEBERG_RETRY_DURATION_IN_SECONDS
+}
+
+effective_retry_options! {
+    /// `ElasticsearchRetryOptions$DurationInSeconds`: "Default value is 300 seconds (5
+    /// minutes)."
+    elasticsearch_retry_options(ElasticsearchRetryOptions) = DEFAULT_RETRY_DURATION_IN_SECONDS
+}
+
+effective_retry_options! {
+    /// `AmazonopensearchserviceRetryOptions$DurationInSeconds`: "Default value is 300
+    /// seconds (5 minutes)."
+    opensearch_retry_options(AmazonopensearchserviceRetryOptions) =
+        DEFAULT_RETRY_DURATION_IN_SECONDS
+}
+
+effective_retry_options! {
+    /// `AmazonOpenSearchServerlessRetryOptions$DurationInSeconds`: "Default value is 300
+    /// seconds (5 minutes)."
+    serverless_retry_options(AmazonOpenSearchServerlessRetryOptions) =
+        DEFAULT_RETRY_DURATION_IN_SECONDS
+}
+
+effective_retry_options! {
+    /// `RedshiftRetryOptions$DurationInSeconds`: "The default value is 3600 seconds (60
+    /// minutes)."
+    redshift_retry_options(RedshiftRetryOptions) = DEFAULT_REDSHIFT_RETRY_DURATION_IN_SECONDS
+}
 
 /// The CloudWatch logging a destination description reports, which every destination type
 /// carries a block for.
@@ -347,7 +502,7 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                 cluster_jdbcurl: config.cluster_jdbcurl.clone(),
                 copy_command: config.copy_command.clone(),
                 username: config.username.clone(),
-                retry_options: config.retry_options.clone(),
+                retry_options: Some(redshift_retry_options(config.retry_options.as_ref())),
                 s3_destination_description: s3_description(&config.s3_configuration),
                 processing_configuration: config.processing_configuration.clone(),
                 s3_backup_mode: Some(s3_backup_mode(
@@ -371,8 +526,10 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                 index_name: Some(config.index_name.clone()),
                 type_name: config.type_name.clone(),
                 index_rotation_period: config.index_rotation_period.clone(),
-                buffering_hints: config.buffering_hints.clone(),
-                retry_options: config.retry_options.clone(),
+                buffering_hints: Some(elasticsearch_buffering_hints(
+                    config.buffering_hints.as_ref(),
+                )),
+                retry_options: Some(elasticsearch_retry_options(config.retry_options.as_ref())),
                 s3_backup_mode: Some(s3_backup_mode(
                     config.s3_backup_mode.as_ref(),
                     DEFAULT_ELASTICSEARCH_S3_BACKUP_MODE,
@@ -394,8 +551,13 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                     index_name: Some(config.index_name.clone()),
                     type_name: config.type_name.clone(),
                     index_rotation_period: config.index_rotation_period.clone(),
-                    buffering_hints: config.buffering_hints.clone(),
-                    retry_options: config.retry_options.clone(),
+                    buffering_hints: Some(opensearch_buffering_hints(
+                        config.buffering_hints.as_ref(),
+                    )),
+                    retry_options: Some(opensearch_retry_options(config.retry_options.as_ref())),
+                    // The model documents no default for this kind's S3BackupMode, so
+                    // there is no effective value to materialise for a create that left
+                    // it out.
                     s3_backup_mode: config.s3_backup_mode.clone(),
                     s3_destination_description: Some(s3_description(&config.s3_configuration)),
                     processing_configuration: config.processing_configuration.clone(),
@@ -413,6 +575,7 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                 hec_token: config.hec_token.clone(),
                 hec_acknowledgment_timeout_in_seconds: config
                     .hec_acknowledgment_timeout_in_seconds,
+                // The model documents no default retry window for Splunk.
                 retry_options: config.retry_options.clone(),
                 s3_backup_mode: Some(s3_backup_mode(
                     config.s3_backup_mode.as_ref(),
@@ -421,7 +584,7 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                 s3_destination_description: Some(s3_description(&config.s3_configuration)),
                 processing_configuration: config.processing_configuration.clone(),
                 cloud_watch_logging_options: logging(&config.cloud_watch_logging_options),
-                buffering_hints: config.buffering_hints.clone(),
+                buffering_hints: Some(splunk_buffering_hints(config.buffering_hints.as_ref())),
                 secrets_manager_configuration: config.secrets_manager_configuration.clone(),
             }),
             ..rendered
@@ -434,11 +597,15 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                     url: Some(config.endpoint_configuration.url.clone()),
                     name: config.endpoint_configuration.name.clone(),
                 }),
-                buffering_hints: config.buffering_hints.clone(),
+                buffering_hints: Some(http_endpoint_buffering_hints(
+                    config.buffering_hints.as_ref(),
+                )),
                 cloud_watch_logging_options: logging(&config.cloud_watch_logging_options),
                 request_configuration: config.request_configuration.clone(),
                 processing_configuration: config.processing_configuration.clone(),
                 role_arn: config.role_arn.clone(),
+                // The model documents neither a retry window nor an S3BackupMode default
+                // for an HTTP endpoint destination.
                 retry_options: config.retry_options.clone(),
                 s3_backup_mode: config.s3_backup_mode.clone(),
                 s3_destination_description: Some(s3_description(&config.s3_configuration)),
@@ -461,11 +628,13 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                 cloud_watch_logging_options: logging(&config.cloud_watch_logging_options),
                 processing_configuration: config.processing_configuration.clone(),
                 role_arn: Some(config.role_arn.clone()),
+                // The model documents neither a retry window nor an S3BackupMode default
+                // for a Snowflake destination.
                 retry_options: config.retry_options.clone(),
                 s3_backup_mode: config.s3_backup_mode.clone(),
                 s3_destination_description: Some(s3_description(&config.s3_configuration)),
                 secrets_manager_configuration: config.secrets_manager_configuration.clone(),
-                buffering_hints: config.buffering_hints.clone(),
+                buffering_hints: Some(snowflake_buffering_hints(config.buffering_hints.as_ref())),
             }),
             ..rendered
         },
@@ -475,8 +644,11 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                     role_arn: Some(config.role_arn.clone()),
                     collection_endpoint: config.collection_endpoint.clone(),
                     index_name: Some(config.index_name.clone()),
-                    buffering_hints: config.buffering_hints.clone(),
-                    retry_options: config.retry_options.clone(),
+                    buffering_hints: Some(serverless_buffering_hints(
+                        config.buffering_hints.as_ref(),
+                    )),
+                    retry_options: Some(serverless_retry_options(config.retry_options.as_ref())),
+                    // The model documents no default for this kind's S3BackupMode.
                     s3_backup_mode: config.s3_backup_mode.clone(),
                     s3_destination_description: Some(s3_description(&config.s3_configuration)),
                     processing_configuration: config.processing_configuration.clone(),
@@ -509,7 +681,7 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                 role_arn: Some(config.role_arn.clone()),
                 // "The default value is false" (`AppendOnly`), materialised like every other
                 // documented default of this description.
-                append_only: Some(config.append_only.unwrap_or(false)),
+                append_only: Some(config.append_only.unwrap_or(DEFAULT_APPEND_ONLY)),
                 catalog_configuration: Some(config.catalog_configuration.clone()),
                 s3_destination_description: Some(s3_description(&config.s3_configuration)),
             }),
@@ -555,31 +727,6 @@ fn s3_description(config: &S3DestinationConfiguration) -> S3DestinationDescripti
             config.encryption_configuration.as_ref(),
         ),
         cloud_watch_logging_options: logging(&config.cloud_watch_logging_options),
-    }
-}
-
-/// "The buffering option. If no value is specified, BufferingHints object default values
-/// are used."
-fn buffering_hints(hints: Option<&BufferingHints>) -> BufferingHints {
-    BufferingHints {
-        size_in_m_bs: hints
-            .and_then(|hints| hints.size_in_m_bs)
-            .or(Some(DEFAULT_BUFFERING_SIZE_IN_MBS)),
-        interval_in_seconds: hints
-            .and_then(|hints| hints.interval_in_seconds)
-            .or(Some(DEFAULT_BUFFERING_INTERVAL_IN_SECONDS)),
-    }
-}
-
-/// "The retry behavior in case Firehose is unable to deliver data to a destination"
-/// (`RetryOptions`), reported with its documented default materialised: a destination that
-/// named no retry duration retries for "the default value … 300 (5 minutes)", the span every
-/// `RetryOptions` member of this API documents as its default.
-fn retry_options(options: Option<&RetryOptions>) -> RetryOptions {
-    RetryOptions {
-        duration_in_seconds: options
-            .and_then(|options| options.duration_in_seconds)
-            .or(Some(DEFAULT_RETRY_DURATION_IN_SECONDS)),
     }
 }
 

@@ -7489,3 +7489,5 @@ mod events_lambda_target_permission_granted_after_the_rule;
 // one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, each declared once, and
 // nothing else. A note about one belongs in that suite's own module doc.
 // `all/appended_notes.rs` holds the notes successive landings had appended here.
+//! the test it explains.
+//! file, which the layout check refuses: the `#[path]` is what points each declaration into
