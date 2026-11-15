@@ -117,7 +117,7 @@ pub(crate) async fn bulk(emulator: &Emulator, host: &str, path: &str, lines: &[V
 
 /// The items a bulk answer carries, each as `(the action's name, its status, its result)` —
 /// `result` is absent on an item that failed, which is what its error stands in for.
-fn items(answer: &Answer) -> Vec<(String, i64, Option<String>, Option<String>)> {
+pub(crate) fn items(answer: &Answer) -> Vec<(String, i64, Option<String>, Option<String>)> {
     answer.body["items"]
         .as_array()
         .unwrap_or(&Vec::new())
@@ -135,7 +135,7 @@ fn items(answer: &Answer) -> Vec<(String, i64, Option<String>, Option<String>)> 
 }
 
 /// How many documents an index holds, as its own count API reports it.
-async fn counted(emulator: &Emulator, host: &str, index: &str) -> i64 {
+pub(crate) async fn counted(emulator: &Emulator, host: &str, index: &str) -> i64 {
     let answer = rest(
         emulator,
         DEFAULT_ACCESS_KEY_ID,

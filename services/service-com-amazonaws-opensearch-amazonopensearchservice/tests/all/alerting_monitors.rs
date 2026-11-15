@@ -95,9 +95,9 @@ fn sqs(emulator: &Emulator) -> ::aws_sdk_sqs::Client {
 
 /// One notification target: the topic a channel publishes to, and the queue subscribed to
 /// it that the notification is read off.
-struct Target {
-    topic_arn: String,
-    queue_url: String,
+pub(crate) struct Target {
+    pub(crate) topic_arn: String,
+    pub(crate) queue_url: String,
 }
 
 /// A topic named `name`, with a queue of the same name subscribed to it.
@@ -105,7 +105,7 @@ struct Target {
 /// The queue carries the policy a subscribed queue has to carry — "you must ensure that the
 /// Amazon SQS queue policy allows the Amazon SNS topic to send messages to the queue" — so
 /// the delivery is one Amazon SNS is allowed to make.
-async fn given_target(emulator: &Emulator, name: &str) -> Target {
+pub(crate) async fn given_target(emulator: &Emulator, name: &str) -> Target {
     let account = ::engine::emulator_account_id();
     let queue_arn = format!("arn:aws:sqs:{REGION}:{account}:{name}");
     let topic_arn = format!("arn:aws:sns:{REGION}:{account}:{name}");
@@ -161,7 +161,7 @@ async fn given_target(emulator: &Emulator, name: &str) -> Target {
 
 /// Every message now on `queue`, with the Amazon SNS notification envelope parsed — the
 /// `Message` each carries is what the trigger's action published.
-async fn received(emulator: &Emulator, queue: &str) -> Vec<Value> {
+pub(crate) async fn received(emulator: &Emulator, queue: &str) -> Vec<Value> {
     let answered = sqs(emulator)
         .receive_message()
         .queue_url(queue)
@@ -186,7 +186,7 @@ async fn received(emulator: &Emulator, queue: &str) -> Vec<Value> {
 /// The wait is for the CONDITION — a message on the queue — and not for a span of time: the
 /// publish is in process and already happened by the time the run answered, so this looks
 /// again only to keep a loaded machine from failing the suite.
-async fn published_message(emulator: &Emulator, case: &str, queue: &str) -> String {
+pub(crate) async fn published_message(emulator: &Emulator, case: &str, queue: &str) -> String {
     let deadline = Instant::now() + ARRIVAL_DEADLINE;
     loop {
         let messages = received(emulator, queue).await;
@@ -212,7 +212,7 @@ async fn published_message(emulator: &Emulator, case: &str, queue: &str) -> Stri
 }
 
 /// The monitor document a row asks for.
-fn monitor_document(
+pub(crate) fn monitor_document(
     name: &str,
     index: &str,
     query: Value,
@@ -249,7 +249,12 @@ fn monitor_document(
 }
 
 /// `POST /_plugins/_alerting/monitors`, answering the id the write minted.
-async fn given_monitor(emulator: &Emulator, domain: &str, case: &str, document: Value) -> String {
+pub(crate) async fn given_monitor(
+    emulator: &Emulator,
+    domain: &str,
+    case: &str,
+    document: Value,
+) -> String {
     let created = rest_prefixed(
         emulator,
         domain,
@@ -271,7 +276,12 @@ async fn given_monitor(emulator: &Emulator, domain: &str, case: &str, document: 
 
 /// `POST /_plugins/_notifications/configs` for an Amazon SNS channel on `topic_arn`,
 /// answering the `config_id` the create minted.
-async fn given_channel(emulator: &Emulator, domain: &str, name: &str, topic_arn: &str) -> String {
+pub(crate) async fn given_channel(
+    emulator: &Emulator,
+    domain: &str,
+    name: &str,
+    topic_arn: &str,
+) -> String {
     let created = rest_prefixed(
         emulator,
         domain,

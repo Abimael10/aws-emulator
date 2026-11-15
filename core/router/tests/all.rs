@@ -2173,3 +2173,13 @@ mod zz_probe_whole_emulator;
 // A note a suite's own header wraps without the indentation `clippy::doc_lazy_continuation`
 // asks of a doc list item, so the lint is allowed for the whole target here — an inner
 // attribute, like an inner doc comment, is legal only before the first item.
+// suite, sorted by name, and no other line, so two branches landing at once insert two
+// the declarations is `E0753` and compiles no suite of this target. With none anywhere in the
+// file, no appended, re-typed or merged copy of a line of it can be one past the first item.
+// A suite no `mod` names compiles nowhere, a suite left at the top level of `tests/` fails
+// the build, and a suite declared twice is `E0428` — each of which fails every suite here
+// too. The `#[path]` above each declaration is what points it into `tests/all/`: this file is
+// a test-target crate root, where a bare `mod` would resolve to a sibling of it. An inner
+// attribute, like an inner doc comment, is legal only ahead of the first item, so the one
+// below stands with this header.
+// explains; a note about this file itself belongs in `all/appended_notes.rs`. The suites
