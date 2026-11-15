@@ -415,7 +415,10 @@ async fn a_group_with_no_refresh_in_progress_has_nothing_to_cancel() {
             "case {:?}: expected the ActiveInstanceRefreshNotFound code, got {body}",
             row.case
         );
-        let expected = format!("No active Instance Refresh found for Auto Scaling group {name}");
+        let expected = format!(
+            "No in progress, baking, pending, or cancelling Instance Refresh found for Auto \
+             Scaling group {name}."
+        );
         assert_eq!(
             xml_unescape(&tag_value(&body, "Message")),
             expected,

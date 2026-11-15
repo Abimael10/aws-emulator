@@ -54,13 +54,12 @@ const NO_DESIRED_CONFIGURATION_MESSAGE: &str =
      specified for the instance refresh.";
 
 /// The sentence a rollback of a group whose launch template version floats is refused
-/// with.
-fn floating_version_message(version: &str) -> String {
-    format!(
-        "The instance refresh cannot be rolled back because the Auto Scaling group uses the \
-         launch template's {version} version."
-    )
-}
+/// with: fixed text naming BOTH floating versions, because the refusal is about the group
+/// using either of them rather than about the one it happens to name.
+const FLOATING_VERSION_MESSAGE: &str =
+    "This Auto Scaling group's launch template version isn't compatible with a rollback. \
+     Rollbacks are not supported when the Auto Scaling group uses the launch template's \
+     '$Latest' or '$Default' version.";
 
 /// The sentence a rollback of a group whose launch template resolves its image through a
 /// Systems Manager parameter is refused with.
@@ -541,7 +540,7 @@ async fn a_rollback_with_nothing_to_reverse_is_refused() {
             desired_configuration: true,
             before: Before::InProgress,
             code: Some("IrreversibleInstanceRefresh"),
-            message: Some(floating_version_message("$Default")),
+            message: Some(FLOATING_VERSION_MESSAGE.to_string()),
         },
         Refusal {
             case: "a group that names the $Default version itself",
@@ -549,7 +548,7 @@ async fn a_rollback_with_nothing_to_reverse_is_refused() {
             desired_configuration: true,
             before: Before::InProgress,
             code: Some("IrreversibleInstanceRefresh"),
-            message: Some(floating_version_message("$Default")),
+            message: Some(FLOATING_VERSION_MESSAGE.to_string()),
         },
         Refusal {
             case: "a group that names the $Latest version",
@@ -557,7 +556,7 @@ async fn a_rollback_with_nothing_to_reverse_is_refused() {
             desired_configuration: true,
             before: Before::InProgress,
             code: Some("IrreversibleInstanceRefresh"),
-            message: Some(floating_version_message("$Latest")),
+            message: Some(FLOATING_VERSION_MESSAGE.to_string()),
         },
         Refusal {
             case: "a numbered version and a desired configuration: the rollback is served",

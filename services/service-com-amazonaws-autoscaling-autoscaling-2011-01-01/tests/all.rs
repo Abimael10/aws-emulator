@@ -39,6 +39,8 @@ mod describe_tags;
 mod error_envelope;
 #[path = "all/group_configuration_refusals.rs"]
 mod group_configuration_refusals;
+#[path = "all/group_state_and_standby_transitions.rs"]
+mod group_state_and_standby_transitions;
 #[path = "all/group_tag_propagate_at_launch.rs"]
 mod group_tag_propagate_at_launch;
 #[path = "all/group_size_and_health_check_refusal_wording.rs"]

@@ -349,8 +349,12 @@ async fn named_zones_win_and_an_update_moves_the_group() {
     let router = router_with(engine.clone());
     let subnets = seed_subnets(&engine, 2);
 
-    // Both members: the zones are the ones the caller named.
-    let named_zone = subnets[1].zone.clone();
+    // Both members: the zones are the ones the caller named, and the subnet it also named
+    // resides in one of them — "if you specify VPCZoneIdentifier with AvailabilityZones,
+    // the subnets that you specify must reside in those Availability Zones"
+    // (`smithy_query(query="doc",shape="CreateAutoScalingGroupType",member="VPCZoneIdentifier")`),
+    // which the sibling suite checks the refusal of.
+    let named_zone = subnets[0].zone.clone();
     let (status, body) = query(
         &router,
         "CreateAutoScalingGroup",

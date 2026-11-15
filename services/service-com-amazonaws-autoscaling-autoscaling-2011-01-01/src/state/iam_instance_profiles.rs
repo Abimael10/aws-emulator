@@ -95,6 +95,54 @@ impl ProfileReference {
             self.value, self.parameter, self.detail
         )
     }
+
+    /// What the FAILED LAUNCH of an instance that would have run as this unresolvable
+    /// profile records as its `StatusMessage`.
+    ///
+    /// The same detail Amazon EC2 states for the launch parameter that did not resolve,
+    /// followed by the sentence every launch failure of this service ends with
+    /// ([`super::LAUNCH_FAILED_SENTENCE`]): an activity reports what happened to one
+    /// launch, not what a caller should change about a request it never made.
+    fn launch_failure(&self) -> String {
+        format!("{}. {}", self.detail, super::LAUNCH_FAILED_SENTENCE)
+    }
+}
+
+/// The first reference the launch templates of a launch source carry that the account's own
+/// IAM store does not resolve, in the order the request names them.
+///
+/// THE ONE resolution, shared by the refusal a request that CONFIGURES the group is
+/// answered ([`unresolvable_profile_error`]) and the failed activity a LAUNCH from an
+/// already-stored configuration records ([`unresolved_profile_launch_failure`]), so the two
+/// cannot disagree about which references resolve.
+fn first_unresolved<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    launch_template: Option<&LaunchTemplateSpecification>,
+    mixed_instances_policy: Option<&MixedInstancesPolicy>,
+) -> Option<ProfileReference> {
+    let references: Vec<ProfileReference> =
+        super::ec2_instances::specifications(launch_template, mixed_instances_policy)
+            .into_iter()
+            .filter_map(|specification| {
+                super::ec2_instances::launch_template_data(engine, specification)
+            })
+            .filter_map(|data| data.iam_instance_profile)
+            .filter_map(|profile| ProfileReference::of(&profile))
+            .collect();
+    if references.is_empty() {
+        return None;
+    }
+    let state = iam::service_state(engine)?;
+    let store = state.lock();
+    references.into_iter().find(|reference| {
+        // IAM entity names "are not distinguished by case", so the profile is looked up
+        // under the key IAM itself holds it by rather than under the casing the
+        // template was written in.
+        !reference
+            .name
+            .as_deref()
+            .is_some_and(|name| store.instance_profiles.contains_key(&iam::name_key(name)))
+    })
 }
 
 /// The refusal for a launch source whose launch template names an IAM instance profile this
@@ -113,31 +161,22 @@ pub fn unresolvable_profile_error<Eng: Send + Sync + 'static, E>(
     launch_template: Option<&LaunchTemplateSpecification>,
     mixed_instances_policy: Option<&MixedInstancesPolicy>,
 ) -> Option<crate::scaffolded::Scaffolded<E>> {
-    let references: Vec<ProfileReference> =
-        super::ec2_instances::specifications(launch_template, mixed_instances_policy)
-            .into_iter()
-            .filter_map(|specification| {
-                super::ec2_instances::launch_template_data(engine, specification)
-            })
-            .filter_map(|data| data.iam_instance_profile)
-            .filter_map(|profile| ProfileReference::of(&profile))
-            .collect();
-    if references.is_empty() {
-        return None;
-    }
-    let state = iam::service_state(engine)?;
-    let store = state.lock();
-    references
-        .into_iter()
-        .find(|reference| {
-            // IAM entity names "are not distinguished by case", so the profile is looked up
-            // under the key IAM itself holds it by rather than under the casing the
-            // template was written in.
-            !reference.name.as_deref().is_some_and(|name| {
-                store
-                    .instance_profiles
-                    .contains_key(&iam::name_key(name))
-            })
-        })
+    first_unresolved(engine, launch_template, mixed_instances_policy)
         .map(|reference| crate::scaffolded::Scaffolded::validation_error(reference.refusal()))
+}
+
+/// The sentence the failed activity of a LAUNCH from a configuration whose instance profile
+/// the account does not hold records; `None` when every reference resolves.
+///
+/// A group launches from the launch-template version its specification names at the instant
+/// of the launch, so a profile that stopped resolving — or a version naming a different one
+/// — fails the launch rather than a request nobody made
+/// ([`super::ec2_instances::launch_failure_reason`]).
+pub fn unresolved_profile_launch_failure<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    launch_template: Option<&LaunchTemplateSpecification>,
+    mixed_instances_policy: Option<&MixedInstancesPolicy>,
+) -> Option<String> {
+    first_unresolved(engine, launch_template, mixed_instances_policy)
+        .map(|reference| reference.launch_failure())
 }

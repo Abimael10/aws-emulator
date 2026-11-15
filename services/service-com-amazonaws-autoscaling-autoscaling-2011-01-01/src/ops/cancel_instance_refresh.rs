@@ -215,8 +215,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The sentence Amazon EC2 Auto Scaling refuses a cancellation of a group with no
-/// instance refresh in progress with: the error class names the group that was asked
-/// for, which is the request's own.
+/// instance refresh in progress with.
+///
+/// The fixed text names the statuses a refresh a cancellation could act on would be in;
+/// the group name is the only variable part and comes from the request.
 fn no_active_refresh_message(group_name: &str) -> String {
-    format!("No active Instance Refresh found for Auto Scaling group {group_name}")
+    format!(
+        "No in progress, baking, pending, or cancelling Instance Refresh found for Auto \
+         Scaling group {group_name}."
+    )
 }

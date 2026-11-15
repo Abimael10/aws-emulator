@@ -408,6 +408,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
+        if let Some(health_check_grace_period) = input.health_check_grace_period {
+            if health_check_grace_period < crate::state::MIN_HEALTH_CHECK_GRACE_PERIOD {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::health_check_grace_period_violation_message(),
+                ));
+            }
+        }
         if let Some(health_check_type) = input.health_check_type.as_deref() {
             if !crate::state::is_valid_health_check_type(health_check_type) {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
@@ -614,6 +621,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and this service reads rather than asks the caller for. Resolved BEFORE this
         // service's own store is locked, so only one store is ever held at a time.
         let mut availability_zones = input.availability_zones.clone().unwrap_or_default();
+        // A request that states the placement by zone ID states the SAME zones: the two
+        // members are two spellings of one placement, so the names are resolved here and
+        // every read of the group reports both ([`crate::state::availability_zone_ids`]).
+        if availability_zones.is_empty() {
+            availability_zones = crate::state::zone_names_of(
+                &region,
+                input.availability_zone_ids.as_deref().unwrap_or_default(),
+            );
+        }
         if availability_zones.is_empty() {
             let subnets = input.vpc_zone_identifier.as_deref().unwrap_or_default();
             match crate::state::ec2_subnets::zones_of(&*self.engine, &region, subnets) {
@@ -629,7 +645,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(crate::state::ec2_subnets::unknown_subnet_error(&subnet_id));
                 }
             }
+        } else if let Some(refusal) = crate::state::ec2_subnets::subnet_zone_mismatch_error(
+            &*self.engine,
+            &region,
+            &availability_zones,
+            input.vpc_zone_identifier.as_deref(),
+        ) {
+            // A request that states BOTH has to state them consistently: "the subnets that
+            // you specify must reside in those Availability Zones".
+            return Err(refusal);
         }
+        // The group's zones, in both spellings, whichever the request wrote.
+        let availability_zone_ids = crate::state::zone_ids_of(&availability_zones);
 
         // The launch template the group would launch from is Amazon EC2's resource, resolved
         // against the account's own Amazon EC2 store before anything is stored: a
@@ -754,7 +781,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .default_cooldown
                 .unwrap_or(crate::state::DEFAULT_COOLDOWN_SECONDS),
             availability_zones,
-            availability_zone_ids: input.availability_zone_ids,
+            availability_zone_ids: Some(availability_zone_ids),
             load_balancer_names: input.load_balancer_names,
             target_group_arns: input.target_group_ar_ns,
             health_check_type: input
@@ -788,10 +815,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             default_instance_warmup: input.default_instance_warmup,
             traffic_sources: input.traffic_sources,
             instance_maintenance_policy: input.instance_maintenance_policy,
-            availability_zone_distribution: input.availability_zone_distribution,
+            // The option sets every group carries, each at the value this request stated or
+            // the default its own documentation states for the member it left out
+            // ([`crate::state::group_defaults`]): a group runs under one of them whether or
+            // not the create said so, so a read of it reports the value in force.
+            availability_zone_distribution: Some(
+                crate::state::group_defaults::availability_zone_distribution(
+                    input.availability_zone_distribution,
+                ),
+            ),
             availability_zone_impairment_policy: input.availability_zone_impairment_policy,
-            capacity_reservation_specification: input.capacity_reservation_specification,
-            instance_lifecycle_policy: input.instance_lifecycle_policy,
+            capacity_reservation_specification: Some(
+                crate::state::group_defaults::capacity_reservation_specification(
+                    input.capacity_reservation_specification,
+                ),
+            ),
+            instance_lifecycle_policy: Some(
+                crate::state::group_defaults::instance_lifecycle_policy(
+                    input.instance_lifecycle_policy,
+                ),
+            ),
             operator: input.operator,
             deletion_protection: input.deletion_protection,
             tags,

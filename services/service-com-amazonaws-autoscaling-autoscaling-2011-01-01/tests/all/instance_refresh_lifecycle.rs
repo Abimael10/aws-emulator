@@ -488,11 +488,24 @@ async fn the_preferences_a_refresh_refuses() {
             case: "every other preference the model carries",
             members: &[
                 ("Preferences.InstanceWarmup", "120"),
-                ("Preferences.AutoRollback", "true"),
                 ("Preferences.ScaleInProtectedInstances", "Ignore"),
                 ("Preferences.StandbyInstances", "Terminate"),
                 ("Preferences.BakeTime", "60"),
             ],
+            code: None,
+        },
+        Refusal {
+            // "A rollback is not supported in the following situations: there is no
+            // desired configuration specified for the instance refresh"
+            // (`smithy_query(query="doc",shape="RefreshPreferences",member="AutoRollback")`),
+            // and these rows carry none.
+            case: "AutoRollback asked for with no desired configuration to go back from",
+            members: &[("Preferences.AutoRollback", "true")],
+            code: Some("ValidationError"),
+        },
+        Refusal {
+            case: "AutoRollback asked NOT to happen, which needs nothing to go back from",
+            members: &[("Preferences.AutoRollback", "false")],
             code: None,
         },
     ];

@@ -16,7 +16,7 @@
 //! (`ScalingProcessQuery$ScalingProcesses`) — so a request that names none suspends every
 //! process of the catalog. A name outside the catalog names no process of this service, so
 //! the request is refused and nothing is written
-//! ([`ProcessRefusal::UnknownProcess`]).
+//! ([`ProcessRefusal::UnknownProcesses`]).
 //!
 //! The collection is keyed by process name, so naming a process twice in one request, or
 //! naming one a later request names again, leaves ONE suspension: a process is either
@@ -61,9 +61,9 @@ pub type SuspendedProcesses = BTreeMap<String, SystemTime>;
 /// situation belongs to.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProcessRefusal {
-    /// The request names a process outside this service's own catalog; carries what it
-    /// named.
-    UnknownProcess(String),
+    /// The request names processes outside this service's own catalog; carries every one
+    /// it named, in the order the request wrote them.
+    UnknownProcesses(Vec<String>),
 }
 
 impl ProcessRefusal {
@@ -71,7 +71,7 @@ impl ProcessRefusal {
     /// suspension refuse the same request differently.
     pub fn message(&self) -> String {
         match self {
-            Self::UnknownProcess(process) => unknown_process_message(process),
+            Self::UnknownProcesses(processes) => unknown_process_message(processes),
         }
     }
 }
@@ -130,11 +130,13 @@ pub fn named_processes(requested: &[String]) -> Result<Vec<String>, ProcessRefus
             .map(|process| (*process).to_string())
             .collect());
     }
-    if let Some(unknown) = requested
+    let unknown: Vec<String> = requested
         .iter()
-        .find(|candidate| !super::SCALING_PROCESS_TYPES.contains(&candidate.as_str()))
-    {
-        return Err(ProcessRefusal::UnknownProcess(unknown.clone()));
+        .filter(|candidate| !super::SCALING_PROCESS_TYPES.contains(&candidate.as_str()))
+        .cloned()
+        .collect();
+    if !unknown.is_empty() {
+        return Err(ProcessRefusal::UnknownProcesses(unknown));
     }
     Ok(requested.to_vec())
 }
@@ -160,13 +162,17 @@ fn whole_seconds_text(at: SystemTime) -> String {
         .unwrap_or_default()
 }
 
-/// The message a request naming a process outside this service's own catalog is refused
-/// with, in the shape this service refuses every value outside one of its catalogs: the
-/// member as the model names it, the value from the request, and the catalog the caller has
-/// to choose from.
-pub fn unknown_process_message(process: &str) -> String {
+/// The message a request naming processes outside this service's own catalog is refused
+/// with.
+///
+/// The fixed text names what the request contained and then the catalog the caller has to
+/// choose from; the one variable part is the names the request wrote that the catalog does
+/// not hold, EVERY one of them, since one call may name several and none of them is
+/// suspended.
+pub fn unknown_process_message(processes: &[String]) -> String {
     format!(
-        "The ScalingProcesses value {process} is not valid: it must be one of {}",
-        super::stated_value_set(super::SCALING_PROCESS_TYPES.iter().copied())
+        "Request contained illegal suspendable process names: [{}].Valid names are :[{}]",
+        processes.join(", "),
+        super::SCALING_PROCESS_TYPES.join(", ")
     )
 }

@@ -209,6 +209,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(preferences) = input.preferences.as_ref() {
             check_preferences(preferences)?;
+            // A rollback the service cannot perform is not a preference it can honour: "a
+            // rollback is not supported" where the refresh states no desired configuration
+            // to go back FROM, so the request asking for one is refused rather than served
+            // with the preference quietly turned off.
+            if preferences.auto_rollback == Some(true) && input.desired_configuration.is_none() {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::refresh_preferences::AUTO_ROLLBACK_WITHOUT_DESIRED_CONFIGURATION_MESSAGE,
+                ));
+            }
         }
         // The desired configuration states the launch source the refresh moves the group's
         // instances onto, so the launch template it names is resolved against the account's
@@ -307,6 +316,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect()
         };
         let instances_at_start = i32::try_from(pending_instance_ids.len()).unwrap_or(i32::MAX);
+        // The preferences this refresh RUNS UNDER: the ones the request stated, with each
+        // member it left out at the default the model documents for it, resolved once
+        // against the group's configuration as it now stands
+        // ([`crate::state::refresh_preferences`]).
+        let preferences =
+            crate::state::refresh_preferences::effective(input.preferences.as_ref(), group);
 
         let instance_refresh_id =
             state.push_instance_refresh(crate::state::StoredInstanceRefresh {
@@ -319,7 +334,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 start_time: now,
                 end_time: None,
                 strategy,
-                preferences: input.preferences.clone(),
+                preferences: Some(preferences),
                 desired_configuration: input.desired_configuration.clone(),
                 instances_at_start,
                 pending_instance_ids,

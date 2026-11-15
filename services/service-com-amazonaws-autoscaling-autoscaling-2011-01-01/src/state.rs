@@ -164,6 +164,26 @@ pub use lifecycle_events::{
     drive_lifecycle_clock, InstanceLifecycle, InstanceLifecycleChange, PendingLifecycleEvent,
 };
 
+/// The two spellings of the Availability Zones a group places its instances in — their
+/// NAMES and their IDS — which a group reports both of however the request named them.
+pub mod availability_zone_ids;
+
+pub use availability_zone_ids::{zone_id_of, zone_ids_of, zone_names_of};
+
+/// The members of a group the SERVICE decides when the request leaves them out: the
+/// option sets every group carries, each at the default its own documentation states.
+pub mod group_defaults;
+
+/// Parking a group's instances in `Standby` and returning them to service: the one
+/// transition `EnterStandby` and `ExitStandby` share.
+pub mod standby;
+
+pub use standby::{StandbyMove, StandbyRefusal};
+
+/// The preferences an instance refresh actually runs under: the ones the request stated,
+/// each member the request left out at the default this service applies.
+pub mod refresh_preferences;
+
 /// How long a lifecycle transition this service owes takes to come due.
 ///
 /// Amazon EC2 Auto Scaling reports a freshly launched instance as `Pending` and an
@@ -216,6 +236,10 @@ pub const LIFECYCLE_PENDING: &str = "Pending";
 pub const LIFECYCLE_IN_SERVICE: &str = "InService";
 /// An instance that is being scaled in.
 pub const LIFECYCLE_TERMINATING: &str = "Terminating";
+/// An instance on its way into `Standby`, the transient state `EnterStandby` starts.
+pub const LIFECYCLE_ENTERING_STANDBY: &str = "EnteringStandby";
+/// An instance parked out of service in `Standby`.
+pub const LIFECYCLE_STANDBY: &str = "Standby";
 
 /// The `HealthStatus` of an instance the service has no failed health check for.
 pub const HEALTH_STATUS_HEALTHY: &str = "Healthy";
@@ -316,6 +340,11 @@ pub const GROUP_STATE_IN_SERVICE: &str = "InService";
 /// `Activity$AutoScalingGroupState` for a group that has been deleted.
 pub const GROUP_STATE_DELETED: &str = "Deleted";
 
+/// The sentence every failed launch of a group's instance ends with: Amazon EC2 Auto
+/// Scaling states WHY the launch could not be made and then that the launch was not made,
+/// so a client reads the cause and the outcome off one `StatusMessage`.
+pub const LAUNCH_FAILED_SENTENCE: &str = "Launching EC2 instance failed.";
+
 /// What the failed activity of a unit of capacity the ACCOUNT could not place reports as
 /// its `StatusMessage` — the cause of the failure a client reads off the activity
 /// ([`StoredActivity::to_activity`]) when nothing about the group itself stopped the
@@ -323,7 +352,8 @@ pub const GROUP_STATE_DELETED: &str = "Deleted";
 ///
 /// One sentence for every launch path, so a client reads the same cause whether the
 /// capacity change, a replacement or the group's own create asked for the instance, and
-/// it ends the way every launch failure does: with the launch that was not made.
+/// it ends the way every launch failure does ([`LAUNCH_FAILED_SENTENCE`]): with the launch
+/// that was not made.
 pub const UNPLACED_INSTANCE_MESSAGE: &str =
     "The account could not place the instance. Launching EC2 instance failed.";
 
@@ -444,6 +474,25 @@ pub const ACTIVITY_WINDOW: Duration = Duration::from_secs(6 * 7 * 24 * 60 * 60);
 /// the bound is the service's own and is checked by the handler.
 pub const MAX_ACTIVITY_IDS_PER_CALL: usize = 50;
 
+/// The most instance IDs ONE standby move may name.
+///
+/// From the model's own documentation for `EnterStandby$InstanceIds` and
+/// `ExitStandby$InstanceIds`: "You can specify up to 20 instances." The member carries no
+/// modelled length, so the bound is the service's own and is checked by the handlers.
+pub const MAX_STANDBY_INSTANCE_IDS_PER_CALL: usize = 20;
+
+/// The message a standby move naming more instance IDs than
+/// [`MAX_STANDBY_INSTANCE_IDS_PER_CALL`] is refused with: the framework's own envelope for
+/// a member value outside its bounds, naming the member as the wire names it and the bound
+/// the request missed.
+pub fn too_many_standby_instance_ids_message(count: usize) -> String {
+    format!(
+        "1 validation error detected: Value with {count} items at 'instanceIds' failed to \
+         satisfy constraint: Member must have length less than or equal to \
+         {MAX_STANDBY_INSTANCE_IDS_PER_CALL}"
+    )
+}
+
 /// The message a read of the scaling activities refuses more than
 /// [`MAX_ACTIVITY_IDS_PER_CALL`] ids with: the standard sentence this service states for
 /// a member value outside its bounds, naming the member as the wire names it and the
@@ -454,6 +503,25 @@ pub fn too_many_activity_ids_message(count: usize) -> String {
          satisfy constraint: Member must have length less than or equal to \
          {MAX_ACTIVITY_IDS_PER_CALL}"
     )
+}
+
+/// The least `HealthCheckGracePeriod` a group may be configured with.
+///
+/// The member is "the amount of time, in seconds, that Amazon EC2 Auto Scaling waits
+/// before checking the health status of an EC2 instance that has come into service"
+/// (`CreateAutoScalingGroup$HealthCheckGracePeriod`): a wait is a length of time, so no
+/// group holds a negative one, and the model states no range for the member
+/// (`smithy_query(query="shape",shape="HealthCheckGracePeriod")` carries none) — so the
+/// bound is the service's own and the handlers that write the member check it.
+pub const MIN_HEALTH_CHECK_GRACE_PERIOD: i32 = 0;
+
+/// The message a request stating a `HealthCheckGracePeriod` below
+/// [`MIN_HEALTH_CHECK_GRACE_PERIOD`] is refused with.
+///
+/// Fixed text with NO variable part: the sentence states what the member has to be and
+/// quotes neither the value the request supplied nor the bound it missed.
+pub fn health_check_grace_period_violation_message() -> String {
+    "Grace period must be a positive integer.".to_string()
 }
 
 /// A stored launch configuration — the `LaunchConfiguration` resource.
@@ -524,14 +592,19 @@ impl StoredInstance {
     ///
     /// THE ONE projection of a stored instance onto the wire shape, so the instances a
     /// group reports and the instances of its warm pool are reported identically.
-    /// `AvailabilityZoneId` and `WeightedCapacity` are left unfilled: neither is part of
-    /// what this service stores for an instance.
+    /// `WeightedCapacity` is left unfilled: it is not part of what this service stores
+    /// for an instance.
+    ///
+    /// `AvailabilityZoneId` is "the Availability Zone ID where the instance was launched"
+    /// (`Instance$AvailabilityZoneId`), which is the ID of the zone this instance is in:
+    /// the two members are two spellings of ONE placement, so the id is read off the zone
+    /// rather than stored beside it ([`availability_zone_ids`]).
     pub fn to_instance(&self) -> Instance {
         Instance {
             instance_id: self.instance_id.clone(),
             instance_type: self.instance_type.clone(),
             availability_zone: self.availability_zone.clone(),
-            availability_zone_id: None,
+            availability_zone_id: zone_id_of(&self.availability_zone),
             lifecycle_state: self.lifecycle_state.clone(),
             health_status: self.health_status.clone(),
             launch_configuration_name: self.launch_configuration_name.clone(),
@@ -540,6 +613,20 @@ impl StoredInstance {
             protected_from_scale_in: self.protected_from_scale_in,
             weighted_capacity: None,
         }
+    }
+
+    /// Whether this instance is parked out of service in `Standby`, or on its way there.
+    ///
+    /// "If you choose to decrement the desired capacity of the Auto Scaling group, the
+    /// instances can enter standby as long as the desired capacity of the Auto Scaling
+    /// group after the instances are placed into standby is equal to or greater than the
+    /// minimum capacity of the group. If you choose not to decrement the desired capacity
+    /// of the Auto Scaling group, the Auto Scaling group launches new instances to replace
+    /// the instances on standby" (`EnterStandby`'s own documentation): a parked instance
+    /// is one the group's capacity is NOT met by, which is what makes a replacement owed.
+    pub fn is_in_standby(&self) -> bool {
+        self.lifecycle_state == LIFECYCLE_ENTERING_STANDBY
+            || self.lifecycle_state == LIFECYCLE_STANDBY
     }
 }
 
@@ -624,11 +711,15 @@ pub struct StoredGroup {
 
 impl StoredGroup {
     /// The instances that count towards the group's capacity: everything that is
-    /// not on its way out.
+    /// not on its way out and not parked in `Standby`.
+    ///
+    /// A parked instance is out of service, so the group's desired capacity is not met by
+    /// it: that is what makes `EnterStandby` without a decrement launch a replacement and
+    /// `ExitStandby` need none ([`StoredInstance::is_in_standby`]).
     pub fn active_instances(&self) -> impl Iterator<Item = &StoredInstance> {
         self.instances
             .iter()
-            .filter(|i| i.lifecycle_state != LIFECYCLE_TERMINATING)
+            .filter(|i| i.lifecycle_state != LIFECYCLE_TERMINATING && !i.is_in_standby())
     }
 
     /// How many instances count towards the group's capacity.
@@ -1113,6 +1204,13 @@ impl AutoScalingState {
         {
             return Ok(refresh.instance_refresh_id.clone());
         }
+        // Whether the GROUP's own configuration can be rolled back to at all is answered
+        // BEFORE the question of whether there is a refresh to roll back: a group whose
+        // launch template version floats pins no version to go back TO, so no refresh of
+        // it could ever be reversed, whichever one a caller asks about.
+        if let Some(reason) = self.group_rollback_refusal_reason(engine, group_name) {
+            return Err(RollbackRefusal::Irreversible(reason));
+        }
         let Some(index) = self.instance_refreshes.iter().position(|refresh| {
             refresh.auto_scaling_group_name == group_name && refresh.is_in_progress()
         }) else {
@@ -1156,14 +1254,11 @@ impl AutoScalingState {
     /// Why the refresh at `index` cannot be rolled back, when it cannot: the sentence
     /// the refusal carries, or `None` for a refresh a rollback can reverse.
     ///
-    /// The situations are the ones the error class itself names: "a desired
-    /// configuration was not found or an incompatible launch template (uses a Systems
-    /// Manager parameter instead of an AMI ID) or launch template version (`$Latest` or
-    /// `$Default`) is present on the Auto Scaling group"
-    /// (`smithy_query(query="shape",shape="IrreversibleInstanceRefreshFault")`). Each is
-    /// a configuration the pre-refresh state cannot be reconstructed from: without a
-    /// desired configuration the refresh changed nothing to go back from, and a floating
-    /// version or a parameter-resolved image pins no version to go back TO.
+    /// The situation this answers is the refresh's OWN: "a desired configuration was not
+    /// found" (`smithy_query(query="shape",shape="IrreversibleInstanceRefreshFault")`) —
+    /// without one the refresh changed nothing to go back from. The two situations that are
+    /// facts of the GROUP's launch source instead are
+    /// [`Self::group_rollback_refusal_reason`], which the rollback answers ahead of this.
     fn irreversible_reason<Eng: Send + Sync + 'static>(
         &self,
         engine: &Eng,
@@ -1174,6 +1269,24 @@ impl AutoScalingState {
         if refresh.desired_configuration.is_none() {
             return Some(ROLLBACK_WITHOUT_DESIRED_CONFIGURATION_MESSAGE.to_string());
         }
+        self.group_rollback_refusal_reason(engine, group_name)
+    }
+
+    /// Why no refresh of `group_name` could be rolled back, when none could: the
+    /// situations that are facts of the GROUP's own launch source rather than of any one
+    /// refresh.
+    ///
+    /// "An incompatible launch template (uses a Systems Manager parameter instead of an
+    /// AMI ID) or launch template version (`$Latest` or `$Default`) is present on the Auto
+    /// Scaling group" (`smithy_query(query="shape",shape="IrreversibleInstanceRefreshFault")`):
+    /// neither pins a configuration a rollback could go back to, whichever refresh is asked
+    /// about — which is why a rollback is refused for them before the group is even looked
+    /// at for a refresh in progress.
+    fn group_rollback_refusal_reason<Eng: Send + Sync + 'static>(
+        &self,
+        engine: &Eng,
+        group_name: &str,
+    ) -> Option<String> {
         let group = self.groups.get(group_name)?;
         let specification = launch_template_of(
             group.launch_template.as_ref(),
@@ -1184,7 +1297,7 @@ impl AutoScalingState {
             .as_deref()
             .unwrap_or(LAUNCH_TEMPLATE_VERSION_DEFAULT);
         if version == LAUNCH_TEMPLATE_VERSION_DEFAULT || version == LAUNCH_TEMPLATE_VERSION_LATEST {
-            return Some(floating_launch_template_version_message(version));
+            return Some(FLOATING_LAUNCH_TEMPLATE_VERSION_MESSAGE.to_string());
         }
         // What the template's own version says the instances run, from the account's
         // Amazon EC2 store: an image named through a Systems Manager parameter is not an
@@ -1339,6 +1452,9 @@ impl AutoScalingState {
                     instance.transition_due = None;
                     if instance.lifecycle_state == LIFECYCLE_PENDING {
                         instance.lifecycle_state = LIFECYCLE_IN_SERVICE.to_string();
+                    } else if instance.lifecycle_state == LIFECYCLE_ENTERING_STANDBY {
+                        // An instance `EnterStandby` started parking has finished parking.
+                        instance.lifecycle_state = LIFECYCLE_STANDBY.to_string();
                     }
                 }
             }
@@ -1674,21 +1790,30 @@ impl AutoScalingState {
         // Never more than the group can still hold, so neither one request nor a run
         // of them can grow the stored instances past MAX_GROUP_CAPACITY.
         let wanted = request.count.min(headroom);
-        let launched = ec2_instances::launch(
-            engine,
-            &ec2_instances::LaunchRequest {
-                region: &region,
-                group_name: request.group_name,
-                count: wanted,
-                placed,
-                zones: &zones,
-                vpc_zone_identifier: vpc_zone_identifier.as_deref(),
-                launch_configuration: launch_configuration.as_ref(),
-                launch_template: launch_template.as_ref(),
-                mixed_instances_policy: mixed_instances_policy.as_ref(),
-                tags: &tags,
-            },
-        );
+        let launch_request = ec2_instances::LaunchRequest {
+            region: &region,
+            group_name: request.group_name,
+            count: wanted,
+            placed,
+            zones: &zones,
+            vpc_zone_identifier: vpc_zone_identifier.as_deref(),
+            launch_configuration: launch_configuration.as_ref(),
+            launch_template: launch_template.as_ref(),
+            mixed_instances_policy: mixed_instances_policy.as_ref(),
+            tags: &tags,
+        };
+        // A launch is made only from a configuration that CAN produce an instance, asked
+        // at the instant of the launch rather than when the group was configured: a group
+        // launching from a floating launch-template version launches from whatever that
+        // version says now, so a configuration the account's own stores cannot satisfy
+        // places nothing and records the reason instead of reporting an instance that
+        // could not exist ([`ec2_instances::launch_failure_reason`]).
+        if wanted > 0 {
+            if let Some(reason) = ec2_instances::launch_failure_reason(engine, &launch_request) {
+                return GroupLaunchOutcome::unplaced(request.count, Some(reason));
+            }
+        }
+        let launched = ec2_instances::launch(engine, &launch_request);
         let unplaced = request.count.saturating_sub(launched.len());
         // Amazon EC2 launches the instances of one capacity change one after another, so
         // each of them is a little newer than the last even though they were asked for
@@ -1707,7 +1832,17 @@ impl AutoScalingState {
                 lifecycle_state: request.destination.pending_state().to_string(),
                 health_status: HEALTH_STATUS_HEALTHY.to_string(),
                 launch_configuration_name: launch_configuration_name.clone(),
-                launch_template: launch_template.clone(),
+                // The launch-template version the instance was ACTUALLY launched from,
+                // as Amazon EC2 resolved it for this launch: a group whose specification
+                // names `$Latest` or `$Default` launches from whichever version that word
+                // named at the instant of the launch, so the instance reports that
+                // version number rather than the word the group floats on. A launch
+                // source naming no template the account holds resolves to nothing, and
+                // the instance reports the specification as the group carries it.
+                launch_template: instance
+                    .launch_template
+                    .clone()
+                    .or_else(|| launch_template.clone()),
                 // What Amazon EC2 launched it as, so the two services report one
                 // instance the same way.
                 instance_type: instance.instance_type,
@@ -2645,12 +2780,12 @@ pub const UNFILLED_DETAIL_TOKEN: &str = "null";
 ///
 /// THE ONE COPY of that fixed text; each operation supplies the subject its own refusal
 /// opens with ([`instance_not_in_group_message`],
-/// [`protected_instance_not_in_group_message`]) and the two variable parts, which both
+/// [`the_instance_not_in_group_message`]) and the two variable parts, which both
 /// come from the request.
 const NOT_PART_OF_GROUP_CLAUSE: &str = " is not part of Auto Scaling group ";
 
-/// The message an instance-scoped PROTECTION update that names an instance the group
-/// does not hold is refused with.
+/// The message an instance-scoped request that names an instance the group does not hold
+/// is refused with, in the subject form that OPENS WITH THE ARTICLE.
 ///
 /// One sentence for the offending instance id, terminated by a period: the fixed text is
 /// `The instance ` / [`NOT_PART_OF_GROUP_CLAUSE`] / `.`, and the two variable parts — the
@@ -2658,9 +2793,10 @@ const NOT_PART_OF_GROUP_CLAUSE: &str = " is not part of Auto Scaling group ";
 ///
 /// Same class as [`instance_not_in_group_message`], which a TERMINATION answers in its
 /// own operation's wording; the refusal is for the request as a WHOLE either way, so a
-/// call that mixes instances of the group with one that is not part of it updates none
-/// of them.
-pub fn protected_instance_not_in_group_message(instance_id: &str, group_name: &str) -> String {
+/// call that mixes instances of the group with one that is not part of it changes none
+/// of them. The operations that answer it are the ones that MOVE an instance of a group
+/// without terminating it: a protection update and a standby move.
+pub fn the_instance_not_in_group_message(instance_id: &str, group_name: &str) -> String {
     format!("The instance {instance_id}{NOT_PART_OF_GROUP_CLAUSE}{group_name}.")
 }
 
@@ -2673,7 +2809,7 @@ pub fn protected_instance_not_in_group_message(instance_id: &str, group_name: &s
 /// names no group at all leaves that part unfilled, so it travels as
 /// [`UNFILLED_DETAIL_TOKEN`] — there is no group the instance could be part of.
 ///
-/// Same class as [`protected_instance_not_in_group_message`], in the subject this
+/// Same class as [`the_instance_not_in_group_message`], in the subject this
 /// operation's own refusal opens with.
 pub fn instance_not_in_group_message(instance_id: &str, group_name: Option<&str>) -> String {
     let group_name = group_name.unwrap_or(UNFILLED_DETAIL_TOKEN);
@@ -2772,14 +2908,15 @@ pub const ROLLBACK_WITHOUT_DESIRED_CONFIGURATION_MESSAGE: &str =
      specified for the instance refresh.";
 
 /// The sentence a rollback of a group whose launch template version floats is refused
-/// with, naming the version the group uses: the pre-refresh configuration is not
-/// pinned to a version a rollback could go back to.
-pub fn floating_launch_template_version_message(version: &str) -> String {
-    format!(
-        "The instance refresh cannot be rolled back because the Auto Scaling group uses the \
-         launch template's {version} version."
-    )
-}
+/// with: the pre-refresh configuration is not pinned to a version a rollback could go
+/// back to.
+///
+/// Fixed text with no variable part: it names BOTH floating versions, because the refusal
+/// is about the group using either of them rather than about the one it happens to name.
+pub const FLOATING_LAUNCH_TEMPLATE_VERSION_MESSAGE: &str =
+    "This Auto Scaling group's launch template version isn't compatible with a rollback. \
+     Rollbacks are not supported when the Auto Scaling group uses the launch template's \
+     '$Latest' or '$Default' version.";
 
 /// The sentence a rollback of a group whose launch template resolves its image through
 /// a Systems Manager parameter is refused with.

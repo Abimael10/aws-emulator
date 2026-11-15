@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
         if let Some(foreign) = foreign {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::protected_instance_not_in_group_message(foreign, &name),
+                crate::state::the_instance_not_in_group_message(foreign, &name),
             ));
         }
 

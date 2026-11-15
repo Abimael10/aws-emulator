@@ -366,10 +366,11 @@ async fn an_unsuspendable_request_is_refused_and_writes_nothing() {
             case.case
         );
         let expected_message = match case.unknown_process {
-            // The value from the request, and the catalog the caller has to choose from,
-            // read from what the service itself publishes.
+            // Every name the request wrote that the catalog does not hold, and the catalog
+            // the caller has to choose from, read from what the service itself publishes.
             Some(process) => format!(
-                "The ScalingProcesses value {process} is not valid: it must be one of [{}]",
+                "Request contained illegal suspendable process names: [{process}].Valid names \
+                 are :[{}]",
                 catalog.join(", ")
             ),
             None => "AutoScalingGroup name not found - null".to_string(),

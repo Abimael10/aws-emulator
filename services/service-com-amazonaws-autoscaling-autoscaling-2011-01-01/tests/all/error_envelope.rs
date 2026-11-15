@@ -140,9 +140,21 @@ const ERROR_CASES: &[ErrorCase] = &[
         code: "ValidationError",
     },
     ErrorCase {
-        case: "an absent required member, which the codec refuses",
+        case: "an absent required member, which this service refuses like every other value \
+               it read",
         action: "SetDesiredCapacity",
         params: &[],
+        status: 400,
+        code: "ValidationError",
+    },
+    ErrorCase {
+        case: "a member whose text is not a value of its wire type, which the codec could \
+               not read at all",
+        action: "SetDesiredCapacity",
+        params: &[
+            ("AutoScalingGroupName", "no-such-group"),
+            ("DesiredCapacity", "not-an-integer"),
+        ],
         status: 400,
         code: "MalformedInput",
     },

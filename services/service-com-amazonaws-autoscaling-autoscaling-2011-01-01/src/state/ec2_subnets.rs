@@ -65,6 +65,53 @@ pub fn no_placement_error<E>() -> crate::scaffolded::Scaffolded<E> {
     )
 }
 
+/// The refusal for a request whose subnets are not in the Availability Zones it states for
+/// the group.
+///
+/// "If you specify `VPCZoneIdentifier` with `AvailabilityZones`, the subnets that you
+/// specify must reside in those Availability Zones"
+/// (`CreateAutoScalingGroup$VPCZoneIdentifier`): a group places each instance in one of its
+/// subnets, and an instance in a subnet is in that subnet's zone — so a subnet outside the
+/// group's zones is a placement the group could never make. The sentence is FIXED: it
+/// states that the two disagree and names neither the zones nor the subnets, a request
+/// carrying several of each.
+///
+/// ONE spelling for both handlers, which write the same group.
+pub fn zone_mismatch_error<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::validation_error(
+        "The availability zones of the specified subnets and the Auto Scaling group do not match",
+    )
+}
+
+/// Whether the subnets `vpc_zone_identifier` names all sit in `zones`, and the refusal
+/// when one of them does not.
+///
+/// A request that states no zone of its own, or names no subnet, states nothing for the two
+/// to disagree about: the group's zones are then the zones of its subnets
+/// ([`zones_of`]), which agree by construction. A subnet the account does not hold is
+/// refused for that subnet by the handler's own resolution, never here.
+pub fn subnet_zone_mismatch_error<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+    region: &str,
+    zones: &[String],
+    vpc_zone_identifier: Option<&str>,
+) -> Option<crate::scaffolded::Scaffolded<E>> {
+    if zones.is_empty() {
+        return None;
+    }
+    let vpc_zone_identifier = vpc_zone_identifier?;
+    if subnet_ids(vpc_zone_identifier).is_empty() {
+        return None;
+    }
+    let ZoneResolution::Zones(subnet_zones) = zones_of(engine, region, vpc_zone_identifier) else {
+        return None;
+    };
+    subnet_zones
+        .iter()
+        .any(|zone| !zones.contains(zone))
+        .then(zone_mismatch_error)
+}
+
 /// The Availability Zones of the subnets `vpc_zone_identifier` names, as the Region
 /// `region` holds them.
 ///

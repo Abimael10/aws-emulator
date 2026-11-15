@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExitStandby
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExitStandby`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExitStandby::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves the instances a request names out of `Standby`, through the one standby
+//! transition this service has ([`crate::state::standby`]): each named instance is
+//! returned to service and the group's desired capacity rises with it, so nothing is
+//! scaled in to make room for it.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +140,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExitStandby` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExitStandbyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExitStandby"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ExitStandbyErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.auto_scaling_group_name;
+        let requested = input.instance_ids.unwrap_or_default();
+
+        // The operation's own documented bound on how many instances ONE call may name,
+        // checked exactly as `EnterStandby` checks its own: how many ids one request
+        // carries is a fact of the REQUEST, so it is answered before anything is looked up.
+        if requested.len() > crate::state::MAX_STANDBY_INSTANCE_IDS_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::too_many_standby_instance_ids_message(requested.len()),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, now);
+
+        // A name no group answers to is refused with the wording this service's
+        // group-scoped writes answer with, its detail field left unfilled.
+        if !state.groups.contains_key(&name) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+            ));
+        }
+
+        // The one standby transition this service has, shared with `EnterStandby`: it
+        // returns every named instance to service, records the activity each return
+        // produced, and raises the group's desired capacity with them
+        // ([`crate::state::standby`]). `ExitStandby` carries no decrement member.
+        let activities: Vec<Activity> = state
+            .move_standby(
+                &*self.engine,
+                &name,
+                &requested,
+                crate::state::StandbyMove::Exit,
+                false,
+                now,
+            )
+            .map_err(|refusal| {
+                crate::scaffolded::Scaffolded::validation_error(
+                    refusal.message(&name, crate::state::StandbyMove::Exit),
+                )
+            })?
+            .iter()
+            // The group these activities belong to is the one this call just returned
+            // instances to, so the account holds it.
+            .map(|activity| activity.to_activity(true))
+            .collect();
+
+        crate::state::audit(
+            ctx.parts(),
+            "ExitStandby",
+            &name,
+            "instances moved out of Standby",
+        );
+        // The returning instances settle on the clock, and the lifecycle events the
+        // group's capacity change produces are published as they fall due, with no further
+        // call from anybody. The store's lock is released first: the pump takes it itself.
+        drop(state);
+        // An instance back in service is a target of the target groups the group is
+        // attached to again.
+        crate::state::elbv2_targets::settle_group(&*self.engine, &name);
+        crate::state::drive_lifecycle_clock(ctx, &self.engine);
+        Ok(ExitStandbyOutput {
+            activities: Some(activities),
+        })
     }
 }

@@ -113,7 +113,11 @@ fn add_request_id(body: &str, request_id: &str) -> Option<String> {
 /// Status, headers and every other byte of the body are left exactly as the renderer
 /// wrote them; a response that is not an awsQuery error envelope (or already carries a
 /// request id) is returned untouched, so the success path cannot be affected.
-pub fn with_request_id(mut resp: RtResponse) -> RtResponse {
+pub fn with_request_id(resp: RtResponse) -> RtResponse {
+    // The answer this service gives a request the framework could not READ is completed
+    // first: it carries no message, which is that module's business, not this one's
+    // ([`crate::service::malformed_input`]).
+    let mut resp = crate::service::malformed_input::without_message(resp);
     let request_id = new_request_id();
     let rewritten = {
         // An error envelope is built in memory by its renderer, so the bytes are readable

@@ -63,6 +63,7 @@
 
 pub mod authorization;
 pub mod decimal_floats;
+pub mod malformed_input;
 pub mod query_error_envelope;
 
 use query_error_envelope::{AutoScalingDefinition, RequestIdEnvelopeOperation};
@@ -70,6 +71,14 @@ use smithy_server_runtime::{
     http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The error code Amazon EC2 Auto Scaling answers every refusal of a value it READ with.
+///
+/// One code for the whole class: a request whose values do not satisfy the rules the model
+/// declares, whichever rule and whichever member. The handlers in `src/ops/` answer it
+/// through `crate::scaffolded::Scaffolded::validation_error`, and the framework's own
+/// constraint walk answers it through [`EmulatedService::override_refusal`] below.
+const VALIDATION_ERROR_CODE: &str = "ValidationError";
 
 /// The `com-amazonaws-autoscaling-autoscaling-2011-01-01` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -128,17 +137,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Amazon EC2 Auto Scaling answers EVERY refusal of values it read with one error
+        // code: `ValidationError`. An absent required member is one of them — the recorded
+        // refusal of a request omitting `ShouldDecrementDesiredCapacity` carries that code
+        // — so the layer the framework distinguishes (a body it could not read at all
+        // against one it read and then refused) decides nothing about the code HERE: a
+        // client of this service branches on `ValidationError` for both.
+        //
+        // The message stays the framework's own: its constraint envelope
+        // (`N validation error(s) detected: <clause>`) is the wording this service states
+        // such a refusal in, so it is rendered from the violations rather than reworded.
+        // The answer for a body that could not be read at all is completed in
+        // [`malformed_input`], which this hook is never called for.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_ERROR_CODE.to_string(),
+                message: aws_smithy_schema_server::envelope(violations)?,
+            }),
+            // An authentication refusal is not about the input at all, and the framework's
+            // own code and wording for it are what AWS answers.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

@@ -383,6 +383,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(crate::state::ec2_subnets::no_placement_error());
         }
+        // A request that states the placement by zone ID states the SAME zones, exactly as
+        // the create resolves them ([`crate::state::availability_zone_ids`]).
+        let zones_from_ids: Option<Vec<String>> = input
+            .availability_zone_ids
+            .as_deref()
+            .map(|ids| crate::state::zone_names_of(&region, ids))
+            .filter(|zones| !zones.is_empty());
         // A request that names new subnets and no zones moves the group to the zones of
         // those subnets: the zone a subnet is in is a fact about that subnet, resolved
         // against the account's own Amazon EC2 subnets of the signed Region, exactly as
@@ -390,7 +397,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // locked, so only one store is ever held at a time. `VPCZoneIdentifier` naming no
         // subnet at all leaves the group's zones as they are.
         let mut zones_from_subnets: Option<Vec<String>> = None;
-        if input.availability_zones.is_none() {
+        if input.availability_zones.is_none() && zones_from_ids.is_none() {
             if let Some(subnets) = input.vpc_zone_identifier.as_deref() {
                 match crate::state::ec2_subnets::zones_of(&*self.engine, &region, subnets) {
                     crate::state::ec2_subnets::ZoneResolution::Zones(zones) => {
@@ -405,6 +412,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         }
+        // A request that states BOTH the zones and the subnets has to state them
+        // consistently, exactly as the create does: "the subnets that you specify must
+        // reside in those Availability Zones".
+        let stated_zones = input
+            .availability_zones
+            .clone()
+            .or_else(|| zones_from_ids.clone())
+            .unwrap_or_default();
+        if let Some(refusal) = crate::state::ec2_subnets::subnet_zone_mismatch_error(
+            &*self.engine,
+            &region,
+            &stated_zones,
+            input.vpc_zone_identifier.as_deref(),
+        ) {
+            return Err(refusal);
+        }
         if let Some(lifetime) = input.max_instance_lifetime {
             if !crate::state::is_valid_max_instance_lifetime(lifetime) {
                 return Err(crate::scaffolded::Scaffolded::validation_error(format!(
@@ -412,6 +435,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                      or at least {} seconds",
                     crate::state::MIN_MAX_INSTANCE_LIFETIME
                 )));
+            }
+        }
+        if let Some(health_check_grace_period) = input.health_check_grace_period {
+            if health_check_grace_period < crate::state::MIN_HEALTH_CHECK_GRACE_PERIOD {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::health_check_grace_period_violation_message(),
+                ));
             }
         }
         if let Some(health_check_type) = input.health_check_type.as_deref() {
@@ -604,6 +634,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let zones_after_update = input
             .availability_zones
             .clone()
+            .or_else(|| zones_from_ids.clone())
             .or_else(|| zones_from_subnets.clone())
             .unwrap_or_else(|| group.availability_zones.clone());
         if zones_after_update.is_empty() && desired_capacity > 0 {
@@ -655,13 +686,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(value) = input.availability_zones {
             group.availability_zones = value;
         }
+        // Zones stated by ID name the same zones as the names they resolve to.
+        if let Some(zones) = zones_from_ids {
+            group.availability_zones = zones;
+        }
         // New subnets and no zones: the group moves to the zones those subnets are in.
         if let Some(zones) = zones_from_subnets {
             group.availability_zones = zones;
         }
-        if let Some(value) = input.availability_zone_ids {
-            group.availability_zone_ids = Some(value);
-        }
+        // The group's zones in both spellings always agree: the ids are the ids of the
+        // zones the group is in, whichever spelling the request wrote.
+        group.availability_zone_ids = Some(crate::state::zone_ids_of(&group.availability_zones));
         if let Some(value) = input.health_check_type {
             group.health_check_type = value;
         }
@@ -702,16 +737,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             group.instance_maintenance_policy = Some(value);
         }
         if let Some(value) = input.availability_zone_distribution {
-            group.availability_zone_distribution = Some(value);
+            group.availability_zone_distribution =
+                Some(crate::state::group_defaults::availability_zone_distribution(Some(value)));
         }
         if let Some(value) = input.availability_zone_impairment_policy {
             group.availability_zone_impairment_policy = Some(value);
         }
         if let Some(value) = input.capacity_reservation_specification {
-            group.capacity_reservation_specification = Some(value);
+            group.capacity_reservation_specification = Some(
+                crate::state::group_defaults::capacity_reservation_specification(Some(value)),
+            );
         }
         if let Some(value) = input.instance_lifecycle_policy {
-            group.instance_lifecycle_policy = Some(value);
+            group.instance_lifecycle_policy =
+                Some(crate::state::group_defaults::instance_lifecycle_policy(Some(value)));
         }
         if let Some(value) = input.deletion_protection {
             group.deletion_protection = Some(value);

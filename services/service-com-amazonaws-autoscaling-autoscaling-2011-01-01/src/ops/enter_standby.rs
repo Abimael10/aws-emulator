@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnterStandby
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnterStandby`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnterStandby::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves the instances a request names into `Standby`, through the one standby transition
+//! this service has ([`crate::state::standby`]): each named instance is parked out of
+//! service and the group is left converging on the capacity the request's own
+//! `ShouldDecrementDesiredCapacity` decided.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +147,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnterStandby` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnterStandbyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnterStandby"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(EnterStandbyErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.auto_scaling_group_name;
+        let requested = input.instance_ids.unwrap_or_default();
+        let should_decrement = input.should_decrement_desired_capacity;
+
+        // The operation's own documented bound on how many instances ONE call may name,
+        // which the model does not express as a length: checked ahead of the group lookup
+        // and of any per-id membership check, like the other per-call bounds of this
+        // service, because how many ids one request carries is a fact of the REQUEST.
+        if requested.len() > crate::state::MAX_STANDBY_INSTANCE_IDS_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::too_many_standby_instance_ids_message(requested.len()),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, now);
+
+        // A name no group answers to is refused with the wording this service's
+        // group-scoped writes answer with, its detail field left unfilled.
+        if !state.groups.contains_key(&name) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+            ));
+        }
+
+        // The one standby transition this service has, shared with `ExitStandby`: it
+        // parks every named instance, records the activity each park produced, and leaves
+        // the group converging on the capacity the request's own decrement decided
+        // ([`crate::state::standby`]).
+        let activities: Vec<Activity> = state
+            .move_standby(
+                &*self.engine,
+                &name,
+                &requested,
+                crate::state::StandbyMove::Enter,
+                should_decrement,
+                now,
+            )
+            .map_err(|refusal| {
+                crate::scaffolded::Scaffolded::validation_error(
+                    refusal.message(&name, crate::state::StandbyMove::Enter),
+                )
+            })?
+            .iter()
+            // The group these activities belong to is the one this call just parked
+            // instances of, so the account holds it.
+            .map(|activity| activity.to_activity(true))
+            .collect();
+
+        crate::state::audit(
+            ctx.parts(),
+            "EnterStandby",
+            &name,
+            if should_decrement {
+                "instances moved to Standby and the desired capacity decremented"
+            } else {
+                "instances moved to Standby"
+            },
+        );
+        // The parked instances settle on the clock, and so does any replacement this call
+        // asked the group to launch for them; the lifecycle events those launches produce
+        // are published as they fall due, with no further call from anybody. The store's
+        // lock is released first: the pump takes it itself.
+        drop(state);
+        // A parked instance is out of service, so it is no longer a target of the target
+        // groups the group is attached to, and a replacement launched for it is one.
+        crate::state::elbv2_targets::settle_group(&*self.engine, &name);
+        crate::state::drive_lifecycle_clock(ctx, &self.engine);
+        Ok(EnterStandbyOutput {
+            activities: Some(activities),
+        })
     }
 }

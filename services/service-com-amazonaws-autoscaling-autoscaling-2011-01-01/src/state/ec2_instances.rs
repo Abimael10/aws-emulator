@@ -73,6 +73,11 @@ pub struct LaunchedInstance {
     pub availability_zone: String,
     pub instance_type: Option<String>,
     pub image_id: Option<String>,
+    /// The launch-template specification this instance was ACTUALLY launched from, with
+    /// the version Amazon EC2 resolved for the launch — the number, never the `$Latest` or
+    /// `$Default` word a group may float on. `None` when the launch read no template of
+    /// the account at all.
+    pub launch_template: Option<LaunchTemplateSpecification>,
 }
 
 /// Where one instance of the group goes: an Availability Zone, and the subnet of that
@@ -152,6 +157,13 @@ pub fn launch<Eng: Send + Sync + 'static>(
     if placements.is_empty() {
         return Vec::new();
     }
+    // The launch-template version this launch READ, as Amazon EC2 resolved it: the group's
+    // specification may float on `$Latest` or `$Default`, and the instance runs the one
+    // version that word named at this instant.
+    let launched_template =
+        launched_specification(request).and_then(|specification| {
+            resolved_specification(&store, specification)
+        });
 
     let mut tags: BTreeMap<String, String> = request
         .tags
@@ -313,6 +325,7 @@ pub fn launch<Eng: Send + Sync + 'static>(
             availability_zone: placement.availability_zone.clone(),
             instance_type: Some(instance_type.clone()),
             image_id: parameters.image_id.clone(),
+            launch_template: launched_template.clone(),
         });
     }
     launched
@@ -968,6 +981,77 @@ fn resolved_version(
     )
     .ok()?;
     Some((launch_template_id, version))
+}
+
+/// The specification an instance launched from `specification` REPORTS: the template's id
+/// and name as Amazon EC2 holds them, and the version this launch resolved to, written as
+/// the number it is.
+///
+/// A group's own specification may name the template by one half and float its version on
+/// `$Latest` or `$Default`; the instance it launches ran ONE version of ONE template, so
+/// that is what the instance reports. `None` when the account holds no such template, or
+/// no such version of it: there is then no launch the group made from it to report.
+fn resolved_specification(
+    store: &ec2::ComAmazonawsEc2Amazonec2State,
+    specification: &LaunchTemplateSpecification,
+) -> Option<LaunchTemplateSpecification> {
+    let (launch_template_id, version) = resolved_version(store, specification)?;
+    let record = store.launch_templates.get(&launch_template_id)?;
+    Some(LaunchTemplateSpecification {
+        launch_template_id: Some(launch_template_id),
+        launch_template_name: record.template.launch_template_name.clone(),
+        version: Some(version.to_string()),
+    })
+}
+
+/// Why the configuration this launch would run cannot produce an instance, or `None` when
+/// it can.
+///
+/// A group launches from the launch-template version its specification names AT THE INSTANT
+/// OF THE LAUNCH — a group floating on `$Latest` or `$Default` launches from whatever that
+/// word then names — so a configuration the account's own stores cannot satisfy is not a
+/// request to refuse but a LAUNCH that fails: Amazon EC2 Auto Scaling places nothing and
+/// records the reason as the failed activity's `StatusMessage`
+/// ([`super::AutoScalingState::record_failed_activity`]), which is where a client reads why
+/// its group never reached its desired capacity.
+///
+/// The sentence each reason carries ends the way every launch failure does
+/// ([`super::LAUNCH_FAILED_SENTENCE`]). `None` also covers an engine carrying neither
+/// store: a failure has to be grounded in what the account's state answered, never assumed.
+/// Why the configuration this launch would run cannot produce an instance, or `None` when
+/// it can.
+///
+/// A group launches from the launch-template version its specification names AT THE INSTANT
+/// OF THE LAUNCH — a group floating on `$Latest` or `$Default` launches from whatever that
+/// word then names — so a configuration the account's own stores cannot satisfy is not a
+/// request to refuse but a LAUNCH that fails: Amazon EC2 Auto Scaling places nothing and
+/// records the reason as the failed activity's `StatusMessage`
+/// ([`super::AutoScalingState::record_failed_activity`]), which is where a client reads why
+/// its group never reached its desired capacity.
+///
+/// What is resolved here is what this service, as the CONSUMER of the template, resolves
+/// when it configures a group — the IAM instance profile the instances would run as
+/// ([`super::iam_instance_profiles`], whose header states why that reference is this
+/// service's to resolve). What Amazon EC2 itself validates about a launch (an AMI and an
+/// instance type whose architectures disagree among them) stays with the service that
+/// owns the images and the instance types.
+///
+/// The sentence each reason carries ends the way every launch failure does
+/// ([`super::LAUNCH_FAILED_SENTENCE`]). `None` also covers an engine carrying no IAM store:
+/// a failure has to be grounded in what the account's state answered, never assumed.
+pub fn launch_failure_reason<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    request: &LaunchRequest<'_>,
+) -> Option<String> {
+    // The IAM instance profile the instances would run as, resolved against the account's
+    // own IAM records: an instance cannot be launched under a profile the account does not
+    // hold. Nothing of this service is locked here, and resolving it reads Amazon EC2's
+    // store and then IAM's, one after the other ([`super::iam_instance_profiles`]).
+    super::iam_instance_profiles::unresolved_profile_launch_failure(
+        engine,
+        request.launch_template,
+        request.mixed_instances_policy,
+    )
 }
 
 /// Whether the launch-template version `specification` names resolves its image through
