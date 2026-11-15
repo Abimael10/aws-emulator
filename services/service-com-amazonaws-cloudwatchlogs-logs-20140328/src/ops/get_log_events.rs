@@ -3,7 +3,10 @@
 //! @op GetLogEvents
 //! Implemented: reads the events persisted for the named stream, filters them to the
 //! requested time window, pages through them in either direction and hands back the
-//! tokens that resume the scan. This is the ONLY file to touch for this operation.
+//! tokens that resume the scan. An event CloudWatch Logs can no longer decrypt — one
+//! ingested under a customer managed key KMS no longer lets it use
+//! ([`crate::state::event_key_access`]) — is withheld from the page rather than refusing
+//! the read. This is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`GetLogEvents::handle`] with real behaviour and
@@ -396,6 +399,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
+
+        // Which of this group's events can still be DECRYPTED, decided before the page is
+        // read: an event is held under the customer managed key its group was associated with
+        // when it arrived, and serving it means using that key, so a key KMS no longer lets
+        // CloudWatch Logs use withholds exactly the events ingested under it
+        // ([`crate::state::event_key_access`]). KMS is asked with no guard of this store
+        // held, so the keys are read under a guard of their own first and the guard the page
+        // is read through is taken afterwards.
+        let encrypted_under = {
+            let store = state.lock();
+            store
+                .log_groups
+                .get(&log_group_name)
+                .map(|group| {
+                    (
+                        group.log_group_arn.clone(),
+                        crate::state::event_key_access::ingest_keys(group),
+                    )
+                })
+                .unwrap_or_default()
+        };
+        let (group_arn, ingest_keys) = encrypted_under;
+        let unusable_keys = if ingest_keys.is_empty() {
+            ::std::collections::BTreeSet::new()
+        } else {
+            crate::state::event_key_access::unusable_keys(ctx, &region, &group_arn, &ingest_keys)
+                .await
+        };
+
         let store = state.lock();
 
         let Some(group) = store.log_groups.get(&log_group_name) else {
@@ -406,6 +438,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // A log group's CLASS decides which features it supports, and reading its stored
+        // events back one stream at a time is outside the subset the classes other than
+        // Standard support ("Log classes", `CreateLogGroup$logGroupClass`): such a group takes
+        // events in and is queried through CloudWatch Logs Insights rather than read here, so
+        // the read is refused with this service's one sentence for a feature the class does
+        // not support ([`crate::state::LOG_CLASS_UNSUPPORTED_OPERATION_MESSAGE`]).
+        if group.log_group_class != crate::state::EVENT_SEARCH_LOG_GROUP_CLASS {
+            return Err(GetLogEventsError::validation(
+                crate::state::LOG_CLASS_UNSUPPORTED_OPERATION_MESSAGE,
+            ));
+        }
         let Some(stream) = group.streams.get(&input.log_stream_name) else {
             return Err(GetLogEventsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -489,20 +532,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => (input.start_time, input.end_time),
         };
 
-        // `startTime` is inclusive and `endTime` exclusive. The stored events are kept
-        // in timestamp order, so the window is one contiguous run: it is found by two
+        // The events this read can serve: the stream's, less the ones whose ingest key
+        // CloudWatch Logs can no longer use. Decided over the whole stream before the window
+        // is taken, so a withheld event is not in the window, not in the page, and not in
+        // the position a cursor resumes from — the read answers exactly as if the stream held
+        // only what it can serve, and nothing of the store changes. ONE representation
+        // whether or not anything is withheld, so the window and the cursor arithmetic below
+        // are the same code for both; the pass is bounded by the stream's storage ceiling
+        // ([`crate::state::MAX_STREAM_EVENTS`]).
+        let readable: Vec<&crate::state::StoredEvent> = stream
+            .events
+            .iter()
+            .filter(|event| event.is_readable(&unusable_keys))
+            .collect();
+
+        // `startTime` is inclusive and `endTime` exclusive. The events a read can serve are
+        // kept in timestamp order, so the window is one contiguous run: it is found by two
         // binary searches rather than by walking everything the stream accumulated.
         let lo = match start_time {
-            Some(start) => stream
-                .events
-                .partition_point(|event| event.timestamp < start),
+            Some(start) => readable.partition_point(|event| event.timestamp < start),
             None => 0,
         };
         let hi = match end_time {
-            Some(end) => stream.events.partition_point(|event| event.timestamp < end),
-            None => stream.events.len(),
+            Some(end) => readable.partition_point(|event| event.timestamp < end),
+            None => readable.len(),
         };
-        let matching = &stream.events[lo..hi.max(lo)];
+        let matching = &readable[lo..hi.max(lo)];
         let total = matching.len();
         // `limit` is modelled `range 1..10000`, so the boundary validator has already
         // refused a value outside it; `max(1)` only keeps the page bounds sane.

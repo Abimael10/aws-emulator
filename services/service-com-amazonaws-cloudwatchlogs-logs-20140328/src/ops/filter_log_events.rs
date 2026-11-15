@@ -7,6 +7,9 @@
 //! delivers it under ([`crate::state::subscription_delivery::event_id`]), beside the
 //! `searchedLogStreams` the search reports and the `searchStatistics` counts of it
 //! ([`SearchStatistics`]), resumable from a `nextToken` while a page still carries events.
+//! An event CloudWatch Logs can no longer decrypt — one ingested under a customer managed
+//! key KMS no longer lets it use ([`crate::state::event_key_access`]) — is withheld from the
+//! search rather than refusing the read.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -440,6 +443,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
+
+        // Which of this group's events can still be DECRYPTED, decided before the search
+        // runs: an event is held under the customer managed key its group was associated with
+        // when it arrived, and serving it means using that key, so a key KMS no longer lets
+        // CloudWatch Logs use withholds exactly the events ingested under it
+        // ([`crate::state::event_key_access`]). KMS is asked with no guard of this store
+        // held, so the keys are read under a guard of their own first and the guard the
+        // search runs under is taken afterwards.
+        let encrypted_under = {
+            let store = state.lock();
+            store
+                .log_groups
+                .get(&log_group_name)
+                .map(|group| {
+                    (
+                        group.log_group_arn.clone(),
+                        crate::state::event_key_access::ingest_keys(group),
+                    )
+                })
+                .unwrap_or_default()
+        };
+        let (group_arn, ingest_keys) = encrypted_under;
+        let unusable_keys = if ingest_keys.is_empty() {
+            ::std::collections::BTreeSet::new()
+        } else {
+            crate::state::event_key_access::unusable_keys(ctx, &region, &group_arn, &ingest_keys)
+                .await
+        };
+
         let store = state.lock();
 
         let invalid = |message: String| {
@@ -501,6 +533,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A log group's CLASS decides which features it supports, and searching its stored
+        // events is outside the subset the classes other than Standard support ("Log
+        // classes", `CreateLogGroup$logGroupClass`): such a group takes events in and is
+        // queried through CloudWatch Logs Insights rather than searched here, so the
+        // identifier naming one is the parameter that is wrong and the search is refused with
+        // this service's one sentence for a feature the class does not support
+        // ([`crate::state::LOG_CLASS_UNSUPPORTED_OPERATION_MESSAGE`]).
+        if group.log_group_class != crate::state::EVENT_SEARCH_LOG_GROUP_CLASS {
+            return Err(FilterLogEventsError::validation(
+                crate::state::LOG_CLASS_UNSUPPORTED_OPERATION_MESSAGE,
+            ));
+        }
+
         // "Filters the results to only logs from the log streams in this list": the list
         // NAMES log streams of that group, so a name the group does not hold names no log
         // stream and the search is refused rather than answered over the rest. A
@@ -536,6 +581,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             for event in &stream.events {
+                // An event whose ingest key CloudWatch Logs can no longer use is not served
+                // by this search: the matches are taken from what the read can decrypt.
+                if !event.is_readable(&unusable_keys) {
+                    continue;
+                }
                 if !scan.admits(event.timestamp) {
                     continue;
                 }

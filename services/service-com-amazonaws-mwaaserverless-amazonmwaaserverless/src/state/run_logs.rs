@@ -197,6 +197,12 @@ pub fn publish<Eng: Send + Sync + 'static>(engine: &Eng, region: &str, lines: Ve
             .get(&log_group)
             .map(|group| store.data_protection_identifiers_for(group))
             .unwrap_or_default();
+        // The customer managed key the destination group is associated with, under which the
+        // data it takes in is encrypted — by whichever path the events arrive.
+        let ingest_kms_key_id = store
+            .log_groups
+            .get(&log_group)
+            .and_then(|group| group.kms_key_id.clone());
         let events: Vec<logs::StoredEvent> = events
             .into_iter()
             .map(|(timestamp, message)| logs::StoredEvent {
@@ -205,6 +211,7 @@ pub fn publish<Eng: Send + Sync + 'static>(engine: &Eng, region: &str, lines: Ve
                 message,
                 ingestion_time: ingested_at,
                 ingestion_seq: store.take_ingestion_seq(),
+                ingest_kms_key_id: ingest_kms_key_id.clone(),
             })
             .collect();
         let added: i64 = events

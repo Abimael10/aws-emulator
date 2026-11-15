@@ -27,18 +27,18 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every request here is signed for, which is the Region the ARNs carry.
-const REGION: &str = "eu-west-2";
+pub(crate) const REGION: &str = "eu-west-2";
 
 /// The error code an association the key policy does not cover is refused with.
 const ACCESS_DENIED: &str = "AccessDeniedException";
 
 /// CloudWatch Logs and KMS on one shared engine, reached over the wire.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signing is not the subject here, so requests are unauthenticated; the credential
@@ -56,7 +56,13 @@ impl Emulator {
     }
 
     /// One awsJson1_1 call to the service signing as `service` under `prefix`.
-    async fn call(&self, service: &str, prefix: &str, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(
+        &self,
+        service: &str,
+        prefix: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -84,12 +90,12 @@ impl Emulator {
     }
 
     /// One CloudWatch Logs call: its status and body.
-    async fn logs(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn logs(&self, operation: &str, body: &Value) -> (u16, Value) {
         self.call("logs", "Logs_20140328", operation, body).await
     }
 
     /// One CloudWatch Logs call that must succeed.
-    async fn logs_ok(&self, case: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn logs_ok(&self, case: &str, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.logs(operation, body).await;
         assert_eq!(
             status, 200,
@@ -99,7 +105,7 @@ impl Emulator {
     }
 
     /// Create a KMS key holding `policy`, answering its ARN — the key the association names.
-    async fn created_key(&self, case: &str, policy: &str) -> String {
+    pub(crate) async fn created_key(&self, case: &str, policy: &str) -> String {
         let (status, parsed) = self
             .call(
                 "kms",
@@ -150,7 +156,7 @@ impl Emulator {
 
 /// A log group's ARN in the form a key policy's encryption-context condition names it by —
 /// `LogGroup$logGroupArn`, which carries no trailing `:*`.
-fn log_group_arn(name: &str) -> String {
+pub(crate) fn log_group_arn(name: &str) -> String {
     format!(
         "arn:aws:logs:{REGION}:{}:log-group:{name}",
         engine::emulator_account_id()
@@ -159,7 +165,7 @@ fn log_group_arn(name: &str) -> String {
 
 /// The statement every key policy carries so the key stays manageable by its account, as
 /// KMS's default key policy words it.
-fn account_statement() -> Value {
+pub(crate) fn account_statement() -> Value {
     json!({
         "Sid": "Enable IAM User Permissions",
         "Effect": "Allow",
@@ -171,7 +177,7 @@ fn account_statement() -> Value {
 
 /// A key policy granting `principal` the CloudWatch Logs encryption operations, scoped by
 /// `condition` when one is given.
-fn key_policy(principal: &str, condition: Option<Value>) -> String {
+pub(crate) fn key_policy(principal: &str, condition: Option<Value>) -> String {
     let mut statement = json!({
         "Effect": "Allow",
         "Principal": {"Service": principal},

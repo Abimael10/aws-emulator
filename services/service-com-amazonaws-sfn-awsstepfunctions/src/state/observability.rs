@@ -1674,6 +1674,12 @@ fn deliver_events<Eng: Send + Sync + 'static>(engine: &Eng, deliveries: &[Delive
             .get(&delivery.log_group)
             .map(|group| store.data_protection_identifiers_for(group))
             .unwrap_or_default();
+        // The customer managed key the destination group is associated with, under which the
+        // data it takes in is encrypted — by whichever path the events arrive.
+        let ingest_kms_key_id = store
+            .log_groups
+            .get(&delivery.log_group)
+            .and_then(|group| group.kms_key_id.clone());
         let events: Vec<logs::StoredEvent> = delivery
             .events
             .iter()
@@ -1683,6 +1689,7 @@ fn deliver_events<Eng: Send + Sync + 'static>(engine: &Eng, deliveries: &[Delive
                 message: message.clone(),
                 ingestion_time: now_ms,
                 ingestion_seq: store.take_ingestion_seq(),
+                ingest_kms_key_id: ingest_kms_key_id.clone(),
             })
             .collect();
         let added: i64 = events

@@ -146,6 +146,12 @@ pub fn deliver<Eng: Send + Sync + 'static>(engine: &Eng, region: &str, spans: &[
         .get(SPANS_LOG_GROUP)
         .map(|group| store.data_protection_identifiers_for(group))
         .unwrap_or_default();
+    // The customer managed key the destination group is associated with, under which the data
+    // it takes in is encrypted — by whichever path the events arrive.
+    let ingest_kms_key_id = store
+        .log_groups
+        .get(SPANS_LOG_GROUP)
+        .and_then(|group| group.kms_key_id.clone());
     let events: Vec<logs::StoredEvent> = spans
         .iter()
         // An event larger than the largest one CloudWatch Logs holds is not
@@ -173,6 +179,7 @@ pub fn deliver<Eng: Send + Sync + 'static>(engine: &Eng, region: &str, spans: &[
             message: span.document.clone(),
             ingestion_time: now_ms,
             ingestion_seq: store.take_ingestion_seq(),
+            ingest_kms_key_id: ingest_kms_key_id.clone(),
         })
         .collect();
     if events.is_empty() {

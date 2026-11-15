@@ -284,6 +284,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A log group's CLASS decides which features it supports: "the Standard log class
+        // supports all CloudWatch Logs features", while the Infrequent Access and Delivery
+        // classes support a subset ("Log classes", `CreateLogGroup$logGroupClass`) that
+        // metric extraction from ingested events is outside. A group in such a class cannot
+        // carry a metric filter at all: the request names a log group this operation cannot
+        // be performed on, which is a refusal of the REQUEST rather than of the resource, so
+        // it is answered through this service's validation channel
+        // ([`crate::scaffolded::Scaffolded::validation`]) — the operation's own error set
+        // declares nothing for it.
+        if group.log_group_class != crate::state::METRIC_FILTER_LOG_GROUP_CLASS {
+            return Err(PutMetricFilterError::validation(
+                crate::state::LOG_CLASS_UNSUPPORTED_OPERATION_MESSAGE,
+            ));
+        }
+
         // "There is also a quota of five regular expression patterns per log group." A put
         // over a filter the group already holds REPLACES that filter's pattern, so the
         // patterns it carries today do not count against the budget this put needs.

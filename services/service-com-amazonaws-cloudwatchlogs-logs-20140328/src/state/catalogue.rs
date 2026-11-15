@@ -237,6 +237,39 @@ pub const INDEX_SOURCE_ACCOUNT: &str = "ACCOUNT";
 /// [`INDEX_SOURCE_ACCOUNT`].
 pub const INDEX_SOURCE_LOG_GROUP: &str = "LOG_GROUP";
 
+/// The one log group class a METRIC FILTER can be put on: `logGroupClass` documents that
+/// "the `Standard` log class supports all CloudWatch Logs features" while "the `Infrequent
+/// Access` log class supports a subset of CloudWatch Logs features", and metric extraction
+/// from ingested events is one of the features outside that subset (the member's own "Log
+/// classes" reference). Spelled as the model's `LogGroupClass` spells it
+/// (`LOG_GROUP_CLASS_VALUES`), and named apart from the other features' classes because each
+/// states a rule of its own.
+pub const METRIC_FILTER_LOG_GROUP_CLASS: &str = "STANDARD";
+
+/// The one log group class a SUBSCRIPTION FILTER can be put on; see
+/// [`METRIC_FILTER_LOG_GROUP_CLASS`] for where the rule comes from — real-time delivery of
+/// ingested events is likewise outside the subset the Infrequent Access class supports.
+pub const SUBSCRIPTION_FILTER_LOG_GROUP_CLASS: &str = "STANDARD";
+
+/// The one log group class a LIVE TAIL session can tail; see
+/// [`METRIC_FILTER_LOG_GROUP_CLASS`] for where the rule comes from — Live Tail is likewise
+/// outside the subset the Infrequent Access class supports.
+pub const LIVE_TAIL_LOG_GROUP_CLASS: &str = "STANDARD";
+
+/// The one log group class whose stored events `GetLogEvents` and `FilterLogEvents` read
+/// back; see [`METRIC_FILTER_LOG_GROUP_CLASS`] for where the rule comes from — a log group of
+/// a class that supports only a subset of the features takes events in and is queried through
+/// CloudWatch Logs Insights instead.
+pub const EVENT_SEARCH_LOG_GROUP_CLASS: &str = "STANDARD";
+
+/// How CloudWatch Logs refuses a call that asks for a feature the log group's CLASS does not
+/// support: the service's fixed sentence for the class, which carries nothing of the request.
+///
+/// The ONE place this service words that refusal, so the features gated on a class cannot
+/// drift apart in how they say so.
+pub const LOG_CLASS_UNSUPPORTED_OPERATION_MESSAGE: &str =
+    "This operation is only supported on the Standard log class.";
+
 /// The one log group class a log-group-level field index policy can be put on, from
 /// `PutIndexPolicy`: "Only log groups in the Standard log class support field index
 /// policies." Spelled as the model's `LogGroupClass` spells it

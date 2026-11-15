@@ -2058,3 +2058,7 @@ mod s3_sourced_table_derived_key_schema;
 // alone.
 // `E0428`; a line between two pairs is a report from the canonical-list suite; and an inner
 // doc comment (`//!`) past the first item is `E0753`. Each of those fails EVERY suite of this
+// cross-service suite under `tests/all/`, and nothing else. Below this header the file holds
+// one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file, sorted by name, and no
+// `E0753` and compiles no suite of this target — which is what repeated landings kept
+// producing here. With no inner doc comment in the file at all, no merge can leave one past

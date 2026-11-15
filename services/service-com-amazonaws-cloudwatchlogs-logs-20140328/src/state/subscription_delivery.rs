@@ -1032,6 +1032,7 @@ mod tests {
             masked_message: None,
             ingestion_time: 1_700_000_000_123,
             ingestion_seq,
+            ingest_kms_key_id: None,
         }
     }
 

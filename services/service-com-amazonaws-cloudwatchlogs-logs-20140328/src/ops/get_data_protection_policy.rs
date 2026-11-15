@@ -2,8 +2,10 @@
 
 //! @op GetDataProtectionPolicy
 //!
-//! Reports the data protection policy `PutDataProtectionPolicy` stored on the log group
-//! the request names — a pure read of that group's stored policy.
+//! Reports the data protection policy in force on the log group the request names — the one
+//! `PutDataProtectionPolicy` stored on it, else the account-level policy that selects it — a
+//! pure read. A log group that carries neither is answered with a successful page reporting
+//! no policy; only a log group this account does not hold is a missing resource.
 //!
 //! ## Shape of an operation
 //!
@@ -179,12 +181,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ::engine::emulator_account_id(),
             ))
         })?;
-        // A group that holds no policy has no policy to REPORT, and nothing about the read
-        // failed: the operation "returns information about a log group data protection
-        // policy", so a group that has none is reported by an answer carrying none of the
-        // output's members. The resource a refusal would be about is the LOG GROUP, which
-        // is the one thing this request names and the one thing that can be missing.
-        let Some(policy) = group.data_protection_policy.as_ref() else {
+        // The policy this read reports is the one IN FORCE on the group: the group's own
+        // where it holds one, and otherwise the account-level data protection policy that
+        // selects it ([`crate::state::applicable_account_policy`]), which is the policy
+        // masking that group's events while the group carries none of its own.
+        //
+        // A group that carries NEITHER is not a missing resource: the operation "returns
+        // information about a log group data protection policy", and the only resource this
+        // request names, and the only one that can be missing, is the LOG GROUP — so a group
+        // that exists is answered by a page carrying none of the output's members. That is
+        // what lets a client tell "this group has no data protection policy" from "there is
+        // no such log group", and what makes a put-if-absent probe, and a read after
+        // `DeleteDataProtectionPolicy`, answer rather than fail.
+        let policy = group
+            .data_protection_policy
+            .as_ref()
+            .map(|held| (held.policy_document.clone(), held.last_updated_time_ms))
+            .or_else(|| {
+                crate::state::applicable_account_policy(
+                    &store.account_policies,
+                    crate::state::POLICY_TYPE_DATA_PROTECTION,
+                    group,
+                )
+                .map(|account_level| {
+                    (
+                        account_level.policy_document.clone(),
+                        account_level.last_updated_time_ms,
+                    )
+                })
+            });
+        let Some((policy_document, last_updated_time)) = policy else {
             return Ok(GetDataProtectionPolicyOutput {
                 log_group_identifier: None,
                 policy_document: None,
@@ -196,8 +222,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The log group name or ARN that you specified in your request" — the
             // identifier as it arrived, not the name it resolved to.
             log_group_identifier: Some(input.log_group_identifier.clone()),
-            policy_document: Some(policy.policy_document.clone()),
-            last_updated_time: Some(policy.last_updated_time_ms),
+            policy_document: Some(policy_document),
+            last_updated_time: Some(last_updated_time),
         })
     }
 }

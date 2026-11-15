@@ -386,22 +386,25 @@ pub(super) fn check_metric_extraction_policy_document(document: &str) -> Result<
     Ok(())
 }
 
-/// One filter of a `selectionCriteria` string: the field it selects on, whether it is
-/// written with `NOT IN` rather than `IN`, and the values of its list.
+/// One filter of a `selectionCriteria` string: the field it selects on, whether it EXCLUDES
+/// the values it names rather than selecting them, and those values.
 ///
 /// The forms are the ones `PutAccountPolicy` spells out — `LogGroupName IN ["log-group-1",
-/// "log-group-2"]`, `LogGroupNamePrefix NOT IN ["/aws/prefix1", "/aws/prefix2"]` — and the
-/// filters are the ones `PutAccountPolicy$selectionCriteria` names per policy type
+/// "log-group-2"]`, `LogGroupNamePrefix NOT IN ["/aws/prefix1", "/aws/prefix2"]`,
+/// `LogGroupNamePrefix = "my-prefix"` — and the filters are the ones
+/// `PutAccountPolicy$selectionCriteria` names per policy type
 /// ([`SELECTION_FIELD_LOG_GROUP_NAME`], [`SELECTION_FIELD_LOG_GROUP_NAME_PREFIX`],
-/// [`SELECTION_FIELD_DATA_SOURCE_NAME`], [`SELECTION_FIELD_DATA_SOURCE_TYPE`]).
+/// [`SELECTION_FIELD_DATA_SOURCE_NAME`], [`SELECTION_FIELD_DATA_SOURCE_TYPE`]). A clause
+/// selects the same log groups whichever of those forms carries its values, so everything
+/// downstream reads the clause rather than the string it was written as.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectionClause {
     /// The filter's field, as the criteria string spells it.
     pub field: String,
-    /// `true` for a `NOT IN` list, `false` for an `IN` list.
+    /// `true` for a `NOT IN` list, `false` for an `IN` list or an equality.
     pub negated: bool,
-    /// The values of the list, in the order written. Empty for the documented
-    /// `LogGroupName NOT IN []`.
+    /// The values the filter names, in the order written: the one value of an equality, or
+    /// the list's. Empty for the documented `LogGroupName NOT IN []`.
     pub values: Vec<String>,
 }
 
@@ -573,7 +576,8 @@ impl<'a> CriteriaSelection<'a> {
 ///   specify up to 50 values in each `IN` or `NOT IN` list."
 ///
 /// Which operator a `LogGroupNamePrefix` filter is written with is not documented for a
-/// transformer or a field index policy, so both are accepted there.
+/// transformer or a field index policy, so every form of it is accepted there — the set
+/// operators over a list and equality on a single value alike ([`parse_selection_clauses`]).
 pub fn check_selection_criteria(policy_type: &str, criteria: &str) -> Result<SelectionCriteria, String> {
     let parsed = SelectionCriteria {
         clauses: parse_selection_clauses(criteria)?,
@@ -619,9 +623,9 @@ pub fn check_selection_criteria(policy_type: &str, criteria: &str) -> Result<Sel
 pub(super) fn selection_criteria_forms(policy_type: &str) -> &'static str {
     match policy_type {
         POLICY_TYPE_SUBSCRIPTION_FILTER => "the filter LogGroupName NOT IN [...]",
-        POLICY_TYPE_TRANSFORMER => "a LogGroupNamePrefix IN [...] filter",
+        POLICY_TYPE_TRANSFORMER => "a LogGroupNamePrefix filter",
         POLICY_TYPE_FIELD_INDEX => {
-            "a LogGroupNamePrefix IN [...] filter, or DataSourceName IN [...] AND DataSourceType IN [...] together"
+            "a LogGroupNamePrefix filter, or DataSourceName IN [...] AND DataSourceType IN [...] together"
         }
         POLICY_TYPE_METRIC_EXTRACTION => {
             "a LogGroupName or LogGroupNamePrefix filter with the IN or NOT IN operator"
@@ -630,24 +634,17 @@ pub(super) fn selection_criteria_forms(policy_type: &str) -> &'static str {
     }
 }
 
-/// Split a `selectionCriteria` string into its clauses — each `Field IN [...]` or `Field
-/// NOT IN [...]`, joined by `AND` — refusing a string that is not written that way.
+/// Split a `selectionCriteria` string into its clauses — each a filter written over a LIST
+/// (`Field IN [...]`, `Field NOT IN [...]`) or over a SINGLE value (`Field = "value"`),
+/// joined by `AND` — refusing a string that is not written that way.
 pub(super) fn parse_selection_clauses(criteria: &str) -> Result<Vec<SelectionClause>, String> {
-    let malformed = || {
-        "selectionCriteria must be one or more filters of the form 'Field IN [\"value\", ...]' or 'Field NOT IN [\"value\", ...]', joined by AND"
-            .to_string()
-    };
+    let malformed = || MALFORMED_SELECTION_CRITERIA_MESSAGE.to_string();
     let mut clauses = Vec::new();
     let mut rest = criteria.trim();
     loop {
-        let open = rest.find('[').ok_or_else(malformed)?;
-        let (head, list) = rest.split_at(open);
-        let close = selection_list_end(list).ok_or_else(malformed)?;
-        // The list is a JSON array of strings in every documented form, so it is read as
-        // one rather than scanned by hand.
-        let values = serde_json::from_str::<Vec<String>>(&list[..=close]).map_err(|_| malformed())?;
-        clauses.push(SelectionClause::parse(head, values).ok_or_else(malformed)?);
-        rest = list[close + 1..].trim_start();
+        let (clause, after) = parse_selection_clause(rest).ok_or_else(malformed)?;
+        clauses.push(clause);
+        rest = after.trim_start();
         if rest.is_empty() {
             break;
         }
@@ -664,6 +661,81 @@ pub(super) fn parse_selection_clauses(criteria: &str) -> Result<Vec<SelectionCla
         return Err(malformed());
     }
     Ok(clauses)
+}
+
+/// How CloudWatch Logs refuses a `selectionCriteria` string that is not written as filters at
+/// all; see [`parse_selection_clauses`] for the forms one is written in.
+pub(super) const MALFORMED_SELECTION_CRITERIA_MESSAGE: &str =
+    "selectionCriteria must be one or more filters of the form 'Field IN [\"value\", ...]', \
+     'Field NOT IN [\"value\", ...]' or 'Field = \"value\"', joined by AND";
+
+/// ONE clause off the front of `text`, and whatever follows it; `None` when the front of
+/// `text` is not a filter.
+///
+/// A filter states its field, an operator and the values it selects on. The operator is
+/// either a SET operator over a list of values (`IN`, `NOT IN` — the form
+/// `PutAccountPolicy$selectionCriteria` spells out for the lists it bounds, "up to 50 values
+/// in each IN or NOT IN list") or EQUALITY on a single value (`LogGroupNamePrefix =
+/// "my-prefix"`, the form the member's prefix filters are written in), and the two select the
+/// same log groups when they carry the same value: equality is the one-value list.
+///
+/// Which form a clause is written in is decided by its own operator — whichever of the list's
+/// `[` and equality's `=` opens first — so a value containing one of those characters inside
+/// the other form's quotes does not change the form.
+fn parse_selection_clause(text: &str) -> Option<(SelectionClause, &str)> {
+    let list_at = text.find('[');
+    let equals_at = text.find('=');
+    if let Some(open) = list_at.filter(|open| equals_at.is_none_or(|equals| *open < equals)) {
+        let (head, list) = text.split_at(open);
+        let close = selection_list_end(list)?;
+        // The list is a JSON array of strings in every documented form, so it is read as
+        // one rather than scanned by hand.
+        let values = serde_json::from_str::<Vec<String>>(&list[..=close]).ok()?;
+        return Some((SelectionClause::parse(head, values)?, &list[close + 1..]));
+    }
+    let equals = equals_at?;
+    let field = single_token(&text[..equals])?;
+    // The value is a JSON string, as every value of the list form is.
+    let value_text = text[equals + 1..].trim_start();
+    let close = selection_string_end(value_text)?;
+    let value = serde_json::from_str::<String>(&value_text[..=close]).ok()?;
+    Some((
+        SelectionClause {
+            field,
+            negated: false,
+            values: vec![value],
+        },
+        &value_text[close + 1..],
+    ))
+}
+
+/// The one whitespace-free word `text` holds, or `None` when it holds none or several — what
+/// a filter's field is written as.
+fn single_token(text: &str) -> Option<String> {
+    let mut tokens = text.split_whitespace();
+    let token = tokens.next()?;
+    tokens.next().is_none().then(|| token.to_string())
+}
+
+/// The byte index of the `"` closing the JSON string that starts at the beginning of `text`,
+/// or `None` when `text` does not start with a string or never closes it. An escaped `"` does
+/// not close it.
+fn selection_string_end(text: &str) -> Option<usize> {
+    let mut characters = text.char_indices();
+    if characters.next()?.1 != '"' {
+        return None;
+    }
+    let mut escaped = false;
+    for (index, character) in characters {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            return Some(index);
+        }
+    }
+    None
 }
 
 /// The byte index of the `]` closing the list that starts at the beginning of `list`, or
@@ -733,11 +805,45 @@ pub fn check_account_policy_criteria_overlap(
             continue;
         };
         if criteria_conflict(policy_type, &putting, &held_selection) {
-            return Err(selection_criteria_overlap_message(&held.policy_name));
+            return Err(overlap_message(policy_type, &putting, &held.policy_name));
         }
     }
     Ok(())
 }
+
+/// How CloudWatch Logs refuses a `selectionCriteria` that overlaps the criteria of an
+/// account-level policy the account already holds: the sentence for the RULE that was broken.
+///
+/// The rules are the ones [`check_account_policy_criteria_overlap`] quotes, and each is
+/// refused in its own words:
+///
+/// * a policy whose LOG GROUP NAME PREFIXES overlap another's breaks "no two of them can use
+///   the same or overlapping log group name prefixes", the rule stated for the transformer
+///   and field index policies, and is refused with the fixed sentence about that prefix
+///   ([`SELECTION_CRITERIA_PREFIX_TAKEN_MESSAGE`]);
+/// * an overlap of any other criteria — the metric extraction policy's, and the field index
+///   policy's data source name and type combination — is refused by naming the policy it
+///   overlaps ([`selection_criteria_overlap_message`]), which is what tells a caller holding
+///   several policies which one to narrow.
+fn overlap_message(
+    policy_type: &str,
+    putting: &CriteriaSelection<'_>,
+    held_policy_name: &str,
+) -> String {
+    let by_prefix = matches!(policy_type, POLICY_TYPE_TRANSFORMER | POLICY_TYPE_FIELD_INDEX)
+        && matches!(putting, CriteriaSelection::Groups { .. });
+    if by_prefix {
+        return SELECTION_CRITERIA_PREFIX_TAKEN_MESSAGE.to_string();
+    }
+    selection_criteria_overlap_message(held_policy_name)
+}
+
+/// The sentence CloudWatch Logs refuses a put whose log group name prefix another
+/// account-level policy of the same type already covers with: fixed text for the class,
+/// carrying nothing of the request — the prefix is the caller's own value and the policy that
+/// holds it is not named.
+pub const SELECTION_CRITERIA_PREFIX_TAKEN_MESSAGE: &str =
+    "SelectionCriteria prefix is already supported by an existing policy";
 
 /// How CloudWatch Logs refuses a `selectionCriteria` that overlaps the criteria of an
 /// account-level policy the account already holds.

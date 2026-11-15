@@ -525,12 +525,19 @@ pub fn deliver<Eng: Send + Sync + 'static>(engine: &Eng, records: &[PublishedRec
             .get(&record.log_group_name)
             .map(|group| store.data_protection_identifiers_for(group))
             .unwrap_or_default();
+        // The customer managed key the destination group is associated with, under which the
+        // data it takes in is encrypted — by whichever path the records arrive.
+        let ingest_kms_key_id = store
+            .log_groups
+            .get(&record.log_group_name)
+            .and_then(|group| group.kms_key_id.clone());
         let stored = logs::StoredEvent {
             timestamp: epoch_millis(record.at),
             masked_message: logs::data_protection::masked(&record.message, &data_identifiers),
             message: record.message.clone(),
             ingestion_time: ingested_at,
             ingestion_seq: store.take_ingestion_seq(),
+            ingest_kms_key_id,
         };
         let added = stored.stored_bytes();
         let Some(group) = store

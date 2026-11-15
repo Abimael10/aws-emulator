@@ -85,6 +85,10 @@ struct Row {
     document: Value,
     /// The reporting operations that refuse a group holding none.
     readers: &'static [&'static str],
+    /// The reporting operations that ANSWER a group holding none — a page reporting no such
+    /// resource rather than a refusal — so they are exercised while the group holds one, and
+    /// in the missing-LOG-GROUP test, but not in the missing-resource refusals.
+    served_readers: &'static [&'static str],
     /// The operation that removes one, which refuses a group holding none too.
     delete: &'static str,
     /// The whole message this row's operations refuse a group holding none of its resource
@@ -126,6 +130,7 @@ fn rows() -> Vec<Row> {
             // documents the document's one required field.
             document: json!({"policyDocument": json!({"Fields": ["requestId"]}).to_string()}),
             readers: &[],
+            served_readers: &[],
             delete: "DeleteIndexPolicy",
             refusal: unidentified_refusal,
         },
@@ -134,10 +139,13 @@ fn rows() -> Vec<Row> {
             resource: "data protection policy",
             put: "PutDataProtectionPolicy",
             document: json!({"policyDocument": data_protection_document("EmailAddress")}),
-            // `GetDataProtectionPolicy` is NOT a refusing reader of this resource: a group
-            // that holds no policy is reported by an answer carrying no policy, which
-            // `tests/all/policy_surface_refusals.rs` is about.
+            // `GetDataProtectionPolicy` is NOT a refusing reader of this resource: a log
+            // group that holds no data protection policy is reported by an answer carrying
+            // no policy, which `tests/all/data_protection_policies.rs` and
+            // `tests/all/policy_surface_refusals.rs` are about. The only resource that read
+            // can fail to find is the log group itself.
             readers: &[],
+            served_readers: &["GetDataProtectionPolicy"],
             delete: "DeleteDataProtectionPolicy",
             refusal: data_protection_key_refusal,
         },
@@ -154,6 +162,7 @@ fn rows() -> Vec<Row> {
             // had no transformer created reports an empty `transformerConfig`, which
             // `tests/all/transformers.rs` is about.
             readers: &[],
+            served_readers: &[],
             delete: "DeleteTransformer",
             refusal: transformer_refusal,
         },
@@ -206,6 +215,15 @@ fn put_body(row: &Row, identifier: &str) -> Value {
 fn refusing_operations(row: &Row) -> Vec<&'static str> {
     let mut operations = row.readers.to_vec();
     operations.push(row.delete);
+    operations
+}
+
+/// Every operation of `row` that a log group the account does not hold is a missing resource
+/// for: the ones that refuse a group holding none, and the readers that would otherwise have
+/// answered one.
+fn log_group_addressing_operations(row: &Row) -> Vec<&'static str> {
+    let mut operations = refusing_operations(row);
+    operations.extend(row.served_readers);
     operations
 }
 
@@ -290,7 +308,7 @@ async fn an_unidentified_missing_resource_is_refused_with_the_services_fixed_tex
             logs.ok(row.put, &put_body(&row, &identifier)).await;
             // While it is there the same operations answer it, so the refusals below are
             // computed from the store rather than fixed in the handler.
-            for operation in row.readers {
+            for operation in row.readers.iter().chain(row.served_readers) {
                 logs.ok(operation, &json!({"logGroupIdentifier": identifier}))
                     .await;
             }
@@ -326,7 +344,7 @@ async fn an_unidentified_missing_resource_is_refused_with_the_services_fixed_tex
             // A put after the refusals stores the resource again, so nothing above left the
             // group unable to hold one.
             logs.ok(row.put, &put_body(&row, &identifier)).await;
-            for operation in row.readers {
+            for operation in row.readers.iter().chain(row.served_readers) {
                 logs.ok(operation, &json!({"logGroupIdentifier": identifier}))
                     .await;
             }
@@ -349,7 +367,7 @@ async fn a_missing_log_group_is_still_named_in_the_refusal() {
 
     for row in rows() {
         for (form, identifier) in [("name", ABSENT.to_string()), ("arn", absent_arn.clone())] {
-            for operation in refusing_operations(&row) {
+            for operation in log_group_addressing_operations(&row) {
                 let (code, message) = logs
                     .refusal(operation, &json!({"logGroupIdentifier": identifier}))
                     .await;

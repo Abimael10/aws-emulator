@@ -326,11 +326,22 @@ impl<Eng: Send + Sync + 'static> StartLiveTail<Eng> {
             std::collections::BTreeMap::new();
         for identifier in &input.log_group_identifiers {
             let name = crate::state::log_group_name_from_identifier(identifier);
-            if !store.log_groups.contains_key(name) {
+            let Some(group) = store.log_groups.get(name) else {
                 return Err(StartLiveTailErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(LOG_GROUP_MISSING_MESSAGE.to_string()),
                     },
+                ));
+            };
+            // A log group's CLASS decides which features it supports, and Live Tail is
+            // outside the subset the classes other than Standard support ("Log classes",
+            // `CreateLogGroup$logGroupClass`): a session cannot tail such a group, so the
+            // identifier naming one is the parameter that is wrong and the request is refused
+            // with this service's one sentence for a feature the class does not support
+            // rather than opening a session that could never deliver its events.
+            if group.log_group_class != crate::state::LIVE_TAIL_LOG_GROUP_CLASS {
+                return Err(invalid(
+                    crate::state::LOG_CLASS_UNSUPPORTED_OPERATION_MESSAGE.to_string(),
                 ));
             }
             groups

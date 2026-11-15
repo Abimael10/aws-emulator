@@ -416,6 +416,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutSubscriptionFi
             .into());
         };
 
+        // A log group's CLASS decides which features it supports: "the Standard log class
+        // supports all CloudWatch Logs features", while the Infrequent Access and Delivery
+        // classes support a subset ("Log classes", `CreateLogGroup$logGroupClass`) that
+        // real-time delivery of ingested events is outside. A group in such a class cannot
+        // carry a subscription filter at all: the request names a log group this operation
+        // cannot be performed on, answered through the same validation channel the metric
+        // filter put answers that class refusal with ([`crate::scaffolded`]).
+        if group.log_group_class != crate::state::SUBSCRIPTION_FILTER_LOG_GROUP_CLASS {
+            return Err(PutSubscriptionFilterError::validation(
+                crate::state::LOG_CLASS_UNSUPPORTED_OPERATION_MESSAGE,
+            ));
+        }
+
         // "Valid values are @aws.account, @aws.region, and @source.log" — the modelled
         // `SystemField` is a plain string, so the boundary validator does not hold the
         // list to that catalogue. Same rule as `retentionInDays`: the refusal lists the

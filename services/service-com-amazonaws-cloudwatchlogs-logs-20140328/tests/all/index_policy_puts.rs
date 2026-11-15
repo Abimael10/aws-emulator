@@ -531,9 +531,13 @@ async fn a_put_is_accepted_only_for_a_log_group_in_the_supported_class() {
                 code, "InvalidParameterException",
                 "case {class}: only a log group in the {INDEX_POLICY_CLASS} class supports a field index policy, got {code}"
             );
-            assert!(
-                message.contains(INDEX_POLICY_CLASS) && message.contains(class),
-                "case {class}: the refusal names the class required and the class the group is in, got {message}"
+            // The sentence is the service's one wording for a feature the log group's class
+            // does not support: fixed text naming the class that does, and nothing of the
+            // request.
+            let expected = "This operation is only supported on the Standard log class.";
+            assert_eq!(
+                message, expected,
+                "case {class}: expected {expected:?}, got {message:?}"
             );
             let described = described_one(&logs, &group).await;
             assert!(

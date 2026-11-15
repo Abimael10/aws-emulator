@@ -221,6 +221,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // A log group's CLASS decides which features it supports, and real-time delivery of
+        // ingested events is outside the subset the classes other than Standard support ("Log
+        // classes", `CreateLogGroup$logGroupClass`): such a group has no subscription filters
+        // to list and none can be put on it, so a request scoped to one is refused with this
+        // service's one sentence for a feature the class does not support rather than
+        // answered with an empty page
+        // ([`crate::state::LOG_CLASS_UNSUPPORTED_OPERATION_MESSAGE`]).
+        if group.log_group_class != crate::state::SUBSCRIPTION_FILTER_LOG_GROUP_CLASS {
+            return Err(DescribeSubscriptionFiltersError::validation(
+                crate::state::LOG_CLASS_UNSUPPORTED_OPERATION_MESSAGE,
+            ));
+        }
+
         let cursor = match input.next_token.as_deref() {
             Some(token) => {
                 let Some(cursor) = Cursor::decode(token) else {

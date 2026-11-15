@@ -259,7 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a refusal rather than an empty page. A request that names none lists the
         // account's filters across every log group.
         if let Some(name) = input.log_group_name.as_deref() {
-            if !store.log_groups.contains_key(name) {
+            let Some(group) = store.log_groups.get(name) else {
                 return Err(
                     DescribeMetricFiltersErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
@@ -268,6 +268,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into(),
                 );
+            };
+            // A log group's CLASS decides which features it supports, and metric extraction
+            // from ingested events is outside the subset the classes other than Standard
+            // support ("Log classes", `CreateLogGroup$logGroupClass`): such a group has no
+            // metric filters to list and none can be put on it, so a request scoped to one is
+            // refused with this service's one sentence for a feature the class does not
+            // support rather than answered with an empty page
+            // ([`crate::state::LOG_CLASS_UNSUPPORTED_OPERATION_MESSAGE`]). A request that
+            // names NO log group is not scoped to a class at all.
+            if group.log_group_class != crate::state::METRIC_FILTER_LOG_GROUP_CLASS {
+                return Err(DescribeMetricFiltersError::validation(
+                    crate::state::LOG_CLASS_UNSUPPORTED_OPERATION_MESSAGE,
+                ));
             }
         }
 

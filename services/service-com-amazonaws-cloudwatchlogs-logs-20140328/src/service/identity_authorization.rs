@@ -66,7 +66,11 @@
 //!   token, a call about one of this service's other resource kinds — is judged against that
 //!   same ARN with both segments empty, which is the account's log groups rather than one
 //!   record: a statement covering them allows such a call and one scoped to a single group
-//!   does not.
+//!   does not;
+//! * a request that carries NO MEMBER AT ALL has nothing in it to name a resource with, so
+//!   there is no ARN to build from it: such a call is about every log group of the account,
+//!   and is judged against this service's log-group ARN carrying IAM's own wildcard
+//!   ([`ADDRESSED_BY_NO_MEMBER`]).
 //!
 //! Every part comes from the request and from the credential scope it was signed under, so
 //! nothing is looked up to decide a call and a refused caller learns nothing about what the
@@ -137,17 +141,42 @@ pub fn decided_by_the_operation(operation: &str) -> bool {
     DECIDED_BY_THE_OPERATION.binary_search(&operation).is_ok()
 }
 
+/// The operations whose REQUEST carries no member at all, so there is nothing in it to name
+/// a log group — or anything else — with.
+///
+/// Such a call is not addressed to one record: it is about the account's log groups as a
+/// whole, which is the resource IAM's own wildcard spells
+/// ([`crate::state::identity_authorization::ANY_RESOURCE`]) under this service's log-group
+/// ARN. A request that DOES carry members naming a log group is judged against the ARN those
+/// members build, with a segment left empty where the request named none (see the module
+/// docs) — which is a different resource, and the one a listing addresses.
+///
+/// SOURCE, for adding an entry: an operation whose modelled input declares no members,
+/// `smithy_query(query="operation", operation="<Operation>")`. Sorted, which
+/// [`addressed_by_no_member`] relies on for `binary_search`.
+pub const ADDRESSED_BY_NO_MEMBER: &[&str] = &["GetStorageTierPolicy"];
+
+/// Whether `operation` is addressed by no member of its request (see
+/// [`ADDRESSED_BY_NO_MEMBER`]).
+#[must_use]
+pub fn addressed_by_no_member(operation: &str) -> bool {
+    ADDRESSED_BY_NO_MEMBER.binary_search(&operation).is_ok()
+}
+
 /// The resource this request is judged against: what it ADDRESSES (see the module docs).
 ///
 /// Read off the request's own body, which on this protocol is the operation's input as
 /// JSON. A body that is not a JSON document at all addresses nothing of this service, so it
 /// is judged exactly as a request that named no log group.
-fn addressed_resource(ctx: &OperationContext<'_>, req: &RtRequest) -> String {
+fn addressed_resource(ctx: &OperationContext<'_>, operation: &str, req: &RtRequest) -> String {
+    let region = crate::state::request_region(ctx.parts());
+    if addressed_by_no_member(operation) {
+        return log_group_resource_wildcard(&region);
+    }
     let submitted: Option<::serde_json::Value> = req
         .body()
         .bytes()
         .and_then(|body| ::serde_json::from_slice(body).ok());
-    let region = crate::state::request_region(ctx.parts());
     addressed_in(submitted.as_ref(), &region)
 }
 
@@ -205,6 +234,21 @@ fn log_group_resource(region: &str, group: &str, stream: &str) -> String {
         crate::state::identity_authorization::ACTION_PREFIX,
         region,
         &format!("log-group:{group}:log-stream:{stream}"),
+    )
+}
+
+/// The resource ARN CloudWatch Logs names a call on EVERY log group of the account by: its
+/// log-group ARN carrying IAM's own wildcard
+/// ([`crate::state::identity_authorization::ANY_RESOURCE`]). See [`ADDRESSED_BY_NO_MEMBER`]
+/// for which calls those are.
+fn log_group_resource_wildcard(region: &str) -> String {
+    ::engine::emulator_arn(
+        crate::state::identity_authorization::ACTION_PREFIX,
+        region,
+        &format!(
+            "log-group:{}",
+            crate::state::identity_authorization::ANY_RESOURCE
+        ),
     )
 }
 
@@ -285,7 +329,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for IamAuthorized<Eng> {
                 ::aws_smithy_schema_server::rpc::routing_key_from_x_amz_target(req)
             {
                 if !decided_by_the_operation(operation) {
-                    let resource = addressed_resource(ctx, req);
+                    let resource = addressed_resource(ctx, operation, req);
                     if let Some(message) =
                         refusal(&*self.engine, ctx, operation, &resource)
                     {
@@ -413,6 +457,42 @@ mod tests {
             "case \"a body that is not a JSON document\": expected {expected:?}, got \
              {unreadable:?}"
         );
+    }
+
+    /// RULE: a request that carries no member at all is judged against every log group of the
+    /// account, spelled with IAM's wildcard — not against the ARN a request naming no group
+    /// builds, which is a different resource.
+    #[test]
+    fn a_request_with_no_member_is_judged_against_every_log_group() {
+        let mut sorted = ADDRESSED_BY_NO_MEMBER.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            ADDRESSED_BY_NO_MEMBER.to_vec(),
+            "the list is searched with binary_search, so it must stay sorted"
+        );
+        let account = ::engine::emulator_account_id();
+        let wildcard = format!("arn:aws:logs:{REGION}:{account}:log-group:*");
+        for operation in ADDRESSED_BY_NO_MEMBER {
+            let addressed = log_group_resource_wildcard(REGION);
+            assert_eq!(
+                addressed, wildcard,
+                "case {operation:?}: expected the account's log groups {wildcard:?}, got \
+                 {addressed:?}"
+            );
+            assert!(
+                addressed_by_no_member(operation),
+                "case {operation:?}: expected the gate to judge it against every log group"
+            );
+        }
+        // An operation whose request DOES carry members is judged against what they name,
+        // even when the client sent none of them.
+        for operation in ["DescribeLogGroups", "PutStorageTierPolicy", "GetLogEvents"] {
+            assert!(
+                !addressed_by_no_member(operation),
+                "case {operation:?}: expected the resource to be read off the request"
+            );
+        }
     }
 
     /// RULE: this gate judges every operation of the service except the ones whose own

@@ -237,13 +237,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Only log groups in the Standard log class support field index policies": a group
         // in any other class cannot carry one, and this operation models no error for an
         // operation invalid on a resource, so the identifier naming such a group is the
-        // parameter that is wrong.
+        // parameter that is wrong. What the refusal SAYS is this service's one sentence for a
+        // feature the class does not support
+        // ([`crate::state::LOG_CLASS_UNSUPPORTED_OPERATION_MESSAGE`]).
         if group.log_group_class != crate::state::INDEX_POLICY_LOG_GROUP_CLASS {
-            return Err(invalid(format!(
-                "a field index policy is supported only for a log group in the {} log class, and this log group is in the {} log class",
-                crate::state::INDEX_POLICY_LOG_GROUP_CLASS,
-                group.log_group_class
-            )));
+            return Err(invalid(
+                crate::state::LOG_CLASS_UNSUPPORTED_OPERATION_MESSAGE.to_string(),
+            ));
         }
 
         // "Creates or updates a field index policy for the specified log group": the put

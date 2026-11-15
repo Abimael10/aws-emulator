@@ -216,6 +216,14 @@ pub mod query_worker;
 /// is what the key's own key policy decides.
 pub mod kms_key_grant;
 
+/// Whether the key a STORED event was ingested under can still serve it, which is what
+/// decides whether a read is answered with that event or without it.
+pub mod event_key_access;
+
+/// Why the ENTITY a `PutLogEvents` request carried was rejected, when it was — the one
+/// thing of such a request that is answered without costing the batch anything.
+pub mod entity_rejection;
+
 /// Whether the KMS key a request names is a key at all: the form of the identifier, and
 /// whether KMS holds a key under it that log data can be encrypted with.
 pub mod kms_key_reference;
@@ -2622,6 +2630,16 @@ pub struct StoredEvent {
     pub masked_message: Option<String>,
     pub ingestion_time: i64,
     pub ingestion_seq: u64,
+    /// The customer managed key this event's log group was associated with when the event
+    /// ARRIVED, under which its stored data is encrypted
+    /// ([`event_key_access`]); `None` for an event ingested while the group had none, whose
+    /// data is held under the service's own key and is readable whatever any customer key is
+    /// in.
+    ///
+    /// Per EVENT rather than per group, because `AssociateKmsKey` re-keys nothing already
+    /// stored — "it does not affect any of the data that was already encrypted" — so a group
+    /// that has been associated with one key and then another holds events bound to each.
+    pub ingest_kms_key_id: Option<String>,
 }
 
 impl StoredEvent {

@@ -287,14 +287,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You can create transformers only for the log groups in the Standard log
         // class": a group in any other class cannot carry one, which is the operation
-        // being invalid on that resource rather than a parameter being wrong.
+        // being invalid on that resource rather than a parameter being wrong. What the
+        // refusal SAYS is this service's one sentence for a feature the class does not
+        // support ([`crate::state::LOG_CLASS_UNSUPPORTED_OPERATION_MESSAGE`]).
         if group.log_group_class != crate::state::TRANSFORMER_LOG_GROUP_CLASS {
             return Err(PutTransformerErrorModeled::InvalidOperationException(
                 InvalidOperationException {
-                    message: Some(format!(
-                        "a transformer can be created only for a log group in the {} log class, and this log group is in the {} log class",
-                        crate::state::TRANSFORMER_LOG_GROUP_CLASS, group.log_group_class
-                    )),
+                    message: Some(
+                        crate::state::LOG_CLASS_UNSUPPORTED_OPERATION_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());

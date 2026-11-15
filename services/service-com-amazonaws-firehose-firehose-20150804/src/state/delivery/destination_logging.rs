@@ -183,12 +183,19 @@ pub fn report_delivery_errors<Eng: Send + Sync + 'static>(
             .map(|group| store.data_protection_identifiers_for(group))
             .unwrap_or_default();
         let message = error_event(stream_arn, version_id, report);
+        // The customer managed key the destination group is associated with, under which the
+        // data it takes in is encrypted — by whichever path the events arrive.
+        let ingest_kms_key_id = store
+            .log_groups
+            .get(&report.logging.log_group)
+            .and_then(|group| group.kms_key_id.clone());
         let event = logs::StoredEvent {
             timestamp,
             masked_message: logs::data_protection::masked(&message, &data_identifiers),
             message,
             ingestion_time: now_ms,
             ingestion_seq: store.take_ingestion_seq(),
+            ingest_kms_key_id,
         };
         let added = event.stored_bytes();
         let group = store

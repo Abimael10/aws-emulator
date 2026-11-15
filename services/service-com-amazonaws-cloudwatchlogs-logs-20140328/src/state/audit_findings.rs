@@ -178,6 +178,12 @@ pub fn deliver(
         if !store.log_groups.contains_key(destination) {
             continue;
         }
+        // A finding is written INTO the destination group, so it is encrypted under the key
+        // that group is associated with — the destination's own, never the audited group's.
+        let destination_kms_key_id = store
+            .log_groups
+            .get(destination)
+            .and_then(|group| group.kms_key_id.clone());
         // The sequence numbers come from the store's one monotonic counter, so a finding is
         // ordered against every other event the store holds; they are taken before the
         // destination group is borrowed to write them.
@@ -189,6 +195,7 @@ pub fn deliver(
                 masked_message: None,
                 ingestion_time: audit_time_ms,
                 ingestion_seq: store.take_ingestion_seq(),
+                ingest_kms_key_id: destination_kms_key_id.clone(),
             })
             .collect();
         let added_bytes: i64 = events

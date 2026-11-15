@@ -341,7 +341,13 @@ fn rows() -> Vec<Row> {
                 "  Group:",
                 "    Type: AWS::Logs::LogGroup",
                 "    Properties:",
-                "      LogGroupClass: INFREQUENT_ACCESS",
+                // The group takes a METRIC FILTER below, and a metric filter is supported
+                // only on the Standard log class (`logs` refuses one on any other with
+                // "This operation is only supported on the Standard log class."), so this
+                // row leaves the class at its default. Which class a declaration APPLIES is
+                // covered where no filter is declared beside it
+                // (`core/router/tests/all/cloudformation_provisions_logs_log_groups.rs`).
+                "      RetentionInDays: 1",
                 "  First:",
                 "    Type: AWS::Logs::LogStream",
                 "    Properties:",
@@ -402,8 +408,8 @@ fn rows() -> Vec<Row> {
                     "dimensions": {"Stage": "$.stage"}
                 }]),
             )),
-            retention: None,
-            class: "INFREQUENT_ACCESS",
+            retention: Some(1),
+            class: "STANDARD",
             authorizer: (
                 "",
                 json!({

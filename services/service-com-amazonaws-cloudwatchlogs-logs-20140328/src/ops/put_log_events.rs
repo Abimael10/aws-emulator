@@ -377,17 +377,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
         ),
         PutLogEventsError,
     > {
-        // Two input members are deliberately accepted and not stored:
-        // * `sequenceToken` — the model states it "is now ignored in PutLogEvents
-        //   actions", which are "accepted and never return InvalidSequenceTokenException
-        //   or DataAlreadyAcceptedException even if the sequence token is not valid".
-        // * `entity` — the entity associated with the events. Nothing this emulator
-        //   serves can observe it: no implemented operation returns an entity, and the
-        //   operations that would (the application-signals surface) are still 501. It is
-        //   accepted without a `rejectedEntityInfo`, which the model reserves for a
-        //   REJECTED entity ("Only returned when the entity is rejected"), and storing it
-        //   belongs with the operation that reads it back.
-        let _ = (&input.sequence_token, &input.entity);
+        // One input member is deliberately accepted and not stored: `sequenceToken`, which
+        // the model states "is now ignored in PutLogEvents actions", which are "accepted and
+        // never return InvalidSequenceTokenException or DataAlreadyAcceptedException even if
+        // the sequence token is not valid".
+        let _ = &input.sequence_token;
+        // The request's `entity` is telemetry metadata about what produced the events rather
+        // than part of them, so it is READ here and never stored: an entity this service
+        // cannot read costs the batch nothing and is reported back as the rejection it is
+        // ([`crate::state::entity_rejection`]), and one it can read adds no member to the
+        // response. Storing it belongs with the operation that reads it back, and none of
+        // this service's does.
+        let rejected_entity_info = crate::state::entity_rejection::rejection(input.entity.as_ref());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PutLogEventsError::from(PutLogEventsErrorModeled::ServiceUnavailableException(
@@ -429,6 +430,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
             }
             Some(group) => group.retention_in_days,
         };
+        // The customer managed key this group is associated with RIGHT NOW, which is the key
+        // the events of this batch are encrypted under: `AssociateKmsKey` binds a key to the
+        // data a group takes in from then on and re-keys nothing already stored, so the
+        // binding belongs to each event this call stores
+        // ([`crate::state::event_key_access`]) rather than to the group.
+        let ingest_kms_key_id = store
+            .log_groups
+            .get(&input.log_group_name)
+            .and_then(|group| group.kms_key_id.clone());
         // Whether this group's Embedded Metric Format events publish metrics is a question
         // about the ACCOUNT's metric extraction policies and this group, answered here —
         // before anything is written — so the answer is the one that held when the batch
@@ -600,6 +610,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
                 message: event.message.clone(),
                 ingestion_time,
                 ingestion_seq,
+                ingest_kms_key_id: ingest_kms_key_id.clone(),
             });
         }
         let accepted_any = !batch.is_empty();
@@ -770,7 +781,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
             PutLogEventsOutput {
                 next_sequence_token: Some(next_sequence_token),
                 rejected_log_events_info,
-                rejected_entity_info: None,
+                rejected_entity_info,
             },
             deliveries,
         ))

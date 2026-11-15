@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_policies.rs"]
 mod account_policies;
+#[path = "all/account_policy_criteria_operators.rs"]
+mod account_policy_criteria_operators;
 #[path = "all/account_policy_release.rs"]
 mod account_policy_release;
 #[path = "all/account_policy_removal.rs"]
@@ -21,6 +23,8 @@ mod account_policy_removal;
 mod account_policy_selection_criteria;
 #[path = "all/anomaly_suppression.rs"]
 mod anomaly_suppression;
+#[path = "all/cmk_event_reads.rs"]
+mod cmk_event_reads;
 #[path = "all/cmk_group_delivery_byte_fidelity.rs"]
 mod cmk_group_delivery_byte_fidelity;
 #[path = "all/cmk_group_fan_out_isolation.rs"]
@@ -39,6 +43,8 @@ mod data_protection_masking;
 mod data_protection_policies;
 #[path = "all/data_protection_policy.rs"]
 mod data_protection_policy;
+#[path = "all/data_protection_policy_reads.rs"]
+mod data_protection_policy_reads;
 #[path = "all/deletion_protection.rs"]
 mod deletion_protection;
 #[path = "all/deliveries.rs"]
@@ -177,6 +183,8 @@ mod log_core_loop;
 mod log_fields;
 #[path = "all/log_group_auth_and_encryption.rs"]
 mod log_group_auth_and_encryption;
+#[path = "all/log_group_class_features.rs"]
+mod log_group_class_features;
 #[path = "all/log_group_fields.rs"]
 mod log_group_fields;
 #[path = "all/log_group_name_pattern_lists.rs"]
@@ -227,6 +235,8 @@ mod parameter_pair_refusals;
 mod policy_surface_refusals;
 #[path = "all/put_log_events_batch_constraints.rs"]
 mod put_log_events_batch_constraints;
+#[path = "all/put_log_events_entity.rs"]
+mod put_log_events_entity;
 #[path = "all/probe_scratch.rs"]
 mod probe_scratch;
 #[path = "all/query_and_stream_refusal_text.rs"]
@@ -299,6 +309,8 @@ mod scheduled_query_updates;
 mod scratch_queries;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/storage_tier_authorization.rs"]
+mod storage_tier_authorization;
 #[path = "all/storage_tier_policy.rs"]
 mod storage_tier_policy;
 #[path = "all/subscription_delivery_authorization.rs"]
