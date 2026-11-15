@@ -1,15 +1,41 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDataflowGraph
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDataflowGraph`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDataflowGraph::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Transforms a Python script into a directed acyclic graph. A Glue ETL script carries its
+//! OWN record of that graph in the annotation comments codegen writes above each node —
+//! `@type` (what the node does), `@args` (the node's properties, as the script spells them),
+//! `@return` (the name the node binds, which is its identifier in the graph) and `@inputs`
+//! (the frames the node reads, each under the parameter it is passed as). This operation
+//! reads those annotations back out: every annotated node answers one `CodeGenNode`, with
+//! its properties as name-value pairs and the line its own statement stands on, and every
+//! input answers one `CodeGenEdge` from the node it names to the node that reads it, under
+//! the parameter it is read as. A script annotating no node — and a request stating no
+//! script at all — describes no graph, so both lists come back empty.
+//!
+//! An argument's `Value` is the text the script spells it with, quotes and brackets
+//! included, so the graph carries exactly what the code carries and the code can be
+//! generated back from the graph. `Param` is set where that text is not a literal the script
+//! states outright but a reference it resolves (a job argument, a variable, an expression).
+//!
+//! Nothing is persisted and nothing is read out of the store: the graph is computed from the
+//! script alone, so two identical calls answer the same graph.
+//!
+//! A script whose annotations cannot describe a graph the model admits is refused with
+//! `InvalidInputException`: an annotated node carrying no `@return` has no identifier, a
+//! name `CodeGenIdentifier` does not admit cannot name a node or an end of an edge, a name
+//! bound twice is not "unique within the node's graph", and a node annotated with more
+//! properties than `CodeGenNodeArgs` admits does not fit one node of the answer.
+//!
+//! The annotations are read, never evaluated: an argument's value is carried as the text it
+//! is spelled with, and the only structure read out of that text is where one entry of an
+//! annotated list ends and the next begins. That reading is bounded — a script longer than
+//! [`MAX_SCRIPT_BYTES`] and an annotation nesting brackets deeper than
+//! [`MAX_ANNOTATION_NESTING`] are refused, and nothing here recurses on anything the caller
+//! controls — so a malformed, truncated or oversized script is answered rather than read
+//! without end.
 //!
 //! ## Shape of an operation
 //!
@@ -69,6 +95,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::std::collections::HashSet;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -101,6 +129,385 @@ impl From<GetDataflowGraphErrorModeled> for GetDataflowGraphError {
     fn from(modeled: GetDataflowGraphErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The annotation naming what a node does, which is also what OPENS a node's annotations:
+/// everything annotated after it, until the next one, belongs to that node.
+const TYPE_ANNOTATION: &str = "type";
+
+/// The annotation carrying the node's properties.
+const ARGS_ANNOTATION: &str = "args";
+
+/// The annotation naming the node: the name its statement binds, which is its identifier in
+/// the graph.
+const RETURN_ANNOTATION: &str = "return";
+
+/// The annotation naming the frames the node reads.
+const INPUTS_ANNOTATION: &str = "inputs";
+
+/// The most properties one node of the answer may carry: `CodeGenNode$Args` is a list of
+/// length 0..50 (`smithy_query shape=CodeGenNode`).
+pub const MAX_NODE_ARGS: usize = 50;
+
+/// The longest a node's name may be: `CodeGenIdentifier` is a string of length 1..255
+/// (`smithy_query shape=CodeGenIdentifier`).
+pub const MAX_IDENTIFIER_LENGTH: usize = 255;
+
+/// The longest script this operation reads, in bytes. The model bounds `PythonScript`
+/// not at all, so the bound is this emulator's own — a property of the REQUEST, answered
+/// before the script is read, like the request-size bounds `GetPlan` enforces for itself.
+pub const MAX_SCRIPT_BYTES: usize = 1 << 20;
+
+/// The deepest the brackets of one annotation may nest. Glue codegen nests them two or
+/// three deep at most (a list of tuples, a dict of lists), and this operation reads the
+/// nesting without ever recursing on it; the bound is this emulator's own, so caller-
+/// controlled nesting is refused rather than read.
+pub const MAX_ANNOTATION_NESTING: usize = 32;
+
+/// This operation's modelled client refusal, carrying `message`.
+fn invalid_input(message: String) -> GetDataflowGraphError {
+    GetDataflowGraphErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
+}
+
+/// Whether `name` is a name the graph may carry: `CodeGenIdentifier` admits 1 to
+/// [`MAX_IDENTIFIER_LENGTH`] characters matching `^[A-Za-z_][A-Za-z0-9_]*$`
+/// (`smithy_query shape=CodeGenIdentifier`), which is also what a Python script can bind a
+/// frame to.
+fn names_a_node(name: &str) -> bool {
+    let mut characters = name.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    name.chars().count() <= MAX_IDENTIFIER_LENGTH
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// The annotation one line of the script carries, as its name and the text after its colon.
+/// Glue codegen writes them as Python comments (`## @type: DataSource`); a comment opened
+/// with any run of `#`, at any indentation, carries the same annotation, because what names
+/// it is the `@name:` and not the spelling of the comment it rides in.
+fn annotation(line: &str) -> Option<(&str, &str)> {
+    let comment = line.trim_start().strip_prefix('#')?.trim_start_matches('#');
+    let text = comment.trim_start().strip_prefix('@')?;
+    let (name, value) = text.split_once(':')?;
+    let name = name.trim_end();
+    if name.is_empty() || name.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some((name, value.trim()))
+}
+
+/// Whether a line of the script is a comment, so it is the annotations of a node and never
+/// the statement they describe.
+fn is_comment(line: &str) -> bool {
+    line.trim_start().starts_with('#')
+}
+
+/// How far into brackets and quotes a scan of annotated text stands. ONE scanner, read by
+/// both splits below, so the two of them read a quoted string and a bracket the same way:
+/// the text an annotation carries is Python source, where a separator inside a string, a
+/// tuple, a list or a dict separates nothing.
+#[derive(Debug, Default)]
+struct Scan {
+    depth: usize,
+    quote: Option<char>,
+    escaped: bool,
+}
+
+impl Scan {
+    /// Read one character and answer whether it stands at the TOP level of the text —
+    /// outside every quote and bracket, which is where a separator separates.
+    fn step(&mut self, character: char) -> bool {
+        if let Some(opened) = self.quote {
+            if self.escaped {
+                self.escaped = false;
+            } else if character == '\\' {
+                self.escaped = true;
+            } else if character == opened {
+                self.quote = None;
+            }
+            return false;
+        }
+        match character {
+            '"' | '\'' => {
+                self.quote = Some(character);
+                false
+            }
+            '(' | '[' | '{' => {
+                self.depth += 1;
+                false
+            }
+            ')' | ']' | '}' => {
+                self.depth = self.depth.saturating_sub(1);
+                false
+            }
+            _ => self.depth == 0,
+        }
+    }
+}
+
+/// The text of an annotated list without the brackets Glue codegen wraps the list in: they
+/// are the list's own and part of no entry of it.
+fn unwrapped(list: &str) -> &str {
+    let text = list.trim();
+    text.strip_prefix('[')
+        .map_or(text, |rest| rest.strip_suffix(']').unwrap_or(rest))
+}
+
+/// The deepest the brackets of an annotated list's entries nest, outside every quoted
+/// string.
+fn nesting(annotated: &str) -> usize {
+    let mut scan = Scan::default();
+    let mut deepest = 0usize;
+    for character in unwrapped(annotated).chars() {
+        scan.step(character);
+        deepest = deepest.max(scan.depth);
+    }
+    deepest
+}
+
+/// The entries of an annotated list, split on the commas that separate them. The brackets
+/// Glue codegen wraps the list in are not part of any entry, and an empty entry — a list
+/// annotated as `[]`, or a trailing comma — contributes none.
+fn entries(list: &str) -> Vec<&str> {
+    let text = unwrapped(list);
+    let mut split: Vec<&str> = Vec::new();
+    let mut scan = Scan::default();
+    let mut start = 0usize;
+    for (at, character) in text.char_indices() {
+        if scan.step(character) && character == ',' {
+            split.push(&text[start..at]);
+            start = at + character.len_utf8();
+        }
+    }
+    split.push(&text[start..]);
+    split
+        .into_iter()
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+/// Whether the `=` at `at` is the one binding a name to a value, rather than a character of
+/// a comparison an argument's value is written with.
+fn binds(entry: &str, at: usize) -> bool {
+    let bytes = entry.as_bytes();
+    let before = at.checked_sub(1).map(|previous| bytes[previous]);
+    !before.is_some_and(|byte| matches!(byte, b'=' | b'!' | b'<' | b'>'))
+        && bytes.get(at + 1) != Some(&b'=')
+}
+
+/// The name and the value an entry of an annotated list spells, `name = value`, split on the
+/// `=` that binds them — the one outside every quote and bracket. An entry spelling no name
+/// binds none, which is how a frame can be named positionally.
+fn named(entry: &str) -> Option<(&str, &str)> {
+    let mut scan = Scan::default();
+    for (at, character) in entry.char_indices() {
+        if scan.step(character) && character == '=' && binds(entry, at) {
+            let (name, value) = entry.split_at(at);
+            return Some((name.trim(), value[character.len_utf8()..].trim()));
+        }
+    }
+    None
+}
+
+/// Whether the text an argument's value is spelled with is a literal the script states
+/// outright, rather than a reference the script resolves. `CodeGenNodeArg$Param` is "true if
+/// the value is used as a parameter", which is what a value that is NOT a literal is: the
+/// node takes whatever the name, job argument or expression the script spells stands for.
+fn is_literal(value: &str) -> bool {
+    let Some(first) = value.chars().next() else {
+        return true;
+    };
+    first.is_ascii_digit()
+        || matches!(first, '"' | '\'' | '[' | '{' | '(' | '-' | '+' | '.')
+        || matches!(value, "True" | "False" | "None")
+}
+
+/// One node as the script annotates it, before it is read as a node of the graph.
+#[derive(Debug, Default)]
+struct Annotated<'script> {
+    /// The `@type` the node is annotated with.
+    node_type: &'script str,
+    /// The 1-based line that `@type` stands on.
+    annotated_at: usize,
+    /// The text of the `@args`, `@return` and `@inputs` annotations, as spelled.
+    args: &'script str,
+    returns: Option<&'script str>,
+    inputs: &'script str,
+    /// The 1-based line the node's own statement stands on: the first line under its
+    /// annotations that is neither blank nor a comment.
+    statement_at: Option<usize>,
+}
+
+impl Annotated<'_> {
+    /// The line of the script the node stands on: the line of its statement, and — for a
+    /// node the script annotates without a statement of its own — the line it is annotated
+    /// on.
+    fn line(&self) -> usize {
+        self.statement_at.unwrap_or(self.annotated_at)
+    }
+}
+
+/// The nodes a script annotates, in the order it annotates them: a `@type` opens a node, the
+/// annotations under it describe that node, and the first line of code under them is its
+/// statement.
+fn annotated(script: &str) -> Vec<Annotated<'_>> {
+    let mut nodes: Vec<Annotated<'_>> = Vec::new();
+    for (index, line) in script.lines().enumerate() {
+        let at = index + 1;
+        if let Some((name, value)) = annotation(line) {
+            if name == TYPE_ANNOTATION {
+                nodes.push(Annotated {
+                    node_type: value,
+                    annotated_at: at,
+                    ..Annotated::default()
+                });
+                continue;
+            }
+            let Some(node) = nodes.last_mut() else {
+                continue;
+            };
+            match name {
+                ARGS_ANNOTATION => node.args = value,
+                RETURN_ANNOTATION => node.returns = Some(value),
+                INPUTS_ANNOTATION => node.inputs = value,
+                // An annotation this operation reads nothing from describes no part of the
+                // graph, so it is left where it stands.
+                _ => {}
+            }
+            continue;
+        }
+        if line.trim().is_empty() || is_comment(line) {
+            continue;
+        }
+        if let Some(node) = nodes.last_mut() {
+            // The FIRST statement under a node's annotations is that node's; what follows it
+            // is code the annotations do not describe.
+            if node.statement_at.is_none() {
+                node.statement_at = Some(at);
+            }
+        }
+    }
+    nodes
+}
+
+/// The refusal for a node the script annotates without naming it.
+fn unnamed_node_message(node_type: &str, line: usize) -> String {
+    format!("the node annotated @type: {node_type} at line {line} carries no @return naming it")
+}
+
+/// The refusal for a name no node of a graph may carry.
+fn not_an_identifier_message(name: &str, line: usize) -> String {
+    format!("{name} at line {line} is not a node identifier a dataflow graph may carry")
+}
+
+/// The refusal for a name the script binds twice: a node's identifier is "unique within the
+/// node's graph" (`CodeGenNode$Id`).
+fn duplicate_node_message(name: &str, line: usize) -> String {
+    format!("{name} at line {line} names a node the script already names")
+}
+
+/// The refusal for a node annotated with more properties than one node may carry.
+fn args_limit_message(name: &str, carried: usize) -> String {
+    format!(
+        "node {name} is annotated with {carried} arguments, more than the {MAX_NODE_ARGS} \
+         arguments one node may carry"
+    )
+}
+
+/// The refusal for a script longer than this operation reads.
+fn script_limit_message(carried: usize) -> String {
+    format!(
+        "the script carries {carried} bytes, more than the {MAX_SCRIPT_BYTES} bytes one script \
+         may carry"
+    )
+}
+
+/// The refusal for an annotation nesting brackets deeper than one node's annotations may.
+fn nesting_limit_message(name: &str, deepest: usize) -> String {
+    format!(
+        "the annotations of node {name} nest brackets {deepest} deep, more than the \
+         {MAX_ANNOTATION_NESTING} levels one node's annotations may nest"
+    )
+}
+
+/// The properties one node's `@args` annotation spells, in the order it spells them: each
+/// entry's name, the text its value is spelled with, and whether that text is a reference
+/// the script resolves rather than a literal.
+fn arguments(annotated: &str) -> Vec<CodeGenNodeArg> {
+    entries(annotated)
+        .into_iter()
+        .filter_map(named)
+        .map(|(name, value)| CodeGenNodeArg {
+            name: name.to_string(),
+            value: value.to_string(),
+            param: !is_literal(value),
+        })
+        .collect()
+}
+
+/// The graph a script describes: one node per annotated node, and one edge per frame a node
+/// reads, from the node that binds that frame to the node reading it, under the parameter it
+/// is read as.
+fn graph(script: &str) -> Result<(Vec<CodeGenNode>, Vec<CodeGenEdge>), GetDataflowGraphError> {
+    let mut nodes: Vec<CodeGenNode> = Vec::new();
+    let mut edges: Vec<CodeGenEdge> = Vec::new();
+    let mut named_already: HashSet<&str> = HashSet::new();
+
+    for node in annotated(script) {
+        let line = node.line();
+        let Some(id) = node.returns else {
+            return Err(invalid_input(unnamed_node_message(node.node_type, line)));
+        };
+        if !names_a_node(id) {
+            return Err(invalid_input(not_an_identifier_message(id, line)));
+        }
+        if !named_already.insert(id) {
+            return Err(invalid_input(duplicate_node_message(id, line)));
+        }
+        let deepest = nesting(node.args).max(nesting(node.inputs));
+        if deepest > MAX_ANNOTATION_NESTING {
+            return Err(invalid_input(nesting_limit_message(id, deepest)));
+        }
+        let args = arguments(node.args);
+        if args.len() > MAX_NODE_ARGS {
+            return Err(invalid_input(args_limit_message(id, args.len())));
+        }
+
+        for input in entries(node.inputs) {
+            let (parameter, source) = match named(input) {
+                Some((parameter, source)) => (Some(parameter.to_string()), source),
+                None => (None, input),
+            };
+            if !names_a_node(source) {
+                return Err(invalid_input(not_an_identifier_message(source, line)));
+            }
+            edges.push(CodeGenEdge {
+                source: source.to_string(),
+                target: id.to_string(),
+                target_parameter: parameter,
+            });
+        }
+
+        nodes.push(CodeGenNode {
+            id: id.to_string(),
+            node_type: node.node_type.to_string(),
+            args,
+            // A script longer than the modelled integer can count lines of still answers
+            // every node it annotates; only the line of a node past that count is clamped.
+            line_number: i32::try_from(line).unwrap_or(i32::MAX),
+        });
+    }
+
+    Ok((nodes, edges))
 }
 
 /// The `GetDataflowGraph` operation.
@@ -139,18 +546,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDataflowGraph` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDataflowGraphErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDataflowGraph"))
+        // The graph is computed from the script the request carries and from nothing else:
+        // this operation reads no resource of the catalog and persists nothing, so neither
+        // the store behind the engine nor anything `ctx` carries is read.
+        let _ = (ctx, &self.engine);
+        // A request stating no script states no graph, which is the empty one rather than a
+        // refusal: `PythonScript` is not a required member of the request
+        // (`smithy_query operation=GetDataflowGraph`).
+        let script = input.python_script.as_deref().unwrap_or_default();
+        // The size of the script is a property of the request, so it is answered before the
+        // script is read and before the graph allocates anything.
+        if script.len() > MAX_SCRIPT_BYTES {
+            return Err(invalid_input(script_limit_message(script.len())));
+        }
+        let (dag_nodes, dag_edges) = graph(script)?;
+        // Both lists are always reported, so a caller reading a script that annotates no
+        // node is served an empty graph rather than an answer missing its members.
+        Ok(GetDataflowGraphOutput {
+            dag_nodes: Some(dag_nodes),
+            dag_edges: Some(dag_edges),
+        })
     }
 }

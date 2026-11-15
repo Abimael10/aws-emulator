@@ -1322,3 +1322,14 @@ mod zz_probe_whole_emulator;
 // crate's own, is stated in that suite's OWN module doc, beside the test it explains.
 // (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` above each `mod` is
 // what points the declaration into `tests/all/`.
+// Single integration-test target for the router: one `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair per suite, sorted by name, and no other line. A suite no pair names
+// compiles nowhere and its tests never run; a second pair for one name is `E0428`; and an
+// inner doc comment (`//!`) past the first item is `E0753` — each of which fails every
+// suite in this target. `all/all_rs_is_a_canonical_declaration_list.rs`,
+// `all/all_rs_declares_each_suite_once.rs` and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` pin those three rules, so what
+// a suite covers, and why it lives in this target rather than in one service crate,
+// belongs in that suite's own module header rather than here. Every comment in this file
+// is an ordinary one, this block included: with no inner doc comment anywhere, no merge of
+// two landings can leave one past the first item.
