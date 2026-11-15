@@ -135,6 +135,8 @@ mod history_event_provenance;
 mod http_task_endpoint;
 #[path = "all/identity_policy_authorization.rs"]
 mod identity_policy_authorization;
+#[path = "all/in_function_identity_authorization.rs"]
+mod in_function_identity_authorization;
 #[path = "all/integration_failure_error_names.rs"]
 mod integration_failure_error_names;
 #[path = "all/integration_family_error_names.rs"]
