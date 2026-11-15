@@ -244,6 +244,70 @@ impl SerializableStruct for BadRequestException {
     }
 }
 
+/// The `message` member of the synthetic `NotFoundException` error shape.
+///
+/// Spelled the way the two synthetic shapes above spell theirs: lowercase
+/// `message` on the JSON protocols, `Message` in the XML envelopes, so the prose
+/// renders wherever the class is answered.
+static NOT_FOUND_EXCEPTION_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#NotFoundException$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `NotFoundException` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as the shapes above:
+/// the shape is in no service model, so it must not collide with a modeled one.
+/// The wire `__type` and the `x-amzn-errortype` header come from
+/// [`OperationError::shape_name`] below.
+pub static NOT_FOUND_EXCEPTION_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#NotFoundException",
+        "smithy.framework",
+        "NotFoundException",
+    ),
+    ShapeType::Structure,
+    &[&NOT_FOUND_EXCEPTION_MESSAGE],
+);
+
+/// The payload of a `NotFoundException`: that the resource the request addressed
+/// does not exist.
+#[derive(Debug, Clone)]
+pub struct NotFoundException {
+    pub message: String,
+}
+
+impl NotFoundException {
+    /// A `NotFoundException` carrying `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for NotFoundException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NotFoundException: {}", self.message)
+    }
+}
+
+impl std::error::Error for NotFoundException {}
+
+impl SerializableStruct for NotFoundException {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&NOT_FOUND_EXCEPTION_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -273,6 +337,18 @@ pub enum Scaffolded<E> {
     /// states a rule of the addressed resource — which is what lets a client tell
     /// the two apart from the error type alone.
     BadRequestException(BadRequestException),
+    /// The resource the request addressed does not exist, reported in the class
+    /// the emulated service answers for THAT lookup rather than in a modeled
+    /// error of the operation: HTTP 404 under the error type
+    /// `NotFoundException`, with the reason in a lowercase `message` member.
+    ///
+    /// Distinct from a modeled not-found error on purpose. Where a service
+    /// classifies the resolution of one kind of identifier apart from the
+    /// not-found error its id-addressed operations state, a client branching on
+    /// the error type alone tells the two resolutions apart — so the
+    /// classification is observable and belongs to the lookup path, not to the
+    /// operation.
+    NotFoundException(NotFoundException),
 }
 
 impl<E> Scaffolded<E> {
@@ -309,6 +385,17 @@ impl<E> Scaffolded<E> {
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::BadRequestException(BadRequestException::new(message))
     }
+
+    /// Refuse the request because the resource it addresses does not exist, with
+    /// HTTP 404 `NotFoundException`.
+    ///
+    /// Reach for this only where the emulated service answers THAT class for the
+    /// lookup in question. A resolution the service states in one of the
+    /// operation's modeled not-found errors belongs in that modeled error
+    /// instead, with every member it declares.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::NotFoundException(NotFoundException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -318,6 +405,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::BadRequestException(e) => write!(f, "{e}"),
+            Self::NotFoundException(e) => write!(f, "{e}"),
         }
     }
 }
@@ -331,6 +419,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
             Self::BadRequestException(e) => e.source(),
+            Self::NotFoundException(e) => e.source(),
         }
     }
 }
@@ -346,6 +435,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
             Self::BadRequestException(e) => e,
+            Self::NotFoundException(e) => e,
         }
     }
 
@@ -355,6 +445,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::BadRequestException(_) => &BAD_REQUEST_EXCEPTION_SCHEMA,
+            Self::NotFoundException(_) => &NOT_FOUND_EXCEPTION_SCHEMA,
         }
     }
 
@@ -368,6 +459,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
             Self::BadRequestException(_) => "BadRequestException",
+            Self::NotFoundException(_) => "NotFoundException",
         }
     }
 
@@ -382,6 +474,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_) => 400,
             // The status the refusal class carries wherever AWS answers it.
             Self::BadRequestException(_) => 400,
+            // The status of a resource that does not exist.
+            Self::NotFoundException(_) => 404,
         }
     }
 
@@ -395,6 +489,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
             Self::BadRequestException(_) => None,
+            Self::NotFoundException(_) => None,
         }
     }
 }

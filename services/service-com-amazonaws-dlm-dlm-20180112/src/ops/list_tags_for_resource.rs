@@ -144,9 +144,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this request was signed for.
         let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
-        let policy = store
-            .policy_by_arn(&region, &input.resource_arn)
-            .map_err(ListTagsForResourceErrorModeled::ResourceNotFoundException)?;
+        // An ARN that names no policy is the refusal the ARN-addressed lookup
+        // answers (`crate::state::arn_resource_not_found`), not one of this
+        // operation's modeled errors.
+        let policy = store.policy_by_arn(&region, &input.resource_arn)?;
 
         Ok(ListTagsForResourceOutput {
             tags: policy.wire_tags(),

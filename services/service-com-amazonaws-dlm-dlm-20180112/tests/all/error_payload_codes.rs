@@ -6,19 +6,24 @@
 //! One rule, asserted over every error class this service can answer rather than
 //! the one payload an issue cited:
 //!
-//! > Every error this service answers reports each member its shape declares,
-//! > and the `Code` member reports the error code of that exception CLASS — the
-//! > member a client branches on beside the shape name. It is reported whichever
-//! > class the error belongs to and whichever operation answers it: a client that
-//! > reads `$.Code` never gets `null`.
+//! > Every MODELLED error this service answers reports each member its shape
+//! > declares, and the `Code` member reports the error code of that exception
+//! > CLASS — the member a client branches on beside the shape name. It is
+//! > reported whichever class the error belongs to and whichever operation
+//! > answers it: a client that reads `$.Code` never gets `null`.
 //!
-//! The four error shapes the service answers are `InvalidRequestException` (400),
+//! The four error shapes the MODEL declares are `InvalidRequestException` (400),
 //! `ResourceNotFoundException` (404), `LimitExceededException` (429) and the
 //! service-common `InternalServerException` (500)
 //! (`smithy_query(query="digest")`), and the model declares `Code` on all four
 //! (`smithy_query(query="shape", shape="LimitExceededException")`: `Message`,
 //! `Code`, `ResourceType`; `smithy_query(query="shape",
 //! shape="InternalServerException")`: `Message`, `Code`).
+//!
+//! The two refusal classes the service answers that the model does NOT declare —
+//! the malformed-input one and the one the ARN-addressed lookup answers — carry a
+//! lowercase `message` and no `Code` at all; they are the subject of
+//! `reserved_tag_key_refusal_class` and `arn_not_found_refusal_class`.
 //!
 //! The rows differ along the class, the operation answering it, the HTTP method
 //! and the shape of the request that provokes it — and, for the 429, along where
@@ -291,10 +296,9 @@ async fn the_client_error_classes_report_their_code() {
     );
     let policy_id = created.policy_id();
 
-    // A policy id, and an ARN, the store resolves to nothing: the far end of the
-    // id space, which the store mints from `policy-0000000000000001` upwards.
+    // A policy id the store resolves to nothing: the far end of the id space,
+    // which the store mints from `policy-0000000000000001` upwards.
     let missing_id = "policy-0fffffffffffffff";
-    let missing_arn = policy_arn(REGION, missing_id);
 
     let rows = vec![
         Refusal {
@@ -388,36 +392,28 @@ async fn the_client_error_classes_report_their_code() {
         },
         Refusal {
             call: Call {
-                case: "ListTagsForResource for an ARN that resolves to nothing",
+                case: "ListTagsForResource with a ResourceArn outside its @pattern",
                 method: "GET",
-                uri: tags_uri(&missing_arn),
+                uri: tags_uri(&policy_arn(REGION, "policy.not-an-id")),
                 body: None,
             },
-            shape: RESOURCE_NOT_FOUND_EXCEPTION,
-            status: RESOURCE_NOT_FOUND_STATUS,
-            code: RESOURCE_NOT_FOUND_CODE,
+            shape: INVALID_REQUEST_EXCEPTION,
+            status: INVALID_REQUEST_STATUS,
+            code: INVALID_PARAMETER_CODE,
         },
         Refusal {
             call: Call {
-                case: "TagResource for an ARN that resolves to nothing",
-                method: "POST",
-                uri: tags_uri(&missing_arn),
-                body: Some(json!({"Tags": {"owner": "team"}})),
-            },
-            shape: RESOURCE_NOT_FOUND_EXCEPTION,
-            status: RESOURCE_NOT_FOUND_STATUS,
-            code: RESOURCE_NOT_FOUND_CODE,
-        },
-        Refusal {
-            call: Call {
-                case: "UntagResource for an ARN that resolves to nothing",
+                case: "UntagResource with a ResourceArn outside its @pattern",
                 method: "DELETE",
-                uri: format!("{}?tagKeys=owner", tags_uri(&missing_arn)),
+                uri: format!(
+                    "{}?tagKeys=owner",
+                    tags_uri(&policy_arn(REGION, "policy.not-an-id"))
+                ),
                 body: None,
             },
-            shape: RESOURCE_NOT_FOUND_EXCEPTION,
-            status: RESOURCE_NOT_FOUND_STATUS,
-            code: RESOURCE_NOT_FOUND_CODE,
+            shape: INVALID_REQUEST_EXCEPTION,
+            status: INVALID_REQUEST_STATUS,
+            code: INVALID_PARAMETER_CODE,
         },
     ];
 

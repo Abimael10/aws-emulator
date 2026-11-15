@@ -1083,29 +1083,34 @@ impl ComAmazonawsDlmDlm20180112State {
     /// policy whose STORED `PolicyArn` it equals, among the policies of the
     /// region the request was signed for — no index is kept for it, because the
     /// ARN is derived from the id and the store is small — and an ARN that names
-    /// none is a [`policy_not_found_by_arn`]. A stored ARN names the region its
+    /// none is an [`arn_resource_not_found`]. A stored ARN names the region its
     /// policy lives in, so an ARN naming another region resolves to no policy
     /// here.
-    pub fn policy_by_arn(
+    ///
+    /// Generic over the calling operation's modeled error enum, because the
+    /// refusal this lookup answers is NOT one of them: every ARN-addressed
+    /// operation reports the same class, status and prose for an ARN that names
+    /// nothing, so each handler lifts this error with `?` and adds nothing.
+    pub fn policy_by_arn<Modeled>(
         &self,
         region: &str,
         arn: &str,
-    ) -> Result<&LifecyclePolicyRecord, ResourceNotFoundException> {
+    ) -> Result<&LifecyclePolicyRecord, crate::scaffolded::Scaffolded<Modeled>> {
         self.policies_in(region)
             .and_then(|policies| policies.values().find(|policy| policy.policy_arn == arn))
-            .ok_or_else(|| policy_not_found_by_arn(arn))
+            .ok_or_else(arn_resource_not_found)
     }
 
     /// The same rule, mutably, for the ARN-addressed operations that write.
-    pub fn policy_mut_by_arn(
+    pub fn policy_mut_by_arn<Modeled>(
         &mut self,
         region: &str,
         arn: &str,
-    ) -> Result<&mut LifecyclePolicyRecord, ResourceNotFoundException> {
+    ) -> Result<&mut LifecyclePolicyRecord, crate::scaffolded::Scaffolded<Modeled>> {
         self.regions
             .get_mut(region)
             .and_then(|policies| policies.values_mut().find(|policy| policy.policy_arn == arn))
-            .ok_or_else(|| policy_not_found_by_arn(arn))
+            .ok_or_else(arn_resource_not_found)
     }
 }
 
@@ -1140,17 +1145,28 @@ pub fn policies_not_found(ids: &[String]) -> ResourceNotFoundException {
     }
 }
 
-/// The `ResourceNotFoundException` payload for an ARN that names no policy.
-pub fn policy_not_found_by_arn(arn: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!("The resource {{{arn}}} was not found.")),
-        code: Some(RESOURCE_NOT_FOUND_CODE.to_string()),
-        resource_type: Some(POLICY_RESOURCE_TYPE.to_string()),
-        // `ResourceIds` is "a list of resource IDs that were not found", and the
-        // request named an ARN rather than an id that could be echoed here.
-        resource_ids: None,
-    }
+/// How this service refuses an operation that addresses a resource by its ARN
+/// when that ARN names no resource, as the whole error channel of the operation
+/// that refuses it.
+///
+/// Amazon Data Lifecycle Manager classifies the ARN-addressed lookup apart from
+/// the `ResourceNotFoundException` its `PolicyId`-addressed operations state: the
+/// answer is HTTP 404 under the error type `NotFoundException`, carrying
+/// [`ARN_RESOURCE_NOT_FOUND_MESSAGE`] in the lowercase `message` member that
+/// class declares. The prose is fixed — it names neither the ARN asked for nor
+/// anything else of the request — and the class declares none of the members the
+/// modeled error does, so a client branching on the error type tells the two
+/// lookups apart.
+///
+/// Generic over the operation's modeled error enum, so every ARN-addressed
+/// operation refuses an unresolvable ARN with the same class, status and prose.
+pub fn arn_resource_not_found<Modeled>() -> crate::scaffolded::Scaffolded<Modeled> {
+    crate::scaffolded::Scaffolded::not_found(ARN_RESOURCE_NOT_FOUND_MESSAGE)
 }
+
+/// How Amazon Data Lifecycle Manager states that an ARN names no resource. The
+/// text is fixed: nothing of the request or of the store appears in it.
+pub const ARN_RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
 
 /// The `InternalServerException` payload for a request that reached a handler
 /// holding no store to serve it from — the ONE 500 this service answers, so

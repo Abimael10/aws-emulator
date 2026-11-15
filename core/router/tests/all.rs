@@ -2484,3 +2484,6 @@ mod declaration_roots_are_canonical_and_complete;
 //! duplicate, re-word or mistype — and what a suite covers, and why it drives the assembled
 //! router rather than one service crate, belongs in that suite's own module header.
 //! `all/all_rs_is_a_canonical_declaration_list.rs` pin that shape; the notes earlier landings
+// Concurrent landings had appended their own copies of this header to the file, and the
+// doc list items among them wrap without the indentation `clippy::doc_lazy_continuation`
+// asks for; the lint is allowed here so the header is a header rather than a build failure.

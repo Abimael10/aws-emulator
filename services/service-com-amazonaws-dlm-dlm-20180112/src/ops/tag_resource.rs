@@ -155,9 +155,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ResourceArn` is a `PolicyArn`, so the resource it names is the policy
         // whose STORED `PolicyArn` it equals — not one derived from the request —
         // among the policies of the region this request was signed for.
-        let policy = store
-            .policy_mut_by_arn(&region, &input.resource_arn)
-            .map_err(TagResourceErrorModeled::ResourceNotFoundException)?;
+        // An ARN that names no policy is the refusal the ARN-addressed lookup
+        // answers (`crate::state::arn_resource_not_found`), which is not one of
+        // this operation's modeled errors, so it is lifted as it stands.
+        let policy = store.policy_mut_by_arn(&region, &input.resource_arn)?;
 
         // Adding a tag whose key is already held replaces that tag's value.
         for (key, value) in input.tags {

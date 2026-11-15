@@ -4,13 +4,16 @@
 //!
 //! The rule under test: an operation that addresses a resource by `ResourceArn`
 //! acts on the policy whose STORED `PolicyArn` equals that ARN, among the
-//! policies of the region the request was signed for, and answers
-//! `ResourceNotFoundException` (HTTP 404) — with the exception's `Code`, the
-//! `ResourceType` token of the resource that was not found, and a message naming
-//! the ARN that resolved to nothing — for an ARN that names none. The three
-//! operations bound to `/tags/{ResourceArn}` (`ListTagsForResource`,
-//! `TagResource`, `UntagResource`) share that one resolution, so each row is
-//! driven through all three.
+//! policies of the region the request was signed for, and answers the
+//! ARN-addressed lookup's own refusal — HTTP 404 under the error type
+//! `NotFoundException`, stating `Resource was not found` — for an ARN that names
+//! none. The three operations bound to `/tags/{ResourceArn}`
+//! (`ListTagsForResource`, `TagResource`, `UntagResource`) share that one
+//! resolution, so each row is driven through all three.
+//!
+//! The class of that refusal is the subject of
+//! `arn_not_found_refusal_class`; here it is asserted alongside WHICH ARNs
+//! resolve to nothing and which policy a resolvable one reaches.
 //!
 //! Every assertion goes through the router, so each case exercises routing,
 //! deserialization, the handler, the persisted state and serialization.
@@ -30,15 +33,13 @@ const REGION: &str = "us-east-1";
 /// Another region, used for the rows about an ARN that names a policy elsewhere.
 const OTHER_REGION: &str = "eu-west-1";
 
-/// The modelled refusal for a resource that was not found, and its status
-/// (`ResourceNotFoundException (HTTP 404)`, from the crate's `OPERATIONS.md`
-/// error list for each tag operation).
-const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
-const RESOURCE_NOT_FOUND_STATUS: u16 = 404;
-/// The members that refusal carries, spelled out here rather than read from the
-/// crate so a wrong constant cannot make this test pass.
-const RESOURCE_NOT_FOUND_CODE: &str = "ResourceNotFound";
-const POLICY_RESOURCE_TYPE: &str = "LIFECYCLE_POLICY";
+/// The refusal an ARN that names no resource gets, its status and its whole
+/// payload — spelled out here rather than read from the crate so a wrong
+/// constant cannot make this test pass. The prose is fixed: no part of the
+/// request appears in it.
+const NOT_FOUND_EXCEPTION: &str = "NotFoundException";
+const NOT_FOUND_STATUS: u16 = 404;
+const NOT_FOUND_MESSAGE: &str = "Resource was not found";
 
 /// The status `TagResource` answers (a body-less write).
 const TAG_RESOURCE_STATUS: u16 = 204;
@@ -191,8 +192,7 @@ fn tag_operations(arn: &str) -> Vec<(&'static str, &'static str, String, Option<
 }
 
 /// RULE — an ARN that names no policy in the calling region is refused the same
-/// way by every operation that addresses a resource by ARN, and the refusal
-/// names that ARN.
+/// way by every operation that addresses a resource by ARN.
 ///
 /// The rows differ along WHY the ARN resolves to nothing: the policy lives in
 /// another region, the id was never minted, the policy was created and deleted,
@@ -248,37 +248,20 @@ async fn an_arn_naming_no_policy_is_refused_identically_by_every_tag_operation()
             let answer = call_in(&router, REGION, method, &uri, body).await;
             let case = format!("{row}, {operation} with {arn}");
             assert_eq!(
-                answer.status, RESOURCE_NOT_FOUND_STATUS,
-                "case {case:?}: expected HTTP {RESOURCE_NOT_FOUND_STATUS}, got {} with {:?}",
+                answer.status, NOT_FOUND_STATUS,
+                "case {case:?}: expected HTTP {NOT_FOUND_STATUS}, got {} with {:?}",
                 answer.status, answer.body
             );
-            assert!(
-                answer.error_code().ends_with(RESOURCE_NOT_FOUND_EXCEPTION),
-                "case {case:?}: expected the modelled {RESOURCE_NOT_FOUND_EXCEPTION}, got {:?}",
+            assert_eq!(
+                answer.error_code().rsplit('#').next().unwrap_or_default(),
+                NOT_FOUND_EXCEPTION,
+                "case {case:?}: expected {NOT_FOUND_EXCEPTION}, got {:?}",
                 answer.error_code()
             );
             assert_eq!(
-                answer.body["Code"],
-                json!(RESOURCE_NOT_FOUND_CODE),
-                "case {case:?}: expected Code {RESOURCE_NOT_FOUND_CODE:?}, got {:?}",
-                answer.body
-            );
-            assert_eq!(
-                answer.body["ResourceType"],
-                json!(POLICY_RESOURCE_TYPE),
-                "case {case:?}: expected ResourceType {POLICY_RESOURCE_TYPE:?}, got {:?}",
-                answer.body
-            );
-            assert_eq!(
-                answer.body["Message"],
-                json!(format!("The resource {{{arn}}} was not found.")),
-                "case {case:?}: the refusal must name the ARN that resolved to nothing, got {:?}",
-                answer.body
-            );
-            assert_eq!(
-                answer.body["ResourceIds"],
-                Value::Null,
-                "case {case:?}: the request named an ARN, so no id is echoed, got {:?}",
+                answer.body["message"],
+                json!(NOT_FOUND_MESSAGE),
+                "case {case:?}: expected the message {NOT_FOUND_MESSAGE:?}, got {:?}",
                 answer.body
             );
         }

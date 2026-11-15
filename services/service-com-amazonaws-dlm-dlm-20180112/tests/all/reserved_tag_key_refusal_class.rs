@@ -53,6 +53,12 @@ const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 const RESOURCE_NOT_FOUND_STATUS: u16 = 404;
 const RESOURCE_NOT_FOUND_CODE: &str = "ResourceNotFound";
 
+/// The refusal the ARN-addressed lookup answers for an ARN that names no
+/// resource, and its status (see `arn_not_found_refusal_class`): the class the
+/// resolution step reaches once the reserved-key check has passed.
+const NOT_FOUND_EXCEPTION: &str = "NotFoundException";
+const NOT_FOUND_STATUS: u16 = 404;
+
 /// One emulator: a router carrying only this service, over one shared engine.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -355,14 +361,14 @@ async fn the_key_is_refused_before_the_resource_is_resolved() {
     )
     .await;
     assert_eq!(
-        resolved.status, RESOURCE_NOT_FOUND_STATUS,
-        "case {:?}: expected HTTP {RESOURCE_NOT_FOUND_STATUS}, got {} with {:?}",
+        resolved.status, NOT_FOUND_STATUS,
+        "case {:?}: expected HTTP {NOT_FOUND_STATUS}, got {} with {:?}",
         "an allowed key on an unresolvable ARN", resolved.status, resolved.body
     );
     assert_eq!(
         resolved.error_shape(),
-        RESOURCE_NOT_FOUND_EXCEPTION,
-        "case {:?}: expected the modelled {RESOURCE_NOT_FOUND_EXCEPTION}, got {:?}",
+        NOT_FOUND_EXCEPTION,
+        "case {:?}: expected {NOT_FOUND_EXCEPTION}, got {:?}",
         "an allowed key on an unresolvable ARN",
         resolved.error_type
     );
@@ -410,16 +416,20 @@ struct ModelledRefusal {
 /// refuse.
 ///
 /// The rows differ along the operation, the class and the kind of rule broken: a
-/// value outside a modelled member constraint, a configuration the documentation
-/// gives to one kind of policy only, and a resource that does not exist.
+/// value outside a modelled member constraint on three different operations, and
+/// an id that resolves to no policy.
 #[tokio::test]
 async fn a_refusal_that_states_a_rule_keeps_its_modelled_class() {
     let router = emulator();
     let (subject, _) = created_policy(&router, "the contrast subject").await;
-    let unresolvable = format!(
-        "arn:aws:dlm:{REGION}:{}:policy/policy-ffffffffffffffff",
+    // A `PolicyArn` the member's `@pattern` does not admit: `.` is outside
+    // `policy/[0-9A-Za-z_-]{1,128}`.
+    let malformed_arn = format!(
+        "arn:aws:dlm:{REGION}:{}:policy/policy.not-an-id",
         engine::emulator_account_id()
     );
+    // A well-formed `PolicyId` this store has not minted.
+    let missing_id = "policy-ffffffffffffffff";
     let mut bad_description = create_request("the contrast");
     bad_description["Description"] = json!("no commas, please");
 
@@ -443,18 +453,31 @@ async fn a_refusal_that_states_a_rule_keeps_its_modelled_class() {
             code: INVALID_PARAMETER_CODE,
         },
         ModelledRefusal {
-            case: "TagResource on an ARN that resolves to nothing",
+            // The tag operations' own modelled refusal: a `ResourceArn` outside
+            // `PolicyArn`'s `@pattern` is a parameter this service refuses, as
+            // against the unresolvable-ARN refusal, which belongs to the lookup
+            // and not to the model (see `arn_not_found_refusal_class`).
+            case: "TagResource with a ResourceArn outside its @pattern",
             method: "POST",
-            uri: tags_uri(&unresolvable),
+            uri: tags_uri(&malformed_arn),
             body: Some(json!({"Tags": {"team": "backups"}})),
-            shape: RESOURCE_NOT_FOUND_EXCEPTION,
-            status: RESOURCE_NOT_FOUND_STATUS,
-            code: RESOURCE_NOT_FOUND_CODE,
+            shape: INVALID_REQUEST_EXCEPTION,
+            status: INVALID_REQUEST_STATUS,
+            code: INVALID_PARAMETER_CODE,
         },
         ModelledRefusal {
-            case: "ListTagsForResource on an ARN that resolves to nothing",
+            case: "ListTagsForResource with a ResourceArn outside its @pattern",
             method: "GET",
-            uri: tags_uri(&unresolvable),
+            uri: tags_uri(&malformed_arn),
+            body: None,
+            shape: INVALID_REQUEST_EXCEPTION,
+            status: INVALID_REQUEST_STATUS,
+            code: INVALID_PARAMETER_CODE,
+        },
+        ModelledRefusal {
+            case: "GetLifecyclePolicy for an id that resolves to nothing",
+            method: "GET",
+            uri: format!("/policies/{missing_id}"),
             body: None,
             shape: RESOURCE_NOT_FOUND_EXCEPTION,
             status: RESOURCE_NOT_FOUND_STATUS,

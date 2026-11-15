@@ -11,6 +11,8 @@
 // points it into `tests/all/`.
 #[path = "all/archive_creation_frequency.rs"]
 mod archive_creation_frequency;
+#[path = "all/arn_not_found_refusal_class.rs"]
+mod arn_not_found_refusal_class;
 #[path = "all/configuration_kind_from_policy_type.rs"]
 mod configuration_kind_from_policy_type;
 #[path = "all/create_policy_kind_materialization.rs"]

@@ -6,8 +6,8 @@
 //! plane, so a lifecycle policy exists only in the region whose endpoint created
 //! it — `GetLifecyclePolicies` reports the policies of the region the call is
 //! made in, and every operation that addresses a policy by id or by ARN resolves
-//! it in that region alone, answering `ResourceNotFoundException` (HTTP 404) for
-//! one that lives in another region.
+//! it in that region alone, answering the not-found refusal of its own lookup
+//! (HTTP 404) for one that lives in another region.
 //!
 //! Every assertion goes through the router, so each case exercises routing,
 //! deserialization, the handler, the persisted state and serialization — the same
@@ -24,11 +24,17 @@ use smithy_server_runtime::MultiServiceRouter;
 /// An `ExecutionRoleArn` satisfying `^arn:aws(-[a-z]{1,3}){0,2}:iam::\d+:role/`.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/AWSDataLifecycleManagerDefaultRole";
 
-/// The modelled error a policy that does not exist is reported with, and its
-/// status: `ResourceNotFoundException (HTTP 404)` (the crate's `OPERATIONS.md`
-/// error list for each of the policy and tag operations).
+/// The modelled error a policy addressed by its id and not found is reported
+/// with, and its status: `ResourceNotFoundException (HTTP 404)` (the crate's
+/// `OPERATIONS.md` error list for each of the policy operations).
 const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 const RESOURCE_NOT_FOUND_STATUS: u16 = 404;
+
+/// The refusal the ARN-addressed lookup answers instead, and its status — the
+/// class the tag operations report for an ARN that names no resource (see
+/// `arn_not_found_refusal_class`).
+const NOT_FOUND_EXCEPTION: &str = "NotFoundException";
+const NOT_FOUND_STATUS: u16 = 404;
 
 /// The `Code` member that error carries, spelled out here rather than read from
 /// the crate so a wrong constant cannot make this test pass.
@@ -380,13 +386,14 @@ async fn a_policy_is_reachable_only_from_the_region_that_created_it() {
             let answer = call_in(&router, away, method, &uri, body).await;
             let case = format!("{label}, {operation} signed for {away}");
             assert_eq!(
-                answer.status, RESOURCE_NOT_FOUND_STATUS,
-                "case {case:?}: expected HTTP {RESOURCE_NOT_FOUND_STATUS}, got {} with {:?}",
+                answer.status, NOT_FOUND_STATUS,
+                "case {case:?}: expected HTTP {NOT_FOUND_STATUS}, got {} with {:?}",
                 answer.status, answer.body
             );
-            assert!(
-                answer.error_code().ends_with(RESOURCE_NOT_FOUND_EXCEPTION),
-                "case {case:?}: expected the modelled {RESOURCE_NOT_FOUND_EXCEPTION}, got {:?}",
+            assert_eq!(
+                answer.error_code().rsplit('#').next().unwrap_or_default(),
+                NOT_FOUND_EXCEPTION,
+                "case {case:?}: expected {NOT_FOUND_EXCEPTION}, got {:?}",
                 answer.error_code()
             );
         }

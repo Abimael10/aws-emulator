@@ -11,9 +11,12 @@
 //!    carrying the `Code` of the exception class and a `Message` naming the
 //!    parameters it refused — never with an error type the model does not
 //!    declare.
-//! 2. A request naming a lifecycle policy that does not exist is
-//!    `ResourceNotFoundException` (HTTP 404) carrying the `Code` of that class and
-//!    the `ResourceType` token of the resource that was not found.
+//! 2. A request naming a lifecycle policy that does not exist is refused by the
+//!    lookup that resolved it: a policy addressed by `PolicyId` is the modelled
+//!    `ResourceNotFoundException` (HTTP 404) carrying the `Code` of that class
+//!    and the `ResourceType` token of the resource that was not found, while a
+//!    resource addressed by `ResourceArn` is `NotFoundException` (HTTP 404)
+//!    stating `Resource was not found`.
 //! 3. A schedule's `CreateRule` states when to create EITHER as a cron expression
 //!    OR as an interval, never both ("You must specify either CronExpression, or
 //!    Interval, IntervalUnit, and Times" — `smithy_query(query="doc",
@@ -56,6 +59,13 @@ const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 const RESOURCE_NOT_FOUND_STATUS: u16 = 404;
 const RESOURCE_NOT_FOUND_CODE: &str = "ResourceNotFound";
 const POLICY_RESOURCE_TYPE: &str = "LIFECYCLE_POLICY";
+
+/// The refusal the ARN-addressed lookup answers instead, its status and the whole
+/// prose it carries — the class the three `/tags/{ResourceArn}` operations report
+/// for an ARN that names no resource (see `arn_not_found_refusal_class`).
+const NOT_FOUND_EXCEPTION: &str = "NotFoundException";
+const NOT_FOUND_STATUS: u16 = 404;
+const NOT_FOUND_MESSAGE: &str = "Resource was not found";
 
 /// The refusal class Amazon Data Lifecycle Manager answers for input no request
 /// may carry, its status, and the text it states a reserved tag key with.
@@ -400,15 +410,17 @@ async fn a_value_outside_a_modelled_constraint_is_an_invalid_request_exception()
     );
 }
 
-/// RULE 2 — a request naming a lifecycle policy that does not exist is answered
-/// with the modelled `ResourceNotFoundException`, carrying its `Code` and the
-/// `ResourceType` token of the resource that was not found.
+/// RULE 2 — a request naming a lifecycle policy that does not exist is refused
+/// by the lookup that resolved it: the `PolicyId`-addressed operations answer the
+/// modelled `ResourceNotFoundException`, carrying its `Code`, the `ResourceType`
+/// token of the resource that was not found and the id asked for, while the
+/// `ResourceArn`-addressed ones answer `NotFoundException` with its fixed prose.
 ///
 /// The rows differ along the operation, the method, and how the policy is
 /// addressed (by id in the URI, by id in the query string, by ARN) — the issue
 /// cited the GET, the DELETE and the PATCH.
 #[tokio::test]
-async fn a_policy_that_does_not_exist_is_a_resource_not_found_exception() {
+async fn a_policy_that_does_not_exist_is_refused_by_the_lookup_that_resolved_it() {
     let router = emulator();
     // A well-formed id and ARN that name no policy: the store is empty.
     let absent = "policy-0000000000000001";
@@ -430,7 +442,7 @@ async fn a_policy_that_does_not_exist_is_a_resource_not_found_exception() {
         (absent.to_string(), absent_arn),
         (deleted.clone(), deleted_arn),
     ] {
-        let cases: Vec<(&str, &str, String, Option<Value>)> = vec![
+        let by_id: Vec<(&str, &str, String, Option<Value>)> = vec![
             ("GetLifecyclePolicy", "GET", format!("/policies/{id}"), None),
             (
                 "DeleteLifecyclePolicy",
@@ -450,21 +462,8 @@ async fn a_policy_that_does_not_exist_is_a_resource_not_found_exception() {
                 format!("/policies?policyIds={id}"),
                 None,
             ),
-            ("ListTagsForResource", "GET", tags_uri(&arn), None),
-            (
-                "TagResource",
-                "POST",
-                tags_uri(&arn),
-                Some(json!({"Tags": {"team": "backups"}})),
-            ),
-            (
-                "UntagResource",
-                "DELETE",
-                format!("{}?tagKeys=team", tags_uri(&arn)),
-                None,
-            ),
         ];
-        for (case, method, uri, body) in cases {
+        for (case, method, uri, body) in by_id {
             let answer = call(&router, method, &uri, body).await;
             assert_eq!(
                 answer.status, RESOURCE_NOT_FOUND_STATUS,
@@ -495,6 +494,48 @@ async fn a_policy_that_does_not_exist_is_a_resource_not_found_exception() {
                 "case {case:?} with {id:?}: the refusal must name the resource asked for, \
                  got {:?}",
                 answer.error_message()
+            );
+        }
+
+        let by_arn: Vec<(&str, &str, String, Option<Value>)> = vec![
+            ("ListTagsForResource", "GET", tags_uri(&arn), None),
+            (
+                "TagResource",
+                "POST",
+                tags_uri(&arn),
+                Some(json!({"Tags": {"team": "backups"}})),
+            ),
+            (
+                "UntagResource",
+                "DELETE",
+                format!("{}?tagKeys=team", tags_uri(&arn)),
+                None,
+            ),
+        ];
+        for (case, method, uri, body) in by_arn {
+            let answer = call(&router, method, &uri, body).await;
+            assert_eq!(
+                answer.status, NOT_FOUND_STATUS,
+                "case {case:?} with {arn:?}: expected HTTP {NOT_FOUND_STATUS}, got {} with {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                answer.error_code().rsplit('#').next().unwrap_or_default(),
+                NOT_FOUND_EXCEPTION,
+                "case {case:?} with {arn:?}: expected {NOT_FOUND_EXCEPTION}, got {:?}",
+                answer.error_code()
+            );
+            assert_eq!(
+                answer.error_message(),
+                NOT_FOUND_MESSAGE,
+                "case {case:?} with {arn:?}: expected the message {NOT_FOUND_MESSAGE:?}, got {:?}",
+                answer.body
+            );
+            assert_eq!(
+                answer.body["Code"],
+                Value::Null,
+                "case {case:?} with {arn:?}: this class declares no Code member, got {:?}",
+                answer.body
             );
         }
     }

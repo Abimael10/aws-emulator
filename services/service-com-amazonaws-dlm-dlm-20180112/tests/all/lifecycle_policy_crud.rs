@@ -1391,7 +1391,8 @@ async fn tag_operations_read_and_write_the_stored_tags() {
     );
 
     // An ARN naming no policy is a 404 from each of the three operations —
-    // including the ARN of a policy that has been deleted.
+    // including the ARN of a policy that has been deleted — in the class the
+    // ARN-addressed lookup answers (see `arn_not_found_refusal_class`).
     delete(&router, &created_bare).await;
     let unknown_arn = format!(
         "arn:aws:dlm:{REGION}:{}:policy/policy-deadbeef",
@@ -1420,9 +1421,14 @@ async fn tag_operations_read_and_write_the_stored_tags() {
                 "case {case:?} with {arn:?}: expected HTTP 404, got {} with {:?}",
                 answer.status, answer.body
             );
-            assert!(
-                answer.error_code().ends_with("ResourceNotFoundException"),
-                "case {case:?} with {arn:?}: expected ResourceNotFoundException, got {:?}",
+            assert_eq!(
+                answer
+                    .error_code()
+                    .rsplit('#')
+                    .next()
+                    .unwrap_or_default(),
+                "NotFoundException",
+                "case {case:?} with {arn:?}: expected NotFoundException, got {:?}",
                 answer.error_code()
             );
         }
