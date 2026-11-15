@@ -118,7 +118,7 @@ pub(crate) async fn application(emulator: &Emulator, name: &str) -> String {
 
 /// A domain of this account — the data source an attachment links an application to —
 /// answering with its ARN.
-async fn domain(emulator: &Emulator, name: &str) -> String {
+pub(crate) async fn domain(emulator: &Emulator, name: &str) -> String {
     let answer = emulator.create(json!({ "DomainName": name })).await;
     assert_eq!(
         answer.status, 200,

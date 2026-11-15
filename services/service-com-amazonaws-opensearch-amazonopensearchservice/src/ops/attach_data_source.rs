@@ -108,7 +108,7 @@ use crate::state::{
     application_not_found_for_account, attachment_client_token_taken, attachment_outcome,
     attachment_quota_exceeded, internal_failure, is_arn, malformed_arn, service_state,
     state_unavailable, workspace_selection_conflict, DataSourceActivation, DataSourceAttachment,
-    ATTACHMENT_QUOTA, ATTACHMENT_STATUS_FAILED, PROVISIONING,
+    ATTACHMENT_QUOTA, PROVISIONING,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -335,23 +335,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "This operation is idempotent: if the data source is already attached or
-        // pending, the operation returns the existing attachment." An attachment that
-        // FAILED is neither attached nor pending, so a later attach of that data source
-        // is a fresh attempt rather than a repeat of the one that failed.
-        let held = application.attachment(&input.data_source_arn);
-        if let Some(attachment) = held.filter(|held| held.status != ATTACHMENT_STATUS_FAILED) {
+        // pending, the operation returns the existing attachment." The attachment belongs
+        // to the PAIR: the single-attachment read is keyed by the application and the data
+        // source alone and reports one `attachmentId`, so one pair names at most one
+        // attachment record and one identifier — whatever status that record carries. A
+        // repeat attach therefore reports the record the pair already holds and performs
+        // no further action, so the identifier the first call handed a caller stays the one
+        // every later attach and every read of the pair report, and no second record is
+        // ever minted for a data source the application already holds an attachment of.
+        if let Some(attachment) = application.attachment(&input.data_source_arn) {
             return Ok(attached(&input.id, &application.arn, attachment));
         }
 
         let application_active_at = application.active_at();
         let attachments_held = application.attachments.len();
-        let replaces_failed = held.is_some();
+        // Reached only for a data source the application holds no attachment of, so a
+        // record the store still carries under this ARN is one a detach has already taken
+        // with it: the attach below REPLACES that record rather than adding one, which is
+        // why it is not counted against the bound.
+        let replaces_record = application
+            .attachments
+            .contains_key(&input.data_source_arn);
 
         // The set is bounded: past its quota an attach is refused rather than adding
         // another record, so a caller looping with fresh data sources cannot grow one
-        // application's state without end. Replacing the record of a data source whose
-        // attachment FAILED adds none.
-        if attachments_held >= ATTACHMENT_QUOTA && !replaces_failed {
+        // application's state without end. Standing in for a detached record adds none.
+        if attachments_held >= ATTACHMENT_QUOTA && !replaces_record {
             return Err(AttachDataSourceErrorModeled::ValidationException(
                 attachment_quota_exceeded(&input.id),
             )

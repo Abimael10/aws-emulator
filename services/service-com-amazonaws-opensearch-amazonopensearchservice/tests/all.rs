@@ -33,6 +33,8 @@ mod application_plane_identity;
 mod application_updates;
 #[path = "all/applications.rs"]
 mod applications;
+#[path = "all/attachment_identity_across_repeats.rs"]
+mod attachment_identity_across_repeats;
 #[path = "all/authorized_principal_type.rs"]
 mod authorized_principal_type;
 #[path = "all/boundary_constraints_precede_stated_checks.rs"]
