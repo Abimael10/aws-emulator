@@ -23,7 +23,7 @@
 //! door a client uses, so nothing reaches into the state struct and a response that is
 //! not computed from persisted state cannot pass.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -36,6 +36,14 @@ use crate::ecs_wire::{
 /// Long enough for one clock-owed transition (`state::TRANSITION_SPAN` is 500 ms) to fall
 /// due, with margin for a loaded test machine.
 const ONE_SPAN: Duration = Duration::from_millis(900);
+
+/// How long a read is repeated for while it waits for a clock-owed transition to fall due.
+/// Generous on purpose: the test waits for the CONDITION, and this deadline is only here so
+/// a failure is a failure rather than a hang.
+const POLL_BUDGET: Duration = Duration::from_secs(30);
+
+/// How long the loop waits between two reads of the same resource.
+const POLL_STEP: Duration = Duration::from_millis(50);
 
 /// The recorded `ClusterContainsServicesException` sentence (`state`'s
 /// `CLUSTER_CONTAINS_SERVICES_MESSAGE`).
@@ -848,14 +856,30 @@ async fn deleting_a_service_drains_its_tasks_and_settles_on_the_clock() {
         "case {case:?}: a caller acting straight after the delete sees DRAINING, got \
          {deleted}"
     );
-    tokio::time::sleep(ONE_SPAN).await;
-    let settled = ok(
-        &router,
-        "DescribeServices",
-        json!({ "cluster": "settling", "services": ["web"] }),
-        case,
-    )
-    .await;
+    // The move to INACTIVE is owed by the CLOCK, so the read is repeated until it reports
+    // the tombstone or a generous deadline passes — never for a fixed time.
+    let deadline = Instant::now() + POLL_BUDGET;
+    let settled = loop {
+        let settled = ok(
+            &router,
+            "DescribeServices",
+            json!({ "cluster": "settling", "services": ["web"] }),
+            case,
+        )
+        .await;
+        let reported = list(&settled, "services", case)
+            .first()
+            .map(|stored| string(stored, "status", case));
+        if reported.as_deref() == Some("INACTIVE") {
+            break settled;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the owed move to INACTIVE to have fallen due, got \
+             {settled}"
+        );
+        tokio::time::sleep(POLL_STEP).await;
+    };
     let stored = &list(&settled, "services", case)[0];
     assert_eq!(
         string(stored, "status", case),
@@ -863,18 +887,26 @@ async fn deleting_a_service_drains_its_tasks_and_settles_on_the_clock() {
         "case {case:?}: expected the owed move to INACTIVE to have fallen due, got \
          {settled}"
     );
-    let tasks = ok(
-        &router,
-        "ListTasks",
-        json!({ "cluster": "settling", "desiredStatus": "STOPPED" }),
-        case,
-    )
-    .await;
-    assert_eq!(
-        list(&tasks, "taskArns", case).len(),
-        2,
-        "case {case:?}: expected the drained tasks to have stopped, got {tasks}"
-    );
+    // The tasks the drain stopped are owed the same clock move, so this read is repeated
+    // too until both of them report STOPPED.
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let tasks = ok(
+            &router,
+            "ListTasks",
+            json!({ "cluster": "settling", "desiredStatus": "STOPPED" }),
+            case,
+        )
+        .await;
+        if list(&tasks, "taskArns", case).len() == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the drained tasks to have stopped, got {tasks}"
+        );
+        tokio::time::sleep(POLL_STEP).await;
+    }
 
     // Deleting the deleted service again is the same delete (`@idempotent`).
     let repeated = ok(
@@ -892,21 +924,18 @@ async fn deleting_a_service_drains_its_tasks_and_settles_on_the_clock() {
 
     // A service that was never created, and a cluster that was never created, are
     // refused with their own fixed sentences.
-    let (code, message) = refusal(
+    let body = refused(
         &router,
         "DeleteService",
         json!({ "cluster": "settling", "service": "nosuchservice" }),
+        "ServiceNotFoundException",
         case,
     )
     .await;
-    assert_eq!(
-        code, "ServiceNotFoundException",
-        "case {case:?}: expected the service-not-found refusal, got {code:?}"
-    );
-    assert_eq!(
-        message, "",
-        "case {case:?}: expected `DeleteService` to carry no sentence at all, got \
-         {message:?}"
+    assert!(
+        body.get("message").is_none(),
+        "case {case:?}: expected `DeleteService` to carry no message member at all, got \
+         {body}"
     );
     let (code, message) = refusal(
         &router,

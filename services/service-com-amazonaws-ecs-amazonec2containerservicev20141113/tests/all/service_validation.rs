@@ -407,8 +407,10 @@ async fn a_load_balancer_binding_names_a_container_and_port_the_revision_declare
             "case {case:?}: expected an InvalidParameterException, got {code:?} with \
              {message:?}"
         );
-        // The refusal is derived from the request, so it names what is at fault.
-        let named = container_name.unwrap_or("containerName");
+        // The refusal is derived from the request, so it names what is at fault: the
+        // container the binding named, or — for a binding that names none — the MEMBER that
+        // should have named one, as Amazon ECS writes it in that sentence.
+        let named = container_name.unwrap_or("Container Name");
         assert!(
             message.contains(named),
             "case {case:?}: expected the refusal to name {named:?}, got {message:?}"

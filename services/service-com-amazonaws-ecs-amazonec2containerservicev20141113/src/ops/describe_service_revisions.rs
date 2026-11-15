@@ -171,8 +171,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeServiceRevisionsErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(crate::state::at_most_items_message(
-                            "service revisions",
+                        message: Some(crate::state::arn_count_message(
+                            "Service Revision",
                             crate::state::MAX_DESCRIBE_SERVICE_REVISIONS,
                         )),
                     },

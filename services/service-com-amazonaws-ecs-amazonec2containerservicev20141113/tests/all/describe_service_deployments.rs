@@ -627,7 +627,7 @@ async fn an_arn_that_names_no_stored_deployment_is_a_missing_failure() {    let 
         (code.as_str(), message.as_str()),
         (
             "InvalidParameterException",
-            "service deployments can have at most 20 items."
+            "Service Deployment ARN count cannot exceed 20"
         ),
         "case {case:?}: unexpected refusal {code} / {message}"
     );

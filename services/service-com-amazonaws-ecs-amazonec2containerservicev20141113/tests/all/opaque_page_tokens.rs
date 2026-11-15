@@ -16,7 +16,9 @@
 //! 3. a value the listing did not mint names no position — one a caller assembled, a plain
 //!    resource identifier, and a token another listing of the same store minted — and is
 //!    refused with the error and the sentence that listing answers for an unusable cursor
-//!    rather than being read as some insertion point in the sequence.
+//!    rather than being read as some insertion point in the sequence. `ListServices` checks
+//!    a token's LENGTH before reading it, so a value shorter than the shortest token Amazon
+//!    ECS hands out earns that listing's length sentence instead ([`expected_refusal`]).
 //!
 //! The rows span the listings of this service that page: what each one walks (clusters,
 //! services, tasks, container instances, task-definition revisions, families, account
@@ -75,6 +77,28 @@ const INVALID_PARAMETER: &str = "InvalidParameterException";
 /// The sentence `crate::state::INVALID_NEXT_TOKEN_MESSAGE` spells, as the listings that
 /// answer it carry it.
 const INVALID_NEXT_TOKEN: &str = "Invalid nextToken.";
+
+/// The shortest continuation token Amazon ECS hands out
+/// (`crate::state::MIN_PAGE_TOKEN_LENGTH`), in characters.
+const MIN_TOKEN_LENGTH: usize = 48;
+
+/// The sentence a listing that checks a token's LENGTH answers for a value shorter than
+/// [`MIN_TOKEN_LENGTH`].
+const SHORT_TOKEN: &str = "token shorter than 48.";
+
+/// The operation that checks a token's length before reading it.
+const LENGTH_CHECKED_LISTING: &str = "ListServices";
+
+/// The sentence `listing` answers for `token`: the listing's own unusable-cursor sentence,
+/// except that [`LENGTH_CHECKED_LISTING`] refuses a value too short to be one of its tokens
+/// for that length first. An empty `refusal_message` is a listing whose sentence this suite
+/// does not pin.
+fn expected_refusal(listing: &Listing, token: &str) -> &'static str {
+    if listing.operation == LENGTH_CHECKED_LISTING && token.chars().count() < MIN_TOKEN_LENGTH {
+        return SHORT_TOKEN;
+    }
+    listing.refusal_message
+}
 
 fn cluster_arn(name: &str) -> String {
     format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:cluster/{name}")
@@ -380,7 +404,8 @@ async fn a_page_token_another_listing_minted_or_a_caller_built_is_refused() {
             );
             if !listing.refusal_message.is_empty() {
                 assert_eq!(
-                    message, listing.refusal_message,
+                    message,
+                    expected_refusal(&listing, &token),
                     "case {row:?}: expected the sentence this listing answers for an \
                      unusable cursor, got {message:?}"
                 );

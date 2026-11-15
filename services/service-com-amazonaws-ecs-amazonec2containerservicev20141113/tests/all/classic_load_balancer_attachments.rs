@@ -594,6 +594,133 @@ async fn a_classic_attachment_is_refused_for_an_awsvpc_revision() {
 }
 
 #[tokio::test]
+async fn a_classic_attachment_on_a_fargate_service_is_refused_before_the_name_is_resolved() {
+    let router = emulator();
+    cluster_with_capacity(&router, CLUSTER, "setup").await;
+    create_classic_load_balancer(&router, SIGNED_REGION, "ecs-fargate-classic", "setup").await;
+    // A Fargate-compatible `awsvpc` revision: Fargate declares its task size on the
+    // revision, so the revision a Fargate service runs has to carry one.
+    ok(
+        &router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": "fargateclassic",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "256",
+            "memory": "512",
+            "containerDefinitions": [container("app", &[80])],
+        }),
+        "setup",
+    )
+    .await;
+
+    // A cluster the two Fargate capacity providers are associated with, for the rows that
+    // say where their tasks run through a strategy rather than through a launch type: "The
+    // specified capacity provider strategy cannot contain a capacity provider that is not
+    // associated with the cluster."
+    let fargate_cluster = "classicfargate";
+    ok(
+        &router,
+        "CreateCluster",
+        json!({
+            "clusterName": fargate_cluster,
+            "capacityProviders": ["FARGATE", "FARGATE_SPOT"],
+        }),
+        "setup",
+    )
+    .await;
+
+    // "Services with tasks that use the awsvpc network mode (for example, those with the
+    // Fargate launch type) only support Application Load Balancers and Network Load
+    // Balancers. Classic Load Balancers aren't supported": a service on Fargate supports NO
+    // Classic load balancer, which is a fault of the request — so it is stated whether or
+    // not the account holds the name, and whichever way the request says its tasks run on
+    // Fargate.
+    let rows: [(&str, &str, Value, &str); 4] = [
+        (
+            "the FARGATE launch type and a load balancer the account holds",
+            CLUSTER,
+            json!({ "launchType": "FARGATE" }),
+            "ecs-fargate-classic",
+        ),
+        (
+            "the FARGATE launch type and a name the account does not hold",
+            CLUSTER,
+            json!({ "launchType": "FARGATE" }),
+            "ecs-fargate-absent",
+        ),
+        (
+            "a FARGATE capacity-provider strategy",
+            fargate_cluster,
+            json!({ "capacityProviderStrategy": [{ "capacityProvider": "FARGATE", "weight": 1 }] }),
+            "ecs-fargate-classic",
+        ),
+        (
+            "a FARGATE_SPOT capacity-provider strategy",
+            fargate_cluster,
+            json!({
+                "capacityProviderStrategy": [
+                    { "capacityProvider": "FARGATE_SPOT", "weight": 1 },
+                ],
+            }),
+            "ecs-fargate-classic",
+        ),
+    ];
+
+    for (index, (case, cluster, placement, load_balancer)) in rows.iter().enumerate() {
+        let service_name = format!("fargateclassic{index}");
+        let mut request = json!({
+            "cluster": cluster,
+            "serviceName": service_name,
+            "taskDefinition": "fargateclassic",
+            "desiredCount": 0,
+            "networkConfiguration": awsvpc_network_configuration(),
+            "loadBalancers": [classic_binding(load_balancer, 80)],
+        });
+        for (member, value) in placement.as_object().expect("the placement is an object") {
+            request[member] = value.clone();
+        }
+        let (code, message) = refusal(&router, "CreateService", request, case).await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (
+                "InvalidParameterException",
+                "Classic Load Balancers are not supported with Fargate."
+            ),
+            "case {case:?}: expected the Fargate refusal, got {code:?} with {message:?}"
+        );
+        assert!(
+            !is_listed(&router, &service_name, case).await,
+            "case {case:?}: a refused create must store no service"
+        );
+    }
+
+    // The same attachment on a service that is NOT on Fargate is judged the other way: the
+    // name is resolved, and a `bridge` revision takes it.
+    let case = "the same attachment on an EC2 service";
+    register(&router, "fargateclassicbridge", "bridge", &[80], case).await;
+    ok(
+        &router,
+        "CreateService",
+        json!({
+            "cluster": CLUSTER,
+            "serviceName": "ec2classic",
+            "taskDefinition": "fargateclassicbridge",
+            "desiredCount": 0,
+            "loadBalancers": [classic_binding("ecs-fargate-classic", 80)],
+        }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        stored_bindings(&router, "ec2classic", case).await,
+        vec![classic_binding("ecs-fargate-classic", 80)],
+        "case {case:?}: expected the attachment stored for a service that is not on Fargate"
+    );
+}
+
+#[tokio::test]
 async fn an_update_is_held_to_the_same_classic_attachment_rules() {
     let router = emulator();
     cluster_with_capacity(&router, CLUSTER, "setup").await;

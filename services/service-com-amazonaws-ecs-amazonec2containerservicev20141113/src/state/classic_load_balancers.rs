@@ -30,6 +30,38 @@
 
 use super::*;
 
+/// `ClientException$message` for a `loadBalancers` entry that does not name exactly ONE
+/// Elastic Load Balancing resource: fixed text naming the two members of the pair and the
+/// requirement, with nothing of the request in it.
+pub const LOAD_BALANCER_MEMBER_PAIR_MESSAGE: &str =
+    "loadBalancerName and targetGroupArn cannot both be specified. You must specify either \
+     a loadBalancerName or a targetGroupArn in all loadBalancer entries";
+
+/// The refusal a `loadBalancers` list earns when one of its entries does not name exactly
+/// one Elastic Load Balancing resource — both members of the pair, or neither — or `None`
+/// when every entry names one.
+///
+/// Which KIND of load balancer an entry attaches is decided by the member it fills, so the
+/// two members are alternatives: "For Classic Load Balancers, this object must contain the
+/// load balancer name" while "If you are using an Application Load Balancer or a Network
+/// Load Balancer the load balancer name parameter should be omitted". An entry that fills
+/// both names two resources and attaches to neither, which is what the sentence states.
+///
+/// Decided BEFORE anything either member names is looked up: it is a fault of the REQUEST,
+/// so the answer cannot depend on what the account holds.
+pub fn load_balancer_member_violation(load_balancers: &[LoadBalancer]) -> Option<String> {
+    let named = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    };
+    load_balancers
+        .iter()
+        .any(|entry| named(&entry.load_balancer_name) == named(&entry.target_group_arn))
+        .then(|| LOAD_BALANCER_MEMBER_PAIR_MESSAGE.to_string())
+}
+
 /// Every CLASSIC load balancer a `loadBalancers` list names, in request order and without
 /// repeats: each entry's `loadBalancerName`, which is the member an attachment to that kind
 /// of load balancer is made through.
@@ -101,14 +133,24 @@ pub fn held_classic_load_balancer_names<Eng: Send + Sync + 'static>(
 /// definition (a deployment controller that takes its tasks from a task set) has no network
 /// mode to check against, so only the existence of the load balancer is.
 ///
-/// The two halves are reported in that order, as the v2 pairing reports them: a name that
-/// resolves to nothing is reported as that, whatever mode the revision declares.
+/// `on_fargate` is where the service's tasks are placed ([`places_on_fargate`]). A service
+/// on Fargate supports no Classic load balancer AT ALL — "Services with tasks that use the
+/// `awsvpc` network mode (for example, those with the Fargate launch type) only support
+/// Application Load Balancers and Network Load Balancers. Classic Load Balancers aren't
+/// supported" — so that is decided FIRST, from the request alone: there is nothing to look
+/// up about a load balancer this service could never be attached to, whether or not the
+/// account holds one by that name.
 pub fn classic_load_balancer_refusal(
     load_balancers: &[LoadBalancer],
     network_mode: Option<&str>,
     held: &[String],
+    on_fargate: bool,
 ) -> Option<String> {
-    for name in requested_load_balancer_names(load_balancers) {
+    let names = requested_load_balancer_names(load_balancers);
+    if on_fargate && !names.is_empty() {
+        return Some(CLASSIC_LOAD_BALANCER_ON_FARGATE_MESSAGE.to_string());
+    }
+    for name in names {
         if !held.contains(&name) {
             return Some(format!(
                 "The load balancer with loadBalancerName {name} does not exist"
@@ -117,6 +159,12 @@ pub fn classic_load_balancer_refusal(
     }
     network_mode.and_then(|mode| classic_load_balancer_mode_refusal(load_balancers, mode))
 }
+
+/// `InvalidParameterException$message` for a Classic load-balancer attachment on a service
+/// whose tasks run on Fargate: fixed text about the two, naming neither the load balancer
+/// the entry carried nor the network mode its revision declares.
+pub const CLASSIC_LOAD_BALANCER_ON_FARGATE_MESSAGE: &str =
+    "Classic Load Balancers are not supported with Fargate.";
 
 /// The network-mode half of [`classic_load_balancer_refusal`]: the refusal the Classic load
 /// balancers a `loadBalancers` list names earn against a revision whose `networkMode` is

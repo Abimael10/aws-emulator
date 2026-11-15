@@ -183,9 +183,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // "This value can be between 1 and 100."
+        // "This value can be between 1 and 100." This listing names the BOUND the page size
+        // crossed at either end of that range, rather than the range itself
+        // ([`crate::state::page_size_bound_violation`]).
         if let Some(message) = input.max_results.and_then(|max_results| {
-            crate::state::page_size_violation(
+            crate::state::page_size_bound_violation(
                 max_results,
                 crate::state::MIN_LIST_PAGE_SIZE,
                 crate::state::MAX_LIST_PAGE_SIZE,
@@ -289,6 +291,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let token_key = guard.page_token_key();
         let start = match input.next_token.as_deref() {
             Some(token) => {
+                // The LENGTH of a token is checked before the token is read: this listing
+                // refuses a value shorter than the shortest continuation token Amazon ECS
+                // hands out for its length, naming that length
+                // ([`crate::state::short_page_token_violation`]). Every token this store
+                // mints is longer than that, so a page a caller resumes from is never
+                // refused here.
+                if let Some(message) = crate::state::short_page_token_violation(token) {
+                    return Err(ListServicesErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(message),
+                        },
+                    )
+                    .into());
+                }
                 let Some(cursor) =
                     crate::state::decode_page_token(&token_key, &page_scope, token)
                 else {

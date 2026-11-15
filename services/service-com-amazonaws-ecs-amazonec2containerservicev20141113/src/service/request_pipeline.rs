@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! What this service does with a request BEFORE a handler runs: the IAM authorization
-//! decision, and then the modelled operation the routing key names.
+//! decision, the refusals this service words per operation, and then the modelled operation
+//! the routing key names.
 //!
 //! The order is the one AWS keeps. A request is authorized at the IAM layer first
 //! ([`super::authorization`]) — a caller that may not perform the action is refused
 //! `AccessDeniedException` whatever else is wrong with the request, and nothing it asked for
 //! is read or written — and only then does the service judge the request itself. A request
 //! the gate does not decide is served by the generated operation exactly as it always was.
+//!
+//! Between the two sits the one refusal this layer words itself: a condition whose sentence
+//! belongs to the OPERATION rather than to the member at fault ([`super::refusal_wording`]),
+//! which the framework's own walk cannot state because it is handed no operation to key it
+//! on. A request that earns none of those reaches the operation untouched.
 //!
 //! It is ONE [`ErasedOperation`] rather than a decision taken in
 //! [`smithy_server_runtime::Service::override_operation`], because that seam is handed no
@@ -27,7 +33,10 @@ use smithy_server_runtime::{
     ServerHttpProtocol, Service,
 };
 
-use crate::ops::types::{AccessDeniedException, SCHEMA_ACCESS_DENIED_EXCEPTION};
+use crate::ops::types::{
+    AccessDeniedException, InvalidParameterException, SCHEMA_ACCESS_DENIED_EXCEPTION,
+    SCHEMA_INVALID_PARAMETER_EXCEPTION,
+};
 
 /// The error code the model pins on `AccessDeniedException`, which is also its shape name.
 const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
@@ -35,6 +44,15 @@ const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
 /// The status the model pins on `AccessDeniedException`: `@httpError 403`
 /// (`smithy_query(query="operation",operation="CreateCluster",…)`).
 const ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The error code the model pins on `InvalidParameterException`, which is also its shape
+/// name — the one error this service declares for a request whose parameters it will not
+/// serve, and the class every refusal worded in [`super::refusal_wording`] carries.
+const INVALID_PARAMETER_EXCEPTION: &str = "InvalidParameterException";
+
+/// The status the model pins on `InvalidParameterException`: `@httpError 400`
+/// (`smithy_query(query="operation",operation="CreateService",…)`).
+const INVALID_PARAMETER_STATUS: u16 = 400;
 
 /// The pre-dispatch sequence of this service.
 ///
@@ -99,9 +117,20 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for RequestPipeline<Eng> {
                     Some(key) => {
                         match self.authorization_refusal(key, protocol, req, ctx, definition) {
                             Some(response) => Ok(response),
-                            None => match definition.routing_table().get(key) {
-                                Some(operation) => Err(operation),
-                                None => Ok(definition.routing_error_response(req)),
+                            // A condition THIS operation words its own sentence for, stated
+                            // here because the framework's walk is handed no operation to
+                            // key it on (see [`super::refusal_wording`]). Everything else
+                            // reaches the operation and is refused exactly as before.
+                            None => match super::refusal_wording::operation_worded_refusal(
+                                key, protocol, req,
+                            ) {
+                                Some(message) => {
+                                    Ok(invalid_parameter_response(definition, req, message))
+                                }
+                                None => match definition.routing_table().get(key) {
+                                    Some(operation) => Err(operation),
+                                    None => Ok(definition.routing_error_response(req)),
+                                },
                             },
                         }
                     }
@@ -119,6 +148,43 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for RequestPipeline<Eng> {
         // cannot weaken the schemes the model declares for it.
         None
     }
+}
+
+/// A refusal worded by [`super::refusal_wording`] as a response in this service's own
+/// protocol envelope, serialized through the same protocol call the framework's error tail
+/// makes — so a sentence chosen here and one a handler returns are indistinguishable on the
+/// wire.
+///
+/// Where the modelled envelope cannot be rendered at all, the same code and message are
+/// answered through the service's framework-refusal envelope instead, so the refusal still
+/// reaches the caller rather than falling through to a handler.
+fn invalid_parameter_response(
+    definition: &dyn ErasedServiceDefinition,
+    req: &RtRequest,
+    message: String,
+) -> RtResponse {
+    let refused = InvalidParameterException {
+        message: Some(message),
+    };
+    definition
+        .protocol()
+        .serialize_error(
+            &refused,
+            &SCHEMA_INVALID_PARAMETER_EXCEPTION,
+            INVALID_PARAMETER_EXCEPTION,
+            INVALID_PARAMETER_STATUS,
+        )
+        .ok()
+        .unwrap_or_else(|| {
+            definition.refusal_response(
+                ProtocolError::Invalid(Vec::new()),
+                Some(Refused {
+                    code: INVALID_PARAMETER_EXCEPTION.to_string(),
+                    message: refused.message.clone().unwrap_or_default(),
+                }),
+                req,
+            )
+        })
 }
 
 /// The authorization refusal as a response in this service's own protocol envelope,

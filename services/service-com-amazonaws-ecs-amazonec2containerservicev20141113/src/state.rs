@@ -377,6 +377,12 @@ pub use placement_reporting::*;
 mod page_tokens;
 pub use page_tokens::*;
 
+/// The FORM a continuation token has to take before a listing reads it: the length below
+/// which a value is no token of this API at all.
+#[path = "state/scratch.rs"]
+mod page_token_form;
+pub use page_token_form::*;
+
 /// The container-instance capabilities a task-definition revision requires, derived from
 /// the revision and reported as `TaskDefinition$requiresAttributes`.
 mod task_definition_capabilities;
@@ -1101,10 +1107,11 @@ pub fn integer_bound_message(member: &str, value: i32, min: i32, max: i32) -> Op
 /// ([`DESIRED_COUNT_NEGATIVE_MESSAGE`]): the count named in words, the one bound the value
 /// crossed, and nothing of the value the request carried.
 pub fn task_count_bound_message(count: i32, min: i32, max: i32) -> Option<String> {
+    let subject = "Task count";
     if count < min {
-        Some(format!("Task count can not be lesser than {min}"))
+        Some(below_minimum_message(subject, min))
     } else if count > max {
-        Some(format!("Task count can not be greater than {max}"))
+        Some(above_maximum_message(subject, max))
     } else {
         None
     }
@@ -1128,6 +1135,17 @@ pub fn page_size_range_message(min: i32, max: i32) -> String {
 /// task count, and a page's `maxResults` carries it for a list.
 pub fn below_minimum_message(subject: &str, min: i32) -> String {
     format!("{subject} can not be lesser than {min}")
+}
+
+/// The sentence a value ABOVE the largest its own member documents is refused with: the
+/// `subject` the refusal names that member by and the bound the value crossed, echoing
+/// neither the value the request carried nor the other end of the range.
+///
+/// The other half of the pair [`below_minimum_message`] opens, spelled once for every member
+/// of this API bounded from above — a `RunTask` count carries it for the tasks one call may
+/// place, and a page's `maxResults` carries it for a listing that names its bounds.
+pub fn above_maximum_message(subject: &str, max: i32) -> String {
+    format!("{subject} can not be greater than {max}")
 }
 
 /// The refusal a `maxResults` of one of this API's LONG-STANDING list operations earns
@@ -1161,6 +1179,26 @@ pub fn page_size_violation(max_results: i32, min: i32, max: i32) -> Option<Strin
 /// ([`page_size_violation`]).
 pub fn page_size_range_violation(max_results: i32, min: i32, max: i32) -> Option<String> {
     (max_results < min || max_results > max).then(|| page_size_range_message(min, max))
+}
+
+/// The refusal a `maxResults` earns from a listing that names the BOUND the page size
+/// crossed at either end of its documented range, or `None` when it is inside it.
+///
+/// The two sentences are the pair every bounded count of this API states
+/// ([`below_minimum_message`] / [`above_maximum_message`]) with the page-size member as its
+/// refusal names it — "Max results can not be lesser than <min>" below the range and "Max
+/// results can not be greater than <max>" above it — rather than the range sentence
+/// [`page_size_violation`] states above it. RECORDED behaviour of `ListServices`; the other
+/// long-standing listings keep the sentence each of them answers.
+pub fn page_size_bound_violation(max_results: i32, min: i32, max: i32) -> Option<String> {
+    let subject = member_subject("maxResults");
+    if max_results < min {
+        Some(below_minimum_message(&subject, min))
+    } else if max_results > max {
+        Some(above_maximum_message(&subject, max))
+    } else {
+        None
+    }
 }
 
 /// The launch type a task takes when the request names neither a `launchType` nor a
@@ -2463,6 +2501,19 @@ pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "Invalid nextToken.";
 /// the operations that carry one.
 pub fn at_most_items_message(entries: &str, max: usize) -> String {
     format!("{entries} can have at most {max} items.")
+}
+
+/// `InvalidParameterException$message` for a required list of ARNs that names more of them
+/// than one call may ask about: Amazon ECS counts the ARNs rather than the items, naming the
+/// resource they identify in the words its own name is written in and the cap, with no
+/// trailing period — "<Resource> ARN count cannot exceed <N>".
+///
+/// The sentence of the reads whose member IS a list of ARNs (`serviceDeploymentArns`,
+/// `serviceRevisionArns` and their daemon counterparts, each documented "You can specify a
+/// maximum of 20 ARNs"), as against [`at_most_items_message`], which is how this API states
+/// the bound of a list of names or ids.
+pub fn arn_count_message(resource: &str, max: usize) -> String {
+    format!("{resource} ARN count cannot exceed {max}")
 }
 
 /// The same sentence for a caller-supplied STRING longer than the member documents.

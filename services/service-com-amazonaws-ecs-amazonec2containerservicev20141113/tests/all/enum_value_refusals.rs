@@ -23,7 +23,6 @@
 //!
 //! * `AssignPublicIp` — ENABLED, DISABLED
 //! * `AvailabilityZoneRebalancing` — ENABLED, DISABLED
-//! * `LaunchType` — EC2, FARGATE, EXTERNAL, MANAGED_INSTANCES
 //! * `Compatibility` (the element of `CompatibilityList`) — EC2, FARGATE, EXTERNAL,
 //!   MANAGED_INSTANCES
 //! * `PropagateTags` — TASK_DEFINITION, SERVICE, NONE
@@ -36,6 +35,10 @@
 //!   regard to ASCII case, since Amazon ECS serves a task listing whose `desiredStatus`
 //!   names a member in another case; `crate::task_listing_filters` pins that, and the row
 //!   here sends a value outside the set in every case)
+//!
+//! `LaunchType` is NOT one of them: the launch types the sentence lists are the ones the
+//! OPERATION publishes rather than the member's modelled set, so that one is pinned by
+//! `crate::operation_worded_refusals`.
 //!
 //! The closing section drives the rest of the recorded check: the refused create leaves no
 //! service behind, and the same request with the value spelled as the set spells it is
@@ -128,10 +131,6 @@ type EnumRow = (&'static str, &'static str, Value, &'static str);
 /// The sentence every `assignPublicIp` row expects — the string the corpus records.
 const ASSIGN_PUBLIC_IP: &str = "assign public ip should be one of [DISABLED,ENABLED]";
 
-/// The sentence every `launchType` row expects.
-const LAUNCH_TYPE: &str =
-    "launch type should be one of [EC2,EXTERNAL,FARGATE,MANAGED_INSTANCES]";
-
 #[tokio::test]
 async fn a_value_outside_an_enumerated_members_set_is_refused_naming_the_member_and_the_set() {
     let router = fixture().await;
@@ -192,35 +191,6 @@ async fn a_value_outside_an_enumerated_members_set_is_refused_naming_the_member_
                 "networkConfiguration": awsvpc_with(Some(" ENABLED ")),
             }),
             ASSIGN_PUBLIC_IP,
-        ),
-        (
-            "a lower-case launchType on a create",
-            "CreateService",
-            json!({
-                "cluster": CLUSTER,
-                "serviceName": "lower-case-launch",
-                "taskDefinition": FAMILY,
-                "desiredCount": 0,
-                "launchType": "fargate",
-            }),
-            LAUNCH_TYPE,
-        ),
-        (
-            "a launchType that names no launch type at all on a task launch",
-            "RunTask",
-            json!({
-                "cluster": CLUSTER,
-                "taskDefinition": FAMILY,
-                "launchType": "SPOT",
-                "networkConfiguration": awsvpc_with(None),
-            }),
-            LAUNCH_TYPE,
-        ),
-        (
-            "a launchType filter outside the set on a list",
-            "ListTasks",
-            json!({ "cluster": CLUSTER, "launchType": "ec2" }),
-            LAUNCH_TYPE,
         ),
         (
             "a lower-case propagateTags on a create",

@@ -809,6 +809,73 @@ pub fn enum_value_message(member_path: &str, accepted: &[String]) -> String {
     value_set_message(&member_words(member_path), &ascending)
 }
 
+/// `InvalidParameterException$message` for a member whose value an operation will not take,
+/// where the whole sentence is the fixed words and the MEMBER as the API publishes its name:
+/// `Invalid parameter: <Member>`.
+///
+/// Neither the value nor the position it sat at is echoed: a caller that sent the value has
+/// it already, and the member is what tells it which value to change.
+pub fn invalid_parameter_member_message(member: &str) -> String {
+    format!("Invalid parameter: {member}")
+}
+
+/// The clause a LIST member earns when its ELEMENTS fail the element type's own value set,
+/// as Amazon ECS states it: the violation is reported against the LIST — the whole list as
+/// the value, the list under the name the API prints for it, and the element's requirement
+/// nested inside the list's — rather than against the position of the first entry at fault.
+///
+/// One list is ONE violation however many of its entries are outside the set, so the
+/// envelope counts one. `accepted` is stated in the ascending order the modelled value sets
+/// of this crate are held in, which is the order Amazon ECS prints a value set in.
+///
+/// Every fixed part of the sentence comes from the tree's one speller of it: the clause
+/// itself is the FRAMEWORK's rendering of a violation ([`::smithy_server_runtime::Violation`]'s
+/// own `message`), the element's requirement and the wrapper that states an ELEMENT
+/// constraint at the collection member come from
+/// [`::service_common::validation_message`]'s `requirement` and `element_set_requirement`,
+/// and the envelope's count and separator from its `envelope_over` — so none of them can
+/// drift from what the framework's own walk writes. What this adds is the half only the
+/// REQUEST carries: the list the member held, and the name the API prints for that member.
+///
+/// The echoed list is BOUNDED at [`MAX_ECHOED_LIST`] bytes, through the same module's one
+/// character-boundary-safe elision (`quoted_echo_up_to`, the `<prefix>... [<n> bytes]`
+/// rendering the framework writes): its length is the caller's to choose, so a message that
+/// quoted it whole would turn a request into an arbitrarily long response.
+pub fn list_member_constraint_message(member: &str, carried: &[String], accepted: &[&str]) -> String {
+    let values: Vec<String> = accepted.iter().map(|value| (*value).to_string()).collect();
+    let kind = ::smithy_server_runtime::ViolationKind::EnumValue(values);
+    // The element's own requirement, and that requirement nested inside the one a clause
+    // states at the COLLECTION member: both are the shared module's spellings.
+    let element = ::service_common::validation_message::requirement(kind.clone());
+    let nested = ::service_common::validation_message::element_set_requirement(
+        ::std::slice::from_ref(&element),
+    );
+    // The clause around it is the FRAMEWORK's own rendering of a violation — the value half,
+    // the member path and the punctuation between them — with the element's requirement
+    // swapped for the nested one, the same substitution
+    // `::service_common::validation_message::valueless_clause` makes on the half it drops.
+    let joined = carried.join(ECHOED_LIST_SEPARATOR);
+    let echoed = ::service_common::validation::quoted_echo_up_to(&joined, MAX_ECHOED_LIST);
+    let clause = ::smithy_server_runtime::Violation {
+        path: member.to_string(),
+        kind,
+        value: Some(format!("[{echoed}]")),
+        sensitive: false,
+    }
+    .message()
+    .replace(&element, &nested);
+    ::service_common::validation_message::envelope_over(::std::slice::from_ref(&clause))
+        .unwrap_or(clause)
+}
+
+/// Ceiling on the caller-supplied list a message echoes, in bytes of the rendered entries:
+/// the framework's own ceiling on the value one clause quotes, so a clause this crate words
+/// quotes no more of a caller's value than one restored from the framework's walk.
+const MAX_ECHOED_LIST: usize = 256;
+
+/// What separates the entries of a list a message echoes.
+const ECHOED_LIST_SEPARATOR: &str = ", ";
+
 /// The member a task listing names the desired status it filters on, as the words a
 /// refusal of it carries are built from ([`member_words`]).
 pub const DESIRED_STATUS_MEMBER: &str = "desiredStatus";
@@ -2547,42 +2614,116 @@ pub const EXECUTE_COMMAND_TASK_SUBJECT: &str = "The task couldn't be launched";
 /// What [`execute_command_violation`] names in an `UpdateService` refusal.
 pub const EXECUTE_COMMAND_SERVICE_UPDATE_SUBJECT: &str = "The service couldn't be updated";
 
-/// The refusal a `loadBalancers` list earns when one of its bindings names a container,
-/// or a container port, the task definition it is bound to does not declare — or `None`
-/// when every binding resolves.
+/// `InvalidParameterException$message` for a member a request has to state a value in and
+/// left blank — absent, empty, or nothing but whitespace, which this API treats alike: the
+/// `subject` the refusal names that member by and the fixed words for a blank value.
+///
+/// One of the sentence family this API states a member's fault in (beside
+/// [`below_minimum_message`] and [`above_maximum_message`]), spelled once so every blank
+/// member earns the same words.
+pub fn blank_member_message(subject: &str) -> String {
+    format!("{subject} can not be blank.")
+}
+
+/// How a load-balancer binding's refusal names the member that says WHICH container of the
+/// task the binding attaches: the member's own name in words, capitalised as this API writes
+/// it in that sentence.
+pub const CONTAINER_NAME_SUBJECT: &str = "Container Name";
+
+/// `InvalidParameterException$message` for a member a request has to state and did not state
+/// at all: the `subject` the refusal names that member by and the fixed words for an absent
+/// one, with no trailing period and nothing of the request beside the member.
+///
+/// Told apart from [`blank_member_message`] because the two are different faults to the
+/// caller: a member it never sent, against one it sent with nothing in it.
+pub fn missing_member_sentence(subject: &str) -> String {
+    format!("{subject} is missing")
+}
+
+/// How a load-balancer binding's refusal names the member that says WHICH port of the
+/// container the binding attaches.
+pub const CONTAINER_PORT_SUBJECT: &str = "Container Port";
+
+/// The refusal a `loadBalancers` list earns for what its bindings NAME — the member that
+/// says which container, and the member that says which port — or `None` when every binding
+/// names a container of the revision and states a port.
 ///
 /// The rule: a load-balancer binding attaches ONE container port of the task to a target
-/// group, so the container it names must be one of the revision's `containerDefinitions`
-/// and the port must be one that container declares in its `portMappings` (as a single
-/// `containerPort`, or inside a `containerPortRange`). The refusal names the container and
-/// the port at fault, because it is derived from the request.
+/// group, so the container it names must be one of the revision's `containerDefinitions` and
+/// the binding must say which port of it. Each fault is the MEMBER's: left blank, naming no
+/// container of the revision, or not stated at all.
+///
+/// Answered BEFORE the stored target group the binding points at is judged: what the request
+/// names against the revision it names is resolved first, whatever the group it would
+/// register that container in carries. Whether that container DECLARES the port is the other
+/// half ([`load_balancer_binding_port_violation`]), which is about the traffic the
+/// attachment would carry and is answered with the target group's own pairing.
 pub fn load_balancer_binding_violation(
     definition: Option<&TaskDefinitionRecord>,
     load_balancers: &[LoadBalancer],
 ) -> Option<String> {
     let definition = definition?;
     for binding in load_balancers {
-        let Some(container_name) = binding.container_name.as_deref() else {
-            return Some(
-                "A load balancer configuration must specify the containerName it \
-                 attaches."
-                    .to_string(),
-            );
+        // A binding that names no container, or names one in blank text, has nothing to
+        // attach: Amazon ECS states that as the member being BLANK rather than as a
+        // container it could not find.
+        let Some(container_name) = named_container(binding) else {
+            return Some(blank_member_message(CONTAINER_NAME_SUBJECT));
+        };
+        if !definition
+            .container_definitions
+            .iter()
+            .any(|container| container.name.as_deref() == Some(container_name))
+        {
+            return Some(format!(
+                "The container {container_name} does not exist in the task definition."
+            ));
+        }
+        if binding.container_port.is_none() {
+            return Some(missing_member_sentence(CONTAINER_PORT_SUBJECT));
+        }
+    }
+    None
+}
+
+/// The container a binding names, or `None` when the member is absent or blank — the one
+/// reading of that member, so the two halves of the binding check cannot disagree about
+/// which container an entry names.
+fn named_container(binding: &LoadBalancer) -> Option<&str> {
+    binding
+        .container_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+/// The refusal a `loadBalancers` list earns when a binding names a port the container it
+/// attaches does not declare, or `None` when every binding's port is one its container
+/// declares in its `portMappings` (as a single `containerPort`, or inside a
+/// `containerPortRange`).
+///
+/// The half of the binding check that is about the TRAFFIC the attachment would carry, so it
+/// is answered with the target group's own pairing rather than with the members the binding
+/// states ([`load_balancer_binding_violation`]). A binding whose members this store has not
+/// resolved yet is skipped here: that is the other half's refusal.
+pub fn load_balancer_binding_port_violation(
+    definition: Option<&TaskDefinitionRecord>,
+    load_balancers: &[LoadBalancer],
+) -> Option<String> {
+    let definition = definition?;
+    for binding in load_balancers {
+        let Some(container_name) = named_container(binding) else {
+            continue;
         };
         let Some(container) = definition
             .container_definitions
             .iter()
             .find(|container| container.name.as_deref() == Some(container_name))
         else {
-            return Some(format!(
-                "The container {container_name} does not exist in the task definition."
-            ));
+            continue;
         };
         let Some(container_port) = binding.container_port else {
-            return Some(format!(
-                "The container {container_name} load balancer configuration must specify \
-                 a containerPort."
-            ));
+            continue;
         };
         let declared = container
             .port_mappings
@@ -2948,15 +3089,31 @@ pub fn load_balancer_refusal(
     target_types: &HashMap<String, String>,
 ) -> Option<String> {
     let arns = requested_target_group_arns(load_balancers);
+    // `LoadBalancer$targetGroupArn` is "the full Amazon Resource Name (ARN)" of the target
+    // group: a value that is not an ARN at all names no group Amazon ECS could read in the
+    // caller's account, so the validation of it never happens and the refusal says so —
+    // rather than reporting a group that does not exist, which is the answer for an ARN that
+    // names none.
+    if arns
+        .iter()
+        .any(|arn| crate::state::request_arn::RequestArn::parse(arn).is_none())
+    {
+        return Some(UNVALIDATED_TARGET_GROUP_MESSAGE.to_string());
+    }
     for arn in &arns {
         if !target_types.contains_key(arn) {
-            return Some(format!(
-                "The target group with targetGroupArn {arn} does not exist"
-            ));
+            return Some(format!("The target group {arn} does not exist."));
         }
     }
     network_mode.and_then(|mode| target_group_type_refusal(&arns, mode, target_types))
 }
+
+/// `InvalidParameterException$message` for a `targetGroupArn` Amazon ECS could not validate
+/// at all: fixed text naming the member and the service role whose permissions the
+/// validation is made under, and nothing of the value the request carried.
+pub const UNVALIDATED_TARGET_GROUP_MESSAGE: &str =
+    "Unable to assume role and validate the specified targetGroupArn. Please verify that \
+     the ECS service role being passed has the proper permissions.";
 
 /// The compatibility half of [`load_balancer_refusal`]: the refusal the target groups in
 /// `arns` earn against a revision whose `networkMode` is `network_mode`, over those the

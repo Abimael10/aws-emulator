@@ -398,6 +398,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Each entry names ONE Elastic Load Balancing resource, through one of the two
+        // members that say which kind: an entry that fills both, or neither, attaches to
+        // nothing ([`crate::state::load_balancer_member_violation`]). A fault of the
+        // request, so it is decided before anything either member names is looked up.
+        if let Some(message) = crate::state::load_balancer_member_violation(&load_balancers) {
+            return Err(CreateServiceErrorModeled::ClientException(ClientException {
+                message: Some(message),
+            })
+            .into());
+        }
+
         // A CODE_DEPLOY-controlled service is deployed by shifting traffic between two
         // target groups, so it has to be BEHIND a load balancer: the same request under
         // the ECS controller is legal, which is why this is keyed on the controller and
@@ -862,6 +873,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A load-balancer binding attaches ONE container port of the task to a target
+        // group, so the container and the port it names have to be ones the revision
+        // declares. Checked BEFORE the stored target group the binding points at is judged:
+        // what the REQUEST itself names against the revision it names is resolved first, and
+        // only a binding that names a container port of that revision is then paired with
+        // the group it would register it in.
+        if let Some(message) =
+            crate::state::load_balancer_binding_violation(definition.as_ref(), &load_balancers)
+        {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // The pairing the target group's `TargetType` must satisfy: an `awsvpc` task is
         // registered by the IP of its own elastic network interface, every other network
         // mode by the container instance that runs it
@@ -887,6 +915,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &load_balancers,
             definition.as_ref().map(|found| found.network_mode.as_str()),
             &held_classic,
+            // Where this service's tasks will run: the launch type the request named, else
+            // the capacity providers of the strategy it named, else the cluster's own
+            // default strategy ([`crate::state::places_on_fargate`]).
+            crate::state::places_on_fargate(
+                input.launch_type.as_deref(),
+                if requested_strategy.is_empty() {
+                    &cluster_default_strategy
+                } else {
+                    &requested_strategy
+                },
+            ),
         ) {
             return Err(CreateServiceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
@@ -896,13 +935,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A load-balancer binding attaches ONE container port of the task to a target
-        // group, so the container and the port it names have to be ones the revision
-        // declares. Checked AFTER the target group's own type: a binding onto a group that
-        // cannot carry this revision's tasks at all is reported as that, whatever else the
-        // binding names.
+        // The other half of the binding: the port it attaches has to be one the container
+        // DECLARES, which is about the traffic the attachment would carry and so is answered
+        // beside the target group's own pairing
+        // ([`crate::state::load_balancer_binding_port_violation`]).
         if let Some(message) =
-            crate::state::load_balancer_binding_violation(definition.as_ref(), &load_balancers)
+            crate::state::load_balancer_binding_port_violation(definition.as_ref(), &load_balancers)
         {
             return Err(CreateServiceErrorModeled::InvalidParameterException(
                 InvalidParameterException {

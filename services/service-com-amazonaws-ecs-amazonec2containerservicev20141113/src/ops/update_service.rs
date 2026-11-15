@@ -445,6 +445,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into());
             }
+            // Each entry a request NAMES has to name ONE Elastic Load Balancing resource,
+            // exactly as at create ([`crate::state::load_balancer_member_violation`]).
+            if let Some(message) = crate::state::load_balancer_member_violation(requested) {
+                return Err(UpdateServiceErrorModeled::ClientException(ClientException {
+                    message: Some(message),
+                })
+                .into());
+            }
         }
         let effective_load_balancers = match &input.load_balancers {
             Some(requested) => requested.clone(),
@@ -924,15 +932,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A load-balancer binding attaches ONE container port of the task to a target
+        // group, so the container and the port it names have to be ones the revision
+        // declares. Checked BEFORE the stored target group the binding points at is judged,
+        // exactly as at create.
+        let network_mode = definition
+            .as_ref()
+            .map(|found| found.network_mode.as_str());
+        if let Some(message) =
+            crate::state::load_balancer_binding_violation(definition.as_ref(), effective_bindings)
+        {
+            return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // A `loadBalancers` list this request NAMES is validated whole — every target
         // group it names has to exist and to carry the target type the revision's
         // `networkMode` registers tasks as — and a request that names a task definition
         // is checked the same way against the target groups the service already holds,
         // because moving a service onto a revision with a different network mode changes
         // how its tasks register (`crate::state::load_balancer_refusal`).
-        let network_mode = definition
-            .as_ref()
-            .map(|found| found.network_mode.as_str());
         let refusal = if input.load_balancers.is_some() {
             crate::state::load_balancer_refusal(
                 &effective_load_balancers,
@@ -970,6 +993,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &effective_load_balancers,
                 network_mode,
                 &held_classic,
+                crate::state::places_on_fargate(
+                    effective_launch_type,
+                    effective_capacity_strategy,
+                ),
             )
         } else if input.task_definition.is_some() {
             network_mode.and_then(|mode| {
@@ -987,12 +1014,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A load-balancer binding attaches ONE container port of the task to a target
-        // group, so the container and the port it names have to be ones the revision
-        // declares. Checked AFTER the target group's own type, as at create.
-        if let Some(message) =
-            crate::state::load_balancer_binding_violation(definition.as_ref(), effective_bindings)
-        {
+        // The other half of the binding: the port it attaches has to be one the container
+        // DECLARES, answered beside the target group's own pairing, as at create.
+        if let Some(message) = crate::state::load_balancer_binding_port_violation(
+            definition.as_ref(),
+            effective_bindings,
+        ) {
             return Err(UpdateServiceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(message),

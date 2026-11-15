@@ -170,8 +170,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeServiceDeploymentsErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(crate::state::at_most_items_message(
-                            "service deployments",
+                        message: Some(crate::state::arn_count_message(
+                            "Service Deployment",
                             crate::state::MAX_DESCRIBE_SERVICE_DEPLOYMENTS,
                         )),
                     },

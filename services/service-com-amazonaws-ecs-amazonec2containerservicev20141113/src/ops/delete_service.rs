@@ -136,14 +136,18 @@ impl From<DeleteServiceErrorModeled> for DeleteServiceError {
     }
 }
 
-/// `ServiceNotFoundException$message` as THIS operation answers it: EMPTY.
+/// `ServiceNotFoundException` as THIS operation answers it: with NO `message` member at
+/// all.
 ///
 /// RECORDED behaviour, and the one place in this crate where two operations word the same
 /// condition differently — `UpdateService` states `crate::state::SERVICE_NOT_FOUND_MESSAGE`
 /// for a service name it cannot resolve, while a `DeleteService` of the same name in the
-/// same cluster carries no sentence at all. The member is still PRESENT, so a client that
-/// reads the message of a refusal reads an empty string rather than nothing.
-const SERVICE_NOT_FOUND_MESSAGE: &str = "";
+/// same cluster carries no sentence at all. The member is ABSENT rather than empty, so a
+/// client that tests for a message finds none and falls back to the error code, instead of
+/// printing a blank reason.
+fn service_not_found() -> ServiceNotFoundException {
+    ServiceNotFoundException { message: None }
+}
 
 /// The `DeleteService` operation.
 ///
@@ -239,12 +243,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let key = (cluster_name.clone(), name.clone());
         let Some(stored) = guard.services.get(&key) else {
-            return Err(DeleteServiceErrorModeled::ServiceNotFoundException(
-                ServiceNotFoundException {
-                    message: Some(SERVICE_NOT_FOUND_MESSAGE.to_string()),
-                },
-            )
-            .into());
+            return Err(
+                DeleteServiceErrorModeled::ServiceNotFoundException(service_not_found()).into(),
+            );
         };
 
         // "You can delete a service if you have no running tasks in it and the desired

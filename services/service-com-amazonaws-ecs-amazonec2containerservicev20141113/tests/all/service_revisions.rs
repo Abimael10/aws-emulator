@@ -487,7 +487,7 @@ async fn arns_that_name_no_captured_revision_are_reported_as_failures() {
         "case {case:?}: expected a bounded list to be refused, got {code} with {message:?}"
     );
     assert_eq!(
-        message, "service revisions can have at most 20 items.",
+        message, "Service Revision ARN count cannot exceed 20",
         "case {case:?}: expected the bound to be named, got {message:?}"
     );
 }

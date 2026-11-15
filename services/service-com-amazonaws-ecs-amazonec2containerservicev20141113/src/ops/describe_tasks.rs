@@ -170,12 +170,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .any(|field| field == "TAGS");
 
         // One request names at most `MAX_DESCRIBE_BATCH` tasks, so the work it does and
-        // the bytes it answers with are bounded however long its `tasks` list is.
+        // the bytes it answers with are bounded however long its `tasks` list is. The noun
+        // the sentence states the list by is the one Amazon ECS publishes for it, which is
+        // not the wire member's name here: the member is `tasks` and the refusal says
+        // `taskIds` ([`crate::state::at_most_items_message`]).
         if input.tasks.len() > crate::state::MAX_DESCRIBE_BATCH {
             return Err(DescribeTasksErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(crate::state::at_most_items_message(
-                        "tasks",
+                        "taskIds",
                         crate::state::MAX_DESCRIBE_BATCH,
                     )),
                 },

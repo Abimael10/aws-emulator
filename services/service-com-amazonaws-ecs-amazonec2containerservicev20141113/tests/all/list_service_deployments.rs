@@ -857,13 +857,13 @@ async fn list_service_deployments_resolves_one_service_and_refuses_what_names_no
             &router,
             "ListServiceDeployments",
             json!({ "cluster": "listing", "service": "web", "nextToken": token }),
-            "ClientException",
+            "InvalidParameterException",
             case,
         )
         .await;
         assert_eq!(
             body["message"].as_str(),
-            Some("Invalid nextToken."),
+            Some("Invalid parameter: NextToken"),
             "case {case:?}: expected the one sentence ECS answers for an unusable token, \
              got {body}"
         );

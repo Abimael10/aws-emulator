@@ -41,6 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 pub mod authorization;
+pub mod refusal_wording;
 pub mod request_pipeline;
 
 use aws_smithy_schema::Schema;
@@ -61,6 +62,30 @@ pub fn read_input<T: DeserializableStruct>(
 ) -> Option<T> {
     let mut deserializer = protocol.deserialize_input(req, schema).ok()?;
     T::deserialize(&mut *deserializer).ok()
+}
+
+/// The REQUIRED member `req` leaves out, as the same read reports it — `None` when the
+/// request carries every required member, and for a body that cannot be read at all for
+/// some other reason.
+///
+/// A member the shape requires is found absent while the request is being READ rather than
+/// while the value that was read is walked, so it travels as the read's own error naming the
+/// member ([`aws_smithy_schema::serde::SerdeError::MissingMember`]) rather than as a
+/// violation. This answers that name, so a layer running before dispatch can state the
+/// sentence the OPERATION words such a refusal with ([`refusal_wording`]) instead of the
+/// clause the framework's walk would render from the member alone.
+pub fn absent_member<T: DeserializableStruct>(
+    protocol: &dyn ServerHttpProtocol,
+    schema: &'static Schema,
+    req: &aws_smithy_runtime_api::http::Request,
+) -> Option<String> {
+    let mut deserializer = protocol.deserialize_input(req, schema).ok()?;
+    match T::deserialize(&mut *deserializer) {
+        Err(aws_smithy_schema::serde::SerdeError::MissingMember { member_name }) => {
+            Some(member_name)
+        }
+        _ => None,
+    }
 }
 
 /// The error this service answers a request refused before any handler ran with: "The

@@ -145,6 +145,10 @@ mod load_balanced_task_health_check_port;
 mod load_balanced_task_propagation;
 #[path = "all/load_balancer_pairing_refusal_wording.rs"]
 mod load_balancer_pairing_refusal_wording;
+// WHICH load-balancer fault a request wrong in more than one way is refused for: the members
+// an entry states are judged before the stored group they point at.
+#[path = "all/load_balancer_refusal_order.rs"]
+mod load_balancer_refusal_order;
 #[path = "all/load_balancer_target_group_placement.rs"]
 mod load_balancer_target_group_placement;
 #[path = "all/load_balancer_target_groups.rs"]
@@ -166,6 +170,11 @@ mod name_pattern_refusals;
 // minted names no position.
 #[path = "all/opaque_page_tokens.rs"]
 mod opaque_page_tokens;
+// What Amazon ECS says when the sentence a refusal carries belongs to the OPERATION rather
+// than to the member at fault: the launch types an operation publishes, the identifier it
+// requires, its page token, its bounded lists, and the refusal it states with no message.
+#[path = "all/operation_worded_refusals.rs"]
+mod operation_worded_refusals;
 #[path = "all/page_size_range_refusals.rs"]
 mod page_size_range_refusals;
 #[path = "all/placement_resolution.rs"]

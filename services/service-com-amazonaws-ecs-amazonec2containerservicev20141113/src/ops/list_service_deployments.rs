@@ -158,6 +158,23 @@ impl From<ListServiceDeploymentsErrorModeled> for ListServiceDeploymentsError {
     }
 }
 
+/// The member this listing resumes a page from, as the API publishes its name — the
+/// capitalised form a refusal states, not the `nextToken` the wire member is spelled with.
+const NEXT_TOKEN_MEMBER: &str = "NextToken";
+
+/// `InvalidParameterException$message` for a `nextToken` this listing cannot resume from:
+/// the fixed words and the member, and nothing of the value the request carried
+/// ([`crate::state::invalid_parameter_member_message`]).
+///
+/// Which CLASS and which sentence a cursor refusal carries is a property of the OPERATION:
+/// this listing answers the modelled `InvalidParameterException` — the class a client may
+/// restart its pagination on — while the listings that answer
+/// [`crate::state::INVALID_NEXT_TOKEN_MESSAGE`] under `ClientException` keep theirs, and
+/// `ListClusters` words its own.
+fn invalid_next_token_message() -> String {
+    crate::state::invalid_parameter_member_message(NEXT_TOKEN_MEMBER)
+}
+
 /// The `ListServiceDeployments` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -340,9 +357,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // position the next page resumes from, authenticated under this store's own secret
         // and bound to this listing's scope ([`crate::state::page_tokens`]), so it discloses
         // no deployment of the service. A value this listing never minted, and one whose
-        // position names no deployment of this service, name no page: a `ClientException`,
-        // the error for a request "specifying an identifier that isn't valid", rather than
-        // some insertion point in the sequence.
+        // position names no deployment of this service, name no page: the modelled
+        // `InvalidParameterException`, whose sentence names the MEMBER the value came in
+        // ([`invalid_next_token_message`]), rather than some insertion point in the
+        // sequence.
         let page_scope = crate::state::listing_scope(Self::NAME, &[&cluster_name, &service_name]);
         let token_key = guard.page_token_key();
         let start = match input.next_token.as_deref() {
@@ -358,12 +376,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         },
                     )
                 else {
-                    return Err(ListServiceDeploymentsErrorModeled::ClientException(
-                        ClientException {
-                            message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
-                        },
-                    )
-                    .into());
+                    return Err(
+                        ListServiceDeploymentsErrorModeled::InvalidParameterException(
+                            InvalidParameterException {
+                                message: Some(invalid_next_token_message()),
+                            },
+                        )
+                        .into(),
+                    );
                 };
                 matching.partition_point(|deployment| deployment.order_key() > resume)
             }

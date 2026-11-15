@@ -36,7 +36,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
     answered, create_cluster, identity_document, identity_document_signature, list, ok, refusal,
-    register_definition, register_instance, service, string, ACCOUNT, SIGNED_REGION,
+    refused, register_definition, register_instance, service, string, ACCOUNT, SIGNED_REGION,
 };
 
 /// One row of an operation table: the operation, and the request it builds around the
@@ -893,21 +893,18 @@ async fn a_service_that_does_not_exist_is_worded_by_the_operation_that_was_refus
         );
 
         let case = format!("DeleteService naming {name:?}");
-        let (code, message) = refusal(
+        let body = refused(
             &router,
             "DeleteService",
             json!({ "cluster": CLUSTER, "service": name }),
+            "ServiceNotFoundException",
             &case,
         )
         .await;
-        assert_eq!(
-            code, "ServiceNotFoundException",
-            "case {case:?}: expected a ServiceNotFoundException, got {code} with \
-             {message:?}"
-        );
-        assert_eq!(
-            message, "",
-            "case {case:?}: expected the delete to carry no sentence, got {message:?}"
+        assert!(
+            body.get("message").is_none(),
+            "case {case:?}: expected the delete to carry no message member at all, got \
+             {body}"
         );
     }
 
