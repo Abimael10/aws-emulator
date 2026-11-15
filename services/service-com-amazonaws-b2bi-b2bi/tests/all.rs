@@ -41,6 +41,8 @@ mod references_logging_and_quota;
 mod refusal_wording;
 #[path = "all/starter_mapping_template.rs"]
 mod starter_mapping_template;
+#[path = "all/starter_template_round_trip.rs"]
+mod starter_template_round_trip;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_resource.rs"]

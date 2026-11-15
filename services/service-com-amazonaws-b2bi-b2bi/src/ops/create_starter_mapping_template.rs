@@ -31,21 +31,29 @@
 //! group, holding a transaction:
 //!
 //! ```text
-//! interchanges[0]                      ISA elements, then IEA elements
-//!   functional_groups[0]               GS elements, then GE elements
-//!     transactions[0]                  ST elements, then SE elements
-//!       segments[0]                     the transaction set's beginning segment
+//! interchanges[0]                      ISA01..ISA15, the interchange header's data
+//!   functional_groups[0]               GS01..GS08, the functional group header
+//!     transactions[0]                  ST01..ST03, the transaction set header
+//!       segments[0..]                   one object per segment of the transaction set
 //! ```
+//!
+//! A template asks the caller for the fields a mapping SUPPLIES and for nothing an EDI
+//! writer derives itself, so it carries no envelope TRAILER (IEA, GE and SE hold the count
+//! of what the envelope encloses and the echo of its control number, which
+//! `super::test_conversion` computes from the document) and no ISA16, which declares the
+//! component element separator the interchange is written with rather than data in it.
 //!
 //! An envelope segment's elements sit directly in the object that holds the segment, keyed
 //! `<SEGMENT>_<position>_<ElementName>` (`ST_01_TransactionSetIdentifierCode`). The
-//! segments INSIDE the transaction sit in its `segments` list, one object each, carrying
-//! the segment's id under `segment_id` and its elements keyed `<SEGMENT>_<position>`
-//! (`BEG_01`) — the very shape this service's X12 reader builds for a parsed document
-//! ([`super::test_parsing::parse_x12`]), because a mapping written against this template
-//! is evaluated into a document that reader's own output is compared with. A template
-//! DERIVED FROM A SAMPLE therefore also carries that reader's detail-table loops
-//! (`PO1-8000_loop`), one entry per occurrence in the sample.
+//! segments INSIDE the transaction sit in its `segments` list, one object each, its
+//! elements keyed `<SEGMENT>_<position>` (`BEG_01`) — which is also what NAMES the segment,
+//! as the X12 reader's `segment_id` marker does for a parsed document
+//! ([`super::test_parsing::parse_x12`]), because a mapping written against this template is
+//! evaluated into a document that reader's own output is compared with. A template DERIVED
+//! FROM A SAMPLE is the sample's own parsed document with its business fields marked, so it
+//! carries that reader's members as the reader wrote them — the envelope trailers it read,
+//! the `segment_id` of each segment, and its detail-table loops (`PO1-8000_loop`), one
+//! entry per occurrence in the sample.
 //!
 //! ## Shape of an operation
 //!
@@ -229,9 +237,9 @@ const X12_RESPONSIBLE_AGENCY_CODE: &str = "X";
 /// describes the very document that reader builds, so the two cannot disagree about the
 /// name of an element or of a member.
 use super::test_parsing::{
-    isa_element_names, FUNCTIONAL_GROUPS_KEY, FUNCTIONAL_GROUP_ITEM, GE_ELEMENTS, GS_ELEMENTS,
-    IEA_ELEMENTS, INTERCHANGES_KEY, INTERCHANGE_ITEM, SEGMENTS_KEY, SEGMENT_ID_KEY, SEGMENT_ITEM,
-    SE_ELEMENTS, ST_ELEMENTS, TRANSACTIONS_KEY, TRANSACTION_ITEM,
+    isa_element_names, FUNCTIONAL_GROUPS_KEY, FUNCTIONAL_GROUP_ITEM, GS_ELEMENTS,
+    INTERCHANGES_KEY, INTERCHANGE_ITEM, SEGMENTS_KEY, SEGMENT_ITEM, ST_ELEMENTS, TRANSACTIONS_KEY,
+    TRANSACTION_ITEM,
 };
 
 /// The value a starter template carries wherever the caller must supply the content:
@@ -648,6 +656,183 @@ fn beginning_segment(transaction_set_code: &str) -> Option<&'static BeginningSeg
         .map(|(_, segment)| segment)
 }
 
+/// A segment of a transaction set's body that follows its beginning segment: the X12
+/// segment id and the number of data elements the segment carries.
+///
+/// A body element is keyed by its POSITION alone ([`body_element_key`]), so the COUNT is
+/// everything a template needs of such a segment — unlike an envelope segment, whose
+/// elements are keyed by name as well.
+struct BodySegment {
+    /// The X12 segment id — `REF` for a reference identification.
+    id: &'static str,
+    /// How many data elements the ASC X12 segment directory gives that segment.
+    elements: usize,
+}
+
+/// One entry of a transaction set's table.
+const fn body(id: &'static str, elements: usize) -> BodySegment {
+    BodySegment { id, elements }
+}
+
+/// How many elements the CUR (Currency) segment carries in a generated template.
+///
+/// Read off the recorded template rather than off the X12 segment directory, which gives
+/// CUR twenty-one elements: the recorded purchase-order template carries `CUR_01` through
+/// `CUR_09`, so nine is what a caller writing a mapping against this template addresses.
+const CUR_ELEMENTS: usize = 9;
+
+/// The segments of a transaction set's body that FOLLOW its beginning segment, in the order
+/// the ASC X12 standard's table for that transaction set places them: the reference,
+/// contact, date and name segments of its heading table, the segment its detail table
+/// repeats, and the totals of its summary table.
+///
+/// Source: the heading, detail and summary tables of each named transaction set in the ASC
+/// X12 standard, and the element count the X12 segment directory gives each segment, except
+/// for the currency segment: the recorded template of a purchase order carries CUR with NINE
+/// elements (`CUR_01`..`CUR_09`) where the directory gives it twenty-one, so that count is
+/// taken from the recorded document ([`CUR_ELEMENTS`]). A transaction set this emulator
+/// carries no table for is generated with its beginning segment alone; the template is a
+/// STARTER either way, so the segments it does not carry are the ones the caller adds.
+const BODY_SEGMENTS: &[(&str, &[BodySegment])] = &[
+    (
+        // 850 Purchase Order: the baseline item segment repeats in its detail table.
+        "850",
+        &[
+            body("CUR", CUR_ELEMENTS),
+            body("REF", 4),
+            body("PER", 9),
+            body("DTM", 6),
+            body("N1", 6),
+            body("N2", 2),
+            body("N3", 2),
+            body("N4", 7),
+            body("PO1", 25),
+            body("PID", 9),
+            body("CTT", 7),
+        ],
+    ),
+    (
+        // 855 Purchase Order Acknowledgment: the same item segment, acknowledged.
+        "855",
+        &[
+            body("CUR", CUR_ELEMENTS),
+            body("REF", 4),
+            body("PER", 9),
+            body("DTM", 6),
+            body("N1", 6),
+            body("N2", 2),
+            body("N3", 2),
+            body("N4", 7),
+            body("PO1", 25),
+            body("PID", 9),
+            body("CTT", 7),
+        ],
+    ),
+    (
+        // 860 Purchase Order Change Request.
+        "860",
+        &[
+            body("CUR", CUR_ELEMENTS),
+            body("REF", 4),
+            body("PER", 9),
+            body("DTM", 6),
+            body("N1", 6),
+            body("N2", 2),
+            body("N3", 2),
+            body("N4", 7),
+            body("CTT", 7),
+        ],
+    ),
+    (
+        // 865 Purchase Order Change Acknowledgment.
+        "865",
+        &[
+            body("CUR", CUR_ELEMENTS),
+            body("REF", 4),
+            body("PER", 9),
+            body("DTM", 6),
+            body("N1", 6),
+            body("N2", 2),
+            body("N3", 2),
+            body("N4", 7),
+            body("CTT", 7),
+        ],
+    ),
+    (
+        // 810 Invoice: the baseline item data segment and the total monetary value summary.
+        "810",
+        &[
+            body("CUR", CUR_ELEMENTS),
+            body("REF", 4),
+            body("PER", 9),
+            body("DTM", 6),
+            body("N1", 6),
+            body("N2", 2),
+            body("N3", 2),
+            body("N4", 7),
+            body("IT1", 25),
+            body("PID", 9),
+            body("TDS", 4),
+            body("CTT", 7),
+        ],
+    ),
+    (
+        // 856 Ship Notice/Manifest: the hierarchical level segment and the item it carries.
+        "856",
+        &[
+            body("DTM", 6),
+            body("REF", 4),
+            body("HL", 4),
+            body("LIN", 31),
+            body("N1", 6),
+            body("N2", 2),
+            body("N3", 2),
+            body("N4", 7),
+            body("CTT", 7),
+        ],
+    ),
+    (
+        // 846 Inventory Inquiry/Advice: the item identification segment.
+        "846",
+        &[
+            body("REF", 4),
+            body("DTM", 6),
+            body("N1", 6),
+            body("N2", 2),
+            body("N3", 2),
+            body("N4", 7),
+            body("LIN", 31),
+            body("CTT", 7),
+        ],
+    ),
+    (
+        // 997 Functional Acknowledgment: the transaction set response header and the
+        // functional group response trailer.
+        "997",
+        &[body("AK2", 3), body("AK9", 9)],
+    ),
+    (
+        // 999 Implementation Acknowledgment: the same pair.
+        "999",
+        &[body("AK2", 3), body("AK9", 9)],
+    ),
+];
+
+/// Every segment of the body of `transaction_set_code`, in the order its X12 table places
+/// them: the beginning segment, then the segments [`BODY_SEGMENTS`] holds for it.
+fn transaction_set_segments(transaction_set_code: &str) -> Vec<BodySegment> {
+    let mut segments: Vec<BodySegment> = beginning_segment(transaction_set_code)
+        .map(|segment| vec![body(segment.id, segment.elements.len())])
+        .unwrap_or_default();
+    if let Some((_, following)) = BODY_SEGMENTS
+        .iter()
+        .find(|(code, _)| *code == transaction_set_code)
+    {
+        segments.extend(following.iter().map(|segment| body(segment.id, segment.elements)));
+    }
+    segments
+}
+
 /// The value a starter template carries wherever the caller must supply the content.
 fn placeholder() -> Node {
     Node::Text(PLACEHOLDER.to_string())
@@ -665,31 +850,42 @@ fn placeholder_elements(segment: &str, names: &[&str]) -> Vec<(String, Node)> {
 /// One segment INSIDE the transaction — the transaction set's own body, which the X12
 /// schema of that transaction set defines — as the object a `segments` list holds.
 ///
-/// It carries the segment's id under [`SEGMENT_ID_KEY`] and then one placeholder per
-/// element, keyed by segment id and position alone (`BEG_01`) rather than by element name
-/// the way an envelope segment's elements are: that is how this service's X12 reader keys
-/// a body segment's elements ([`super::test_parsing::parse_x12`]), and the document a
-/// mapping written against this template produces is read as one of those.
-fn body_segment(segment: &BeginningSegment) -> Node {
-    let mut members = vec![(
-        SEGMENT_ID_KEY.to_string(),
-        Node::Text(segment.id.to_string()),
-    )];
-    members.extend(
-        segment
-            .elements
-            .iter()
-            .enumerate()
-            .map(|(index, _)| (body_element_key(segment.id, index + 1), placeholder())),
-    );
-    Node::Map(members)
+/// It carries one placeholder per element, keyed by segment id and position alone
+/// (`BEG_01`) rather than by element name the way an envelope segment's elements are: the
+/// segment is NAMED by each of its element keys, so an object that carries the elements
+/// carries the segment, and that is the only member a generated template writes here.
+fn body_segment(segment: &BodySegment) -> Node {
+    Node::Map(
+        (1..=segment.elements)
+            .map(|position| (body_element_key(segment.id, position), placeholder()))
+            .collect(),
+    )
 }
 
-/// The interchange control header (ISA): sixteen positional elements, all of them the
-/// caller's to supply.
+/// The interchange control header (ISA) as a template carries it: the fifteen DATA elements,
+/// all of them the caller's to supply.
+///
+/// ISA16 is left out: it declares the component element SEPARATOR the interchange is written
+/// with, a delimiter of the file rather than data in it, so a template that asked the caller
+/// for an expression there would describe a document whose ISA16 is not a delimiter at all
+/// — which this service's X12 writer refuses (`super::test_conversion`).
 fn isa_elements(release: u32) -> Vec<(String, Node)> {
-    placeholder_elements("ISA", &isa_element_names(release))
+    let names = isa_element_names(release);
+    // Every element but the component element separator, taken out BY NAME rather than by
+    // position, so a reader whose element list changes still has its data elements written
+    // and this still omits the one delimiter. It is the LAST element of the header, so the
+    // positions of the ones kept are the positions they are keyed by.
+    let data_elements: Vec<&str> = names
+        .into_iter()
+        .filter(|name| *name != COMPONENT_SEPARATOR_ELEMENT)
+        .collect();
+    placeholder_elements("ISA", &data_elements)
 }
+
+/// The name the X12 reader gives ISA16, the element that declares the component element
+/// separator the interchange is written with — the one element of the interchange header a
+/// template leaves out ([`isa_elements`]).
+const COMPONENT_SEPARATOR_ELEMENT: &str = "ComponentSeparator";
 
 /// The functional group header (GS). GS07 is fixed at [`X12_RESPONSIBLE_AGENCY_CODE`] and
 /// GS08 is the version/release/industry identifier code the request determines; the first
@@ -737,9 +933,14 @@ fn st_elements(
 /// determine.
 ///
 /// The transaction's body — the segments between ST and SE, which differ with every
-/// transaction set — sits in its `segments` list, carrying the beginning segment of the
-/// requested transaction set; the segments after it are what the caller adds to the
-/// template. Every element this operation does not determine is a placeholder.
+/// transaction set — sits in its `segments` list, one object per segment of the requested
+/// transaction set's X12 table ([`transaction_set_segments`]); the segments after those are
+/// what the caller adds to the template. Every element this operation does not determine is
+/// a placeholder.
+///
+/// No envelope TRAILER is written: IEA, GE and SE carry the count of what the envelope
+/// encloses and the echo of its control number, which the EDI writer derives from the
+/// document itself (`super::test_conversion`), so they are not fields a mapping supplies.
 fn starter_document(
     transaction_set_code: &str,
     implementation_convention: Option<&str>,
@@ -747,16 +948,16 @@ fn starter_document(
     version_release_industry_code: &str,
 ) -> Node {
     let mut transaction = st_elements(transaction_set_code, implementation_convention);
-    if let Some(segment) = beginning_segment(transaction_set_code) {
+    let body = transaction_set_segments(transaction_set_code);
+    if !body.is_empty() {
         transaction.push((
             SEGMENTS_KEY.to_string(),
             Node::List {
                 item: SEGMENT_ITEM.to_string(),
-                items: vec![body_segment(segment)],
+                items: body.iter().map(body_segment).collect(),
             },
         ));
     }
-    transaction.extend(placeholder_elements("SE", SE_ELEMENTS));
 
     let mut functional_group = gs_elements(version_release_industry_code);
     functional_group.push((
@@ -766,7 +967,6 @@ fn starter_document(
             items: vec![Node::Map(transaction)],
         },
     ));
-    functional_group.extend(placeholder_elements("GE", GE_ELEMENTS));
 
     let mut interchange = isa_elements(release);
     interchange.push((
@@ -776,7 +976,6 @@ fn starter_document(
             items: vec![Node::Map(functional_group)],
         },
     ));
-    interchange.extend(placeholder_elements("IEA", IEA_ELEMENTS));
 
     Node::Map(vec![(
         INTERCHANGES_KEY.to_string(),

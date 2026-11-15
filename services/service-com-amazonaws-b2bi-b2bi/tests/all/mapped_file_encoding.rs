@@ -4,18 +4,25 @@
 //! (awsJson1_0, `x-amz-target: B2BI.TestMapping`) through the same router the emulator
 //! boots.
 //!
-//! The rule under test: `mappedFileContent` is a `String`, and what it holds is the mapped
-//! file's TEXT as a JSON string literal — so a client parses the member once for that text
-//! and parses the text for the mapped document. The encoding is a property of the MEMBER,
-//! not of the result's JSON type: a mapping whose result is a scalar is recovered by the
-//! same two steps as one whose result is an object, which is what makes the member
-//! readable at all for a projecting mapping.
+//! Two rules are under test here, both about the layer that carries a mapped document
+//! rather than about what the mapping computes (which `tests/all/test_mapping.rs` asserts):
 //!
-//! The rows differ along what the rule generalises over: the JSON type of the mapped
+//! * `mappedFileContent` is a `String`, and what it holds is the mapped file's TEXT as a
+//!   JSON string literal — so a client parses the member once for that text and parses the
+//!   text for the mapped document. The encoding is a property of the MEMBER, not of the
+//!   result's JSON type: a mapping whose result is a scalar is recovered by the same two
+//!   steps as one whose result is an object, which is what makes the member readable at all
+//!   for a projecting mapping.
+//! * an object of the mapped document carries its members in the order the document the
+//!   mapping READ writes them — never sorted, which a client diffing the mapped output
+//!   against an expected document would see as differences the mapping did not make. A
+//!   member the input document does not name follows the ones it does, so one request
+//!   always answers with one text.
+//!
+//! The rows differ along what the rules generalise over: the JSON type of the mapped
 //! result (object, array, string, number, boolean, null), whether the mapped text needs
-//! escaping (quotes, newlines, a backslash) and whether the result has no value at all.
-//! What the mapping COMPUTES is asserted by `tests/all/test_mapping.rs`; this suite is
-//! about the layer that carries it.
+//! escaping (quotes, newlines, a backslash), the member order of the input document, how
+//! deeply the members nest, and whether a mapped member comes from the input at all.
 
 use serde_json::{json, Value};
 
@@ -52,6 +59,16 @@ async fn mapped_member(
         .to_string()
 }
 
+/// The mapped file's text: one parse of the member, the way a client reads it.
+fn mapped_text(case: &str, member: &str) -> String {
+    serde_json::from_str::<String>(member).unwrap_or_else(|failure| {
+        panic!(
+            "case {case:?}: one parse of mappedFileContent {member:?} must yield the mapped \
+             file's text: {failure}"
+        )
+    })
+}
+
 /// RULE: `mappedFileContent` holds the mapped file's text JSON-string-encoded, whatever
 /// the mapped result's JSON type.
 #[tokio::test]
@@ -63,7 +80,7 @@ async fn mapped_file_content_holds_the_mapped_text_json_string_encoded() {
             "an object result",
             r#"{"orderId":"PO-1","amount":2}"#,
             "$",
-            "{\n  \"amount\": 2,\n  \"orderId\": \"PO-1\"\n}",
+            "{\n  \"orderId\": \"PO-1\",\n  \"amount\": 2\n}",
         ),
         (
             "an array result",
@@ -143,10 +160,10 @@ async fn mapped_file_content_holds_the_mapped_text_json_string_encoded() {
 
 /// RULE (the same member, read as a client reads it): the two parses are what recover the
 /// mapped document, and the identity template recovers the INPUT document — for a document
-/// of any shape.
+/// of any shape, member for member AND in the order that document writes its members.
 ///
-/// The rows differ along the document's shape (object, array, nested, scalar members) and
-/// the characters its values carry.
+/// The rows differ along the document's shape (object, array, nested, scalar members), the
+/// order its members are written in and the characters its values carry.
 #[tokio::test]
 async fn two_parses_recover_the_input_document_for_an_identity_mapping() {
     let router = b2bi_router();
@@ -164,13 +181,19 @@ async fn two_parses_recover_the_input_document_for_an_identity_mapping() {
             "values carrying quotes and newlines",
             r#"{"note":"a \"quoted\" line\nand more"}"#,
         ),
+        (
+            "members written in reverse alphabetical order",
+            r#"{"zulu":1,"mike":2,"alpha":3}"#,
+        ),
+        (
+            "a nested document whose members are written out of order",
+            r#"{"third":{"inner":3,"before":2},"first":1}"#,
+        ),
     ];
 
     for (case, input) in documents {
         let member = mapped_member(&router, case, input, "$").await;
-        let text: String = serde_json::from_str(&member).unwrap_or_else(|failure| {
-            panic!("case {case:?}: mappedFileContent {member:?} must hold text: {failure}")
-        });
+        let text = mapped_text(case, &member);
         let mapped: Value = serde_json::from_str(&text)
             .unwrap_or_else(|failure| panic!("case {case:?}: {text:?} must be JSON: {failure}"));
         let expected: Value = serde_json::from_str(input)
@@ -179,5 +202,111 @@ async fn two_parses_recover_the_input_document_for_an_identity_mapping() {
             mapped, expected,
             "case {case:?}: the identity mapping must recover the input document, got {mapped}"
         );
+
+        // The ORDER too: the names in the mapped text appear in the order the input wrote
+        // them, which a sorted answer would not do.
+        assert_eq!(
+            member_names(&text),
+            member_names(input),
+            "case {case:?}: the mapped text {text:?} must keep the member order of {input:?}"
+        );
     }
+}
+
+/// RULE: a mapped object's members are written in the order the INPUT DOCUMENT writes them,
+/// whatever order the template or the interpreter holds them in, and a member the input
+/// does not name follows the ones it does — so the same request always answers with the
+/// same text.
+#[tokio::test]
+async fn a_mapped_objects_members_follow_the_input_documents_order() {
+    let router = b2bi_router();
+
+    // Each row: the case, the input document, the template, and the member names the mapped
+    // text must carry, in order.
+    let cases: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "every member comes from the input, the template naming them in another order",
+            r#"{"orderId":"12345","item":"widget","quantity":3}"#,
+            r#"{"quantity": quantity, "orderId": orderId, "item": item}"#,
+            &["orderId", "item", "quantity"],
+        ),
+        (
+            "the input writes its members in reverse of the template's order",
+            r#"{"quantity":3,"item":"widget","orderId":"12345"}"#,
+            r#"{"orderId": orderId, "item": item, "quantity": quantity}"#,
+            &["quantity", "item", "orderId"],
+        ),
+        (
+            "a member the input does not carry follows the ones it does",
+            r#"{"orderId":"12345"}"#,
+            r#"{"total": 7, "orderId": orderId}"#,
+            &["orderId", "total"],
+        ),
+        (
+            "no member comes from the input, so the names order themselves",
+            "{}",
+            r#"{"zulu": 1, "alpha": 2}"#,
+            &["alpha", "zulu"],
+        ),
+        (
+            "a nested object follows the order of the document it was read from",
+            r#"{"outer":{"second":2,"first":1}}"#,
+            r#"{"outer": {"first": outer.first, "second": outer.second}}"#,
+            &["outer", "second", "first"],
+        ),
+    ];
+
+    for (case, input, template, expected) in cases {
+        let member = mapped_member(&router, case, input, template).await;
+        let text = mapped_text(case, &member);
+        assert_eq!(
+            member_names(&text),
+            *expected,
+            "case {case:?}: expected the member order {expected:?}, got {text:?}"
+        );
+        // Repeatable: the same request answers with the same text, byte for byte, which a
+        // hash-map order would not.
+        let again = mapped_member(&router, case, input, template).await;
+        assert_eq!(
+            again, member,
+            "case {case:?}: the same request must answer with the same text, got {again:?}"
+        );
+    }
+}
+
+/// The member names of every object in the JSON document `text`, in the order the document
+/// writes them — read off the TEXT, because a parsed `serde_json::Value` sorts them.
+fn member_names(text: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut characters = text.chars().peekable();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(character) = characters.next() {
+        if in_string {
+            if escaped {
+                current.push(character);
+                escaped = false;
+            } else if character == '\\' {
+                current.push(character);
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+                // A name is a string followed by a colon; anything else is a value.
+                let mut rest = characters.clone();
+                while rest.peek().is_some_and(|next| next.is_whitespace()) {
+                    rest.next();
+                }
+                if rest.peek() == Some(&':') {
+                    names.push(current.clone());
+                }
+                current.clear();
+            } else {
+                current.push(character);
+            }
+        } else if character == '"' {
+            in_string = true;
+        }
+    }
+    names
 }

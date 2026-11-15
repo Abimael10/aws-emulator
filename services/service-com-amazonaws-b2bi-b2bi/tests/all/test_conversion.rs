@@ -523,9 +523,9 @@ async fn a_document_that_is_not_a_b2bi_edi_document_is_refused() {
             "carries no transaction set header",
         ),
         (
-            "a body segment with no segment_id",
+            "a body segment with neither a segment_id nor an element key naming its segment",
             "JSON",
-            with_isa(&isa, json!({ "segments": [{ "BEG_01": "00" }] })),
+            with_isa(&isa, json!({ "segments": [{ "note": "no element of a segment" }] })),
             "carries no segment_id",
         ),
         (

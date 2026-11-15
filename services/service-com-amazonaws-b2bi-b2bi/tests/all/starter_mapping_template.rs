@@ -9,8 +9,9 @@
 //! X12 envelope carries the values the requested transaction set and version determine —
 //! ST01 the transaction set code, ST03 the implementation convention reference when the
 //! transaction set names one, GS08 the six-digit version/release code followed by that
-//! convention — with a placeholder wherever the caller must supply an expression; and it
-//! persists nothing, so the same request always answers with the same template.
+//! convention — with a placeholder wherever the caller must supply an expression, and with
+//! nothing an EDI writer derives itself (no envelope trailer, no ISA16); and it persists
+//! nothing, so the same request always answers with the same template.
 //!
 //! Each test asserts that rule over a TABLE whose rows differ along what it generalises
 //! over: mapping type, transaction set (with and without an implementation guide) and
@@ -50,9 +51,9 @@ fn mapping_template(case: &str, status: u16, body: &Value) -> String {
 }
 
 /// The transaction, functional group and interchange objects of a JSONATA template,
-/// which is a JSON document. Each one carries its own segment's elements directly: the
-/// transaction its ST and SE elements, the group its GS and GE elements, the interchange
-/// its ISA and IEA elements.
+/// which is a JSON document. Each one carries its own HEADER segment's elements directly:
+/// the transaction its ST elements, the group its GS elements, the interchange its ISA
+/// elements.
 fn segments(case: &str, template: &str) -> (Value, Value, Value) {
     let document: Value = serde_json::from_str(template).unwrap_or_else(|error| {
         panic!("case {case:?}: a JSONATA template must be a JSON document, got {error}: {template}")
@@ -321,13 +322,13 @@ async fn starter_template_carries_the_values_the_request_determines() {
 }
 
 #[tokio::test]
-async fn a_template_carries_the_transaction_sets_beginning_segment() {
+async fn a_template_carries_the_transaction_sets_body_segments() {
     let router = b2bi_router();
 
     // Each row: the case, the `X12TransactionSet` and `X12Version` values, and the X12
     // segment id that opens that transaction set's heading table — `None` for a
     // transaction set this emulator has no segment table for, whose template carries the
-    // envelope and the ST/SE pair alone.
+    // envelope and the ST header alone.
     let cases: Vec<(&str, &str, &str, Option<&str>)> = vec![
         ("850 purchase order", "X12_850", "VERSION_4010", Some("BEG")),
         ("810 invoice", "X12_810", "VERSION_4010", Some("BIG")),
@@ -371,26 +372,31 @@ async fn a_template_carries_the_transaction_sets_beginning_segment() {
         match segment {
             Some(id) => {
                 // The body segments sit in the transaction's `segments` list, each one an
-                // object carrying its `segment_id` and its elements keyed by position —
-                // the shape the X12 reader builds for a parsed document.
+                // object whose elements are keyed by segment and position — which is what
+                // names the segment, so the object carries no further member.
                 let body_segment = &transaction["segments"][0];
-                assert_eq!(
-                    body_segment["segment_id"].as_str(),
-                    Some(id),
-                    "case {case:?}: the template must open the transaction's body with {id}, \
-                     got {transaction:?}"
-                );
+                let elements = body_segment.as_object().unwrap_or_else(|| {
+                    panic!("case {case:?}: a segment is an object, got {body_segment}")
+                });
                 let first = format!("{id}_01");
                 assert_eq!(
                     body_segment[&first].as_str(),
                     Some(PLACEHOLDER),
                     "case {case:?}: {first} must be a placeholder, got {body_segment:?}"
                 );
+                for (position, key) in elements.keys().enumerate() {
+                    assert_eq!(
+                        key,
+                        &format!("{id}_{:02}", position + 1),
+                        "case {case:?}: the body's first segment carries the elements of {id} \
+                         keyed by position, got {body_segment}"
+                    );
+                }
             }
             None => assert!(
-                keys.iter()
-                    .all(|key| key.starts_with("ST_") || key.starts_with("SE_")),
-                "case {case:?}: with no segment table the transaction carries ST and SE only, got {keys:?}"
+                keys.iter().all(|key| key.starts_with("ST_")),
+                "case {case:?}: with no segment table the transaction carries its ST header \
+                 alone, got {keys:?}"
             ),
         }
     }
@@ -427,7 +433,6 @@ async fn template_elements_keep_their_positional_order() {
             "ISA_13_InterchangeControlNumber",
             "ISA_14_AcknowledgmentRequested",
             "ISA_15_TestIndicator",
-            "ISA_16_ComponentSeparator",
         ]
         .iter()
         .map(|element| {
@@ -440,6 +445,13 @@ async fn template_elements_keep_their_positional_order() {
         assert!(
             positions.windows(2).all(|pair| pair[0] < pair[1]),
             "case {case:?}: ISA elements must appear in positional order, got offsets {positions:?}"
+        );
+        // ISA16 declares the component element separator the interchange is written with — a
+        // delimiter of the file rather than data in it — so a template asks for no
+        // expression there.
+        assert!(
+            !template.contains("ISA_16"),
+            "case {case:?}: a template carries no ISA16, got {template}"
         );
     }
 }

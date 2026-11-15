@@ -725,18 +725,39 @@ fn body_segment(item: &Source, component: char) -> Result<Vec<Fields>, String> {
              {SEGMENT_ID_KEY} and its elements."
         ));
     };
-    let Some(id) = member(members, SEGMENT_ID_KEY).and_then(leaf) else {
+    let Some(id) = member(members, SEGMENT_ID_KEY)
+        .and_then(leaf)
+        .map(str::to_string)
+        .or_else(|| keyed_segment_id(members))
+    else {
         return Err(format!(
-            "A segment of the document carries no {SEGMENT_ID_KEY}, so the X12 segment it \
-             is cannot be told."
+            "A segment of the document carries no {SEGMENT_ID_KEY} and no element keyed by \
+             an X12 segment and position, so the X12 segment it is cannot be told."
         ));
     };
-    if !is_segment_id(id) {
+    if !is_segment_id(&id) {
         return Err(format!("{id:?} is not an X12 segment identifier."));
     }
-    let mut segments = vec![fields(id, segment_elements(id, members, component)?)];
+    let mut segments = vec![fields(&id, segment_elements(&id, members, component)?)];
     segments.extend(body_segments(member(members, SEGMENTS_KEY), component)?);
     Ok(segments)
+}
+
+/// The X12 segment a body segment's own ELEMENT KEYS name, for a segment written without
+/// the [`SEGMENT_ID_KEY`] marker.
+///
+/// Every element of a body segment is keyed by that segment and the element's position
+/// (`BEG_01`), so the segment is named by each of its elements, and a document that carries
+/// the elements carries the segment: that is the shape `CreateStarterMappingTemplate`'s
+/// generated template writes a transaction set's body in, so a mapping written against that
+/// template produces documents of this shape. The id is read off the FIRST such member, and
+/// a member that names an element of another segment is left to
+/// [`segment_elements`] to ignore, as it is for a segment that does carry the marker.
+fn keyed_segment_id(members: &[(String, Source)]) -> Option<String> {
+    members.iter().find_map(|(key, _)| {
+        let (id, _) = key.split_once('_')?;
+        element_position(id, key).map(|_| id.to_string())
+    })
 }
 
 /// One transaction set: ST, the segments of its body, then SE.

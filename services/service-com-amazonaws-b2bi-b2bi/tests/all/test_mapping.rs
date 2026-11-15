@@ -1058,12 +1058,14 @@ async fn mapping_is_repeatable_and_persists_nothing() {
         "the same request must map to the same document, got {first} then {second}"
     );
     // Byte-identical, not merely equivalent: the mapped document is written as text with
-    // every object's members in sorted key order, so the answer does not depend on the
-    // interpreter's hash order.
+    // every object's members in the order the input document names them — and these two are
+    // computed members the input does not name, so they fall back to name order — which is
+    // what keeps the answer independent of the interpreter's hash order.
     assert_eq!(
         mapped_text(&first),
         "{\n  \"count\": 2,\n  \"total\": 7\n}",
-        "expected the mapped document as pretty-printed, key-sorted text, got {first}"
+        "expected the mapped document as pretty-printed text whose computed members order by \
+         name, got {first}"
     );
     assert!(
         same_json(&mapped_document(&first), &json!({"total": 7, "count": 2})),

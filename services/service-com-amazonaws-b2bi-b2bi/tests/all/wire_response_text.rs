@@ -212,13 +212,12 @@ async fn an_unusable_pagination_token_is_refused_with_one_fixed_sentence() {
 /// compact serialization of one — with the text JSON-string-encoded into the member, so a
 /// client parses the member once for the mapped file's text.
 ///
-/// Every object's members are written in sorted key order, which makes the answer a
-/// function of the request alone: the interpreter holds an object's members in a hash map,
-/// so its own order varies between evaluations, and the order the real service answers
-/// (the one its mapping constructed) is not reproducible from it. The rows differ in the
-/// result's JSON type (object, array, string, number), its member count, how deeply it
-/// nests, and the order the request's own text writes the members in — which, being
-/// sorted here, the answer does not follow.
+/// Every object's members are written in the order the document the mapping READ writes
+/// them, a member that document does not name following the ones it does, by name: that
+/// makes the answer a function of the request alone, since the interpreter holds an
+/// object's members in a hash map whose own order varies between evaluations. The rows
+/// differ in the result's JSON type (object, array, string, number), its member count, how
+/// deeply it nests, and whether the members come from the input document.
 #[tokio::test]
 async fn a_mapped_document_is_answered_as_pretty_printed_text() {
     let router = b2bi_router();
@@ -227,13 +226,13 @@ async fn a_mapped_document_is_answered_as_pretty_printed_text() {
     // `mappedFileContent` string carries.
     let cases: Vec<(&str, &str, &str, &str)> = vec![
         (
-            "three members, written in neither the template's nor the document's order",
+            "three members the input document writes in another order",
             r#"{"quantity":3,"item":"widget","orderId":"12345"}"#,
             r#"{"orderId": orderId, "item": item, "quantity": quantity}"#,
-            "{\n  \"item\": \"widget\",\n  \"orderId\": \"12345\",\n  \"quantity\": 3\n}",
+            "{\n  \"quantity\": 3,\n  \"item\": \"widget\",\n  \"orderId\": \"12345\"\n}",
         ),
         (
-            "a computed member and a counted one",
+            "a computed member and a counted one, neither of them the input's",
             r#"{"items":[{"amount":3},{"amount":4}]}"#,
             r#"{"total": $sum(items.amount), "count": $count(items)}"#,
             "{\n  \"count\": 2,\n  \"total\": 7\n}",
@@ -245,22 +244,22 @@ async fn a_mapped_document_is_answered_as_pretty_printed_text() {
             "{\n  \"after\": 1,\n  \"outer\": {\n    \"first\": 1,\n    \"second\": 2\n  }\n}",
         ),
         (
-            "an array of objects",
+            "an array of objects, whose members the input document names",
             r#"{"rows":[{"b":1,"a":2}]}"#,
             r#"{"rows": [{"b": rows[0].b, "a": rows[0].a}]}"#,
-            "{\n  \"rows\": [\n    {\n      \"a\": 2,\n      \"b\": 1\n    }\n  ]\n}",
+            "{\n  \"rows\": [\n    {\n      \"b\": 1,\n      \"a\": 2\n    }\n  ]\n}",
         ),
         (
-            "the identity template over a document written out of order",
+            "the identity template over a document written out of alphabetical order",
             r#"{"third":3,"first":1,"second":2}"#,
             "$",
-            "{\n  \"first\": 1,\n  \"second\": 2,\n  \"third\": 3\n}",
+            "{\n  \"third\": 3,\n  \"first\": 1,\n  \"second\": 2\n}",
         ),
         (
             "a member whose name the template computes",
             r#"{"b":1}"#,
             r#"{"b": b, $string("z"): 1, $string("a"): 2}"#,
-            "{\n  \"a\": 2,\n  \"b\": 1,\n  \"z\": 1\n}",
+            "{\n  \"b\": 1,\n  \"a\": 2,\n  \"z\": 1\n}",
         ),
         (
             "an empty object",
@@ -319,10 +318,9 @@ async fn a_mapped_document_is_answered_as_pretty_printed_text() {
 
 /// RULE: a starter mapping template generated from `templateDetails` writes the service's
 /// one placeholder value wherever the caller must supply the content, and the segments of
-/// the transaction's body sit in its `segments` list — each one an object carrying its
-/// `segment_id` and its elements keyed by position — which is the shape this service's X12
-/// reader builds for a parsed document and therefore the shape a mapping written against
-/// the template produces.
+/// the transaction's body sit in its `segments` list — each one an object whose elements are
+/// keyed by segment and position, which is the shape this service's X12 reader builds for a
+/// parsed document and therefore the shape a mapping written against the template produces.
 ///
 /// The rows differ in the transaction set (so in the beginning segment and its element
 /// count) and in the X12 release.
@@ -381,26 +379,15 @@ async fn a_starter_template_marks_every_caller_supplied_field_with_one_placehold
         let transaction =
             &document["interchanges"][0]["functional_groups"][0]["transactions"][0];
         let body_segment = &transaction["segments"][0];
-        assert_eq!(
-            body_segment["segment_id"].as_str(),
-            Some(segment_id),
-            "case {case:?}: the body's first segment must be {segment_id}, got {transaction}"
-        );
-        assert!(
-            template.contains(&format!("\"segment_id\" : \"{segment_id}\"")),
-            "case {case:?}: the segments list carries the segment id, got {template}"
-        );
 
         // Every element of that segment is the placeholder, keyed by segment and
-        // position alone.
+        // position alone — which is also what names the segment, so the object carries no
+        // further member.
         let elements = body_segment
             .as_object()
             .unwrap_or_else(|| panic!("case {case:?}: a segment is an object, got {body_segment}"));
         let mut positions = 0usize;
         for (key, value) in elements {
-            if key == "segment_id" {
-                continue;
-            }
             positions += 1;
             assert_eq!(
                 key,

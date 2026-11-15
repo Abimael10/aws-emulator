@@ -94,7 +94,7 @@ pub fn json_parse_diagnostic(content: &str, failure: &::serde_json::Error) -> St
 ///
 /// `serde_json`'s own pretty layout — no space before the colon, every array element on a
 /// line of its own — is what the MAPPED document of a `TestMapping` answer is recorded
-/// with, so that operation writes its text with `serde_json::to_string_pretty` and the two
+/// with, so that operation writes its text with [`to_text_in_member_order`] and the two
 /// layouts stay apart.
 pub fn to_document_text<T: ::serde::Serialize + ?Sized>(document: &T) -> Result<String, String> {
     let mut text = Vec::new();
@@ -210,6 +210,176 @@ impl ::serde_json::ser::Formatter for DocumentFormatter {
         }
         self.wrote_member = true;
         writer.write_all(b"]")
+    }
+}
+
+/// The member names of every object in the JSON document `text`, in the order the document
+/// WRITES them, depth first — each object's names in turn, a nested document's names after
+/// the name it arrives under.
+///
+/// A mapped document's objects are answered in the order of the document they were built
+/// from ([`to_text_in_member_order`]), and `serde_json::Value` holds an object's members
+/// sorted, so the order has to be read off the parse itself: this records each member name
+/// as the parser reaches it. A document that does not parse writes no member, and answers
+/// an empty list.
+///
+/// What this holds is bounded by the document it reads: one name per object member, and the
+/// caller of this function bounds that document's size before anything parses it
+/// (`crate::ops::test_mapping`'s document ceiling). The walk recurses once per level of
+/// nesting, which `serde_json`'s own recursion limit — the same one that refuses an
+/// over-nested document on the parse before this one — is what bounds.
+pub fn member_order(text: &str) -> Vec<String> {
+    ::serde_json::from_str::<MemberOrder>(text)
+        .map(|order| order.0)
+        .unwrap_or_default()
+}
+
+/// The member names a JSON document writes, in document order, as a `serde` target.
+struct MemberOrder(Vec<String>);
+
+impl<'de> ::serde::Deserialize<'de> for MemberOrder {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(MemberOrderVisitor)
+    }
+}
+
+/// The visitor behind [`MemberOrder`]: a container records the names it writes, in order,
+/// and a scalar records none.
+struct MemberOrderVisitor;
+
+impl<'de> ::serde::de::Visitor<'de> for MemberOrderVisitor {
+    type Value = MemberOrder;
+
+    fn expecting(&self, formatter: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        formatter.write_str("a JSON document")
+    }
+
+    fn visit_map<A: ::serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> Result<Self::Value, A::Error> {
+        let mut names = Vec::new();
+        while let Some(name) = map.next_key::<String>()? {
+            names.push(name);
+            names.extend(map.next_value::<MemberOrder>()?.0);
+        }
+        Ok(MemberOrder(names))
+    }
+
+    fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
+        self,
+        mut sequence: A,
+    ) -> Result<Self::Value, A::Error> {
+        let mut names = Vec::new();
+        while let Some(nested) = sequence.next_element::<MemberOrder>()? {
+            names.extend(nested.0);
+        }
+        Ok(MemberOrder(names))
+    }
+
+    fn visit_unit<E: ::serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(MemberOrder(Vec::new()))
+    }
+
+    fn visit_bool<E: ::serde::de::Error>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(MemberOrder(Vec::new()))
+    }
+
+    fn visit_i64<E: ::serde::de::Error>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(MemberOrder(Vec::new()))
+    }
+
+    fn visit_u64<E: ::serde::de::Error>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(MemberOrder(Vec::new()))
+    }
+
+    fn visit_f64<E: ::serde::de::Error>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(MemberOrder(Vec::new()))
+    }
+
+    fn visit_str<E: ::serde::de::Error>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(MemberOrder(Vec::new()))
+    }
+}
+
+/// `value` as the pretty-printed JSON TEXT a mapped document is carried as — two-space
+/// indentation, a space AFTER each member's colon, one array element per line — with every
+/// object's members in the order `order` writes them.
+///
+/// A member `order` does not name follows the ones it does, by name, so one request always
+/// answers with one text: the interpreter holds an object's members in a hash map, whose own
+/// iteration order varies between evaluations, so SOME order has to be imposed and this is
+/// the one the document the mapping read was written in.
+///
+/// `serde_json::Value` would sort the members, so the ordered tree is serialized through
+/// [`InMemberOrder`] instead.
+pub fn to_text_in_member_order(
+    value: ::serde_json::Value,
+    order: &[String],
+) -> Result<String, String> {
+    let mut ranks: ::std::collections::HashMap<&str, usize> =
+        ::std::collections::HashMap::with_capacity(order.len());
+    for (rank, name) in order.iter().enumerate() {
+        ranks.entry(name.as_str()).or_insert(rank);
+    }
+    ::serde_json::to_string_pretty(&in_member_order(value, &ranks)).map_err(|f| f.to_string())
+}
+
+/// A JSON document whose objects keep the member order they were given, rather than the
+/// sorted order a `serde_json::Value` holds them in.
+enum InMemberOrder {
+    /// A value with no member of its own: a string, a number, a boolean or null.
+    Scalar(::serde_json::Value),
+    /// A list, each element ordered in turn.
+    Array(Vec<InMemberOrder>),
+    /// An object's members, in the order they are to be written.
+    Object(Vec<(String, InMemberOrder)>),
+}
+
+impl ::serde::Serialize for InMemberOrder {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            InMemberOrder::Scalar(value) => value.serialize(serializer),
+            InMemberOrder::Array(items) => serializer.collect_seq(items.iter()),
+            InMemberOrder::Object(members) => {
+                serializer.collect_map(members.iter().map(|(name, value)| (name.as_str(), value)))
+            }
+        }
+    }
+}
+
+/// `value` with every object's members ordered by the rank `ranks` gives their name, a
+/// member it does not rank after the ones it does and ordered by name among themselves.
+fn in_member_order(
+    value: ::serde_json::Value,
+    ranks: &::std::collections::HashMap<&str, usize>,
+) -> InMemberOrder {
+    match value {
+        ::serde_json::Value::Array(items) => InMemberOrder::Array(
+            items
+                .into_iter()
+                .map(|item| in_member_order(item, ranks))
+                .collect(),
+        ),
+        ::serde_json::Value::Object(members) => {
+            let mut ordered: Vec<(String, ::serde_json::Value)> = members.into_iter().collect();
+            ordered.sort_by(|(left, _), (right, _)| {
+                let rank = |name: &str| ranks.get(name).copied();
+                match (rank(left), rank(right)) {
+                    (Some(left_rank), Some(right_rank)) => left_rank.cmp(&right_rank),
+                    (Some(_), None) => ::std::cmp::Ordering::Less,
+                    (None, Some(_)) => ::std::cmp::Ordering::Greater,
+                    (None, None) => left.cmp(right),
+                }
+            });
+            InMemberOrder::Object(
+                ordered
+                    .into_iter()
+                    .map(|(name, member)| (name, in_member_order(member, ranks)))
+                    .collect(),
+            )
+        }
+        scalar => InMemberOrder::Scalar(scalar),
     }
 }
 

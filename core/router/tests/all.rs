@@ -12,14 +12,12 @@
 // the first item is `E0753`, the list is pairs-sorted-and-nothing-else, and every file under
 // `tests/all/` is declared. Every comment here is an ordinary `//` one, this header included,
 // so no merge of two landings can leave a doc comment past the first item.
-//
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of
 // this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each
 // declaration is what points it into `tests/all/`. Some of the files below are shared
 // harnesses or probes rather than suites; all are declared, because a file no declaration
 // names is compiled nowhere.
 // Single integration-test target for the router: the DECLARATION LIST, and nothing else.
-//
 // Put a new suite at `tests/all/<name>.rs` and insert its
 // `#[path = "all/<name>.rs"]` / `mod <name>;` pair into the sorted list below. The list
 // holds one pair per suite and no other line, so two branches landing at once insert two
@@ -30,7 +28,6 @@
 // target. With none anywhere in the file, no merge of two landings can put one past the
 // first item.
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of
-// this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each
 // `mod` is what points the declaration into `tests/all/`. A suite file no `mod` here names
 // is compiled nowhere and this crate's build script refuses it, and a second `mod` for one
 // name is `E0428`, which fails every suite in this target.
@@ -1340,3 +1337,16 @@ mod cloudtrail_iam_credential_write_audit;
 // deliberate: with no `//!` anywhere, no merge of two landings can leave a doc comment past
 // the first item.
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair into the sorted list below — one pair per
+// suite and no other line, so two branches landing at once insert two lines in two places
+// and have no prose to duplicate, re-word or mistype.
+// deliberate: an inner doc comment (`//!`) is legal only before the first item, so one that
+// lands past the declarations is `E0753` and compiles no suite of this target. With no `//!`
+// anywhere in the file, no merge of two landings can leave one past the first item.
+// A suite no `mod` here names compiles nowhere and its tests never run; a suite left at the
+// top level of `tests/` fails the build; and a second `mod` for one name is `E0428`. Each
+// fails every suite in this target, which is why `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs` and
+// `all/declaration_roots_are_canonical_and_complete.rs` check the shape rather than restate
+// it. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING
+// test it explains; the notes earlier landings appended here live in `all/appended_notes.rs`.

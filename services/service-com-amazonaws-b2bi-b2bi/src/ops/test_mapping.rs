@@ -147,14 +147,15 @@
 //!   so it is that document rendered to TEXT: pretty-printed with two-space indentation
 //!   (see [`mapped_document_text`]) and then JSON-string-encoded into the member
 //!   ([`mapped_file_member`]), so a caller parses the member once for the mapped file's
-//!   text and parses that text for the document. Every object's members are in SORTED key
-//!   order. That last part is a known divergence, not a rule: the real service writes a
-//!   mapped object's
-//!   members in the order its mapping constructed them, and nothing here can reproduce that
-//!   order — the interpreter holds an object's members in a hash map, so its own order
-//!   varies between evaluations, and it exposes no typed view of the parsed template to
-//!   read the construction order from. A test written to run against AWS as well should
-//!   compare `mappedFileContent` as PARSED JSON rather than as a byte string;
+//!   text and parses that text for the document. Every object's members are written in the
+//!   order the document the mapping read writes them, a member that document does not name
+//!   after the ones it does. The real service writes them in the order its mapping
+//!   CONSTRUCTED them, which for a mapping that carries its input's members through is the
+//!   same order; for a member the input does not carry, the order is this emulator's,
+//!   because the interpreter holds an object's members in a hash map whose own order varies
+//!   between evaluations and exposes no typed view of the parsed template to read the
+//!   construction order from. A test written to run against AWS as well should compare
+//!   `mappedFileContent` as PARSED JSON rather than as a byte string;
 //! * a template using a regular-expression literal, `$distinct` or `$pad` is answered
 //!   with the 501 that names the construct this emulator does not evaluate instead of
 //!   mapped ([`unbounded_construct`] gives the bound each one lacks, and the measured
@@ -419,8 +420,8 @@ static EVALUATION_PERMITS: ::tokio::sync::Semaphore =
 /// How many evaluation THREADS may exist at once, including any that outran the request
 /// that started them.
 ///
-/// The permit recycles with the request, so this is the bound that keeps a flood \u2014 or a
-/// template whose last step runs long \u2014 from piling threads and arenas up without limit:
+/// The permit recycles with the request, so this is the bound that keeps a flood — or a
+/// template whose last step runs long — from piling threads and arenas up without limit:
 /// a request that would start the (n+1)th is throttled instead. Slack over
 /// [`MAX_CONCURRENT_EVALUATIONS`], not a multiple of it, so the resident footprint stays a
 /// small multiple of [`MAX_EVALUATION_ARENA_BYTES`] while a slow evaluation handing its
@@ -435,7 +436,7 @@ static LIVE_EVALUATIONS: ::std::sync::atomic::AtomicUsize =
 /// runs.
 ///
 /// Constructed BEFORE the thread is spawned and moved into it, so the count falls when
-/// the evaluation really ends \u2014 including when it ends long after the request that
+/// the evaluation really ends — including when it ends long after the request that
 /// started it was answered by [`EVALUATION_DEADLINE`]. That is what makes the recycled
 /// permit safe: the permit says how many requests may be evaluating, and this says how
 /// many threads may exist, so neither a flood nor a wedged evaluation can grow the
@@ -946,24 +947,20 @@ fn ceiling_not_implemented(detail: String) -> TestMappingError {
 /// JSON-string-encoded — see [`mapped_file_member`], which is the last step before the
 /// answer, so the text itself is what a transformer job writes to its output file.
 ///
-/// Every object's members are written in sorted key order. That is NOT the order the real
-/// service answers — it writes the members in the order the mapping constructed them — and
-/// this emulator cannot reproduce that order: the interpreter holds an object's members in
-/// a hash map, so its own order varies between evaluations, and `jsonata-rs` declares the
-/// parsed expression's `mod parser` privately, so there is no typed view of the template's
-/// construction order to take it from either. Sorting is what keeps the same request
-/// answering the same text; the member ORDER is a known divergence rather than a rule this
-/// handler implements.
+/// Every object's members are written in the order the DOCUMENT THE MAPPING READ writes
+/// them (`input_order`, from [`crate::state::documents::member_order`]), a member that
+/// document does not name after the ones it does: the interpreter holds an object's members
+/// in a hash map, whose iteration order varies between evaluations, so the order is
+/// reconstructed rather than taken from it.
 ///
 /// Two results are passed through unchanged: the empty string the interpreter writes
 /// for an expression with no value, and anything the JSON reader will not take back
 /// (a result nested past its recursion limit) — answered as the interpreter wrote it
 /// rather than refused.
-fn mapped_document_text(serialized: String) -> String {
+fn mapped_document_text(serialized: String, input_order: &[String]) -> String {
     match ::serde_json::from_str::<::serde_json::Value>(&serialized) {
-        Ok(parsed) => {
-            ::serde_json::to_string_pretty(&with_sorted_members(parsed)).unwrap_or(serialized)
-        }
+        Ok(parsed) => crate::state::documents::to_text_in_member_order(parsed, input_order)
+            .unwrap_or(serialized),
         Err(_) => serialized,
     }
 }
@@ -983,29 +980,6 @@ fn mapped_document_text(serialized: String) -> String {
 /// `Display`, which needs no fallback.
 fn mapped_file_member(document: String) -> String {
     ::serde_json::Value::String(document).to_string()
-}
-
-/// `value` with every object's members in sorted key order.
-///
-/// The sort is explicit because `serde_json::Map` keeps insertion order whenever anything
-/// in the build turns on the crate's `preserve_order` feature.
-fn with_sorted_members(value: ::serde_json::Value) -> ::serde_json::Value {
-    match value {
-        ::serde_json::Value::Array(items) => {
-            ::serde_json::Value::Array(items.into_iter().map(with_sorted_members).collect())
-        }
-        ::serde_json::Value::Object(members) => {
-            let mut pairs: Vec<(String, ::serde_json::Value)> = members.into_iter().collect();
-            pairs.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-            ::serde_json::Value::Object(
-                pairs
-                    .into_iter()
-                    .map(|(key, value)| (key, with_sorted_members(value)))
-                    .collect(),
-            )
-        }
-        scalar => scalar,
-    }
 }
 
 /// The modelled 429 refusal: this emulator is already running
@@ -1266,7 +1240,14 @@ fn evaluate_jsonata(template: &str, document: Option<&str>) -> Result<String, Te
             serialized.len()
         )));
     }
-    let answered = mapped_document_text(serialized);
+    // The order the mapped document's objects are written in: the one the document the
+    // mapping read writes, which is the order the answer preserves.
+    let answered = mapped_document_text(
+        serialized,
+        &document
+            .map(crate::state::documents::member_order)
+            .unwrap_or_default(),
+    );
     if answered.len() > MAX_MAPPED_FILE_BYTES {
         return Err(invalid(format!(
             "the mapping produced {} bytes, past the {MAX_MAPPED_FILE_BYTES} bytes this emulator \
