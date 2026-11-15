@@ -163,12 +163,69 @@ pub fn vpc_peering_pending_acceptance_message(accepter_owner_id: &str) -> String
 pub const VPC_PEERING_CONNECTION_FAILED_MESSAGE: &str =
     "Failed due to incorrect VPC-ID, Account ID, or overlapping CIDR range";
 
+/// The `VpcPeeringConnectionStateReason$Message` of a connection being set up after its
+/// owner accepted it: the state's own word, which is what EC2 reports while a peering is
+/// [`VPC_PEERING_CONNECTION_STATE_PROVISIONING`]. It names no account, the request having
+/// been answered.
+pub const VPC_PEERING_CONNECTION_PROVISIONING_MESSAGE: &str = "Provisioning";
+
+/// The `VpcPeeringConnectionStateReason$Message` of a connection that carries traffic: the
+/// state's own word, which is what EC2 reports for a peering that reached
+/// [`VPC_PEERING_CONNECTION_STATE_ACTIVE`].
+pub const VPC_PEERING_CONNECTION_ACTIVE_MESSAGE: &str = "Active";
+
+/// The `VpcPeeringConnectionStateReason$Message` that goes with `code`, or `None` for a
+/// state EC2 reports no message for — "A message that provides more information about the
+/// status, IF APPLICABLE" (`VpcPeeringConnectionStateReason$Message`).
+///
+/// The ONE mapping from a peering's status to the sentence reported beside it, so the create
+/// that mints a request, the clock that moves it on
+/// ([`ComAmazonawsEc2Amazonec2State::materialize_due_vpc_peering_connections`]) and the
+/// acceptance that answers it ([`ComAmazonawsEc2Amazonec2State::accept_vpc_peering_connection`])
+/// cannot word one state two ways. The two states a request passes through while it waits
+/// name the account it waits for; the states it reaches afterwards do not — except a finished
+/// deletion, whose sentence names the account that deleted it and is therefore written by the
+/// delete rather than mapped from the state ([`vpc_peering_deleted_message`]).
+pub fn vpc_peering_connection_state_message(
+    code: &str,
+    accepter_owner_id: &str,
+) -> Option<String> {
+    match code {
+        VPC_PEERING_CONNECTION_STATE_INITIATING_REQUEST => {
+            Some(vpc_peering_initiating_request_message(accepter_owner_id))
+        }
+        VPC_PEERING_CONNECTION_STATE_PENDING_ACCEPTANCE => {
+            Some(vpc_peering_pending_acceptance_message(accepter_owner_id))
+        }
+        VPC_PEERING_CONNECTION_STATE_PROVISIONING => {
+            Some(VPC_PEERING_CONNECTION_PROVISIONING_MESSAGE.to_string())
+        }
+        VPC_PEERING_CONNECTION_STATE_ACTIVE => {
+            Some(VPC_PEERING_CONNECTION_ACTIVE_MESSAGE.to_string())
+        }
+        VPC_PEERING_CONNECTION_STATE_FAILED => {
+            Some(VPC_PEERING_CONNECTION_FAILED_MESSAGE.to_string())
+        }
+        _ => None,
+    }
+}
+
 /// Whether a connection in this state is still waiting for the accepter's owner, so the
-/// clock may expire it.
+/// clock may expire it and its owner may still answer it.
 ///
 /// `initiating-request` and `pending-acceptance` are the two states a request passes
 /// through before anybody answers it; every other state is one the request has been
 /// answered in or has already left.
+///
+/// This is also the question an acceptance asks of the request it is given: a request that
+/// is still waiting is what an acceptance RECORDS — "To accept a request, the VPC peering
+/// connection must be in the pending-acceptance state" (`AcceptVpcPeeringConnection`) says
+/// which requests are still open, and a request on its way in is on its way to exactly that
+/// state, the real service leaving `initiating-request` inside the call that mints it, so an
+/// acceptance issued straight after a create is served rather than refused. An acceptance of
+/// a connection that is no longer waiting writes nothing, and whether it is answered or
+/// refused is a fact of whether that connection is still a peering at all
+/// ([`vpc_peering_connection_holds_its_pair`]).
 pub fn vpc_peering_connection_awaits_acceptance(code: Option<&str>) -> bool {
     matches!(
         code,
@@ -187,7 +244,7 @@ pub fn vpc_peering_deleted_message(deleted_by_owner_id: &str) -> String {
 
 /// Whether a connection in this state still PEERS its two VPCs, so a second request to
 /// peer the same pair is a duplicate ([`vpc_peering_connection_already_exists`]) rather
-/// than a new request.
+/// than a new request, and an acceptance of it is one the service can still answer.
 ///
 /// A request on its way in, one waiting to be answered, one being set up and an active
 /// connection all hold the pair; a `failed`, `expired`, `rejected`, `deleting` or `deleted`
@@ -277,6 +334,48 @@ pub fn vpc_peering_connection_already_exists<E>(
              {vpc_peering_connection_id}"
         ),
     )
+}
+
+/// Refuse an acceptance made in a Region other than the accepter VPC's: HTTP 400
+/// `OperationNotPermitted`, naming the Region the request was made in and the one it has to
+/// be made in.
+///
+/// "For an inter-Region VPC peering connection request, you must accept the VPC peering
+/// connection in the Region of the accepter VPC" (`AcceptVpcPeeringConnection`): the
+/// accepter's Region is the one the connection itself records for that side
+/// (`VpcPeeringConnectionVpcInfo$Region`), and the request's is the one it was signed for.
+pub fn vpc_peering_connection_wrong_region<E>(
+    request_region: &str,
+    vpc_peering_connection_id: &str,
+    accepter_region: &str,
+) -> Scaffolded<E> {
+    Scaffolded::operation_not_permitted(format!(
+        "Incorrect region ({request_region}) specified for this request. VPC peering \
+         connection {vpc_peering_connection_id} must be accepted in region {accepter_region}"
+    ))
+}
+
+/// Refuse an acceptance by an account that does not own the accepter VPC: HTTP 400
+/// `OperationNotPermitted`, naming the account that asked and the account that has to.
+///
+/// "To accept a request, … you must be the owner of the peer VPC"
+/// (`AcceptVpcPeeringConnection`): the accepter's owner is the account the connection itself
+/// records for that side (`VpcPeeringConnectionVpcInfo$OwnerId`), which a cross-account
+/// request names ([`VpcPeeringConnectionSpec::peer_owner_id`]). This emulator serves one
+/// account ([`::engine::emulator_account_id`]), so a request whose accepter belongs to
+/// another is one no caller here can answer, and it is refused rather than accepted on that
+/// account's behalf — worded alongside the Region refusal above, the two together being the
+/// standing the operation documents for accepting.
+pub fn vpc_peering_connection_wrong_account<E>(
+    caller_account_id: &str,
+    vpc_peering_connection_id: &str,
+    accepter_owner_id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::operation_not_permitted(format!(
+        "Incorrect account ({caller_account_id}) specified for this request. VPC peering \
+         connection {vpc_peering_connection_id} must be accepted by account \
+         {accepter_owner_id}"
+    ))
 }
 
 /// What one peering connection is created with, beyond everything the service itself
@@ -465,11 +564,13 @@ impl ComAmazonawsEc2Amazonec2State {
             }),
             status: Some(VpcPeeringConnectionStateReason {
                 code: Some(status_code.to_string()),
-                message: Some(if overlapping {
-                    VPC_PEERING_CONNECTION_FAILED_MESSAGE.to_string()
-                } else {
-                    vpc_peering_initiating_request_message(&spec.peer_owner_id)
-                }),
+                // Through the ONE mapping from a status to the sentence reported beside it,
+                // so the state a request is minted in cannot be worded one way here and
+                // another by the clock or by an acceptance.
+                message: vpc_peering_connection_state_message(
+                    status_code,
+                    &spec.peer_owner_id,
+                ),
             }),
             // "The time that an unaccepted VPC peering connection will expire"
             // (`VpcPeeringConnection$ExpirationTime`): only a request that can still be
@@ -491,6 +592,58 @@ impl ComAmazonawsEc2Amazonec2State {
             VpcPeeringConnectionRecord { view, pending },
         );
         vpc_peering_connection_id
+    }
+
+    /// Record the acceptance of the peering request `vpc_peering_connection_id` names, and
+    /// answer the connection as it now stands — `None` when this store holds none.
+    ///
+    /// The ONE writer of an acceptance, as [`Self::insert_vpc_peering_connection`] is of a
+    /// request. The request leaves the state it was waiting in for
+    /// [`VPC_PEERING_CONNECTION_STATE_ACTIVE`], the state a peering that carries traffic is
+    /// in, and keeps no expiry: "The time that an UNACCEPTED VPC peering connection will
+    /// expire" (`VpcPeeringConnection$ExpirationTime`) is a fact of a request nobody has
+    /// answered, and this one now has been.
+    ///
+    /// The peering is set up WITHIN the call that accepts it, so nothing is owed to the clock
+    /// afterwards — the same reading [`super::VPC_PROVISIONING_DELAY`] gives a VPC that is
+    /// provisioned within its own create: the acceptance's answer is where the real service
+    /// reports what the connection became, and the read that follows it with nothing in
+    /// between already reports the connection carrying traffic. (The `provisioning` member of
+    /// the status catalog belongs to a peering whose two sides a Region or an account apart
+    /// still have to be joined, which is work this store cannot do for another account's VPC.)
+    ///
+    /// Whether the connection is in a state that admits an acceptance is the CALLER's
+    /// question ([`vpc_peering_connection_invalid_state_transition`] is how it refuses one
+    /// that is not), because it is asked of the request alongside who may answer it and
+    /// where.
+    pub fn accept_vpc_peering_connection(
+        &mut self,
+        vpc_peering_connection_id: &str,
+    ) -> Option<VpcPeeringConnection> {
+        let record = self
+            .vpc_peering_connections
+            .get_mut(vpc_peering_connection_id)?;
+        let accepter_owner_id = record
+            .view
+            .accepter_vpc_info
+            .as_ref()
+            .and_then(|info| info.owner_id.clone())
+            .unwrap_or_default();
+        record.view.status = Some(VpcPeeringConnectionStateReason {
+            code: Some(VPC_PEERING_CONNECTION_STATE_ACTIVE.to_string()),
+            message: vpc_peering_connection_state_message(
+                VPC_PEERING_CONNECTION_STATE_ACTIVE,
+                &accepter_owner_id,
+            ),
+        });
+        record.view.expiration_time = None;
+        // The move the request was owed while it waited goes with the answer: a connection
+        // that has been accepted is not on its way to being waited on.
+        record.pending = None;
+        // Reported through the ONE projection of a stored connection, so the acceptance and
+        // the describe that follows it cannot answer differently.
+        let accepted = record.clone();
+        Some(self.vpc_peering_connection_view(&accepted))
     }
 
     /// Whether the two VPCs `spec` names have overlapping address space, as far as this
@@ -628,20 +781,17 @@ impl ComAmazonawsEc2Amazonec2State {
                 .map(str::to_string)
             {
                 // "A message that provides more information about the status, if applicable"
-                // (`VpcPeeringConnectionStateReason$Message`): a request now waiting for the
-                // accepter's owner names that account, and a deletion that has FINISHED keeps
-                // the sentence the delete wrote, which names the account that deleted it.
-                // Every other state carries none.
+                // (`VpcPeeringConnectionStateReason$Message`): a deletion that has FINISHED
+                // keeps the sentence the delete wrote, which names the account that deleted
+                // it; every other state takes the sentence that state carries, from the one
+                // mapping of a peering's status to its message.
                 let message = match due.as_str() {
-                    VPC_PEERING_CONNECTION_STATE_PENDING_ACCEPTANCE => {
-                        Some(vpc_peering_pending_acceptance_message(&accepter_owner_id))
-                    }
                     VPC_PEERING_CONNECTION_STATE_DELETED => record
                         .view
                         .status
                         .as_ref()
                         .and_then(|status| status.message.clone()),
-                    _ => None,
+                    due => vpc_peering_connection_state_message(due, &accepter_owner_id),
                 };
                 record.view.status = Some(VpcPeeringConnectionStateReason {
                     code: Some(due.clone()),
@@ -666,8 +816,12 @@ impl ComAmazonawsEc2Amazonec2State {
                     // "A message that provides more information about the status, IF
                     // APPLICABLE" (`VpcPeeringConnectionStateReason$Message`): the message
                     // the request carried named the account that was to answer it, which an
-                    // expired request is no longer waiting for.
-                    message: None,
+                    // expired request is no longer waiting for — so the one mapping from a
+                    // status to its sentence reports none for this state.
+                    message: vpc_peering_connection_state_message(
+                        VPC_PEERING_CONNECTION_STATE_EXPIRED,
+                        &accepter_owner_id,
+                    ),
                 });
                 // A request that has expired is owed nothing further, and it can no longer
                 // be accepted, so the move it was waiting on goes with it.

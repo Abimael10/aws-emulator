@@ -2381,3 +2381,10 @@ mod cloudformation_provisions_glue_table_optimizers;
 // names compiles nowhere, and a second `mod` for one name is `E0428` — either fails EVERY
 // suite of this target. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves
 // each module into `tests/all/`.
+// Below this header the file holds ONE `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
+// `tests/all/<name>.rs` and insert its pair into the sorted list: two branches landing at
+// mistype. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a
+// sibling of this file, which the layout check refuses; the `#[path]` is what points each
+// Three suites of this target pin that shape rather than restating it:
+// `all/all_rs_is_a_canonical_declaration_list.rs` (pairs, sorted, nothing else). A note about
+// this file belongs in `all/appended_notes.rs`, declared below like any other suite.

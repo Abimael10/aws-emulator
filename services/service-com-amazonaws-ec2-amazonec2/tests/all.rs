@@ -1470,6 +1470,15 @@ mod vpc_network_lifecycle;
 // unanswered request, the overlapping-range failure, and the ids, filters and pages.
 #[path = "all/vpc_peering_connections.rs"]
 mod vpc_peering_connections;
+// What `AcceptVpcPeeringConnection` answers: the peering request the store holds written into
+// `active` with no expiry left, read back through `DescribeVpcPeeringConnections` with both
+// sides' address space — beside the connection already accepted it answers unchanged, and the
+// states, the accepter's account and Region, the ids and the dry run it refuses without
+// answering the request. Declared beside the suite of the create it answers, inside the
+// long-settled block, rather than in the tail every landing appends to: two squash merges of
+// this fix lost the tail to another suite's move and left a duplicate `mod`.
+#[path = "all/accept_vpc_peering_connection.rs"]
+mod accept_vpc_peering_connection;
 #[path = "all/vpc_resources_blocking_encryption_enforcement.rs"]
 mod vpc_resources_blocking_encryption_enforcement;
 #[path = "all/vpn_connection_device_types.rs"]
