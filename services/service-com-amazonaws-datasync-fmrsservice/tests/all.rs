@@ -33,6 +33,8 @@ mod location_listing;
 mod not_found_refusal_wording;
 #[path = "all/object_storage_location.rs"]
 mod object_storage_location;
+#[path = "all/object_storage_location_existence.rs"]
+mod object_storage_location_existence;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/s3_transfer_execution.rs"]
