@@ -6934,3 +6934,16 @@ mod all_rs_is_a_canonical_declaration_list;
 // at the HEAD of this file, where an inner doc comment is legal, and the two guard
 // suites check both halves of them. Declare a new suite with its `#[path]` line and a
 // note about the suite itself.)
+//! A suite that is not declared here compiles nowhere and its tests never run; a
+//! suite left at the top level of `tests/` fails the build; and a suite declared
+//! twice is `E0428`, which fails every suite in this target. THIS BLOCK IS THE
+//! ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE: past the first
+//! item one is `E0753` and compiles no suite of this target, so below, add a
+//! declaration — not a note about one.
+//! that, for this file and for every service crate's `tests/all.rs`.
+//! SIBLING of this file (`tests/<name>.rs`), which the layout check refuses: the
+//! `#[path]` is what points each declaration into `tests/all/`.
+//! WHY a suite lives in this target rather than in one service crate's own — it
+//! drives more than one service over the assembled router — belongs in that
+//! suite's own module doc, where it is read beside the test it explains. This
+//! file is the declaration list and nothing else.

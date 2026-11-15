@@ -110,8 +110,9 @@
 //! [`not_found_document_detail`] as the only two projections any document
 //! operation reports. A document's status advances on the CLOCK alone, through
 //! the same `materialise_due_transitions` — including the chain an accepted
-//! deletion starts, which ends at the `NOT_FOUND` status the record keeps
-//! reporting rather than at a record the store drops.
+//! deletion starts, at the end of which the record is dropped, so the data
+//! source holds nothing for that document and only the
+//! [`not_found_document_detail`] projection answers for its identity.
 //!
 //! A flow's aliases (`CreateFlowAlias`, `GetFlowAlias`, `ListFlowAliases`) are
 //! backed by the
@@ -2262,7 +2263,10 @@ pub enum DocumentStatus {
     DeleteInProgress,
     /// The document is gone from the data source — the terminal status of a
     /// deletion, which the modelled member documents as the status of a document
-    /// that "wasn't found", so the clock owes it nothing more.
+    /// that "wasn't found", so the clock owes it nothing more. A record that
+    /// reaches it is retired from the store by the same pass that applies it:
+    /// the status is the answer a targeted read gives for an identifier nothing
+    /// is held for, not a document the data source still enumerates.
     NotFound,
 }
 
@@ -2492,9 +2496,11 @@ impl DocumentRecord {
     /// Accept the deletion of this document: it reports `DELETING` from now on,
     /// and the clock owes it the rest of the chain down to `NOT_FOUND`.
     ///
-    /// The record STAYS in the store: a deleted document is a document whose
-    /// status says it is gone, which is what every document read reports for it
-    /// from here on. The digest of the source object it was taken from goes,
+    /// The record stays in the store while the deletion is in flight, so a
+    /// poller observes the statuses the model declares for it; once the chain
+    /// reaches its terminal status the record is retired and the data source
+    /// holds nothing for this document any more. The digest of the source object
+    /// it was taken from goes,
     /// because the data source no longer holds this document's content — so a
     /// later crawl that finds that object again ingests it anew rather than
     /// taking it for one already held.
@@ -2926,9 +2932,11 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
 
     /// Accept the deletion of one document of this data source: it reports the
     /// modelled `DELETING` status from now on and the clock owes it the rest of
-    /// the chain, which ends at `NOT_FOUND` — the status every later read of it
-    /// reports. `None` when this data source holds no such document, which is
-    /// not a document to delete at all.
+    /// the chain, at the end of which the record is retired and the data source
+    /// holds nothing for this document — from there every read of the identifier
+    /// answers the status the model gives one nothing is stored for. `None` when
+    /// this data source holds no such document, which is not a document to
+    /// delete at all.
     ///
     /// A deletion already accepted is not accepted again: the document is
     /// already on its way out, so a repeat of the same delete reports it as it
@@ -3083,6 +3091,15 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
                     .map(|(span, after)| (due + span, after));
             }
         }
+        // A document whose delete chain has reached its end is removed from the
+        // store, the same way an accepted data-source or knowledge-base removal
+        // is applied once its instant has passed: the data source holds nothing
+        // for it any more, so its listing stops enumerating it and a targeted
+        // read of the identifier answers the status the model gives one nothing
+        // is stored for. Its identity is free again, for a later ingestion to
+        // take.
+        self.documents
+            .retain(|_, document| document.status != DocumentStatus::NotFound);
         // A removal an accepted delete put on the clock is owed the same way:
         // once its instant has passed the resource is gone, whether or not
         // anybody called. A knowledge base takes the data sources it contains
@@ -3312,10 +3329,13 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     /// holds, in document order and from the position `cursor` names, at most
     /// `page_size` of them, plus the token to resume from when more remain.
     ///
-    /// Every document of the data source is reported, whatever its ingestion
-    /// status, and no other data source's: a document is identified within the
-    /// data source it was ingested into. A data source holding none reports an
-    /// empty listing — an unknown one has nothing to enumerate, which the caller
+    /// Every document the data source HOLDS is reported, whatever its ingestion
+    /// status — including one whose deletion is still in flight — and no other
+    /// data source's: a document is identified within the data source it was
+    /// ingested into. A document whose delete has run to completion is held no
+    /// more ([`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::materialise_due_transitions`]),
+    /// so it is in no page. A data source holding none reports an empty
+    /// listing — an unknown one has nothing to enumerate, which the caller
     /// refuses as a missing resource before asking.
     pub fn page_of_documents(
         &self,
