@@ -23,6 +23,8 @@ mod alert_profile_trust;
 mod domain_space_lifecycle;
 #[path = "all/omni_dashboard_lifecycle.rs"]
 mod omni_dashboard_lifecycle;
+#[path = "all/principal_search.rs"]
+mod principal_search;
 #[path = "all/probe.rs"]
 mod probe;
 #[path = "all/response_shaping.rs"]

@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchPrincipals
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchPrincipals`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchPrincipals::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Searches the IAM Identity Center identities this emulator holds for the users and
+//! groups of one domain:
+//!
+//! * the domain is this service's resource, so the request's `domainId` is resolved in
+//!   this store, and a domain it holds no record of is the modelled
+//!   `ResourceNotFoundException` (404);
+//! * a domain NOT configured with Identity Center cannot be searched at all — the
+//!   operation's own doc states "The domain must be configured with Identity Center" —
+//!   which is the modelled `ValidationException` (400);
+//! * the principals themselves belong to the identity store service, so they are read out
+//!   of ITS state through the same shared engine (`crate::state::principal_search`): what
+//!   a search reports is what `CreateUser`/`CreateGroup` really wrote there.
+//!
+//! Nothing is written: a search leaves both stores exactly as it found them.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +162,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchPrincipals` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchPrincipalsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchPrincipals"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SearchPrincipalsError::from(SearchPrincipalsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CloudWatchOmni store is unavailable".to_string(),
+                    error_code: None,
+                },
+            ))
+        })?;
+
+        // A token this service did not mint cannot name a resume point, so it is a bad
+        // request rather than an empty page.
+        let already_reported = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => crate::state::decode_search_principals_page_token(token)
+                .and_then(|reported| usize::try_from(reported).ok())
+                .ok_or_else(|| {
+                    SearchPrincipalsError::from(SearchPrincipalsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "nextToken is not a valid pagination token for \
+                                      SearchPrincipals"
+                                .to_string(),
+                            error_code: None,
+                        },
+                    ))
+                })?,
+        };
+
+        // `maxResults` carries @range(min: 1, max: 100), already enforced at the
+        // boundary; its documented default is 100.
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::DEFAULT_MAX_RESULTS)
+            .max(1) as usize;
+
+        // The domain decides whether this search is served at all. Its store is read and
+        // released before the identity store is read: the two services keep their own
+        // stores, and this operation never holds both locks at once.
+        {
+            let store = state.lock();
+            let stored = store.domains.get(&input.domain_id).ok_or_else(|| {
+                SearchPrincipalsError::from(
+                    SearchPrincipalsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: format!("Domain '{}' does not exist.", input.domain_id),
+                            resource_type: Some("Domain".to_string()),
+                            resource_id: Some(input.domain_id.clone()),
+                            error_code: None,
+                        },
+                    ),
+                )
+            })?;
+            if !crate::state::is_identity_center_domain(&stored.domain) {
+                return Err(SearchPrincipalsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::not_identity_center_message(&input.domain_id),
+                        error_code: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        let matched: Vec<PrincipalSearchResult> =
+            crate::state::identity_center_principals(&*self.engine)
+                .into_iter()
+                .filter(|principal| {
+                    crate::state::principal_matches(&input.search_query, principal)
+                })
+                .collect();
+
+        let remaining = matched.get(already_reported..).unwrap_or_default();
+        let page_len = page_size.min(remaining.len());
+        let results = remaining[..page_len].to_vec();
+        // A token only when matches remain beyond this page, and it resumes after every
+        // match reported so far.
+        let next_token = (remaining.len() > page_len).then(|| {
+            crate::state::encode_search_principals_page_token((already_reported + page_len) as u64)
+        });
+
+        Ok(SearchPrincipalsOutput {
+            results,
+            next_token,
+        })
     }
 }

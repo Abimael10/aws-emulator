@@ -31,6 +31,10 @@ sqlparser = "0.59"
 # the clause, the envelope, the `@pattern` rendering and the order an enumerated type's
 # value set is listed in — which `service::validation` delegates to.
 service-common = { path = "../common" }
+# The IAM Identity Center identity store `SearchPrincipals` searches, read through the same
+# shared engine: the users and groups a search reports are the ones `CreateUser` and
+# `CreateGroup` wrote in the service that OWNS them, not a second copy kept here.
+service-com-amazonaws-identitystore-awsidentitystore = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

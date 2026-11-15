@@ -1252,7 +1252,18 @@ mod dashboard_body;
 /// definition applies the same rule to it.
 mod view_definition;
 
+/// The Identity Center users and groups a principal search reports, which belong to the
+/// identity store service rather than to this one. It lives beside the store because it
+/// is a READ of another service's state through the same shared engine, the same way the
+/// projections above are reads of this one's.
+mod principal_search;
+
 pub use view_definition::{view_definition_rejection, INVALID_VIEW_DEFINITION};
+
+pub use principal_search::{
+    identity_center_principals, is_identity_center_domain, not_identity_center_message,
+    principal_matches, PRINCIPAL_TYPE_GROUP, PRINCIPAL_TYPE_USER, SEARCH_ALL_PRINCIPALS,
+};
 
 pub use dashboard_body::{
     dashboard_body_rejection, dashboard_body_violations, DashboardBodyViolation,
@@ -1333,6 +1344,26 @@ pub fn encode_view_page_token(seq: u64) -> String {
 /// for a view listing.
 pub fn decode_view_page_token(token: &str) -> Option<u64> {
     decode_page_token(VIEW_PAGE_TOKEN_PREFIX, token)
+}
+
+/// The prefix a principal-search page token carries, for the same reason.
+const SEARCH_PRINCIPALS_PAGE_TOKEN_PREFIX: &str = "search-principals:";
+
+/// Mint the opaque `nextToken` that resumes a principal search after the first
+/// `returned` matching principals.
+///
+/// A principal search enumerates another service's identities rather than this store's
+/// own records, so the cursor is the number of matches already reported rather than one
+/// of this store's sequence numbers: the next page is the rest of the SAME match
+/// sequence, which the order [`identity_center_principals`] walks keeps stable.
+pub fn encode_search_principals_page_token(returned: u64) -> String {
+    encode_page_token(SEARCH_PRINCIPALS_PAGE_TOKEN_PREFIX, returned)
+}
+
+/// Read a principal-search `nextToken` back, or `None` when it is not one this service
+/// minted for a principal search.
+pub fn decode_search_principals_page_token(token: &str) -> Option<u64> {
+    decode_page_token(SEARCH_PRINCIPALS_PAGE_TOKEN_PREFIX, token)
 }
 
 #[cfg(test)]
