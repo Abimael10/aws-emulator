@@ -1,0 +1,38 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudformation__glue__iam__s3.deploy-glue-table-optimizer-lifecycle cloudformation__glue__iam__s3.deploy-glue-table-optimizer-invalid-type-rejected
+Issue-Key: cloudformation__glue__iam__s3.deploy-glue-table-optimizer-lifecycle|run#12|AssertionError|assert status == "CREATE_COMPLETE", (
+Issue-Key: cloudformation__glue__iam__s3.deploy-glue-table-optimizer-invalid-type-rejected|run#14|AssertionError|assert status == "CREATE_COMPLETE", (
+Issue-Commit: 5b064f062b9916884ab43e17b49dfc5f4cd625aa
+
+# cloudformation__glue__iam__s3: an AWS::Glue::Table declaring OpenTableFormatInput (Iceberg) always ends CREATE_FAILED, rolling the stack back before any TableOptimizer is reached
+
+> _Note: this issue was identified against the code base at commit `5b064f062b9916884ab43e17b49dfc5f4cd625aa`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateStack
+
+## Description
+Cause 1 of 1: a CloudFormation stack whose AWS::Glue::Table carries OpenTableFormatInput/IcebergInput (an Apache Iceberg table) can never be provisioned — the table resource fails at create and the whole stack rolls back, so every AWS::Glue::TableOptimizer scenario built on an Iceberg table is cut off before its first assertion. Failing checks: cloudformation__glue__iam__s3.deploy-glue-table-optimizer-lifecycle, cloudformation__glue__iam__s3.deploy-glue-table-optimizer-invalid-type-rejected.
+
+AWS: Glue's own model declares this create path — Smithy (services/service-com-amazonaws-glue-awsglue): CreateTable input member OpenTableFormatInput -> OpenTableFormatInput$IcebergInput -> IcebergInput{MetadataOperation (required, enum, 'Can only be set to CREATE'), Version (VersionString, len 1..255, defaults to 2), CreateIcebergTableInput{Location (required), Schema (required), PartitionSpec, WriteOrder, Properties}}. Recorded behavior for the CloudFormation surface: a stack declaring Bucket (AWS::S3::Bucket), Db (AWS::Glue::Database), Role (AWS::IAM::Role) and Tbl (AWS::Glue::Table with OpenTableFormatInput.IcebergInput{MetadataOperation: CREATE, Version: '2', IcebergTableInput{Location: s3://<bucket>/data/, Schema{SchemaId, Type: struct, Fields}}}) reaches CREATE_COMPLETE with every resource CREATE_COMPLETE; the Iceberg metadata is written under the declared Location, and the table is then readable through Glue GetTable and usable as the TableName of an AWS::Glue::TableOptimizer (Ref '<table>|<database>|<type>|<account>').
+
+Emulator: the Tbl resource goes straight to CREATE_FAILED and the stack rolls back. Replayed event sequence (decisive, non-IN_PROGRESS rows, from the suite output): [('Bucket','CREATE_COMPLETE'), ('Db','CREATE_COMPLETE'), ('Tbl','CREATE_FAILED'), ('Role','CREATE_COMPLETE'), ('Role','DELETE_COMPLETE'), ('Tbl','DELETE_COMPLETE'), ('Db','DELETE_COMPLETE'), ('Bucket','DELETE_COMPLETE'), ('<stack>','ROLLBACK_COMPLETE')] — i.e. final StackStatus ROLLBACK_COMPLETE where AWS reports CREATE_COMPLETE. The replay output exposes only the status rows, not the ResourceStatusReason the handler put on the Tbl CREATE_FAILED row, so no refusal text is quoted here: AWS emits no refusal at all for this template, so the requirement is a successful create, not a message. Note that plain (non-Iceberg) AWS::Glue::Table resources do provision in this emulator, so the divergence is specific to the OpenTableFormatInput path; the Glue service's own CreateTable handler documents an implemented OpenTableFormatInput/ICEBERG path (services/service-com-amazonaws-glue-awsglue/src/ops/create_table.rs), which points at the CloudFormation-side property translation rather than the Glue API itself.
+
+Why: a client deploying any Iceberg table through CloudFormation (the normal way an Iceberg Glue table and its compaction/retention TableOptimizer are declared) gets a rolled-back stack instead of a catalog table, and every downstream resource that Refs the table (TableOptimizer, Lake Formation grants, crawlers) is unreachable. A negative test that expects the stack's optimizer to be the only failing resource (ROLLBACK_FAILED with the optimizer's Type enum refusal) instead sees its positive control collapse, so the optimizer's validation behavior cannot be observed at all.
+
+Fix: the CloudFormation provisioner's AWS::Glue::Table resource handler — its property translation for OpenTableFormatInput/IcebergInput (including the nested IcebergTableInput Location/Schema members, where Location arrives as a resolved Fn::Sub string) and the Glue CreateTable call it makes with them; the Tbl CREATE_FAILED row must stop being produced for this template, and the handler must surface the Glue-side reason when a create genuinely fails.
+
+Traces: cloudformation__glue__iam__s3.deploy-glue-table-optimizer-lifecycle (AssertionError: stack ended 'ROLLBACK_COMPLETE' at the CREATE_COMPLETE assertion) and cloudformation__glue__iam__s3.deploy-glue-table-optimizer-invalid-type-rejected (AssertionError: control stack ended 'ROLLBACK_COMPLETE'), both in the behavioral suite under '### cloudformation__glue__iam__s3'.
+
+## Evidence
+Expected (AWS, as recorded by both checks): DescribeStacks StackStatus == 'CREATE_COMPLETE' with decisive stack-event rows showing Bucket/Db/Role/Tbl all CREATE_COMPLETE; Glue GetTableOptimizer then returns the compaction optimizer (type 'compaction', configuration.roleArn == the stack's IAM role ARN, configuration.enabled == true) and Ref(Topt) == '<table>|<database>|compaction|<account>'.
+
+Actual (emulator): StackStatus == 'ROLLBACK_COMPLETE'. Rows: [('Bucket','CREATE_COMPLETE'), ('Db','CREATE_COMPLETE'), ('Tbl','CREATE_FAILED'), ('Role','CREATE_COMPLETE'), ('Role','DELETE_COMPLETE'), ('Tbl','DELETE_COMPLETE'), ('Db','DELETE_COMPLETE'), ('Bucket','DELETE_COMPLETE'), ('sim2real-cfngluetopt-<suffix>','ROLLBACK_COMPLETE')] for deploy-glue-table-optimizer-lifecycle, and the same shape with ('sim2real-cfntoptbad-okstack-<suffix>','ROLLBACK_COMPLETE') for the positive control of deploy-glue-table-optimizer-invalid-type-rejected. The stack never reaches the GetTableOptimizer/Ref assertions, and the ROLLBACK_FAILED + optimizer-Type refusal the negative check grades is never reached either. (The generated stack/database/table/bucket names and suffixes above are per-run values, not part of the requirement.)
+
+## Steps to Reproduce
+1. CreateStack with Capabilities=['CAPABILITY_IAM'] and a template containing: an AWS::S3::Bucket 'Bucket'; an AWS::IAM::Role 'Role' usable by Glue; an AWS::Glue::Database 'Db' (CatalogId {Ref: AWS::AccountId}, DatabaseInput.Name <db>); and an AWS::Glue::Table 'Tbl' with Properties {CatalogId {Ref: AWS::AccountId}, DatabaseName {Ref: Db}, Name <tbl>, OpenTableFormatInput {IcebergInput {MetadataOperation: 'CREATE', Version: '2', IcebergTableInput {Location {Fn::Sub: 's3://${Bucket}/data/'}, Schema {SchemaId: 0, Type: 'struct', Fields: [{Id: 1, Name: 'id', Type: 'int', Required: true}]}}}}, plus an AWS::Glue::TableOptimizer 'Topt' (Type 'compaction', TableOptimizerConfiguration {RoleArn {Fn::GetAtt: [Role, Arn]}, Enabled: true}) and Outputs ToptRef {Ref: Topt}.
+2. Poll DescribeStacks by StackId until a terminal status.
+3. Observe StackStatus 'ROLLBACK_COMPLETE' with the Tbl row CREATE_FAILED (AWS: 'CREATE_COMPLETE'); DescribeStackEvents shows the reason the Glue::Table handler recorded.
+4. Replay: cloudformation__glue__iam__s3.deploy-glue-table-optimizer-lifecycle and cloudformation__glue__iam__s3.deploy-glue-table-optimizer-invalid-type-rejected.
