@@ -31,6 +31,7 @@
 //! assertion reads the XML this emulator itself answered with.
 
 use crate::db_instances::{call, emulator, expect_error, expect_ok, text};
+use crate::sibling_global_databases::GLOBAL_DATABASE_ENGINES;
 
 /// The Query API error code every refusal below carries: a value outside what its own
 /// member accepts.
@@ -207,10 +208,11 @@ struct GlobalEngineCase {
 
 /// The rows of the global-cluster table.
 ///
-/// `CreateGlobalCluster$Engine` publishes the engines a global database can run ("Valid
-/// Values: aurora-mysql | aurora-postgresql"), so the rows span what lies outside that
-/// list: the RDS engines with a cluster form, the two sibling control planes' engines this
-/// one front door also serves, the legacy Aurora engine name, a published value in the
+/// The engines a global database can run on this front door are the ones each control
+/// plane it serves publishes for its own `CreateGlobalCluster` — this model's "Valid
+/// Values: aurora-mysql | aurora-postgresql" plus the sibling control planes' own engines
+/// (`GLOBAL_DATABASE_ENGINES` below) — so the rows span what lies outside them: the RDS
+/// engines with a cluster form, the legacy Aurora engine name, a published value in the
 /// wrong case, a value that names no engine at all — and, on an engine that IS in the list,
 /// an `EngineVersion` that is no engine version at all.
 const GLOBAL_ENGINE_CASES: &[GlobalEngineCase] = &[
@@ -222,16 +224,6 @@ const GLOBAL_ENGINE_CASES: &[GlobalEngineCase] = &[
     GlobalEngineCase {
         case: "the other Multi-AZ DB cluster engine",
         engine: "postgres",
-        engine_version: None,
-    },
-    GlobalEngineCase {
-        case: "the Amazon DocumentDB engine",
-        engine: "docdb",
-        engine_version: None,
-    },
-    GlobalEngineCase {
-        case: "the Amazon Neptune engine",
-        engine: "neptune",
         engine_version: None,
     },
     GlobalEngineCase {
@@ -305,9 +297,9 @@ async fn a_global_cluster_engine_refusal_carries_one_fixed_sentence() {
         );
     }
 
-    // Both engines the member publishes are created and read back, so the refusals above
-    // are the value's doing rather than this path refusing every create.
-    for (index, engine) in ["aurora-mysql", "aurora-postgresql"].iter().enumerate() {
+    // Every engine a global database CAN run is created and read back, so the refusals
+    // above are the value's doing rather than this path refusing every create.
+    for (index, engine) in GLOBAL_DATABASE_ENGINES.iter().enumerate() {
         let identifier = format!("emu-global-ok-{index}");
         expect_ok(
             engine,

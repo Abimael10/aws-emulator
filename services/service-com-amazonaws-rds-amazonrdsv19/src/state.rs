@@ -2594,7 +2594,18 @@ impl GlobalClusterRecord {
     }
 
     /// Project the stored record onto the modelled `GlobalCluster` output shape.
+    ///
+    /// Three of this model's members belong to this model ALONE: neither sibling control
+    /// plane's `GlobalCluster` publishes an `Endpoint`, an `EngineLifecycleSupport` or a
+    /// `StorageEncryptionType` (`com.amazonaws.neptune#GlobalCluster` and
+    /// `com.amazonaws.docdb#GlobalCluster` both carry the identifier, the resource id, the
+    /// ARN, the status, the engine and its version, the database name, the two booleans,
+    /// the member list, the failover state and the tags, and nothing else). A global
+    /// database of one of their engines is a resource of THAT control plane, so it reports
+    /// the members its own API has and not this model's extra three.
     pub fn to_wire(&self) -> GlobalCluster {
+        let own_control_plane =
+            !is_sibling_control_plane_engine(self.engine.as_deref().unwrap_or_default());
         GlobalCluster {
             global_cluster_identifier: Some(self.identifier.clone()),
             global_cluster_resource_id: Some(self.resource_id.clone()),
@@ -2602,14 +2613,16 @@ impl GlobalClusterRecord {
             status: Some(self.status.clone()),
             engine: self.engine.clone(),
             engine_version: self.engine_version.clone(),
-            engine_lifecycle_support: Some(self.engine_lifecycle_support.clone()),
+            engine_lifecycle_support: own_control_plane
+                .then(|| self.engine_lifecycle_support.clone()),
             database_name: self.database_name.clone(),
             storage_encrypted: Some(self.storage_encrypted),
             // "The type of encryption used to protect data at rest in the global database
             // cluster" — see [`Self::storage_encryption_type`].
-            storage_encryption_type: Some(self.storage_encryption_type().to_string()),
+            storage_encryption_type: own_control_plane
+                .then(|| self.storage_encryption_type().to_string()),
             // The global database's own writer endpoint — see [`Self::endpoint`].
-            endpoint: Some(self.endpoint()),
+            endpoint: own_control_plane.then(|| self.endpoint()),
             deletion_protection: Some(self.deletion_protection),
             global_cluster_members: Some(
                 self.member_cluster_arns

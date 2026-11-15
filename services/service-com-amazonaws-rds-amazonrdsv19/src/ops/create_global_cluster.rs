@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGlobalCluster
-//! IMPLEMENTED: this operation persists a new Aurora global database cluster in this
-//! service's store, which is what `DescribeGlobalClusters` reports. It is the ONLY file
-//! to touch for this operation.
+//! IMPLEMENTED: this operation persists a new global database cluster — an Aurora one, or
+//! one of a sibling control plane's engine, since one front door serves all three — in
+//! this service's store, which is what `DescribeGlobalClusters` reports. It is the ONLY
+//! file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken".
@@ -252,8 +253,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `CreateDBCluster` stored: the source becomes the global database's first
             // member, its PRIMARY, and the four settings above come from it.
         }
-        // "Valid Values: aurora-mysql | aurora-postgresql" — a global database is an
-        // Aurora resource, so an engine outside that list names nothing it can run.
+        // The engines a global database can run on this front door: the Aurora pair this
+        // model publishes ("Valid Values: aurora-mysql | aurora-postgresql") together with
+        // the engine each sibling control plane this one door serves publishes for its own
+        // `CreateGlobalCluster` — see [`crate::state::engine_can_run_a_global_cluster`]. An
+        // engine outside them names nothing a global database can run.
         if let Some(engine) = &input.engine {
             crate::state::check_global_cluster_engine(engine)
                 .map_err(CreateGlobalClusterError::invalid_parameter_value)?;

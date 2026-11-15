@@ -353,6 +353,8 @@ mod scratch_aurora_truth;
 mod serverless_v2_capacity_range;
 #[path = "all/sibling_control_plane_clusters.rs"]
 mod sibling_control_plane_clusters;
+#[path = "all/sibling_global_databases.rs"]
+mod sibling_global_databases;
 // Declared because the build enforces that every file under `tests/all/` is: the suite this
 // names is an INERT placeholder (see its own docs) whose subject — `StartExportTask` and the
 // objects it writes — is driven end to end by `rds_s3_integration` beside it.

@@ -792,7 +792,31 @@ pub fn check_engine_lifecycle_support(value: &str) -> Result<(), String> {
 /// aurora-postgresql"). A global database is an Aurora resource — "This operation applies
 /// only to Aurora DB clusters" — so the list is narrower than the DB instance engines in
 /// [`DB_INSTANCE_ENGINES`].
+///
+/// It is this model's own list, not the whole set of engines a global database can run on
+/// this front door: the two sibling control planes create global databases of their own
+/// engines here too, which is what [`engine_can_run_a_global_cluster`] answers.
 pub const GLOBAL_CLUSTER_ENGINES: [&str; 2] = ["aurora-mysql", "aurora-postgresql"];
+
+/// Whether a global database cluster can run `engine` on this front door.
+///
+/// Two published value lists, because one awsQuery front door serves three control planes
+/// (`src/service.rs`): the Aurora engines this model's own member publishes
+/// ([`GLOBAL_CLUSTER_ENGINES`]), and the engine each sibling control plane
+/// ([`SIBLING_CONTROL_PLANE_ENGINES`]) publishes for the global database its OWN
+/// `CreateGlobalCluster` creates —
+/// `com.amazonaws.neptune#CreateGlobalClusterMessage$Engine` ("Valid values: neptune",
+/// whose `GlobalCluster$Engine` is "The Neptune database engine used by the global
+/// database (\"neptune\")") and `com.amazonaws.docdb#GlobalCluster$Engine` ("The Amazon
+/// DocumentDB database engine used by the global cluster"). A request naming one of those
+/// is a request to THAT control plane, whose global database this door creates exactly as
+/// it creates an Aurora one.
+///
+/// Compared EXACTLY, the way the Aurora list is: an engine is one of the values its API
+/// publishes, and the same name in another case is not one of them.
+pub fn engine_can_run_a_global_cluster(engine: &str) -> bool {
+    GLOBAL_CLUSTER_ENGINES.contains(&engine) || SIBLING_CONTROL_PLANE_ENGINES.contains(&engine)
+}
 
 /// The longest `EngineVersion` this service accepts as a version string at all. AWS's
 /// longest published version strings are the SQL Server ones (`15.00.4382.1.v1`) and the
@@ -836,12 +860,13 @@ pub fn check_engine_version_form(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuse an `Engine` a global database cluster cannot run.
+/// Refuse an `Engine` a global database cluster cannot run
+/// ([`engine_can_run_a_global_cluster`]).
 ///
 /// The refusal is [`GLOBAL_CLUSTER_ENGINE_NOT_FOUND_MESSAGE`]: this front door states
 /// neither the value it rejected nor the engines it would have taken.
 pub fn check_global_cluster_engine(engine: &str) -> Result<(), String> {
-    if GLOBAL_CLUSTER_ENGINES.contains(&engine) {
+    if engine_can_run_a_global_cluster(engine) {
         return Ok(());
     }
     Err(GLOBAL_CLUSTER_ENGINE_NOT_FOUND_MESSAGE.to_string())
