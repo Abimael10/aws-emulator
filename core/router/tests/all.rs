@@ -1482,3 +1482,21 @@ mod cloudformation_provisions_bedrock_flows;
 // `clippy::doc_lazy_continuation` asks of a doc list item, so the lint is allowed for the
 // whole target. An inner attribute, like an inner doc comment, is legal only before the first
 // item, so it stands here rather than in the list below.
+// blank line, and nothing after the last pair. Put a new suite at `tests/all/<name>.rs` and
+// insert its pair where its name sorts to, so two branches landing at once insert two lines in
+// two places and have no prose to duplicate, re-word or mistype. What a suite covers, and why
+// it drives the assembled router rather than one service crate, belongs in that suite's OWN
+// module header, where it is read beside the test it explains; a note about THIS file belongs
+// in `all/appended_notes.rs`, `all/appended_header_notes.rs`, `all/appended_notes_tail.rs` or
+// `all/appended_prose.rs`, which keep what earlier landings had appended here and are declared
+// below like any other file.
+// declarations is `E0753` and compiles no suite of this target at all. A suite file no `mod`
+// and a second `mod` for one name is `E0428`, which compiles neither copy. `tests/all.rs` is a
+// points it into `tests/all/`. Some of the files below are shared harnesses or probes rather
+// than suites; every one of them is declared, because a file no declaration names is compiled
+// nowhere. The `all/all_rs_*` suites, `all/declaration_roots_*` and
+// `all/every_suite_file_is_declared.rs` pin all of that, for this file and for every service
+// crate's own `tests/all.rs`, so check there rather than leaving a note here.
+// doc list item; the lint is allowed for this target so a header line is a header line rather
+#[path = "all/bedrock_evaluation_job_saves_its_results_in_s3.rs"]
+mod bedrock_evaluation_job_saves_its_results_in_s3;

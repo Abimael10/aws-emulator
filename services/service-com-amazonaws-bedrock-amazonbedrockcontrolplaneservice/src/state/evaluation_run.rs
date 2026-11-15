@@ -47,6 +47,8 @@
 //! store, or no inference plane, to ask establishes nothing, so such a job keeps the
 //! lifecycle it has always had rather than being failed on an unanswered question.
 
+use std::collections::HashMap;
+
 use serde_json::{json, Value};
 
 use service_com_amazonaws_bedrockruntime_amazonbedrockfrontendservice::state as runtime;
@@ -75,16 +77,41 @@ const OUTPUT_CONTENT_TYPE: &str = "application/json";
 /// The name of the result file of one model, task type and dataset of a job.
 const OUTPUT_FILE: &str = "output.jsonl";
 
-/// `Builtin.Toxicity` — the published built-in metric this emulator computes a score for:
-/// the toxicity of the response the evaluated model answered with.
+/// `Builtin.Toxicity` — the built-in metric whose value is a property of the response the
+/// evaluated model answered with: how toxic that text is.
 ///
-/// Source: "Use automatic model evaluation" in the Amazon Bedrock User Guide, which
-/// publishes the built-in metric names a `datasetMetricConfigs` entry can carry; this is the
-/// one of them whose computation is a property OF THE RESPONSE TEXT, which this emulator's
-/// inference plane has an engine for ([`response_toxicity`]). The others are scored against
-/// knowledge or perturbation this emulator holds nothing for, so a record reports them as
-/// metrics no value was computed for rather than carrying a number nothing computed.
+/// "For automated model evaluation jobs, valid values are `Builtin.Accuracy`,
+/// `Builtin.Robustness`, and `Builtin.Toxicity`"
+/// (`smithy_query(query="shape",shape="EvaluationDatasetMetricConfig",member="metricNames")`)
+/// — the three built-in metrics a `datasetMetricConfigs` entry of an automated job can name.
+/// This one is computed by the very content recognizers this emulator's inference plane
+/// evaluates a guardrail with ([`response_toxicity`]).
 pub const METRIC_TOXICITY: &str = "Builtin.Toxicity";
+
+/// `Builtin.Accuracy` — the built-in metric whose value is how well the response ANSWERS the
+/// record, so it is computed from that response and the record's own `referenceResponse`
+/// ([`accuracy_score`]).
+pub const METRIC_ACCURACY: &str = "Builtin.Accuracy";
+
+/// `QuestionAndAnswer` — the task type whose accuracy is the F1 overlap of the response with
+/// the record's reference response.
+///
+/// A value of the modelled `EvaluationTaskType`
+/// (`smithy_query(query="shape",shape="EvaluationTaskType")`: `Summarization`,
+/// `Classification`, `QuestionAndAnswer`, `Generation`, `Custom`). "Use automatic model
+/// evaluation" in the Amazon Bedrock User Guide publishes what accuracy is computed as per
+/// task type: the F1 score for question answering, and whether the predicted class is the
+/// real one for text classification ([`TASK_CLASSIFICATION`]) — both a comparison of the
+/// response with the reference response the record carries, which is what this emulator
+/// holds for a record. The accuracy of the other task types is published as a score of a
+/// model this emulator runs none of (a semantic similarity for summarization, a real-world
+/// knowledge score for generation), so those are reported as metrics no value was computed
+/// for rather than carrying a number computed another way under the same name.
+const TASK_QUESTION_AND_ANSWER: &str = "QuestionAndAnswer";
+
+/// `Classification` — the task type whose accuracy is whether the response carries the class
+/// the record names, scored one or zero. See [`TASK_QUESTION_AND_ANSWER`] for the source.
+const TASK_CLASSIFICATION: &str = "Classification";
 
 /// What a result record reports for a configured metric this emulator computes no value for.
 ///
@@ -93,6 +120,23 @@ pub const METRIC_TOXICITY: &str = "Builtin.Toxicity";
 #[must_use]
 pub fn uncomputed_metric_message(metric: &str) -> String {
     format!("This emulator computes no {metric} score for an evaluated response.")
+}
+
+/// The same for a metric whose value is computed for this task type but not for THIS record:
+/// there is no reference response to compare the response with.
+#[must_use]
+pub fn unreferenced_metric_message(metric: &str) -> String {
+    format!(
+        "This emulator computes no {metric} score for a record that carries no \
+         referenceResponse to compare the response with."
+    )
+}
+
+/// The same for a metric whose published computation for THIS task type needs a score of a
+/// model this emulator runs none of.
+#[must_use]
+pub fn untasked_metric_message(metric: &str, task_type: &str) -> String {
+    format!("This emulator computes no {metric} score for a {task_type} task.")
 }
 
 /// One dataset a job is configured to evaluate over, with the task type and the metrics
@@ -479,11 +523,11 @@ fn evaluated_record(
     let mut scores: Vec<Value> = Vec::new();
     let mut unscored: Vec<Value> = Vec::new();
     for metric in &dataset.metric_names {
-        match metric_score(metric, &response) {
+        match metric_score(metric, &dataset.task_type, record, &response) {
             Some(result) => scores.push(json!({"metricName": metric, "result": result})),
             None => unscored.push(json!({
                 "metricName": metric,
-                "message": uncomputed_metric_message(metric),
+                "message": unscored_metric_message(metric, &dataset.task_type, record),
             })),
         }
     }
@@ -505,10 +549,134 @@ fn evaluated_record(
     (line, intervened)
 }
 
-/// The score of one configured metric over the response the evaluated model answered with,
-/// or `None` for a metric this emulator computes no value for.
-fn metric_score(metric: &str, response: &str) -> Option<f64> {
-    (metric == METRIC_TOXICITY).then(|| response_toxicity(response))
+/// The score of one configured metric over the record and the response the evaluated model
+/// answered it with, or `None` for a metric no value was computed for
+/// ([`unscored_metric_message`] says which of the reasons it was).
+///
+/// The built-in metrics of an automated job are `Builtin.Accuracy`, `Builtin.Robustness` and
+/// `Builtin.Toxicity` (the `metricNames` member's own documentation). Toxicity is a property
+/// of the response alone and accuracy a comparison of it with the record's reference
+/// response, so both are computed here from what the run actually has. Robustness is
+/// published as a score over the responses to PERTURBED inputs, and the response this
+/// emulator's inference plane answers does not vary with the wording of the prompt, so
+/// nothing it holds computes a robustness value — it is reported as a metric no value was
+/// computed for, as is any metric name outside the built-in set (a custom metric is scored by
+/// the judge model its own configuration names).
+fn metric_score(
+    metric: &str,
+    task_type: &str,
+    record: &DatasetRecord,
+    response: &str,
+) -> Option<f64> {
+    match metric {
+        METRIC_TOXICITY => Some(response_toxicity(response)),
+        METRIC_ACCURACY => accuracy_score(task_type, reference_response(record)?, response),
+        _ => None,
+    }
+}
+
+/// The reference response a record carries for its answer to be compared with, or `None` for
+/// a record that carries none to compare against.
+fn reference_response(record: &DatasetRecord) -> Option<&str> {
+    record
+        .reference_response
+        .as_deref()
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty())
+}
+
+/// Which of the reasons a configured metric carries no score in a record, stated so a reader
+/// of the results can tell a metric that scored zero from one that was never scored, and a
+/// metric this emulator never scores from one this RECORD gave it nothing to score.
+fn unscored_metric_message(metric: &str, task_type: &str, record: &DatasetRecord) -> String {
+    match (metric, accuracy_is_computed_for(task_type)) {
+        (METRIC_ACCURACY, false) => untasked_metric_message(metric, task_type),
+        (METRIC_ACCURACY, true) if reference_response(record).is_none() => {
+            unreferenced_metric_message(metric)
+        }
+        _ => uncomputed_metric_message(metric),
+    }
+}
+
+/// Whether the accuracy of a task type is one this emulator computes: the task types whose
+/// published accuracy is a comparison of the response with the record's reference response
+/// ([`TASK_QUESTION_AND_ANSWER`], [`TASK_CLASSIFICATION`]).
+fn accuracy_is_computed_for(task_type: &str) -> bool {
+    matches!(task_type, TASK_QUESTION_AND_ANSWER | TASK_CLASSIFICATION)
+}
+
+/// How accurately the response answers the record, in the 0..1 scale a metric score is
+/// reported on — or `None` for a task type whose accuracy is published as the score of a
+/// model this emulator runs none of.
+///
+/// Question answering is scored with the F1 overlap of the response with the reference
+/// response ([`token_f1`]) and classification with whether the response carries the class the
+/// record names ([`carries_class`]), which is what each is published as
+/// ([`TASK_QUESTION_AND_ANSWER`]).
+fn accuracy_score(task_type: &str, reference: &str, response: &str) -> Option<f64> {
+    match task_type {
+        TASK_QUESTION_AND_ANSWER => Some(token_f1(reference, response)),
+        TASK_CLASSIFICATION => Some(if carries_class(reference, response) {
+            1.0
+        } else {
+            0.0
+        }),
+        _ => None,
+    }
+}
+
+/// The words of a text, as both halves of a comparison are read: lower-cased runs of
+/// alphanumeric characters, so punctuation and spacing cannot make two spellings of one word
+/// differ.
+fn words(text: &str) -> Vec<String> {
+    text.split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// The F1 overlap of the response with the reference response: the harmonic mean of how much
+/// of the response is in the reference (precision) and how much of the reference is in the
+/// response (recall), over the words of each. A response sharing no word with the reference
+/// scores zero, and one that is the reference scores one.
+fn token_f1(reference: &str, response: &str) -> f64 {
+    let expected = words(reference);
+    let answered = words(response);
+    if expected.is_empty() || answered.is_empty() {
+        return 0.0;
+    }
+    // The words of the reference still to be matched, counted: a word the reference carries
+    // twice is matched twice and no more, which is what makes this an overlap of the two
+    // texts rather than a test of membership.
+    let mut outstanding: HashMap<&str, usize> = HashMap::new();
+    for word in &expected {
+        *outstanding.entry(word.as_str()).or_default() += 1;
+    }
+    let mut shared = 0usize;
+    for word in &answered {
+        if let Some(left) = outstanding.get_mut(word.as_str()).filter(|left| **left > 0) {
+            *left -= 1;
+            shared += 1;
+        }
+    }
+    if shared == 0 {
+        return 0.0;
+    }
+    let precision = shared as f64 / answered.len() as f64;
+    let recall = shared as f64 / expected.len() as f64;
+    2.0 * precision * recall / (precision + recall)
+}
+
+/// Whether the response carries the class the record names: its words, in order, somewhere in
+/// the words of the response.
+fn carries_class(reference: &str, response: &str) -> bool {
+    let label = words(reference);
+    let answered = words(response);
+    !label.is_empty()
+        && answered.len() >= label.len()
+        && answered
+            .windows(label.len())
+            .any(|window| window == label.as_slice())
 }
 
 /// How toxic the response is, in the 0..1 scale a metric score is reported on.
@@ -721,6 +889,30 @@ mod tests {
         }
     }
 
+    /// One row of the accuracy table: what the record and the response carry, and what the
+    /// metric must come to over them (`None` for a case no value is computed for).
+    struct AccuracyCase {
+        case: &'static str,
+        /// `taskType`, which decides HOW accuracy is computed.
+        task_type: &'static str,
+        /// `referenceResponse`, where the record carries one.
+        reference: Option<&'static str>,
+        /// The response the evaluated model answered with.
+        response: &'static str,
+        /// The score, or `None` where the metric is reported as one no value was computed for.
+        score: Option<f64>,
+    }
+
+    /// One dataset record, with the reference response a metric is computed against where it
+    /// carries one.
+    fn record(prompt: &str, reference: Option<&str>) -> DatasetRecord {
+        DatasetRecord {
+            prompt: prompt.to_string(),
+            reference_response: reference.map(str::to_string),
+            category: None,
+        }
+    }
+
     /// RULE: a toxicity score is computed from the response, so a response the recognizers
     /// place content in scores above one they place nothing in, and every score is in the
     /// 0..1 range a metric is reported on.
@@ -737,8 +929,9 @@ mod tests {
         // table is compared against: a metric score is computed from the response, so a
         // response nothing is placed in scores the bottom of the range.
         let benign = 0.0f64;
+        let asked = record("any prompt", None);
         for (case, response, toxic) in rows {
-            let score = metric_score(METRIC_TOXICITY, response)
+            let score = metric_score(METRIC_TOXICITY, TASK_QUESTION_AND_ANSWER, &asked, response)
                 .unwrap_or_else(|| panic!("case {case:?}: {METRIC_TOXICITY} is computed"));
             assert!(
                 (0.0..=1.0).contains(&score),
@@ -758,10 +951,124 @@ mod tests {
                 );
             }
         }
-        assert!(
-            metric_score("Builtin.Accuracy", "any response").is_none(),
-            "case \"a metric this emulator computes no value for\": expected no score, got {:?}",
-            metric_score("Builtin.Accuracy", "any response")
+        let robustness = metric_score(
+            "Builtin.Robustness",
+            TASK_QUESTION_AND_ANSWER,
+            &record("any prompt", Some("any answer")),
+            "any response",
         );
+        assert!(
+            robustness.is_none(),
+            "case \"a built-in metric this emulator computes no value for\": expected no score, \
+             got {robustness:?}"
+        );
+    }
+
+    /// RULE: `Builtin.Accuracy` is computed from the response and the record's own
+    /// `referenceResponse` — the F1 overlap of the two for a question-answering task and
+    /// whether the response carries the class for a classification one — and is reported as a
+    /// metric no value was computed for where the record carries no reference or the task
+    /// type's accuracy is published as the score of a model this emulator runs none of.
+    #[test]
+    fn the_accuracy_metric_is_computed_from_the_response_and_the_reference() {
+        let rows = vec![
+            AccuracyCase {
+                case: "question answering, the reference answered word for word",
+                task_type: TASK_QUESTION_AND_ANSWER,
+                reference: Some("Paris"),
+                response: "Paris",
+                score: Some(1.0),
+            },
+            AccuracyCase {
+                case: "question answering, the reference inside a sentence",
+                task_type: TASK_QUESTION_AND_ANSWER,
+                reference: Some("yes"),
+                response: "Yes, it is.",
+                // One of the three words answered is one of the one word expected.
+                score: Some(2.0 * (1.0 / 3.0) * 1.0 / ((1.0 / 3.0) + 1.0)),
+            },
+            AccuracyCase {
+                case: "question answering, a response sharing no word with the reference",
+                task_type: TASK_QUESTION_AND_ANSWER,
+                reference: Some("yes"),
+                response: "The Pacific is the largest ocean.",
+                score: Some(0.0),
+            },
+            AccuracyCase {
+                case: "question answering, punctuation and case differing only",
+                task_type: TASK_QUESTION_AND_ANSWER,
+                reference: Some("366 days"),
+                response: "366 DAYS.",
+                score: Some(1.0),
+            },
+            AccuracyCase {
+                case: "question answering, a record carrying no reference",
+                task_type: TASK_QUESTION_AND_ANSWER,
+                reference: None,
+                response: "Paris",
+                score: None,
+            },
+            AccuracyCase {
+                case: "question answering, a reference of blank text",
+                task_type: TASK_QUESTION_AND_ANSWER,
+                reference: Some("   "),
+                response: "Paris",
+                score: None,
+            },
+            AccuracyCase {
+                case: "classification, the class the record names",
+                task_type: TASK_CLASSIFICATION,
+                reference: Some("positive"),
+                response: "This review is Positive overall.",
+                score: Some(1.0),
+            },
+            AccuracyCase {
+                case: "classification, another class",
+                task_type: TASK_CLASSIFICATION,
+                reference: Some("negative"),
+                response: "This review is positive overall.",
+                score: Some(0.0),
+            },
+            AccuracyCase {
+                case: "summarization, published as the score of a model this emulator runs \
+                       none of",
+                task_type: "Summarization",
+                reference: Some("A granite lighthouse."),
+                response: "A granite lighthouse.",
+                score: None,
+            },
+            AccuracyCase {
+                case: "generation, published as a real-world knowledge score",
+                task_type: "Generation",
+                reference: Some("Paris"),
+                response: "Paris",
+                score: None,
+            },
+        ];
+        for row in rows {
+            let case = row.case;
+            let asked = record("any prompt", row.reference);
+            let score = metric_score(METRIC_ACCURACY, row.task_type, &asked, row.response);
+            match (row.score, score) {
+                (Some(expected), Some(score)) => {
+                    assert!(
+                        (0.0..=1.0).contains(&score) && (score - expected).abs() < 1e-9,
+                        "case {case:?}: expected the score {expected}, got {score}"
+                    );
+                }
+                (None, None) => {
+                    let message =
+                        unscored_metric_message(METRIC_ACCURACY, row.task_type, &asked);
+                    assert!(
+                        message.contains(METRIC_ACCURACY),
+                        "case {case:?}: the record says which metric was not scored, got \
+                         {message:?}"
+                    );
+                }
+                (expected, score) => panic!(
+                    "case {case:?}: expected the score {expected:?}, got {score:?}"
+                ),
+            }
+        }
     }
 }

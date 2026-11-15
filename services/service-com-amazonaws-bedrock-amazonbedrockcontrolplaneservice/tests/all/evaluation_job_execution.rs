@@ -81,8 +81,11 @@ const OTHER_MODEL: &str = "amazon.nova-pro-v1:0";
 const TOXICITY_DATASET: &str = "Builtin.RealToxicityPrompts";
 const SUMMARIZATION_DATASET: &str = "Builtin.Gigaword";
 
-/// The metric this emulator computes a score for, and one it does not.
-const UNSCORED_METRIC: &str = "Builtin.Accuracy";
+/// `Builtin.Accuracy`, which the rows below configure on the task types whose accuracy is
+/// published as the score of a model this emulator runs none of, so those rows expect it
+/// reported as a metric no value was computed for. The task types whose accuracy IS computed
+/// here are the metric table's own (`a_jobs_records_score_the_metrics_computed_from_the_run`).
+const UNSCORED_METRIC: &str = bedrock::state::evaluation_run::METRIC_ACCURACY;
 
 /// How long after the create a job's status is owed its move to the terminal status its run
 /// ended in, read off the handler's own constant.
@@ -1004,5 +1007,337 @@ async fn a_record_whose_model_serves_no_inference_is_reported_as_an_error() {
             "case {case:?}: record {position} carries no score, since nothing was scored, got \
              {record}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// 4. The configured metrics are SCORED: a result record carries a value for every metric
+//    computed from what the run has, and names the ones no value was computed for.
+// ---------------------------------------------------------------------------------------
+
+/// Every key the bucket holds under `prefix`, as `ListObjectsV2` reports them — the call a
+/// client makes to find a finished job's results. An empty `prefix` lists the whole bucket.
+async fn listed_keys(emu: &Emulator, case: &str, prefix: &str) -> Vec<String> {
+    let (status, body) = emu
+        .s3("GET", &format!("/{BUCKET}?list-type=2&prefix={prefix}"), &[])
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the output bucket must be listable, got {status} with body {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    let listing = String::from_utf8_lossy(&body).to_string();
+    listing
+        .split("<Key>")
+        .skip(1)
+        .filter_map(|tail| tail.split("</Key>").next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The words of a text as a comparison of two texts reads them, which is how this suite
+/// decides what a score over a response and a reference must come to without re-deriving the
+/// service's own arithmetic: lower-cased runs of alphanumeric characters.
+fn text_words(text: &str) -> Vec<String> {
+    text.split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Whether the response and the reference have a word in common at all.
+fn shares_a_word(reference: &str, response: &str) -> bool {
+    let answered = text_words(response);
+    text_words(reference)
+        .iter()
+        .any(|word| answered.contains(word))
+}
+
+/// What a result record must report for one configured metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expect {
+    /// A score in the 0..1 range a metric is reported on, computed from this record.
+    Scored,
+    /// No score, and the metric named among the ones no value was computed for.
+    Unscored,
+}
+
+/// One row of the metric table: a job configured with one dataset entry, and what each of
+/// that entry's metrics must come to in the saved records.
+struct MetricRow {
+    case: &'static str,
+    name: &'static str,
+    /// `taskType` — a value of the modelled `EvaluationTaskType`
+    /// (`smithy_query(query="shape",shape="EvaluationTaskType")`).
+    task_type: &'static str,
+    /// `dataset.name`.
+    dataset: &'static str,
+    /// The key of the caller's own prompt file, for a row that evaluates one rather than a
+    /// built-in dataset.
+    location: Option<&'static str>,
+    /// Each configured metric name and what a record must report for it.
+    metrics: Vec<(&'static str, Expect)>,
+    /// `outputDataConfig.s3Uri` after the bucket.
+    output_suffix: &'static str,
+}
+
+/// The rows differ along what the rule generalises over: the task type, which dataset's
+/// records are evaluated (a built-in one whose records carry a reference response, another,
+/// and the caller's own file whose records carry none), which metrics the entry configures
+/// (one, two, a built-in one this emulator computes no value for), and the shape of the
+/// output location. The recorded case — question answering over the built-in yes-or-no
+/// dataset, scored with `Builtin.Accuracy`, saved under a prefix — is the first row.
+fn metric_rows() -> Vec<MetricRow> {
+    vec![
+        MetricRow {
+            case: "question answering over the built-in yes-or-no dataset, scored for accuracy",
+            name: "eval-question-accuracy",
+            task_type: "QuestionAndAnswer",
+            dataset: "Builtin.BoolQ",
+            location: None,
+            metrics: vec![(UNSCORED_METRIC, Expect::Scored)],
+            output_suffix: "/eval-output/",
+        },
+        MetricRow {
+            case: "question answering over open-domain questions, scored for accuracy and \
+                   toxicity",
+            name: "eval-question-two-metrics",
+            task_type: "QuestionAndAnswer",
+            dataset: "Builtin.NaturalQuestions",
+            location: None,
+            metrics: vec![
+                (UNSCORED_METRIC, Expect::Scored),
+                (METRIC_TOXICITY, Expect::Scored),
+            ],
+            output_suffix: "/reports/accuracy",
+        },
+        MetricRow {
+            case: "classification over the built-in review dataset, scored for accuracy",
+            name: "eval-classification-accuracy",
+            task_type: "Classification",
+            dataset: "Builtin.WomensEcommerceClothingReviews",
+            location: None,
+            metrics: vec![(UNSCORED_METRIC, Expect::Scored)],
+            output_suffix: "",
+        },
+        MetricRow {
+            case: "question answering over the caller's own file, whose records carry no \
+                   reference response",
+            name: "eval-question-no-reference",
+            task_type: "QuestionAndAnswer",
+            dataset: "own-questions",
+            location: Some("datasets/questions.jsonl"),
+            metrics: vec![
+                (UNSCORED_METRIC, Expect::Unscored),
+                (METRIC_TOXICITY, Expect::Scored),
+            ],
+            output_suffix: "/eval-output/",
+        },
+        MetricRow {
+            case: "summarization, whose accuracy is published as the score of a model this \
+                   emulator runs none of",
+            name: "eval-summaries-accuracy",
+            task_type: "Summarization",
+            dataset: SUMMARIZATION_DATASET,
+            location: None,
+            metrics: vec![(UNSCORED_METRIC, Expect::Unscored)],
+            output_suffix: "/eval-output/",
+        },
+        MetricRow {
+            case: "a built-in metric computed over perturbed inputs, which this emulator's \
+                   inference answers nothing to compute from",
+            name: "eval-question-robustness",
+            task_type: "QuestionAndAnswer",
+            dataset: "Builtin.TriviaQA",
+            location: None,
+            metrics: vec![("Builtin.Robustness", Expect::Unscored)],
+            output_suffix: "/eval-output/",
+        },
+    ]
+}
+
+/// RULE: a job the emulator carries into `Completed` has SCORED the metrics its
+/// `datasetMetricConfigs` configured over the records it evaluated — `Builtin.Accuracy` from
+/// the response and the record's own reference response, `Builtin.Toxicity` from the response
+/// — and its result objects are listable under the prefix its `outputDataConfig.s3Uri` named;
+/// a configured metric no value was computed for is NAMED in the record rather than reported
+/// as a number nothing computed.
+#[tokio::test]
+async fn a_jobs_records_score_the_metrics_computed_from_the_run() {
+    let emu = emulator();
+    given_bucket(&emu).await;
+    given_dataset_object(&emu, "datasets/questions.jsonl", OWN_PROMPTS).await;
+
+    for row in metric_rows() {
+        let case = row.case;
+        let output_uri = format!("s3://{BUCKET}{}", row.output_suffix);
+        let metric_names: Vec<&str> = row.metrics.iter().map(|(metric, _)| *metric).collect();
+        let location = row
+            .location
+            .map(|key| format!("s3://{BUCKET}/{key}"));
+        let arn = submit(
+            &emu,
+            case,
+            row.name,
+            vec![dataset_metric_config(
+                row.task_type,
+                row.dataset,
+                location.as_deref(),
+                &metric_names,
+            )],
+            &[EVALUATED_MODEL],
+            &output_uri,
+        )
+        .await;
+        poll_until_status(&emu, case, &arn, "Completed").await;
+
+        // Where a client looks for the results: a listing of the prefix the submission named.
+        let prefix = row.output_suffix.trim_matches('/');
+        let keys = listed_keys(&emu, case, prefix).await;
+        let key = result_key(
+            row.output_suffix,
+            row.name,
+            &arn,
+            EVALUATED_MODEL,
+            row.task_type,
+            row.dataset,
+        );
+        assert!(
+            keys.contains(&key),
+            "case {case:?}: a listing of {prefix:?} must report the result object {key:?}, got \
+             {keys:?}"
+        );
+        assert!(
+            keys.iter().all(|listed| listed.starts_with(prefix)),
+            "case {case:?}: a listing of {prefix:?} reports only keys under it, got {keys:?}"
+        );
+
+        let records = result_records(&emu, case, &key).await;
+        let expected_records = match row.location {
+            Some(_) => OWN_PROMPTS.len(),
+            None => builtin_prompts(row.dataset).len(),
+        };
+        assert_eq!(
+            records.len(),
+            expected_records,
+            "case {case:?}: one result record per dataset record, expected {expected_records}, \
+             got {}",
+            records.len()
+        );
+
+        for (position, record) in records.iter().enumerate() {
+            let response = record
+                .pointer("/modelResponses/0/response")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: record {position} carries no response: {record}")
+                });
+            let reference = record
+                .pointer("/inputRecord/referenceResponse")
+                .and_then(Value::as_str);
+            let scored: Vec<(&str, f64)> = record
+                .pointer("/automatedEvaluationResult/scores")
+                .and_then(Value::as_array)
+                .map(|scores| {
+                    scores
+                        .iter()
+                        .filter_map(|score| {
+                            Some((
+                                score.get("metricName").and_then(Value::as_str)?,
+                                score.get("result").and_then(Value::as_f64)?,
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let unscored: Vec<(&str, &str)> = record
+                .get("unscoredMetrics")
+                .and_then(Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| {
+                            Some((
+                                entry.get("metricName").and_then(Value::as_str)?,
+                                entry.get("message").and_then(Value::as_str)?,
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            for (metric, expect) in &row.metrics {
+                let score = scored
+                    .iter()
+                    .find(|(scored, _)| scored == metric)
+                    .map(|(_, score)| *score);
+                match expect {
+                    Expect::Scored => {
+                        let score = score.unwrap_or_else(|| {
+                            panic!(
+                                "case {case:?}: record {position} must carry a {metric} score, \
+                                 got {record}"
+                            )
+                        });
+                        assert!(
+                            (0.0..=1.0).contains(&score),
+                            "case {case:?}: record {position} scores {metric} in 0..1, got \
+                             {score}"
+                        );
+                        if *metric == UNSCORED_METRIC {
+                            // Accuracy is computed from the response and the reference, so
+                            // what it comes to follows from the two: a question-answering
+                            // response sharing no word with the reference scores the bottom of
+                            // the range and one sharing a word scores above it, and a
+                            // classification response scores one exactly when it carries the
+                            // class the record names.
+                            let reference = reference.unwrap_or_else(|| {
+                                panic!(
+                                    "case {case:?}: record {position} carries the reference its \
+                                     accuracy was computed against, got {record}"
+                                )
+                            });
+                            if row.task_type == "Classification" {
+                                // Classification accuracy is binary — one where the predicted
+                                // class is the record's own, zero otherwise — and the
+                                // inference plane answers a notice that no model ran, which
+                                // carries neither class of this dataset, so every record of
+                                // this row scores the bottom of the range.
+                                assert_eq!(
+                                    score, 0.0,
+                                    "case {case:?}: record {position} scores {metric} zero, \
+                                     since the response {response:?} carries neither the class \
+                                     {reference:?} nor any other, got {score}"
+                                );
+                            } else {
+                                assert_eq!(
+                                    score > 0.0,
+                                    shares_a_word(reference, response),
+                                    "case {case:?}: record {position} scores {metric} above zero \
+                                     exactly where the response shares a word with the reference \
+                                     {reference:?}, got {score} for {response:?}"
+                                );
+                            }
+                        }
+                    }
+                    Expect::Unscored => {
+                        assert_eq!(
+                            score, None,
+                            "case {case:?}: record {position} reports no {metric} value, got \
+                             {score:?}"
+                        );
+                        let message = unscored
+                            .iter()
+                            .find(|(named, _)| named == metric)
+                            .map(|(_, message)| *message);
+                        assert!(
+                            message.is_some_and(|message| message.contains(metric)),
+                            "case {case:?}: record {position} names {metric} among the metrics \
+                             no value was computed for, got {record}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
