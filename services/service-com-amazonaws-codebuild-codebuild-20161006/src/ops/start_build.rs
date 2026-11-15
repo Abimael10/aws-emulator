@@ -423,8 +423,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .or_else(|| project.logs_config.clone());
         // The artifacts destinations this build RUNS WITH, resolved the same way: the
         // override when the request carries one, and the project's own otherwise. The
-        // build's own record reports them as `BuildArtifacts`, which states no type, so
-        // the resolved `ProjectArtifacts` are what the run is given (`StoredBuild`).
+        // build's own record reports them as `BuildArtifacts`, which states the
+        // destination's type in the token form the wire carries rather than the modelled
+        // one, so the resolved `ProjectArtifacts` are what the run is given
+        // (`StoredBuild`).
         let artifacts_destination = input
             .artifacts_override
             .clone()
@@ -586,8 +588,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 start_millis: now,
                 settle_due_millis: now + crate::state::BUILD_SETTLE_MILLIS,
                 // The destinations this build UPLOADS to, kept as the artifacts they were
-                // resolved from: the type is what says whether there is a destination at
-                // all, and the `BuildArtifacts` the record reports carries none.
+                // resolved from: the modelled, upper-case type is what says whether there
+                // is a destination at all, and the `BuildArtifacts` the record reports
+                // carries the wire form of it.
                 artifacts: artifacts_destination.clone(),
                 secondary_artifacts: secondary_destinations.clone().unwrap_or_default(),
                 run_claimed: false,

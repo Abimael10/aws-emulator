@@ -2735,6 +2735,16 @@ impl StoredBuild {
         self.build.end_time = Some(datetime(self.settle_due_millis));
         self.build.phases = Some(run.phases);
         self.build.exported_environment_variables = run.exported_variables;
+        // Once the environment has been provisioned, the build reports the environment it
+        // RAN IN rather than only the one it was started with: CodeBuild starts a build
+        // container with its own entrypoint — the agent that runs the buildspec — rather
+        // than the entrypoint of the image, so a build that got an environment reports
+        // that. A build whose provisioning failed never had one, so it reports none.
+        if run.environment_provisioned {
+            if let Some(environment) = self.build.environment.as_mut() {
+                environment.custom_entrypoint = Some(true);
+            }
+        }
         if let Some(artifacts) = artifacts {
             self.build.artifacts = Some(artifacts);
         }
@@ -4193,18 +4203,24 @@ fn open_batch_phase(phase_type: &str, start_millis: i64) -> BuildBatchPhase {
     }
 }
 
-/// A started build's view of its output artifacts: the configured destination, with
-/// the checksums and the resolved location left absent because nothing was uploaded.
+/// A started run's view of its output artifacts: the destination it RUNS WITH, with
+/// the checksums left absent because nothing has been uploaded yet.
 ///
-/// Shared by `StartBuild` and `StartBuildBatch`, which project the same
-/// `ProjectArtifacts` onto the `BuildArtifacts` their records carry. The destination's
-/// TYPE is the batch's own report of what it combines its artifacts to
-/// ([`batch_artifacts_of`]), so a build leaves it absent: no recorded build read states
-/// one.
+/// A run always STATES the destination it carries, the way it states its cache, source
+/// and environment ([`effective_cache`] and its siblings): the `type` is that
+/// destination's type in the token form the service puts on the wire
+/// ([`wire_artifacts_type`]) and the `location` is a stated value — the empty string for
+/// a destination that names none — so a client reading `artifacts` to decide whether a
+/// run produces output can tell a destination that holds nothing from an answer that
+/// said nothing.
+///
+/// Shared by `StartBuild` and `StartBuildBatch` (and so by every read of the records
+/// they persist), which project the same `ProjectArtifacts` onto the `BuildArtifacts`
+/// their records carry.
 pub fn build_artifacts_of(artifacts: ProjectArtifacts) -> BuildArtifacts {
     BuildArtifacts {
-        r#type: None,
-        location: artifacts.location,
+        r#type: Some(wire_artifacts_type(&artifacts.r#type)),
+        location: Some(artifacts.location.unwrap_or_default()),
         sha256sum: None,
         md5sum: None,
         override_artifact_name: artifacts.override_artifact_name,
@@ -4215,8 +4231,8 @@ pub fn build_artifacts_of(artifacts: ProjectArtifacts) -> BuildArtifacts {
 }
 
 /// The artifacts destination each build of a batch build carries, projected once for the
-/// whole fan-out: the primary artifacts and the secondary ones, as a BUILD reports them
-/// ([`build_artifacts_of`]) rather than as the batch does ([`batch_artifacts_of`]).
+/// whole fan-out: the primary artifacts and the secondary ones, as a run reports them
+/// ([`build_artifacts_of`]).
 #[derive(Debug, Clone, Default)]
 pub struct GroupArtifacts {
     /// The build's primary output artifacts.
@@ -4225,34 +4241,15 @@ pub struct GroupArtifacts {
     pub secondary: Option<Vec<BuildArtifacts>>,
 }
 
-/// A started BATCH build's view of its output artifacts — [`build_artifacts_of`] plus
-/// what a batch states about the destination it combines the artifacts of its builds to:
-/// the destination's TYPE, and its LOCATION as a stated value rather than an absent one.
-///
-/// Recorded behaviour of a batch build read: the batch's `artifacts` carries the
-/// destination type in the token form the service puts on the wire
-/// ([`wire_artifacts_type`]) and a `location` that is the empty string for a destination
-/// that names none — a batch reports the destination it RUNS WITH, the way it reports its
-/// cache, source and environment ([`effective_cache`] and its siblings), rather than
-/// omitting what the project configured.
-pub fn batch_artifacts_of(artifacts: ProjectArtifacts) -> BuildArtifacts {
-    let r#type = wire_artifacts_type(&artifacts.r#type);
-    let location = artifacts.location.clone().unwrap_or_default();
-    BuildArtifacts {
-        r#type: Some(r#type),
-        location: Some(location),
-        ..build_artifacts_of(artifacts)
-    }
-}
-
 /// An `ArtifactsType` in the token form CodeBuild puts on the wire for an artifact it
 /// REPORTS — the modelled value lowercased (`NO_ARTIFACTS` -> `no_artifacts`).
 ///
-/// Recorded behaviour: a batch build read states the artifact type of both the batch's
-/// own `artifacts` and the `primaryArtifact` of each build group in this form, while the
-/// value an artifact is CONFIGURED with (`ProjectArtifacts$type`) is the modelled,
-/// upper-case one. So the token is derived from the configured value rather than written
-/// out: a destination type this service never saw before reports in the same form.
+/// Recorded behaviour: a build read and a batch build read both state the artifact type
+/// of the record's own `artifacts` (and of the `primaryArtifact` of each build group) in
+/// this form, while the value an artifact is CONFIGURED with (`ProjectArtifacts$type`) is
+/// the modelled, upper-case one. So the token is derived from the configured value rather
+/// than written out: a destination type this service never saw before reports in the same
+/// form.
 pub fn wire_artifacts_type(configured: &str) -> String {
     configured.to_ascii_lowercase()
 }

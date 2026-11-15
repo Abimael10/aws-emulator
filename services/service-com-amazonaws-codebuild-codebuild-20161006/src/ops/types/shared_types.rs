@@ -157,6 +157,7 @@ pub struct ProjectEnvironment {
     pub image_pull_credentials_type: Option<String>,
     pub docker_server: Option<DockerServer>,
     pub host_kernel: Option<String>,
+    pub custom_entrypoint: Option<bool>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.codebuild#ComputeConfiguration")]

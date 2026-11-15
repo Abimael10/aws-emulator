@@ -236,9 +236,11 @@ async fn a_readable_buildspec_is_never_a_parse_refusal() {
             download["phaseStatus"], json!("SUCCEEDED"),
             "case {case:?}: the source phase read the buildspec, got {download}"
         );
-        assert!(
-            download["contexts"].is_null(),
-            "case {case:?}: a buildspec that was read carries no context, got {download}"
+        assert_eq!(
+            download["contexts"],
+            json!([{"statusCode": "", "message": ""}]),
+            "case {case:?}: a buildspec that was read leaves the phase's context empty, got \
+             {download}"
         );
     }
 }

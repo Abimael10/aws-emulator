@@ -121,6 +121,8 @@ mod sandbox_idle_timeout;
 mod sandbox_lifecycle;
 #[path = "all/sandbox_sessions.rs"]
 mod sandbox_sessions;
+#[path = "all/settled_build_record.rs"]
+mod settled_build_record;
 #[path = "all/shell_probe.rs"]
 mod shell_probe;
 #[path = "all/source_credential_arn_shape.rs"]

@@ -310,6 +310,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cloud_watch_logs: logs.cloud_watch_logs.clone(),
             s3_logs: logs.s3_logs.clone(),
         });
+        // The environment the retry was STARTED with, which is the retried build's own
+        // configuration without what the retried build's RUN added to it: no environment
+        // has been provisioned for this build yet.
+        let environment = retried.environment.clone().map(|mut environment| {
+            environment.custom_entrypoint = None;
+            environment
+        });
         let build = Build {
             id: Some(id.clone()),
             arn: Some(arn.clone()),
@@ -318,6 +325,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             end_time: None,
             current_phase: Some("QUEUED".to_string()),
             build_status: Some("IN_PROGRESS".to_string()),
+            environment,
             // Nothing clones a repository here, so the retry has no resolved
             // revision of its own yet.
             resolved_source_version: None,

@@ -228,7 +228,9 @@ async fn deliver_log(
 /// makes the log readable as the account of why a build ended as it did — including a build
 /// whose commands never ran, whose whole account is the phase that stopped it. The two lines
 /// are the agent's own (`Phase complete: <phase> State: <state>` and `Phase context status
-/// code: <code> Message: <message>`); every value in them is the phase's own.
+/// code: <code> Message: <message>`); every value in them is the phase's own. A phase whose
+/// context reports NOTHING (the empty context a phase that ended cleanly carries) has
+/// nothing for the second line to say, so none is written for it.
 fn agent_lines(phases: &[BuildPhase]) -> Vec<String> {
     let mut lines = Vec::new();
     for phase in phases {
@@ -239,10 +241,13 @@ fn agent_lines(phases: &[BuildPhase]) -> Vec<String> {
             lines.push(format!("Phase complete: {phase_type} State: {state}"));
         }
         for context in phase.contexts.iter().flatten() {
+            let status_code = context.status_code.clone().unwrap_or_default();
+            let message = context.message.clone().unwrap_or_default();
+            if status_code.is_empty() && message.is_empty() {
+                continue;
+            }
             lines.push(format!(
-                "Phase context status code: {} Message: {}",
-                context.status_code.clone().unwrap_or_default(),
-                context.message.clone().unwrap_or_default()
+                "Phase context status code: {status_code} Message: {message}"
             ));
         }
     }

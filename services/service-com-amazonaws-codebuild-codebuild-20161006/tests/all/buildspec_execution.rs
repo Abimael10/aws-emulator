@@ -331,9 +331,10 @@ async fn the_finishing_phases_report_what_the_build_put_where() {
                     "case {case:?}: unexpected upload failure, got {phase}"
                 );
             }
-            None => assert!(
-                phase["contexts"].is_null(),
-                "case {case:?}: a successful upload carries no context, got {phase}"
+            None => assert_eq!(
+                phase["contexts"],
+                json!([{"statusCode": "", "message": ""}]),
+                "case {case:?}: a successful upload leaves its context empty, got {phase}"
             ),
         }
         let pairs = phase_pairs(&build);

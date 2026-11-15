@@ -409,12 +409,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // The destination the batch combines its builds' artifacts to. The BATCH reports
-        // that destination as the one it runs with (`crate::state::batch_artifacts_of`:
-        // its type, and its location stated rather than absent), while the builds of the
-        // batch carry the same destination as a build does
-        // (`crate::state::build_artifacts_of`) — which is what each of them deployed to,
-        // and what their groups' resolved artifacts are then read from.
+        // The destination the batch combines its builds' artifacts to — the same
+        // destination each build of the batch carries, reported the same way
+        // (`crate::state::build_artifacts_of`: its type in the token form the service puts
+        // on the wire, and its location stated rather than absent), which is what each of
+        // them deployed to and what their groups' resolved artifacts are then read from.
         let configured_artifacts = input
             .artifacts_override
             .clone()
@@ -474,10 +473,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             artifacts: configured_artifacts
                 .clone()
-                .map(crate::state::batch_artifacts_of),
+                .map(crate::state::build_artifacts_of),
             secondary_artifacts: configured_secondary_artifacts.clone().map(|list| {
                 list.into_iter()
-                    .map(crate::state::batch_artifacts_of)
+                    .map(crate::state::build_artifacts_of)
                     .collect()
             }),
             cache: Some(crate::state::effective_cache(
@@ -761,9 +760,9 @@ fn resolve_idempotency_token(
 /// build number from that project's sequence, and it names the batch it belongs to
 /// through `buildBatchArn`.
 ///
-/// `artifacts` is the batch's destination as a BUILD reports one
-/// (`crate::state::build_artifacts_of`) rather than as the batch reports it, so a build
-/// of the batch answers exactly what a build of the same project answers.
+/// `artifacts` is the batch's destination as a run reports one
+/// (`crate::state::build_artifacts_of`), so a build of the batch answers exactly what a
+/// build of the same project answers.
 fn group_build(
     build_batch: &BuildBatch,
     artifacts: &crate::state::GroupArtifacts,

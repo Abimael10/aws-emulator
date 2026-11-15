@@ -20,16 +20,18 @@
 //! * `LogsLocation$cloudWatchLogsArn` states its own format
 //!   (`arn:${Partition}:logs:${Region}:${Account}:log-group:${LogGroupName}:log-stream:${LogStreamName}`),
 //!   so it is composed from the two names above rather than stated separately.
+//! * `deepLink` is "the URL to an individual build log in CloudWatch Logs", so it is the
+//!   CloudWatch Logs console address of that same group and stream
+//!   ([`CLOUD_WATCH_CONSOLE`]) — composed from the two names for the same reason.
 //!
-//! A configuration that DISABLES CloudWatch delivery leaves all three absent: there is no
-//! group, no stream and no stream ARN for output that was not delivered there. The
-//! configurations themselves (`cloudWatchLogs`, `s3Logs`) are reported as the build RUNS
-//! with them, which for a build whose project configures neither is CloudWatch `ENABLED` and
-//! Amazon S3 `DISABLED` — the delivery CodeBuild performs for a project that configures no
-//! logs at all.
+//! A configuration that DISABLES CloudWatch delivery leaves all four absent: there is no
+//! group, no stream, no stream ARN and no log to link to for output that was not delivered
+//! there. The configurations themselves (`cloudWatchLogs`, `s3Logs`) are reported as the
+//! build RUNS with them, which for a build whose project configures neither is CloudWatch
+//! `ENABLED` and Amazon S3 `DISABLED` — the delivery CodeBuild performs for a project that
+//! configures no logs at all.
 //!
-//! `deepLink`, `s3DeepLink` and `s3LogsArn` are left absent: the first two are console URLs,
-//! which this emulator does not serve, and the third addresses the S3 object an upload of the
+//! `s3DeepLink` and `s3LogsArn` are left absent: both address the S3 object an upload of the
 //! build's log file created, which happens only for a build whose output was delivered to a
 //! bucket.
 
@@ -48,6 +50,16 @@ pub const LOGS_DISABLED: &str = "DISABLED";
 
 /// The ARN namespace the CloudWatch Logs group and stream of a build live under.
 const LOGS_ARN_NAMESPACE: &str = "logs";
+
+/// The CloudWatch Logs console view of ONE log stream, which is what `deepLink` addresses:
+/// the console's log-event view takes the group and the stream in its fragment
+/// (`#logEvent:group=<group>;stream=<stream>`).
+const CLOUD_WATCH_CONSOLE: &str = "https://console.aws.amazon.com/cloudwatch/home";
+
+/// The console address of the log events one build wrote — `LogsLocation$deepLink`.
+fn deep_link(region: &str, group: &str, stream: &str) -> String {
+    format!("{CLOUD_WATCH_CONSOLE}?region={region}#logEvent:group={group};stream={stream}")
+}
 
 /// Whether `config` leaves CloudWatch delivery on: a configuration that states no
 /// `cloudWatchLogs` at all, or one whose status is not `DISABLED`.
@@ -131,11 +143,13 @@ pub fn build_logs_location(
                     &format!("log-group:{group}:log-stream:{stream}"),
                 )
             }),
+        deep_link: group_name
+            .as_deref()
+            .zip(stream_name.as_deref())
+            .map(|(group, stream)| deep_link(region, group, stream)),
         group_name,
         stream_name,
-        // Console URLs this emulator does not serve, and the object an S3 log upload
-        // created; see the module docs.
-        deep_link: None,
+        // The object an S3 log upload created; see the module docs.
         s3_deep_link: None,
         s3_logs_arn: None,
         cloud_watch_logs: Some(cloud_watch_logs),
@@ -228,9 +242,10 @@ mod tests {
                 "case {case:?}: expected the stream {stream:?}, got {:?}",
                 location.stream_name
             );
-            // The stream ARN is composed from the two names, so it is present exactly when
-            // they are.
+            // The stream ARN and the console link are composed from the two names, so they
+            // are present exactly when they are.
             let arn = location.cloud_watch_logs_arn.clone();
+            let link = location.deep_link.clone();
             match (group, stream) {
                 (Some(group), Some(stream)) => {
                     let expected = format!(":log-group:{group}:log-stream:{stream}");
@@ -238,11 +253,22 @@ mod tests {
                         arn.as_deref().is_some_and(|arn| arn.ends_with(&expected)),
                         "case {case:?}: expected a stream ARN ending {expected:?}, got {arn:?}"
                     );
+                    let expected = format!("#logEvent:group={group};stream={stream}");
+                    assert!(
+                        link.as_deref().is_some_and(|link| link.ends_with(&expected)),
+                        "case {case:?}: expected a deep link ending {expected:?}, got {link:?}"
+                    );
                 }
-                _ => assert!(
-                    arn.is_none(),
-                    "case {case:?}: expected no stream ARN, got {arn:?}"
-                ),
+                _ => {
+                    assert!(
+                        arn.is_none(),
+                        "case {case:?}: expected no stream ARN, got {arn:?}"
+                    );
+                    assert!(
+                        link.is_none(),
+                        "case {case:?}: expected no deep link, got {link:?}"
+                    );
+                }
             }
             // The configurations the build runs with are always reported.
             assert!(

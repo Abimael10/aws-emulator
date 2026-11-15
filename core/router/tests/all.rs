@@ -1896,3 +1896,24 @@ mod zz_probe_whole_emulator;
 // wrap a list item without the indentation `clippy::doc_lazy_continuation` asks for, which
 // is a note rather than a build failure. An inner attribute, like an inner doc comment, is
 // legal only before the first item, so it stands here rather than in the list.
+// Single integration-test target for the router: the declaration list of every cross-service
+// suite under `tests/all/`, and nothing else.
+// `*.rs` file under `tests/all/`, sorted by name, and no other line — no prose between the
+// pairs, no blank line, and nothing after the last pair. Two branches landing at once then
+// new suite at `tests/all/<name>.rs` and insert its pair where its name sorts to.
+// comment documents the module it stands in, so the language accepts it only ahead of that
+// module's first item: one written past the declarations compiles no suite of this target at
+// all. With none anywhere in the file, there is no such line for a landing to copy, which is
+// how the tail of this file had last grown into re-typed fragments of a header.
+// under `tests/` — which the layout check refuses: the `#[path]` above each `mod` is what
+// points the declaration into `tests/all/`. Declare each suite exactly ONCE, since a second
+// declaration of one name compiles neither copy, and declare every file, since one no `mod`
+// names is compiled nowhere and its tests never run. Some of the files below are shared
+// harnesses or probes rather than suites; each is declared like any other.
+// `all/appended_prose.rs` keep the notes earlier landings had appended here. The rules above
+// are checked rather than restated: `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/every_suite_file_is_declared.rs` read them for this file and for every service crate's
+// The module headers of the suites this root compiles wrap without the indentation
+// `clippy::doc_lazy_continuation` asks of a doc list item, so the lint is allowed for the
+// whole target. An inner attribute, like an inner doc comment, is legal only before the first
+// item, so it stands in this header rather than in the list.

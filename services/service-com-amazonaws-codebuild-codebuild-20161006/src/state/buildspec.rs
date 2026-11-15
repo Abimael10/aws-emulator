@@ -67,12 +67,14 @@ const PHASE_FINALIZING: &str = "FINALIZING";
 /// See [`PHASE_SUBMITTED`].
 const PHASE_COMPLETED: &str = "COMPLETED";
 
-/// The phases a buildspec declares commands for, as the `BuildPhaseType` each is
-/// reported by paired with the buildspec key that declares it, in the order CodeBuild
-/// runs them.
+/// The phases a build RUNS the commands of, as the `BuildPhaseType` each is reported by
+/// paired with the buildspec key that declares it, in the order CodeBuild runs them.
 ///
 /// From the buildspec reference's `phases` sequence: `install`, `pre_build`, `build` and
-/// `post_build` are the phases whose `commands` the build runs.
+/// `post_build` are the phases whose `commands` the build runs. Every build runs ALL FOUR
+/// and reports every one it reached, whether or not the buildspec declares that key: a
+/// phase that declares nothing runs no command, so it succeeds — it is still a phase the
+/// build went through.
 const COMMAND_PHASES: [(&str, &str); 4] = [
     ("install", "INSTALL"),
     ("pre_build", "PRE_BUILD"),
@@ -97,6 +99,31 @@ const UNREADABLE_YAML_MESSAGE: &str = "Unable to parse YAML file";
 
 /// The `PhaseContext$statusCode` a phase whose command failed reports.
 const COMMAND_EXECUTION_ERROR: &str = "COMMAND_EXECUTION_ERROR";
+
+/// The `contexts` a phase that reached its end with NOTHING to report carries.
+///
+/// A build's phases each carry a `contexts` list "especially to help troubleshoot a failed
+/// build", and the list is there whether or not the phase had anything to put in it: a
+/// phase with nothing to report carries one context whose `statusCode` and `message` are
+/// both empty, so a client walking `contexts` reads an empty report rather than an absent
+/// one. The two phases before the environment exists — the build having been submitted and
+/// its wait in the queue — are not phases of the build environment and carry none
+/// ([`leading_phases`]), and neither does the terminal marker phase, which has not ended.
+fn empty_contexts() -> Option<Vec<PhaseContext>> {
+    Some(vec![PhaseContext {
+        status_code: Some(String::new()),
+        message: Some(String::new()),
+    }])
+}
+
+/// `contexts` for a phase that ended: what it reported, or the empty report of a phase
+/// that had nothing to report ([`empty_contexts`]).
+fn phase_contexts(reported: Option<PhaseContext>) -> Option<Vec<PhaseContext>> {
+    match reported {
+        Some(context) => Some(vec![context]),
+        None => empty_contexts(),
+    }
+}
 
 /// What CodeBuild states as the reason a phase's command failed: the command it ran and
 /// the status that command exited with.
@@ -168,7 +195,8 @@ pub struct Buildspec {
     /// The runtimes the install phase's `runtime-versions` selects, as the runtime and the
     /// version each entry names, in declaration order.
     pub runtime_versions: Vec<(String, String)>,
-    /// The phases that declare commands, in the order they run.
+    /// The four phases a build runs the commands of, in the order it runs them — present
+    /// for each whether or not the document declares it ([`COMMAND_PHASES`]).
     pub phases: Vec<DeclaredPhase>,
     /// The `artifacts` section, which is what says WHICH files of the build's working tree
     /// the declared artifact is made of — `None` when the buildspec declares none at all.
@@ -217,8 +245,8 @@ pub struct ArtifactDeclaration {
 /// for one this crate does not read inside the bounds it parses a buildspec in.
 ///
 /// A readable buildspec that declares no `phases`, or a phase that declares no
-/// `commands`, declares no command: the build then has nothing to run, which is a build
-/// that runs to success rather than one that failed.
+/// `commands`, declares no command: the build then has nothing to run in that phase,
+/// which is a phase that runs to success rather than one that failed.
 pub fn read_buildspec(buildspec: &str) -> Result<Buildspec, UnreadableBuildspec> {
     let document = buildspec_document(buildspec)?;
     let root = document.as_hash().ok_or(UnreadableBuildspec::NotRead)?;
@@ -272,40 +300,46 @@ pub fn read_buildspec(buildspec: &str) -> Result<Buildspec, UnreadableBuildspec>
             read.exported_variables = exported.iter().filter_map(scalar_string).collect();
         }
     }
-    if let Some(phases) = mapping_get(root, PHASES_KEY).and_then(::yaml_rust2::Yaml::as_hash) {
-        for (key, phase_type) in COMMAND_PHASES {
-            let Some(phase) = mapping_get(phases, key).and_then(::yaml_rust2::Yaml::as_hash) else {
-                continue;
-            };
-            let commands = mapping_get(phase, COMMANDS_KEY)
+    // Every one of the four phases is read, whether or not the document declares it: the
+    // build RUNS all four ([`COMMAND_PHASES`]), and a phase the buildspec says nothing
+    // about is one that runs no command.
+    let declared = mapping_get(root, PHASES_KEY).and_then(::yaml_rust2::Yaml::as_hash);
+    for (key, phase_type) in COMMAND_PHASES {
+        let phase = declared
+            .and_then(|phases| mapping_get(phases, key))
+            .and_then(::yaml_rust2::Yaml::as_hash);
+        let commands = phase
+            .and_then(|phase| mapping_get(phase, COMMANDS_KEY))
+            .and_then(::yaml_rust2::Yaml::as_vec)
+            .map(|listed| listed.iter().filter_map(scalar_string).collect())
+            .unwrap_or_default();
+        let abort_on_failure = phase
+            .and_then(|phase| mapping_get(phase, ON_FAILURE_KEY))
+            .and_then(scalar_string)
+            .is_none_or(|on_failure| !on_failure.eq_ignore_ascii_case(ON_FAILURE_CONTINUE));
+        if key == INSTALL_PHASE_KEY {
+            if let Some(runtimes) = phase
+                .and_then(|phase| mapping_get(phase, RUNTIME_VERSIONS_KEY))
+                .and_then(::yaml_rust2::Yaml::as_hash)
+            {
+                read.runtime_versions = runtimes
+                    .iter()
+                    .filter_map(|(runtime, version)| {
+                        Some((runtime.as_str()?.to_string(), scalar_string(version)?))
+                    })
+                    .collect();
+            }
+        }
+        read.phases.push(DeclaredPhase {
+            phase_type,
+            commands,
+            finally: phase
+                .and_then(|phase| mapping_get(phase, FINALLY_KEY))
                 .and_then(::yaml_rust2::Yaml::as_vec)
                 .map(|listed| listed.iter().filter_map(scalar_string).collect())
-                .unwrap_or_default();
-            let abort_on_failure = mapping_get(phase, ON_FAILURE_KEY)
-                .and_then(scalar_string)
-                .is_none_or(|on_failure| !on_failure.eq_ignore_ascii_case(ON_FAILURE_CONTINUE));
-            if key == INSTALL_PHASE_KEY {
-                if let Some(runtimes) =
-                    mapping_get(phase, RUNTIME_VERSIONS_KEY).and_then(::yaml_rust2::Yaml::as_hash)
-                {
-                    read.runtime_versions = runtimes
-                        .iter()
-                        .filter_map(|(runtime, version)| {
-                            Some((runtime.as_str()?.to_string(), scalar_string(version)?))
-                        })
-                        .collect();
-                }
-            }
-            read.phases.push(DeclaredPhase {
-                phase_type,
-                commands,
-                finally: mapping_get(phase, FINALLY_KEY)
-                    .and_then(::yaml_rust2::Yaml::as_vec)
-                    .map(|listed| listed.iter().filter_map(scalar_string).collect())
-                    .unwrap_or_default(),
-                abort_on_failure,
-            });
-        }
+                .unwrap_or_default(),
+            abort_on_failure,
+        });
     }
     Ok(read)
 }
@@ -397,6 +431,11 @@ pub struct BuildRun {
     /// The variables the buildspec's `exported-variables` named and the build's session
     /// held a value for — `None` when it exported none.
     pub exported_variables: Option<Vec<ExportedEnvironmentVariable>>,
+    /// Whether the build ENVIRONMENT was provisioned at all, which is what decides whether
+    /// the build reports the environment it RAN IN
+    /// ([`super::StoredBuild::record_run`]) — `false` for a build whose provisioning phase
+    /// failed, since there was no environment for it to run in.
+    pub environment_provisioned: bool,
 }
 
 /// What the build environment already holds when the build's phases run, and why the
@@ -500,6 +539,7 @@ pub fn environment_failure(start_millis: i64, due_millis: i64, context: PhaseCon
         status: BUILD_STATUS_FAILED.to_string(),
         phases,
         exported_variables: None,
+        environment_provisioned: false,
     }
 }
 
@@ -530,7 +570,7 @@ pub fn run_commands(
         BUILD_STATUS_SUCCEEDED,
         due_millis,
         due_millis,
-        None,
+        empty_contexts(),
     ));
 
     let buildspec = build
@@ -608,7 +648,7 @@ pub fn run_commands(
         BUILD_STATUS_SUCCEEDED,
         due_millis,
         due_millis,
-        None,
+        empty_contexts(),
     ));
 
     let mut shell = BuildShell::new(
@@ -643,7 +683,7 @@ pub fn run_commands(
             },
             due_millis,
             due_millis,
-            outcome.map(|context| vec![context]),
+            phase_contexts(outcome),
         ));
         // A phase whose failure aborts the build is the last phase that ran, so the build
         // reports none of the ones after it; `on-failure: CONTINUE` goes on to the next
@@ -714,7 +754,7 @@ pub fn finish_build(run: CommandRun, upload: Option<PhaseContext>, due_millis: i
             },
             due_millis,
             due_millis,
-            upload.map(|context| vec![context]),
+            phase_contexts(upload),
         ));
     }
     // The build's own finishing work runs for every build that got as far as running its
@@ -725,7 +765,7 @@ pub fn finish_build(run: CommandRun, upload: Option<PhaseContext>, due_millis: i
             BUILD_STATUS_SUCCEEDED,
             due_millis,
             due_millis,
-            None,
+            empty_contexts(),
         ));
     }
     phases.push(open_phase(PHASE_COMPLETED, due_millis));
@@ -737,6 +777,10 @@ pub fn finish_build(run: CommandRun, upload: Option<PhaseContext>, due_millis: i
         },
         phases,
         exported_variables,
+        // This build's commands RAN, so the environment they ran in was provisioned
+        // ([`run_commands`] is the only caller, and a build whose environment was not
+        // provisioned answers through [`environment_failure`] instead).
+        environment_provisioned: true,
     }
 }
 
