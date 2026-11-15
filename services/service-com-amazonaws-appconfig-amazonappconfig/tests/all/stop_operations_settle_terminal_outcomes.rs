@@ -46,10 +46,14 @@ use crate::stop_experiment_run::stop_run;
 use crate::update_experiment_run::update_run;
 
 /// The terminal `DeploymentState` of a deployment a caller stopped while the service was
-/// still working on it, from the model's `DeploymentState` enum (`BAKING | COMPLETE |
-/// DEPLOYING | REVERTED | ROLLED_BACK | ROLLING_BACK | VALIDATING`,
-/// `smithy_query(query="operation", operation="StopDeployment")`).
-const ROLLED_BACK: &str = "ROLLED_BACK";
+/// still working on it, in the CamelCase form `Deployment$State` goes on the wire as.
+///
+/// The model's `DeploymentState` enum declares the members `BAKING | COMPLETE | DEPLOYING
+/// | REVERTED | ROLLED_BACK | ROLLING_BACK | VALIDATING`
+/// (`smithy_query(query="operation", operation="StopDeployment")`) with no `@enumValue`
+/// trait on any of them, and AppConfig serves each one as its published CamelCase
+/// spelling.
+const ROLLED_BACK: &str = "RolledBack";
 
 /// The `DeploymentEventType` of the entry a settled rollback records, and the
 /// `Description` and `TriggeredBy` AppConfig reports it with when a request initiated the
@@ -122,7 +126,7 @@ async fn a_stop_answers_the_deployment_in_its_terminal_rolled_back_state() {
         let at_start = member(&started.json(), "State");
         let at_start = at_start.as_str().unwrap_or_default();
         assert!(
-            matches!(at_start, "DEPLOYING" | "BAKING"),
+            matches!(at_start, "Deploying" | "Baking"),
             "case {case:?}: this row's strategy must leave the deployment in progress, got \
              {at_start:?}"
         );

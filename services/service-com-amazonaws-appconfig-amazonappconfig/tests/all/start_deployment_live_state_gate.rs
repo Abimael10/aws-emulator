@@ -213,7 +213,7 @@ async fn a_busy_environment_refuses_every_body_with_its_own_state() {
     );
     assert_eq!(
         started.string("State").as_deref(),
-        Some("DEPLOYING"),
+        Some("Deploying"),
         "the first deployment must still be rolling out, got {}",
         started.json()
     );

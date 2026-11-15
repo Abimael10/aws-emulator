@@ -91,7 +91,6 @@
 // comment is legal only before the first item, so one left past the declarations is `E0753`
 // and compiles no suite of this target. With none anywhere in the file, no merge of two
 // landings can leave one there.
-// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of
 // this file under `tests/`, which the layout check refuses: the `#[path]` above each `mod` is
 // what points the declaration into `tests/all/`. A suite file no `mod` names is compiled
 // nowhere and its tests never run, and a second `mod` for one name is `E0428`.
@@ -1344,8 +1343,6 @@ mod zz_probe_whole_emulator;
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
 // `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs` and
 // `all/declaration_roots_are_canonical_and_complete.rs` check all of the above, for this file
-// and for every service crate's `tests/all.rs`, so check there rather than leaving a note
-// here.
 // The header paragraphs above wrap without the indentation `clippy::doc_lazy_continuation`
 // asks of a doc list item; the lint is allowed here so a header line is a header line rather
 // than a build failure. An inner attribute, like an inner doc comment, is legal only before
@@ -1357,15 +1354,12 @@ mod zz_probe_whole_emulator;
 // once then insert two lines in two places and have no prose here to duplicate, re-word or
 // mistype, which is what had gone wrong with this file, whose tail had grown hundreds of
 // re-typed copies of its own header.
-// EVERY comment in this file is an ORDINARY `//` one, this header included: an inner doc
-// comment is legal only before the first item, so one appended past the declarations is
 // `E0753` and compiles no suite of this target, and with none anywhere in the file no merge
 // of two landings can leave one there. A suite no `mod` names compiles nowhere and its tests
 // never run; a suite left at the top level of `tests/` fails the build; and a suite declared
 // twice is `E0428`. The `all/all_rs_*` suites, `all/every_suite_file_is_declared.rs` and
 // into `tests/all/`. Some of the files below are shared harnesses or probes rather than
 // suites; every one of them is declared, because a file no declaration names is compiled
-// nowhere.
 #[path = "all/cloudformation_provisions_appsync_event_and_merged_apis.rs"]
 mod cloudformation_provisions_appsync_event_and_merged_apis;
 // `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs`,
@@ -1379,9 +1373,6 @@ mod cloudformation_provisions_appsync_event_and_merged_apis;
 // so it stands here rather than in the list.
 // Single integration-test target for the router: the canonical DECLARATION LIST of its
 // cross-service suites, and nothing else.
-// file under `tests/all/`, sorted by name, and no other line — no prose between the pairs, no
-// blank line, and nothing after the last pair. Two branches landing at once then insert two
-// lines in two places and have no prose to duplicate, re-word or mistype, which is what had
 // gone wrong here: the tail of this file had grown hundreds of re-typed copies of its header.
 // `E0753` and compiles no suite of this target; with none anywhere in the file, no merge of
 // two landings can leave one past the first item. A suite file no `mod` here names is compiled

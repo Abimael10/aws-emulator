@@ -44,13 +44,14 @@ use crate::extensions::create_extension;
 use crate::resource_tags::arn;
 
 /// The `DeploymentState` values a deployment can no longer leave
-/// (`smithy_query(query="shape",shape="DeploymentState")`: the rollout ends in one of
-/// these, and the suite waits for whichever one this row's directive leads to.
-const TERMINAL_STATES: &[&str] = &["COMPLETE", "ROLLED_BACK", "REVERTED"];
+/// (`smithy_query(query="shape",shape="DeploymentState")`, in the CamelCase form
+/// `Deployment$State` goes on the wire as: the rollout ends in one of these, and the suite
+/// waits for whichever one this row's directive leads to.
+const TERMINAL_STATES: &[&str] = &["Complete", "RolledBack", "Reverted"];
 
 /// The `DeploymentState` values of a deployment the service is still rolling out, which is
 /// when the position a tick reports is the position the deployment itself reports.
-const IN_FLIGHT_STATES: &[&str] = &["DEPLOYING", "BAKING"];
+const IN_FLIGHT_STATES: &[&str] = &["Deploying", "Baking"];
 
 /// The share of targets this suite's paced rollout grows by per interval.
 ///
@@ -330,8 +331,11 @@ struct Row {
     case: &'static str,
     /// The JSON document the row's handler answers, verbatim.
     answer: &'static str,
-    /// The terminal `DeploymentState` the rollout ends in.
+    /// The terminal `DeploymentState` the rollout ends in, as the document serves it.
     expected_state: &'static str,
+    /// The MEMBER NAME of [`Row::expected_state`], which is the form the refusal of a stop
+    /// of the terminal deployment spells it in.
+    expected_member_name: &'static str,
     /// The `Description` the answer asked AppConfig to record for the rollback, when it
     /// supplied one.
     expected_description: Option<&'static str>,
@@ -343,31 +347,36 @@ const ROWS: &[Row] = &[
     Row {
         case: "an abort directive with a reason",
         answer: r#"{"Directive": "ROLL_BACK", "Description": "error rate above the canary limit"}"#,
-        expected_state: "ROLLED_BACK",
+        expected_state: "RolledBack",
+        expected_member_name: "ROLLED_BACK",
         expected_description: Some("error rate above the canary limit"),
     },
     Row {
         case: "an abort directive with no reason",
         answer: r#"{"Directive": "ROLL_BACK"}"#,
-        expected_state: "ROLLED_BACK",
+        expected_state: "RolledBack",
+        expected_member_name: "ROLLED_BACK",
         expected_description: None,
     },
     Row {
         case: "a directive to carry on",
         answer: r#"{"Directive": "CONTINUE", "Description": "the canary is healthy"}"#,
-        expected_state: "COMPLETE",
+        expected_state: "Complete",
+        expected_member_name: "COMPLETE",
         expected_description: None,
     },
     Row {
         case: "an answer carrying no directive",
         answer: "{}",
-        expected_state: "COMPLETE",
+        expected_state: "Complete",
+        expected_member_name: "COMPLETE",
         expected_description: None,
     },
     Row {
         case: "a directive AppConfig defines no meaning for",
         answer: r#"{"Directive": "PAUSE", "Description": "not a directive of the API"}"#,
-        expected_state: "COMPLETE",
+        expected_state: "Complete",
+        expected_member_name: "COMPLETE",
         expected_description: None,
     },
 ];
@@ -424,7 +433,7 @@ async fn an_at_deployment_tick_directive_steers_the_deployment_it_is_invoked_for
         .await;
         assert_eq!(
             seeding.json()["State"],
-            json!("COMPLETE"),
+            json!("Complete"),
             "case {case:?}: the instant deployment of version 1 must be complete, got {}",
             seeding.json()
         );
@@ -483,7 +492,7 @@ async fn an_at_deployment_tick_directive_steers_the_deployment_it_is_invoked_for
         );
         assert_eq!(
             started.json()["State"],
-            json!("DEPLOYING"),
+            json!("Deploying"),
             "case {case:?}: a paced deployment is still rolling out when StartDeployment \
              answers, got {}",
             started.json()
@@ -535,7 +544,7 @@ async fn an_at_deployment_tick_directive_steers_the_deployment_it_is_invoked_for
         // A rollout nothing aborted is ticked right through its growth steps, so its ticks
         // report a position that GREW: a tick reporting the share it started at for a
         // deployment that reached every target is reporting a stale position.
-        if row.expected_state != "ROLLED_BACK" {
+        if row.expected_state != "RolledBack" {
             assert!(
                 reached > 0.0,
                 "case {case:?}: the ticks of a rollout that reached every target must \
@@ -544,7 +553,7 @@ async fn an_at_deployment_tick_directive_steers_the_deployment_it_is_invoked_for
         }
 
         let types = event_types(&document);
-        if row.expected_state == "ROLLED_BACK" {
+        if row.expected_state == "RolledBack" {
             for owed in ["ROLLBACK_STARTED", "ROLLBACK_COMPLETED"] {
                 assert!(
                     types.iter().any(|event| event == owed),
@@ -594,7 +603,7 @@ async fn an_at_deployment_tick_directive_steers_the_deployment_it_is_invoked_for
         // version's exact bytes back in service, and one that completed serves the new
         // ones.
         let (in_service, version) = served(&router, case, &application, &environment, &profile).await;
-        let (expected_bytes, expected_version) = if row.expected_state == "ROLLED_BACK" {
+        let (expected_bytes, expected_version) = if row.expected_state == "RolledBack" {
             (&first, "1")
         } else {
             (&second, "2")
@@ -630,7 +639,8 @@ async fn an_at_deployment_tick_directive_steers_the_deployment_it_is_invoked_for
         let message = stopped.string("Message").unwrap_or_default();
         let expected = format!(
             "Deployment 2 for App {application} and Environment {environment} cannot be \
-             stopped, it has a status of {state}."
+             stopped, it has a status of {}.",
+            row.expected_member_name
         );
         assert_eq!(
             message, expected,

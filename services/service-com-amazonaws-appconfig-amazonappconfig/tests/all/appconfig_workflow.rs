@@ -192,10 +192,10 @@ pub(crate) fn with_required_retrieval_role(mut body: serde_json::Value) -> serde
     body
 }
 
-/// The `DeploymentState` values a deployment stops at: "COMPLETE", a rollback that
+/// The `DeploymentState` values a deployment stops at: "Complete", a rollback that
 /// finished, and the revert of one that had completed. What [`deployment_in_state`] waits
 /// for when a caller is waiting for a deployment to be over.
-pub(crate) const TERMINAL_DEPLOYMENT_STATES: &[&str] = &["COMPLETE", "ROLLED_BACK", "REVERTED"];
+pub(crate) const TERMINAL_DEPLOYMENT_STATES: &[&str] = &["Complete", "RolledBack", "Reverted"];
 
 /// How long [`deployment_in_state`] waits for a deployment to reach the state it is
 /// polling for.
@@ -1073,7 +1073,7 @@ async fn predefined_strategies_deploy_and_the_deployment_reads_back() {
             .unwrap_or_default()
             .to_string();
         assert!(
-            state_now == "DEPLOYING" || state_now == "BAKING",
+            state_now == "Deploying" || state_now == "Baking",
             "case {case:?}: expected a deployment in progress, got State {state_now:?}"
         );
         let event_log = read
@@ -1606,11 +1606,11 @@ async fn deployment_numbers_increase_per_environment() {
 
         // A strategy with no rollout window and no bake time paces no stage: AppConfig has
         // nothing to roll out gradually and nothing to monitor, so the start call itself
-        // answers a COMPLETE deployment — and the next deployment into the same environment
+        // answers a `Complete` deployment — and the next deployment into the same environment
         // is not blocked, with no caller asking for anything and no test sleeping.
         assert_eq!(
             started.string("State").as_deref(),
-            Some("COMPLETE"),
+            Some("Complete"),
             "case {case:?}: a deployment whose strategy paces no stage is over when the \
              start answers, got {}",
             started.json()
@@ -1622,12 +1622,12 @@ async fn deployment_numbers_increase_per_environment() {
             &application,
             &first,
             i64::from(expected_number),
-            &["COMPLETE"],
+            &["Complete"],
         )
         .await;
         assert_eq!(
             finished.get("State").and_then(serde_json::Value::as_str),
-            Some("COMPLETE"),
+            Some("Complete"),
             "case {case:?}: expected the deployment to have completed, got {finished}"
         );
         assert_eq!(

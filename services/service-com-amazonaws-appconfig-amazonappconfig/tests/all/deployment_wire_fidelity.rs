@@ -15,10 +15,10 @@
 //!    `DeploymentType`, `USER` for a deployment a caller started).
 //! 3. `StartDeployment` answers the deployment as it stands at the instant it was asked
 //!    for: a strategy that paces any stage — a rollout window or a final bake time — leaves
-//!    it still `DEPLOYING`, having reached nobody and carrying only its start event,
+//!    it still `Deploying`, having reached nobody and carrying only its start event,
 //!    because reaching the targets, baking and completing are transitions AppConfig
 //!    performs after the call; a strategy that paces NEITHER leaves AppConfig nothing to
-//!    pace or monitor, so the deployment is already `COMPLETE` with a `CompletedAt` and a
+//!    pace or monitor, so the deployment is already `Complete` with a `CompletedAt` and a
 //!    completion event.
 //! 4. Every `EventLog` entry carries `ActionInvocations` as a LIST — "the list of
 //!    extensions that were invoked as part of the deployment" — which is empty for an
@@ -39,9 +39,9 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::appconfig_workflow::{
     create_application, create_environment, create_profile, json_call, router, send, Answer,
 };
+use crate::deployment_state_wire_form::is_a_published_deployment_state;
 use service_com_amazonaws_appconfig_amazonappconfig::ops::types::{
-    DEPLOYMENT_EVENT_TYPE_VALUES, DEPLOYMENT_STATE_VALUES, DEPLOYMENT_TYPE_VALUES,
-    TRIGGERED_BY_VALUES,
+    DEPLOYMENT_EVENT_TYPE_VALUES, DEPLOYMENT_TYPE_VALUES, TRIGGERED_BY_VALUES,
 };
 
 /// One row: what a failing assertion calls it, and the criteria of the deployment
@@ -190,8 +190,9 @@ fn assert_document_shape(case: &str, document: &str, body: &Value) {
     let state = member(body, "State");
     let state = state.as_str().unwrap_or_default();
     assert!(
-        DEPLOYMENT_STATE_VALUES.contains(&state),
-        "case {case:?}: {document}'s State must be a modelled DeploymentState, got {state:?}"
+        is_a_published_deployment_state(state),
+        "case {case:?}: {document}'s State must be a value AppConfig publishes for a \
+         DeploymentState member, got {state:?}"
     );
 
     assert_eq!(
@@ -289,7 +290,7 @@ fn expected_at_start(row: &Row) -> (&'static str, f64, bool, Vec<&'static str>) 
         // No rollout window and no bake time: AppConfig has nothing to pace and nothing to
         // monitor, so the deployment is over when the start answers.
         return (
-            "COMPLETE",
+            "Complete",
             100.0,
             true,
             vec!["DEPLOYMENT_COMPLETED", "DEPLOYMENT_STARTED"],
@@ -298,7 +299,7 @@ fn expected_at_start(row: &Row) -> (&'static str, f64, bool, Vec<&'static str>) 
     // Any paced stage puts every later stage after this call: no interval of the rollout
     // has elapsed at the start instant, so no growth step is due and nobody has the
     // configuration yet.
-    ("DEPLOYING", 0.0, false, vec!["DEPLOYMENT_STARTED"])
+    ("Deploying", 0.0, false, vec!["DEPLOYMENT_STARTED"])
 }
 
 /// The members of a Deployment document that NOTHING the clock does changes, so the read

@@ -137,7 +137,9 @@ async fn environment_state(
 /// <number> for App <application id> and Environment <environment id> cannot be stopped,
 /// it has a status of <state>.`, so every value in `must_name` is one the request or the
 /// record supplied, and `one_of` are the states the record could be in — more than one
-/// only where the clock may have moved the record on between two calls.
+/// only where the clock may have moved the record on between two calls — each spelled as
+/// the `DeploymentState` MEMBER NAME the sentence carries rather than as the CamelCase
+/// value the document serves.
 fn assert_bad_request(case: &str, answer: &Answer, must_name: &[&str], one_of: &[&str]) {
     assert_eq!(
         answer.status,
@@ -177,8 +179,12 @@ fn read_deployment_state(case: &str, body: &Value) -> String {
 
 /// The terminal `DeploymentState` a stop of a deployment in progress leaves behind: the
 /// stop settles the rollback it performs, so there is no transitional state for a reader
-/// to catch.
-const ROLLED_BACK: &str = "ROLLED_BACK";
+/// to catch. Spelled as the value `Deployment$State` goes on the wire as.
+const ROLLED_BACK: &str = "RolledBack";
+
+/// The MEMBER NAME of [`ROLLED_BACK`], which is the form a refusal's sentence spells a
+/// state in.
+const ROLLED_BACK_MEMBER: &str = "ROLLED_BACK";
 
 /// The `EnvironmentState` wire value matching [`ROLLED_BACK`].
 const ROLLED_BACK_ENVIRONMENT: &str = "RolledBack";
@@ -273,7 +279,7 @@ async fn stopping_a_deployment_in_progress_rolls_it_back_whatever_paced_it() {
         let at_start = member(&start_body, "State");
         let at_start = at_start.as_str().unwrap_or_default();
         assert!(
-            matches!(at_start, "DEPLOYING" | "BAKING"),
+            matches!(at_start, "Deploying" | "Baking"),
             "case {case:?}: this row's strategy must leave the deployment in progress, got \
              {at_start:?}"
         );
@@ -381,7 +387,7 @@ async fn stopping_a_deployment_in_progress_rolls_it_back_whatever_paced_it() {
             case,
             &again,
             &["Deployment 1", application.as_str(), environment.as_str()],
-            &[ROLLED_BACK],
+            &[ROLLED_BACK_MEMBER],
         );
         let after_refusal = get_deployment(&router, &application, &environment, 1).await;
         assert_eq!(
@@ -425,12 +431,12 @@ async fn a_completed_deployment_is_reverted_only_when_the_request_allows_it() {
         &application,
         &environment,
         1,
-        &["COMPLETE"],
+        &["Complete"],
     )
     .await;
     assert_eq!(
         member(&start_body, "State").as_str(),
-        Some("COMPLETE"),
+        Some("Complete"),
         "a deployment nobody stopped completes on its own, got {}",
         member(&start_body, "State")
     );
@@ -462,7 +468,7 @@ async fn a_completed_deployment_is_reverted_only_when_the_request_allows_it() {
         let read_back = get_deployment(&router, &application, &environment, 1).await.json();
         assert_eq!(
             member(&read_back, "State").as_str(),
-            Some("COMPLETE"),
+            Some("Complete"),
             "case {case:?}: a refused stop leaves the deployment where it was, got {}",
             member(&read_back, "State")
         );
@@ -493,8 +499,8 @@ async fn a_completed_deployment_is_reverted_only_when_the_request_allows_it() {
     let revert_body = reverted.json();
     assert_eq!(
         member(&revert_body, "State").as_str(),
-        Some("REVERTED"),
-        "case {case:?}: a reverted deployment reports REVERTED, got {}",
+        Some("Reverted"),
+        "case {case:?}: a reverted deployment reports the reverted state, got {}",
         member(&revert_body, "State")
     );
     assert_eq!(
@@ -524,7 +530,7 @@ async fn a_completed_deployment_is_reverted_only_when_the_request_allows_it() {
     let read_back = get_deployment(&router, &application, &environment, 1).await.json();
     assert_eq!(
         member(&read_back, "State").as_str(),
-        Some("REVERTED"),
+        Some("Reverted"),
         "case {case:?}: GetDeployment must report the state the revert wrote, got {}",
         member(&read_back, "State")
     );

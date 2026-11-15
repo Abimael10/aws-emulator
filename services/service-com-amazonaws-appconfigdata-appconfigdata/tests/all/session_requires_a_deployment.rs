@@ -325,8 +325,9 @@ struct DeploymentStateCase {
     stopped: bool,
     /// The `DeploymentState` values this leaves the deployment in, any of which the
     /// control plane may legitimately report by the time it is read (a stop starts a
-    /// rollback the clock then finishes). `DeploymentState` is listed for GetDeployment
-    /// in the control plane's own `OPERATIONS.md`.
+    /// rollback the clock then finishes), in the CamelCase form the enum's members go on
+    /// the wire as. `DeploymentState` is listed for GetDeployment in the control plane's
+    /// own `OPERATIONS.md`.
     states: &'static [&'static str],
 }
 
@@ -335,19 +336,19 @@ const DEPLOYMENT_STATE_CASES: &[DeploymentStateCase] = &[
         name: "still monitoring its final bake time",
         settled: false,
         stopped: false,
-        states: &["BAKING", "DEPLOYING"],
+        states: &["Baking", "Deploying"],
     },
     DeploymentStateCase {
         name: "finished",
         settled: true,
         stopped: false,
-        states: &["COMPLETE"],
+        states: &["Complete"],
     },
     DeploymentStateCase {
         name: "undone by a caller's stop",
         settled: false,
         stopped: true,
-        states: &["ROLLING_BACK", "ROLLED_BACK", "REVERTED"],
+        states: &["RollingBack", "RolledBack", "Reverted"],
     },
 ];
 

@@ -37,7 +37,6 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_appconfig_amazonappconfig::ops::types::DEPLOYMENT_STATE_VALUES;
 use service_com_amazonaws_appconfig_amazonappconfig::state::{
     ENVIRONMENT_DEPLOYING, PREDEFINED_DEPLOYMENT_STRATEGIES,
 };
@@ -546,6 +545,20 @@ async fn a_created_strategy_takes_both_mutations() {
 // 3. the in-flight-deployment conflict
 // =============================================================================
 
+/// The values `Deployment$State` goes on the wire as while AppConfig is still working on
+/// a deployment — the CamelCase spellings of the `DEPLOYING` and `BAKING` members, which
+/// is what a blocking deployment reports.
+const IN_FLIGHT_DEPLOYMENT_STATES: &[&str] = &["Deploying", "Baking"];
+
+/// The `EnvironmentState` MEMBER NAME this conflict spells into its sentence for an
+/// environment that holds a deployment in flight.
+///
+/// The refusal names the enum's member rather than the CamelCase value
+/// `Environment$State` goes on the wire as, and `DEPLOYING` is the one member
+/// `EnvironmentState` has for a deployment in flight — whichever phase that deployment is
+/// in, so a blocking deployment that is baking is reported the same way.
+const BLOCKED_BY_MEMBER_NAME: &str = "DEPLOYING";
+
 /// One blocking deployment: the criteria of the strategy that paces it, chosen so the
 /// deployment is still in flight when the second `StartDeployment` runs.
 struct Blocking {
@@ -661,20 +674,17 @@ async fn an_in_flight_deployment_conflicts_on_the_environments_state() {
             first.status,
             String::from_utf8_lossy(&first.body)
         );
-        // The state the refusal must report is read off the deployment that blocks, not
-        // written per row.
+        // The deployment that blocks is in flight, which is why the second start is
+        // refused: its `State` is one of the values `Deployment$State` goes on the wire as
+        // while AppConfig is still working on it, read off the record rather than written
+        // per row.
         let blocking_state = first
             .string("State")
             .unwrap_or_else(|| panic!("case {case:?}: no State in {}", first.json()));
         assert!(
-            DEPLOYMENT_STATE_VALUES.contains(&blocking_state.as_str()),
-            "case {case:?}: the blocking deployment's State must be a modelled \
-             DeploymentState, got {blocking_state:?}"
-        );
-        assert_ne!(
-            blocking_state, "COMPLETE",
-            "case {case:?}: this row's strategy must leave the deployment in flight, got \
-             {blocking_state:?}"
+            IN_FLIGHT_DEPLOYMENT_STATES.contains(&blocking_state.as_str()),
+            "case {case:?}: the blocking deployment's State must be one of \
+             {IN_FLIGHT_DEPLOYMENT_STATES:?}, got {blocking_state:?}"
         );
 
         let second = start_deployment(&router, &application, &environment, &body).await;
@@ -696,8 +706,8 @@ async fn an_in_flight_deployment_conflicts_on_the_environments_state() {
             second.error_code()
         );
         let expected = format!(
-            "Environment {environment} currently has a state of {blocking_state}. The current \
-             deployment must finish before a new deployment can be started."
+            "Environment {environment} currently has a state of {BLOCKED_BY_MEMBER_NAME}. The \
+             current deployment must finish before a new deployment can be started."
         );
         let message = second.string("Message").unwrap_or_default();
         assert_eq!(
@@ -711,9 +721,13 @@ async fn an_in_flight_deployment_conflicts_on_the_environments_state() {
         );
 
         // The environment really is mid-deployment, and reports that through its own
-        // `EnvironmentState` wire value — a different spelling from the DeploymentState
-        // the refusal carries, which is why the message's state is not read off the
-        // environment record.
+        // `EnvironmentState` wire value — the CamelCase spelling, a different form from
+        // the member name the refusal's sentence carries.
+        assert_ne!(
+            BLOCKED_BY_MEMBER_NAME, ENVIRONMENT_DEPLOYING,
+            "case {case:?}: the refusal names the enum's member, which is not the value the \
+             document serves"
+        );
         let read_back = json_call(
             &router,
             "GET",

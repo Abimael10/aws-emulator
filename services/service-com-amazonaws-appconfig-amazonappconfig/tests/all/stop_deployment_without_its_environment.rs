@@ -231,7 +231,7 @@ async fn a_stop_settles_a_deployment_whose_environment_was_deleted() {
         let at_start = member(&start_body, "State");
         let at_start = at_start.as_str().unwrap_or_default();
         assert!(
-            matches!(at_start, "DEPLOYING" | "BAKING"),
+            matches!(at_start, "Deploying" | "Baking"),
             "case {case:?}: this row's strategy must leave the deployment in flight when the \
              environment is deleted, got {at_start:?}"
         );
@@ -302,7 +302,7 @@ async fn a_stop_settles_a_deployment_whose_environment_was_deleted() {
         let stop_body = stopped.json();
         assert_eq!(
             member(&stop_body, "State").as_str(),
-            Some("ROLLED_BACK"),
+            Some("RolledBack"),
             "case {case:?}: a stop settles the rollback it performs, so the deployment is \
              rolled back when the stop answers, got {}",
             member(&stop_body, "State")
@@ -509,12 +509,12 @@ async fn a_completed_deployment_without_its_environment_is_only_revertable() {
             &application,
             &environment,
             1,
-            &["COMPLETE"],
+            &["Complete"],
         )
         .await;
         assert_eq!(
             member(&start_body, "State").as_str(),
-            Some("COMPLETE"),
+            Some("Complete"),
             "case {case:?}: a deployment nobody stopped completes on its own, got {}",
             member(&start_body, "State")
         );
@@ -545,8 +545,8 @@ async fn a_completed_deployment_without_its_environment_is_only_revertable() {
             let body = answer.json();
             assert_eq!(
                 member(&body, "State").as_str(),
-                Some("REVERTED"),
-                "case {case:?}: a reverted deployment reports REVERTED, got {}",
+                Some("Reverted"),
+                "case {case:?}: a reverted deployment reports the reverted state, got {}",
                 member(&body, "State")
             );
             assert_eq!(

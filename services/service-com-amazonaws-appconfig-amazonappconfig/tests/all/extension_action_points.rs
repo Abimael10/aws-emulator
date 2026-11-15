@@ -1080,7 +1080,7 @@ async fn the_deployment_lifecycle_action_points_fire_as_the_deployment_reaches_e
     );
     assert_eq!(
         started.json()["State"],
-        json!("COMPLETE"),
+        json!("Complete"),
         "case \"instant strategy\": expected a completed deployment, got {}",
         started.json()
     );
@@ -1136,7 +1136,7 @@ async fn the_deployment_lifecycle_action_points_fire_as_the_deployment_reaches_e
     );
     assert_eq!(
         paced.json()["State"],
-        json!("DEPLOYING"),
+        json!("Deploying"),
         "case \"paced strategy\": expected a deployment still rolling out, got {}",
         paced.json()
     );

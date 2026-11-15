@@ -841,18 +841,24 @@ async fn a_terminal_stop_states_the_verb_the_request_asked_for() {
     .string("Id")
     .expect("CreateDeploymentStrategy answered no Id");
 
-    // (case, the stop that puts the deployment in its terminal state, the state it then
-    // holds): a plain stop of a COMPLETE deployment is refused, so the row that reaches
-    // ROLLED_BACK stops one that is still in flight.
-    let terminal_states: [(&str, bool, &str); 2] = [
-        ("a reverted deployment", true, "REVERTED"),
-        ("a rolled-back deployment", false, "ROLLED_BACK"),
+    // (case, the stop that puts the deployment in its terminal state, the value
+    // `Deployment$State` serves for the state it then holds, the `DeploymentState` member
+    // name a refusal spells into its sentence): a plain stop of a completed deployment is
+    // refused, so the row that reaches the rolled-back state stops one still in flight.
+    let terminal_states: [(&str, bool, &str, &str); 2] = [
+        ("a reverted deployment", true, "Reverted", "REVERTED"),
+        (
+            "a rolled-back deployment",
+            false,
+            "RolledBack",
+            "ROLLED_BACK",
+        ),
     ];
 
-    for (index, (case, allow_revert, state)) in terminal_states.iter().enumerate() {
+    for (index, (case, allow_revert, state, member_name)) in terminal_states.iter().enumerate() {
         let environment = create_environment(&router, &application, &format!("env-{index}")).await;
-        // The ROLLED_BACK row needs a deployment still in flight to stop, which a strategy
-        // with a rollout window gives it; the REVERTED row needs a COMPLETE one.
+        // The rolled-back row needs a deployment still in flight to stop, which a strategy
+        // with a rollout window gives it; the reverted row needs a completed one.
         let paced = if *allow_revert {
             strategy.clone()
         } else {
@@ -895,8 +901,8 @@ async fn a_terminal_stop_states_the_verb_the_request_asked_for() {
             .as_i64()
             .unwrap_or_else(|| panic!("case {case:?}: StartDeployment answered no number"));
 
-        // The REVERTED row reverts a deployment that COMPLETED, and completing is a
-        // transition the clock owes, so the row waits for the condition; the ROLLED_BACK
+        // The reverted row reverts a deployment that COMPLETED, and completing is a
+        // transition the clock owes, so the row waits for the condition; the rolled-back
         // row stops a deployment that is still in flight, which it is from the start.
         if *allow_revert {
             crate::appconfig_workflow::deployment_in_state(
@@ -905,7 +911,7 @@ async fn a_terminal_stop_states_the_verb_the_request_asked_for() {
                 &application,
                 &environment,
                 number,
-                &["COMPLETE"],
+                &["Complete"],
             )
             .await;
         }
@@ -944,7 +950,7 @@ async fn a_terminal_stop_states_the_verb_the_request_asked_for() {
             );
             let expected = format!(
                 "Deployment {number} for App {application} and Environment {environment} cannot \
-                 be {verb}, it has a status of {state}."
+                 be {verb}, it has a status of {member_name}."
             );
             assert_eq!(
                 again.string("Message").unwrap_or_default(),

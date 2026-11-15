@@ -52,25 +52,37 @@ pub mod validators;
 
 pub use rollout::RolloutBucket;
 
-/// `DeploymentState` values this service moves a deployment through. Each is a member
-/// of `DEPLOYMENT_STATE_VALUES` in `crate::ops::types` (the model's `DeploymentState`
-/// enum).
-pub const DEPLOYMENT_DEPLOYING: &str = "DEPLOYING";
+/// `DeploymentState` values this service moves a deployment through — the WIRE values,
+/// which for this enum are NOT the model's member names.
+///
+/// `DEPLOYMENT_STATE_VALUES` in `crate::ops::types` lists the member names (`DEPLOYING`,
+/// `BAKING`, `COMPLETE`, …), but AppConfig serves `Deployment$State` in the CamelCase
+/// form — `Deploying | Baking | Complete | RollingBack | RolledBack | Reverted` — which
+/// is the form every recorded response carries, exactly as for `Environment$State`
+/// ([`ENVIRONMENT_READY_FOR_DEPLOYMENT`]): the shipped model JSON in `smithy-model/`
+/// carries no `@enumValue` trait on either enum's members, so the generated value lists
+/// fell back to the member names. A client waiting for a deployment to finish compares
+/// `State` against the served value, so these constants are the single place the service
+/// spells it.
+///
+/// A refusal that spells a state INTO A SENTENCE names the enum's MEMBER instead
+/// ([`state_member_name`]), which is the form the recorded refusals carry.
+pub const DEPLOYMENT_DEPLOYING: &str = "Deploying";
 /// See [`DEPLOYMENT_DEPLOYING`].
-pub const DEPLOYMENT_BAKING: &str = "BAKING";
+pub const DEPLOYMENT_BAKING: &str = "Baking";
 /// See [`DEPLOYMENT_DEPLOYING`].
-pub const DEPLOYMENT_COMPLETE: &str = "COMPLETE";
+pub const DEPLOYMENT_COMPLETE: &str = "Complete";
 /// See [`DEPLOYMENT_DEPLOYING`]. Where a caller's stop puts a deployment that is still
 /// rolling out or baking: the rollback has started and has not finished yet.
-pub const DEPLOYMENT_ROLLING_BACK: &str = "ROLLING_BACK";
+pub const DEPLOYMENT_ROLLING_BACK: &str = "RollingBack";
 /// See [`DEPLOYMENT_ROLLING_BACK`]. Where that rollback leaves it once it finishes.
-pub const DEPLOYMENT_ROLLED_BACK: &str = "ROLLED_BACK";
+pub const DEPLOYMENT_ROLLED_BACK: &str = "RolledBack";
 /// See [`DEPLOYMENT_ROLLING_BACK`]. Where reverting a deployment that already completed
 /// leaves it.
-pub const DEPLOYMENT_REVERTED: &str = "REVERTED";
+pub const DEPLOYMENT_REVERTED: &str = "Reverted";
 
 /// `EnvironmentState` values this service moves an environment through — the WIRE
-/// values, which for this one enum are NOT the model's member names.
+/// values, which for this enum are NOT the model's member names.
 ///
 /// `ENVIRONMENT_STATE_VALUES` in `crate::ops::types` lists the member names
 /// (`READY_FOR_DEPLOYMENT`, `DEPLOYING`, …), but AppConfig serves `Environment$State`
@@ -81,10 +93,10 @@ pub const DEPLOYMENT_REVERTED: &str = "REVERTED";
 /// generated value list fell back to the member names; the recorded wire form is
 /// authoritative and these constants are the single place the service spells it.
 ///
-/// Every other enum this module names a value of (`DeploymentState`, `GrowthType`,
-/// `DeploymentEventType`, `TriggeredBy`) is served as its member name, exactly as the
-/// AppConfig API Reference lists those members' valid values, so their constants are
-/// unchanged.
+/// `DeploymentState` ([`DEPLOYMENT_DEPLOYING`]) is served the same way. Every other enum
+/// this module names a value of (`GrowthType`, `DeploymentEventType`, `TriggeredBy`) is
+/// served as its member name, exactly as the AppConfig API Reference lists those members'
+/// valid values, so their constants are unchanged.
 pub const ENVIRONMENT_READY_FOR_DEPLOYMENT: &str = "ReadyForDeployment";
 /// See [`ENVIRONMENT_READY_FOR_DEPLOYMENT`].
 pub const ENVIRONMENT_DEPLOYING: &str = "Deploying";
@@ -3702,29 +3714,34 @@ fn next_token_not_issued(submitted: &str) -> String {
 /// The member NAME is what the sentence carries, not `Environment$State`'s CamelCase wire
 /// value, so a retry loop keyed on the environment reads the subject AppConfig names.
 pub fn environment_not_ready_for_deployment(environment_id: &str, environment_state: &str) -> String {
-    let state = environment_state_member_name(environment_state);
+    let state = state_member_name(environment_state);
     format!(
         "Environment {environment_id} currently has a state of {state}. The current deployment \
          must finish before a new deployment can be started."
     )
 }
 
-/// The `EnvironmentState` MEMBER NAME for the state this service stores on an environment.
+/// The enum MEMBER NAME for a state value this service stores on a record.
 ///
-/// The stored value is the CamelCase form `Environment$State` carries on the wire (see
-/// [`ENVIRONMENT_READY_FOR_DEPLOYMENT`]); a refusal that spells a state into a sentence
-/// spells the enum's member name instead, which is the form the model declares and the
-/// recorded refusals carry. Anything this service does not hold an environment in is
-/// reported as given, so a value added later is never silently renamed.
-fn environment_state_member_name(environment_state: &str) -> &str {
-    match environment_state {
-        ENVIRONMENT_READY_FOR_DEPLOYMENT => "READY_FOR_DEPLOYMENT",
-        ENVIRONMENT_DEPLOYING => "DEPLOYING",
-        ENVIRONMENT_ROLLING_BACK => "ROLLING_BACK",
-        ENVIRONMENT_ROLLED_BACK => "ROLLED_BACK",
-        ENVIRONMENT_REVERTED => "REVERTED",
-        other => other,
+/// The stored value is the CamelCase form the member goes on the wire as (see
+/// [`ENVIRONMENT_READY_FOR_DEPLOYMENT`] and [`DEPLOYMENT_DEPLOYING`]); a refusal that
+/// spells a state into a sentence spells the enum's member name instead, which is the
+/// form the model declares and the recorded refusals carry. One rule for both state
+/// enums: a member name is the served value broken at every boundary where a lower-case
+/// character is followed by an upper-case one, upper-cased. A value that carries no such
+/// boundary — a member name already, or a member this service never puts a record in — is
+/// reported as given, so nothing is silently renamed.
+fn state_member_name(state: &str) -> String {
+    let mut name = String::with_capacity(state.len() + 2);
+    let mut previous: Option<char> = None;
+    for character in state.chars() {
+        if character.is_uppercase() && previous.is_some_and(|earlier| earlier.is_lowercase()) {
+            name.push('_');
+        }
+        name.extend(character.to_uppercase());
+        previous = Some(character);
     }
+    name
 }
 
 /// Why a `CreateHostedConfigurationVersion` pinned to `expected` is refused by its
@@ -3864,6 +3881,11 @@ impl StopVerb {
 /// the application and environment it scoped the lookup to, the verb it asked for
 /// ([`StopVerb`]) and the state that deployment is actually in — so nothing of any one
 /// request is stored here.
+///
+/// The state is spelled as the `DeploymentState` MEMBER the record sits in
+/// ([`state_member_name`]) rather than as the CamelCase value the document serves it as:
+/// the recorded refusals name the member, the same way the environment's conflict
+/// ([`environment_not_ready_for_deployment`]) does.
 pub fn deployment_cannot_be_stopped(
     application_id: &str,
     environment_id: &str,
@@ -3871,6 +3893,7 @@ pub fn deployment_cannot_be_stopped(
     verb: StopVerb,
     state: &str,
 ) -> String {
+    let state = state_member_name(state);
     format!(
         "Deployment {deployment_number} for App {application_id} and Environment \
          {environment_id} cannot be {}, it has a status of {state}.",

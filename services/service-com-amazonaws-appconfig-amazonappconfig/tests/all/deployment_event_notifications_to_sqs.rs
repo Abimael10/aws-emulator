@@ -192,12 +192,12 @@ async fn deploy_and_wait_complete(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        if state == "COMPLETE" {
+        if state == "Complete" {
             return number;
         }
         assert!(
             Instant::now() < deadline,
-            "case {case:?}: deployment {number} of version {version} did not reach COMPLETE \
+            "case {case:?}: deployment {number} of version {version} did not complete \
              within {}s; last state {state:?}",
             SETTLE_BY.as_secs()
         );

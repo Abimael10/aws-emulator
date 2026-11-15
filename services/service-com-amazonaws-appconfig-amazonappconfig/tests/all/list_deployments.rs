@@ -28,13 +28,12 @@ use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_appconfig_amazonappconfig::ops::types::{
-    DEPLOYMENT_STATE_VALUES, DEPLOYMENT_TYPE_VALUES,
-};
+use service_com_amazonaws_appconfig_amazonappconfig::ops::types::DEPLOYMENT_TYPE_VALUES;
 
 use crate::appconfig_workflow::{
     create_application, create_environment, create_profile, json_call, router, send, Answer,
 };
+use crate::deployment_state_wire_form::is_a_published_deployment_state;
 
 /// The published bounds of `MaxResults` on this operation (`range 1..50`,
 /// `smithy_query(query="operation",operation="ListDeployments")`).
@@ -324,7 +323,7 @@ const PLAN: [Planned; 5] = [
         version: "1",
         description: None,
         revert: false,
-        expected_state: "COMPLETE",
+        expected_state: "Complete",
     },
     Planned {
         case: "a deployment named by version label",
@@ -332,7 +331,7 @@ const PLAN: [Planned; 5] = [
         version: "v2-beta",
         description: Some("the labelled revision"),
         revert: false,
-        expected_state: "COMPLETE",
+        expected_state: "Complete",
     },
     Planned {
         case: "a deployment of an unlabelled version",
@@ -344,7 +343,7 @@ const PLAN: [Planned; 5] = [
         version: "3",
         description: Some(""),
         revert: false,
-        expected_state: "COMPLETE",
+        expected_state: "Complete",
     },
     Planned {
         case: "a completed deployment the caller reverted",
@@ -352,7 +351,7 @@ const PLAN: [Planned; 5] = [
         version: "1",
         description: None,
         revert: true,
-        expected_state: "REVERTED",
+        expected_state: "Reverted",
     },
     Planned {
         case: "a deployment still rolling out",
@@ -360,7 +359,7 @@ const PLAN: [Planned; 5] = [
         version: "v2-beta",
         description: Some("the long rollout"),
         revert: false,
-        expected_state: "DEPLOYING",
+        expected_state: "Deploying",
     },
 ];
 
@@ -428,7 +427,7 @@ async fn deploy_the_plan(
                 application,
                 environment,
                 number,
-                &["COMPLETE"],
+                &["Complete"],
             )
             .await;
             let stopped = send(
@@ -453,7 +452,7 @@ async fn deploy_the_plan(
         }
         // An environment holds one deployment at a time, so a row whose deployment is
         // meant to be over waits for it before the next row starts.
-        if row.expected_state != "DEPLOYING" {
+        if row.expected_state != "Deploying" {
             crate::appconfig_workflow::deployment_in_state(
                 router,
                 row.case,
@@ -506,7 +505,7 @@ async fn deploy_completed(
             application,
             environment,
             number,
-            &["COMPLETE"],
+            &["Complete"],
         )
         .await;
         numbers.push(number);
@@ -584,9 +583,9 @@ async fn a_summary_reports_the_stored_deployment_as_the_reader_does() {
             member(summary, "State")
         );
         assert!(
-            DEPLOYMENT_STATE_VALUES
-                .contains(&member(summary, "State").as_str().unwrap_or_default()),
-            "case {case:?}: State must be a modelled DeploymentState, got {}",
+            is_a_published_deployment_state(member(summary, "State").as_str().unwrap_or_default()),
+            "case {case:?}: State must be a value AppConfig publishes for a DeploymentState \
+             member, got {}",
             member(summary, "State")
         );
         assert_eq!(
@@ -639,7 +638,7 @@ async fn a_summary_reports_the_stored_deployment_as_the_reader_does() {
         // RULE 2: the instants are ISO-8601 strings, and a deployment cannot complete
         // before it started. A deployment still in flight carries no completion instant.
         let started_at = iso_instant(case, "StartedAt", &member(summary, "StartedAt"));
-        if row.expected_state == "DEPLOYING" {
+        if row.expected_state == "Deploying" {
             assert!(
                 member(summary, "CompletedAt").is_null(),
                 "case {case:?}: a deployment still in flight has no CompletedAt, got {}",
@@ -1225,7 +1224,7 @@ async fn the_listing_reports_what_the_deployments_before_it_left() {
         );
         assert_eq!(
             member(&page[0], "State").as_str(),
-            Some("REVERTED"),
+            Some("Reverted"),
             "case {case:?}: the listing must report the state the stop left, got {}",
             member(&page[0], "State")
         );

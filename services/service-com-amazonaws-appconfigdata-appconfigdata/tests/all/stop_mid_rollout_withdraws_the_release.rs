@@ -41,7 +41,10 @@ use super::rollout_percentage_splits_sessions::{
 /// The `DeploymentState` wire token a withdrawn release reports, as the recorded stop
 /// answers it — `DeploymentState` has no `STOPPED` member: a stop of a deployment still in
 /// progress is a rollback.
-const ROLLED_BACK: &str = "ROLLED_BACK";
+const ROLLED_BACK: &str = "RolledBack";
+/// The `DeploymentState` MEMBER NAME of [`ROLLED_BACK`], which is the form a refusal's
+/// sentence spells a state in rather than the value the document serves.
+const ROLLED_BACK_MEMBER: &str = "ROLLED_BACK";
 /// The `EnvironmentState` wire token the environment of a withdrawn release reports, as the
 /// recording carries it.
 const ROLLED_BACK_ENVIRONMENT: &str = "RolledBack";
@@ -229,7 +232,7 @@ async fn a_stop_mid_rollout_withdraws_the_release_from_every_session() {
         );
         let expected = format!(
             "Deployment {number} for App {} and Environment {} cannot be stopped, it has a \
-             status of {ROLLED_BACK}.",
+             status of {ROLLED_BACK_MEMBER}.",
             hierarchy.application_id, hierarchy.environment_id
         );
         let message = refused.json()["Message"].as_str().map(str::to_string);

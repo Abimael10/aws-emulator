@@ -61,6 +61,8 @@ mod deployment_not_found_message;
 mod deployment_phases_follow_the_strategy;
 #[path = "all/deployment_settles_on_its_own.rs"]
 mod deployment_settles_on_its_own;
+#[path = "all/deployment_state_wire_form.rs"]
+mod deployment_state_wire_form;
 #[path = "all/deployment_strategy_patch_paces_deployments.rs"]
 mod deployment_strategy_patch_paces_deployments;
 #[path = "all/deployment_tick_directive.rs"]

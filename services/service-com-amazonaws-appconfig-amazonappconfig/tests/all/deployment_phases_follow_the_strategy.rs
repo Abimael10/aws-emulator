@@ -235,7 +235,7 @@ async fn a_start_answers_the_phase_appconfig_has_reached() {
             // Nothing to pace and nothing to monitor: the deployment is over.
             assert_eq!(
                 member(&body, "State").as_str(),
-                Some("COMPLETE"),
+                Some("Complete"),
                 "case {case:?}: a strategy that paces no stage leaves the deployment over \
                  when the start answers, got {body}"
             );
@@ -265,7 +265,7 @@ async fn a_start_answers_the_phase_appconfig_has_reached() {
 
         assert_eq!(
             member(&body, "State").as_str(),
-            Some("DEPLOYING"),
+            Some("Deploying"),
             "case {case:?}: a strategy that paces a stage leaves every later phase to \
              AppConfig, so the start answers the first one, got {body}"
         );
@@ -339,7 +339,7 @@ async fn the_share_reached_and_the_bake_are_appconfigs_own_transitions() {
 
         // The bake begins on its own: the suite re-reads until it has.
         let baking =
-            deployment_in_state(&router, case, &application, &environment, number, &["BAKING"])
+            deployment_in_state(&router, case, &application, &environment, number, &["Baking"])
                 .await;
         assert_eq!(
             member(&baking, "PercentageComplete").as_f64(),
@@ -412,11 +412,11 @@ async fn a_second_deployment_is_refused_with_the_environments_own_state() {
     let rows: [(Row, &str); 2] = [
         (
             ("while the first is rolling out", 1440, 1.0, "LINEAR", 0),
-            "DEPLOYING",
+            "Deploying",
         ),
         (
             ("while the first is baking", 0, 100.0, "LINEAR", 1440),
-            "BAKING",
+            "Baking",
         ),
     ];
 
@@ -534,7 +534,7 @@ async fn a_stop_answers_the_whole_history_of_the_deployment_it_rolled_back() {
     let rows: [StopRow; 2] = [
         StopRow {
             row: ("stopped while rolling out", 1440, 1.0, "LINEAR", 0),
-            phase: "DEPLOYING",
+            phase: "Deploying",
             // A rollout that is still growing can log a further share at any interval, so
             // this row asserts the entries its phases pin rather than a whole log a faster
             // or slower host would change.
@@ -543,7 +543,7 @@ async fn a_stop_answers_the_whole_history_of_the_deployment_it_rolled_back() {
         },
         StopRow {
             row: ("stopped while baking", 0, 100.0, "LINEAR", 1440),
-            phase: "BAKING",
+            phase: "Baking",
             exact_log: Some(log_of_a_stopped_bake),
             absent: &["DEPLOYMENT_COMPLETED", "REVERT_COMPLETED"],
         },
@@ -584,7 +584,7 @@ async fn a_stop_answers_the_whole_history_of_the_deployment_it_rolled_back() {
         let settled = stopped.json();
         assert_eq!(
             member(&settled, "State").as_str(),
-            Some("ROLLED_BACK"),
+            Some("RolledBack"),
             "case {case:?}: the stop settles the rollback it performs, got {settled}"
         );
         assert_eq!(
@@ -608,7 +608,7 @@ async fn a_stop_answers_the_whole_history_of_the_deployment_it_rolled_back() {
         );
         assert_eq!(
             member(&read_back, "State").as_str(),
-            Some("ROLLED_BACK"),
+            Some("RolledBack"),
             "case {case:?}: nothing is left for a reader to finish, got {read_back}"
         );
         assert_eq!(
