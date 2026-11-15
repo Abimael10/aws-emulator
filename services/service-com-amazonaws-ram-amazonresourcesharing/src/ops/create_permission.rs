@@ -11,10 +11,11 @@
 //!
 //! Its refusals of a bad request come from the member documentation's own rules: a
 //! `resourceType` that is not a resource type a customer managed permission can be
-//! created for is `InvalidParameterException`, a template that cannot be read as one
-//! is `MalformedPolicyTemplateException`, and one whose effect is not an allow or
-//! whose actions the permission's resource type does not support is
-//! `InvalidPolicyException` ([`crate::state::policy_template_rejection`]).
+//! created for is `InvalidParameterException`, and a `policyTemplate` that is not a
+//! policy a managed permission may carry — one that cannot be read as a policy
+//! statement, whose effect is not an allow, or whose actions the permission's resource
+//! type does not support — is `InvalidPolicyException`
+//! ([`crate::state::policy_template_rejection`]).
 //!
 //! ## Shape of an operation
 //!
@@ -308,13 +309,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A permission's name is unique within the Region, and its ARN carries that
         // name, so a second permission of the same name in the same Region is the
-        // name clash RAM refuses rather than a second record.
+        // name clash RAM refuses rather than a second record. The refusal names the
+        // permission already holding the name by the ARN it is stored under.
         let arn = crate::state::permission_arn(&region, &input.name);
-        if store.permission(&arn).is_some() {
+        if let Some(existing) = store.permission(&arn) {
+            let existing_arn = existing.arn.clone();
             return Err(
                 CreatePermissionErrorModeled::PermissionAlreadyExistsException(
                     PermissionAlreadyExistsException {
-                        message: crate::state::permission_exists_message(&input.name, &region),
+                        message: crate::state::permission_exists_message(&existing_arn),
                     },
                 )
                 .into(),

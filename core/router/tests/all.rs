@@ -2567,3 +2567,14 @@ mod bedrock_agent_ingestion_populates_its_aoss_index;
 // check those rules, for this file and for every service crate's `tests/all.rs`.
 // An inner attribute, like an inner doc comment, is legal only before the first item of the
 // file, so it stands here rather than in the list below.
+// suite file under `tests/all/`, sorted by name, and no other line — so two branches landing
+// Put a new suite at `tests/all/<name>.rs` and insert its pair in the one place its name
+// sorts to; what that suite covers, and why it drives the assembled router rather than one
+// service crate, belongs in its own module doc, and a note about THIS file belongs in
+// It is written with ordinary comments throughout, deliberately: an inner doc comment (`//!`)
+// is legal only before the first item, so an appended, re-typed or merged copy of one of
+// these lines past the first declaration would be `E0753`, which compiles no suite of this
+// target at all. A suite no `mod` names compiles nowhere, and a suite declared twice is
+// `E0428`. `all/all_rs_carries_no_inner_doc_comment.rs`,
+// This file is a test-target CRATE ROOT, where a bare `mod` would resolve to a SIBLING of it
+// (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each declaration is

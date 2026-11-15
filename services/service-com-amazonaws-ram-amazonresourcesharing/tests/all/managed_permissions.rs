@@ -482,7 +482,7 @@ async fn a_create_that_breaks_a_rule_is_refused_and_stores_nothing() {
                 "policyTemplate": "allow everything",
             }),
             status: 400,
-            code: "MalformedPolicyTemplateException",
+            code: "InvalidPolicyException",
         },
         RefusalCase {
             case: "a policyTemplate that is a JSON array",
@@ -492,7 +492,7 @@ async fn a_create_that_breaks_a_rule_is_refused_and_stores_nothing() {
                 "policyTemplate": "[]",
             }),
             status: 400,
-            code: "MalformedPolicyTemplateException",
+            code: "InvalidPolicyException",
         },
         RefusalCase {
             case: "a policyTemplate carrying no Effect",
@@ -502,7 +502,7 @@ async fn a_create_that_breaks_a_rule_is_refused_and_stores_nothing() {
                 "policyTemplate": r#"{"Action":["codebuild:BatchGetProjects"]}"#,
             }),
             status: 400,
-            code: "MalformedPolicyTemplateException",
+            code: "InvalidPolicyException",
         },
         RefusalCase {
             case: "a policyTemplate carrying no Action",
@@ -512,7 +512,7 @@ async fn a_create_that_breaks_a_rule_is_refused_and_stores_nothing() {
                 "policyTemplate": r#"{"Effect":"ALLOW"}"#,
             }),
             status: 400,
-            code: "MalformedPolicyTemplateException",
+            code: "InvalidPolicyException",
         },
         RefusalCase {
             case: "an Action that is not an action name",
@@ -522,7 +522,7 @@ async fn a_create_that_breaks_a_rule_is_refused_and_stores_nothing() {
                 "policyTemplate": r#"{"Effect":"ALLOW","Action":5}"#,
             }),
             status: 400,
-            code: "MalformedPolicyTemplateException",
+            code: "InvalidPolicyException",
         },
         RefusalCase {
             case: "an empty Action list",
@@ -532,7 +532,7 @@ async fn a_create_that_breaks_a_rule_is_refused_and_stores_nothing() {
                 "policyTemplate": r#"{"Effect":"ALLOW","Action":[]}"#,
             }),
             status: 400,
-            code: "MalformedPolicyTemplateException",
+            code: "InvalidPolicyException",
         },
         RefusalCase {
             case: "an Action list with an entry that is not a name",
@@ -542,7 +542,7 @@ async fn a_create_that_breaks_a_rule_is_refused_and_stores_nothing() {
                 "policyTemplate": r#"{"Effect":"ALLOW","Action":["codebuild:ListProjects",7]}"#,
             }),
             status: 400,
-            code: "MalformedPolicyTemplateException",
+            code: "InvalidPolicyException",
         },
         RefusalCase {
             case: "a Condition that is not a JSON object",
@@ -553,7 +553,7 @@ async fn a_create_that_breaks_a_rule_is_refused_and_stores_nothing() {
                     r#"{"Effect":"ALLOW","Action":["codebuild:ListProjects"],"Condition":"always"}"#,
             }),
             status: 400,
-            code: "MalformedPolicyTemplateException",
+            code: "InvalidPolicyException",
         },
         RefusalCase {
             case: "an Effect that denies",

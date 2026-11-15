@@ -1155,7 +1155,7 @@ async fn a_permission_version_that_cannot_be_written_is_refused() {
         (
             "a policyTemplate that is not JSON",
             json!({"permissionArn": permission_arn, "policyTemplate": "not json"}),
-            "MalformedPolicyTemplateException",
+            "InvalidPolicyException",
             None,
         ),
         (

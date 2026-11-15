@@ -371,6 +371,15 @@ pub const MAX_PERMISSIONS: usize = 500;
 /// both what one call can store and what the JSON reader is handed.
 pub const MAX_POLICY_TEMPLATE_LEN: usize = 10_240;
 
+/// The message every refusal of a policy document that cannot be read as a policy
+/// statement carries.
+///
+/// RAM words this one refusal class with a single fixed sentence that interpolates
+/// nothing from the request: the error class's own code (`InvalidPolicyException`'s
+/// `awsQueryError` code is `InvalidPolicy`) ahead of the reason the document was not
+/// read. Every operation that takes a `policyTemplate` reports it from here.
+pub const INVALID_POLICY_FORMAT_MESSAGE: &str = "InvalidPolicy: Invalid policy format.";
+
 /// One entry of this service's resource-type catalog.
 #[derive(Debug, Clone, Copy)]
 pub struct ResourceTypeEntry {
@@ -2008,15 +2017,11 @@ pub fn unknown_permission_version_message(arn: &str, version: i32) -> String {
 /// The message of the `PermissionAlreadyExistsException` a create renders when the
 /// Region already holds a permission of that name.
 ///
-/// RAM refuses it because "a permission with the specified name already exists in the
-/// requested Amazon Web Services Region. Choose a different name"
-/// (`PermissionAlreadyExistsException`'s own documentation), so the message names the
-/// name and the Region it is taken in.
-pub fn permission_exists_message(name: &str, region: &str) -> String {
-    format!(
-        "A permission named '{}' already exists in Region {region}. Choose a different name.",
-        truncate(name)
-    )
+/// The refusal identifies the permission that already holds the name by its ARN — the
+/// one thing that names the conflicting resource, so a caller can read it back — and
+/// says nothing else: the message is fixed text around the stored permission's ARN.
+pub fn permission_exists_message(arn: &str) -> String {
+    format!("The permission {arn} already exists.")
 }
 
 /// Whether `entity` names a part of an AWS Organizations hierarchy: an organization,
@@ -2274,11 +2279,16 @@ pub fn resource_type_entry_of(value: &str) -> Option<&'static ResourceTypeEntry>
 /// modelled error RAM words that refusal with.
 #[derive(Debug, Clone)]
 pub enum PolicyTemplateRejection {
-    /// The template cannot be read as one: `MalformedPolicyTemplateException`.
+    /// The template is past what this service reads at all, so it is not a policy
+    /// template this service can hold: `MalformedPolicyTemplateException`.
     Malformed(String),
-    /// It reads as one, but says something a managed permission's template may not
-    /// say — an effect that is not an allow, or an action the permission's resource
-    /// type does not support: `InvalidPolicyException`.
+    /// The template is not a policy a managed permission may carry — it cannot be
+    /// read as a policy statement, its effect is not an allow, or it names an action
+    /// the permission's resource type does not support: `InvalidPolicyException`.
+    ///
+    /// A document that cannot be read as a policy statement carries RAM's fixed
+    /// [`INVALID_POLICY_FORMAT_MESSAGE`]; the rules a readable statement breaks are
+    /// reported with the rule that was broken.
     InvalidPolicy(String),
 }
 
@@ -2291,6 +2301,12 @@ pub enum PolicyTemplateRejection {
 /// permission. The list must contain only actions that are supported by the specified
 /// resource type … Condition: (optional)". One template across every operation that
 /// takes one, so a permission and a later version of it are held to one rule.
+///
+/// A document that cannot be read as that policy statement at all — one that is not
+/// JSON, not a JSON object, or carrying an element that is not of the type a policy
+/// statement's element takes — is one refusal class with one fixed message
+/// ([`invalid_policy_format`]); a statement that reads but breaks one of the rules
+/// above is reported with the rule it broke.
 pub fn policy_template_rejection(
     resource_type: &str,
     template: &str,
@@ -2302,22 +2318,15 @@ pub fn policy_template_rejection(
         )));
     }
     let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(template) else {
-        return Some(PolicyTemplateRejection::Malformed(
-            "policyTemplate is not a JSON document".to_string(),
-        ));
+        return invalid_policy_format();
     };
     let Some(elements) = document.as_object() else {
-        return Some(PolicyTemplateRejection::Malformed(format!(
-            "policyTemplate must be a JSON object carrying an {POLICY_TEMPLATE_EFFECT_ELEMENT} \
-             element and an {POLICY_TEMPLATE_ACTION_ELEMENT} element"
-        )));
+        return invalid_policy_format();
     };
     let Some(effect) = policy_template_element(elements, POLICY_TEMPLATE_EFFECT_ELEMENT)
         .and_then(::serde_json::Value::as_str)
     else {
-        return Some(PolicyTemplateRejection::Malformed(format!(
-            "policyTemplate must carry a string {POLICY_TEMPLATE_EFFECT_ELEMENT} element"
-        )));
+        return invalid_policy_format();
     };
     if !effect.eq_ignore_ascii_case(POLICY_TEMPLATE_EFFECT_ALLOW) {
         return Some(PolicyTemplateRejection::InvalidPolicy(format!(
@@ -2336,32 +2345,18 @@ pub fn policy_template_rejection(
                 .filter_map(::serde_json::Value::as_str)
                 .collect();
             if named.len() != entries.len() {
-                return Some(PolicyTemplateRejection::Malformed(format!(
-                    "every entry of the policyTemplate {POLICY_TEMPLATE_ACTION_ELEMENT} element \
-                     must be an action name"
-                )));
+                return invalid_policy_format();
             }
             named
         }
-        _ => {
-            return Some(PolicyTemplateRejection::Malformed(format!(
-                "policyTemplate must carry an {POLICY_TEMPLATE_ACTION_ELEMENT} element naming one \
-                 action or a list of them"
-            )))
-        }
+        _ => return invalid_policy_format(),
     };
     if actions.is_empty() {
-        return Some(PolicyTemplateRejection::Malformed(format!(
-            "the policyTemplate {POLICY_TEMPLATE_ACTION_ELEMENT} element must name at least one \
-             action"
-        )));
+        return invalid_policy_format();
     }
     if let Some(condition) = policy_template_element(elements, POLICY_TEMPLATE_CONDITION_ELEMENT) {
         if !condition.is_object() {
-            return Some(PolicyTemplateRejection::Malformed(format!(
-                "the policyTemplate {POLICY_TEMPLATE_CONDITION_ELEMENT} element must be a JSON \
-                 object of condition operators"
-            )));
+            return invalid_policy_format();
         }
     }
     // An action is supported by a resource type only if it belongs to the service
@@ -2387,6 +2382,14 @@ pub fn policy_template_rejection(
         }
     }
     None
+}
+
+/// The refusal of a policy document that cannot be read as a policy statement: the
+/// `InvalidPolicyException` class, worded with its one fixed sentence.
+fn invalid_policy_format() -> Option<PolicyTemplateRejection> {
+    Some(PolicyTemplateRejection::InvalidPolicy(
+        INVALID_POLICY_FORMAT_MESSAGE.to_string(),
+    ))
 }
 
 /// One element of a policy template, looked up however the request cased its name.
