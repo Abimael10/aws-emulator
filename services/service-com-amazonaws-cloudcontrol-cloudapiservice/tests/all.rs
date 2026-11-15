@@ -19,6 +19,8 @@ mod arn_identified_resources;
 mod audit_records;
 #[path = "all/cancel_resource_request.rs"]
 mod cancel_resource_request;
+#[path = "all/deleted_resource_refusal.rs"]
+mod deleted_resource_refusal;
 #[path = "all/emulator.rs"]
 mod emulator;
 #[path = "all/native_queue_lifecycle.rs"]

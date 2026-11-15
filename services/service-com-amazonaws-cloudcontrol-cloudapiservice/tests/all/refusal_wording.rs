@@ -54,7 +54,7 @@ const DYNAMODB_TABLE: &str = "AWS::DynamoDB::Table";
 
 /// A patch that changes nothing, for the rows that are about something other than the
 /// patch.
-fn inert_patch() -> Value {
+pub(crate) fn inert_patch() -> Value {
     json!([{ "op": "add", "path": "/Tags", "value": [] }])
 }
 
@@ -156,6 +156,39 @@ pub(crate) fn assert_handler_not_found(
 /// as the request and every answer spell it.
 pub(crate) fn generic_not_found(type_name: &str, identifier: &str) -> String {
     format!("Resource of type '{type_name}' with identifier '{identifier}' was not found.")
+}
+
+/// The resource types whose handler names the resource as the PRIMARY-IDENTIFIER OBJECT
+/// the type's registry schema declares, with the pointer that schema's `primaryIdentifier`
+/// holds.
+///
+/// Catalog source: the `primaryIdentifier` list of the type's resource provider schema,
+/// whose pointers name properties of that schema. Which of the two forms a primary
+/// identifier may be given in ("Primary identifiers can be specified as a string or JSON",
+/// `GetResource$Identifier`) a HANDLER echoes back in its own diagnostic is that handler's
+/// business, so this is PER TYPE: a type absent from here is named by the identifier the
+/// request carried.
+const RENDERED_AS_SCHEMA_MAP: &[(&str, &str)] =
+    &[("AWS::Logs::LogGroup", "/properties/LogGroupName")];
+
+/// Cloud Control's own generic not-found diagnostic for `type_name`, with the resource
+/// named as the HANDLER that owns the type names it ([`RENDERED_AS_SCHEMA_MAP`]).
+///
+/// The one place this suite's siblings state that expectation, so a case about a type whose
+/// handler renders the schema's identifier object and one about a type named by the
+/// identifier it was given are the same assertion with a different row.
+pub(crate) fn handler_rendered_not_found(type_name: &str, identifier: &str) -> String {
+    match RENDERED_AS_SCHEMA_MAP
+        .iter()
+        .find(|(name, _)| *name == type_name)
+    {
+        Some((_, pointer)) => {
+            let mut map = serde_json::Map::new();
+            map.insert((*pointer).to_string(), json!(identifier));
+            generic_not_found(type_name, &Value::Object(map).to_string())
+        }
+        None => generic_not_found(type_name, identifier),
+    }
 }
 
 /// Cloud Control's own generic already-exists diagnostic, which names the resource the

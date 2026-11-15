@@ -256,10 +256,10 @@ impl Diagnostic {
 
 /// What the `AWS::Logs::LogGroup` handler states for a group it cannot find: Cloud
 /// Control's own sentence, naming the resource as the type's primary-identifier object —
-/// the form that handler's refusal is recorded carrying.
+/// the form that handler's refusal is recorded carrying, built by the one composer this
+/// crate's suites share.
 fn log_group_not_found(name: &str) -> String {
-    let rendered = json!({ "/properties/LogGroupName": name }).to_string();
-    format!("Resource of type 'AWS::Logs::LogGroup' with identifier '{rendered}' was not found.")
+    super::refusal_wording::handler_rendered_not_found("AWS::Logs::LogGroup", name)
 }
 
 #[tokio::test]

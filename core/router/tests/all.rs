@@ -4832,3 +4832,21 @@ mod appended_notes;
 //! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING
 //! of this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what
 //! points each module into `tests/all/`.
+//! left at the top level of `tests/` fails the build.
+//! Two rules this file lives or dies by, both checked by suites of its own
+//! (`all/all_rs_declares_each_suite_once.rs` and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs`, for this file and for every
+//! service crate's `tests/all.rs`):
+//! * Declare each suite EXACTLY ONCE. This is one crate root, so a second `mod` for the
+//!   same name is `E0428` and takes every suite in the target down with it.
+//! * An inner doc comment (`//!`) is legal only BEFORE the first item, so this header is
+//!   the only place one may stand: a note written with `//!` further down this file is
+//!   `E0753` and compiles nothing. Write such a note as an ordinary `//` comment, or
+//!   better, put the rule here.
+//! this file (`tests/boot_serve.rs`) — which the layout check refuses. The `#[path]` above
+//! each declaration is what points it into `tests/all/`, and the checker suite above
+//! requires one naming `all/<name>.rs`.
+//! The list below is the declarations and nothing else: per-entry notes about WHY a suite
+//! needs the whole mounted service set belong in that suite's own module doc, where they
+//! stay next to the test they describe instead of growing this root past the project's
+//! file-length limit.

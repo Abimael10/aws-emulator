@@ -25,19 +25,14 @@ use super::emulator::{
     code, descriptions, message, properties_of, text, Emulator, STATUS_FAILED,
 };
 use super::refusal_wording::{
-    assert_handler_not_found, generic_already_exists, generic_not_found,
+    assert_handler_not_found, generic_already_exists, handler_rendered_not_found,
 };
 
 /// The not-found diagnostic the handler of each type here states: Cloud Control's own
-/// sentence, naming the resource as that HANDLER names it — for `AWS::Logs::LogGroup` the
-/// type's primary-identifier object, which is the form its recorded refusal carries, and
-/// for the other types the identifier the request carried.
+/// sentence, naming the resource as that HANDLER names it — which is per type, so the
+/// expectation is built by the one composer this crate's suites share.
 fn not_found_detail(type_name: &str, identifier: &str) -> String {
-    if type_name == LOG_GROUP {
-        let rendered = json!({ "/properties/LogGroupName": identifier }).to_string();
-        return generic_not_found(type_name, &rendered);
-    }
-    generic_not_found(type_name, identifier)
+    handler_rendered_not_found(type_name, identifier)
 }
 
 /// The type whose resources live in the CloudWatch Logs service's own store.
