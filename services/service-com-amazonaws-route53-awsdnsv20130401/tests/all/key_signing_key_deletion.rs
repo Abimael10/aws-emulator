@@ -66,7 +66,14 @@ async fn delete_ksk(router: &MultiServiceRouter, zone_id: &str, name: &str) -> R
 /// Deactivate one key-signing key:
 /// `POST /2013-04-01/keysigningkey/{HostedZoneId}/{Name}/deactivate`
 /// (`smithy_query(query="operation",operation="DeactivateKeySigningKey")`).
-async fn deactivate_ksk(router: &MultiServiceRouter, zone_id: &str, name: &str) -> Reply {
+///
+/// `pub(crate)` so the sibling suite over what a served deactivation leaves
+/// behind drives the SAME call rather than growing a second copy of it.
+pub(crate) async fn deactivate_ksk(
+    router: &MultiServiceRouter,
+    zone_id: &str,
+    name: &str,
+) -> Reply {
     call(
         router,
         "POST",

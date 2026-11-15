@@ -127,16 +127,21 @@ mod hosted_zone_records;
 mod hosted_zones_by_name;
 #[path = "all/hosted_zones_by_vpc.rs"]
 mod hosted_zones_by_vpc;
-// Declared beside the DNSSEC suite: this one is the key-signing key a zone is
-// signed with — what a create computes from its customer managed key, what it
-// persists and what it refuses.
-#[path = "all/key_signing_keys.rs"]
-mod key_signing_keys;
+// Declared beside the key-signing key suite: this one is what a SERVED
+// deactivation leaves behind — the one key's status it moves, and everything
+// about the zone's DNSSEC state it must not touch.
+#[path = "all/key_signing_key_deactivation.rs"]
+mod key_signing_key_deactivation;
 // Declared beside the key-signing key suite: this one is the rest of a key's
 // lifecycle — the delete, what it is refused for and the wording of those
 // refusals.
 #[path = "all/key_signing_key_deletion.rs"]
 mod key_signing_key_deletion;
+// Declared beside the DNSSEC suite: this one is the key-signing key a zone is
+// signed with — what a create computes from its customer managed key, what it
+// persists and what it refuses.
+#[path = "all/key_signing_keys.rs"]
+mod key_signing_keys;
 // Declared beside the listing suites: this one is the page size every
 // `maxitems`-paged listing reports, across all of them at once.
 #[path = "all/listing_page_size_echo.rs"]

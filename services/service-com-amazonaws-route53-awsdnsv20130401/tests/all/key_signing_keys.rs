@@ -251,7 +251,11 @@ fn reported<'a>(case: &str, reply: &'a Reply, name: &str) -> &'a str {
 
 /// Every member of a key-signing key whose value the create and the DNSSEC read
 /// must agree on, which is what makes the create's answer the key it PERSISTED.
-const PERSISTED_MEMBERS: &[&str] = &[
+///
+/// `pub(crate)` so the sibling suite over what a deactivation leaves behind
+/// compares the same member list rather than a second copy of it, and a new
+/// modelled member is added in one place.
+pub(crate) const PERSISTED_MEMBERS: &[&str] = &[
     "Name",
     "Status",
     "KmsArn",
