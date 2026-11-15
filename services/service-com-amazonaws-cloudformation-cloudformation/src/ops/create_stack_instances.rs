@@ -763,7 +763,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         status::CREATE_FAILED,
                         failure.clone(),
                     );
-                    failure_reason = Some(failure);
+                    // What the INSTANCE reports is the failure as a stack instance states
+                    // one — the resource of its stack that the deployment could not carry
+                    // through, named ([`crate::state::stack_set_instance_stacks`]) — so a
+                    // failure this walk found and one the clock finds later read alike. A
+                    // deployment with no resource of its own to name keeps this walk's own
+                    // account of it.
+                    failure_reason = Some(
+                        crate::state::stack_set_instance_stacks::failure_reason(stack)
+                            .unwrap_or(failure),
+                    );
                 }
             }
             if let Some(reason) = failure_reason {
@@ -796,12 +805,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 {
                     // "FAILED: The operation exceeded the specified failure tolerance",
                     // which for an operation with no tolerance stated is any failure at all.
+                    // The conclusion is still to come, so its outcome is counted and
+                    // explained where every other one is
+                    // ([`crate::state::stack_set_instance_outcomes`]), off the stacks the
+                    // instances deploy.
                     if let Some(pending) = operation.pending.as_mut() {
                         pending.status = operation_status::FAILED.to_string();
                         pending.failed_stack_instances_count = Some(failed);
-                        pending.status_reason = failed_instances
-                            .first()
-                            .map(|(_, _, reason)| reason.clone());
                     }
                 }
             }

@@ -2527,3 +2527,13 @@ mod declaration_roots_are_canonical_and_complete;
 // nothing, so add a declaration below rather than a note about one — the notes earlier
 // landings appended live in `all/appended_notes.rs`.
 // `all/all_rs_is_a_canonical_declaration_list.rs` check those rules — the first two for
+// producing — is `E0753` and compiles no suite of this target. With none anywhere in the
+// file, no merge of two landings can put one past the first item.
+// name: pairs only, and no other line. Three suites pin that rather than restating it here —
+// `all/all_rs_is_a_canonical_declaration_list.rs`. What a suite covers, and why it belongs to
+// this cross-service target rather than to one service crate's own, is stated in that suite's
+// own module doc; a note about THIS file belongs in `all/appended_notes.rs`.
+#[path = "all/cloudformation_stack_set_status_change_events.rs"]
+mod cloudformation_stack_set_status_change_events;
+#[path = "all/cloudformation_stackset_failed_instance_events.rs"]
+mod cloudformation_stackset_failed_instance_events;

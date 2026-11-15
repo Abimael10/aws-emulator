@@ -581,6 +581,8 @@ mod stack_role_trust;
 mod stack_service_role_stickiness;
 #[path = "all/stack_set_drift_lifecycle.rs"]
 mod stack_set_drift_lifecycle;
+#[path = "all/stack_set_instance_stack_failures.rs"]
+mod stack_set_instance_stack_failures;
 #[path = "all/stack_set_failed_instance_outcome.rs"]
 mod stack_set_failed_instance_outcome;
 #[path = "all/stack_set_lifecycle.rs"]

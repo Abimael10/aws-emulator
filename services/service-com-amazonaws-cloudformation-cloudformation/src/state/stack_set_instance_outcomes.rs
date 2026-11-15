@@ -56,15 +56,7 @@ use super::stack_sets::{
     detailed_status, instance_status, operation_action, operation_status, StoredStackSet,
     StoredStackSetOperation,
 };
-use super::{
-    operation_carried_through, ComAmazonawsCloudformationCloudformationState, StoredStack,
-    STACK_RESOURCE_TYPE,
-};
-
-/// The suffix every `ResourceStatus` of a resource whose transition did not go through
-/// carries (`CREATE_FAILED`, `UPDATE_FAILED`, `DELETE_FAILED` — [`super::resource_status`]),
-/// which is what makes one event the report of a resource that FAILED.
-const FAILED_STATUS_SUFFIX: &str = "_FAILED";
+use super::{operation_carried_through, ComAmazonawsCloudformationCloudformationState, StoredStack};
 
 /// How far the stack of ONE stack instance has got with the deployment in flight.
 #[derive(Debug, Clone)]
@@ -176,37 +168,13 @@ fn progress_of(stack: &StoredStack) -> InstanceStack {
 
 /// The `StatusReason` CloudFormation reports on a stack instance whose own stack failed.
 ///
-/// "The explanation for the specific status code assigned to this stack instance"
-/// (`StackInstanceSummary$StatusReason`), which for a stack whose RESOURCE failed the
-/// deployment names that resource: its `LogicalResourceId`, its type and the
-/// `ResourceStatusReason` — "success/failure message associated with the resource" — of its
-/// own failed transition, which is where the failing resource's diagnosis lives.
-///
-/// The resource is read off the stack's own event log, from the first failure the operation
-/// now ending recorded: that is the resource the deployment stopped at. A stack whose
-/// failure no resource carries — one CloudFormation refused before any resource was asked
-/// for — reports the stack's own `StackStatusReason` instead, since that is the whole of
-/// what failed it.
+/// Worded where every path that fails an instance words it
+/// ([`super::stack_set_instance_stacks`]), so the explanation a failure the clock found later
+/// carries is the one the handler that deployed the instance would have carried: the template
+/// resource that failed, its type and that resource's own failure message — or, for a stack
+/// whose failure no resource carries, the stack's own `StackStatusReason`.
 fn instance_failure_reason(stack: &StoredStack) -> String {
-    let opened_at = stack.last_operation().map(|operation| operation.started_at);
-    stack
-        .events
-        .iter()
-        .filter(|event| opened_at.is_none_or(|at| event.timestamp >= at))
-        .find(|event| {
-            event.resource_type != STACK_RESOURCE_TYPE
-                && event.resource_status.ends_with(FAILED_STATUS_SUFFIX)
-                && event.resource_status_reason.is_some()
-        })
-        .and_then(|event| {
-            let reason = event.resource_status_reason.as_deref()?;
-            Some(format!(
-                "ResourceLogicalId:{}, ResourceType:{}, ResourceStatusReason:{reason}",
-                event.logical_resource_id, event.resource_type
-            ))
-        })
-        .or_else(|| stack.status_reason.clone())
-        .unwrap_or_default()
+    super::stack_set_instance_stacks::failure_reason(stack).unwrap_or_default()
 }
 
 /// Write what the stacks of `stack_set`'s instances have reached onto the deployments in

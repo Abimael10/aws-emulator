@@ -221,7 +221,11 @@ pub async fn apply(
             stack.record_materialised_resources(materialised.resources);
             if let Some(failure) = materialised.failure {
                 stack.fail_transition(SystemTime::now(), status::UPDATE_FAILED, failure.clone());
-                reason = Some(failure);
+                // The INSTANCE reports it as a stack instance states a failure of the stack
+                // it deploys: the resource that failed, named
+                // ([`super::stack_set_instance_stacks`]).
+                reason =
+                    Some(super::stack_set_instance_stacks::failure_reason(stack).unwrap_or(failure));
             }
         }
         if let Some(reason) = reason {
@@ -272,11 +276,18 @@ pub fn record_failures(
         .find(|held| held.operation_id == operation_id)
     {
         match operation.pending.as_mut() {
+            // A conclusion still to come has its outcome counted and explained where every
+            // other one is ([`super::stack_set_instance_outcomes`]), off the stacks the
+            // instances deploy, so nothing is written over here.
             Some(pending) => {
                 pending.status = operation_status::FAILED.to_string();
                 pending.failed_stack_instances_count = Some(count);
-                pending.status_reason = reason;
             }
+            // The clock CONCLUDED this operation while the rollout was still running in the
+            // owning services, so no pending outcome is left for that pass to write: the
+            // failure is recorded on the concluded record itself, with the explanation its
+            // first failed target carries ([`super::stack_set_instance_stacks`]) — nothing
+            // reports a success, or an unexplained failure, for an update that failed.
             None => {
                 operation.status = operation_status::FAILED.to_string();
                 operation.failed_stack_instances_count = Some(count);
