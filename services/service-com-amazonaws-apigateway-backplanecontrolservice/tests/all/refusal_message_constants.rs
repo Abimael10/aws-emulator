@@ -515,16 +515,15 @@ async fn a_body_no_importer_can_read_is_refused_with_the_importers_own_sentence(
         assert_refusal(&answer, BAD_REQUEST, UNREADABLE_PARTS, case);
     }
 
-    // The same, for the API definition the two import operations read: unparsable, not an
-    // object, and an object that declares no OpenAPI version.
-    let definitions = [
-        ("a definition that is not JSON or YAML", "}not a document{"),
-        ("a definition that is a JSON array", "[]"),
-        (
-            "a definition declaring no OpenAPI version",
-            "{\"info\":{\"title\":\"no version\"}}",
-        ),
-    ];
+    // The same, for the API definition the two import operations read: a document whose
+    // VERSION is declared, so it is read as that format, and which still cannot be read as
+    // one. A body whose version cannot be determined at all, and a request carrying no
+    // definition at all, are the two refusals beside this one, each with its own
+    // sentence — see `definition_payload_refusals`.
+    let definitions = [(
+        "a definition whose paths are not paths",
+        "{\"openapi\": \"3.0.1\", \"info\": {\"title\": \"x\"}, \"paths\": [\"/pets\"]}",
+    )];
     for (case, body) in definitions {
         let imported = import_rest_api(&gateway, body).await;
         assert_refusal(
@@ -543,6 +542,11 @@ async fn a_body_no_importer_can_read_is_refused_with_the_importers_own_sentence(
             &format!("PutRestApi with {case}"),
         );
     }
+
+    // A document the reader DOES read but which declares no version of the format it is
+    // written in is a different refusal, and says so: see
+    // `definition_payload_refusals::a_definition_whose_version_cannot_be_determined_is_refused_as_that`,
+    // which pins that sentence over a set of such bodies.
 }
 
 #[tokio::test]

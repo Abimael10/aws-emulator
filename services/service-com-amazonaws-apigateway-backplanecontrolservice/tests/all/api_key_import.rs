@@ -663,8 +663,11 @@ async fn a_payload_that_is_not_an_api_key_file_is_refused() {
     let gateway = Gateway::new();
 
     // (case, document)
+    //
+    // A request carrying NO payload at all is not one of these: the member is `@required`,
+    // so it is refused by the layer in front of the handler under that layer's own class —
+    // see `definition_payload_refusals`.
     let cases: Vec<(&str, String)> = vec![
-        ("an empty payload", String::new()),
         ("a payload of whitespace only", "   \n".to_string()),
         (
             "a header declaring neither required column",

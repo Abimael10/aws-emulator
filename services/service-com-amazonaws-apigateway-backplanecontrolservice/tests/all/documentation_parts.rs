@@ -844,9 +844,10 @@ async fn a_body_that_is_not_a_documentation_set_is_refused_and_changes_nothing()
     )
     .await;
 
-    // Each row is a body that is not a documentation set, differing along how: not JSON
-    // at all, truncated, a JSON value that is not an object, an object that declares no
-    // documentation parts, and a documentation set that is not a list.
+    // Each row is a body that is not a documentation set, differing along how: carrying
+    // nothing at all, not JSON at all, truncated, a JSON value that is not an object, an
+    // object that declares no documentation parts, and a documentation set that is not a
+    // list.
     let refused: &[&str] = &[
         "",
         "not json",

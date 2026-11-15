@@ -96,6 +96,34 @@ use super::create_api_key::{value_too_short, MAX_VALUE_CHARS, MIN_VALUE_CHARS};
 /// added to the model later is refused rather than read as a CSV document.
 const FORMAT_CSV: &str = "csv";
 
+/// The input member the API key file travels in, named as the clause of an
+/// absent-required-member refusal names it ([`absent_body`]).
+///
+/// `ImportApiKeysRequest$body` is `@required @httpPayload`
+/// (`smithy_query(query="operation", operation="ImportApiKeys")`), so a request carrying
+/// no payload carries no value for it.
+const BODY_MEMBER: &str = "body";
+
+/// The refusal for a request that carries NO payload at all.
+///
+/// Nothing this handler's CSV reader could say applies: a caller who sent no body did not
+/// send a document whose header line is wrong, it left a `@required` member out — so the
+/// refusal is the one the layer in FRONT of every operation makes about an absent required
+/// member, under that layer's own class (HTTP 400 `ValidationException`) and in its own
+/// envelope, which [`aws_smithy_schema_server::constraints::missing_member_message`]
+/// renders. A payload member is named by its own member name, with no input-shape root:
+/// the body is not a member of the document the input shape describes, it IS the request's
+/// body.
+///
+/// The framework cannot make this refusal itself: a `@httpPayload` member whose target is
+/// a blob takes the body VERBATIM, so zero bytes deserialize into an EMPTY value rather
+/// than into no value at all, and the required-member check behind the codec never fires.
+fn absent_body() -> ImportApiKeysError {
+    crate::scaffolded::Scaffolded::validation(
+        ::aws_smithy_schema_server::constraints::missing_member_message(BODY_MEMBER),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // The API key file's columns.
 //
@@ -528,6 +556,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
+
+        // A request that carries no payload at all left a `@required` member out, and is
+        // refused as that BEFORE the CSV reader is reached — see [`absent_body`].
+        if input.body.is_empty() {
+            return Err(absent_body());
+        }
 
         if input.format != FORMAT_CSV {
             return Err(bad_request(format!(

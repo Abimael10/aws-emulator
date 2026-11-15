@@ -799,3 +799,10 @@ mod access_association_domain_resolution;
 // path it addressed, for the principal its credential speaks for.
 #[path = "all/control_plane_authorization.rs"]
 mod control_plane_authorization;
+// Appended for the reason the note above gives: how this service refuses the PAYLOAD of the
+// three operations whose payload it reads itself or leaves to the required-member check — a
+// request that carries none at all, and a definition document that does not say which format
+// it is written in. `ImportDocumentationParts`, the fourth operation that binds a payload,
+// keeps its own reader's sentence and is covered in `all/documentation_parts.rs`.
+#[path = "all/definition_payload_refusals.rs"]
+mod definition_payload_refusals;

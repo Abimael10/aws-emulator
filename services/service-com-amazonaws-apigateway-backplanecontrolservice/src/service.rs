@@ -696,8 +696,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
 #[cfg(test)]
 mod tests {
-    //! The one thing about the wiring above that a wire test cannot see: that the
-    //! hand-maintained `wrap_operations!` list is the WHOLE surface.
+    //! What a wire test cannot see about the wiring above: that the hand-maintained
+    //! `wrap_operations!` list is the WHOLE surface, and the model facts a handler's
+    //! refusal rests on.
 
     use super::*;
 
@@ -751,5 +752,52 @@ mod tests {
                  answers a refusal in the framework's wording instead of this service's"
             );
         }
+    }
+
+    /// The model fact `ImportApiKeys` rests on when it answers a request carrying no
+    /// payload as an absent required member: on every operation of this service that
+    /// binds the whole request payload to a member, that member is `@required`.
+    ///
+    /// Read off the model rather than listed, so an operation that later binds an
+    /// OPTIONAL payload fails here — where the fact is written down — instead of
+    /// answering an absent-required-member refusal for a body a caller may leave out.
+    #[test]
+    fn the_payload_of_every_operation_that_binds_one_is_required() {
+        let model = std::fs::read_to_string(MODEL_PATH)
+            .expect("the model that generated this crate ships beside it");
+        let model: serde_json::Value =
+            serde_json::from_str(&model).expect("the model that generated this crate is JSON");
+        let shapes = model["shapes"]
+            .as_object()
+            .expect("a Smithy model declares shapes");
+        // Every operation's input shape, by the id the operation names it with.
+        let inputs: Vec<&str> = shapes
+            .iter()
+            .filter(|(_, shape)| shape["type"] == "operation")
+            .filter_map(|(_, shape)| shape["input"]["target"].as_str())
+            .collect();
+        let mut bound = 0_usize;
+        for input in inputs {
+            let Some(members) = shapes[input]["members"].as_object() else {
+                continue;
+            };
+            for (name, member) in members {
+                let traits = &member["traits"];
+                if traits["smithy.api#httpPayload"].is_null() {
+                    continue;
+                }
+                bound += 1;
+                assert!(
+                    !traits["smithy.api#required"].is_null(),
+                    "case {input}${name}: a payload an operation of this service refuses as \
+                     absent when no body is carried must be @required, and this one is not"
+                );
+            }
+        }
+        assert!(
+            bound > 0,
+            "case the model's payload members: expected the operations that bind a \
+             payload, found none"
+        );
     }
 }
