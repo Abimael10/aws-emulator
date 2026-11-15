@@ -1251,8 +1251,18 @@ pub const MAX_PROPERTIES_DEPTH: usize = 128;
 pub enum PatchRefusal {
     /// The document carries more operations than a patch may.
     TooManyOperations,
-    /// One of its operations could not be applied to the model: the operation, as the
-    /// document spells it, and the path it names.
+    /// One of its operations named a pointer the model it is applied to does not carry:
+    /// the operation, as the document spells it, and the pointer the request provided.
+    NoSuchPath {
+        /// The operation RFC 6902 name of the step whose pointer resolved to nothing.
+        operation: &'static str,
+        /// The pointer that step read its source value through — the `from` of a `move`
+        /// or a `copy`, the operation's own path everywhere else.
+        path: String,
+    },
+    /// One of its operations could not be applied to the model for a reason other than an
+    /// absent pointer — a `test` whose value does not hold, a `move` into its own subtree:
+    /// the operation, as the document spells it, and the path it names.
     NotApplicable {
         /// The operation RFC 6902 name of the step that failed.
         operation: &'static str,
@@ -1274,6 +1284,10 @@ impl PatchRefusal {
             Self::TooManyOperations => format!(
                 "PatchDocument must carry at most {MAX_PATCH_OPERATIONS} patch operations"
             ),
+            // A pointer that resolves to nothing is stated in the terms the patch reader
+            // itself states it in: WHICH operation of the document found nothing, and the
+            // path the request provided ([`no_such_path_message`]).
+            Self::NoSuchPath { operation, path } => no_such_path_message(operation, path),
             // Naming the operation and the path it failed on is what tells this refusal
             // from every other reason a document may be rejected: the caller has to know
             // WHICH step of its document the resource model would not take.
@@ -1296,18 +1310,26 @@ impl PatchRefusal {
         }
     }
 
-    /// Whether this refusal is a fault in the DOCUMENT, which the front door judges from
-    /// the request and the resource model alone, rather than a verdict on the model the
-    /// handler would have been asked to store.
+    /// The whole `Message` the FRONT DOOR states this refusal with, or `None` for a refusal
+    /// that is a verdict on the model the document would leave behind rather than a fault in
+    /// the document itself.
     ///
-    /// A patch operation that names a path the model does not carry cannot be applied to
-    /// any model, so it is the front door's refusal. The remaining refusals are about
-    /// what applying the document WOULD leave behind — a value that is not a resource
-    /// model, one past the length the model can report — or about this emulator's own
-    /// cap on the work one document may drive ([`MAX_PATCH_OPERATIONS`]), none of which
-    /// the front door decides.
-    pub fn is_document_fault(&self) -> bool {
-        matches!(self, Self::NotApplicable { .. })
+    /// A patch operation that could not be applied to the model it was computed against
+    /// cannot be applied to any model, so it is the front door's refusal. WHICH sentence it
+    /// is stated with follows from the rule it broke: a pointer the model does not carry is
+    /// the patch reader's own `noSuchPath` verdict, which names the operation and the path
+    /// the request provided and is the whole message, while every other reason a document
+    /// would not apply is stated behind the prefix Cloud Control API carries an unusable
+    /// `PatchDocument` under. The remaining refusals are about what applying the document
+    /// WOULD leave behind — a value that is not a resource model, one past the length the
+    /// model can report — or about this emulator's own cap on the work one document may
+    /// drive ([`MAX_PATCH_OPERATIONS`]), none of which the front door decides.
+    pub fn document_message(&self) -> Option<String> {
+        match self {
+            Self::NoSuchPath { .. } => Some(self.detail()),
+            Self::NotApplicable { .. } => Some(invalid_patch_document_message(&self.detail())),
+            Self::TooManyOperations | Self::NotAnObject | Self::TooLarge | Self::TooDeep => None,
+        }
     }
 }
 
@@ -1326,6 +1348,19 @@ fn operation_description(operation: &::json_patch::PatchOperation) -> (&'static 
     }
 }
 
+/// The pointer one patch operation READS its source value through: the `from` of a `move`
+/// or a `copy`, which is where the value it writes comes from, and the operation's own path
+/// everywhere else.
+fn operation_source(operation: &::json_patch::PatchOperation) -> String {
+    use ::json_patch::PatchOperation;
+
+    match operation {
+        PatchOperation::Move(operation) => operation.from.to_string(),
+        PatchOperation::Copy(operation) => operation.from.to_string(),
+        other => operation_description(other).1,
+    }
+}
+
 /// The top-level properties of the resource model a patch document would CHANGE.
 ///
 /// A patch operation names its target as a JSON pointer into the model, so the property
@@ -1340,10 +1375,30 @@ fn operation_description(operation: &::json_patch::PatchOperation) -> (&'static 
 /// change is refused because the document names it, whether or not the operation could
 /// have been applied.
 pub fn patched_properties(patch: &::json_patch::Patch) -> BTreeSet<String> {
+    properties_changed_by(patch, |_| true)
+}
+
+/// The top-level properties of the resource model a patch document would change with an
+/// operation that is NOT an `add` — the only operation a write-only property may be named
+/// by ([`write_only_properties`]).
+///
+/// A property is read off each operation's pointers the way [`patched_properties`] reads
+/// them, so the two cannot disagree about which property one pointer names.
+pub fn properties_patched_without_add(patch: &::json_patch::Patch) -> BTreeSet<String> {
+    properties_changed_by(patch, |operation| {
+        !matches!(operation, ::json_patch::PatchOperation::Add(_))
+    })
+}
+
+/// The top-level properties the operations of `patch` that `selected` admits would change.
+fn properties_changed_by(
+    patch: &::json_patch::Patch,
+    selected: impl Fn(&::json_patch::PatchOperation) -> bool,
+) -> BTreeSet<String> {
     use ::json_patch::PatchOperation;
 
     let mut properties = BTreeSet::new();
-    for operation in &patch.0 {
+    for operation in patch.0.iter().filter(|operation| selected(operation)) {
         let targets: Vec<&::json_patch::jsonptr::Pointer> = match operation {
             PatchOperation::Add(operation) => vec![&operation.path],
             PatchOperation::Remove(operation) => vec![&operation.path],
@@ -1385,11 +1440,25 @@ pub fn apply_patch(properties: &mut Value, patch: &::json_patch::Patch) -> Resul
     }
     for operation in &patch.0 {
         let step = ::json_patch::Patch(vec![operation.clone()]);
-        ::json_patch::patch(properties, &step).map_err(|_| {
+        ::json_patch::patch(properties, &step).map_err(|error| {
             let (named, path) = operation_description(operation);
-            PatchRefusal::NotApplicable {
-                operation: named,
-                path,
+            match error.kind {
+                // The pointer the operation writes through, or the one it reads its value
+                // from, resolves to nothing in the model it was applied to: the one
+                // refusal the reader states in its own `noSuchPath` terms, naming the
+                // pointer the request provided rather than the one the reader stopped at.
+                ::json_patch::PatchErrorKind::InvalidPointer => PatchRefusal::NoSuchPath {
+                    operation: named,
+                    path,
+                },
+                ::json_patch::PatchErrorKind::InvalidFromPointer => PatchRefusal::NoSuchPath {
+                    operation: named,
+                    path: operation_source(operation),
+                },
+                _ => PatchRefusal::NotApplicable {
+                    operation: named,
+                    path,
+                },
             }
         })?;
         if !properties_within_depth(properties) {
@@ -2082,10 +2151,69 @@ fn invalid_patch_update_message(classification: &str, properties: &[&str]) -> St
     )
 }
 
+/// The properties a resource type's registry schema declares `writeOnlyProperties`, keyed
+/// by `TypeName`.
+///
+/// Catalog source: the `writeOnlyProperties` list of each type's resource provider schema,
+/// as CloudFormation publishes it (`DescribeType`), with the `/properties/` prefix of each
+/// pointer dropped. A write-only property is one a caller SETS and the type's READ handler
+/// does not report, so there is nothing in the model a patch is applied to for an operation
+/// to update in place: such a property can only be `add`ed
+/// ([`write_only_properties`]). A type whose schema declares none is absent from here.
+const WRITE_ONLY_PROPERTIES: &[(&str, &[&str])] = &[
+    // `AWS::SSM::Parameter`: the properties the type's read handler, which reads a
+    // parameter through `ssm:GetParameter`, does not report — that call answers with the
+    // parameter's name, type, value and data type and with none of these.
+    (
+        "AWS::SSM::Parameter",
+        &["AllowedPattern", "Description", "Policies", "Tier"],
+    ),
+];
+
+/// The properties of `type_name` a patch may only `add`: the type's declared
+/// `writeOnlyProperties`, in the order the schema declares them, so a refusal lists them
+/// the way the schema does.
+pub fn write_only_properties(type_name: &str) -> &'static [&'static str] {
+    WRITE_ONLY_PROPERTIES
+        .iter()
+        .find(|(name, _)| *name == type_name)
+        .map_or(&[], |(_, properties)| *properties)
+}
+
+/// How a mutating operation words a patch that updates a write-only property with an
+/// operation other than `add`: the schema list that classifies them, the properties as the
+/// pointers into the RESOURCE MODEL the patch names them by — the model is where the
+/// operation found nothing to update — and the one operation that may set them.
+pub fn write_only_message(properties: &[&str]) -> String {
+    let pointers: Vec<String> = properties
+        .iter()
+        .map(|property| format!("/{property}"))
+        .collect();
+    format!(
+        "Invalid patch update: writeOnlyProperties [{}] can only be updated using 'add' \
+         operation",
+        pointers.join(", ")
+    )
+}
+
 /// How a mutating operation words a `PatchDocument` its reader would not take, with the
 /// prefix Cloud Control API states such a refusal behind.
 pub fn invalid_patch_document_message(detail: &str) -> String {
     format!("Invalid PatchDocument: {detail}")
+}
+
+/// How the patch reader states an operation whose pointer resolved to nothing in the model
+/// the document was applied to: the operation RFC 6902 names, as the reader spells it, and
+/// the path the request provided.
+///
+/// The path is reported the way the reader reports a pointer it has READ — its tokens
+/// behind the root separator it reads them from — so a document's own `/X` is stated as
+/// `//X`, the reader's separator before the document's own.
+pub fn no_such_path_message(operation: &str, path: &str) -> String {
+    format!(
+        "[{} Operation] noSuchPath in source, path provided : /{path}",
+        operation.to_ascii_uppercase()
+    )
 }
 
 /// What the document reader states about a `PatchDocument` it could not read as a list

@@ -734,7 +734,10 @@ async fn an_update_applies_the_patch_and_refuses_one_that_cannot_be() {
     // The rows a patch is refused on, each leaving the stored model untouched. The code
     // is part of the row: a document the FRONT DOOR will not read, or one naming a path
     // the resource model does not have, never reaches a handler, while a verdict on the
-    // model the handler would have been asked to store is the handler's own.
+    // model the handler would have been asked to store is the handler's own. A pointer
+    // that resolved to nothing is stated in the patch reader's own `noSuchPath` terms
+    // (`patch_path_refusals` holds the whole class to that), and a `test` that did not
+    // hold — whose pointer DID resolve — is not.
     let before = emulator.properties(TABLE, &identifier).await;
     let refusals: [(&str, &str, &str, String); 7] = [
         (
@@ -765,17 +768,14 @@ async fn an_update_applies_the_patch_and_refuses_one_that_cannot_be() {
             "a replace of a path the model does not carry",
             "[{\"op\":\"replace\",\"path\":\"/Missing/Deeper\",\"value\":1}]",
             "ValidationException",
-            "Invalid PatchDocument: the replace operation at path '/Missing/Deeper' could \
-             not be applied to the resource model"
+            "[REPLACE Operation] noSuchPath in source, path provided : //Missing/Deeper"
                 .to_string(),
         ),
         (
             "a remove of a path the model does not carry",
             "[{\"op\":\"remove\",\"path\":\"/Missing\"}]",
             "ValidationException",
-            "Invalid PatchDocument: the remove operation at path '/Missing' could not be \
-             applied to the resource model"
-                .to_string(),
+            "[REMOVE Operation] noSuchPath in source, path provided : //Missing".to_string(),
         ),
         (
             "a test operation that does not hold",

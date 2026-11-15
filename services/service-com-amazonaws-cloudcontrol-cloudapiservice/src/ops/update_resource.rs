@@ -514,6 +514,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // A write-only property is one the owning service's READ handler does not report, so
+        // the model a patch is applied to carries nothing at that pointer for an operation
+        // to update in place: Cloud Control API admits only the operation that SETS such a
+        // property and refuses every other one naming it — whatever the stored model happens
+        // to carry, which is what makes this too a verdict on the DOCUMENT.
+        let write_only = crate::state::write_only_properties(&input.type_name);
+        let updated = crate::state::properties_patched_without_add(&patch);
+        let write_only_offending: Vec<&str> = write_only
+            .iter()
+            .copied()
+            .filter(|property| updated.contains(*property))
+            .collect();
+        if !write_only_offending.is_empty() {
+            return Err(validation(crate::state::write_only_message(
+                &write_only_offending,
+            )));
+        }
+
         // "You specify your resource property updates as a list of patch operations
         // contained in a JSON patch document": the patch is applied to a COPY of the
         // model the store holds, with the one rule that bounds the work it can drive
@@ -531,12 +549,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(overlap);
             }
             drop(store);
-            return Err(if refusal.is_document_fault() {
-                validation(crate::state::invalid_patch_document_message(
-                    &refusal.detail(),
-                ))
-            } else {
-                invalid_request(refusal.detail())
+            return Err(match refusal.document_message() {
+                Some(message) => validation(message),
+                None => invalid_request(refusal.detail()),
             });
         }
         // A patch that does not NAME the primary identifier can still change it — the

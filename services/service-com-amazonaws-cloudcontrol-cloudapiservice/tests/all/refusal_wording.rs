@@ -747,7 +747,9 @@ async fn a_patch_document_the_front_door_refuses_is_a_validation_failure() {
     // door will not read, or whose operation names a path the resource model does not
     // have, never reaches a handler; a verdict on the model the handler would have been
     // asked to store is the handler's own. A document the reader will not take names
-    // where in the document it stopped, so the rows also differ along where that is.
+    // where in the document it stopped, so the rows also differ along where that is. An
+    // operation whose pointer resolved to nothing is stated in the patch reader's own
+    // `noSuchPath` terms, which `patch_path_refusals` holds to over the whole class.
     let rows: [(&str, &str, &str, &str); 6] = [
         (
             "a document that is not JSON",
@@ -781,8 +783,7 @@ async fn a_patch_document_the_front_door_refuses_is_a_validation_failure() {
             "a replace of a path the model does not carry",
             "[{\"op\":\"replace\",\"path\":\"/NoSuchProp\",\"value\":1}]",
             "ValidationException",
-            "Invalid PatchDocument: the replace operation at path '/NoSuchProp' could not \
-             be applied to the resource model",
+            "[REPLACE Operation] noSuchPath in source, path provided : //NoSuchProp",
         ),
         (
             "a document that would leave something other than a resource model",
