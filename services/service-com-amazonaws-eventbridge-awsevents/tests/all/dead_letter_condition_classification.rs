@@ -8,11 +8,10 @@
 //!
 //! The RULE asserted here: the `ERROR_CODE` EventBridge stamps on a dead-lettered
 //! event is the service's OWN classification of why the delivery failed, never the
-//! target service's error code. A target this service could not address — one that
-//! was not there to take the event, and a queue whose own policy grants this service
-//! nothing, which it cannot tell apart from one that is not there — is
-//! `NO_RESOURCE`; one whose service told this service the IDENTITY the call was made
-//! as was refused, as a role whose policies withhold the call does, is
+//! target service's error code. A target that was not there to take the event is
+//! `NO_RESOURCE`; a target that IS there and refused the identity the call was made
+//! as — a role whose policies withhold the call, and a queue whose own policy grants
+//! this service nothing — is
 //! `NO_PERMISSIONS` (the class `tests/all/dead_letter_error_code.rs` spans over the
 //! two steps of a role-governed handover); a failure of any other kind is `UNKNOWN`.
 //! The
@@ -28,8 +27,9 @@
 //! classification the failure falls in, along the target's SERVICE (a queue, a
 //! state machine), and along the FORM the failure takes within one class — a queue
 //! that was never created and one deleted after the target was written both being
-//! a resource that is not there, while a queue granting nothing and a queue
-//! refusing one parameter of the send are different classes on the same service.
+//! a resource that is not there, while a queue granting nothing, a queue refused by
+//! a policy scoped to another rule and a queue refusing one parameter of the send
+//! are different classes on the same service.
 //!
 //! The harness (the router with EventBridge, Amazon SQS, Step Functions, IAM and
 //! CloudWatch on one engine, and the queue, role and rule fixtures) is
@@ -37,7 +37,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    InvocationOutcome, NO_RESOURCE, SERVICE_PRINCIPAL, UNKNOWN_CONDITION,
+    rule_arn, InvocationOutcome, DEFAULT_EVENT_BUS_NAME, NO_PERMISSIONS, NO_RESOURCE,
+    SERVICE_PRINCIPAL, UNKNOWN_CONDITION,
 };
 
 use crate::target_dispatch::{
@@ -64,12 +65,40 @@ fn account() -> &'static str {
     engine::emulator_account_id()
 }
 
+/// A rule of this account and Region that is NOT the one publishing below, which a
+/// target queue's policy can be scoped to so its grant does not reach this
+/// delivery.
+const OTHER_RULE: &str = "somebody-elses-rule";
+
+/// A queue policy granting this service `sqs:SendMessage` on `queue_arn`, scoped by
+/// `aws:SourceArn` to the deliveries of the rule `rule` and no other — IAM's own
+/// condition key and operator, as a queue's `Policy` is an IAM policy document.
+fn granting_one_rule(queue_arn: &str, rule: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": SERVICE_PRINCIPAL},
+            "Action": "sqs:SendMessage",
+            "Resource": queue_arn,
+            "Condition": {
+                "ArnEquals": {"aws:SourceArn": rule_arn(REGION, DEFAULT_EVENT_BUS_NAME, rule)},
+            },
+        }],
+    })
+    .to_string()
+}
+
 /// What a row's target is, and how it is brought into the state the row needs.
 enum Target {
     /// A queue carrying the policy a delivery needs.
     Queue,
     /// A queue carrying no policy at all, so it has granted this service nothing.
     QueueGrantingNothing,
+    /// A queue whose policy grants this service the send, but only for the
+    /// deliveries of a rule other than the one publishing — so the grant does not
+    /// reach this delivery, on a queue that is plainly there.
+    QueueGrantingAnotherRule,
     /// A queue ARN of this account that no queue was ever created for.
     QueueNeverCreated,
     /// A queue created, named by the target, and then deleted.
@@ -159,6 +188,13 @@ async fn given_target(
                 given_queue_with_policy(emulator, &format!("classified-{index}"), None).await;
             (arn, None)
         }
+        Target::QueueGrantingAnotherRule => {
+            let scoped = |queue_arn: &str| granting_one_rule(queue_arn, OTHER_RULE);
+            let (_url, arn) =
+                given_queue_with_policy(emulator, &format!("classified-{index}"), Some(&scoped))
+                    .await;
+            (arn, None)
+        }
         Target::QueueNeverCreated => (
             format!("arn:aws:sqs:{REGION}:{}:never-created-{index}", account()),
             None,
@@ -210,7 +246,12 @@ async fn the_dead_letter_condition_classifies_the_targets_own_answer() {
         Row {
             case: "a queue whose policy grants this service nothing",
             target: Target::QueueGrantingNothing,
-            condition: Some(NO_RESOURCE),
+            condition: Some(NO_PERMISSIONS),
+        },
+        Row {
+            case: "a queue whose policy is scoped by aws:SourceArn to another rule",
+            target: Target::QueueGrantingAnotherRule,
+            condition: Some(NO_PERMISSIONS),
         },
         Row {
             case: "a queue ARN no queue was created for",

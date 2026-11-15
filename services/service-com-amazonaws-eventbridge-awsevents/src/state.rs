@@ -872,8 +872,11 @@ pub const SERVICE_PRINCIPAL: &str = "events.amazonaws.com";
 pub const FAILED_TO_ASSUME_ROLE: &str = "FAILED_TO_ASSUME_ROLE";
 
 /// The condition EventBridge reports for an event whose target invocation was
-/// refused for want of a permission: the role could be assumed, and the policies
-/// in force on it do not allow the API call the target's invocation makes.
+/// refused for want of a permission: every document in force over that invocation
+/// was read and none of them authorizes it. That is the role's policies where the
+/// target names a role, and the TARGET's own resource policy where it names none —
+/// a queue, a topic, a function or a log group this service may not call — because
+/// what both say is that the resource is there and the call was not allowed on it.
 pub const NO_PERMISSIONS: &str = "NO_PERMISSIONS";
 
 /// The condition EventBridge reports for a delivery that failed for a reason its
@@ -3140,14 +3143,15 @@ const SQS_ACCESS_DENIED_STATUS: u16 = 403;
 /// authorization sentence naming the principal the call was made as, the action
 /// and the queue, followed by the metadata block an AWS error carries.
 ///
-/// The condition is [`NO_RESOURCE`], the SAME one a queue that is not there earns:
-/// a queue whose policy withholds every grant from this service is a queue this
-/// service cannot address at all, so what the delivery can report about it is that
-/// it had no queue to deliver to rather than which of the two it was. That is what
-/// a dead letter of such a delivery carries, and the sentence beside it is where
-/// the authorization failure itself is reported. A refusal of the IDENTITY the
-/// call was made as ([`NO_PERMISSIONS`]) is the condition of a target whose own
-/// service told this service which of the two it was.
+/// The condition is [`NO_PERMISSIONS`], the one every refusal a target's own
+/// documents decide carries: the queue IS there — it was found and its attributes
+/// were read — and what stopped the delivery is the missing `sqs:SendMessage`
+/// grant for this service's principal, which is a refusal of the identity the call
+/// was made as. [`NO_RESOURCE`] stays reserved for the other class, a target that
+/// is not there to take the event, so the two classes a consumer of a dead-letter
+/// queue triages on are not collapsed into one: a letter saying the target is gone
+/// never names a queue one `SetQueueAttributes` away from receiving. The sentence
+/// beside the condition is where the authorization failure is reported in full.
 ///
 /// The request id is MINTED here and nowhere else: it identifies the one refused
 /// call, so it is drawn fresh rather than derived from the event or the target,
@@ -3158,7 +3162,7 @@ const SQS_ACCESS_DENIED_STATUS: u16 = 403;
 pub fn queue_access_refusal(queue_arn: &str) -> (String, String) {
     let request_id = ::service_common::query_error_envelope::new_request_id();
     (
-        NO_RESOURCE.to_string(),
+        NO_PERMISSIONS.to_string(),
         format!(
             "{} (Service: {SQS_SERVICE_NAME}; Status Code: {SQS_ACCESS_DENIED_STATUS}; Error \
              Code: {SQS_ACCESS_DENIED_CODE}; Request ID: {request_id}; Proxy: null)",

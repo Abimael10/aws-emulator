@@ -3628,9 +3628,9 @@ const SNS_AUTHORIZATION_ERROR_STATUS: u16 = 403;
 /// and the topic, followed by the metadata block an AWS error carries — the
 /// service, the status, the error code and the id of the refused request. So the
 /// condition names the PERMISSION ([`crate::state::NO_PERMISSIONS`]) rather than
-/// the resource, which is what distinguishes it from a queue's refusal
-/// ([`crate::state::queue_access_refusal`]): Amazon SNS says which of the two it
-/// was, and Amazon SQS does not.
+/// the resource, the same one a queue's refusal carries
+/// ([`crate::state::queue_access_refusal`]): a target whose own document withheld
+/// the grant is one that IS there, whichever service it lives in.
 ///
 /// The request id is MINTED here and nowhere else, for the reason
 /// [`crate::state::queue_access_refusal`] gives: it identifies the ONE refused

@@ -20,9 +20,10 @@
 //!
 //! A withheld publish is a delivery that FAILED, so it goes to the target's
 //! dead-letter queue carrying what Amazon SNS answers a caller it has granted
-//! nothing: that service says WHICH of the two it was — an `AuthorizationError`
-//! naming the principal, the action and the topic — so the condition names the
-//! PERMISSION (`NO_PERMISSIONS`) where a queue's refusal names the resource. It is
+//! nothing: an `AuthorizationError` naming the principal, the action and the topic
+//! — so the condition names the PERMISSION (`NO_PERMISSIONS`), the same one a
+//! queue refused by its own policy carries, because a target whose own document
+//! withheld the grant is one that IS there whichever service it lives in. It is
 //! not retried, so the dead letter carries exactly the four attributes EventBridge
 //! stamps on one and no retry attributes, even for a target whose `RetryPolicy`
 //! allows many attempts. The rule's OTHER targets are unaffected: each handover is
