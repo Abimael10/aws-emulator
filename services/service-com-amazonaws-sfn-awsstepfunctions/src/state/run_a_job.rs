@@ -118,7 +118,7 @@ async fn poll<Eng: Send + Sync + 'static>(
         };
 
         let (call, request) =
-            integration::describing(task.api, task.job, &task.job_id, &task.naming);
+            integration::describing(task.api, task.family, task.job, &task.job_id, &task.naming);
         // The poll is one of the execution's own calls, so the policies in force on
         // its role decide whether it is made: a role that may not report the job
         // cannot be told what the job did, and the task it belongs to has already been

@@ -314,6 +314,57 @@ fn a_resource_names_the_call_its_action_does() {
     }
 }
 
+/// Each family names a service the way the SDK that serves it does, and the two names
+/// differ in NOTHING but that spelling: the AWS SDK's own name for a service and the
+/// token its `Resource` names the service by are the same letters, and the EXCEPTION
+/// half of a task error is the same class whichever family named the call.
+///
+/// Pinned over the whole table rather than over one entry, because the two names of
+/// every service this crate calls are stated there and a mistyped one is only
+/// discoverable against something.
+#[test]
+fn both_names_of_every_called_service_are_the_same_letters() {
+    for api in APIS.iter().chain(std::iter::once(&S3_API)) {
+        let case = api.namespace;
+        // The AWS SDK family's `Resource` names the service by its SDK id lower-cased
+        // ([`Api::sdk_token`]), so the name its errors carry is that same token with the
+        // SDK's own capitalisation and nothing else changed.
+        assert_eq!(
+            api.sdk_error_prefix.to_lowercase(),
+            api.sdk_token(),
+            "case {case:?}: the AWS SDK family's name for the service must be the token that \
+             family names it by, got {:?} beside {:?}",
+            api.sdk_error_prefix,
+            api.sdk_token()
+        );
+        // Neither name carries the separator between the two halves of an error name.
+        for named in [api.error_prefix, api.sdk_error_prefix] {
+            assert!(
+                !named.is_empty() && !named.contains('.'),
+                "case {case:?}: a service name must be one unseparated label, got {named:?}"
+            );
+        }
+        // The exception half is the answer's own error class, so it is the same through
+        // either family: only the service half may differ.
+        let shape = "ResourceNotFoundException";
+        for (family, expected) in [
+            (Family::Optimized, api.error_prefix),
+            (Family::AwsSdk, api.sdk_error_prefix),
+        ] {
+            assert_eq!(
+                api.task_error(family, shape),
+                format!("{expected}.{shape}"),
+                "case {case:?}: expected {family:?} to name the service {expected:?}"
+            );
+            assert_eq!(
+                api.base_error(family),
+                format!("{expected}.{}", api.sdk_exception),
+                "case {case:?}: expected {family:?} to name the service {expected:?}"
+            );
+        }
+    }
+}
+
 /// What one answer means for the task, over a TABLE spanning the answer forms a
 /// JSON service gives: a document, an empty success, and a refusal in each of
 /// the spellings its error code may arrive in.
@@ -415,8 +466,11 @@ fn an_answer_is_the_result_or_the_error_the_service_named() {
 
     for (case, status, error_type, body, expected) in rows {
         let answer = answer_of(
-            api,
-            "PutItem",
+            Called {
+                api,
+                family: Family::Optimized,
+                operation: "PutItem",
+            },
             status,
             error_type,
             body.as_bytes(),
@@ -491,8 +545,11 @@ fn a_query_compatible_refusal_is_named_by_its_shape_and_reports_its_legacy_code(
     for (case, shape, legacy, error, reported) in rows {
         let body = format!(r#"{{"__type":"{shape}","message":"refused."}}"#);
         let answer = answer_of(
-            api,
-            "SendMessage",
+            Called {
+                api,
+                family: Family::Optimized,
+                operation: "SendMessage",
+            },
             400,
             None,
             body.as_bytes(),

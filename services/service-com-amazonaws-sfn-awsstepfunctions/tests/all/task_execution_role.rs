@@ -58,8 +58,12 @@ const PATIENCE: Duration = Duration::from_secs(20);
 
 /// The error a `Task` state reports when Step Functions refuses the call it made: this
 /// service's base SDK exception, which is what an error its operation does not model is
-/// reported under.
+/// reported under, under the name the OPTIMIZED family writes for this service.
 const REFUSAL_ERROR: &str = "StepFunctions.AWSStepFunctionsException";
+
+/// The same refusal of a call named through the AWS SDK integration family, which names
+/// the service as the AWS SDK does.
+const SDK_REFUSAL_ERROR: &str = "Sfn.AWSStepFunctionsException";
 
 /// The fragments the cause of that refusal carries: the code the answer came back
 /// under, and the resource the call was refused ON.
@@ -406,6 +410,12 @@ async fn a_tasks_call_is_made_only_when_the_execution_role_allows_it() {
     ];
 
     for (index, (case, child, resource, allowed)) in rows.into_iter().enumerate() {
+        // Each family names the service its own way, so what the refusal is reported
+        // under follows the `Resource` the row named.
+        let refusal_error = match resource == AWS_SDK {
+            true => SDK_REFUSAL_ERROR,
+            false => REFUSAL_ERROR,
+        };
         let child_arn = children[child].clone();
         let machine_name = format!("role-parent-{index}");
         let parent = chain
@@ -444,8 +454,8 @@ async fn a_tasks_call_is_made_only_when_the_execution_role_allows_it() {
         );
         assert_eq!(
             described.get("error").and_then(Value::as_str),
-            Some(REFUSAL_ERROR),
-            "case {case:?}: expected {REFUSAL_ERROR}, got {described:?}"
+            Some(refusal_error),
+            "case {case:?}: expected {refusal_error}, got {described:?}"
         );
         // Exactly one TaskFailed, carrying the refusal; and nothing claiming the job
         // was submitted, because the call was never made.
@@ -463,7 +473,7 @@ async fn a_tasks_call_is_made_only_when_the_execution_role_allows_it() {
             .unwrap_or_else(|| panic!("case {case:?}: expected taskFailedEventDetails"));
         assert_eq!(
             details.get("error").and_then(Value::as_str),
-            Some(REFUSAL_ERROR),
+            Some(refusal_error),
             "case {case:?}: expected the task's own error to name the refusal, got {details:?}"
         );
         let cause = string(details, "cause");

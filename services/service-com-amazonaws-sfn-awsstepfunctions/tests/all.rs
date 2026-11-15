@@ -135,6 +135,8 @@ mod http_task_endpoint;
 mod identity_policy_authorization;
 #[path = "all/integration_failure_error_names.rs"]
 mod integration_failure_error_names;
+#[path = "all/integration_family_error_names.rs"]
+mod integration_family_error_names;
 #[path = "all/integration_member_names.rs"]
 mod integration_member_names;
 #[path = "all/interpreter_data_fidelity.rs"]

@@ -265,6 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(parked) = stopped.parked {
             let (call, request) = crate::state::integration::stopping(
                 parked.api,
+                parked.family,
                 parked.job,
                 &parked.job_id,
                 &parked.naming,

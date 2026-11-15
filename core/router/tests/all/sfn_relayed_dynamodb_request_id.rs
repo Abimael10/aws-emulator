@@ -366,7 +366,8 @@ async fn a_relayed_dynamodb_answer_names_its_request_the_way_dynamodb_does() {
                 "Item": { "pk": { "S": SEEDED_KEY }, "note": { "S": "second" } },
                 "ConditionExpression": "attribute_not_exists(pk)",
             }),
-            error: "DynamoDB.ConditionalCheckFailedException",
+            // That family names the service as the AWS SDK does.
+            error: "DynamoDb.ConditionalCheckFailedException",
             code: "ConditionalCheckFailedException",
             sentence: Sentence::Whole("The conditional request failed"),
         },
@@ -417,7 +418,8 @@ async fn a_relayed_dynamodb_answer_names_its_request_the_way_dynamodb_does() {
                 "TableName": ABSENT_TABLE,
                 "Key": { "pk": { "S": SEEDED_KEY } },
             }),
-            error: "DynamoDB.ResourceNotFoundException",
+            // That family names the service as the AWS SDK does.
+            error: "DynamoDb.ResourceNotFoundException",
             code: "ResourceNotFoundException",
             sentence: Sentence::Opening("Requested resource not found"),
         },

@@ -2161,6 +2161,7 @@ impl Interpreter<'_> {
                         raw_input: raw.clone(),
                         job,
                         api: call.api,
+                        family: call.family,
                         parsed_output: call.parsed_output,
                         job_id: job_id.to_string(),
                         // The job is reported and stopped through calls of its own

@@ -1491,6 +1491,10 @@ pub struct ParkedJob {
     /// stops it.
     pub job: &'static super::integration::RunAJob,
     pub api: &'static super::integration::Api,
+    /// Which integration family the `Resource` named that service by, which is the
+    /// family the pattern's own calls are made as and a refusal of one is named in
+    /// ([`super::integration::Family`]).
+    pub family: super::integration::Family,
     /// Whether the `Resource` asked for the pattern's second revision.
     pub parsed_output: bool,
     /// The job's own identifier, as the call that started it reported it.

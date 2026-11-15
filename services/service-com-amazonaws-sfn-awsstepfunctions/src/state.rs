@@ -1421,6 +1421,10 @@ pub struct JobTask {
     /// stops it.
     pub job: &'static integration::RunAJob,
     pub api: &'static integration::Api,
+    /// Which integration family the `Resource` named that service by, which is the
+    /// family the calls that report and stop the job are made as
+    /// ([`integration::Family`]).
+    pub family: integration::Family,
     /// Whether the `Resource` asked for the pattern's second revision.
     pub parsed_output: bool,
     /// The job's own identifier, as the call that started it reported it.
@@ -1507,6 +1511,8 @@ pub struct PlannedJob {
     pub state_input: String,
     pub job: &'static integration::RunAJob,
     pub api: &'static integration::Api,
+    /// See [`JobTask::family`].
+    pub family: integration::Family,
     pub parsed_output: bool,
     pub job_id: String,
     pub naming: integration::JobNaming,

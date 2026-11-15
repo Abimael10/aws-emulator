@@ -765,6 +765,7 @@ fn planned_job(parked: asl::ParkedJob, start: SystemTime) -> PlannedJob {
         state_input: parked.raw_input.to_string(),
         job: parked.job,
         api: parked.api,
+        family: parked.family,
         parsed_output: parked.parsed_output,
         job_id: parked.job_id,
         naming: parked.naming,

@@ -67,9 +67,13 @@ const PAST_THE_TABLE_TRANSITION: Duration =
     STATUS_TRANSITION.saturating_add(Duration::from_millis(200));
 
 /// The error a `Task` state reports when DynamoDB refuses the call it made with an
-/// error that operation does not model: DynamoDB's base SDK exception, as Step
-/// Functions names the service in a task error.
+/// error that operation does not model: DynamoDB's base SDK exception, under the name
+/// the OPTIMIZED integration family writes for the service.
 const REFUSAL_ERROR: &str = "DynamoDB.AmazonDynamoDBException";
+
+/// The same refusal of a call named through the AWS SDK integration family, which names
+/// the service as the AWS SDK does.
+const SDK_REFUSAL_ERROR: &str = "DynamoDb.AmazonDynamoDBException";
 
 /// The code the refused answer came back under, as the cause reports it.
 const REFUSAL_CODE: &str = "Error Code: AccessDeniedException";
@@ -453,6 +457,12 @@ async fn a_tasks_dynamodb_call_is_made_only_when_the_execution_role_allows_it() 
     ];
 
     for (index, (case, resource, addressed, allowed)) in rows.into_iter().enumerate() {
+        // Each family names the service its own way, so the refusal is reported under
+        // the name the family this row's `Resource` belongs to writes.
+        let refusal_error = match resource.contains(":aws-sdk:") {
+            true => SDK_REFUSAL_ERROR,
+            false => REFUSAL_ERROR,
+        };
         let (table, table_arn) = match addressed {
             Addressed::Granted => ("granted", granted.as_str()),
             Addressed::GrantedByArn => (granted.as_str(), granted.as_str()),
@@ -518,8 +528,8 @@ async fn a_tasks_dynamodb_call_is_made_only_when_the_execution_role_allows_it() 
         );
         assert_eq!(
             described.get("error").and_then(Value::as_str),
-            Some(REFUSAL_ERROR),
-            "case {case:?}: expected {REFUSAL_ERROR}, got {described:?}"
+            Some(refusal_error),
+            "case {case:?}: expected {refusal_error}, got {described:?}"
         );
         let cause = string(&described, "cause");
         // The principal is the SESSION of the role the call was made as, under the name

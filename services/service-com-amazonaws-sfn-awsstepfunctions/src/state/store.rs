@@ -858,6 +858,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             state_input: planned.state_input,
             job: planned.job,
             api: planned.api,
+            family: planned.family,
             parsed_output: planned.parsed_output,
             job_id: planned.job_id,
             naming: planned.naming,

@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use service_com_amazonaws_sfn_awsstepfunctions::state::integration::{
-    describing, read, stopping, task_result, Api, JobNaming, RunAJob, RUN_A_JOB,
+    describing, read, stopping, task_result, Api, Family, JobNaming, RunAJob, RUN_A_JOB,
 };
 use service_com_amazonaws_sfn_awsstepfunctions::state::EVENT_TASK_SUBMITTED;
 
@@ -124,7 +124,9 @@ fn each_catalogued_job_is_reported_and_stopped_by_the_members_that_name_it() {
 
             // The reporting call: the operation the entry names, carrying the
             // identifier under its own member beside the naming, and nothing more.
-            let (reporting, reported) = describing(api, entry, JOB_ID, &naming);
+            // The catalogue names each integration by its OPTIMIZED token
+            // ([`RunAJob::starts`]), which is the family these rows name it through.
+            let (reporting, reported) = describing(api, Family::Optimized, entry, JOB_ID, &naming);
             assert_eq!(
                 reporting.operation, entry.describe,
                 "case {label:?}: expected the reporting operation {}, got {}",
@@ -145,7 +147,7 @@ fn each_catalogued_job_is_reported_and_stopped_by_the_members_that_name_it() {
 
             // The stopping call: the same, with the identifier in the shape that
             // operation types the member as.
-            let (stopping_call, to_stop) = stopping(api, entry, JOB_ID, &naming);
+            let (stopping_call, to_stop) = stopping(api, Family::Optimized, entry, JOB_ID, &naming);
             assert_eq!(
                 stopping_call.operation, entry.stop,
                 "case {label:?}: expected the stopping operation {}, got {}",
@@ -173,9 +175,9 @@ fn each_catalogued_job_is_reported_and_stopped_by_the_members_that_name_it() {
             naming.is_empty(),
             "case {label:?}: expected no naming members, got {naming:?}"
         );
-        let (_, reported) = describing(api, entry, JOB_ID, &naming);
+        let (_, reported) = describing(api, Family::Optimized, entry, JOB_ID, &naming);
         assert_members(&label, &reported, entry.describe_member, &naming);
-        let (_, to_stop) = stopping(api, entry, JOB_ID, &naming);
+        let (_, to_stop) = stopping(api, Family::Optimized, entry, JOB_ID, &naming);
         assert_members(&label, &to_stop, entry.stop_member, &naming);
     }
 }

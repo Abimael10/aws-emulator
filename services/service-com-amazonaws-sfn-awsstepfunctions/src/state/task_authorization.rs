@@ -363,8 +363,8 @@ pub fn role_gate<Eng: Send + Sync + 'static>(
             // deserializes an unmodelled code into.
             return Some(Failed {
                 error: targets.denied.map_or_else(
-                    || call.api.base_error(),
-                    |denied| call.api.task_error(denied.exception),
+                    || call.base_error(),
+                    |denied| call.task_error(denied.exception),
                 ),
                 cause: refused,
             });

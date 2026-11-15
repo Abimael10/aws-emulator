@@ -35,6 +35,8 @@ pub(super) static S3_API: Api = Api {
     wire: Wire::Rest(S3_REST),
     sdk_id: "S3",
     error_prefix: "S3",
+    // The AWS SDK names the service `S3`, which its own `S3` client carries.
+    sdk_error_prefix: "S3",
     // The client class `AmazonS3Client`, whose base exception is `AmazonS3Exception`.
     sdk_client: "AmazonS3",
     sdk_exception: "AmazonS3Exception",

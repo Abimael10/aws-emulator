@@ -304,8 +304,9 @@ async fn a_caught_states_exited_event_carries_the_error_output_it_left_with() {
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: expected the caught error in {output}"));
     assert!(
-        error.starts_with("StepFunctions."),
-        "case {case:?}: expected the invoked service's own error name, got {error:?}"
+        error.starts_with("Sfn."),
+        "case {case:?}: expected the invoked service's own error name, as the AWS SDK \
+         integration family names that service, got {error:?}"
     );
 }
 

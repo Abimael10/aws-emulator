@@ -7,7 +7,9 @@
 //!
 //! RULE: a failed service-integration `Task` is reported under the exception the invoked
 //! service's own SDK client raises for the refusal — the service as Step Functions names
-//! it, then the class of the error SHAPE the answer named, which is that shape's name
+//! it in that integration FAMILY (the AWS SDK's own name for it through the AWS SDK
+//! family, Step Functions' own through an optimized integration), then the class of the
+//! error SHAPE the answer named, which is that shape's name
 //! with the `Exception` suffix the SDKs give it — and under that service's BASE
 //! exception where the answer named no shape of its model: one of AWS's common errors,
 //! or a shape of the request framework in front of the service. The cause is that
@@ -137,7 +139,7 @@ async fn a_refused_integration_call_is_named_after_the_services_own_exception() 
             case: "the same refusal through the AWS SDK integration",
             resource: "arn:aws:states:::aws-sdk:sqs:sendMessage",
             parameters: json!({ "QueueUrl": absent_url.clone(), "MessageBody": "nowhere" }),
-            error: "SQS.QueueDoesNotExistException",
+            error: "Sqs.QueueDoesNotExistException",
             carries: vec!["The specified queue does not exist.".to_string()],
         },
         Row {

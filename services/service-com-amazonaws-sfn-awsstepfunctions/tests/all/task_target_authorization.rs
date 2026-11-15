@@ -120,7 +120,8 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             parameters: json!({ "queueUrl": queue_url.clone(), "messageBody": "hello" }),
             action: "sqs:SendMessage",
             resource_arn: queue_arn,
-            refusal_error: "SQS.AmazonSQSException",
+            // That family names the service as the AWS SDK does.
+            refusal_error: "Sqs.AmazonSQSException",
             refusal_code: REFUSAL_CODE,
         },
         // `Publish` MODELS the refusal of an unauthorized call
@@ -142,7 +143,8 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             parameters: json!({ "TopicArn": topic_arn.clone(), "Message": "hello" }),
             action: "SNS:Publish",
             resource_arn: topic_arn,
-            refusal_error: "SNS.AuthorizationErrorException",
+            // That family names the service as the AWS SDK does.
+            refusal_error: "Sns.AuthorizationErrorException",
             refusal_code: "Error Code: AuthorizationError",
         },
         Row {

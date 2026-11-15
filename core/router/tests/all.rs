@@ -1869,3 +1869,22 @@ mod cloudtrail_iam_credential_write_audit;
 // `all/declaration_roots_are_canonical_and_complete.rs`. What a suite covers, and why it
 // drives the assembled router rather than one service crate, belongs in that suite's own
 // module header; a note about THIS file belongs in `all/appended_notes.rs`.
+// Single integration-test target for the router: the canonical DECLARATION LIST of every
+// cross-service suite, and nothing else.
+// suite file under `tests/all/`, sorted by name, and no other line. Two branches landing at
+// once then insert two lines in two places and have no prose to duplicate, re-word or
+// mistype — which is what had happened here: the tail of this file had grown hundreds of
+// re-typed copies of its own header, many of them written as inner doc comments past the
+// first item, which is `E0753` and compiles no suite of this target at all.
+// EVERY comment in this file is an ORDINARY one, this header included: with no inner doc
+// comment anywhere, no merge of two landings can leave one past the first item.
+// this file, which the layout check refuses: the `#[path]` is what points each declaration
+// into `tests/all/`. Declare each suite exactly ONCE — a second `mod` for one name is
+// `E0428` — and declare EVERY entry under `tests/all/` the layout check counts: each
+// `<name>.rs` file, and each `<name>/` directory that carries a `mod.rs`. One no declaration
+// names is compiled nowhere. Some of those files are shared harnesses rather than suites
+// (`query_wire`, `eks_wire`, `cloudformation_stack_clock`) and some are probes; each is
+// declared like any other.
+// service crate's own, is stated in that suite's OWN module header, where it is read beside
+// the test it explains. A note about THIS file belongs in `all/appended_notes.rs`.
+// `all/declaration_roots_are_canonical_and_complete.rs`, beside

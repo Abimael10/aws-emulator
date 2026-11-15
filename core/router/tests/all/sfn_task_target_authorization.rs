@@ -465,7 +465,8 @@ async fn an_integration_call_the_role_is_not_granted_is_not_made() {
             resource: "arn:aws:states:::aws-sdk:sqs:sendMessage",
             parameters: json!({ "QueueUrl": queue_url.clone(), "MessageBody": "hello" }),
             action: "sqs:SendMessage",
-            refusal_error: "SQS.AmazonSQSException",
+            // That family names the service as the AWS SDK does.
+            refusal_error: "Sqs.AmazonSQSException",
         },
         Row {
             case: "an invocation, the function named by its ARN",

@@ -812,8 +812,11 @@ async fn a_catch_reading_the_error_output_recovers_the_execution() {
     use crate::integration_failure_error_names::Emulator as WithTargets;
 
     /// The name the mounted DynamoDB service's refusal of a write to a table nobody
-    /// created is reported under.
+    /// created is reported under, for an OPTIMIZED `Resource`.
     const REFUSED: &str = "DynamoDB.ResourceNotFoundException";
+    /// The same refusal through the AWS SDK integration family, which names the
+    /// service as the AWS SDK does.
+    const SDK_REFUSED: &str = "DynamoDb.ResourceNotFoundException";
 
     // (case, the Task state, the state that recovers, what the run must put out)
     let rows: Vec<(&str, Value, Value, Value)> = vec![
@@ -945,7 +948,7 @@ async fn a_catch_reading_the_error_output_recovers_the_execution() {
                 "End": true,
             }),
             json!({ "Type": "Pass", "End": true }),
-            json!({ "recovered": true, "error": REFUSED }),
+            json!({ "recovered": true, "error": SDK_REFUSED }),
         ),
         (
             // The failure is one level IN: the iteration's task fails, the `Map` state
@@ -1024,7 +1027,7 @@ async fn a_catch_reading_the_error_output_recovers_the_execution() {
                 "Output": { "recovered": true, "error": "{% $states.input.error %}" },
                 "End": true,
             }),
-            json!({ "recovered": true, "error": REFUSED }),
+            json!({ "recovered": true, "error": SDK_REFUSED }),
         ),
         (
             // The catcher is one level IN, on the task inside a `Parallel` BRANCH: the
