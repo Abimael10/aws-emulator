@@ -7311,3 +7311,18 @@ mod events_lambda_target_permission_granted_after_the_rule;
 //! `E0428`, which compiles no suite of this target. THIS HEADER IS THE ONLY PLACE AN INNER
 //! DOC COMMENT MAY STAND IN THIS FILE: past the first item one is `E0753` and compiles
 //! nothing, so what goes below is a declaration, and any note beside it is an ordinary
+//! This file is a LIST and nothing else: one `#[path = "all/<name>.rs"]` / `mod <name>;` pair
+//! per suite under `tests/all/`, kept sorted, so a landing has one place to insert and nothing
+//! to keep consistent. Put a new suite at `tests/all/<name>.rs` and add its pair below.
+//! A suite that is not declared here compiles nowhere and its tests never run; a suite left at
+//! the top level of `tests/` fails the build; a second `mod` for one name is `E0428`; and an
+//! inner doc comment past the first item is `E0753`. Each of those fails every suite in this
+//! target, so this header is the only place a `//!` line may stand, and what goes below it is a
+//! declaration — never a note about one, never a copy of this header. A note that has to be
+//! written below, even after the last declaration, is an ordinary `//` comment.
+//! A declaration carries the `#[path = "all/<name>.rs"]` attribute because `tests/all.rs` is a
+//! test-target CRATE ROOT, where a bare `mod` would resolve to a sibling of this file, which
+//! the layout check refuses. `all/all_rs_declares_each_suite_once.rs` and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of the above,
+//! service crate's own, is stated in that suite's own module doc, where it is read beside the
+//! test it explains and stays correct when the test changes.

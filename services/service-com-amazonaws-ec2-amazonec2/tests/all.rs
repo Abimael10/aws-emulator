@@ -2368,6 +2368,14 @@ mod modify_transit_gateway_metering_policy;
 // tail of this file, which is where every new ec2 suite lands.
 #[path = "all/delete_transit_gateway_vpc_attachment.rs"]
 mod delete_transit_gateway_vpc_attachment;
+// What `DeleteIpam` records: the stored IPAM written into the transient delete state of its own
+// catalog with the clock owing its removal, answered with every other member unchanged, read back
+// through `DescribeIpams` and then gone with the scopes it contained and the pools created in them
+// — beside the unresolvable ids, the pools that block it, the `Cascade` that takes the private
+// ones with it, the second delete and the dry run it refuses without writing anything. Declared at
+// the tail of this file, which is where every new ec2 suite lands.
+#[path = "all/delete_ipam.rs"]
+mod delete_ipam;
 // The instance metadata service one instance's guest reads itself from: the published
 // categories, the signed identity document its agents register the machine with, the IMDSv2
 // token form, and what it publishes nothing for. Declared at the tail of this file, which is
