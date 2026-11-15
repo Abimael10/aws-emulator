@@ -17,7 +17,8 @@
 use std::collections::HashMap;
 
 use crate::ops::types::{
-    AccessGrant, AccessGrantPrincipal, AccessProfile, Alert, AlertStateInfo, Domain,
+    AccessGrant, AccessGrantPrincipal, AccessProfile, AccessProfileSummary, Alert, AlertStateInfo,
+    Domain,
     EncryptionConfiguration, IdentityProviderConfiguration, NotificationRule, OmniDashboard,
     OmniDashboardSummary, Rule, Space, SpaceSummary, ALERT_STATE_VALUES, COMPARATOR_VALUES,
     ENCRYPTION_STRATEGY_VALUES, NOTIFICATION_TARGET_TYPE_VALUES, QUERY_LANGUAGE_VALUES,
@@ -458,6 +459,25 @@ impl ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
             .values()
             .filter(|stored| stored.seq > after_seq)
             .filter(|stored| r#type.is_none_or(|category| stored.r#type == category))
+            .collect();
+        selected.sort_by_key(|stored| stored.seq);
+        selected
+    }
+
+    /// Every stored access profile of one space in creation order, skipping everything
+    /// at or before `after_seq`.
+    ///
+    /// Linear in the number of stored profiles, which [`ACCESS_PROFILE_QUOTA`] bounds.
+    pub fn access_profiles_after(
+        &self,
+        space_id: &str,
+        after_seq: u64,
+    ) -> Vec<&StoredAccessProfile> {
+        let mut selected: Vec<&StoredAccessProfile> = self
+            .access_profiles
+            .values()
+            .filter(|stored| stored.profile.space_id == space_id)
+            .filter(|stored| stored.seq > after_seq)
             .collect();
         selected.sort_by_key(|stored| stored.seq);
         selected
@@ -1094,6 +1114,25 @@ pub fn access_profile_view(stored: &StoredAccessProfile) -> AccessProfile {
     }
 }
 
+/// Project a stored access profile into the `AccessProfileSummary` the list operation
+/// returns.
+///
+/// Every `AccessProfileSummary` member is a member of `AccessProfile` with the same
+/// name — the summary's doc reads "Summary of an access profile. Call GetAccessProfile
+/// for the full profile" — so the projection is a copy of exactly those members, and a
+/// summary never reports a value the full profile does not. The members the summary
+/// leaves out (the parent space, the timestamps and the caller's `assumeStatus`) are
+/// what `GetAccessProfile` is for.
+pub fn access_profile_summary(profile: &AccessProfile) -> AccessProfileSummary {
+    AccessProfileSummary {
+        profile_id: profile.profile_id.clone(),
+        arn: profile.arn.clone(),
+        name: profile.name.clone(),
+        description: profile.description.clone(),
+        profile_type: profile.profile_type.clone(),
+    }
+}
+
 /// The state an alert reports when its last evaluation produced no data.
 ///
 /// `NoData`'s model doc: it "Configures how the alert reacts when an evaluation produces
@@ -1371,6 +1410,20 @@ pub fn encode_omni_dashboard_page_token(seq: u64) -> String {
 /// minted for a dashboard listing.
 pub fn decode_omni_dashboard_page_token(token: &str) -> Option<u64> {
     decode_page_token(OMNI_DASHBOARD_PAGE_TOKEN_PREFIX, token)
+}
+
+/// The prefix an access-profile-list page token carries, for the same reason.
+const ACCESS_PROFILE_PAGE_TOKEN_PREFIX: &str = "access-profiles:";
+
+/// Mint the opaque `nextToken` that resumes an access profile listing after `seq`.
+pub fn encode_access_profile_page_token(seq: u64) -> String {
+    encode_page_token(ACCESS_PROFILE_PAGE_TOKEN_PREFIX, seq)
+}
+
+/// Read an access-profile-list `nextToken` back, or `None` when it is not one this
+/// service minted for an access profile listing.
+pub fn decode_access_profile_page_token(token: &str) -> Option<u64> {
+    decode_page_token(ACCESS_PROFILE_PAGE_TOKEN_PREFIX, token)
 }
 
 /// The prefix a view-list page token carries, for the same reason.

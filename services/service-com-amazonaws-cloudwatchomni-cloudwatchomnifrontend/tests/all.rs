@@ -15,6 +15,8 @@
 mod access_grant_lifecycle;
 #[path = "all/access_profile_lifecycle.rs"]
 mod access_profile_lifecycle;
+#[path = "all/access_profile_listing.rs"]
+mod access_profile_listing;
 #[path = "all/alert_lifecycle.rs"]
 mod alert_lifecycle;
 #[path = "all/alert_profile_trust.rs"]
