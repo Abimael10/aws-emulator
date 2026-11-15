@@ -251,6 +251,8 @@ mod maintenance_action_absent_resource;
 mod maintenance_action_resource_guard;
 #[path = "all/managed_master_secret_cluster_creation.rs"]
 mod managed_master_secret_cluster_creation;
+#[path = "all/managed_master_secret_instance_encryption.rs"]
+mod managed_master_secret_instance_encryption;
 #[path = "all/managed_master_user_credentials.rs"]
 mod managed_master_user_credentials;
 #[path = "all/managed_master_secret_key_bound.rs"]

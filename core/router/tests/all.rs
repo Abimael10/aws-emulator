@@ -1285,3 +1285,26 @@ mod lambda_in_function_assumed_role_session;
 //! restatement here, and what a suite covers belongs in that suite's own module doc, where it
 //! is read beside the test it describes. The notes earlier landings appended to this file live
 //! in `all/appended_notes.rs`.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, keeping the list sorted: this file
+//! holds those pairs and nothing else, so a landing has one place to insert and nothing to
+//! keep consistent. A suite no `mod` names compiles nowhere and its tests never run, and a
+//! suite left at the top level of `tests/` fails the build.
+//! Three rules this file lives or dies by, each checked by a suite of its own
+//! (`all/all_rs_declares_each_suite_once.rs`,
+//! `all/all_rs_is_a_canonical_declaration_list.rs`):
+//! * Declare each suite EXACTLY ONCE. This is one crate root, so a second `mod` for the
+//!   same name is `E0428` and takes every suite in the target down with it.
+//! * An inner doc comment (`//!`) is legal only BEFORE the first item, so this header is
+//!   the only place one may stand: a note written with `//!` further down this file is
+//!   `E0753` and compiles nothing.
+//! * Past this header the file is declaration pairs and NOTHING else — no note, no blank
+//!   line — sorted by suite name. Keep what you have to say about a suite in that suite's
+//!   own header.
+//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod <name>;` resolves to a
+//! sibling of this file (`tests/<name>.rs`) — which the layout check refuses: the `#[path]`
+//! above each declaration is what points it into `tests/all/`. Some of the files below are
+//! shared harnesses rather than suites (`query_wire`, `eks_wire`,
+//! `cloudformation_stack_clock`) and some are probes; every file under `tests/all/` is
+//! declared, because a file no declaration names is compiled nowhere. The notes that
+//! concurrent landings appended to the end of THIS file live in the `appended_notes` suite,
+//! which is declared below like any other.
