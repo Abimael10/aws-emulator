@@ -269,7 +269,7 @@ pub const EVENT_QUEUE_ACTIONS: [&str; 3] = [
 /// The queue calls a crawl makes, as a refusal lists them: each action in the order the crawl
 /// makes them ([`EVENT_QUEUE_ACTIONS`]), comma-separated and closed by `and`.
 ///
-/// The REQUIREMENT clause of [`messages::event_queue_inaccessible`] states the whole grant
+/// The REQUIREMENT clause of [`messages::event_queue_grant_missing`] states the whole grant
 /// the crawl needs rather than the one call that happened to be withheld first, because every
 /// one of them has to be admitted for the crawl to read the queue at all — so a caller is told
 /// what to grant, whichever of them its policies are missing.
@@ -279,6 +279,18 @@ pub fn event_queue_actions_clause() -> String {
         Some((last, leading)) => format!("{} and {last}", leading.join(", ")),
         None => String::new(),
     }
+}
+
+/// Every action name a policy may state about a queue, as the service that OWNS the queue
+/// publishes them.
+///
+/// Read from that service rather than listed here, so the question [`queue_is_disclosed`]
+/// asks — may this role touch that queue AT ALL? — leaves out no call it serves, and a name
+/// added to or withdrawn from its API changes this with it. Each is asked about qualified with
+/// that service's own action prefix, which IAM compares without regard to case, so it decides
+/// exactly as the `SQS:`-spelled [`EVENT_QUEUE_ACTIONS`] do.
+fn queue_action_names() -> Vec<&'static str> {
+    ::service_com_amazonaws_sqs_amazonsqs::state::authorization::policy_action_names()
 }
 
 /// The most policy documents this check reads for ONE role.
@@ -357,11 +369,18 @@ pub fn role_policy_documents(role: &str, iam: &IamState) -> Option<Vec<String>> 
 /// by [`role_policy_documents`] — through the shared evaluator every service that decides
 /// authorization uses, so no two services answer differently.
 ///
-/// EVERY action the crawl makes has to be admitted, so the first one the documents do not
-/// admit — in the order the crawl makes them — settles it; which of IAM's rules withheld it
-/// (an explicit `Deny`, or no grant at all) decides nothing about the ANSWER, because Glue
-/// states its own refusal for a queue the crawl cannot read and that sentence names only the
-/// queue ([`messages::event_queue_inaccessible`]).
+/// EVERY action the crawl makes has to be admitted, so one the documents do not admit settles
+/// THAT the create is refused; which of IAM's rules withheld it (an explicit `Deny`, or no
+/// grant at all) decides nothing, because Glue states its own refusal rather than the queue
+/// service's authorization answer.
+///
+/// WHICH of Glue's two refusals it is, is settled by what those same documents show the role
+/// about the queue ITSELF ([`queue_is_disclosed`]): a role they admit some call on that queue
+/// to is refused with the grant the crawl needs named, since a queue it may touch is a queue
+/// that is there and a missing grant is the only thing left to report
+/// ([`messages::event_queue_grant_missing`]); a role they admit no call on it to is shown
+/// nothing that tells an absent queue from one it may not reach, and is refused with the
+/// sentence that conflates exactly those two ([`messages::event_queue_inaccessible`]).
 ///
 /// The documents are PREPARED once per request and passed in, so a request naming several
 /// queues parses them once rather than once per queue, and the caller holds no IAM guard
@@ -370,19 +389,64 @@ pub fn event_queue_refusal(
     prepared: &[::service_common::iam_authorization::PreparedDocument],
     queue_arn: &str,
 ) -> Option<String> {
+    if EVENT_QUEUE_ACTIONS
+        .iter()
+        .all(|action| admits_queue_call(prepared, action, queue_arn))
+    {
+        return None;
+    }
+    Some(if queue_is_disclosed(prepared, queue_arn) {
+        messages::event_queue_grant_missing(queue_arn)
+    } else {
+        messages::event_queue_inaccessible(queue_arn)
+    })
+}
+
+/// Whether the policies `prepared` admit the role the call `action` on the queue `queue_arn`.
+///
+/// Nothing stated is an implicit deny in IAM, and the documents in force on the role ARE the
+/// authority on what it may do: a role whose policies say nothing about the call may not make
+/// it. The one reading of that question in this module, so what a refusal is decided on and
+/// what it is WORDED from cannot drift apart.
+fn admits_queue_call(
+    prepared: &[::service_common::iam_authorization::PreparedDocument],
+    action: &str,
+    queue_arn: &str,
+) -> bool {
     use ::service_common::iam_authorization as authorization;
 
-    let withheld = EVENT_QUEUE_ACTIONS.iter().any(|action| {
-        let request = authorization::Request::new(action, queue_arn, &[]);
-        // Nothing stated is an implicit deny in IAM, and the documents in force on the role
-        // ARE the authority on what it may do: a role whose policies say nothing about the
-        // call may not make it.
-        !matches!(
-            authorization::identity_decision_prepared(prepared, &request),
-            authorization::Decision::Allowed
-        )
-    });
-    withheld.then(|| messages::event_queue_inaccessible(queue_arn))
+    let request = authorization::Request::new(action, queue_arn, &[]);
+    matches!(
+        authorization::identity_decision_prepared(prepared, &request),
+        authorization::Decision::Allowed
+    )
+}
+
+/// Whether the policies `prepared` show the role ANYTHING about the queue `queue_arn`: whether
+/// they admit it so much as one of that queue's own service's calls on it
+/// ([`queue_action_names`]).
+///
+/// This is the question that tells Glue's two refusals apart, and it is NOT a requirement on
+/// the create — what an event-mode crawl has to be admitted is [`EVENT_QUEUE_ACTIONS`], and a
+/// role holding that whole grant is never refused. A role admitted any call on the queue has
+/// been shown the queue is there, so the refusal can name the grant it still needs; a role
+/// admitted none has been shown nothing that tells a queue that is not there from one it may
+/// not reach, which is what the other refusal says. A grant of some OTHER service's action on
+/// the same ARN shows nothing about this queue: only the owning service's calls reach it.
+///
+/// The decision is the role's DOCUMENTS alone, exactly as the refusal beside it is: whether a
+/// queue of that ARN is there is the queue service's own answer, and this check does not ask
+/// it — it refuses only what the account's IAM records SHOW, so the two refusals differ by
+/// what the role may do and never by what another service holds.
+fn queue_is_disclosed(
+    prepared: &[::service_common::iam_authorization::PreparedDocument],
+    queue_arn: &str,
+) -> bool {
+    let prefix = ::service_com_amazonaws_sqs_amazonsqs::state::authorization::ACTION_PREFIX;
+
+    queue_action_names()
+        .into_iter()
+        .any(|name| admits_queue_call(prepared, &format!("{prefix}:{name}"), queue_arn))
 }
 
 /// The default version's document of the managed policy `arn` names, or `None` when the

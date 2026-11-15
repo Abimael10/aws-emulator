@@ -430,22 +430,39 @@ pub const MAX_CAPACITY_EXCLUDES_WORKERS: &str =
 /// withholds it.
 pub const JOB_ALREADY_EXISTS: &str = "Job already exists.";
 
-/// `CreateCrawler` for an S3 target whose `EventQueueArn` (or `DlqEventQueueArn`)
-/// names a queue the crawler's `Role` may not consume ([`super::event_queue_refusal`]).
+/// `CreateCrawler` for an S3 target whose `EventQueueArn` (or `DlqEventQueueArn`) names a
+/// queue the crawler's `Role` is shown nothing about: its policies admit no call of that
+/// queue's own service on it ([`super::event_queue_refusal`]).
 ///
-/// Recorded template: TWO fixed clauses around one variable part, the queue ARN exactly as
-/// the request supplied it. The first CONFLATES the two reasons a crawl could not read that
-/// queue — the queue not being there, and the role not being allowed to consume it — so a
-/// client matching on it recognises either; the second states the REQUIREMENT the crawl holds
-/// that queue to, naming the queue calls a crawl in event mode makes on it
-/// ([`super::EVENT_QUEUE_ACTIONS`], in the order it makes them) so the caller is told which
-/// grant to add. Glue states its own refusal rather than restating the queue service's
-/// authorization answer: it discloses neither the identity the crawl would run as, nor which
-/// of IAM's rules withheld the grant, so the refusal reads the same whichever of them it was.
+/// Recorded template, and the WHOLE message: one fixed sentence around one variable part, the
+/// queue ARN exactly as the request supplied it. It CONFLATES the two reasons a crawl could
+/// not read that queue — the queue not being there, and the role not being allowed to reach
+/// it — because a role that may not touch the queue at all cannot be told apart from a queue
+/// that is not there. It names no queue call: there is no grant to ask for on a queue whose
+/// existence this role cannot establish. Glue states its own refusal rather than restating
+/// the queue service's authorization answer: it discloses neither the identity the crawl
+/// would run as, nor which of IAM's rules withheld the grant, so the refusal reads the same
+/// whichever of them it was.
 pub fn event_queue_inaccessible(queue_arn: &str) -> String {
+    format!("SQS queue {queue_arn} does not exist or the role provided does not have access to it.")
+}
+
+/// `CreateCrawler` for an S3 target whose event queue the crawler's `Role` is shown something
+/// about — its policies admit some call of that queue's own service on it — but may not
+/// consume ([`super::event_queue_refusal`]).
+///
+/// Recorded in part: what is pinned is that this refusal NAMES the queue action the role is
+/// missing, so a caller whose role can reach the queue is told which grant to add rather than
+/// sent looking for a queue that is demonstrably there. Stated as the sentence of
+/// [`event_queue_inaccessible`] — which a client matching Glue's refusal on a queue it cannot
+/// read still recognises — followed by the REQUIREMENT the crawl holds that queue to, naming
+/// the queue calls a crawl in event mode makes on it ([`super::EVENT_QUEUE_ACTIONS`], in the
+/// order it makes them). The variable part is the same single one: the queue ARN exactly as
+/// the request supplied it; the identity the crawl would run as is not disclosed here either.
+pub fn event_queue_grant_missing(queue_arn: &str) -> String {
     format!(
-        "SQS queue {queue_arn} does not exist or the role provided does not have access to \
-         it. Please make sure the role has {} permissions on the queue.",
+        "{} Please make sure the role has {} permissions on the queue.",
+        event_queue_inaccessible(queue_arn),
         super::event_queue_actions_clause()
     )
 }

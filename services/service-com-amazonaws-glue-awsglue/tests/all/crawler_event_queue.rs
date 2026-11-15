@@ -13,13 +13,17 @@
 //! policies in force on that role do not admit the queue operations the crawl makes on
 //! that queue, and creates the identically-shaped crawler whose role does hold them.
 //!
-//! The refusal is Glue's OWN sentence for a queue a crawl cannot read, not the queue
+//! WHICH refusal it is follows from what those same policies show the role about the queue
+//! ITSELF: a role they admit some call of the queue's own service on it to is told the grant
+//! its crawl needs, naming the queue calls a crawl in event mode makes, because a queue it may
+//! touch is a queue that is there and a missing grant is all there is left to report; a role
+//! they admit no call on it to is shown nothing that tells an absent queue from one it may not
+//! reach, and gets exactly the sentence that conflates those two and asks for no grant.
+//!
+//! Either refusal is Glue's OWN sentence for a queue a crawl cannot read, not the queue
 //! service's authorization answer: its one variable part is the queue the target carried, and
 //! it names neither the identity the crawl would run as nor which of IAM's rules withheld the
-//! grant. It states the two reasons a crawl could not read that queue, its absence and the
-//! role's access, in one clause, and then the REQUIREMENT the crawl holds the queue to — the
-//! queue calls a crawl in event mode makes on it, in the order it makes them — so the caller
-//! is told which grant to add whichever of them its policies are missing.
+//! grant.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -97,20 +101,49 @@ fn allow(actions: &[&str], resource: &str) -> Value {
     })
 }
 
-/// The sentence Glue refuses an event-mode create with when the crawl cannot read the
-/// queue a target names: the queue ARN as the request supplied it, inside fixed text that
-/// conflates the queue's absence with the role's access to it, followed by the queue calls a
-/// crawl makes on that queue.
+/// The sentence Glue refuses an event-mode create with when the role is shown nothing about
+/// the queue a target names: the queue ARN as the request supplied it, inside fixed text that
+/// conflates the queue's absence with the role's access to it, and no queue call named.
 ///
-/// Spelled out here rather than built from the service's own constructor, so the wording
-/// this suite pins is the test's and not the code's — including the ACTIONS, written out in
-/// the order a crawl makes them.
-fn expected_refusal(queue_arn: &str) -> String {
+/// Spelled out here rather than built from the service's own constructor, so the wording this
+/// suite pins is the test's and not the code's.
+fn expected_inaccessible(queue_arn: &str) -> String {
+    format!("SQS queue {queue_arn} does not exist or the role provided does not have access to it.")
+}
+
+/// The sentence Glue refuses an event-mode create with when the role is shown SOMETHING about
+/// the queue but may not consume it: the conflating sentence above, then the grant a crawl
+/// needs on that queue — the ACTIONS written out here in the order a crawl makes them, so the
+/// wording this suite pins is the test's and not the code's.
+fn expected_grant_missing(queue_arn: &str) -> String {
     format!(
         "SQS queue {queue_arn} does not exist or the role provided does not have access to \
          it. Please make sure the role has SQS:ReceiveMessage, SQS:GetQueueAttributes and \
          SQS:DeleteMessage permissions on the queue."
     )
+}
+
+/// What a row of the tables below expects of its create.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Expected {
+    /// The role holds the whole grant, so the create is admitted.
+    Created,
+    /// The role is shown nothing about the queue: the conflating sentence, naming no action.
+    Inaccessible,
+    /// The role may make some call on the queue but not the crawl's: the sentence naming the
+    /// grant.
+    GrantMissing,
+}
+
+impl Expected {
+    /// The message a refused row must carry, or `None` where the row is created.
+    fn message(self, queue_arn: &str) -> Option<String> {
+        match self {
+            Expected::Created => None,
+            Expected::Inaccessible => Some(expected_inaccessible(queue_arn)),
+            Expected::GrantMissing => Some(expected_grant_missing(queue_arn)),
+        }
+    }
 }
 
 /// A `CreateCrawler` body whose single S3 target is crawled from `queue`, in event mode.
@@ -125,27 +158,24 @@ fn event_mode_crawler(name: &str, role: &str, queue: &str) -> Value {
     })
 }
 
-/// Whether the row's documents leave the crawl a queue call it may not make, which is what
-/// the create is refused over; `false` where the row's role holds the whole grant and the
-/// create must be admitted.
-type ExpectedRefusal = bool;
-
 /// One row of the table below: what the case is, the identity policy documents the
-/// crawler's role carries, and whether they earn the refusal.
-type Row = (String, Vec<Value>, ExpectedRefusal);
+/// crawler's role carries, and what they earn the create.
+type Row = (String, Vec<Value>, Expected);
 
 /// A role whose policies do not admit the crawl's queue operations cannot back an
 /// event-mode crawler, and the identically-shaped request whose role does admit them is
 /// created.
 ///
 /// The rows differ along WHAT the role's policies grant: nothing at all, the queue
-/// operations on another queue, a subset of them (one row per action the crawl makes,
-/// each missing in turn), a `Deny` of one of them beside an `Allow` of all, and the full
-/// grant — written as the exact ARN, through a wildcard, and spread over two documents.
+/// operations on another queue, another service's action on the queue's own ARN, one unrelated
+/// call on the queue, the queue's management calls without any of the crawl's, a subset of the
+/// crawl's calls (one row per action the crawl makes, each missing in turn), a `Deny` beside
+/// an `Allow` of all, and the full grant — written as the exact ARN, through a wildcard, and
+/// spread over two documents.
 ///
-/// Every refused row earns the SAME sentence, naming the queue and the grant a crawl needs on
-/// it: which queue call the row's documents withhold, and whether a `Deny` or an absent grant
-/// withheld it, decides that the create is refused and nothing about how it is worded.
+/// Whether a `Deny` or an absent grant withheld a call decides nothing about the wording; what
+/// does is whether those documents admit the role ANY call on that queue, which is the one
+/// thing that tells "the queue may not be there" from "grant your role these queue calls".
 #[tokio::test]
 async fn an_event_mode_crawler_needs_its_role_to_consume_the_event_queue() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -156,37 +186,58 @@ async fn an_event_mode_crawler_needs_its_role_to_consume_the_event_queue() {
     // refused at.
     let first_action = EVENT_QUEUE_ACTIONS[0];
     let last_action = EVENT_QUEUE_ACTIONS[EVENT_QUEUE_ACTIONS.len() - 1];
-    // A document DENYING `action` on the queue, whatever else is granted.
-    let deny = |action: &str| {
+    // A document DENYING `actions` on the queue, whatever else is granted.
+    let deny = |actions: &[&str]| {
         json!({
             "Version": "2012-10-17",
-            "Statement": [{ "Effect": "Deny", "Action": action, "Resource": queue }],
+            "Statement": [{ "Effect": "Deny", "Action": actions, "Resource": queue }],
         })
     };
 
-    // (case, the documents the role carries, and whether they earn the refusal — `false`
-    // where the role holds the whole grant and the create must be admitted)
+    // (case, the documents the role carries, what they earn the create)
     let mut rows: Vec<Row> = vec![
-        ("no policy at all".to_string(), Vec::new(), true),
+        (
+            "no policy at all".to_string(),
+            Vec::new(),
+            Expected::Inaccessible,
+        ),
         (
             "the queue operations on another queue".to_string(),
             vec![allow(&every_action, &queue_arn("some-other-queue"))],
-            true,
+            Expected::Inaccessible,
         ),
         (
-            "an unrelated grant on the queue".to_string(),
+            "another service's action on the queue's own ARN".to_string(),
+            vec![allow(&["s3:GetObject"], &queue)],
+            Expected::Inaccessible,
+        ),
+        (
+            "one queue call, and none of the crawl's".to_string(),
+            vec![allow(&["sqs:GetQueueUrl"], &queue)],
+            Expected::GrantMissing,
+        ),
+        (
+            "a send grant on the queue, and none of the crawl's".to_string(),
             vec![allow(&["sqs:SendMessage"], &queue)],
-            true,
+            Expected::GrantMissing,
+        ),
+        (
+            "the queue's management calls but none of the crawl's".to_string(),
+            vec![allow(
+                &["sqs:GetQueueUrl", "sqs:SetQueueAttributes", "sqs:PurgeQueue"],
+                &queue,
+            )],
+            Expected::GrantMissing,
         ),
         (
             "every queue operation, named exactly".to_string(),
             vec![allow(&every_action, &queue)],
-            false,
+            Expected::Created,
         ),
         (
             "every queue operation, through a wildcard".to_string(),
             vec![allow(&["sqs:*"], &format!("{}*", queue_arn("")))],
-            false,
+            Expected::Created,
         ),
         (
             "every queue operation, spread over two documents".to_string(),
@@ -194,21 +245,27 @@ async fn an_event_mode_crawler_needs_its_role_to_consume_the_event_queue() {
                 allow(&every_action[..1], &queue),
                 allow(&every_action[1..], &queue),
             ],
-            false,
+            Expected::Created,
         ),
         (
             "an explicit deny of the first operation beside the grant".to_string(),
-            vec![allow(&every_action, &queue), deny(first_action)],
-            true,
+            vec![allow(&every_action, &queue), deny(&[first_action])],
+            Expected::GrantMissing,
         ),
         (
             "an explicit deny of the last operation beside the grant".to_string(),
-            vec![allow(&every_action, &queue), deny(last_action)],
-            true,
+            vec![allow(&every_action, &queue), deny(&[last_action])],
+            Expected::GrantMissing,
+        ),
+        (
+            "a deny of every queue call beside the grant".to_string(),
+            vec![allow(&every_action, &queue), deny(&["sqs:*"])],
+            Expected::Inaccessible,
         ),
     ];
     // One row per action the crawl makes, each one missing from an otherwise complete
-    // grant: every action is required, so each omission refuses on its own.
+    // grant: every action is required, so each omission refuses on its own — and what is left
+    // is still a call on that queue, so each omission is told which grant to add.
     for missing in EVENT_QUEUE_ACTIONS {
         let granted: Vec<&str> = every_action
             .iter()
@@ -218,18 +275,18 @@ async fn an_event_mode_crawler_needs_its_role_to_consume_the_event_queue() {
         rows.push((
             format!("every queue operation except {missing}"),
             vec![allow(&granted, &queue)],
-            true,
+            Expected::GrantMissing,
         ));
     }
 
-    for (index, (case, documents, refusal)) in rows.iter().enumerate() {
+    for (index, (case, documents, expected)) in rows.iter().enumerate() {
         let role_name = format!("crawler-role-{index}");
         let role = seed_role(&engine, &role_name, documents);
         let crawler = format!("event-crawler-{index}");
         let request = event_mode_crawler(&crawler, &role, &queue);
 
         let (status, body) = call(&router, "CreateCrawler", &request).await;
-        if !refusal {
+        let Some(expected_message) = expected.message(&queue) else {
             assert_eq!(
                 status, 200,
                 "case {case:?}: the role holds the grant, so the create must be admitted, \
@@ -242,7 +299,7 @@ async fn an_event_mode_crawler_needs_its_role_to_consume_the_event_queue() {
                 "case {case:?}: the created crawler must be readable, got {read}"
             );
             continue;
-        }
+        };
 
         assert_eq!(
             status, 400,
@@ -255,10 +312,8 @@ async fn an_event_mode_crawler_needs_its_role_to_consume_the_event_queue() {
         );
         let message = error_message(&body);
         assert_eq!(
-            message,
-            expected_refusal(&queue),
-            "case {case:?}: the refusal must be Glue's own sentence naming {queue}, got \
-             {message:?}"
+            message, expected_message,
+            "case {case:?}: expected the {expected:?} refusal naming {queue}, got {message:?}"
         );
         // No crawler was stored: the refused create left nothing behind.
         let (status, body) = call(&router, "GetCrawler", &json!({ "Name": crawler })).await;
@@ -274,32 +329,49 @@ async fn an_event_mode_crawler_needs_its_role_to_consume_the_event_queue() {
     }
 }
 
-/// The refusal is worded from the REQUEST: whichever way the request names the role — its
+/// Either refusal is worded from the REQUEST: whichever way the request names the role — its
 /// bare name or its ARN — the one variable part of the sentence is the queue the target
 /// carried, exactly as sent, and the role the crawl would run as is not disclosed.
 #[tokio::test]
 async fn the_refusal_is_worded_from_the_request() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = emulator_on(engine.clone());
-    // A role granted nothing at all, so every row below is refused at the crawl's first
-    // queue call.
-    let role_arn = seed_role(&engine, "worded-role", &[]);
+    // A role granted nothing at all, so nothing is shown about any queue.
+    let silent_arn = seed_role(&engine, "worded-role", &[]);
+    // ... and one granted ONE queue call on every queue of this account, so it may touch each
+    // of them and consume none.
+    let one_call = allow(&["sqs:GetQueueUrl"], &format!("{}*", queue_arn("")));
+    let reaching_arn = seed_role(&engine, "reaching-role", &[one_call]);
 
-    // (case, the `Role` the request carries, the queue the target names)
+    // (case, the `Role` the request carries, the queue the target names, what it earns)
     let rows = [
         (
             "the role's ARN and a plainly named queue",
-            role_arn.clone(),
+            silent_arn.clone(),
             queue_arn("worded-events"),
+            Expected::Inaccessible,
         ),
         (
             "the role's bare NAME and another queue",
             "worded-role".to_string(),
             queue_arn("worded-events-2.fifo"),
+            Expected::Inaccessible,
+        ),
+        (
+            "a reaching role's ARN and a plainly named queue",
+            reaching_arn.clone(),
+            queue_arn("worded-events-3"),
+            Expected::GrantMissing,
+        ),
+        (
+            "a reaching role's bare NAME and another queue",
+            "reaching-role".to_string(),
+            queue_arn("worded-events-4.fifo"),
+            Expected::GrantMissing,
         ),
     ];
 
-    for (index, (case, role, queue)) in rows.iter().enumerate() {
+    for (index, (case, role, queue, expected)) in rows.iter().enumerate() {
         let crawler = format!("worded-crawler-{index}");
         let (status, body) = call(
             &router,
@@ -314,14 +386,114 @@ async fn the_refusal_is_worded_from_the_request() {
         let message = error_message(&body);
         assert_eq!(
             message,
-            expected_refusal(queue),
+            expected
+                .message(queue)
+                .expect("every row of this table is a refusal"),
             "case {case:?}: the refusal must name the queue the request carried, got \
              {message:?}"
         );
         // Glue words its own refusal, so the identity the crawl would run as is not in it.
+        for role_arn in [&silent_arn, &reaching_arn] {
+            assert!(
+                !message.contains(role_arn),
+                "case {case:?}: the refusal must not disclose the role, got {message:?}"
+            );
+        }
+    }
+}
+
+/// The two refusals are told APART by whether the role's policies admit it any call on the
+/// queue, and the one for a role that may touch the queue is the one that names the grant.
+///
+/// Both halves matter to a caller: a client keyed on Glue's sentence for a queue it cannot
+/// read matches either, and one keyed on the grant to add matches only the second — so the
+/// sentence for a role shown nothing about the queue names no queue call at all, and the one
+/// for a role that may touch it names every call the crawl makes.
+///
+/// The rows differ along what the role is granted: nothing, another service's action on the
+/// queue's ARN, the crawl's own calls on a DIFFERENT queue, and — one row per name the queue
+/// service publishes as grantable (`state::authorization::policy_action_names` of that
+/// service) — that one call on this queue, so no call it serves is left out of the question
+/// and the rows reach far past the ones this suite names by hand.
+#[tokio::test]
+async fn the_refusal_names_the_grant_only_when_the_role_may_touch_the_queue() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(engine.clone());
+    let queue = queue_arn("told-apart-events");
+    let crawl_actions: Vec<&str> = EVENT_QUEUE_ACTIONS.to_vec();
+
+    // (case, the documents the role carries, whether they admit it any call on THIS queue)
+    let mut rows: Vec<(String, Vec<Value>, bool)> = vec![
+        (
+            "a role granted nothing on the queue".to_string(),
+            Vec::new(),
+            false,
+        ),
+        (
+            "a role granted another service's action on the queue's ARN".to_string(),
+            vec![allow(&["s3:GetObject"], &queue)],
+            false,
+        ),
+        (
+            "a role granted the crawl's calls on another queue".to_string(),
+            vec![allow(&crawl_actions, &queue_arn("told-apart-other"))],
+            false,
+        ),
+    ];
+    // One row per action an Amazon SQS policy may state, each granted ALONE: a role admitted
+    // any one of them may touch the queue, so each is told which grant the crawl still needs —
+    // including the names this suite never writes out.
+    for action in ::service_com_amazonaws_sqs_amazonsqs::state::authorization::policy_action_names()
+    {
+        let qualified = format!("sqs:{action}");
+        // A role granted every call the crawl makes is not refused at all, so the one action
+        // it is granted here must leave at least one of them withheld; granting one at a time
+        // always does, since the crawl makes more than one.
+        rows.push((
+            format!("a role granted {qualified} alone"),
+            vec![allow(&[qualified.as_str()], &queue)],
+            true,
+        ));
+    }
+
+    for (index, (case, documents, reachable)) in rows.iter().enumerate() {
+        let role = seed_role(&engine, &format!("told-apart-{index}"), documents);
+        let (status, body) = call(
+            &router,
+            "CreateCrawler",
+            &event_mode_crawler(&format!("told-apart-crawler-{index}"), &role, &queue),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} with {body}"
+        );
+        let message = error_message(&body);
+        // The clause that conflates an absent queue with one the role may not reach is in
+        // BOTH refusals, naming the queue the target carried.
         assert!(
-            !message.contains(&role_arn),
-            "case {case:?}: the refusal must not disclose the role, got {message:?}"
+            message.starts_with(&expected_inaccessible(&queue)),
+            "case {case:?}: every refusal must carry Glue's sentence for a queue a crawl \
+             cannot read, got {message:?}"
+        );
+        for action in EVENT_QUEUE_ACTIONS {
+            assert_eq!(
+                message.contains(action),
+                *reachable,
+                "case {case:?}: the grant {action} must be named only where the role may \
+                 touch the queue (may touch it: {reachable}), got {message:?}"
+            );
+        }
+        assert_eq!(
+            message,
+            if *reachable {
+                expected_grant_missing(&queue)
+            } else {
+                expected_inaccessible(&queue)
+            },
+            "case {case:?}: wrong refusal for a role that may{} touch the queue, got \
+             {message:?}",
+            if *reachable { "" } else { " not" }
         );
     }
 }

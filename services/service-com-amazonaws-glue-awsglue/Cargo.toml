@@ -109,6 +109,12 @@ apache-avro = { version = "0.17", default-features = false }
 # scaffolding every service crate here builds.
 service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 
+# Amazon SQS, for the ONE question this crate asks about a queue: which actions a policy may
+# state about one. An event-mode crawler's `EventQueueArn` check reads that service's own
+# published action names (`state::authorization::policy_action_names`) rather than keeping a
+# second list here, so "may this role touch that queue at all?" leaves out no call it serves.
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
@@ -116,12 +122,11 @@ emulator-core-build-support = { workspace = true }
 # The catalog-encryption suite mounts the KMS service beside Glue on one engine, because a
 # catalog write and a catalog read of an SSE-KMS catalog each call it.
 service-com-amazonaws-kms-trentservice = { workspace = true }
-# EventBridge and SQS are mounted beside Glue on one engine in the job-run event suite,
-# because a job run that comes to rest is published onto the default event bus and a rule
-# on that bus delivers it to an SQS queue: without them mounted there is nothing for the
-# publication to reach.
+# EventBridge is mounted beside Glue on one engine in the job-run event suite, because a job
+# run that comes to rest is published onto the default event bus and a rule on that bus
+# delivers it to an SQS queue: without it mounted there is nothing for the publication to
+# reach. (Amazon SQS, the other half of that pipeline, is a dependency above.)
 service-com-amazonaws-eventbridge-awsevents = { workspace = true }
-service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # Amazon S3, mounted beside Glue on one engine, so a column statistics task run aggregates
 # the objects a test staged with `PutObject` at the covered table's location.
 service-com-amazonaws-s3-amazons3 = { workspace = true }

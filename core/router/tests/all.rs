@@ -2195,3 +2195,11 @@ mod zz_probe_whole_emulator;
 // file, which the layout check refuses: the `#[path]` above each `mod` is what points it into
 // `tests/all/`.
 // belongs in that suite's own module header; a note about this file belongs in
+// two places and have no prose to duplicate, re-word or mistype. A suite no `mod` names is
+// item is `E0753`. Each of the last two fails every suite of this target, which is why EVERY
+// comment in this file is an ordinary `//` one, this header included: with no `//!` anywhere
+// in it, no appended, re-typed or merged copy of one of its lines can be one past the first
+// item.
+// service crate's own, is stated in that suite's own module header, where it is read beside
+// the test it explains; a note about THIS file belongs in `all/appended_notes.rs`, declared
+// below like any other suite. The `all/all_rs_*.rs` suites,
