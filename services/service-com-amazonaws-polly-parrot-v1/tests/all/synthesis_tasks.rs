@@ -52,6 +52,76 @@ pub(crate) async fn list_ids(polly: &Polly, query: &str) -> Vec<String> {
     task_ids(&json(&response))
 }
 
+/// Every task id the report serves for `status`, in page order, following `NextToken` to
+/// the end — the concatenation of all pages, which is what a paging client sees.
+///
+/// The ONE page walker of this crate's task suites: `crate::task_listing_order` (the order
+/// of the sequence), `crate::task_retention` (which tasks it holds) and the pagination test
+/// below all read the pages through it, so no two of them can drift on how a page is
+/// requested or on the per-page invariants checked here — every page carries at least one
+/// task, and no page carries more than the caller's `MaxResults`.
+pub(crate) async fn paged_task_ids(
+    polly: &Polly,
+    status: Option<&str>,
+    max_results: Option<usize>,
+) -> Vec<String> {
+    let mut ids_of_pages: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0usize;
+    loop {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(status) = status {
+            parts.push(format!("Status={status}"));
+        }
+        if let Some(max_results) = max_results {
+            parts.push(format!("MaxResults={max_results}"));
+        }
+        if let Some(token) = &token {
+            parts.push(format!("NextToken={token}"));
+        }
+        let query = if parts.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", parts.join("&"))
+        };
+
+        let response = list(polly, &query).await;
+        assert_eq!(
+            response.status(),
+            200,
+            "query {query:?}: the report must succeed, body {:?}",
+            String::from_utf8_lossy(response.body())
+        );
+        let body = json(&response);
+        let ids = task_ids(&body);
+        assert!(
+            !ids.is_empty(),
+            "query {query:?}: page {pages} is empty, and a page reached through a NextToken \
+             must carry at least one task"
+        );
+        if let Some(max_results) = max_results {
+            assert!(
+                ids.len() <= max_results,
+                "query {query:?}: page {pages} carries {} tasks, more than MaxResults={max_results}",
+                ids.len()
+            );
+        }
+        ids_of_pages.extend(ids);
+        pages += 1;
+        // A page carries at least one task, so a store no suite fills past a few hundred
+        // tasks cannot need this many pages: reaching it means the cursor is not advancing.
+        assert!(
+            pages <= 512,
+            "query {query:?}: pagination did not terminate, reported {ids_of_pages:?}"
+        );
+        match body["NextToken"].as_str() {
+            Some(next) => token = Some(next.to_string()),
+            None => break,
+        }
+    }
+    ids_of_pages
+}
+
 /// RULE: `ListSpeechSynthesisTasks` reports the stored tasks ordered by their creation
 /// date, MOST RECENTLY CREATED FIRST, each one carrying the members the store holds for it.
 #[tokio::test]
@@ -223,47 +293,10 @@ async fn pagination_visits_every_task_exactly_once() {
     // Both published bounds of `MaxResults` (1 and 100), sizes in between, and a
     // request that names no bound at all (`None`), which is therefore not paged.
     for max_results in [Some(1usize), Some(2), Some(7), Some(24), Some(100), None] {
-        let mut seen: Vec<String> = Vec::new();
-        let mut pages = 0;
-        let mut token: Option<String> = None;
-        loop {
-            let query = match (max_results, &token) {
-                (Some(max), None) => format!("?MaxResults={max}"),
-                (Some(max), Some(next)) => format!("?MaxResults={max}&NextToken={next}"),
-                (None, None) => String::new(),
-                (None, Some(next)) => format!("?NextToken={next}"),
-            };
-            let response = list(&polly, &query).await;
-            assert_eq!(
-                response.status(),
-                200,
-                "MaxResults={max_results:?} page {pages}: body {:?}",
-                String::from_utf8_lossy(response.body())
-            );
-            let body = json(&response);
-            let ids = task_ids(&body);
-            assert!(
-                !ids.is_empty(),
-                "MaxResults={max_results:?} page {pages}: a page reached through a NextToken must not be empty"
-            );
-            if let Some(max) = max_results {
-                assert!(
-                    ids.len() <= max,
-                    "MaxResults={max}: page {pages} carries {} tasks",
-                    ids.len()
-                );
-            }
-            seen.extend(ids);
-            pages += 1;
-            match body["NextToken"].as_str() {
-                Some(next) => token = Some(next.to_string()),
-                None => break,
-            }
-            assert!(
-                pages < 40,
-                "MaxResults={max_results:?}: pagination did not terminate"
-            );
-        }
+        // The shared page walker above checks the per-page invariants — a page reached
+        // through a `NextToken` is not empty, and carries at most `MaxResults` tasks — so
+        // what is left to this test is what the pages together are.
+        let seen = paged_task_ids(&polly, None, max_results).await;
         assert_eq!(
             seen, expected,
             "MaxResults={max_results:?}: the pages together must be every task once, newest first"

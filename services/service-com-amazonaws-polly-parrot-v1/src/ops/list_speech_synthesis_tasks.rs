@@ -165,14 +165,14 @@ const CURSOR_SEPARATOR: char = '\u{1f}';
 /// this service ISSUED and not merely one of the right shape.
 fn encode_task_cursor(
     key: &crate::state::PageTokenKey,
-    created_millis: i64,
+    created_nanos: i64,
     task_id: &str,
     status: Option<&str>,
 ) -> String {
     crate::state::encode_page_token(
         key,
         &format!(
-            "{created_millis}{CURSOR_SEPARATOR}{task_id}{CURSOR_SEPARATOR}{}",
+            "{created_nanos}{CURSOR_SEPARATOR}{task_id}{CURSOR_SEPARATOR}{}",
             status.unwrap_or_default()
         ),
     )
@@ -193,13 +193,13 @@ fn decode_task_cursor(
 ) -> Option<(i64, String)> {
     let cursor = crate::state::decode_page_token(key, token)?;
     let mut fields = cursor.split(CURSOR_SEPARATOR);
-    let created_millis = fields.next()?.parse::<i64>().ok()?;
+    let created_nanos = fields.next()?.parse::<i64>().ok()?;
     let task_id = fields.next()?.to_string();
     let minted_for = fields.next()?;
     if fields.next().is_some() {
         return None;
     }
-    (minted_for == status.unwrap_or_default()).then_some((created_millis, task_id))
+    (minted_for == status.unwrap_or_default()).then_some((created_nanos, task_id))
 }
 
 /// The total order the report pages in.
@@ -209,16 +209,23 @@ fn decode_task_cursor(
 /// client reading the first page to find its latest task depends on. This key is the
 /// creation date and the `TaskId`, and the report sorts by it DESCENDING: the date decides,
 /// and the `TaskId` breaks a tie so the order is TOTAL and a page token can resume it
-/// exactly. The date is taken at millisecond precision, the precision the cursor carries, so
-/// sorting and resuming cannot disagree.
+/// exactly.
+///
+/// The date is taken at the FULL precision the store holds it at, which is the precision the
+/// cursor carries and the precision the task reports its `CreationTime` at: a task created
+/// after another is therefore never reported behind it, however close together the two were
+/// created, and sorting and resuming cannot disagree. Two instants outside what the key can
+/// tell apart — one before the epoch, which reads as the epoch, and one past what nanoseconds
+/// fit in an `i64` (beyond the year 2262), which saturates — fall to the `TaskId` tie-break,
+/// which keeps the order total.
 fn order_key(task: &crate::state::StoredSynthesisTask) -> (i64, &str) {
-    let created_millis = task
+    let created_nanos = task
         .creation_time
         .duration_since(::std::time::SystemTime::UNIX_EPOCH)
         .map_or(0, |since_epoch| {
-            i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX)
+            i64::try_from(since_epoch.as_nanos()).unwrap_or(i64::MAX)
         });
-    (created_millis, task.task_id.as_str())
+    (created_nanos, task.task_id.as_str())
 }
 
 /// The `ListSpeechSynthesisTasks` operation.
@@ -343,7 +350,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|task| {
                 after
                     .as_ref()
-                    .is_none_or(|(millis, task_id)| order_key(task) < (*millis, task_id.as_str()))
+                    .is_none_or(|(nanos, task_id)| order_key(task) < (*nanos, task_id.as_str()))
             })
             .collect();
         // Descending: the most recently created task is the first one reported, and the
@@ -358,10 +365,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         matching.truncate(window);
         let next_token = if has_further_page {
             matching.last().map(|last| {
-                let (created_millis, task_id) = order_key(last);
+                let (created_nanos, task_id) = order_key(last);
                 encode_task_cursor(
                     &page_token_key,
-                    created_millis,
+                    created_nanos,
                     task_id,
                     input.status.as_deref(),
                 )
@@ -391,33 +398,33 @@ mod tests {
     #[test]
     fn task_cursors_round_trip_and_reject_foreign_tokens() {
         let key = crate::state::PageTokenKey::new();
-        for (millis, task_id, status) in [
+        for (nanos, task_id, status) in [
             (0_i64, "a", None),
-            (1_761_000_000_000, "task-1", None),
-            (1_761_000_000_001, "TASK_2", Some("completed")),
+            (1_761_000_000_000_000_000, "task-1", None),
+            (1_761_000_000_000_000_001, "TASK_2", Some("completed")),
             (i64::MAX, "z", Some("inProgress")),
         ] {
-            let token = encode_task_cursor(&key, millis, task_id, status);
+            let token = encode_task_cursor(&key, nanos, task_id, status);
             assert_eq!(
                 decode_task_cursor(&key, &token, status),
-                Some((millis, task_id.to_string())),
-                "cursor ({millis}, {task_id:?}, {status:?}): token {token:?} did not round-trip"
+                Some((nanos, task_id.to_string())),
+                "cursor ({nanos}, {task_id:?}, {status:?}): token {token:?} did not round-trip"
             );
             // The same position under a different filter is not the same cursor.
             let other = Some("failed");
             assert_eq!(
                 decode_task_cursor(&key, &token, other),
                 None,
-                "cursor ({millis}, {task_id:?}, {status:?}): must not resume filter {other:?}"
+                "cursor ({nanos}, {task_id:?}, {status:?}): must not resume filter {other:?}"
             );
             // The same cursor minted under another store's key is not this store's
             // token, whatever filter it is presented with.
             let foreign =
-                encode_task_cursor(&crate::state::PageTokenKey::new(), millis, task_id, status);
+                encode_task_cursor(&crate::state::PageTokenKey::new(), nanos, task_id, status);
             assert_eq!(
                 decode_task_cursor(&key, &foreign, status),
                 None,
-                "cursor ({millis}, {task_id:?}, {status:?}): a token of another key must be refused"
+                "cursor ({nanos}, {task_id:?}, {status:?}): a token of another key must be refused"
             );
         }
 

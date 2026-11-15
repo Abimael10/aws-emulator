@@ -21,7 +21,7 @@ use service_com_amazonaws_polly_parrot_v1::state::TASK_RETENTION;
 
 use crate::lexicons_and_speech::{error_code, json, Polly};
 use crate::support::{fixture_task_id, get_task, message_slot, seed_task, stored_task};
-use crate::synthesis_tasks::{list, list_ids};
+use crate::synthesis_tasks::{list_ids, paged_task_ids};
 
 /// The ages a task is read back at, and whether the service still holds it.
 ///
@@ -195,47 +195,10 @@ async fn expired_tasks_take_up_no_page_slot() {
     // Both published bounds of `MaxResults` (1 and 100), sizes in between, and a
     // request that bounds nothing.
     for max_results in [Some(1usize), Some(2), Some(5), Some(100), None] {
-        let mut seen: Vec<String> = Vec::new();
-        let mut token: Option<String> = None;
-        let mut pages = 0;
-        loop {
-            let query = match (max_results, &token) {
-                (Some(max), None) => format!("?MaxResults={max}"),
-                (Some(max), Some(next)) => format!("?MaxResults={max}&NextToken={next}"),
-                (None, None) => String::new(),
-                (None, Some(next)) => format!("?NextToken={next}"),
-            };
-            let response = list(&polly, &query).await;
-            assert_eq!(
-                response.status(),
-                200,
-                "MaxResults={max_results:?} page {pages}: body {:?}",
-                String::from_utf8_lossy(response.body())
-            );
-            let body = json(&response);
-            let ids = crate::synthesis_tasks::task_ids(&body);
-            assert!(
-                !ids.is_empty(),
-                "MaxResults={max_results:?} page {pages}: an expired task must not fill a page"
-            );
-            if let Some(max) = max_results {
-                assert!(
-                    ids.len() <= max,
-                    "MaxResults={max}: page {pages} carries {} tasks",
-                    ids.len()
-                );
-            }
-            seen.extend(ids);
-            pages += 1;
-            match body["NextToken"].as_str() {
-                Some(next) => token = Some(next.to_string()),
-                None => break,
-            }
-            assert!(
-                pages < 20,
-                "MaxResults={max_results:?}: pagination did not terminate"
-            );
-        }
+        // The shared page walker (`crate::synthesis_tasks::paged_task_ids`) checks the
+        // per-page invariants, an expired task filling a page among them, so what is left
+        // here is which tasks the pages together hold.
+        let seen = paged_task_ids(&polly, None, max_results).await;
         assert_eq!(
             seen, expected,
             "MaxResults={max_results:?}: the pages together must be the retained tasks once, newest first"

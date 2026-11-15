@@ -74,6 +74,8 @@ mod synthesis_request_rejections;
 mod synthesis_tasks;
 #[path = "all/synthesis_task_side_effects.rs"]
 mod synthesis_task_side_effects;
+#[path = "all/task_listing_order.rs"]
+mod task_listing_order;
 #[path = "all/task_page_token_minting.rs"]
 mod task_page_token_minting;
 #[path = "all/task_report_bounds.rs"]
