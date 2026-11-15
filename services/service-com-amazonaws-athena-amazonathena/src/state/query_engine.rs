@@ -20,6 +20,10 @@
 //! slice runs SQL and holds rows, and [`super::catalog_sql`] is what resolves a statement
 //! against the catalog and hands the objects it reads to [`run_over`].
 
+/// The type a projected column has by the submitted statement's own signature for it,
+/// rather than by the values it produced.
+mod projection;
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -65,6 +69,19 @@ const TYPE_UNKNOWN: (&str, i32) = ("unknown", 0);
 /// `UNKNOWN` is what can honestly be said; it is one of `COLUMN_NULLABLE_VALUES` in
 /// [`crate::ops::types`].
 const COLUMN_NULLABLE_UNKNOWN: &str = "UNKNOWN";
+
+/// The `ColumnInfo$CatalogName` of every column of every result set this service serves:
+/// the name of the ENGINE that computed it.
+///
+/// Athena's own engine is the Hive/Trino one its `AwsDataCatalog` is read through, and that
+/// is the catalog a result column belongs to whichever Data Catalog the statement's context
+/// named — so it is the engine's name rather than the request's.
+const RESULT_CATALOG_NAME: &str = "hive";
+
+/// The `ColumnInfo$SchemaName` and `ColumnInfo$TableName` of a column that is not projected
+/// from one named relation: the EMPTY string, which is the value Athena reports where a
+/// column has no originating database or table rather than an omitted member.
+const NO_ORIGIN_RELATION: &str = "";
 
 /// How long ONE query's engine run may take, wall clock.
 ///
@@ -950,6 +967,8 @@ fn execute_once(
             )
         })
         .collect();
+    // The types the statement itself fixes, which no value of the run can decide.
+    let fixed_types = projection::fixed_column_types(sql);
 
     let mut rows = statement.query(rusqlite::params_from_iter(bound.iter()))?;
     let mut records: Vec<Row> = Vec::new();
@@ -1017,7 +1036,16 @@ fn execute_once(
     let column_info = columns
         .iter()
         .zip(observed.iter())
-        .map(|((name, _), column_type)| column_metadata(name, *column_type))
+        .enumerate()
+        .map(|(index, ((name, _), column_type))| {
+            // The STATEMENT's own signature for the projected expression wins over the type
+            // the values imply, and only for the columns it fixes one for: a column of a
+            // projection the reading could not match up with the result is not among them.
+            let fixed = (fixed_types.len() == columns.len())
+                .then(|| fixed_types.get(index).copied().flatten())
+                .flatten();
+            column_metadata(name, fixed.or(*column_type))
+        })
         .collect();
 
     Ok(Produced::Rows {
@@ -1241,11 +1269,17 @@ impl ColumnType {
 fn column_metadata(name: &str, column_type: Option<ColumnType>) -> ColumnInfo {
     let (type_name, precision) = column_type.map_or(TYPE_UNKNOWN, ColumnType::named);
     ColumnInfo {
-        // A projection's columns belong to no one table, and the engine names neither a
-        // catalog nor a schema for them, so none is reported.
-        catalog_name: None,
-        schema_name: None,
-        table_name: None,
+        // "The catalog to which the query results belong": every statement here is served
+        // by the one engine this service runs, so the catalog a result column belongs to
+        // is that engine's own ([`RESULT_CATALOG_NAME`]).
+        catalog_name: Some(RESULT_CATALOG_NAME.to_string()),
+        // "The schema name (database name) to which the query results belong" and "the
+        // table name for the query results": a column of a PROJECTION belongs to no one
+        // relation — the engine reports no originating table for it — and the empty string
+        // is what Athena reports where there is none, which is a value and not an absent
+        // member.
+        schema_name: Some(NO_ORIGIN_RELATION.to_string()),
+        table_name: Some(NO_ORIGIN_RELATION.to_string()),
         name: name.to_string(),
         // The label is what a client renders as the heading, which is this column's name.
         label: Some(name.to_string()),

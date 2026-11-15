@@ -2,9 +2,9 @@
 
 //! @op GetQueryResults
 //! IMPLEMENTED: pages the output the named execution's run wrote — the column labels
-//! first for a DML query, then the rows, and the empty result set of a statement whose
-//! result is the engine's text output — and refuses an execution that wrote no output at
-//! all.
+//! first for a DML query, then the rows, with the flattened view of the same page beside
+//! the modelled one, and the empty result set of a statement whose result is the engine's
+//! text output — and refuses an execution that wrote no output at all.
 //!
 //! ## Shape of an operation
 //!
@@ -269,6 +269,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetQueryResultsOutput {
             update_count: record.update_count(),
             result_set: Some(ResultSet {
+                // The flattened views carry the SAME page: the same columns the modelled
+                // metadata describes, and the same rows the modelled `Rows` reports, so the
+                // two views of one result set can never disagree.
+                column_infos: Some(result.column_info.clone()),
+                result_rows: Some(rows.iter().map(flat_row).collect()),
                 rows: Some(rows),
                 result_set_metadata: Some(ResultSetMetadata {
                     column_info: Some(result.column_info.clone()),
@@ -302,6 +307,24 @@ fn label_row(column_info: &[ColumnInfo]) -> Row {
                         column.label.clone().unwrap_or_else(|| column.name.clone()),
                     ),
                 })
+                .collect(),
+        ),
+    }
+}
+
+/// One row of the page in the FLATTENED form reported beside the modelled one: the same
+/// values in the same order, each as the plain string the row's datum carries.
+///
+/// A flat string cannot carry the ABSENCE of a value, so a NULL appears here as the empty
+/// string — the modelled `Rows` is the view that tells the two apart.
+fn flat_row(row: &Row) -> ResultRow {
+    ResultRow {
+        data: Some(
+            row.data
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|datum| datum.var_char_value.clone().unwrap_or_default())
                 .collect(),
         ),
     }

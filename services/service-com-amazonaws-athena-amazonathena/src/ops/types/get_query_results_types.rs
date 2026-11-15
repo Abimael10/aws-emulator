@@ -28,12 +28,75 @@ pub struct GetQueryResultsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.athena#ResultSet")]
+/// The result set of a query execution: the modelled rows and column metadata, plus the
+/// FLATTENED view of the same result set the service publishes beside them.
+///
+/// Member set and order from `smithy_query(query="shape", shape="ResultSet")`, which models
+/// `Rows` and `ResultSetMetadata`, plus `ColumnInfos` and `ResultRows` — RECORDED BEHAVIOUR
+/// rather than modelled; see [`ResultRow`] and `types::recorded_member_wire` for why the
+/// shape is hand-written. Both recorded members are projected from the SAME page the
+/// modelled members report, so the two views of one result set can never disagree.
 #[derive(Debug, Clone, Default)]
 pub struct ResultSet {
     pub rows: Option<Vec<Row>>,
     pub result_set_metadata: Option<ResultSetMetadata>,
+    pub column_infos: Option<Vec<ColumnInfo>>,
+    pub result_rows: Option<Vec<ResultRow>>,
 }
+
+ath_schema_and_codec!(
+    ResultSet,
+    RESULT_SET_SCHEMA,
+    "com.amazonaws.athena#ResultSet",
+    "com.amazonaws.athena",
+    "ResultSet",
+    (M_ROWS, rows, "Rows", 0, opt, list_of_struct(Row)),
+    (
+        M_RESULT_SET_METADATA,
+        result_set_metadata,
+        "ResultSetMetadata",
+        1,
+        opt,
+        struct_of(ResultSetMetadata)
+    ),
+    (
+        M_COLUMN_INFOS,
+        column_infos,
+        "ColumnInfos",
+        2,
+        out,
+        recorded(list_of_struct(ColumnInfo))
+    ),
+    (
+        M_RESULT_ROWS,
+        result_rows,
+        "ResultRows",
+        3,
+        out,
+        recorded(list_of_struct(ResultRow))
+    ),
+);
+
+/// One row of a result set in the FLATTENED form a read of it also reports: the row's values
+/// in column order, as plain strings rather than as the modelled `Datum` each is wrapped in.
+///
+/// Wholly RECORDED behaviour — the on-disk model declares no such shape — so it and its one
+/// member sit in the recorded namespace; see `types::recorded_member_wire`. A flat string
+/// cannot carry the ABSENCE of a value, so a NULL appears here as the empty string: the
+/// modelled `Rows` is the view that tells the two apart.
+#[derive(Debug, Clone, Default)]
+pub struct ResultRow {
+    pub data: Option<Vec<String>>,
+}
+
+ath_schema_and_codec!(
+    ResultRow,
+    RESULT_ROW_SCHEMA,
+    "com.amazonaws.athena.recorded#ResultRow",
+    "com.amazonaws.athena.recorded",
+    "ResultRow",
+    (M_DATA, data, "Data", 0, out, list_of_string),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.athena#Row")]
 #[derive(Debug, Clone, Default)]

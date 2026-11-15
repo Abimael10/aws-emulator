@@ -77,13 +77,20 @@ macro_rules! ath_shape_type {
     (struct_of) => {
         ::aws_smithy_schema::ShapeType::Structure
     };
+    (list_of_struct) => {
+        ::aws_smithy_schema::ShapeType::List
+    };
+    (list_of_string) => {
+        ::aws_smithy_schema::ShapeType::List
+    };
 }
 
 /// One member's schema, as the vendored codegen emits it: the member's shape id, its shape
 /// type, its wire name and its index in the member list.
 ///
 /// `$kind` is the member's shape kind — `string`, `boolean`, `integer`, `long`, `date_time`,
-/// `struct_of(T)` — or `recorded(<kind>)` for a member the model does not declare at all,
+/// `struct_of(T)`, `list_of_struct(T)`, `list_of_string` — or `recorded(<kind>)` for a member
+/// the model does not declare at all,
 /// whose shape id then sits in [`RECORDED_NAMESPACE`] rather than in the service's own.
 macro_rules! ath_member_schema {
     ($ns:literal, $local:literal, $wire:literal, $idx:literal, recorded($kind:tt $(($inner:ty))?)) => {
@@ -137,6 +144,25 @@ macro_rules! ath_write_member {
     ($s:ident, $m:expr, $v:expr, struct_of($inner:ty)) => {
         $s.write_struct($m, $v)?;
     };
+    // A list writes its elements through the ELEMENT's own schema, exactly as the vendored
+    // codegen's list branch does: the member schema is what names the member on the wire, and
+    // the element schema is what each element is written against.
+    ($s:ident, $m:expr, $v:expr, list_of_struct($inner:ty)) => {
+        $s.write_list($m, &|__sl| {
+            for __it in $v.iter() {
+                __sl.write_struct(&<$inner>::SCHEMA, __it)?;
+            }
+            ::std::result::Result::Ok(())
+        })?;
+    };
+    ($s:ident, $m:expr, $v:expr, list_of_string) => {
+        $s.write_list($m, &|__sl| {
+            for __it in $v.iter() {
+                __sl.write_string($m, __it.as_str())?;
+            }
+            ::std::result::Result::Ok(())
+        })?;
+    };
 }
 
 /// Read one member, as the vendored codegen's `codegen::emit_read` does for that kind.
@@ -165,6 +191,24 @@ macro_rules! ath_read_member {
     ($d:ident, $m:expr, struct_of($inner:ty)) => {
         <$inner as ::aws_smithy_schema_server::DeserializableStruct>::deserialize($d)?
     };
+    ($d:ident, $m:expr, list_of_struct($inner:ty)) => {{
+        let mut __items: ::std::vec::Vec<$inner> = ::std::vec::Vec::new();
+        $d.read_list($m, &mut |__d| {
+            __items.push(
+                <$inner as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(__d)?,
+            );
+            ::std::result::Result::Ok(())
+        })?;
+        __items
+    }};
+    ($d:ident, $m:expr, list_of_string) => {{
+        let mut __items: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
+        $d.read_list($m, &mut |__d| {
+            __items.push(__d.read_string($m)?);
+            ::std::result::Result::Ok(())
+        })?;
+        __items
+    }};
 }
 
 /// Write a member only when the value is there: an `Option` one when it is `Some`, a
