@@ -570,10 +570,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `inputDetails`/`outputDetails` say whether the data itself is included: it
         // is, because this response carries it ("Indicates whether input or output was
-        // included in the response. Always true for API calls."). `output` is reported
-        // "only if the execution succeeds. If the execution fails, this field is null",
-        // which is what the walk already left on the record, so `outputDetails` follows
-        // the output rather than being reported beside an absent one.
+        // included in the response. Always true for API calls."). They are metadata
+        // about THIS CALL and not about one value, so both are reported on every
+        // response that carries the run's data — including a run whose `output` is null
+        // because it did not succeed ("This field is set only if the execution
+        // succeeds"): a client reads `outputDetails.included` to decide whether the
+        // output it did not receive was withheld, which is a question an absent
+        // structure cannot answer.
         //
         // A METADATA-ONLY call reports none of the sensitive data — `input`, `output`,
         // `error` and `cause`, the members the state machine's key seals — and so no
@@ -612,7 +615,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input: sensitive(Some(executed.input.clone())),
             input_details: included.clone(),
             output: sensitive(executed.output.clone()),
-            output_details: executed.output.as_ref().and(included),
+            output_details: included,
             trace_header: executed.trace_header.clone(),
             // What the run cost, in the increments Express Workflows are billed in:
             // the span this execution ran for, and the memory its own data retained.

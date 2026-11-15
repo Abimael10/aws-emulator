@@ -274,9 +274,9 @@ async fn a_sync_start_answers_the_outcome_the_definition_computed() {
             );
         }
 
-        // The run's own data: the input it ran on comes back, and the details
-        // structures say the data is included ("Always true for API calls"), the
-        // output's only where there is an output to report.
+        // The run's own data: the input it ran on comes back, and BOTH details
+        // structures say the data is included ("Always true for API calls"), whether
+        // or not the member they describe carries a value.
         assert_eq!(
             document(&answered, "input"),
             Some(
@@ -292,8 +292,9 @@ async fn a_sync_start_answers_the_outcome_the_definition_computed() {
         );
         assert_eq!(
             details_included(&answered, "outputDetails"),
-            case.output.map(|_| true),
-            "case {label:?}: the output details follow the output, got {answered:?}"
+            Some(true),
+            "case {label:?}: the output details must report the data as included even for a \
+             run with no output, got {answered:?}"
         );
 
         // The identity of the run: its state machine, the name it was given, and an

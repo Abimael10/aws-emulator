@@ -17,8 +17,8 @@
 //! choice-condition sentence, with NO space before the colon, for a path a `Choice`
 //! rule's condition reads; the parameter sentence naming the MEMBER for one of a pair
 //! of alternatives a `Wait` state reads its figure through; and the field the path was
-//! written for beside the WHOLE document it was looked for in, for a member of a
-//! payload template.
+//! written for beside the WHOLE document it was looked for in, for a NAMED FIELD of a
+//! state — a member of a payload template and a `Fail` state's `ErrorPath`/`CausePath`.
 //!
 //! The rows differ along what the rule generalises over: which MEMBER names the path (a
 //! `Choice` rule's `Variable`, the same rule's `*Path` operand, `OutputPath`, a `Wait`
@@ -64,7 +64,8 @@ enum Diagnosis {
     /// of a pair of alternatives of (a `Wait` state's `SecondsPath`, say).
     Member(&'static str),
     /// The field the path was written for and the WHOLE document it was looked for in,
-    /// for a `"<name>.$"` member of a payload template.
+    /// for a NAMED FIELD of a state: a `"<name>.$"` member of a payload template, and a
+    /// `Fail` state's `ErrorPath`/`CausePath`.
     Field {
         field: &'static str,
         /// The document the path was resolved against, as the execution carries it.
@@ -193,7 +194,10 @@ fn rows() -> Vec<Row> {
             path: "$.why",
             entered_event: "FailStateEntered",
             transitions_to_done: false,
-            diagnosis: Diagnosis::Path,
+            diagnosis: Diagnosis::Field {
+                field: "CausePath",
+                searched: r#"{"other":1}"#,
+            },
         },
         Row {
             case: "a Map state's ItemsPath",
@@ -256,9 +260,9 @@ fn definition(row: &Row) -> String {
 /// The `diagnosis` selects what follows: a path a `Choice` rule's condition reads is
 /// reported with the condition referencing a value that is not there and no space before
 /// its colon, a member of a pair of alternatives is reported as that parameter not
-/// referencing an input value, a payload-template member is reported with the field it
-/// builds and the whole document the path was looked for in, and every other member of a
-/// state is reported with the path that was RESOLVED, in bracket notation.
+/// referencing an input value, a NAMED FIELD of a state is reported with the field the
+/// path was written for and the whole document it was looked for in, and every other
+/// member of a state is reported with the path that was RESOLVED, in bracket notation.
 fn expected_cause(name: &str, entered: i64, path: &str, diagnosis: &Diagnosis) -> String {
     let prefix =
         format!("An error occurred while executing the state '{name}' (entered at the event id #{entered}). ");

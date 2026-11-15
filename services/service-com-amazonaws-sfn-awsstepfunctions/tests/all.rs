@@ -268,6 +268,8 @@ mod sync_execution;
 mod sync_execution_data_events;
 #[path = "all/sync_execution_qualified_arn.rs"]
 mod sync_execution_qualified_arn;
+#[path = "all/sync_execution_response_members.rs"]
+mod sync_execution_response_members;
 #[path = "all/sync_service_integration.rs"]
 mod sync_service_integration;
 #[path = "all/task_execution_role.rs"]

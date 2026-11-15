@@ -1441,6 +1441,13 @@ impl Interpreter<'_> {
     ///
     /// In JSONata the member itself carries the expression — "you can use JSONata
     /// expressions in Error and Cause" — so there is no `*Path` form to read.
+    ///
+    /// A `*Path` member carries "a reference path or an intrinsic function", and it is a
+    /// NAMED FIELD of the state, so a path it writes that selects no value is reported
+    /// the way every other named field's unresolvable path is: the field the path was
+    /// written for beside the WHOLE document it was looked for in
+    /// ([`template_expression`]), which is what points a reader at the member to
+    /// correct. The state names itself around the diagnosis ([`names_its_state`]).
     pub(super) fn fail_member(
         &self,
         state: &Map<String, Value>,
@@ -1470,7 +1477,7 @@ impl Interpreter<'_> {
         match state.get(path_member) {
             None => Ok(None),
             Some(Value::String(path)) => {
-                let value = expression(path, input, context)?;
+                let value = template_expression(path_member, path, input, context)?;
                 let text = value.as_str().map(str::to_string).ok_or_else(|| {
                     runtime(referenced_value_must_be_a_string(path_member, &value))
                 })?;
