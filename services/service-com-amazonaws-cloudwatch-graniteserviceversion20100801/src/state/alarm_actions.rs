@@ -923,18 +923,47 @@ where
         )
 }
 
-/// The history item recording ONE action execution: what was executed, for which state, and
-/// whether it succeeded.
+/// The one-line summary of ONE action execution: the outcome, the action that was executed,
+/// and — where the action's own ARN does not say WHAT it was executed against — the resource it
+/// acted on.
+///
+/// Most action kinds are a message handed to the target the ARN names (an SNS topic, a Lambda
+/// function), so naming the ARN says both what ran and where it went. An EC2 INSTANCE action's
+/// ARN names an OPERATION and no resource at all (`arn:aws:automate:<region>:ec2:<verb>`,
+/// [`ec2_instance_actions`]): the instance it is performed on comes from the alarm's own metric
+/// identity ([`ec2_instance_actions::watched_instance_id`]), so a summary carrying the ARN
+/// alone accounts for an execution without saying which instance was stopped, rebooted or
+/// terminated — a client reading the history of an account whose alarms each watch an instance
+/// of their own could not attribute any of it. So the summary of such an action names that
+/// instance beside the ARN, quoted the way an instance id is quoted wherever it is named back
+/// (EC2's own `The instance ID 'i-…' does not exist`), and it is named whether the operation
+/// succeeded or failed: what the record accounts for is the instance the action was ATTEMPTED
+/// against. The id comes from the alarm's stored dimension, never from the request that
+/// materialised the transition.
+///
+/// An EC2 instance action on an alarm whose metric names no instance acted on nothing
+/// ([`ec2_instance_actions::execute`] records that as the failure it is), so there is no
+/// instance to name and the summary is the ARN alone.
+fn action_summary(action: &str, instance_id: Option<&str>, failure: Option<&str>) -> String {
+    let outcome = match failure {
+        None => "Successfully executed action",
+        Some(_) => "Failed to execute action",
+    };
+    match ec2_instance_actions::of_action_arn(action).and(instance_id) {
+        Some(instance_id) => format!("{outcome} {action} on instance '{instance_id}'"),
+        None => format!("{outcome} {action}"),
+    }
+}
+
+/// The history item recording ONE action execution: what was executed, against what, for which
+/// state, and whether it succeeded.
 fn action_history_item(
     notification: &AlarmNotification,
     action: &str,
     failure: Option<&str>,
     now_secs: f64,
 ) -> AlarmHistoryItem {
-    let summary = match failure {
-        None => format!("Successfully executed action {action}"),
-        Some(_) => format!("Failed to execute action {action}"),
-    };
+    let summary = action_summary(action, notification.instance_id.as_deref(), failure);
     let mut document = Map::new();
     document.insert("version".to_string(), Value::from(NOTIFICATION_VERSION));
     document.insert(

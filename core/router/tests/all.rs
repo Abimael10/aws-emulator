@@ -1852,3 +1852,16 @@ mod default_vpc_internet_path_runs_ecs_tasks;
 // asks of a doc list item; the lint is allowed here so a header line is a header line rather
 // than a build failure. An inner attribute, like an inner doc comment, is legal only before
 // the first item, so it stands here rather than in the list below.
+// `mod <name>;` pair per suite file under `tests/all/`, sorted by name, and no other line.
+// Put a new suite at `tests/all/<name>.rs` and insert its pair into the list below, in the one
+// place its name sorts to, so two branches landing at once insert two lines in two places and
+// have no prose to duplicate, re-word or mistype.
+// comment (`//!`) is legal only before the first item, so a re-typed or merged copy of such a
+// line landing past the list is `E0753` and compiles no suite of this target at all — which is
+// how this file's tail came to take every suite down with it. An inner attribute (`#![...]`)
+// is bound by the same rule, so this file carries none. A suite declared twice is `E0428`, and
+// a suite file no `mod` names compiles nowhere.
+// `all/every_suite_file_is_declared.rs` pin all of it, for this file and for every service
+// belongs in that suite's OWN module doc, where it is read beside the test it explains; a note
+// about this file belongs in `all/appended_notes.rs`.
+// This file is a test-target CRATE ROOT, where a bare `mod` resolves to a SIBLING of it

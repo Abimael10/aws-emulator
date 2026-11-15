@@ -7,7 +7,8 @@
 //! whose action list carries an EC2 instance action — `arn:aws:automate:<region>:ec2:<verb>`
 //! or the Simple Workflow form of the same verb — that EC2 operation is performed on the
 //! instance the alarm's own metric is dimensioned by, in the Region the action names, and the
-//! alarm's history gains one `Action` item reporting the outcome; an alarm with
+//! alarm's history gains one `Action` item reporting the outcome and the instance it acted
+//! on; an alarm with
 //! `ActionsEnabled=false` evaluates the same way and executes nothing, leaving its instance
 //! untouched and its history without an `Action` item.**
 //!
@@ -505,10 +506,20 @@ async fn an_alarms_ec2_instance_action_is_executed_against_the_instance_its_metr
             Value::Null,
             "case {case:?}: an action that succeeded records no error, got {item}"
         );
+        // The summary reports the executed action AND the instance it was performed on: an EC2
+        // instance action's ARN names the operation and no resource, so the instance the
+        // alarm's metric is dimensioned by is what says which instance this execution moved.
         assert_eq!(
             item["summary"].as_str(),
-            Some(format!("Successfully executed action {}", row.action).as_str()),
-            "case {case:?}: the summary must report the executed action, got {item}"
+            Some(
+                format!(
+                    "Successfully executed action {} on instance '{instance_id}'",
+                    row.action
+                )
+                .as_str()
+            ),
+            "case {case:?}: the summary must report the executed action and the instance it \
+             acted on, got {item}"
         );
         // An EC2 instance action hands no message to a target, so nothing claims one was
         // published.
