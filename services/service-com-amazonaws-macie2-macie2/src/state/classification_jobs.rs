@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The classification-job plane of this service's state: the sensitive data
-//! discovery jobs `CreateClassificationJob` mints and
-//! `DescribeClassificationJob` projects, together with the bounds their members
-//! are documented with and the values the service applies to a member a request
-//! omits.
+//! discovery jobs `CreateClassificationJob` mints,
+//! `DescribeClassificationJob` projects and `UpdateClassificationJob` moves
+//! between statuses, together with the bounds their members are documented
+//! with and the values the service applies to a member a request omits.
 //!
 //! Everything a read reports about a job is a field of [`ClassificationJob`] or
 //! projected from one, so no response member is computed from the request that
@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
-use crate::ops::types::{JobScheduleFrequency, S3JobDefinition, Statistics};
+use crate::ops::types::{JobScheduleFrequency, S3JobDefinition, Statistics, UserPausedDetails};
 
 /// The resource-type segment of a classification job's ARN, read from the only
 /// Macie ARN grammar the model pins (`CreateAllowListResponse$arn`) with this
@@ -46,6 +46,78 @@ pub const JOB_STATUS_IDLE: &str = "IDLE";
 /// data specified for the job. This value doesn't apply to recurring jobs." An
 /// entry of [`crate::ops::types::JOB_STATUS_VALUES`].
 pub const JOB_STATUS_COMPLETE: &str = "COMPLETE";
+
+/// The `JobStatus` of a job the caller paused temporarily: the status doc
+/// states "USER_PAUSED - You paused the job. If you paused the job while it had
+/// a status of RUNNING and you don't resume it within 30 days of pausing it,
+/// the job or job run will expire and be cancelled". An entry of
+/// [`crate::ops::types::JOB_STATUS_VALUES`].
+pub const JOB_STATUS_USER_PAUSED: &str = "USER_PAUSED";
+
+/// The `JobStatus` of a job the caller cancelled, which is terminal: the
+/// `jobStatus` member doc of `UpdateClassificationJobRequest` states "CANCELLED
+/// - Stops the job permanently and cancels it … You can't resume or restart a
+/// job after you cancel it." An entry of
+/// [`crate::ops::types::JOB_STATUS_VALUES`].
+pub const JOB_STATUS_CANCELLED: &str = "CANCELLED";
+
+/// The `JobStatus` of a job Macie itself paused because further processing
+/// would exceed an account's monthly sensitive data discovery quota: the status
+/// doc states "PAUSED - Macie started running the job but additional processing
+/// would exceed the monthly sensitive data discovery quota". An entry of
+/// [`crate::ops::types::JOB_STATUS_VALUES`]. Nothing in this emulator moves a
+/// job to it — it is named because it is one of the current statuses a
+/// requested status is valid FROM
+/// ([`statuses_a_requested_status_is_valid_from`]).
+pub const JOB_STATUS_PAUSED: &str = "PAUSED";
+
+/// The statuses a request may ask a job to move to, each with the current
+/// statuses it is valid from, read off the `jobStatus` member doc of
+/// `UpdateClassificationJobRequest`: "CANCELLED … is valid only if the job's
+/// current status is IDLE, PAUSED, RUNNING, or USER_PAUSED", "RUNNING - Resumes
+/// the job. This value is valid only if the job's current status is
+/// USER_PAUSED" and "USER_PAUSED - Pauses the job temporarily. This value is
+/// valid only if the job's current status is IDLE, PAUSED, or RUNNING."
+///
+/// The statuses the doc lists no transition for — the ones the SERVICE moves a
+/// job to as a run ends or a quota is reached — are absent, so a request asking
+/// for one of those is refused.
+pub const REQUESTABLE_JOB_STATUSES: [(&str, &[&str]); 3] = [
+    (
+        JOB_STATUS_CANCELLED,
+        &[
+            JOB_STATUS_IDLE,
+            JOB_STATUS_PAUSED,
+            JOB_STATUS_RUNNING,
+            JOB_STATUS_USER_PAUSED,
+        ],
+    ),
+    (JOB_STATUS_RUNNING, &[JOB_STATUS_USER_PAUSED]),
+    (
+        JOB_STATUS_USER_PAUSED,
+        &[JOB_STATUS_IDLE, JOB_STATUS_PAUSED, JOB_STATUS_RUNNING],
+    ),
+];
+
+/// The current statuses `requested` is a valid new status from, or `None` when
+/// a request may not ask for `requested` at all. The one reading of
+/// [`REQUESTABLE_JOB_STATUSES`].
+pub fn statuses_a_requested_status_is_valid_from(requested: &str) -> Option<&'static [&'static str]> {
+    REQUESTABLE_JOB_STATUSES
+        .iter()
+        .find(|(status, _)| *status == requested)
+        .map(|(_, valid_from)| *valid_from)
+}
+
+/// How long a paused job or job run stays paused before it expires and the
+/// service cancels it. A duration the service DOCUMENTS, so it keeps its value:
+/// the `jobStatus` member doc of `UpdateClassificationJobRequest` states "If you
+/// pause a one-time job and you don't resume it within 30 days, the job expires
+/// and Macie cancels the job. If you pause a recurring job when its status is
+/// RUNNING and you don't resume it within 30 days, the job run expires and Macie
+/// cancels the run."
+pub const PAUSE_EXPIRES_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 60 * 60);
 
 /// How long a run this service has started stays in progress before the clock
 /// owes its end: a one-time job's run finishes (COMPLETE) and a recurring job's
@@ -207,6 +279,23 @@ pub struct ClassificationJob {
     /// How many runs of this job the service has started, which is what
     /// `Statistics$numberOfRuns` reports.
     pub runs_started: u32,
+    /// When the CALLER paused this job (`UpdateClassificationJob` with a
+    /// `jobStatus` of [`JOB_STATUS_USER_PAUSED`]), which is what
+    /// `UserPausedDetails$jobPausedAt` reports. `None` while nothing has paused
+    /// it.
+    pub paused_at: Option<SystemTime>,
+    /// When the paused job or job run is owed its expiry — `None` when no pause
+    /// is in effect, and when the pause interrupted no run in progress, since
+    /// then there is nothing to expire. [`PAUSE_EXPIRES_AFTER`] past
+    /// [`Self::paused_at`], which is what `UserPausedDetails$jobExpiresAt`
+    /// reports, and [`Self::status_at`] is what reports the status the clock
+    /// owes once the instant has passed.
+    pub pause_expires_at: Option<SystemTime>,
+    /// How much of the run in progress was left when a pause interrupted it,
+    /// and `None` when the pause interrupted no run. A resume continues "from
+    /// the point where you paused the job", which is this much of the run still
+    /// to go from the instant of the resume.
+    pub paused_run_remaining: Option<std::time::Duration>,
 }
 
 impl ClassificationJob {
@@ -276,20 +365,121 @@ impl ClassificationJob {
     /// a job it started sees the run end instead of a job in progress for ever.
     /// Only a job whose stored status is [`JOB_STATUS_RUNNING`] is owed that
     /// transition: a status something else moved the job to is the job's status.
+    ///
+    /// A pause the caller has left in place past its expiry
+    /// ([`Self::pause_expires_at`]) is owed its end the same way: a one-time
+    /// job's pause expires with "the job expires and Macie cancels the job", so
+    /// the job is [`JOB_STATUS_CANCELLED`], and a recurring job's expires with
+    /// "the job run expires and Macie cancels the run", which leaves the job
+    /// itself waiting for its next scheduled run — [`JOB_STATUS_IDLE`].
     pub fn status_at(&self, now: SystemTime) -> &str {
-        if self.job_status != JOB_STATUS_RUNNING {
-            return &self.job_status;
-        }
-        match self.run_settles_at {
-            Some(due) if now >= due => {
-                if self.job_type == JOB_TYPE_SCHEDULED {
-                    JOB_STATUS_IDLE
-                } else {
-                    JOB_STATUS_COMPLETE
-                }
-            }
+        let (due, ended) = match self.job_status.as_str() {
+            JOB_STATUS_RUNNING => (self.run_settles_at, self.run_ends_as()),
+            JOB_STATUS_USER_PAUSED => (self.pause_expires_at, self.pause_expires_as()),
+            _ => return &self.job_status,
+        };
+        match due {
+            Some(due) if now >= due => ended,
             _ => &self.job_status,
         }
+    }
+
+    /// The status a run of this job that reaches its end leaves it in.
+    fn run_ends_as(&self) -> &'static str {
+        if self.job_type == JOB_TYPE_SCHEDULED {
+            JOB_STATUS_IDLE
+        } else {
+            JOB_STATUS_COMPLETE
+        }
+    }
+
+    /// The status an expired pause of this job leaves it in: a one-time job is
+    /// cancelled outright, while a recurring job loses only the run the pause
+    /// interrupted and waits for its next scheduled one.
+    fn pause_expires_as(&self) -> &'static str {
+        if self.job_type == JOB_TYPE_SCHEDULED {
+            JOB_STATUS_IDLE
+        } else {
+            JOB_STATUS_CANCELLED
+        }
+    }
+
+    /// This job's `userPausedDetails`, as of `now`.
+    ///
+    /// The member "is present only if the value for jobStatus is USER_PAUSED",
+    /// so it is reported exactly while the pause is in effect — and absent once
+    /// the clock owes that pause its end.
+    /// `jobImminentExpirationHealthEventArn` is left absent: it names "the
+    /// Health event that Amazon Macie sent to notify you of the job or job
+    /// run's pending expiration", and this emulator sends no such event, so
+    /// there is no event ARN to report.
+    pub fn user_paused_details_at(&self, now: SystemTime) -> Option<UserPausedDetails> {
+        if self.status_at(now) != JOB_STATUS_USER_PAUSED {
+            return None;
+        }
+        Some(UserPausedDetails {
+            job_expires_at: self.pause_expires_at.map(super::to_date_time),
+            job_imminent_expiration_health_event_arn: None,
+            job_paused_at: self.paused_at.map(super::to_date_time),
+        })
+    }
+
+    /// Pause this job at `now`, as a `jobStatus` of
+    /// [`JOB_STATUS_USER_PAUSED`] asks: the job stops being in progress, the
+    /// pause is recorded, and what was left of a run in progress is kept so a
+    /// resume continues from the point the pause interrupted it. Only such a
+    /// run has an expiry: the doc gives one for a paused one-time job and for a
+    /// recurring job "paused when its status is RUNNING".
+    ///
+    /// Whether a run was in progress is read off the CLOCK, not off the stored
+    /// status: a run whose end was already due at `now` is a run that has
+    /// finished, so the pause interrupted nothing and nothing is owed an
+    /// expiry.
+    pub fn pause_at(&mut self, now: SystemTime) {
+        self.paused_run_remaining = self
+            .run_settles_at
+            .filter(|due| *due > now)
+            .map(|due| due.duration_since(now).unwrap_or_default());
+        self.pause_expires_at = self
+            .paused_run_remaining
+            .map(|_| now + PAUSE_EXPIRES_AFTER);
+        self.paused_at = Some(now);
+        self.run_settles_at = None;
+        self.job_status = JOB_STATUS_USER_PAUSED.to_string();
+    }
+
+    /// Resume this job at `now`, as a `jobStatus` of [`JOB_STATUS_RUNNING`]
+    /// asks.
+    ///
+    /// A pause that interrupted a run resumes THAT run "from the point where
+    /// you paused the job", so what was left of it is what is left to go and
+    /// the run count does not move. A pause that interrupted no run leaves the
+    /// job to resume "according to the schedule and other settings for the
+    /// job", which starts a run of its own.
+    pub fn resume_at(&mut self, now: SystemTime) {
+        match self.paused_run_remaining.take() {
+            Some(remaining) => self.run_settles_at = Some(now + remaining),
+            None => {
+                self.last_run_started_at = Some(now);
+                self.runs_started = self.runs_started.saturating_add(1);
+                self.run_settles_at = Some(now + RUN_SETTLES_AFTER);
+            }
+        }
+        self.paused_at = None;
+        self.pause_expires_at = None;
+        self.job_status = JOB_STATUS_RUNNING.to_string();
+    }
+
+    /// Cancel this job, as a `jobStatus` of [`JOB_STATUS_CANCELLED`] asks:
+    /// "Stops the job permanently and cancels it." No run of it is owed an end
+    /// and no pause of it is owed an expiry afterwards, and the status is
+    /// terminal — "You can't resume or restart a job after you cancel it."
+    pub fn cancel(&mut self) {
+        self.run_settles_at = None;
+        self.paused_at = None;
+        self.pause_expires_at = None;
+        self.paused_run_remaining = None;
+        self.job_status = JOB_STATUS_CANCELLED.to_string();
     }
 
     /// This job's `statistics`, as a read reports them.
@@ -330,13 +520,49 @@ pub fn classification_job_not_found_message(job_id: &str) -> String {
     format!("Classification Job not found for id: {job_id}")
 }
 
+/// How the service refuses an `UpdateClassificationJob` asking for a status the
+/// job's CURRENT status may not move to.
+///
+/// The fixed text is the service's; the variable parts are the status the job
+/// is in, as the refusal words it, and the ARN of the job the request
+/// addressed.
+pub fn job_status_not_updatable_message(current_status: &str, job_arn: &str) -> String {
+    format!(
+        "Input validation failed, cannot update {} job for job: {job_arn}",
+        current_status.to_lowercase()
+    )
+}
+
+/// How the service refuses an `UpdateClassificationJob` asking for a status no
+/// request may ask for — one the SERVICE moves a job to as a run ends or a
+/// quota is reached, which the member documents no transition for.
+///
+/// This is a different refusal from [`job_status_not_updatable_message`]: what
+/// is wrong is the status the request asked for, not the status the job is in.
+/// The variable parts are the statuses a request may ask for, which is the
+/// member's own list of valid values ([`REQUESTABLE_JOB_STATUSES`]), and the
+/// ARN of the job the request addressed.
+pub fn job_status_not_requestable_message(job_arn: &str) -> String {
+    let requestable: Vec<&str> = REQUESTABLE_JOB_STATUSES
+        .iter()
+        .map(|(status, _)| *status)
+        .collect();
+    format!(
+        "Input validation failed, jobStatus must be one of {} for job: {job_arn}",
+        requestable.join(", ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ClassificationJob, DEFAULT_MANAGED_DATA_IDENTIFIER_SELECTOR, JOB_STATUS_COMPLETE,
-        JOB_STATUS_IDLE, JOB_STATUS_RUNNING, JOB_TYPE_ONE_TIME, JOB_TYPE_SCHEDULED,
-        MANAGED_DATA_IDENTIFIER_SELECTOR_NONE, RUN_SETTLES_AFTER,
-        SELECTORS_NAMING_MANAGED_DATA_IDENTIFIERS, SELECTORS_NAMING_NO_MANAGED_DATA_IDENTIFIERS,
+        ClassificationJob, DEFAULT_MANAGED_DATA_IDENTIFIER_SELECTOR, JOB_STATUS_CANCELLED,
+        JOB_STATUS_COMPLETE, JOB_STATUS_IDLE, JOB_STATUS_PAUSED, JOB_STATUS_RUNNING,
+        JOB_STATUS_USER_PAUSED, JOB_TYPE_ONE_TIME, JOB_TYPE_SCHEDULED,
+        MANAGED_DATA_IDENTIFIER_SELECTOR_NONE, PAUSE_EXPIRES_AFTER, REQUESTABLE_JOB_STATUSES,
+        RUN_SETTLES_AFTER, SELECTORS_NAMING_MANAGED_DATA_IDENTIFIERS,
+        SELECTORS_NAMING_NO_MANAGED_DATA_IDENTIFIERS,
+        statuses_a_requested_status_is_valid_from,
     };
     use crate::ops::types::{
         JOB_STATUS_VALUES, JOB_TYPE_VALUES, MANAGED_DATA_IDENTIFIER_SELECTOR_VALUES,
@@ -367,6 +593,9 @@ mod tests {
             last_run_started_at: None,
             run_settles_at: None,
             runs_started: 0,
+            paused_at: None,
+            pause_expires_at: None,
+            paused_run_remaining: None,
         }
     }
 
@@ -374,11 +603,32 @@ mod tests {
     /// declares, so none of them can drift from the wire.
     #[test]
     fn every_named_wire_value_is_one_the_model_declares() {
-        for case in [JOB_STATUS_RUNNING, JOB_STATUS_IDLE, JOB_STATUS_COMPLETE] {
+        for case in [
+            JOB_STATUS_RUNNING,
+            JOB_STATUS_IDLE,
+            JOB_STATUS_COMPLETE,
+            JOB_STATUS_USER_PAUSED,
+            JOB_STATUS_CANCELLED,
+            JOB_STATUS_PAUSED,
+        ] {
             assert!(
                 JOB_STATUS_VALUES.contains(&case),
                 "case {case:?}: expected a modelled JobStatus, got one of {JOB_STATUS_VALUES:?}"
             );
+        }
+        for (requested, valid_from) in REQUESTABLE_JOB_STATUSES {
+            assert!(
+                JOB_STATUS_VALUES.contains(&requested),
+                "case {requested:?}: expected a modelled JobStatus, got one of \
+                 {JOB_STATUS_VALUES:?}"
+            );
+            for from in valid_from {
+                assert!(
+                    JOB_STATUS_VALUES.contains(from),
+                    "case {requested:?} from {from:?}: expected a modelled JobStatus, got one \
+                     of {JOB_STATUS_VALUES:?}"
+                );
+            }
         }
         for case in [JOB_TYPE_ONE_TIME, JOB_TYPE_SCHEDULED] {
             assert!(
@@ -556,6 +806,266 @@ mod tests {
                 expected,
                 "case {case:?}: expected {expected:?}, got {:?}",
                 job.status_at(now)
+            );
+        }
+    }
+
+    /// The statuses a request may ask for, and the current statuses each is
+    /// valid from, are exactly the table the member documents — including the
+    /// statuses that are NOT requestable at all.
+    #[test]
+    fn only_the_documented_statuses_are_requestable() {
+        for status in JOB_STATUS_VALUES {
+            let requestable = statuses_a_requested_status_is_valid_from(status);
+            let expected = REQUESTABLE_JOB_STATUSES
+                .iter()
+                .any(|(requested, _)| requested == status);
+            assert_eq!(
+                requestable.is_some(),
+                expected,
+                "case {status:?}: expected requestable={expected}, got {requestable:?}"
+            );
+        }
+        for case in ["", "running", "DELETED"] {
+            assert!(
+                statuses_a_requested_status_is_valid_from(case).is_none(),
+                "case {case:?}: expected no transition, got {:?}",
+                statuses_a_requested_status_is_valid_from(case)
+            );
+        }
+    }
+
+    /// A pause stops the run in progress, keeps what was left of it, and is
+    /// owed an expiry a documented span later; a resume puts exactly that much
+    /// of the run back, from the instant of the resume, without starting a
+    /// second run.
+    #[test]
+    fn a_pause_keeps_the_rest_of_the_run_and_a_resume_continues_it() {
+        let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(60);
+        for elapsed in [
+            Duration::ZERO,
+            Duration::from_millis(500),
+            RUN_SETTLES_AFTER - Duration::from_millis(1),
+        ] {
+            let paused_at = started_at + elapsed;
+            let mut job = ClassificationJob {
+                last_run_started_at: Some(started_at),
+                run_settles_at: Some(started_at + RUN_SETTLES_AFTER),
+                runs_started: 1,
+                ..job()
+            };
+            job.pause_at(paused_at);
+            let remaining = RUN_SETTLES_AFTER.saturating_sub(elapsed);
+            assert_eq!(
+                (
+                    job.status_at(paused_at),
+                    job.paused_at,
+                    job.pause_expires_at,
+                    job.run_settles_at,
+                    job.paused_run_remaining,
+                ),
+                (
+                    JOB_STATUS_USER_PAUSED,
+                    Some(paused_at),
+                    Some(paused_at + PAUSE_EXPIRES_AFTER),
+                    None,
+                    Some(remaining),
+                ),
+                "case \"paused {elapsed:?} into the run\": expected the pause recorded with \
+                 {remaining:?} of the run left, got {job:?}"
+            );
+
+            let resumed_at = paused_at + Duration::from_secs(7);
+            job.resume_at(resumed_at);
+            assert_eq!(
+                (
+                    job.status_at(resumed_at),
+                    job.run_settles_at,
+                    job.runs_started,
+                    job.last_run_started_at,
+                    job.paused_at,
+                    job.user_paused_details_at(resumed_at).is_some(),
+                ),
+                (
+                    JOB_STATUS_RUNNING,
+                    Some(resumed_at + remaining),
+                    1,
+                    Some(started_at),
+                    None,
+                    false,
+                ),
+                "case \"resumed {elapsed:?} into the run\": expected the same run with \
+                 {remaining:?} left, got {job:?}"
+            );
+        }
+    }
+
+    /// A pause that interrupted no run has nothing to expire, so it carries no
+    /// expiry and never ends on its own — and resuming it starts a run of its
+    /// own, as the job's schedule and settings ask.
+    #[test]
+    fn a_pause_that_interrupted_no_run_has_no_expiry() {
+        let paused_at = SystemTime::UNIX_EPOCH + Duration::from_secs(60);
+        let mut job = ClassificationJob {
+            job_type: JOB_TYPE_SCHEDULED.to_string(),
+            job_status: JOB_STATUS_IDLE.to_string(),
+            ..job()
+        };
+        job.pause_at(paused_at);
+        let long_after = paused_at + PAUSE_EXPIRES_AFTER + Duration::from_secs(86_400);
+        assert_eq!(
+            (
+                job.pause_expires_at,
+                job.paused_run_remaining,
+                job.status_at(long_after)
+            ),
+            (None, None, JOB_STATUS_USER_PAUSED),
+            "case \"a recurring job paused while idle\": expected a pause with no expiry, \
+             got {job:?}"
+        );
+        let details = job
+            .user_paused_details_at(paused_at)
+            .expect("a paused job reports its pause");
+        assert_eq!(
+            (details.job_paused_at, details.job_expires_at),
+            (Some(super::super::to_date_time(paused_at)), None),
+            "case \"a recurring job paused while idle\": expected the pause instant and no \
+             expiry, got {details:?}"
+        );
+
+        job.resume_at(long_after);
+        assert_eq!(
+            (
+                job.status_at(long_after),
+                job.runs_started,
+                job.last_run_started_at,
+                job.run_settles_at
+            ),
+            (
+                JOB_STATUS_RUNNING,
+                1,
+                Some(long_after),
+                Some(long_after + RUN_SETTLES_AFTER)
+            ),
+            "case \"resuming a job paused while idle\": expected a run of its own, got {job:?}"
+        );
+    }
+
+    /// Whether a pause interrupted a run is read off the CLOCK: a job whose run
+    /// has already reached its end is not in progress whatever its stored
+    /// status says, so pausing it keeps no run and is owed no expiry.
+    #[test]
+    fn a_pause_after_the_run_ended_interrupts_nothing() {
+        let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let mut settled = ClassificationJob {
+            job_type: JOB_TYPE_SCHEDULED.to_string(),
+            job_status: JOB_STATUS_RUNNING.to_string(),
+            last_run_started_at: Some(started_at),
+            run_settles_at: Some(started_at + RUN_SETTLES_AFTER),
+            runs_started: 1,
+            ..job()
+        };
+        let after_the_run = started_at + RUN_SETTLES_AFTER + Duration::from_secs(1);
+        assert_eq!(
+            settled.status_at(after_the_run),
+            JOB_STATUS_IDLE,
+            "case \"a recurring run that has ended\": expected IDLE, got {:?}",
+            settled.status_at(after_the_run)
+        );
+        settled.pause_at(after_the_run);
+        assert_eq!(
+            (settled.paused_run_remaining, settled.pause_expires_at),
+            (None, None),
+            "case \"pausing after the run ended\": expected no run kept and no expiry, got \
+             {settled:?}"
+        );
+    }
+
+    /// A pause the caller leaves in place is owed its end at its expiry: a
+    /// one-time job is cancelled, and a recurring job loses only the run the
+    /// pause interrupted, so it waits for its next scheduled one. A cancel is
+    /// terminal whatever the clock says.
+    #[test]
+    fn an_expired_pause_and_a_cancel_are_owed_the_documented_status() {
+        let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(60);
+        let mut one_time = ClassificationJob {
+            last_run_started_at: Some(started_at),
+            run_settles_at: Some(started_at + RUN_SETTLES_AFTER),
+            runs_started: 1,
+            ..job()
+        };
+        one_time.pause_at(started_at);
+        let recurring = ClassificationJob {
+            job_type: JOB_TYPE_SCHEDULED.to_string(),
+            ..one_time.clone()
+        };
+        let mut cancelled = ClassificationJob {
+            last_run_started_at: Some(started_at),
+            run_settles_at: Some(started_at + RUN_SETTLES_AFTER),
+            runs_started: 1,
+            ..job()
+        };
+        cancelled.cancel();
+
+        let due = started_at + PAUSE_EXPIRES_AFTER;
+        let cases: Vec<(&str, &ClassificationJob, SystemTime, &str)> = vec![
+            (
+                "a one-time pause one tick before it expires",
+                &one_time,
+                due - Duration::from_nanos(1),
+                JOB_STATUS_USER_PAUSED,
+            ),
+            (
+                "a one-time pause at the instant it expires",
+                &one_time,
+                due,
+                JOB_STATUS_CANCELLED,
+            ),
+            (
+                "a recurring pause at the instant it expires",
+                &recurring,
+                due,
+                JOB_STATUS_IDLE,
+            ),
+            (
+                "a cancelled job long afterwards",
+                &cancelled,
+                due + Duration::from_secs(86_400),
+                JOB_STATUS_CANCELLED,
+            ),
+        ];
+        for (case, job, now, expected) in cases {
+            assert_eq!(
+                job.status_at(now),
+                expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                job.status_at(now)
+            );
+            assert_eq!(
+                job.user_paused_details_at(now).is_some(),
+                expected == JOB_STATUS_USER_PAUSED,
+                "case {case:?}: userPausedDetails is reported only while the pause is in \
+                 effect, got {:?}",
+                job.user_paused_details_at(now)
+            );
+        }
+        // A cancel leaves no run owed an end and no pause owed an expiry.
+        assert_eq!(
+            (
+                cancelled.run_settles_at,
+                cancelled.paused_at,
+                cancelled.pause_expires_at,
+                cancelled.paused_run_remaining
+            ),
+            (None, None, None, None),
+            "case \"a cancelled job\": expected nothing owed, got {cancelled:?}"
+        );
+        // Nothing above moved the two paused jobs: the clock reports their end,
+        // it does not rewrite them.
+        for (case, job) in [("one-time", &one_time), ("recurring", &recurring)] {
+            assert_eq!(
+                job.job_status, JOB_STATUS_USER_PAUSED,
+                "case {case:?}: expected the stored status untouched, got {job:?}"
             );
         }
     }

@@ -353,6 +353,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // clock owes.
             run_settles_at: run_started.then(|| now + crate::state::RUN_SETTLES_AFTER),
             runs_started: u32::from(run_started),
+            // Nothing has paused a job this create has just minted.
+            paused_at: None,
+            pause_expires_at: None,
+            paused_run_remaining: None,
         };
 
         state.idempotency.insert(replay_key, job_id.clone());

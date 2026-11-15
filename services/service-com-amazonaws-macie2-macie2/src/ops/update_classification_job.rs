@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateClassificationJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateClassificationJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateClassificationJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: moves a classification job `crate::state` holds to the status the
+//! request asks for, when that status is one the job's CURRENT status may move
+//! to, and refuses every other combination without touching the stored job.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +153,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateClassificationJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateClassificationJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateClassificationJob"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateClassificationJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the classification job store is unavailable on this engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = store.lock();
+
+        // Macie has to be enabled in the region before any of its resources can
+        // be read or written, as every other operation of this service
+        // requires.
+        if state.session(&region).is_none() {
+            return Err(UpdateClassificationJobErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::MACIE_NOT_ENABLED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let Some(job) = state.job_mut(&region, &input.job_id) else {
+            return Err(
+                UpdateClassificationJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::classification_job_not_found_message(
+                            &input.job_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A request may ask only for a status the member documents a transition
+        // for; the statuses the SERVICE moves a job to as a run ends or a quota
+        // is reached are not among its valid values.
+        let Some(valid_from) =
+            crate::state::statuses_a_requested_status_is_valid_from(&input.job_status)
+        else {
+            return Err(UpdateClassificationJobErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::job_status_not_requestable_message(
+                        &job.job_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The transition is judged against the job's status as of THIS instant:
+        // the stored one, or the status the clock already owes it because the
+        // run it started has finished or the pause on it has expired.
+        let current = job.status_at(now).to_string();
+        if !valid_from.contains(&current.as_str()) {
+            return Err(UpdateClassificationJobErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::job_status_not_updatable_message(
+                        &current,
+                        &job.job_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The job moves to the status the request asked for, and everything the
+        // move carries with it — the pause instant and its expiry, what is left
+        // of a run the pause interrupted, the run count — moves with it, so a
+        // later read reports the stored job rather than this request.
+        match input.job_status.as_str() {
+            crate::state::JOB_STATUS_CANCELLED => job.cancel(),
+            crate::state::JOB_STATUS_USER_PAUSED => job.pause_at(now),
+            crate::state::JOB_STATUS_RUNNING => job.resume_at(now),
+            // Unreachable while the three statuses above are the ones a request
+            // may ask for; named rather than folded into the resume arm, so a
+            // fourth requestable status is reported instead of silently
+            // resuming the job.
+            other => {
+                return Err(
+                    UpdateClassificationJobErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: Some(format!(
+                                "this emulator has no transition for a jobStatus of {other}"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // `UpdateClassificationJobResponse` models no members: the move is read
+        // back through `DescribeClassificationJob`.
+        Ok(UpdateClassificationJobOutput {})
     }
 }

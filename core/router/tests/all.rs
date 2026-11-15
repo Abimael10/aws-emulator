@@ -6,25 +6,21 @@
 // `#[path = "all/<name>.rs"]` / `mod <name>;` pair into the sorted list below. The list
 // holds one pair per suite and no other line, so two branches landing at once insert two
 // lines in two places and have no prose to duplicate, re-word or mistype.
-//
 // EVERY comment in this file is an ORDINARY one, this block included, and that is
 // deliberate: an inner doc comment (`//` followed by `!`) is legal only before the first
 // item, so one that lands past the declarations is `E0753` and compiles no suite of this
 // target. With none anywhere in the file, no merge of two landings can put one past the
 // first item.
-//
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of
 // this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each
 // `mod` is what points the declaration into `tests/all/`. A suite file no `mod` here names
 // is compiled nowhere and this crate's build script refuses it, and a second `mod` for one
 // name is `E0428`, which fails every suite in this target.
-//
 // Four suites check those rules rather than restating them:
 // `all/all_rs_declares_each_suite_once.rs`,
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
 // `all/all_rs_is_a_canonical_declaration_list.rs` and
 // `all/every_suite_file_is_declared.rs`.
-//
 // WHAT a suite covers, and WHY it belongs to this cross-service target rather than to one
 // service crate's own, is stated in that suite's own module doc, where it is read beside the
 // test it explains; `all/appended_notes.rs` keeps the notes landings had appended here.
@@ -1210,3 +1206,12 @@ mod zz_opensearch_fgac_probe;
 mod zz_probe;
 #[path = "all/zz_probe_whole_emulator.rs"]
 mod zz_probe_whole_emulator;
+// Single integration-test target for the router: the declaration list, and nothing else.
+// Put a new suite at `tests/all/<name>.rs` and add ONE `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair below, in its sorted position; nothing else belongs in this file, and
+// EVERY comment in it is an ordinary `//` one so that no merge of two landings can leave an
+// inner doc comment past the first item (`E0753`, which compiles no suite of this target).
+// `all/all_rs_is_a_canonical_declaration_list.rs`,
+// `all/declaration_roots_are_canonical_and_complete.rs` and
+// `all/every_suite_file_is_declared.rs` pin that shape, for this file and for every service
+// crate's `tests/all.rs`.

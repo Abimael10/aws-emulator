@@ -35,8 +35,9 @@
 //! one, `GetAllowList` projects it together with the status it derives for it,
 //! `ListAllowLists` enumerates them) live in [`allow_lists`], which is where the
 //! object-store read that status rests on lives too. The classification jobs
-//! `CreateClassificationJob` mints and `DescribeClassificationJob` projects live
-//! in [`classification_jobs`]. Everything any of them declares is re-exported
+//! `CreateClassificationJob` mints, `DescribeClassificationJob` projects and
+//! `UpdateClassificationJob` moves between statuses live in
+//! [`classification_jobs`]. Everything any of them declares is re-exported
 //! here, so a handler reaches all of this service's state through
 //! `crate::state::…` whichever plane it touches.
 
@@ -819,6 +820,13 @@ impl ComAmazonawsMacie2Macie2State {
     pub fn job(&self, region: &str, job_id: &str) -> Option<&ClassificationJob> {
         self.classification_jobs
             .get(job_id)
+            .filter(|job| job.region == region)
+    }
+
+    /// The same record, for a write.
+    pub fn job_mut(&mut self, region: &str, job_id: &str) -> Option<&mut ClassificationJob> {
+        self.classification_jobs
+            .get_mut(job_id)
             .filter(|job| job.region == region)
     }
 

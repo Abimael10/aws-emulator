@@ -317,12 +317,100 @@ pub struct LastRunErrorStatus {
     pub code: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.macie2#UserPausedDetails")]
+// `UserPausedDetails`'s schema and codec are hand-written rather than derived
+// with `#[smithy_macros::smithy(shape = ...)]`, because `jobExpiresAt` and
+// `jobPausedAt` target `__timestampIso8601` and the derive drops that shape's
+// `@timestampFormat("date-time")`. See `super::date_time_wire` for the whole
+// reason and for when to delete this block; everything else below mirrors the
+// derive exactly.
 #[derive(Debug, Clone, Default)]
 pub struct UserPausedDetails {
     pub job_expires_at: Option<::aws_smithy_types::DateTime>,
     pub job_imminent_expiration_health_event_arn: Option<String>,
     pub job_paused_at: Option<::aws_smithy_types::DateTime>,
+}
+
+impl UserPausedDetails {
+    /// `@timestampFormat("date-time")`, from the `__timestampIso8601` shape it
+    /// targets. THE reason this schema is hand-written.
+    pub const M_JOB_EXPIRES_AT: ::aws_smithy_schema::Schema =
+        super::date_time_wire::date_time_member(
+            "com.amazonaws.macie2#UserPausedDetails$jobExpiresAt",
+            "jobExpiresAt",
+            0,
+        );
+    pub const M_JOB_IMMINENT_EXPIRATION_HEALTH_EVENT_ARN: ::aws_smithy_schema::Schema =
+        super::date_time_wire::member(
+            "com.amazonaws.macie2#UserPausedDetails$jobImminentExpirationHealthEventArn",
+            "jobImminentExpirationHealthEventArn",
+            ::aws_smithy_schema::ShapeType::String,
+            1,
+        );
+    /// The same, for the other instant.
+    pub const M_JOB_PAUSED_AT: ::aws_smithy_schema::Schema =
+        super::date_time_wire::date_time_member(
+            "com.amazonaws.macie2#UserPausedDetails$jobPausedAt",
+            "jobPausedAt",
+            2,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.macie2#UserPausedDetails",
+            "com.amazonaws.macie2",
+            "UserPausedDetails",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_JOB_EXPIRES_AT,
+            &Self::M_JOB_IMMINENT_EXPIRATION_HEALTH_EVENT_ARN,
+            &Self::M_JOB_PAUSED_AT,
+        ],
+    );
+}
+
+pub static USER_PAUSED_DETAILS_SCHEMA: &::aws_smithy_schema::Schema = &UserPausedDetails::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for UserPausedDetails {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.job_expires_at.as_ref() {
+            s.write_timestamp(&Self::M_JOB_EXPIRES_AT, value)?;
+        }
+        if let Some(value) = self.job_imminent_expiration_health_event_arn.as_ref() {
+            s.write_string(
+                &Self::M_JOB_IMMINENT_EXPIRATION_HEALTH_EVENT_ARN,
+                value.as_str(),
+            )?;
+        }
+        if let Some(value) = self.job_paused_at.as_ref() {
+            s.write_timestamp(&Self::M_JOB_PAUSED_AT, value)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for UserPausedDetails {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.job_expires_at = Some(d.read_timestamp(&Self::M_JOB_EXPIRES_AT)?),
+                Some(1) => {
+                    out.job_imminent_expiration_health_event_arn =
+                        Some(d.read_string(&Self::M_JOB_IMMINENT_EXPIRATION_HEALTH_EVENT_ARN)?);
+                }
+                Some(2) => out.job_paused_at = Some(d.read_timestamp(&Self::M_JOB_PAUSED_AT)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.macie2#Invitation")]

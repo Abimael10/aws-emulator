@@ -286,10 +286,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             statistics: Some(job.statistics()),
             tags: job.tags_output(),
             // `userPausedDetails` "is present only if the value for jobStatus
-            // is USER_PAUSED". A job this store holds carries the status its
-            // create started it in, and nothing has paused one, so there is no
-            // pause to report.
-            user_paused_details: None,
+            // is USER_PAUSED", so it is reported exactly while the pause an
+            // `UpdateClassificationJob` put in place is still in effect.
+            user_paused_details: job.user_paused_details_at(now),
         })
     }
 }

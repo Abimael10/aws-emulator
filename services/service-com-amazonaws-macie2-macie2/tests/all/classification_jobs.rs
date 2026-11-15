@@ -79,7 +79,7 @@ fn buckets() -> serde_json::Value {
 }
 
 /// A create body for a one-time job, with `extra` merged over it.
-fn one_time(token: &str, extra: serde_json::Value) -> serde_json::Value {
+pub(crate) fn one_time(token: &str, extra: serde_json::Value) -> serde_json::Value {
     let mut body = serde_json::json!({
         "clientToken": token,
         "jobType": "ONE_TIME",
@@ -92,7 +92,7 @@ fn one_time(token: &str, extra: serde_json::Value) -> serde_json::Value {
 
 /// A create body for a recurring job with a daily recurrence pattern, with
 /// `extra` merged over it.
-fn scheduled(token: &str, extra: serde_json::Value) -> serde_json::Value {
+pub(crate) fn scheduled(token: &str, extra: serde_json::Value) -> serde_json::Value {
     let mut body = serde_json::json!({
         "clientToken": token,
         "jobType": "SCHEDULED",
@@ -132,7 +132,10 @@ fn tags(count: usize, key_chars: usize, value_chars: usize) -> serde_json::Value
 }
 
 /// Create one job and hand back the id and ARN it reported.
-async fn create(
+///
+/// `pub(crate)` so the sibling suite that drives the job's STATUS transitions
+/// mints its jobs the same way rather than through a second copy of this.
+pub(crate) async fn create(
     router: &MultiServiceRouter,
     region: &str,
     body: &serde_json::Value,
@@ -155,7 +158,7 @@ async fn create(
 }
 
 /// Read one job back.
-async fn describe(
+pub(crate) async fn describe(
     router: &MultiServiceRouter,
     region: &str,
     job_id: &str,
