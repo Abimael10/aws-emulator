@@ -40,10 +40,13 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// One answered request: the status, the error shape when there was one, and the parsed
 /// body.
-struct Reply {
-    status: u16,
+///
+/// Shared with the sibling suite that renders the same operation across the template's
+/// lifecycle (`email_template_render_tracks_the_store`), so one harness drives both.
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     error_type: Option<String>,
-    body: Value,
+    pub(crate) body: Value,
 }
 
 impl Reply {
@@ -51,7 +54,7 @@ impl Reply {
     ///
     /// restJson1 resolves the error shape from `x-amzn-errortype`; the JSON body's
     /// `__type` carries the same name, so either is read.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         let raw = self
             .error_type
             .as_deref()
@@ -73,7 +76,7 @@ impl Reply {
 
     /// The MIME document the preview answered with, or an empty string when it answered
     /// no `RenderedTemplate` at all.
-    fn rendered(&self) -> String {
+    pub(crate) fn rendered(&self) -> String {
         self.body
             .get("RenderedTemplate")
             .and_then(Value::as_str)
@@ -83,12 +86,12 @@ impl Reply {
 }
 
 /// The emulated service behind its router.
-struct Ses {
+pub(crate) struct Ses {
     router: MultiServiceRouter,
 }
 
 impl Ses {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These cases exercise handler behaviour, not SigV4.
@@ -136,7 +139,7 @@ impl Ses {
     }
 
     /// Save a template under `name` with `content`.
-    async fn create_template(&self, name: &str, content: Value) -> Reply {
+    pub(crate) async fn create_template(&self, name: &str, content: Value) -> Reply {
         self.call(
             "POST",
             "/v2/email/templates",
@@ -145,7 +148,40 @@ impl Ses {
         .await
     }
 
-    async fn get_template(&self, name: &str) -> Reply {
+    /// Save a template under `name` with `content` and the tags `tags`.
+    pub(crate) async fn create_tagged_template(
+        &self,
+        name: &str,
+        content: Value,
+        tags: &[(&str, &str)],
+    ) -> Reply {
+        let listed: Vec<Value> = tags
+            .iter()
+            .map(|(key, value)| json!({"Key": key, "Value": value}))
+            .collect();
+        self.call(
+            "POST",
+            "/v2/email/templates",
+            Some(json!({
+                "TemplateName": name,
+                "TemplateContent": content,
+                "Tags": Value::Array(listed),
+            })),
+        )
+        .await
+    }
+
+    /// Replace the content the account holds under `name`.
+    pub(crate) async fn update_template(&self, name: &str, content: Value) -> Reply {
+        self.call(
+            "PUT",
+            &format!("/v2/email/templates/{name}"),
+            Some(json!({"TemplateContent": content})),
+        )
+        .await
+    }
+
+    pub(crate) async fn get_template(&self, name: &str) -> Reply {
         self.call("GET", &format!("/v2/email/templates/{name}"), None)
             .await
     }
@@ -156,7 +192,7 @@ impl Ses {
     }
 
     /// Render the saved template `name` against `data`.
-    async fn render(&self, name: &str, data: &str) -> Reply {
+    pub(crate) async fn render(&self, name: &str, data: &str) -> Reply {
         self.call(
             "POST",
             &format!("/v2/email/templates/{name}/render"),
@@ -168,7 +204,7 @@ impl Ses {
 
 /// The name the cases save their template under, where the name is not what is under
 /// test.
-const TEMPLATE: &str = "receipt";
+pub(crate) const TEMPLATE: &str = "receipt";
 
 /// The body part of `document` whose media type is `media_type`, decoded.
 ///
@@ -176,16 +212,23 @@ const TEMPLATE: &str = "receipt";
 /// parts; one with a single part declares that part's media type at the top level. Both
 /// are read the same way here, so a case asserts the PART it means whichever shape the
 /// document has.
-fn part_of(document: &ParsedMail, media_type: &str) -> Option<String> {
+pub(crate) fn part_of(document: &ParsedMail, media_type: &str) -> Option<String> {
+    part_with(document, media_type).map(|part| part.get_body().expect("decode the body"))
+}
+
+/// The part of `document` whose media type is `media_type`, headers and all — the part
+/// [`part_of`] decodes the body of.
+pub(crate) fn part_with<'a>(
+    document: &'a ParsedMail<'a>,
+    media_type: &str,
+) -> Option<&'a ParsedMail<'a>> {
     if document.subparts.is_empty() {
-        return (document.ctype.mimetype == media_type)
-            .then(|| document.get_body().expect("decode the body"));
+        return (document.ctype.mimetype == media_type).then_some(document);
     }
     document
         .subparts
         .iter()
         .find(|part| part.ctype.mimetype == media_type)
-        .map(|part| part.get_body().expect("decode the body"))
 }
 
 /// One row of the render table: the content to save, the data to render it against and

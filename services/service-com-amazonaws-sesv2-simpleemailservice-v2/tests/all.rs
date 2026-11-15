@@ -125,6 +125,8 @@ mod email_template_listing;
 mod email_template_refusal_wording;
 #[path = "all/email_template_render.rs"]
 mod email_template_render;
+#[path = "all/email_template_render_tracks_the_store.rs"]
+mod email_template_render_tracks_the_store;
 #[path = "all/email_template_updates.rs"]
 mod email_template_updates;
 #[path = "all/email_templates.rs"]

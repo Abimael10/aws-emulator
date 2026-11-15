@@ -2185,3 +2185,5 @@ mod ses_configuration_set_cursor_shared_across_v1_and_v2;
 // belongs in that suite's own module header, where it is read beside the test it explains; a
 // note about THIS file belongs in `all/appended_notes.rs`, declared below like any other
 // suite. `all/all_rs_declares_each_suite_once.rs`,
+// inner doc comment in the file at all, no merge of two landings can put one past the first
+// The suites `all/all_rs_carries_no_inner_doc_comment.rs`,
