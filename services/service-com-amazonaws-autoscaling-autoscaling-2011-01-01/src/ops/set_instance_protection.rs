@@ -163,15 +163,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The operation's own documented bound on how many instances ONE call may
         // name, which the model does not express as a length, so it is checked here
-        // rather than at the boundary — ahead of the group lookup, like the other
-        // per-call bound this service enforces.
+        // rather than at the boundary — ahead of the group lookup and of any per-id
+        // membership check, like the other per-call bound this service enforces. How
+        // many ids one request carries is a fact of the REQUEST, so it is refused as a
+        // validation failure; the modelled `LimitExceededFault` means the account has
+        // run out of Auto Scaling resources, which no shape of request can cause.
         if requested.len() > crate::state::MAX_INSTANCE_IDS_PER_CALL {
-            return Err(SetInstanceProtectionErrorModeled::LimitExceededFault(
-                LimitExceededFault {
-                    message: Some(crate::state::too_many_instance_ids_message()),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::too_many_instance_ids_message(),
+            ));
         }
 
         let now = ::std::time::SystemTime::now();
@@ -189,20 +189,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Checked for EVERY named instance before any flag is written: one id this
         // group does not hold refuses the whole call and leaves the protection of the
-        // instances it does hold exactly as it was.
-        let foreign: Vec<String> = requested
-            .iter()
-            .filter(|instance_id| {
-                !group
-                    .instances
-                    .iter()
-                    .any(|instance| instance.instance_id == **instance_id)
-            })
-            .cloned()
-            .collect();
-        if !foreign.is_empty() {
+        // instances it does hold exactly as it was. The refusal speaks of ONE instance
+        // — the first id of the request the group does not hold — and names the group
+        // the request asked about, so the caller is told which group the id is missing
+        // from.
+        let foreign = requested.iter().find(|instance_id| {
+            !group
+                .instances
+                .iter()
+                .any(|instance| instance.instance_id == **instance_id)
+        });
+        if let Some(foreign) = foreign {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::instances_not_in_group_message(&foreign),
+                crate::state::protected_instance_not_in_group_message(foreign, &name),
             ));
         }
 

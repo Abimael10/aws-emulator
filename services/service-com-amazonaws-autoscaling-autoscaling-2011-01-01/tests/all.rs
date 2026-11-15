@@ -87,6 +87,8 @@ mod scaling_policies;
 mod scaling_activity_log;
 #[path = "all/set_desired_capacity_on_subnet_placed_groups.rs"]
 mod set_desired_capacity_on_subnet_placed_groups;
+#[path = "all/set_instance_protection_refusal_fidelity.rs"]
+mod set_instance_protection_refusal_fidelity;
 #[path = "all/sns_notifications.rs"]
 mod sns_notifications;
 #[path = "all/state_roundtrip.rs"]

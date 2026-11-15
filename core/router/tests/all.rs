@@ -1215,3 +1215,27 @@ mod zz_probe_whole_emulator;
 // `all/declaration_roots_are_canonical_and_complete.rs` and
 // `all/every_suite_file_is_declared.rs` pin that shape, for this file and for every service
 // crate's `tests/all.rs`.
+// Put a new suite at `tests/all/<name>.rs` and declare it below with one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted so the list stays sorted by
+// name — one pair per suite and no other line, so two branches landing at once insert two
+// EVERY comment in this file is an ORDINARY one, this header included, and that is
+// deliberate: an inner doc comment (a `//` followed by a `!`) is legal only before the
+// first item, so one that lands past the declarations is `E0753` and compiles no suite of
+// this target at all. With none anywhere in the file, no merge of two landings can put one
+// past the first item.
+// Declare each suite exactly ONCE: this is one crate root, so a second `mod` for the same
+// name is `E0428` and fails every suite in this target too.
+// `tests/all.rs` is a test-target CRATE ROOT, where a bare `mod` resolves to a SIBLING
+// (`tests/<name>.rs`) that the layout check refuses: the `#[path]` is what points each
+// declaration into `tests/all/`.
+// Four suites of this target pin the rules above rather than restating them:
+// `all/declaration_roots_are_canonical_and_complete.rs`.
+// What a suite covers, and why it belongs to this cross-service target rather than to one
+// service crate's own, is stated in that suite's own module doc, where it is read beside
+// the test it explains; a note about this file itself belongs in `all/appended_notes.rs`.
+// The note paragraphs concurrent landings had appended to this file wrapped without the
+// indentation `clippy::doc_lazy_continuation` asks of a doc list item; the lint is allowed
+// here so a re-appended note is a note rather than a build failure. An inner attribute,
+// like an inner doc comment, is legal only before the first item, so it stands here rather
+// than in the list below.
+#![allow(clippy::doc_lazy_continuation)]

@@ -2602,38 +2602,59 @@ pub fn too_many_target_groups_message() -> String {
 /// From the model's own documentation for `SetInstanceProtection`: "If you exceed
 /// your maximum limit of instance IDs, which is 50 per Auto Scaling group, the call
 /// fails." The member carries no modelled length, so the bound is the service's own
-/// and is checked by the handler, which answers the operation's modelled
-/// `LimitExceededFault` past it.
+/// and is checked by the handler.
+///
+/// How many ids ONE request may carry is a fact of the REQUEST's shape, so the refusal
+/// past this bound is the service-common `ValidationError` — the same class the other
+/// per-call bound of this service answers with ([`MAX_TARGET_GROUPS_PER_CALL`]). The
+/// modelled `LimitExceededFault` states something else entirely ("You have already
+/// reached a limit for your Amazon EC2 Auto Scaling resources",
+/// `smithy_query(query="shape",shape="LimitExceededFault")`), so it stays reserved for
+/// the account's own resource limits.
 pub const MAX_INSTANCE_IDS_PER_CALL: usize = 50;
 
 /// The message a call naming more instance IDs than [`MAX_INSTANCE_IDS_PER_CALL`] is
 /// refused with, which quotes the bound the caller has to come back under.
 ///
-/// Same shape as [`too_many_target_groups_message`]: this service reports a per-call
-/// bound by naming the resource the request named too many of and the limit itself.
+/// Fixed text apart from that bound, which is the documented per-call limit rather than
+/// a value from the request: the sentence says how many instances one call may protect
+/// at a time, so the caller splits its ids into calls of that size.
 pub fn too_many_instance_ids_message() -> String {
-    format!("Trying to update too many Instances at once. The limit is {MAX_INSTANCE_IDS_PER_CALL}")
-}
-
-/// The message an instance-scoped update that names an instance the group does not
-/// hold is refused with, which names those instances.
-///
-/// Same shape as [`unattached_target_groups_message`], the refusal this service
-/// answers when a request names a resource of the same group-scoped kind that the
-/// group does not hold: the refusal is for the request as a WHOLE, so a call that
-/// mixes instances of the group with one that is not in it updates none of them, and
-/// the message says what was wrong with the request rather than reporting a partial
-/// result. The variable part is the instance ids the request named, in request order.
-pub fn instances_not_in_group_message(instance_ids: &[String]) -> String {
     format!(
-        "Trying to update Instances that are not part of the group: {}",
-        instance_ids.join(", ")
+        "Exceeded maximum allowed instances to protect simultaneously; can provide at most \
+         {MAX_INSTANCE_IDS_PER_CALL} instances."
     )
 }
 
 /// The token this service's refusals carry where a message names a part of the request
 /// the request did not supply, as [`ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL`] carries it.
 pub const UNFILLED_DETAIL_TOKEN: &str = "null";
+
+/// The clause both of this service's "that instance is not part of that group" refusals
+/// are built around: an instance-scoped request is resolved against the group the
+/// request NAMES, so the refusal names the instance AND that group, and one sentence
+/// speaks of one instance id.
+///
+/// THE ONE COPY of that fixed text; each operation supplies the subject its own refusal
+/// opens with ([`instance_not_in_group_message`],
+/// [`protected_instance_not_in_group_message`]) and the two variable parts, which both
+/// come from the request.
+const NOT_PART_OF_GROUP_CLAUSE: &str = " is not part of Auto Scaling group ";
+
+/// The message an instance-scoped PROTECTION update that names an instance the group
+/// does not hold is refused with.
+///
+/// One sentence for the offending instance id, terminated by a period: the fixed text is
+/// `The instance ` / [`NOT_PART_OF_GROUP_CLAUSE`] / `.`, and the two variable parts — the
+/// instance id and the group name — both come from the request.
+///
+/// Same class as [`instance_not_in_group_message`], which a TERMINATION answers in its
+/// own operation's wording; the refusal is for the request as a WHOLE either way, so a
+/// call that mixes instances of the group with one that is not part of it updates none
+/// of them.
+pub fn protected_instance_not_in_group_message(instance_id: &str, group_name: &str) -> String {
+    format!("The instance {instance_id}{NOT_PART_OF_GROUP_CLAUSE}{group_name}.")
+}
 
 /// The message a TERMINATION request that names an instance which is not part of the
 /// Auto Scaling group it is terminated from is refused with.
@@ -2644,12 +2665,11 @@ pub const UNFILLED_DETAIL_TOKEN: &str = "null";
 /// names no group at all leaves that part unfilled, so it travels as
 /// [`UNFILLED_DETAIL_TOKEN`] — there is no group the instance could be part of.
 ///
-/// This is a different class from [`instances_not_in_group_message`], which refuses a
-/// group-scoped UPDATE over a set of instances as one unit of work and names the whole
-/// offending set; a termination acts on the instance itself.
+/// Same class as [`protected_instance_not_in_group_message`], in the subject this
+/// operation's own refusal opens with.
 pub fn instance_not_in_group_message(instance_id: &str, group_name: Option<&str>) -> String {
     let group_name = group_name.unwrap_or(UNFILLED_DETAIL_TOKEN);
-    format!("Instance {instance_id} is not part of Auto Scaling group {group_name}.")
+    format!("Instance {instance_id}{NOT_PART_OF_GROUP_CLAUSE}{group_name}.")
 }
 
 /// The message a termination request that names no instance at all is refused with: the

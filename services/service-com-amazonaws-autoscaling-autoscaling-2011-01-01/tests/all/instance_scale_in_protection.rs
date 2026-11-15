@@ -6,11 +6,12 @@
 //! of work over the instances THAT GROUP holds — every instance id the request names
 //! must be one the group reports, so a call naming an id of another group, or of no
 //! group at all, updates NONE of them and is refused `ValidationError` naming the
-//! instances that are not part of the group, while a call whose every id belongs to the
-//! group writes the setting on exactly those instances and leaves the rest as they
-//! were. Past the operation's own documented per-call bound on instance ids the call is
-//! refused with the modelled `LimitExceededFault` instead, and a group the account does
-//! not hold is refused like every other group-scoped write of this service.
+//! offending instance and the group it is not part of, while a call whose every id
+//! belongs to the group writes the setting on exactly those instances and leaves the
+//! rest as they were. Past the operation's own documented per-call bound on instance ids
+//! the call is refused `ValidationError` too — how many ids ONE request carries is a
+//! fact of the request's shape — and a group the account does not hold is refused like
+//! every other group-scoped write of this service.
 //!
 //! The tables below span what that rule generalises over — how many instances the group
 //! holds, how many the request names, where in the request a foreign id sits, whether
@@ -39,19 +40,35 @@ const ZONE: (&str, &str) = ("AvailabilityZones.member.1", "us-west-2a");
 /// The most instance ids ONE call may name, from the model's own documentation for
 /// `SetInstanceProtection`: "If you exceed your maximum limit of instance IDs, which is
 /// 50 per Auto Scaling group, the call fails."
-const MAX_INSTANCE_IDS_PER_CALL: usize = 50;
+///
+/// `pub(crate)` so the sibling suite over this operation's refusals holds the same bound
+/// rather than a second copy of it.
+pub(crate) const MAX_INSTANCE_IDS_PER_CALL: usize = 50;
+
+/// The message a call naming more instance ids than [`MAX_INSTANCE_IDS_PER_CALL`] is
+/// refused with: fixed text apart from the documented per-call bound itself.
+pub(crate) fn too_many_instance_ids_message() -> String {
+    format!(
+        "Exceeded maximum allowed instances to protect simultaneously; can provide at most \
+         {MAX_INSTANCE_IDS_PER_CALL} instances."
+    )
+}
 
 /// What a group reports for one of its instances.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ReportedInstance {
-    instance_id: String,
-    protected_from_scale_in: bool,
-    lifecycle_state: String,
+pub(crate) struct ReportedInstance {
+    pub(crate) instance_id: String,
+    pub(crate) protected_from_scale_in: bool,
+    pub(crate) lifecycle_state: String,
 }
 
 /// Create a group holding `capacity` instances and answer the instance ids it reports,
 /// in the order the group holds them.
-async fn create_group(router: &MultiServiceRouter, name: &str, capacity: usize) -> Vec<String> {
+pub(crate) async fn create_group(
+    router: &MultiServiceRouter,
+    name: &str,
+    capacity: usize,
+) -> Vec<String> {
     let capacity = capacity.to_string();
     let params = vec![
         p("AutoScalingGroupName", name),
@@ -80,7 +97,10 @@ async fn create_group(router: &MultiServiceRouter, name: &str, capacity: usize) 
 
 /// The instances the group reports through the implemented reader of its own
 /// `Instances`, in the order it holds them.
-async fn reported_instances(router: &MultiServiceRouter, name: &str) -> Vec<ReportedInstance> {
+pub(crate) async fn reported_instances(
+    router: &MultiServiceRouter,
+    name: &str,
+) -> Vec<ReportedInstance> {
     let (status, body) = query(
         router,
         "DescribeAutoScalingGroups",
@@ -111,7 +131,7 @@ async fn reported_instances(router: &MultiServiceRouter, name: &str) -> Vec<Repo
 }
 
 /// Post one `SetInstanceProtection` and answer its status, wire error code and message.
-async fn set_protection(
+pub(crate) async fn set_protection(
     router: &MultiServiceRouter,
     name: &str,
     instance_ids: &[String],
@@ -138,14 +158,11 @@ async fn set_protection(
     )
 }
 
-/// The message Amazon EC2 Auto Scaling refuses an instance-scoped update naming
-/// instances the group does not hold with: fixed text plus the ids from the request that
-/// are not part of the group, in request order.
-fn not_in_group_message(instance_ids: &[String]) -> String {
-    format!(
-        "Trying to update Instances that are not part of the group: {}",
-        instance_ids.join(", ")
-    )
+/// The message Amazon EC2 Auto Scaling refuses an instance-scoped update naming an
+/// instance the group does not hold with: fixed text, with the offending instance id and
+/// the group name from the request.
+pub(crate) fn not_in_group_message(instance_id: &str, group_name: &str) -> String {
+    format!("The instance {instance_id} is not part of Auto Scaling group {group_name}.")
 }
 
 /// One accepted row: the case, how many instances the group holds, whether every
@@ -300,19 +317,19 @@ enum Foreign {
 }
 
 /// One refused row: the case, how many instances the group holds, the request's ids (an
-/// `Ok` position names an instance of the group, an `Err` one a foreign id) and the ids
-/// the refusal must name, in request order.
+/// `Ok` position names an instance of the group, an `Err` one a foreign id) and the id
+/// the refusal must name — the first the group does not hold, in request order.
 struct RefusedRow {
     case: &'static str,
     held: usize,
     named: &'static [Result<usize, Foreign>],
-    refused: &'static [Foreign],
+    refused: Foreign,
 }
 
-/// Every row: HTTP 400, `ValidationError`, the refusal naming the instances that are not
-/// part of the group, and NOTHING written — every instance of the group is still
-/// unprotected, and the other group's instance is too, which is what makes the refusal
-/// whole.
+/// Every row: HTTP 400, `ValidationError`, the refusal naming the instance that is not
+/// part of the group and the group it was asked about, and NOTHING written — every
+/// instance of the group is still unprotected, and the other group's instance is too,
+/// which is what makes the refusal whole.
 #[tokio::test]
 async fn a_call_naming_an_instance_the_group_does_not_hold_is_refused_whole() {
     let rows = [
@@ -320,25 +337,25 @@ async fn a_call_naming_an_instance_the_group_does_not_hold_is_refused_whole() {
             case: "an id no instance of the account has, alone",
             held: 2,
             named: &[Err(Foreign::Unknown("i-0fff0000000000001"))],
-            refused: &[Foreign::Unknown("i-0fff0000000000001")],
+            refused: Foreign::Unknown("i-0fff0000000000001"),
         },
         RefusedRow {
             case: "an instance of another group of the account, alone",
             held: 2,
             named: &[Err(Foreign::OtherGroup(1))],
-            refused: &[Foreign::OtherGroup(1)],
+            refused: Foreign::OtherGroup(1),
         },
         RefusedRow {
             case: "an instance of the group followed by one of another group",
             held: 2,
             named: &[Ok(1), Err(Foreign::OtherGroup(2))],
-            refused: &[Foreign::OtherGroup(2)],
+            refused: Foreign::OtherGroup(2),
         },
         RefusedRow {
             case: "a foreign id ahead of an instance of the group",
             held: 2,
             named: &[Err(Foreign::Unknown("i-0fff0000000000002")), Ok(2)],
-            refused: &[Foreign::Unknown("i-0fff0000000000002")],
+            refused: Foreign::Unknown("i-0fff0000000000002"),
         },
         RefusedRow {
             case: "two foreign ids mixed between two instances of the group",
@@ -349,10 +366,7 @@ async fn a_call_naming_an_instance_the_group_does_not_hold_is_refused_whole() {
                 Ok(2),
                 Err(Foreign::Unknown("i-0fff0000000000003")),
             ],
-            refused: &[
-                Foreign::OtherGroup(1),
-                Foreign::Unknown("i-0fff0000000000003"),
-            ],
+            refused: Foreign::OtherGroup(1),
         },
         RefusedRow {
             case: "the same foreign id named twice",
@@ -361,16 +375,13 @@ async fn a_call_naming_an_instance_the_group_does_not_hold_is_refused_whole() {
                 Err(Foreign::Unknown("i-0fff0000000000004")),
                 Err(Foreign::Unknown("i-0fff0000000000004")),
             ],
-            refused: &[
-                Foreign::Unknown("i-0fff0000000000004"),
-                Foreign::Unknown("i-0fff0000000000004"),
-            ],
+            refused: Foreign::Unknown("i-0fff0000000000004"),
         },
         RefusedRow {
             case: "an instance of another group, for a group that holds none",
             held: 0,
             named: &[Err(Foreign::OtherGroup(1))],
-            refused: &[Foreign::OtherGroup(1)],
+            refused: Foreign::OtherGroup(1),
         },
     ];
 
@@ -394,7 +405,7 @@ async fn a_call_naming_an_instance_the_group_does_not_hold_is_refused_whole() {
                 Err(foreign) => id_of(foreign),
             })
             .collect();
-        let refused: Vec<String> = row.refused.iter().map(id_of).collect();
+        let refused = id_of(&row.refused);
 
         let (status, code, message) = set_protection(&router, &name, &requested, true).await;
         assert_eq!(
@@ -407,7 +418,7 @@ async fn a_call_naming_an_instance_the_group_does_not_hold_is_refused_whole() {
             "case {:?}: expected the ValidationError code, got {code:?} {message:?}",
             row.case
         );
-        let expected = not_in_group_message(&refused);
+        let expected = not_in_group_message(&refused, &name);
         assert_eq!(
             message, expected,
             "case {:?}: expected the message {expected:?}, got {message:?}",
@@ -432,8 +443,8 @@ async fn a_call_naming_an_instance_the_group_does_not_hold_is_refused_whole() {
 }
 
 /// The documented per-call bound: a call naming the maximum is served, and one naming a
-/// single instance id more is refused with the operation's modelled `LimitExceededFault`
-/// — before anything is written, so the group is untouched.
+/// single instance id more is refused `ValidationError` — the request's own shape is what
+/// is wrong with it — before anything is written, so the group is untouched.
 #[tokio::test]
 async fn a_call_past_the_documented_per_call_maximum_is_refused() {
     let router = router_with(new_engine());
@@ -448,14 +459,15 @@ async fn a_call_past_the_documented_per_call_maximum_is_refused() {
         "a call naming {} instance ids must be refused, got {status} with {code:?} {message:?}",
         past_bound.len()
     );
-    // `LimitExceededFault` carries the awsQuery error code `LimitExceeded`
-    // (smithy_query(query="operation",operation="SetInstanceProtection")).
+    // The count of ids one request carries is a fact of the REQUEST, so the refusal is
+    // the service-common `ValidationError`; the modelled `LimitExceededFault` is the
+    // account's own resource limits
+    // (smithy_query(query="shape",shape="LimitExceededFault")).
     assert_eq!(
-        code, "LimitExceeded",
-        "expected the LimitExceeded code past the bound, got {code:?} {message:?}"
+        code, "ValidationError",
+        "expected the ValidationError code past the bound, got {code:?} {message:?}"
     );
-    let expected =
-        format!("Trying to update too many Instances at once. The limit is {MAX_INSTANCE_IDS_PER_CALL}");
+    let expected = too_many_instance_ids_message();
     assert_eq!(
         message, expected,
         "expected the message {expected:?} past the bound, got {message:?}"
