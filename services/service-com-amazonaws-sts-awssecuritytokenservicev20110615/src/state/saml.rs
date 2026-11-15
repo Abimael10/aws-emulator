@@ -117,7 +117,9 @@ const ACCEPTED_CANONICALIZATIONS: &[&str] = &[
 
 /// How AWS words the refusal of a signature that did not check out against the keys the
 /// provider publishes ("Troubleshooting SAML 2.0 federation with AWS"). Fixed text: a
-/// verifier that rejected a signature says no more than that it did.
+/// verifier that rejected a signature says no more than that it did, and — unlike the other
+/// readings of a presented response — this class's message carries no relayed envelope either
+/// (see [`AssertionDefect::relayed_exception`]), so it is equal for every presentation.
 const SIGNATURE_INVALID_MESSAGE: &str = "Response signature invalid";
 
 /// How AWS words the refusal of a response whose `Issuer` is not the one the named provider
@@ -288,32 +290,40 @@ impl AssertionDefect {
         }
     }
 
-    /// The exception the relayed reading answered this class with, or `None` for a class no
-    /// relayed call decided.
+    /// The exception the relayed reading answered this class with, or `None` for a class whose
+    /// refusal carries NO envelope.
     ///
     /// Reading the manifest the account registered and reading the presented response against
-    /// it are two steps of that call, and the exception says which of them refused. The
-    /// classes this service decides ITSELF — the role the request asked for against the pairs
-    /// a VERIFIED response asserts, the validity window it answers its own expiry error for,
-    /// and the provider's own report that the authentication failed — are nobody's relayed
-    /// refusal.
+    /// it are two steps of that call, and the exception says which of them refused. Three
+    /// kinds of class carry none:
+    ///
+    /// * the classes this service decides ITSELF — the role the request asked for against the
+    ///   pairs a VERIFIED response asserts, the validity window it answers its own expiry
+    ///   error for, and the provider's own report that the authentication failed — because no
+    ///   relayed call refused them;
+    /// * the SIGNATURE classes: a response whose signature does not check out, and one whose
+    ///   declared transforms a verifier will not accept, are refused with the fixed sentence
+    ///   ALONE. Unlike the other readings of the presented document, that refusal carries no
+    ///   parenthesized envelope at all, so a client telling this class from the others matches
+    ///   a message that is equal every time.
     #[must_use]
     pub fn relayed_exception(&self) -> Option<&'static str> {
         match self {
             // The lookup: there is no manifest to read a key or an issuer out of.
             Self::ProviderNotFound => Some(MANIFEST_NOT_FOUND_EXCEPTION),
-            // The reading: everything the presented document is held to, from its encoding
-            // to the session it names.
+            // The reading: what the presented document is held to, from its encoding to the
+            // session it names.
             Self::NotBase64
             | Self::NotWellFormed
             | Self::NotSamlResponse
             | Self::NotSigned
-            | Self::UnacceptedTransform
-            | Self::SignatureInvalid
             | Self::IssuerNotInProvider
             | Self::SessionNameMissing
             | Self::SessionNamePattern => Some(INVALID_RESPONSE_EXCEPTION),
-            Self::ClaimRejected
+            // The signature classes, and the classes this service decides itself.
+            Self::UnacceptedTransform
+            | Self::SignatureInvalid
+            | Self::ClaimRejected
             | Self::RoleNotAsserted
             | Self::Expired
             | Self::NotRedeemable

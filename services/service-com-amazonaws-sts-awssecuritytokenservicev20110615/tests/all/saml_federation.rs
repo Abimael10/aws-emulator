@@ -75,7 +75,8 @@ const ROLE_SESSION_NAME_ATTRIBUTE: &str = "https://aws.amazon.com/SAML/Attribute
 
 /// The sentences AWS words each refusal class with. The ones a relayed reading of the
 /// response answers are followed on the wire by the envelope naming that call, which
-/// `super::saml_relayed_refusal` is the one reading of.
+/// `super::saml_relayed_refusal` is the one reading of; the SIGNATURE classes and the ones
+/// this service decides itself carry the sentence alone.
 pub(crate) const SIGNATURE_INVALID_MESSAGE: &str = "Response signature invalid";
 pub(crate) const ISSUER_NOT_IN_PROVIDER_MESSAGE: &str = "Issuer not present in specified provider";
 pub(crate) const PROVIDER_NOT_FOUND_MESSAGE: &str = "Specified provider doesn't exist";
@@ -491,8 +492,9 @@ pub(crate) async fn exchange(
 enum Expected {
     /// A session of the role, reporting the facts the response carried.
     Federated,
-    /// This status, this `<Code>` and exactly this message: a class this service decides
-    /// itself states its sentence alone.
+    /// This status, this `<Code>` and exactly this message: a class that carries no envelope
+    /// — the SIGNATURE classes, and the classes this service decides itself — states its
+    /// sentence alone.
     Refused(u16, &'static str, String),
     /// This status, this `<Code>`, this sentence and then the envelope of the relayed
     /// reading that refused it, naming this exception (`super::saml_relayed_refusal`).
@@ -614,11 +616,10 @@ async fn a_saml_identity_is_federated_only_when_its_registered_provider_signed_t
             role_arn.clone(),
             provider_arn.clone(),
             saml_assertion(&other, &Response::valid(&other, &role_arn, &provider_arn)),
-            Expected::Relayed(
+            Expected::Refused(
                 400,
                 "InvalidIdentityToken",
                 SIGNATURE_INVALID_MESSAGE.to_string(),
-                INVALID_RESPONSE_EXCEPTION,
             ),
         ),
         (
@@ -629,11 +630,10 @@ async fn a_saml_identity_is_federated_only_when_its_registered_provider_signed_t
                 altered_after_signing: true,
                 ..valid()
             }),
-            Expected::Relayed(
+            Expected::Refused(
                 400,
                 "InvalidIdentityToken",
                 SIGNATURE_INVALID_MESSAGE.to_string(),
-                INVALID_RESPONSE_EXCEPTION,
             ),
         ),
         (
@@ -646,11 +646,10 @@ async fn a_saml_identity_is_federated_only_when_its_registered_provider_signed_t
                 transforms: vec![ENVELOPED_SIGNATURE, XPATH_TRANSFORM],
                 ..valid()
             }),
-            Expected::Relayed(
+            Expected::Refused(
                 400,
                 "InvalidIdentityToken",
                 SIGNATURE_INVALID_MESSAGE.to_string(),
-                INVALID_RESPONSE_EXCEPTION,
             ),
         ),
         (

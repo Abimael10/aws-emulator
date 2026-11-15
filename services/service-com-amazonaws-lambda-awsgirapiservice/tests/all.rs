@@ -131,6 +131,8 @@ mod event_invoke_config;
 mod event_invoke_config_destination_slots;
 #[path = "all/event_source_mapping_attempt_report.rs"]
 mod event_source_mapping_attempt_report;
+#[path = "all/event_source_mapping_attempt_reservation.rs"]
+mod event_source_mapping_attempt_reservation;
 #[path = "all/event_source_mapping_batch_item_failures.rs"]
 mod event_source_mapping_batch_item_failures;
 #[path = "all/event_source_mapping_batching_window.rs"]

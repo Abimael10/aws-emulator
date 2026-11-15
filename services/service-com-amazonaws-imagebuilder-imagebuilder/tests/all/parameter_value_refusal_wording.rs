@@ -10,12 +10,15 @@
 //! observes.
 //!
 //! The rule under test: a value this service cannot accept for a parameter is refused HTTP
-//! 400 `InvalidParameterValueException` stating ONE sentence — the parameter as the API
-//! addresses it, then the requirement its value had to satisfy — and that sentence is the
-//! same whether a modelled constraint, a lookup of the resource the value names, a parse of
-//! the document it carries, or the opaqueness of a token this service issues is what
-//! established the value is not admitted. The refusal names the request it answers in the
-//! body's `requestId`, and nothing of the store changes.
+//! 400 `InvalidParameterValueException` stating the parameter as the API addresses it and the
+//! requirement its value had to satisfy, with the value itself withheld — whether a modelled
+//! constraint, a lookup of the resource the value names, a parse of the document it carries,
+//! or the opaqueness of a token this service issues is what established the value is not
+//! admitted. A refusal of the modelled-constraint class states it as `The value supplied for
+//! parameter '<member>' is not valid. <requirement>`, and the instance-profile lookup — the
+//! service's own refusal rather than the model's — states it as `Invalid parameter value for
+//! <member>: <requirement>`. The refusal names the request it answers in the body's
+//! `requestId`, and nothing of the store changes.
 //!
 //! `tests/all/parameter_value_refusals.rs` spans the modelled-constraint classes; the rows
 //! here span what the rule generalises over BESIDE them: what established the value is not
@@ -62,8 +65,8 @@ struct Row {
     method: &'static str,
     uri: &'static str,
     body: Option<Value>,
-    parameter: &'static str,
-    requirement: String,
+    /// The whole sentence the refusal must state, in the envelope its class carries.
+    message: String,
 }
 
 /// One emulator: imagebuilder and IAM on a single shared engine behind the production
@@ -197,12 +200,17 @@ fn configuration_arn(name: &str) -> String {
     format!("arn:aws:imagebuilder:{REGION}:{ACCOUNT}:infrastructure-configuration/{name}")
 }
 
-/// The sentence this service states for `parameter`, whose value had to satisfy
-/// `requirement`: the one envelope
-/// (`service_common::validation_message::parameter_value_mismatch`) every parameter refusal
-/// of this service is stated in.
-fn expected_message(parameter: &str, requirement: &str) -> String {
+/// The sentence this service states for `parameter` when a MODELLED constraint, a parse or a
+/// token it did not issue established the value is not admitted
+/// (`service_common::validation_message::parameter_value_mismatch`).
+fn constraint_message(parameter: &str, requirement: &str) -> String {
     format!("The value supplied for parameter '{parameter}' is not valid. {requirement}")
+}
+
+/// The sentence this service states for `parameter` when the refusal is its OWN — the
+/// instance-profile lookup, whose refusal names the member and then the requirement.
+fn named_parameter_message(parameter: &str, requirement: &str) -> String {
+    format!("Invalid parameter value for {parameter}: {requirement}")
 }
 
 /// Whether `id` has the 8-4-4-4-12 lowercase-hex form an AWS request id carries.
@@ -250,9 +258,10 @@ fn rows() -> Vec<Row> {
                 "clientToken": "wtok-0001",
                 "data": BUILD_DOCUMENT,
             })),
-            parameter: "semanticVersion",
-            requirement: r"semanticVersion must match pattern ^[0-9]+\.[0-9]+\.[0-9]+$"
-                .to_string(),
+            message: constraint_message(
+                "semanticVersion",
+                r"semanticVersion must match pattern ^[0-9]+\.[0-9]+\.[0-9]+$",
+            ),
         },
         Row {
             // An IAM lookup: the model admits the name, and this account holds no profile
@@ -265,8 +274,10 @@ fn rows() -> Vec<Row> {
                 "instanceProfileName": ABSENT_PROFILE,
                 "clientToken": "wtok-0002",
             })),
-            parameter: "instanceProfileName",
-            requirement: absent_profile_requirement(),
+            message: named_parameter_message(
+                "instanceProfileName",
+                &absent_profile_requirement(),
+            ),
         },
         Row {
             // The SAME refusal from a second operation: one sentence, not one per handler.
@@ -278,8 +289,10 @@ fn rows() -> Vec<Row> {
                 "instanceProfileName": ABSENT_PROFILE,
                 "clientToken": "wtok-0003",
             })),
-            parameter: "instanceProfileName",
-            requirement: absent_profile_requirement(),
+            message: named_parameter_message(
+                "instanceProfileName",
+                &absent_profile_requirement(),
+            ),
         },
         Row {
             // A parse: a resource policy is a JSON document, and this one is not.
@@ -292,8 +305,7 @@ fn rows() -> Vec<Row> {
                 ),
                 "policy": "not-a-json-document",
             })),
-            parameter: "policy",
-            requirement: "Policy is malformed and cannot be parsed".to_string(),
+            message: constraint_message("policy", "Policy is malformed and cannot be parsed"),
         },
         Row {
             // An opaque token: the only value the member admits is one a previous page of
@@ -302,16 +314,20 @@ fn rows() -> Vec<Row> {
             method: "POST",
             uri: "/ListComponents",
             body: Some(json!({ "nextToken": "not-a-token-this-service-issued" })),
-            parameter: "nextToken",
-            requirement: "The provided token does not meet the required format.".to_string(),
+            message: constraint_message(
+                "nextToken",
+                "The provided token does not meet the required format.",
+            ),
         },
         Row {
             case: "a page token this service did not issue, on a listing of configurations",
             method: "POST",
             uri: "/ListInfrastructureConfigurations",
             body: Some(json!({ "nextToken": "not-a-token-this-service-issued" })),
-            parameter: "nextToken",
-            requirement: "The provided token does not meet the required format.".to_string(),
+            message: constraint_message(
+                "nextToken",
+                "The provided token does not meet the required format.",
+            ),
         },
     ]
 }
@@ -363,7 +379,7 @@ async fn every_parameter_value_this_service_refuses_is_stated_in_one_sentence() 
              {error_type:?}",
             row.case
         );
-        let expected = expected_message(row.parameter, &row.requirement);
+        let expected = row.message.as_str();
         let message = refused
             .get("message")
             .and_then(Value::as_str)

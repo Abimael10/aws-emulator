@@ -18,10 +18,11 @@
 //!   The hold covers the whole span this poller holds the batch — the window it gathers it
 //!   over plus the attempt it hands it to, which is the queue's own `VisibilityTimeout` or
 //!   the function's `Timeout`, whichever is longer, since one attempt cannot outlast the
-//!   function's — and it is RENEWED while an attempt is still running ([`renew_hold`]),
-//!   because what an attempt costs this emulator is not bounded by those spans alone: an
-//!   invocation also waits for its share of the run capacity. So no message is handed to a
-//!   second consumer while the first attempt at it may still be running (see
+//!   function's — and it is RENEWED when the attempt BEGINS and while it is still running
+//!   ([`renew_hold`]), because the hold the delivery took has already paid for the gathering
+//!   window by then, and because what an attempt costs this emulator is not bounded by those
+//!   spans alone: an invocation also waits for its share of the run capacity. So no message is
+//!   handed to a second consumer while the first attempt at it may still be running (see
 //!   [`invisible_for_seconds`]). A mapping carrying a
 //!   `MaximumBatchingWindowInSeconds` — "the maximum amount of time, in seconds, that Lambda
 //!   spends gathering records before invoking the function" — holds a batch it has not
@@ -917,12 +918,15 @@ struct HeldBatch<'batch> {
 /// Renew the hold on `held`'s messages in `target`'s queue, hiding each of them for the hold
 /// span again, counted from `now`.
 ///
-/// One delivery hides a message for one hold span, counted from that delivery; an ATTEMPT
-/// still running when that span is up belongs to a consumer that is still working on the
-/// batch, so the hold is extended through the queue's own visibility bookkeeping — the path a
-/// client's `ChangeMessageVisibility` takes — instead of being let lapse under a running
-/// attempt. The span an attempt really takes is not bounded by the function's `Timeout`
-/// alone: an invocation also waits for its share of this emulator's run capacity, so a hold
+/// One delivery hides a message for one hold span, counted from that delivery; a poller that
+/// is STILL HOLDING the batch when part of that span has been spent is a consumer that is
+/// still working on it, so the hold is extended through the queue's own visibility
+/// bookkeeping — the path a client's `ChangeMessageVisibility` takes — instead of being let
+/// lapse under it. Both spans a pass holds a batch over are renewed this way: the ATTEMPT
+/// reserves it afresh when it begins, because the delivery's hold has already paid for the
+/// batching window the batch was gathered over, and again while the attempt is still running,
+/// because the span an attempt really takes is not bounded by the function's `Timeout` alone
+/// — an invocation also waits for its share of this emulator's run capacity, so a hold
 /// computed from the configured spans can be up before the attempt it covers is decided.
 ///
 /// Best effort per message: one the attempt has already had deleted, and one whose hold
@@ -1137,10 +1141,15 @@ async fn hand_over_batch(
 /// Hand one batch over ([`hand_over_batch`]) while KEEPING the hold on the messages `held`
 /// covers alive for as long as the attempt takes.
 ///
-/// The attempt is raced against the renewal cadence [`hold_renewal`] states, so every time
-/// one hold span is about to run out under a running attempt the batch is hidden for another
-/// ([`renew_hold`]) — which is what makes the poller's promise true: no message is handed to
-/// a second consumer, this loop's own next pass included, while the first attempt at it is
+/// The attempt RESERVES the batch for a whole hold span counted from the instant it begins,
+/// before it is even started ([`renew_hold`]): the reservation it would otherwise inherit is
+/// only what is LEFT of the hold the delivery took, and a mapping that gathered its batch
+/// over a batching window has already spent that window of it — so a batch gathered over a
+/// window would come back mid-attempt, a delivery to a second consumer that nothing asked
+/// for. From there the attempt is raced against the renewal cadence [`hold_renewal`] states,
+/// so every time one hold span is about to run out under a running attempt the batch is
+/// hidden for another — which is what makes the poller's promise true: no message is handed
+/// to a second consumer, this loop's own next pass included, while the first attempt at it is
 /// still being decided. Nothing is renewed once the attempt answers: the hold the last
 /// renewal left runs out on the queue's own bookkeeping, so a message the attempt did not
 /// process comes back for another delivery one hold span later.
@@ -1151,6 +1160,7 @@ async fn attempt_batch(
     invoking: &[String],
     held: &HeldBatch<'_>,
 ) -> Result<Vec<String>, String> {
+    renew_hold(target, held, SystemTime::now());
     let mut attempt = ::std::pin::pin!(hand_over_batch(client, target, payload, invoking));
     let renew_every = hold_renewal(held.hold_seconds);
     loop {

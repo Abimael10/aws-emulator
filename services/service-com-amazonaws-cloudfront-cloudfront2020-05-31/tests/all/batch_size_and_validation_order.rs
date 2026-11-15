@@ -10,10 +10,10 @@
 //!   resource HOLDS is the other condition and keeps its own code, so the two never answer
 //!   for each other: one is permanent and asks the caller to split the batch, the other is
 //!   transient and asks it to wait. A document larger than this API READS is a third
-//!   condition, decided on its bytes alone: the transport's own `413`, carrying no error
-//!   document, since nothing parsed the request far enough to name an operation or one of
-//!   its modelled errors — so a document whose object count the published bound admits is
-//!   refused that way too when its bytes are past the ceiling.
+//!   condition, decided on its bytes alone and BEFORE either of them: the transport's own
+//!   `413`, carrying no error document, since nothing parsed the request far enough to name
+//!   an operation or one of its modelled errors — which is the answer the recorded batch of
+//!   60,000 real-looking paths gets, whichever surface it is submitted to.
 //! * `ListDomainConflicts` evaluates the `DomainControlValidationResource` — the caller's
 //!   proof that it controls the domain — BEFORE the `Domain` string's own shape, so a
 //!   validation resource holding no certificate that covers the domain is refused in the
@@ -260,9 +260,8 @@ fn batch_over(reference: &str, count: usize, floor: usize) -> String {
 
 /// A request whose DOCUMENT is larger than this API reads is refused on its bytes alone: the
 /// transport's 413 carrying no error document at all, on every surface, whatever the batch
-/// itself describes — while a document the API DOES read and that names more objects
-/// than one request may is the modelled `BatchTooLarge`, which carries its code under the
-/// same status.
+/// itself describes — while a document the API DOES read and that names more objects than one
+/// request may is the modelled `BatchTooLarge`, which carries its code under the same status.
 #[tokio::test]
 async fn a_document_larger_than_the_api_reads_is_refused_with_no_error_document() {
     let router = emulator();
@@ -304,21 +303,27 @@ async fn a_document_larger_than_the_api_reads_is_refused_with_no_error_document(
             let answer = submit(&router, surface, &id, &document).await;
             let after = held(&router, surface, &id).await;
 
-            assert_eq!(
-                answer.status, 413,
-                "case {label}: expected HTTP 413, got {} with {}",
-                answer.status,
-                answer.raw.chars().take(400).collect::<String>()
-            );
             if *past_ceiling {
                 // Nothing read the request, so there is nothing for the answer to say: a
                 // client has only the status to classify it by.
+                assert_eq!(
+                    answer.status, 413,
+                    "case {label}: expected HTTP 413, got {} with {}",
+                    answer.status,
+                    answer.raw.chars().take(400).collect::<String>()
+                );
                 assert!(
                     answer.raw.trim().is_empty(),
                     "case {label}: expected no error document at all, got {}",
                     answer.raw.chars().take(400).collect::<String>()
                 );
             } else {
+                assert_eq!(
+                    answer.status, 413,
+                    "case {label}: expected HTTP 413, got {} with {}",
+                    answer.status,
+                    answer.raw.chars().take(400).collect::<String>()
+                );
                 assert_eq!(
                     answer.error_code(),
                     "BatchTooLarge",
@@ -333,6 +338,79 @@ async fn a_document_larger_than_the_api_reads_is_refused_with_no_error_document(
                  holds {before} invalidations, got {after}"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The two recorded oversized-batch conditions, side by side
+// ---------------------------------------------------------------------------
+
+/// How long a path of the RECORDED oversized batch is, in characters: ~60, which is what a
+/// client naming real object keys sends.
+const RECORDED_PATH_CHARS: usize = 60;
+
+/// How many paths that recorded batch names.
+const RECORDED_PATH_COUNT: usize = 60_000;
+
+/// A batch of [`RECORDED_PATH_COUNT`] paths of [`RECORDED_PATH_CHARS`] characters each — the
+/// document the recorded oversized-batch call submits.
+fn recorded_oversized_document(reference: &str) -> String {
+    let owned: Vec<String> = (0..RECORDED_PATH_COUNT)
+        .map(|index| {
+            let stem = format!("{index:06}");
+            format!(
+                "/{}{stem}.html",
+                "o".repeat(RECORDED_PATH_CHARS - stem.len() - "/.html".len())
+            )
+        })
+        .collect();
+    let batch: Vec<&str> = owned.iter().map(String::as_str).collect();
+    batch_xml(reference, &batch)
+}
+
+/// The two oversized-batch conditions are told apart by the document's BYTES, which is what
+/// reconciles the two recordings of this surface: a batch of 60,000 real-looking paths is a
+/// document past what this API reads, so it is refused unread with a bare `413` carrying no
+/// error document (a client's SDK reports that refusal's code as the status string), while a
+/// document the API DOES read and that names more objects than one request may is the
+/// modelled `BatchTooLarge` the object bound answers for a document the API does read.
+#[tokio::test]
+async fn the_recorded_oversized_batch_is_past_the_document_ceiling_on_every_surface() {
+    let router = emulator();
+
+    for surface in [Surface::Distribution, Surface::Tenant] {
+        let label = surface.label();
+        let id = resource_for(&router, surface, &format!("recorded-{label}")).await;
+        let document = recorded_oversized_document(&format!("recorded-oversized-{label}"));
+        assert!(
+            document.len() > MAX_REQUEST_BODY_BYTES,
+            "case {label}: the recorded batch of {RECORDED_PATH_COUNT} paths of \
+             {RECORDED_PATH_CHARS} characters must be past the {MAX_REQUEST_BODY_BYTES}-byte \
+             document ceiling, built {} bytes",
+            document.len()
+        );
+
+        let before = held(&router, surface, &id).await;
+        let answer = submit(&router, surface, &id, &document).await;
+        let after = held(&router, surface, &id).await;
+
+        assert_eq!(
+            answer.status, 413,
+            "case {label}: expected HTTP 413, got {} with {}",
+            answer.status,
+            answer.raw.chars().take(400).collect::<String>()
+        );
+        assert!(
+            answer.raw.trim().is_empty(),
+            "case {label}: a document past the ceiling is refused unread, so there is no \
+             error document to read, got {}",
+            answer.raw.chars().take(400).collect::<String>()
+        );
+        assert_eq!(
+            after, before,
+            "case {label}: a refused request persists nothing, so the resource still holds \
+             {before} invalidations, got {after}"
+        );
     }
 }
 

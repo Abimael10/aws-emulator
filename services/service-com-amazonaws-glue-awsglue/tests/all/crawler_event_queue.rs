@@ -14,10 +14,12 @@
 //! that queue, and creates the identically-shaped crawler whose role does hold them.
 //!
 //! The refusal is Glue's OWN sentence for a queue a crawl cannot read, not the queue
-//! service's authorization answer: it names the queue the target carried and nothing else —
-//! neither the identity the crawl would run as, nor which queue call was withheld, nor which
-//! of IAM's rules withheld it — and it states the two reasons a crawl could not read that
-//! queue, its absence and the role's access, in one clause.
+//! service's authorization answer: its one variable part is the queue the target carried, and
+//! it names neither the identity the crawl would run as nor which of IAM's rules withheld the
+//! grant. It states the two reasons a crawl could not read that queue, its absence and the
+//! role's access, in one clause, and then the REQUIREMENT the crawl holds the queue to — the
+//! queue calls a crawl in event mode makes on it, in the order it makes them — so the caller
+//! is told which grant to add whichever of them its policies are missing.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -97,13 +99,17 @@ fn allow(actions: &[&str], resource: &str) -> Value {
 
 /// The sentence Glue refuses an event-mode create with when the crawl cannot read the
 /// queue a target names: the queue ARN as the request supplied it, inside fixed text that
-/// conflates the queue's absence with the role's access to it.
+/// conflates the queue's absence with the role's access to it, followed by the queue calls a
+/// crawl makes on that queue.
 ///
 /// Spelled out here rather than built from the service's own constructor, so the wording
-/// this suite pins is the test's and not the code's.
+/// this suite pins is the test's and not the code's — including the ACTIONS, written out in
+/// the order a crawl makes them.
 fn expected_refusal(queue_arn: &str) -> String {
     format!(
-        "SQS queue {queue_arn} does not exist or the role provided does not have access to it."
+        "SQS queue {queue_arn} does not exist or the role provided does not have access to \
+         it. Please make sure the role has SQS:ReceiveMessage, SQS:GetQueueAttributes and \
+         SQS:DeleteMessage permissions on the queue."
     )
 }
 
@@ -137,9 +143,9 @@ type Row = (String, Vec<Value>, ExpectedRefusal);
 /// each missing in turn), a `Deny` of one of them beside an `Allow` of all, and the full
 /// grant — written as the exact ARN, through a wildcard, and spread over two documents.
 ///
-/// Every refused row earns the SAME sentence, naming the queue: which queue call the row's
-/// documents withhold, and whether a `Deny` or an absent grant withheld it, decides that the
-/// create is refused and nothing about how it is worded.
+/// Every refused row earns the SAME sentence, naming the queue and the grant a crawl needs on
+/// it: which queue call the row's documents withhold, and whether a `Deny` or an absent grant
+/// withheld it, decides that the create is refused and nothing about how it is worded.
 #[tokio::test]
 async fn an_event_mode_crawler_needs_its_role_to_consume_the_event_queue() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -158,9 +164,8 @@ async fn an_event_mode_crawler_needs_its_role_to_consume_the_event_queue() {
         })
     };
 
-    // (case, the documents the role carries, the refusal it earns: the action the
-    // rejection must name and whether an explicit `Deny` withheld it, or `None` where
-    // the create must be admitted)
+    // (case, the documents the role carries, and whether they earn the refusal — `false`
+    // where the role holds the whole grant and the create must be admitted)
     let mut rows: Vec<Row> = vec![
         ("no policy at all".to_string(), Vec::new(), true),
         (
@@ -203,8 +208,7 @@ async fn an_event_mode_crawler_needs_its_role_to_consume_the_event_queue() {
         ),
     ];
     // One row per action the crawl makes, each one missing from an otherwise complete
-    // grant: every action is required, so each omission refuses on its own — and the
-    // refusal names the action that omission withheld.
+    // grant: every action is required, so each omission refuses on its own.
     for missing in EVENT_QUEUE_ACTIONS {
         let granted: Vec<&str> = every_action
             .iter()

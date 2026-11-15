@@ -98,22 +98,19 @@ fn documented_endpoint(api_id: &str, region: &str) -> String {
     format!("https://{api_id}.execute-api.{region}.amazonaws.com")
 }
 
-/// Assert `reported` is the documented endpoint of `api_id` in `row`'s Region, label by
-/// label, so a failure says WHICH part of the form is wrong.
-fn assert_documented(row: &Row, reporter: &str, api_id: &str, reported: &str) {
+/// Assert `reported` is the documented endpoint of `api_id` in `row`'s Region, part by part,
+/// so a failure says WHICH part of the form is wrong.
+fn assert_announced(row: &Row, reporter: &str, api_id: &str, reported: &str) {
     let expected = documented_endpoint(api_id, row.region);
     assert_eq!(
         reported, expected,
         "case {:?}: {reporter} must report {expected:?}, got {reported:?}",
         row.case
     );
-    let authority = reported
-        .strip_prefix("https://")
-        .unwrap_or_else(|| panic!("case {:?}: {reporter} reported {reported:?}", row.case));
+    let (authority, path) = split_authority(row, reporter, reported);
     assert!(
-        !authority.contains('/'),
-        "case {:?}: {reporter} must report an endpoint with no path of its own, got \
-         {reported:?}",
+        path.is_empty(),
+        "case {:?}: the documented endpoint carries no path of its own, got {reported:?}",
         row.case
     );
     let labels: Vec<&str> = authority.split('.').collect();
@@ -136,6 +133,18 @@ fn assert_documented(row: &Row, reporter: &str, api_id: &str, reported: &str) {
         "case {:?}: {reporter} must carry the request's Region, got {reported:?}",
         row.case
     );
+}
+
+/// `reported` split into the authority a client dials and the path it carries — empty for an
+/// endpoint that is a bare host.
+fn split_authority(row: &Row, reporter: &str, reported: &str) -> (String, String) {
+    let authority = reported
+        .strip_prefix("https://")
+        .unwrap_or_else(|| panic!("case {:?}: {reporter} reported {reported:?}", row.case));
+    match authority.find('/') {
+        Some(at) => (authority[..at].to_string(), authority[at..].to_string()),
+        None => (authority.to_string(), String::new()),
+    }
 }
 
 /// The OpenAPI definition the import rows PUT: one route fronting the same upstream, so what
@@ -218,17 +227,17 @@ async fn deploy(emulator: &MultiServiceRouter, row: &Row, api_id: &str) {
     );
 }
 
-/// Send one invoke to the announced authority and assert the api's route SERVED it.
+/// Send one invoke to the announced address and assert the api's route SERVED it: the
+/// authority the announced endpoint names, at its own base path followed by `path`.
 async fn assert_invoke_reaches_the_route(
     emulator: &MultiServiceRouter,
     row: &Row,
     announced: &str,
     path: &str,
 ) {
-    let authority = announced
-        .strip_prefix("https://")
-        .unwrap_or_else(|| panic!("case {:?}: announced {announced:?}", row.case));
-    let answer: Answer = send(emulator, authority, "GET", path, &[]).await;
+    let (authority, base_path) = split_authority(row, "the announced endpoint", announced);
+    let path = format!("{base_path}{path}");
+    let answer: Answer = send(emulator, &authority, "GET", &path, &[]).await;
     assert_ne!(
         answer.error_type.as_deref(),
         Some(UNKNOWN_SERVICE),
@@ -254,8 +263,8 @@ async fn assert_invoke_reaches_the_route(
     );
 }
 
-/// `CreateApi` reports the documented endpoint whatever endpoint the create was addressed
-/// at, every later reporter repeats it, and the host it names is one this emulator claims.
+/// `CreateApi` reports the documented endpoint to a client that resolves AWS's own hosts,
+/// every later reporter repeats it, and the host it names is one this emulator claims.
 #[tokio::test]
 async fn a_created_api_reports_the_documented_execute_api_endpoint() {
     for (index, row) in rows().into_iter().enumerate() {
@@ -279,7 +288,7 @@ async fn a_created_api_reports_the_documented_execute_api_endpoint() {
         );
         let api_id = as_str(&created, "apiId");
         let announced = as_str(&created, "apiEndpoint");
-        assert_documented(&row, "CreateApi", &api_id, &announced);
+        assert_announced(&row, "CreateApi", &api_id, &announced);
 
         let (status, fetched) = call_at_host(
             &emulator,
@@ -295,7 +304,7 @@ async fn a_created_api_reports_the_documented_execute_api_endpoint() {
             "case {:?}: GetApi must answer 200, got {status} {fetched}",
             row.case
         );
-        assert_documented(&row, "GetApi", &api_id, &as_str(&fetched, "apiEndpoint"));
+        assert_announced(&row, "GetApi", &api_id, &as_str(&fetched, "apiEndpoint"));
 
         let (status, listed) =
             call_at_host(&emulator, row.host, row.region, "GET", "/v2/apis", None).await;
@@ -313,7 +322,7 @@ async fn a_created_api_reports_the_documented_execute_api_endpoint() {
             "case {:?}: this emulator holds exactly the row's api, got {listed}",
             row.case
         );
-        assert_documented(&row, "GetApis", &api_id, &as_str(&items[0], "apiEndpoint"));
+        assert_announced(&row, "GetApis", &api_id, &as_str(&items[0], "apiEndpoint"));
 
         let (status, updated) = call_at_host(
             &emulator,
@@ -329,7 +338,7 @@ async fn a_created_api_reports_the_documented_execute_api_endpoint() {
             "case {:?}: UpdateApi must answer 201, got {status} {updated}",
             row.case
         );
-        assert_documented(&row, "UpdateApi", &api_id, &as_str(&updated, "apiEndpoint"));
+        assert_announced(&row, "UpdateApi", &api_id, &as_str(&updated, "apiEndpoint"));
 
         let (status, reimported) = call_at_host(
             &emulator,
@@ -345,14 +354,14 @@ async fn a_created_api_reports_the_documented_execute_api_endpoint() {
             "case {:?}: ReimportApi must answer 200, got {status} {reimported}",
             row.case
         );
-        assert_documented(
+        assert_announced(
             &row,
             "ReimportApi",
             &api_id,
             &as_str(&reimported, "apiEndpoint"),
         );
 
-        // And the host that endpoint names is claimed: the reimported definition's route
+        // And the address that endpoint names is claimed: the reimported definition's route
         // answers on it, both at the api's root stage and with that stage spelled out.
         let (status, stage) = call_at_host(
             &emulator,
@@ -403,7 +412,7 @@ async fn an_imported_api_reports_the_documented_execute_api_endpoint() {
         );
         let api_id = as_str(&imported, "apiId");
         let announced = as_str(&imported, "apiEndpoint");
-        assert_documented(&row, "ImportApi", &api_id, &announced);
+        assert_announced(&row, "ImportApi", &api_id, &announced);
 
         // An imported api carries no stage, so one is released over it, and the endpoint the
         // import published serves the route the definition declared.
@@ -448,14 +457,14 @@ async fn the_announced_host_serves_a_created_api_s_own_route() {
     );
     let api_id = as_str(&created, "apiId");
     let announced = as_str(&created, "apiEndpoint");
-    assert_documented(row, "CreateApi", &api_id, &announced);
+    assert_announced(row, "CreateApi", &api_id, &announced);
 
     deploy(&emulator, row, &api_id).await;
     assert_invoke_reaches_the_route(&emulator, row, &announced, ROUTE_PATH).await;
 }
 
-/// The one api this rule does not cover: a WEBSOCKET api reports the `wss` socket the core
-/// opened for its data plane, which is the only address an RFC 6455 handshake can be
+/// The api neither half of this rule covers: a WEBSOCKET api reports the `wss` socket the
+/// core opened for its data plane, which is the only address an RFC 6455 handshake can be
 /// completed against. `ProtocolType` is `HTTP | WEBSOCKET`
 /// (`smithy_query(query="shape", shape="ProtocolType")`), so this is the whole exception.
 #[tokio::test]
@@ -543,7 +552,7 @@ async fn the_documented_endpoint_varies_only_in_the_api_id_and_the_region() {
         );
         let api_id = as_str(&created, "apiId");
         let reported = as_str(&created, "apiEndpoint");
-        assert_documented(&row, "CreateApi", &api_id, &reported);
+        assert_announced(&row, "CreateApi", &api_id, &reported);
         announced.push((row.region.to_string(), reported));
     }
     // What is left of each value once its own id and its own Region are taken out is the

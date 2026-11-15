@@ -4163,24 +4163,40 @@ pub fn invalid_wildcard_semantic_version_message(member: &str) -> String {
 /// The member an instance profile name arrives in, as the API addresses it.
 pub const INSTANCE_PROFILE_NAME_MEMBER: &str = "instanceProfileName";
 
-/// Why a create naming an instance profile this account does not hold is refused.
+/// Why a create or an update naming an instance profile this account does not hold is
+/// refused.
 ///
 /// `instanceProfileName` is "the instance profile to associate with the instance used to
 /// customize your Amazon EC2 AMI" — an IAM resource of the caller's account, which the model
 /// can only constrain the SHAPE of, so whether it exists is resolved against IAM itself
-/// ([`instance_profile_named`]). A value this service cannot accept is refused in the ONE
-/// sentence it states every parameter refusal in
-/// (`service_common::validation_message::parameter_value_mismatch`), whatever established
-/// that the value is not one it admits — a constraint of the model, or a lookup of the
-/// resource the value names. The requirement clause states that no such profile exists;
-/// nothing of the value is echoed.
+/// ([`instance_profile_named`]). This refusal is NOT one of the modelled-constraint class the
+/// service states as `The value supplied for parameter '<member>' is not valid. …`
+/// (`service_common::validation_message::parameter_value_mismatch`): a profile that is not
+/// there is reported in the service's own naming form for a refused parameter — the member
+/// unquoted, then a colon, then the requirement — which is how the instance-profile lookup
+/// words it. The requirement clause states that no such profile exists; nothing of the value
+/// is echoed.
 #[must_use]
 pub fn missing_instance_profile_message(member: &str) -> String {
-    ::service_common::validation_message::parameter_value_mismatch(
+    invalid_parameter_value_message(
         member,
         "The provided instance profile does not exist. Please specify a different instance \
          profile and try again.",
     )
+}
+
+/// The sentence this service states a parameter refusal in when the refusal is the service's
+/// own rather than one of the modelled-constraint class: `Invalid parameter value for
+/// <member>: <requirement>`.
+///
+/// The member is named as the API addresses it and the requirement follows the colon, so the
+/// caller is told which parameter was refused and what its value had to satisfy. The value
+/// itself is WITHHELD, exactly as in the constraint-class sentence
+/// (`service_common::validation_message::parameter_value_mismatch`): the requirement is what
+/// the parameter admits, not the one value that missed it.
+#[must_use]
+pub fn invalid_parameter_value_message(member: &str, requirement: &str) -> String {
+    format!("Invalid parameter value for {member}: {requirement}")
 }
 
 /// Why a `CreateComponent` naming neither a document nor a URI, or both, is refused.

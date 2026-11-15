@@ -1667,3 +1667,22 @@ mod zz_probe_whole_emulator;
 //! check that, for this file and for every service crate's `tests/all.rs`.
 //! The `#[path]` is what points each declaration into `tests/all/`, and the build's layout
 //! check requires every file under `tests/all/` to be declared here.
+//! Single integration-test target for the router: the suites that drive MORE THAN ONE
+//! service over the assembled emulator.
+//! This file is a CANONICAL DECLARATION LIST: this module doc, then one
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file under `tests/all/`,
+//! sorted by name, and no other line — so two branches landing at once insert two lines in
+//! A suite that is not declared here compiles nowhere and its tests never run (this crate's
+//! `build.rs` refuses it); a suite left at the top level of `tests/` is a test target of its
+//! own, which the layout check refuses; a second `mod` for one name is `E0428`; and an inner
+//! doc comment (`//!`) is legal only BEFORE the first item, so THESE lines are the only
+//! place one may stand — past the first declaration it is `E0753`. Each of those fails every
+//! suite in this target. `all/all_rs_declares_each_suite_once.rs`,
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check them, for this file and for every
+//! service crate's `tests/all.rs`.
+//! file (`tests/<name>.rs`): the `#[path]` is what points each declaration into `tests/all/`.
+//! WHAT a suite covers, and why it belongs to this cross-service target rather than to one
+//! service crate's own, is stated in that suite's OWN module doc, where it is read beside
+//! the test it explains; `all/appended_notes.rs` keeps the notes landings had appended here.
+#[path = "all/lambda_sqs_event_source_attempt_reservation.rs"]
+mod lambda_sqs_event_source_attempt_reservation;

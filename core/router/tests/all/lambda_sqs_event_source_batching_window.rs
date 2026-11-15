@@ -157,6 +157,32 @@ pub(crate) async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Val
     (status, parsed)
 }
 
+/// Receive from the queue `url` addresses as an INDEPENDENT consumer: whatever it is handed,
+/// which must be nothing while a mapping of that queue holds the record.
+///
+/// The one reading of that question for the suites over what a mapping HOLDS
+/// (`crate::lambda_sqs_event_source_visibility_hold`,
+/// `crate::lambda_sqs_event_source_attempt_reservation`): the reservation is observable only
+/// as what another consumer of the same queue is handed, so both reach for this rather than
+/// keeping a copy of it.
+pub(crate) async fn independent_receive(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+) -> Vec<Value> {
+    let (status, received) = sqs(
+        router,
+        "ReceiveMessage",
+        &json!({ "QueueUrl": url, "MaxNumberOfMessages": 10 }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: an independent ReceiveMessage answered {status} {received}"
+    );
+    received["Messages"].as_array().cloned().unwrap_or_default()
+}
+
 /// A queue called `name` hiding a delivered record for [`VISIBILITY_TIMEOUT`]; answers its url
 /// and the ARN a mapping names it by, both read back out of Amazon SQS.
 async fn given_queue(router: &MultiServiceRouter, case: &str, name: &str) -> (String, String) {

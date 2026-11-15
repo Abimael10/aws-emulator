@@ -292,8 +292,9 @@ async fn assert_served(
 /// Every spelling of the invoke URL a client builds from the published endpoint, as
 /// `(what a failing assertion calls it, the path to send)`.
 ///
-/// `base_path` is what the endpoint carries ahead of the stage, which is empty for the
-/// documented execute-api host; an empty path is the root itself.
+/// `base_path` is what the endpoint carries ahead of the stage — the reserved data-plane path
+/// of the api for a client on the emulator's own endpoint, and empty for the documented
+/// execute-api host; an empty path is the root itself.
 fn spellings(base_path: &str) -> Vec<(String, String)> {
     let at = |path: String| if path.is_empty() { "/".to_string() } else { path };
     vec![

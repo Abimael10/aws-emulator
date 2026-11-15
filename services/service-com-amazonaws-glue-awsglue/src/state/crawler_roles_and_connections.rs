@@ -251,8 +251,8 @@ pub async fn glue_role_is_unassumable(
 /// The Amazon SQS actions a crawler performs against the event queue of an S3 target it
 /// crawls in event mode: it RECEIVES the change messages, reads the queue's attributes to
 /// learn what is pending, and DELETES each message it has processed. Listed in the order
-/// the crawl makes them, which is the order a refusal reports the first one withheld in
-/// ([`event_queue_refusal`]).
+/// the crawl makes them, which is the order a refusal states the grant it needs in
+/// ([`event_queue_actions_clause`]).
 ///
 /// Each is qualified the way the queue's OWN service qualifies its actions — `SQS:` before
 /// the API name, the spelling its policies and its authorization refusals carry (see that
@@ -265,6 +265,21 @@ pub const EVENT_QUEUE_ACTIONS: [&str; 3] = [
     "SQS:GetQueueAttributes",
     "SQS:DeleteMessage",
 ];
+
+/// The queue calls a crawl makes, as a refusal lists them: each action in the order the crawl
+/// makes them ([`EVENT_QUEUE_ACTIONS`]), comma-separated and closed by `and`.
+///
+/// The REQUIREMENT clause of [`messages::event_queue_inaccessible`] states the whole grant
+/// the crawl needs rather than the one call that happened to be withheld first, because every
+/// one of them has to be admitted for the crawl to read the queue at all — so a caller is told
+/// what to grant, whichever of them its policies are missing.
+pub fn event_queue_actions_clause() -> String {
+    match EVENT_QUEUE_ACTIONS.split_last() {
+        Some((last, [])) => (*last).to_string(),
+        Some((last, leading)) => format!("{} and {last}", leading.join(", ")),
+        None => String::new(),
+    }
+}
 
 /// The most policy documents this check reads for ONE role.
 ///

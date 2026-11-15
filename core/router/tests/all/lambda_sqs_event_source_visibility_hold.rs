@@ -28,13 +28,13 @@
 //! The rows differ along what the rule generalises over: the queue's own `VisibilityTimeout`
 //! against the window the mapping gathers over, and how many records the reservation covers.
 
-use serde_json::{json, Value};
+use serde_json::json;
 use service_com_amazonaws_lambda_awsgirapiservice::state::LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::lambda_sqs_event_source_batching_window::{
-    await_state, given_queue_hiding_for, given_unrunnable_function, lambda,
-    last_processing_result, queue_attribute, send_message, shared_emulator, sqs, BUDGET,
+    await_state, given_queue_hiding_for, given_unrunnable_function, independent_receive, lambda,
+    last_processing_result, queue_attribute, send_message, shared_emulator, BUDGET,
     FUNCTION_TIMEOUT, IN_FLIGHT_MESSAGES, LOOK_AGAIN, MAPPINGS_URI, STATE_ENABLED,
 };
 
@@ -57,22 +57,6 @@ struct Row {
 /// The `BatchSize` every row polls under: larger than the records it sends, so no row's
 /// batch fills and each waits its whole window out.
 const BATCH_SIZE: i64 = 10;
-
-/// Receive from the queue `url` addresses as an INDEPENDENT consumer: whatever it is handed,
-/// which must be nothing while the mapping holds the record.
-async fn independent_receive(router: &MultiServiceRouter, case: &str, url: &str) -> Vec<Value> {
-    let (status, received) = sqs(
-        router,
-        "ReceiveMessage",
-        &json!({ "QueueUrl": url, "MaxNumberOfMessages": 10 }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: an independent ReceiveMessage answered {status} {received}"
-    );
-    received["Messages"].as_array().cloned().unwrap_or_default()
-}
 
 /// How many of the queue's records are in flight with a consumer right now.
 async fn in_flight(router: &MultiServiceRouter, case: &str, url: &str) -> u64 {

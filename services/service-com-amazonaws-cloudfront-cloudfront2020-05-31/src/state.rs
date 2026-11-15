@@ -531,7 +531,10 @@ pub const MAX_TRUSTED_KEY_GROUPS: usize = 4;
 /// CloudFront's published quota for an invalidation request is 3,000 files, and the
 /// batch is stored whole, so this bounds a single request's contribution to the store as
 /// well. Over it, the refusal is the modelled `BatchTooLarge` (HTTP 413): "Invalidation
-/// batch specified is too large."
+/// batch specified is too large." — on every create that takes an invalidation batch, since
+/// the bound is a property of the request alone. A document whose BYTES are past what this
+/// API reads never reaches that check: it is refused unread by the request boundary
+/// (`crate::service::envelope::MAX_REQUEST_BODY_BYTES`).
 pub const MAX_INVALIDATION_PATHS: usize = 3_000;
 
 /// The most tags ONE CloudFront resource may carry.

@@ -9,11 +9,17 @@
 //! <the status it answered>; Error Code: <the exception it named>; Request ID: <that call's
 //! own id, minted per call>; Proxy: null)`, the five fields in that order. The exception
 //! names which step of that reading refused — looking the provider's manifest up, or reading
-//! the presented response against the manifest it found. A class this service decides ITSELF
-//! — the role the REQUEST asked for against the pairs a verified response asserts, the
-//! validity window it answers its own expiry error for, and the provider's own report that
-//! the authentication failed — carries its sentence ALONE, because no relayed call refused
-//! it.
+//! the presented response against the manifest it found.
+//!
+//! Three kinds of class carry NO envelope, and state the sentence alone:
+//!
+//! * the classes this service decides ITSELF — the role the REQUEST asked for against the
+//!   pairs a verified response asserts, the validity window it answers its own expiry error
+//!   for, and the provider's own report that the authentication failed — because no relayed
+//!   call refused them;
+//! * the SIGNATURE classes: a response whose signature does not check out, and one whose
+//!   declared transforms a verifier will not accept. That refusal is the bare sentence, so a
+//!   client telling this class from the others matches a message that is equal every time.
 //!
 //! The rows below span the class: which part of the presented value was wrong (its encoding,
 //! its XML, its SAML-ness, its signature, its issuer, the session it names), whether the
@@ -21,7 +27,8 @@
 //! on its own. Each row drives the real path end to end on one shared engine — the provider
 //! and the role are registered through IAM's own operations and the response is signed here
 //! — and the recorded cases (a non-base64 value, a response with its signature removed, a
-//! response asserting another role, and a deleted provider) are rows of it.
+//! response signed by another key, a response asserting another role, and a deleted provider)
+//! are rows of it.
 
 use service_common::query_error_envelope::is_request_id;
 
@@ -80,15 +87,12 @@ pub(crate) fn relayed_request_id(
 
 /// The ARN IAM keys a SAML provider of this account by.
 fn provider_arn_of(name: &str) -> String {
-    format!(
-        "arn:aws:iam::{}:saml-provider/{name}",
-        emulator_account()
-    )
+    format!("arn:aws:iam::{}:saml-provider/{name}", emulator_account())
 }
 
 /// What a row expects of the refusal: the HTTP status, the `<Code>`, the fixed sentence of
-/// its class, and the exception of the relayed call that refused it — `None` for a class this
-/// service decides itself, which carries no envelope.
+/// its class, and the exception of the relayed call that refused it — `None` for a class that
+/// carries no envelope (the signature classes, and the classes this service decides itself).
 struct Refusal {
     status: u16,
     code: &'static str,
@@ -126,7 +130,7 @@ fn assert_refusal(case: &str, status: u16, body: &str, expected: &Refusal) -> St
             );
             assert!(
                 !reported.contains("(Service:"),
-                "case {case:?}: a class this service decides itself relays nothing, got \
+                "case {case:?}: a class that carries no envelope relays nothing, got \
                  {reported:?}"
             );
         }
@@ -135,8 +139,8 @@ fn assert_refusal(case: &str, status: u16, body: &str, expected: &Refusal) -> St
 }
 
 /// The whole table: every class the reading of a presented response is refused as carries its
-/// sentence and the envelope of the call that refused it, and every class this service
-/// decides itself carries its sentence alone.
+/// sentence and the envelope of the call that refused it, every SIGNATURE class carries its
+/// sentence alone, and so does every class this service decides itself.
 #[tokio::test]
 async fn each_refusal_states_its_class_and_the_relayed_call_that_refused_it() {
     let (router, _engine) = emulator_with_iam();
@@ -201,10 +205,11 @@ async fn each_refusal_states_its_class_and_the_relayed_call_that_refused_it() {
             relayed(NOT_SIGNED_MESSAGE, INVALID_RESPONSE_EXCEPTION),
         ),
         (
+            // A SIGNATURE class: the recorded refusal is the bare sentence.
             "a response signed by a key the named provider does not publish",
             provider_arn.clone(),
             saml_assertion(&other, &Response::valid(&other, &role_arn, &provider_arn)),
-            relayed(SIGNATURE_INVALID_MESSAGE, INVALID_RESPONSE_EXCEPTION),
+            own(400, "InvalidIdentityToken", SIGNATURE_INVALID_MESSAGE),
         ),
         (
             "a response altered after it was signed",
@@ -213,7 +218,7 @@ async fn each_refusal_states_its_class_and_the_relayed_call_that_refused_it() {
                 altered_after_signing: true,
                 ..valid()
             }),
-            relayed(SIGNATURE_INVALID_MESSAGE, INVALID_RESPONSE_EXCEPTION),
+            own(400, "InvalidIdentityToken", SIGNATURE_INVALID_MESSAGE),
         ),
         (
             "a response from an issuer the named provider is not registered for",
@@ -301,10 +306,11 @@ async fn each_refusal_states_its_class_and_the_relayed_call_that_refused_it() {
     }
 }
 
-/// The envelope's request id belongs to the relayed CALL, so each refusal reports its own:
-/// two presentations of the same value answer the same class, the same status and the same
-/// sentence, and never the same request id — while a class carrying no envelope answers
-/// byte for byte alike.
+/// The envelope's request id belongs to the relayed CALL, so each refusal that carries one
+/// reports its own: two presentations of the same value answer the same class, the same status
+/// and the same sentence, and never the same request id — while a class carrying no envelope
+/// answers byte for byte alike, which is what a client matching the signature class's sentence
+/// depends on.
 #[tokio::test]
 async fn every_relayed_refusal_reports_its_own_request_id() {
     let (router, _engine) = emulator_with_iam();
@@ -315,7 +321,7 @@ async fn every_relayed_refusal_reports_its_own_request_id() {
     let valid = || Response::valid(&provider, &role_arn, &provider_arn);
 
     // One row: the case, the value presented, the sentence of its class, and the exception of
-    // the relayed call — `None` for the class this service decides itself.
+    // the relayed call — `None` for a class that carries no envelope.
     let rows: Vec<(&str, String, &str, Option<&'static str>)> = vec![
         (
             "a value that is not base64",
@@ -334,6 +340,18 @@ async fn every_relayed_refusal_reports_its_own_request_id() {
             ),
             NOT_SIGNED_MESSAGE,
             Some(INVALID_RESPONSE_EXCEPTION),
+        ),
+        (
+            "a response altered after it was signed",
+            saml_assertion(
+                &provider,
+                &Response {
+                    altered_after_signing: true,
+                    ..valid()
+                },
+            ),
+            SIGNATURE_INVALID_MESSAGE,
+            None,
         ),
         (
             "a response asserting another role",
@@ -398,7 +416,8 @@ async fn every_relayed_refusal_reports_its_own_request_id() {
                         message, &messages[0],
                         "case {case:?}: presentation {} must answer exactly as the first did, \
                          expected {:?}, got {message:?}",
-                        presentation + 1, messages[0]
+                        presentation + 1,
+                        messages[0]
                     );
                 }
             }
