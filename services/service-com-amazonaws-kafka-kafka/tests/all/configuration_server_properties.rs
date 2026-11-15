@@ -22,9 +22,8 @@
 
 use serde_json::Value;
 
-use service_com_amazonaws_kafka_kafka::state::{
-    catalogued_kafka_versions,
-    server_properties::{Declaration, SERVER_PROPERTIES_MEMBER},
+use service_com_amazonaws_kafka_kafka::state::server_properties::{
+    Declaration, SERVER_PROPERTIES_MEMBER,
 };
 
 use super::kafka_harness::{reported_server_properties, Emulator, Reply};
@@ -67,12 +66,8 @@ impl Row {
                 value: (*value).to_string(),
             })
             .collect();
-        let versions: Vec<String> = catalogued_kafka_versions()
-            .iter()
-            .map(|version| (*version).to_string())
-            .collect();
         service_com_amazonaws_kafka_kafka::state::server_properties::unsupported_properties_message(
-            &rejected, &versions,
+            &rejected,
         )
     }
 }

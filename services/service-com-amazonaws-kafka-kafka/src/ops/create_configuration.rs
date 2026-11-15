@@ -288,19 +288,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The refusal this builds is BOUNDED at both its factors, so no body can
         // amplify itself into a large response: the declarations reported are at
         // most `MAX_REPORTED_PROPERTIES` (the `take` below, which the reading
-        // applies too), and the versions each of them names are chosen from the
-        // versions this service publishes — the ones this configuration names,
-        // where it names any, and the whole published catalogue otherwise — so
-        // that list is at most `catalogued_kafka_versions().len()` long whatever
-        // the request carried. The body itself was bounded by the stored-body
-        // ceiling above before any of this read it.
-        let checked_versions: Vec<String> =
-            crate::state::server_properties::checked_versions(
-                &input.kafka_versions.clone().unwrap_or_default(),
-            )
-            .into_iter()
-            .take(crate::state::catalogued_kafka_versions().len())
-            .collect();
+        // applies too), and the versions each of them names are the versions this
+        // service publishes, so that list is at most
+        // `catalogued_kafka_versions().len()` long whatever the request carried.
+        // The body itself was bounded by the stored-body ceiling above before any
+        // of this read it.
         let Some(unconfigurable) =
             crate::state::server_properties::unconfigurable_declarations(&input.server_properties)
         else {
@@ -323,10 +315,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::server_properties::SERVER_PROPERTIES_MEMBER.to_string(),
                     ),
                     message: Some(
-                        crate::state::server_properties::unsupported_properties_message(
-                            &reported,
-                            &checked_versions,
-                        ),
+                        crate::state::server_properties::unsupported_properties_message(&reported),
                     ),
                 },
             )

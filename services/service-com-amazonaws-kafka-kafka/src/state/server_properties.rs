@@ -33,10 +33,9 @@
 //!   index, slice or arithmetic on anything the request carries;
 //! * the refusal's size is capped at BOTH its factors, so no request can amplify
 //!   itself into a large response: at most [`MAX_REPORTED_PROPERTIES`] (10)
-//!   declarations are reported, and the versions each names come from
-//!   [`checked_versions`], which chooses them FROM this service's published
-//!   catalogue and is therefore at most as long as that catalogue however long a
-//!   list the request carried.
+//!   declarations are reported, and the versions each names are this service's
+//!   published catalogue ([`checked_versions`]) rather than anything the request
+//!   carried.
 
 /// The published set of broker properties, which is data rather than reading.
 mod catalog;
@@ -100,19 +99,20 @@ pub fn is_configurable_property(name: &str) -> bool {
     catalog::CONFIGURABLE_PROPERTIES.contains(&name)
 }
 
-/// The Apache Kafka versions a declaration's name is checked against: the versions
-/// `named` that this service publishes, each once and in the catalogue's published
-/// order, and EVERY published version where `named` names none of them.
+/// The Apache Kafka versions a declaration's name is checked against: the
+/// versions this service publishes, in the order it publishes them
+/// ([`crate::state::catalogued_kafka_versions`], which names each published
+/// version once however many rows the catalogue publishes it under).
 ///
-/// Chosen FROM the catalogue rather than taken from the submitted list, so the
-/// refusal names versions this service actually publishes and its length is
-/// bounded by that catalogue however long a list the request carried.
-pub fn checked_versions(named: &[String]) -> Vec<String> {
+/// A property of the SERVICE, not of the request: the service knows a broker
+/// property from the versions it publishes, so the versions a refusal names are
+/// the same ones whatever a request's `KafkaVersions` carried — a caller pinning
+/// one version is not told the name was checked against that version alone. Its
+/// length is therefore bounded by the catalogue however long a list a request
+/// carried, and the published list is borrowed rather than copied, so a refusal
+/// allocates nothing for it.
+fn checked_versions() -> &'static [&'static str] {
     crate::state::catalogued_kafka_versions()
-        .iter()
-        .filter(|version| named.is_empty() || named.iter().any(|want| want == *version))
-        .map(|version| (*version).to_string())
-        .collect()
 }
 
 /// The message Amazon MSK refuses a body declaring properties it does not
@@ -120,24 +120,39 @@ pub fn checked_versions(named: &[String]) -> Vec<String> {
 /// declared them, each carrying the name and value as submitted and the sentence
 /// about the name, which names the versions it was checked against.
 ///
+/// The envelope is a JSON array of per-property objects, LAID OUT the way the
+/// service writes it: the array's brackets carry a space inside them and its
+/// elements are separated by `, `, an object's members sit one per line indented
+/// by [`ENVELOPE_INDENT`], each member's name is separated from its value by
+/// ` : `, and a member whose value is an array keeps that array on the member's
+/// own line with a space inside its brackets. The layout is part of the message —
+/// a client that displays or splits it reads these bytes — so it is rendered
+/// here rather than left to a serializer's own separators.
+///
 /// Bounded at both factors: at most [`MAX_REPORTED_PROPERTIES`] entries, each
-/// naming at most the catalogue's versions ([`checked_versions`]).
-pub fn unsupported_properties_message(rejected: &[Declaration], versions: &[String]) -> String {
-    let checked = versions.join(", ");
+/// naming exactly the catalogue's versions ([`checked_versions`]), so no request
+/// can amplify itself into a large response.
+pub fn unsupported_properties_message(rejected: &[Declaration]) -> String {
+    let checked = checked_versions().join(", ");
     let entries: Vec<String> = rejected
         .iter()
         .take(MAX_REPORTED_PROPERTIES)
         .map(|declared| {
             format!(
-                "{{\"name\":{},\"value\":{},\"errorMessages\":[{}]}}",
+                "{{\n{indent}\"name\" : {},\n{indent}\"value\" : {},\n{indent}\"errorMessages\" : [ {} ]\n}}",
                 quoted(&declared.name),
                 quoted(&declared.value),
                 quoted(&unsupported_property_sentence(&declared.name, &checked)),
+                indent = ENVELOPE_INDENT,
             )
         })
         .collect();
-    format!("[{}]", entries.join(","))
+    format!("[ {} ]", entries.join(", "))
 }
+
+/// What one level of the refusal envelope's indentation is: the two spaces each
+/// member of a per-property object is written behind.
+const ENVELOPE_INDENT: &str = "  ";
 
 /// The sentence one offending declaration carries: the property's name and the
 /// versions it was checked against, in the words Amazon MSK states it in.
@@ -162,7 +177,7 @@ mod tests {
 
     /// RULE: the refusal is bounded at both its factors — at most
     /// [`MAX_REPORTED_PROPERTIES`] declarations, and the versions each is checked
-    /// against are the catalogue's, each once, however long the submitted list.
+    /// against are the service's own checked set, each once.
     #[test]
     fn the_refusal_is_bounded_at_both_factors() {
         let many: Vec<u8> = (0..MAX_REPORTED_PROPERTIES * 3)
@@ -182,39 +197,40 @@ mod tests {
             "case \"many offenders\": expected the body's order, got {reported:?}"
         );
 
-        let published = crate::state::catalogued_kafka_versions();
-        let first = *published
-            .first()
-            .expect("the catalogue publishes at least one version");
-        let repeated: Vec<String> = std::iter::repeat_n(first.to_string(), 100)
-            .chain(std::iter::once("0.0.1-does-not-exist".to_string()))
-            .collect();
+        let checked = checked_versions();
         assert_eq!(
-            checked_versions(&repeated),
-            vec![first.to_string()],
-            "case \"a repeated submitted version\": expected it named once"
+            checked,
+            crate::state::catalogued_kafka_versions(),
+            "case \"the checked versions\": expected every published version, each once"
         );
+        let mut once: Vec<&str> = checked.to_vec();
+        once.sort_unstable();
+        once.dedup();
         assert_eq!(
-            checked_versions(&[]).len(),
-            published.len(),
-            "case \"no version named\": expected every published version"
+            once.len(),
+            checked.len(),
+            "case \"the checked versions\": expected each version named once, got {checked:?}"
         );
     }
 
     /// RULE: the refusal names each reported declaration, its value and the
-    /// versions its name was checked against, in Amazon MSK's own words.
+    /// versions its name was checked against, in Amazon MSK's own words and
+    /// layout.
     #[test]
     fn the_refusal_reports_each_declaration_in_msks_words() {
         let rejected = vec![Declaration {
             name: "broker.id".to_string(),
             value: "7".to_string(),
         }];
-        let message = unsupported_properties_message(&rejected, &["3.6.0".to_string()]);
+        let message = unsupported_properties_message(&rejected);
         assert_eq!(
             message,
-            "[{\"name\":\"broker.id\",\"value\":\"7\",\"errorMessages\":[\"Key 'broker.id' is \
-             not supported by at least one Apache Kafka version. Key checked against \
-             versions: [3.6.0]\"]}]",
+            format!(
+                "[ {{\n  \"name\" : \"broker.id\",\n  \"value\" : \"7\",\n  \
+                 \"errorMessages\" : [ \"Key 'broker.id' is not supported by at least one \
+                 Apache Kafka version. Key checked against versions: [{}]\" ]\n}} ]",
+                crate::state::catalogued_kafka_versions().join(", ")
+            ),
             "case \"one offending declaration\": got {message}"
         );
     }

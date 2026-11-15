@@ -2239,3 +2239,12 @@ mod zz_probe_whole_emulator;
 // `all/every_suite_file_is_declared.rs` pin all of it, for this root and for every
 // service crate's `tests/all.rs`, so a note about any of those rules belongs there
 // rather than here; the notes earlier landings had appended to this file live in
+// Single integration-test target for the router: the canonical DECLARATION LIST, and nothing
+// else.
+// module header, where it is read beside the test it explains, and a note about THIS file
+// belongs in `all/appended_notes.rs`, declared below like any other suite.
+// EVERY comment in this file is an ordinary one, this header included, and that is deliberate:
+// an inner doc comment documents the module it stands in, so the language accepts it only
+// ahead of the first item, and one a landing leaves below the list is `E0753` and compiles no
+// suite of this target. With none anywhere in the file, no appended, re-typed or merged copy
+// of a line of it can be one.

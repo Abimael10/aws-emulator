@@ -557,6 +557,28 @@ impl Emulator {
         .await
     }
 
+    /// Every configuration name `ListConfigurations` reports for this endpoint, which
+    /// is how a suite asserts that a refused create registered nothing.
+    pub async fn listed_configuration_names(&self) -> Vec<String> {
+        let reply = self.call("GET", "/v1/configurations", None).await;
+        assert_eq!(
+            reply.status, 200,
+            "expected ListConfigurations to succeed, got {} {}",
+            reply.status, reply.body
+        );
+        reply
+            .at("/configurations")
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// `CreateVpcConnection`, which the model binds to `POST /v1/vpc-connection`.
     pub async fn create_vpc_connection(&self, request: &ConnectionRequest) -> Reply {
         self.call("POST", "/v1/vpc-connection", Some(request.to_json()))

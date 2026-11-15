@@ -229,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it would be appended to has resolved: a body that is no properties
         // document at all is the parameter refusal, and one declaring a property
         // MSK does not configure names each offending declaration and the versions
-        // this configuration's own record has them checked against.
+        // this service checks a property name against.
         let Some(unconfigurable) = admission else {
             return Err(UpdateConfigurationErrorModeled::BadRequestException(
                 crate::state::parameter_refusal(
@@ -241,29 +241,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // BOUNDED at both factors, as the create's refusal is: at most
         // `MAX_REPORTED_PROPERTIES` declarations are reported, and the versions
-        // each names are chosen from the versions this service publishes, so that
-        // list is at most `catalogued_kafka_versions().len()` long whatever the
-        // request or the record carried.
+        // each names are the versions this service publishes, so that list is at
+        // most `catalogued_kafka_versions().len()` long whatever the request or
+        // the record carried.
         let reported: Vec<_> = unconfigurable
             .into_iter()
             .take(crate::state::server_properties::MAX_REPORTED_PROPERTIES)
             .collect();
         if !reported.is_empty() {
-            let checked_versions: Vec<String> =
-                crate::state::server_properties::checked_versions(&configuration.kafka_versions)
-                    .into_iter()
-                    .take(crate::state::catalogued_kafka_versions().len())
-                    .collect();
             return Err(UpdateConfigurationErrorModeled::BadRequestException(
                 BadRequestException {
                     invalid_parameter: Some(
                         crate::state::server_properties::SERVER_PROPERTIES_MEMBER.to_string(),
                     ),
                     message: Some(
-                        crate::state::server_properties::unsupported_properties_message(
-                            &reported,
-                            &checked_versions,
-                        ),
+                        crate::state::server_properties::unsupported_properties_message(&reported),
                     ),
                 },
             )
