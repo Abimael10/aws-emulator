@@ -1254,3 +1254,14 @@ mod zz_probe_whole_emulator;
 //! leaving a note here.
 //! (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what points each
 //! declaration into `tests/all/`.
+//! Put a new suite at `tests/all/<name>.rs` and declare it below, in the sorted list:
+//! one `#[path]` / `mod` pair per suite and NOTHING else, so a landing has one place to
+//! insert and nothing to keep consistent.
+//! ONCE: this is one crate root, so a second `mod` for the same name is `E0428`. An inner
+//! doc comment (`//!`) is legal only before the first item, so THIS header is the only
+//! place one may stand — one written further down this file is `E0753`. Either fails every
+//! suite in this target, so leave no note below: `all/all_rs_declares_each_suite_once.rs`
+//! and `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of that,
+//! for this file and for every service crate's `tests/all.rs`, and that is where a note
+//! about either rule belongs.
+//! (`tests/boot_serve.rs`), which the layout check refuses: the `#[path]` is what points

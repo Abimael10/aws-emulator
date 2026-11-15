@@ -241,6 +241,21 @@ pub fn not_found_message(kind: &str, identifier: &str) -> String {
     format!("{kind} not found: {identifier}")
 }
 
+/// The sentence the END-USER product views refuse an identifier with: one sentence that
+/// covers both reasons such a read can fail — nothing stored carries the identifier, and
+/// a stored product this view cannot reach through any launch path — so a caller cannot
+/// learn from the refusal that a product it has no access to exists. The identifier the
+/// request addressed the product by is the only variable part.
+///
+/// Shared by every end-user read of a product (`DescribeProduct`, which addresses it by
+/// `Id` or `Name`, and `DescribeProductView`, which addresses its product view by `Id`),
+/// so the deliberate ambiguity cannot be worded two ways. The ADMIN views see every
+/// stored product and so report [`not_found_message`] instead; the two are deliberately
+/// not shared.
+pub fn access_or_existence_message(identifier: &str) -> String {
+    format!("{identifier} does not exist or access was denied")
+}
+
 /// The resource kind a launch path is, as its not-found names it.
 pub const KIND_LAUNCH_PATH: &str = "Launch path";
 

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeProductView
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeProductView`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeProductView::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +133,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeProductView` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeProductViewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // A pure read: this operation reports the product a create or a copy stored and
+        // writes nothing, so a later caller sees exactly what this one saw.
+        let state = state.lock();
+
+        // `Id` is required and `@length 1..100`, so the framework has already refused an
+        // absent or empty one: whatever reaches here addresses a product view.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeProductView"))
+        // A product view IS a product as a catalog shows it, and this service stores one
+        // view per product: `ProductViewSummary` carries the view's own `Id` beside the
+        // `ProductId` of the product it shows, so either identifier addresses the same one
+        // view and both resolve it here.
+        //
+        // This is the END-USER view of a product, and an end user reaches a product only
+        // through a LAUNCH PATH: a portfolio the product is associated with. A product no
+        // portfolio carries is therefore outside the catalog this operation can see,
+        // exactly as a product nothing stored carries is — the same scoping
+        // `DescribeProduct` applies, so the two end-user reads of one product cannot
+        // disagree about whether it is visible. The ADMIN view, `DescribeProductAsAdmin`,
+        // is what reads a product that sits in no portfolio.
+        let product = state
+            .products
+            .values()
+            .find(|product| product.view_id == input.id || product.id == input.id)
+            .filter(|product| !state.launch_path_portfolios(&product.id).is_empty())
+            .ok_or_else(|| {
+                // One sentence for both reasons this read can fail, so a refusal cannot be
+                // read as "this product exists but you may not see it"; the identifier the
+                // request carried is its only variable part.
+                DescribeProductViewErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::access_or_existence_message(&input.id)),
+                    },
+                )
+            })?;
+
+        Ok(DescribeProductViewOutput {
+            // The same stored record `DescribeProduct` and the admin views report, rendered
+            // by the one function that renders it, so every reader of one product agrees.
+            product_view_summary: Some(product.view_summary()),
+            // "Information about the provisioning artifacts for the product": every version
+            // the product carries, in stored order — a copy's versions are its own, so they
+            // are the ids the copy minted rather than the source's.
+            provisioning_artifacts: Some(
+                product
+                    .provisioning_artifacts
+                    .values()
+                    .map(crate::state::ProvisioningArtifact::listed)
+                    .collect(),
+            ),
+        })
     }
 }

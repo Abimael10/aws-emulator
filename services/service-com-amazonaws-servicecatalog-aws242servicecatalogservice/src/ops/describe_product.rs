@@ -195,10 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // request addressed the product by (`Id`, or `Name` when no id was
                 // given). The ADMIN view (`DescribeProductAsAdmin`) sees every stored
                 // product and so words its own refusal differently; the two sentences are
-                // deliberately not shared.
+                // deliberately not shared. Every end-user read of a product words this one
+                // through the same function, so they cannot drift apart.
                 return Err(DescribeProductErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("{identifier} does not exist or access was denied")),
+                        message: Some(crate::state::access_or_existence_message(&identifier)),
                     },
                 )
                 .into())
