@@ -52,6 +52,12 @@ mod schema_merge;
 mod resolvers;
 pub use resolvers::*;
 
+/// The caching configuration a resolver is written with: the window its cache-entry
+/// `ttl` lies in, the context maps its caching keys may name an entry of, and the
+/// refusals for a configuration AppSync could not cache by.
+mod caching_config;
+pub use caching_config::*;
+
 /// The members whose modelled `@pattern` admits any text at all — mapping templates and
 /// descriptions — and the `@length` that is the only bound left on them.
 mod free_text;

@@ -2426,3 +2426,13 @@ mod declaration_roots_are_canonical_and_complete;
 //! `tests/` fails the build. WHY a suite belongs to this cross-service target rather than
 //! to one service crate's own is stated in that suite's own module doc, where it is read
 //! with the test it explains.
+//! list holds those pairs and NOTHING else, so a landing has one place to insert and no
+//! prose to duplicate, re-word or mistype.
+//! Three rules this crate root lives by, each checked by a suite of its own:
+//!   name is `E0428` and compiles neither copy (`all/all_rs_declares_each_suite_once.rs`);
+//!   the only place one may stand; past the first item `//!` is `E0753` and compiles no
+//!   suite of this target (`all/all_rs_inner_doc_comments_precede_the_first_item.rs`);
+//! * this file is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING under
+//!   `tests/` — which the layout check refuses. The `#[path]` is what points each
+//!   declaration into `tests/all/` (`all/all_rs_is_a_canonical_declaration_list.rs`).
+//! the test it explains; the notes landings had appended to this file live in

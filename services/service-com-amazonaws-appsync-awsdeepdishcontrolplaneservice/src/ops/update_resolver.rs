@@ -219,6 +219,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The same caching rules the create enforces, over the same member: the `ttl` of
+        // a cached resolver lies inside the documented cache-entry window ("Valid values
+        // are 1–3,600 seconds", `CachingConfig$ttl`) and each caching key names an entry
+        // of one of the request-context maps a cache entry may be keyed on ("Valid values
+        // are entries from the `$context.arguments`, `$context.source`, and
+        // `$context.identity` maps", `CachingConfig$cachingKeys`), so a configuration that
+        // breaks either rule is refused and the stored resolver is left exactly as it was
+        // (`crate::state::caching_config_refusal`).
+        if let Some(message) = crate::state::caching_config_refusal(input.caching_config.as_ref()) {
+            return Err(UpdateResolverErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
         // An update states the resolver's definition in full, so the kind it is of is
         // the one THIS request names — "A UNIT resolver is the default resolver type"
         // (`Resolver$kind`), so a request that names none asks for a UNIT resolver,

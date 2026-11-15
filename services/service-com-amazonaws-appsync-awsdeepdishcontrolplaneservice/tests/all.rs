@@ -141,6 +141,10 @@ mod merged_api_disassociation;
 mod plane_dependency_refusals;
 #[path = "all/rds_introspection_failure_diagnosis.rs"]
 mod rds_introspection_failure_diagnosis;
+#[path = "all/resolver_caching_config.rs"]
+mod resolver_caching_config;
+#[path = "all/resolver_caching_keys.rs"]
+mod resolver_caching_keys;
 #[path = "all/resolver_definition_pairing.rs"]
 mod resolver_definition_pairing;
 #[path = "all/resolvers.rs"]

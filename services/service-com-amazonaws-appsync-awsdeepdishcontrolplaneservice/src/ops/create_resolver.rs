@@ -216,6 +216,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A caching configuration describes a cache AppSync could keep: its `ttl` lies
+        // inside the documented cache-entry window ("Valid values are 1–3,600 seconds",
+        // `CachingConfig$ttl`) and each caching key names an entry of one of the
+        // request-context maps a cache entry may be keyed on ("Valid values are entries
+        // from the `$context.arguments`, `$context.source`, and `$context.identity`
+        // maps", `CachingConfig$cachingKeys`), so a configuration that breaks either rule
+        // is refused and no resolver is written
+        // (`crate::state::caching_config_refusal`).
+        if let Some(message) = crate::state::caching_config_refusal(input.caching_config.as_ref()) {
+            return Err(CreateResolverErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
         // "A UNIT resolver is the default resolver type" (`Resolver$kind`), so a
         // request that names no kind asks for one, and the resolver is stored — and
         // judged below — as the kind it is.
