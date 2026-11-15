@@ -4711,3 +4711,10 @@ mod appended_notes;
 // (`codebuild_secrets_manager_environment_variable` is declared ONCE, further up this file:
 // the second declaration a concurrent landing appended here is gone, a module declared
 // twice being `E0428`.)
+//! Put a new suite at `tests/all/<name>.rs` and declare it below, keeping the list sorted.
+//! is one crate root, so a second `mod` for the same name is `E0428`, and an inner doc
+//! comment (`//!`) is legal only before the first item, so a note written with `//!` anywhere
+//! but this header is `E0753` — either one fails every suite in this target. A note further
+//! down this file has to be an ordinary `//` comment.
+// (`tests/boot_serve.rs`) — which the layout check refuses. The `#[path]` is what points the
+// declaration into `tests/all/`.

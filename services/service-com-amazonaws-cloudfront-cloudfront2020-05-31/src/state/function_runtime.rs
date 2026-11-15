@@ -3,6 +3,13 @@
 //! RUNNING a CloudFront function: the engine the stored function code executes in, inside
 //! this process.
 //!
+//! A CONNECTION function is code of the same runtime, stored by the same kind of create and
+//! held to the same quota, so it runs HERE too ([`run_connection_function`]) rather than on a
+//! second engine. Its programming model is the other one: a connection function declares no
+//! handler — its code is a SCRIPT that runs over the connection CloudFront is deciding about,
+//! which this module puts in scope as the global `connection`, and the decision that script
+//! takes on it (`connection.allow()`) is what the run produced.
+//!
 //! "CloudFront runs the function, passing it the event object that you provided, and returns
 //! the function's result (the modified event object) in the response. The response also
 //! contains function logs and error messages, if any exist." Every one of those three is
@@ -17,9 +24,11 @@
 //! no value outlives the call that made it. Inside that engine the code reaches the language
 //! and ONE host function — the log writer the console is built over, which only appends to
 //! this run's own captured lines and is deleted from the global object before any of the
-//! caller's code is compiled, so only the console closure still holds it. No module loader
-//! is installed, so an `import` resolves to nothing; plain QuickJS registers no filesystem,
-//! process, environment, network, host-library or thread API, and nothing here adds one.
+//! caller's code is compiled, so only the console closure still holds it. A connection
+//! function's script also reaches the connection in scope, whose decision answers the run
+//! through a channel the code cannot reach. No module loader is installed, so an `import`
+//! resolves to nothing; plain QuickJS registers no filesystem, process, environment,
+//! network, host-library or thread API, and nothing here adds one.
 //!
 //! # What bounds it
 //!
@@ -166,6 +175,12 @@ pub enum FunctionOutcome {
     /// declared no handler, it raised, it returned something that is not an event object, or
     /// a bound of this module stopped it.
     Failed(String),
+    /// The code RAN and came back without answering, and nothing about it failed: a
+    /// connection function's script that took no decision about the connection it was run
+    /// over. There is nothing to report but the lines it logged and the time it spent — and
+    /// no error either, because nothing went wrong. A handler model run has no such outcome:
+    /// a handler that never settles is a run that failed.
+    Unanswered,
     /// The run did not happen at all — the engine did not start, every run slot was taken,
     /// or the host gave up waiting for it. Nothing was learned about the code, which is a
     /// different answer from "the function failed".
@@ -208,7 +223,75 @@ impl FunctionRun {
     }
 }
 
-/// Run `code` over the event object `event` (the JSON text of it), on a blocking thread.
+/// The programming model one run follows: how the code is INVOKED, and how what it produced
+/// is reported.
+///
+/// Everything else about a run — the engine, every bound it is held to, the console it logs
+/// through and the clock the compute utilization is measured against — is the same for both
+/// models, so the two kinds of function share this module rather than each carrying an
+/// engine of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Model {
+    /// A CloudFront function: the code "declares a function named `handler`", which is
+    /// CALLED with the event object, and the result is "the function's result (the modified
+    /// event object)" that call came back with ([`event_output`]).
+    Handler,
+    /// A connection function: the code is a SCRIPT, run with the connection it decides about
+    /// in scope as the global `connection`, and the result is the connection it ALLOWED
+    /// ([`returned_output`]). Nothing is called: a connection function declares no
+    /// handler, so a script that only decides is a whole connection function — and a script
+    /// that decides nothing is one too, which is why taking no decision is not a failure.
+    ConnectionScript,
+}
+
+impl Model {
+    /// What the result reports for a run whose answer was `text` (the JSON the engine
+    /// rendered it as), or the message of an answer that cannot be reported.
+    fn output(self, text: &str) -> Result<String, String> {
+        match self {
+            Self::Handler => event_output(text),
+            Self::ConnectionScript => returned_output(text),
+        }
+    }
+
+    /// What a run that came back without answering at all comes to.
+    ///
+    /// A HANDLER that returned a promise nothing settled produced no event object, which is
+    /// the run failing — the model states the function's result IS the event object it
+    /// returns. A SCRIPT that took no decision about the connection failed at nothing: the
+    /// model requires no decision of a connection function, so the run reports what it did
+    /// (its logs and the time it spent) and neither an output nor an error.
+    fn unanswered(self) -> FunctionOutcome {
+        match self {
+            Self::Handler => FunctionOutcome::Failed(UNSETTLED.to_string()),
+            Self::ConnectionScript => FunctionOutcome::Unanswered,
+        }
+    }
+}
+
+/// Run the CloudFront function `code` over the event object `event` (the JSON text of it),
+/// reporting what its handler returned as the event object a `TestResult` carries.
+///
+/// See [`run_on_engine`] for what bounds the run.
+pub async fn run_function(code: Vec<u8>, event: String) -> FunctionRun {
+    run_on_engine(code, event, Model::Handler).await
+}
+
+/// Run the connection function `code` over the connection object `connection_object` (the
+/// JSON text of it), reporting the connection it allowed as the output a
+/// `ConnectionFunctionTestResult` carries.
+///
+/// A connection function is code of the same runtime, stored by the same create and held to
+/// the same quota as a CloudFront function, so it runs on the same engine under the same
+/// bounds ([`run_on_engine`]); what differs is the programming model: the code is a SCRIPT
+/// that decides about the connection in scope, rather than a handler called with an event
+/// object.
+pub async fn run_connection_function(code: Vec<u8>, connection_object: String) -> FunctionRun {
+    run_on_engine(code, connection_object, Model::ConnectionScript).await
+}
+
+/// Run `code` over the document `argument` (the JSON text of the object the run is handed),
+/// on a blocking thread, under the programming model `model`.
 ///
 /// `code` is the code of a STORED function, so its size is already held to the published
 /// function-code quota by the create and the update that wrote it
@@ -227,7 +310,7 @@ impl FunctionRun {
 /// slot comes back only when the engine thread ends, so [`MAX_CONCURRENT_RUNS`] bounds the
 /// engines that exist whatever a caller does; a caller that finds every slot still taken is
 /// answered as a run that did not happen.
-pub async fn run_function(code: Vec<u8>, event: String) -> FunctionRun {
+async fn run_on_engine(code: Vec<u8>, argument: String, model: Model) -> FunctionRun {
     let waited = ::tokio::time::timeout(
         RUN_PERMIT_WAIT,
         ::std::sync::Arc::clone(function_runs()).acquire_owned(),
@@ -246,7 +329,7 @@ pub async fn run_function(code: Vec<u8>, event: String) -> FunctionRun {
     let running = ::tokio::task::spawn_blocking(move || {
         // The slot is released where the RUN ends, on every path out of it.
         let _slot = permit;
-        run(code, &event)
+        run(code, &argument, model)
     });
     match ::tokio::time::timeout(CALLER_WAIT_CEILING, running).await {
         Ok(Ok(run)) => run,
@@ -260,8 +343,9 @@ pub async fn run_function(code: Vec<u8>, event: String) -> FunctionRun {
     }
 }
 
-/// Run `code` over `event` on THIS thread, under every bound this module declares.
-fn run(code: Vec<u8>, event: &str) -> FunctionRun {
+/// Run `code` over the document `argument` on THIS thread, under every bound this module
+/// declares and under the programming model `model`.
+fn run(code: Vec<u8>, argument: &str, model: Model) -> FunctionRun {
     let collected = Arc::new(Mutex::new(Collected::default()));
     // The code is a blob on the wire, so it may be bytes no engine can read at all. That is
     // a property of the code rather than of this emulator, so it is the function failing.
@@ -294,9 +378,10 @@ fn run(code: Vec<u8>, event: &str) -> FunctionRun {
 
     let answer: Arc<Mutex<Option<Answered>>> = Arc::new(Mutex::new(None));
     let (invoked, mut elapsed) =
-        context.with(|ctx| invoke(&ctx, &source, event, &collected, &answer));
-    // A handler that returned a promise has not answered yet: its jobs are what settle it,
-    // and nothing else of this run drives them.
+        context.with(|ctx| invoke(&ctx, &source, argument, &collected, &answer, model));
+    // Code that has not answered yet may have queued the work that answers for it — a handler
+    // that returned a promise, a script that decided inside one — and nothing else of this run
+    // drives those jobs.
     if matches!(invoked, Invoked::Pending) {
         let started = Instant::now();
         drain_jobs(&runtime, &bounds);
@@ -318,12 +403,12 @@ fn run(code: Vec<u8>, event: &str) -> FunctionRun {
         Invoked::Failed(message) => FunctionOutcome::Failed(message),
         Invoked::Settled | Invoked::Pending => {
             match answer.lock().unwrap_or_else(PoisonError::into_inner).clone() {
-                Some(Answered::Returned(text)) => match event_output(&text) {
+                Some(Answered::Returned(text)) => match model.output(&text) {
                     Ok(output) => FunctionOutcome::Returned(output),
                     Err(message) => FunctionOutcome::Failed(message),
                 },
                 Some(Answered::Raised(message)) => FunctionOutcome::Failed(message),
-                None => FunctionOutcome::Failed(UNSETTLED.to_string()),
+                None => model.unanswered(),
             }
         }
     };
@@ -366,18 +451,64 @@ enum Answered {
     Raised(String),
 }
 
-/// Compile the code, call its handler over the event object and report what the call came
-/// to, inside one engine context — and how long the compile and the call took.
+/// Prepare the engine for this run and invoke the code as `model` says, inside one engine
+/// context — and report what the invocation came to and how long the function's own work
+/// took.
 fn invoke(
     ctx: &Ctx<'_>,
     source: &str,
-    event: &str,
+    argument: &str,
     collected: &Arc<Mutex<Collected>>,
     answer: &Arc<Mutex<Option<Answered>>>,
+    model: Model,
 ) -> (Invoked, Duration) {
     if let Err(reason) = install_console(ctx, collected) {
         return (Invoked::Unavailable(reason), Duration::ZERO);
     }
+    match model {
+        Model::Handler => invoke_handler(ctx, source, argument, answer),
+        Model::ConnectionScript => invoke_script(ctx, source, argument, answer),
+    }
+}
+
+/// The channel one run's answer is reported through, as a host function the engine can call.
+///
+/// Passed as an ARGUMENT to this module's own code rather than installed as a global, so the
+/// caller's code cannot reach it; the FIRST answer through it is the run's, so a later one
+/// changes nothing.
+fn settle_channel(answer: &Arc<Mutex<Option<Answered>>>) -> impl Fn(bool, String) + 'static {
+    let latched = Arc::clone(answer);
+    move |raised: bool, text: String| {
+        let mut held = latched.lock().unwrap_or_else(PoisonError::into_inner);
+        if held.is_none() {
+            *held = Some(if raised {
+                Answered::Raised(text)
+            } else {
+                Answered::Returned(text)
+            });
+        }
+    }
+}
+
+/// The document `text` read by the engine's own JSON parser.
+///
+/// Its caller admits only a document that already parsed as a JSON object, and the text
+/// handed here is that document re-rendered, so a failure here is the ENGINE not reading what
+/// the host read — never a caller's malformed document, which its caller refuses as the
+/// invalid argument it is.
+fn parsed<'js>(ctx: &Ctx<'js>, text: &str, what: &str) -> Result<Value<'js>, Invoked> {
+    ctx.json_parse(text.to_string())
+        .map_err(|error| Invoked::Unavailable(format!("the {what} could not be read: {error}")))
+}
+
+/// Compile the code, call its handler over the event object and report what the call came
+/// to — the CloudFront function model.
+fn invoke_handler(
+    ctx: &Ctx<'_>,
+    source: &str,
+    event: &str,
+    answer: &Arc<Mutex<Option<Answered>>>,
+) -> (Invoked, Duration) {
     // Held BEFORE any of the caller's code is compiled, so the invoker this run reads its
     // answer through is this module's own however the code rebinds the global object.
     let invoker = match ctx.eval::<Function<'_>, _>(INVOKER_SOURCE).catch(ctx) {
@@ -389,19 +520,9 @@ fn invoke(
             )
         }
     };
-    // The event object, read by the engine's own JSON parser. Its caller admits only a
-    // document that already parsed as a JSON object, and the text handed here is that
-    // document re-rendered, so a failure here is the ENGINE not reading what the host read —
-    // never a caller's malformed event object, which its caller refuses as the invalid
-    // argument it is.
-    let argument = match ctx.json_parse(event.to_string()) {
+    let argument = match parsed(ctx, event, "event object") {
         Ok(argument) => argument,
-        Err(error) => {
-            return (
-                Invoked::Unavailable(format!("the event object could not be read: {error}")),
-                Duration::ZERO,
-            )
-        }
+        Err(unavailable) => return (unavailable, Duration::ZERO),
     };
 
     // From here on the clock is the FUNCTION's: its compile, and the call of its handler.
@@ -412,20 +533,7 @@ fn invoke(
     let Ok(handler) = ctx.globals().get::<_, Function<'_>>(HANDLER_NAME) else {
         return (Invoked::Failed(NO_HANDLER.to_string()), started.elapsed());
     };
-    let latched = Arc::clone(answer);
-    // The channel the invoker reports through is passed as an ARGUMENT rather than installed
-    // as a global, so the caller's code cannot reach it; the first answer through it is the
-    // run's, so a later one changes nothing.
-    let settle = Func::from(move |raised: bool, text: String| {
-        let mut held = latched.lock().unwrap_or_else(PoisonError::into_inner);
-        if held.is_none() {
-            *held = Some(if raised {
-                Answered::Raised(text)
-            } else {
-                Answered::Returned(text)
-            });
-        }
-    });
+    let settle = Func::from(settle_channel(answer));
     if let Err(caught) = invoker.call::<_, ()>((handler, argument, settle)).catch(ctx) {
         // The invoker reports the code's own raise itself, so reaching here means the run
         // was interrupted out of it — which the latch has already recorded.
@@ -435,6 +543,66 @@ fn invoke(
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .is_none();
+    let invoked = if pending {
+        Invoked::Pending
+    } else {
+        Invoked::Settled
+    };
+    (invoked, started.elapsed())
+}
+
+/// Put the connection in scope, run the code as a SCRIPT and report what it decided — the
+/// connection function model.
+///
+/// A connection function declares no handler: it is code that runs over the connection
+/// CloudFront is deciding about, which this module puts in scope as the global `connection`
+/// before any of that code is compiled — the connection object the request carried, carrying
+/// the decision the service lets a script take on it (`connection.allow()`). Taking that
+/// decision is what answers the run, so the result reports the connection the script allowed;
+/// a script that raises reports the raise, and one that decided nothing has not answered at
+/// all.
+fn invoke_script(
+    ctx: &Ctx<'_>,
+    source: &str,
+    connection_object: &str,
+    answer: &Arc<Mutex<Option<Answered>>>,
+) -> (Invoked, Duration) {
+    // Held BEFORE any of the caller's code is compiled, for the reason the handler model's
+    // invoker is: what the decision does is this module's own however the code rebinds the
+    // global object, and the channel it answers through is unreachable from that code.
+    let prepare = match ctx.eval::<Function<'_>, _>(CONNECTION_SOURCE).catch(ctx) {
+        Ok(prepare) => prepare,
+        Err(caught) => {
+            return (
+                Invoked::Unavailable(format!("the engine did not start: {caught}")),
+                Duration::ZERO,
+            )
+        }
+    };
+    let connection = match parsed(ctx, connection_object, "connection object") {
+        Ok(connection) => connection,
+        Err(unavailable) => return (unavailable, Duration::ZERO),
+    };
+    let settle = Func::from(settle_channel(answer));
+    if let Err(caught) = prepare.call::<_, ()>((connection, settle)).catch(ctx) {
+        return (
+            Invoked::Unavailable(format!("the connection could not be put in scope: {caught}")),
+            Duration::ZERO,
+        );
+    }
+
+    // From here on the clock is the FUNCTION's: compiling and running its script IS the
+    // invocation.
+    let started = Instant::now();
+    if let Err(caught) = ctx.eval::<Value<'_>, _>(source).catch(ctx) {
+        return (Invoked::Failed(raised_message(&caught)), started.elapsed());
+    }
+    let pending = answer
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_none();
+    // A script that has not decided yet may have queued the work that decides for it, so the
+    // run is reported as pending and the jobs it queued are drained before its answer is read.
     let invoked = if pending {
         Invoked::Pending
     } else {
@@ -488,6 +656,27 @@ fn event_output(text: &str) -> Result<String, String> {
         ));
     }
     Ok(output)
+}
+
+/// The result `ConnectionFunctionTestResult$ConnectionFunctionOutput` carries for a
+/// connection function that allowed the connection `text` (the JSON the engine rendered it
+/// as).
+///
+/// Reported as it stands rather than re-serialised or wrapped in a member of this emulator's
+/// choosing — "the connection function output" is a plain string the model states no
+/// structure for — so what a caller reads is the connection the script allowed, with the
+/// changes that script made to it. The one thing checked is that it is within what this
+/// operation's documents carry ([`MAX_OUTPUT_BYTES`]), and a value past that is the run
+/// failing, as an event object past it is.
+fn returned_output(text: &str) -> Result<String, String> {
+    if text.len() > MAX_OUTPUT_BYTES {
+        return Err(format!(
+            "The function allowed a connection of {} bytes, and at most {MAX_OUTPUT_BYTES} \
+             bytes are allowed",
+            text.len()
+        ));
+    }
+    Ok(text.to_string())
 }
 
 /// The message a raise carries: the error's own, as the code worded it.
@@ -657,6 +846,41 @@ const INVOKER_SOURCE: &str = r#"
             return;
         }
         returned(value);
+    };
+})()
+"#;
+
+/// The code that puts the connection in scope: it installs the decision
+/// (`connection.allow()`, which states that the connection may proceed and is what answers
+/// the run) on the connection object the request carried, and binds that object as the
+/// global `connection` every connection function's script reads.
+///
+/// An expression rather than a global, for the reason [`INVOKER_SOURCE`] is one: the
+/// caller's code can neither read it nor replace it, and it captures `JSON.stringify` and
+/// `String` before any of that code runs, so code that rebinds either cannot change how the
+/// connection it allowed is rendered. The decision reports through the channel it is handed,
+/// which the caller's code cannot reach. It is defined as a NON-ENUMERABLE member, so the
+/// connection a script walks is the document the request carried and nothing of this
+/// emulator's own.
+const CONNECTION_SOURCE: &str = r#"
+(function () {
+    const stringify = JSON.stringify;
+    const toText = String;
+    return function (connection, settle) {
+        Object.defineProperty(connection, "allow", {
+            enumerable: false,
+            value: function () {
+                let text;
+                try {
+                    text = stringify(connection);
+                } catch (error) {
+                    settle(true, toText(error));
+                    return;
+                }
+                settle(false, text === undefined ? "null" : text);
+            }
+        });
+        globalThis.connection = connection;
     };
 })()
 "#;

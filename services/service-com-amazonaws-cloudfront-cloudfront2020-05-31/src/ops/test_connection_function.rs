@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TestConnectionFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TestConnectionFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TestConnectionFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a test RUNS the stored connection function code over the connection object
+//! the request carries — on the JavaScript engine embedded in this process
+//! ([`crate::state::function_runtime`]) — and reports what that run produced: the connection
+//! the code allowed, the lines it logged, the error it raised and how much of the allowed
+//! execution time it took. A connection function declares no handler: its code is a script
+//! that runs with the connection in scope and decides about it, so the run is that script's
+//! own work. It PERSISTS nothing: the stage, the code and the version token it runs against
+//! are read from the one stored connection function record, and a test leaves that record
+//! exactly as it stands. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +78,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -150,20 +152,197 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TestConnectionFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TestConnectionFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TestConnectionFunction"))
+        // The engine is reachable from `&self` (constructor-injected); this operation needs
+        // nothing from the request metadata the context carries.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+
+        // The stage, the code and the version token this test runs against are read from the
+        // ONE stored connection function record, under the lock, and the lock is released
+        // before any of that code runs — the run is the caller's own code, so it never
+        // happens while the store is held. Nothing here writes: a test reports what the
+        // connection function did and leaves the record as it stands.
+        let prepared = {
+            let now = ::std::time::SystemTime::now();
+            let mut store = state.lock();
+            store.settle(now);
+
+            // "The connection function stage", either DEVELOPMENT or LIVE: a request that
+            // names none addresses the stage a connection function is created in, as every
+            // other stage-aware read of this resource kind does.
+            let stage = input
+                .stage
+                .as_deref()
+                .unwrap_or(crate::state::DEFAULT_FUNCTION_STAGE);
+
+            // "The connection function ID": this operation addresses the resource by the id
+            // its create minted, which is the key the record is held under, so no other
+            // identifier names a connection function to test. An id the store holds nothing
+            // under, and a stage the connection function has never been published to, are
+            // the same thing to the caller — the entity it asked for was not found — and
+            // both are answered BEFORE the precondition, which can only be checked against
+            // a stored version.
+            let Some((function, tested)) = store
+                .connection_functions
+                .get(&input.id)
+                .and_then(|function| Some((function, function.stage(stage)?)))
+            else {
+                return Err(TestConnectionFunctionErrorModeled::EntityNotFound(
+                    crate::state::connection_function_not_found(),
+                )
+                .into());
+            };
+
+            // `IfMatch` is "The current version (ETag value) of the connection function",
+            // checked against the STORED version of the stage being tested — so a test only
+            // runs the code its caller actually read. A token that is not a version token at
+            // all is "missing or not valid"; a well-formed token that is not that stage's
+            // current one is a failed precondition, which is the split every connection
+            // function mutation of this service answers with.
+            match crate::state::check_if_match(&tested.etag, Some(input.if_match.as_str())) {
+                IfMatch::Current => {}
+                IfMatch::Invalid => {
+                    return Err(TestConnectionFunctionErrorModeled::InvalidIfMatchVersion(
+                        crate::state::invalid_if_match_version(),
+                    )
+                    .into());
+                }
+                IfMatch::Stale => {
+                    return Err(TestConnectionFunctionErrorModeled::PreconditionFailed(
+                        crate::state::precondition_failed_missing_requirements(),
+                    )
+                    .into());
+                }
+            }
+
+            // "The connection function summary" this result reports is the projection of the
+            // stage that was tested, read from the record rather than from the request.
+            (
+                stage.to_string(),
+                tested.code.clone(),
+                tested.to_summary(&function.name, &function.id, &function.arn),
+            )
+        };
+        let (stage, code, connection_function_summary) = prepared;
+
+        // "The connection object" is the connection the script is run over: the service puts
+        // it in scope for that code, so a payload that is not a JSON object describes no
+        // connection a connection function can decide about, and is refused with the modelled
+        // `InvalidArgument` rather than run. The sentence the caller is served is the FIXED
+        // one for the condition — the parser's own account of where the document stopped is a
+        // detail of this emulator, so it is logged rather than put on the wire.
+        let connection_object =
+            match ::serde_json::from_slice::<::serde_json::Value>(&input.connection_object) {
+                Ok(object @ ::serde_json::Value::Object(_)) => object.to_string(),
+                Ok(_) => return Err(invalid_argument(NOT_A_CONNECTION_OBJECT).into()),
+                Err(error) => {
+                    ::tracing::debug!(
+                        operation = Self::NAME,
+                        detail = %error,
+                        "the connection object a connection function test carried is not JSON",
+                    );
+                    return Err(invalid_argument(NOT_JSON).into());
+                }
+            };
+
+        // The run itself: the code the store holds, over that connection object, under every
+        // bound the runtime module declares, on a blocking thread. The connection is put in
+        // scope for that code, and the decision the script takes on it is what the run
+        // produced.
+        let run = crate::state::run_connection_function(code, connection_object).await;
+        let compute_utilization = run.compute_utilization();
+
+        // One record per invocation: which connection function and stage ran and what the run
+        // came to. The connection object, the output and the logged lines are the caller's own
+        // content and are what the response carries, so none of them is recorded here.
+        ::tracing::info!(
+            operation = Self::NAME,
+            connection_function = %input.id,
+            stage = %stage,
+            outcome = outcome_kind(&run.outcome),
+            "a CloudFront connection function was tested",
+        );
+
+        let (connection_function_output, connection_function_error_message) = match run.outcome {
+            // "The connection function output" — the connection the script allowed, as it
+            // left it.
+            crate::state::FunctionOutcome::Returned(output) => (Some(output), None),
+            // "The connection function error message": the script ran and failed, which is
+            // a result this operation reports with the error message of that failure rather
+            // than a server fault.
+            crate::state::FunctionOutcome::Failed(message) => (None, Some(message)),
+            // The script ran to its end and took no decision about the connection. Nothing
+            // failed, so there is no error message to report, and nothing was allowed, so
+            // there is no connection to report either: the result is the summary, the logs
+            // and the time the run spent.
+            crate::state::FunctionOutcome::Unanswered => (None, None),
+            // The run did not happen at all, so there is no result to report and nothing is
+            // known about the code: "The CloudFront function failed" is what the service
+            // answers for a test it could not carry out.
+            crate::state::FunctionOutcome::Unavailable(reason) => {
+                ::tracing::warn!(
+                    detail = %reason,
+                    "a CloudFront connection function was not run, so its test could not be \
+                     answered",
+                );
+                return Err(TestConnectionFunctionErrorModeled::TestFunctionFailed(
+                    TestFunctionFailed {
+                        message: Some(TEST_FUNCTION_FAILED_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+        };
+
+        Ok(TestConnectionFunctionOutput {
+            connection_function_test_result: Some(ConnectionFunctionTestResult {
+                connection_function_summary: Some(connection_function_summary),
+                // "The connection function compute utilization": how long the function took
+                // to run as a percentage of the allowed execution time, measured over the run
+                // that just happened.
+                compute_utilization: Some(compute_utilization),
+                // "The connection function execution logs" — the lines that run wrote, in the
+                // order it wrote them.
+                connection_function_execution_logs: Some(run.logs),
+                connection_function_error_message,
+                connection_function_output,
+            }),
+        })
     }
 }
+
+/// The modelled `InvalidArgument` ("An argument is invalid") for a connection object this
+/// operation refuses, carrying `reason`.
+fn invalid_argument(reason: impl ::std::fmt::Display) -> TestConnectionFunctionErrorModeled {
+    TestConnectionFunctionErrorModeled::InvalidArgument(InvalidArgument {
+        message: Some(format!("An argument is invalid: {reason}")),
+    })
+}
+
+/// What a run came to, in one word, for the record of the call: the outcome's kind and
+/// nothing of its content, which is the caller's own.
+fn outcome_kind(outcome: &crate::state::FunctionOutcome) -> &'static str {
+    match outcome {
+        crate::state::FunctionOutcome::Returned(_) => "allowed the connection",
+        crate::state::FunctionOutcome::Failed(_) => "failed",
+        crate::state::FunctionOutcome::Unanswered => "decided nothing",
+        crate::state::FunctionOutcome::Unavailable(_) => "not run",
+    }
+}
+
+/// The reason a connection object that is valid JSON but not a JSON OBJECT is refused: the
+/// object is what the function is called with.
+const NOT_A_CONNECTION_OBJECT: &str =
+    "the connection object is not a JSON object, so it describes no connection a connection \
+     function can be passed";
+
+/// The reason a connection object that is not JSON at all is refused.
+const NOT_JSON: &str = "the connection object is not valid JSON";
+
+/// `TestFunctionFailed`'s message: the sentence the model states for the condition ("The
+/// CloudFront function failed."), served for a test this emulator could not carry out at
+/// all. It names no run of its own, because nothing about the code was learned.
+const TEST_FUNCTION_FAILED_MESSAGE: &str = "The CloudFront function failed.";

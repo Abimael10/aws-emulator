@@ -268,6 +268,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // error message": the function ran and failed, which is a result this operation
             // reports with the error message of that failure rather than a server fault.
             crate::state::FunctionOutcome::Failed(message) => (None, Some(message)),
+            // A run that came back without answering: the handler model has none, because a
+            // handler that produced no event object is a run that FAILED, which the engine
+            // reports as that. Reported all the same as the run it was — the lines it wrote
+            // and the time it spent — rather than as an event object nothing returned.
+            crate::state::FunctionOutcome::Unanswered => (None, None),
             // The run did not happen at all, so there is no result to report and nothing is
             // known about the code: "The CloudFront function failed" is what the service
             // answers for a test it could not carry out.
@@ -313,6 +318,7 @@ fn outcome_kind(outcome: &crate::state::FunctionOutcome) -> &'static str {
     match outcome {
         crate::state::FunctionOutcome::Returned(_) => "returned",
         crate::state::FunctionOutcome::Failed(_) => "failed",
+        crate::state::FunctionOutcome::Unanswered => "answered nothing",
         crate::state::FunctionOutcome::Unavailable(_) => "not run",
     }
 }
