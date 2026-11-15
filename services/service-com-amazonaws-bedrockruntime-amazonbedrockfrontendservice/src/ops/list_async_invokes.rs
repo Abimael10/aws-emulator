@@ -188,7 +188,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::async_invoke_output::settle_due_invocations(
             &*self.engine,
             crate::state::now_millis(),
-        );
+        )
+        .await;
         let guard = state.lock();
 
         let submitted_after = input

@@ -2169,3 +2169,17 @@ mod s3_notification_lambda_invoke_grant_gates_delivery;
 // explains; `all/appended_notes.rs` keeps the notes earlier landings had appended here.
 #[path = "all/cloudformation_cloudfront_published_edge_address.rs"]
 mod cloudformation_cloudfront_published_edge_address;
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`, sorted by
+// name, and no other line. Add a suite by putting it at `tests/all/<name>.rs` and inserting
+// its pair into the sorted list; what that suite covers, and why it drives the assembled
+// router rather than one service crate, belongs in its OWN module header, where it is read
+// beside the test it explains, and a note about THIS file belongs in
+// This is the one file in the target whose breakage compiles no suite at all, so sibling
+// suites pin the shape above: `all/all_rs_is_a_canonical_declaration_list.rs` (one pair per
+// suite, sorted, no other line), `all/all_rs_declares_each_suite_once.rs` (a second `mod`
+// for one name is `E0428`), `all/all_rs_inner_doc_comments_precede_the_first_item.rs` (an
+// inner doc comment past the first item is `E0753`),
+// `all/declaration_roots_are_canonical_and_complete.rs` (a file or module directory no
+// declaration names is compiled nowhere). EVERY comment in this file is an ordinary `//`
+// one, this header included, so no merge of two landings can leave a doc comment past the
+// harnesses or notes rather than suites; all are declared, because a file no declaration

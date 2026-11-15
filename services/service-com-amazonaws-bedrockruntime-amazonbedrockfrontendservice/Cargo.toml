@@ -41,6 +41,19 @@ flate2 = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Encodes the opaque `ListAsyncInvokes` page token.
 hex = { workspace = true }
+# The H.264 encoder and the MP4 writer behind the media object a finished asynchronous
+# invocation delivers (`state::async_invoke_video`): the frames this emulator renders are
+# encoded and written by maintained implementations, so the object a client reads out of
+# its bucket is a real video file any player decodes rather than bytes shaped like one.
+# `openh264` is a NATIVE component: its `-sys` crate compiles the bundled Cisco C++ sources
+# with `cc` at build time (as `aws-lc-sys` and `vorbis_rs` already do here), and it is a
+# library computing over frames in-process — it opens no listener, starts no process, reads
+# no file and makes no outbound connection.
+openh264 = "0.9"
+mp4 = "0.14"
+# The 8x8 bitmap font the rendered frames are lettered with — the same font this
+# emulator's CloudWatch metric widgets label their axes with.
+font8x8 = "0.3"
 
 # The CloudWatch metric store an inference publishes its token volume into
 # (`state::invocation_metrics`): the datapoints go into the store `PutMetricData` writes

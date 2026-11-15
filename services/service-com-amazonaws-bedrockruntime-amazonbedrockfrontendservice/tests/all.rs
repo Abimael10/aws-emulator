@@ -17,6 +17,8 @@ mod account_enforced_guardrail;
 mod apply_guardrail;
 #[path = "all/async_invoke_model_contract.rs"]
 mod async_invoke_model_contract;
+#[path = "all/async_invoke_output_artifact.rs"]
+mod async_invoke_output_artifact;
 #[path = "all/bedrock_cloudwatch_request_metrics.rs"]
 mod bedrock_cloudwatch_request_metrics;
 #[path = "all/bedrock_cloudwatch_token_metric_dimensioning.rs"]
@@ -73,3 +75,5 @@ mod resource_reference_refusals;
 mod state_roundtrip;
 #[path = "all/submit_destination_and_guardrail_reference.rs"]
 mod submit_destination_and_guardrail_reference;
+#[path = "all/zz_probe.rs"]
+mod zz_probe;

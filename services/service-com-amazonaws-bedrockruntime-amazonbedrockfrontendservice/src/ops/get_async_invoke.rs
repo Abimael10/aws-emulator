@@ -200,12 +200,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // answers — which includes DELIVERING the output of an invocation that
         // has finished, so an invocation this read reports as `Completed` is one
         // whose output is already in the caller's bucket (see
-        // `crate::state::async_invoke_output`). It runs with no guard of this
-        // store held, because the object store's own guard is taken inside it.
-        crate::state::async_invoke_output::settle_due_invocations(
+        // `crate::state::async_invoke_output`). The invocation THIS read is about
+        // is delivered first, so the bound on how much one read delivers never
+        // holds it back. It runs with no guard of this store held, because the
+        // object store's own guard is taken inside it.
+        crate::state::async_invoke_output::settle_due_invocation(
             &*self.engine,
             crate::state::now_millis(),
-        );
+            &input.invocation_arn,
+        )
+        .await;
         let guard = state.lock();
 
         let Some(record) = guard.async_invokes.get(&input.invocation_arn) else {

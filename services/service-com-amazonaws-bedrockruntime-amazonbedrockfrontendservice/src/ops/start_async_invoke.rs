@@ -328,6 +328,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let record = crate::state::AsyncInvokeRecord {
             invocation_arn: invocation_arn.clone(),
+            // The id of THIS call, which the invocation's delivered output names as the
+            // request it came from.
+            request_id: ::service_common::query_error_envelope::new_request_id(),
             model_id: model.model_id.clone(),
             model_arn: crate::state::foundation_model_arn(&region, &model.model_id),
             client_request_token: token.map(str::to_string),

@@ -12,6 +12,41 @@ Issue-Commit: 470e644ed8a1d9f9695329376c11ab8f2895bf9a
 
 > _Note: this issue was identified against the code base at commit `470e644ed8a1d9f9695329376c11ab8f2895bf9a`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+
+Cause 1 is FIXED. A finished video invocation now delivers the GENERATED MEDIA object of the requested
+modality — `output.mp4` — under its own segment of the submitted prefix, beside the manifest it already
+wrote, both written before the status flips to `Completed`
+(`services/service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice/src/state/async_invoke_video.rs`,
+`src/state/async_invoke_output.rs`). The object is a real video file: its frames are rendered here and
+encoded by the maintained H.264 encoder and MP4 writer the crate now depends on, at the geometry and the
+length the submitted `modelInput` configured (`videoGenerationConfig.dimension` / `durationSeconds`, or
+`resolution` / `aspect_ratio` / `duration`), so a client that polls to `Completed` and reads its own bucket
+has a decodable artifact. No video model runs in this emulator, so what the frames SAY is exactly that,
+beside the facts of the invocation served — nothing renders the scene the prompt describes and no pixel is
+derived from the prompt. The manifest additionally names the submitting call (`requestId`). The check's
+replay key passes.
+
+Cause 2's behaviour is FIXED and pinned, and its replay key still times out for a reason outside the
+emulator. A `Completed` invocation now stays resolvable with an unchanged
+`outputDataConfig.s3OutputDataConfig.s3Uri`, each `GetAsyncInvoke` answers in milliseconds without
+blocking, and the artifact stays present and byte-identical however often it is re-read
+(`tests/all/async_invoke_output_artifact.rs`). The cause's own hypotheses — a record that never leaves
+`InProgress`, or a `Get`/`List` that does not answer — are both false now: the sibling check
+`bedrock-runtime.async-invoke-output-written-to-configured-destination-serverside` runs the same
+start -> poll-to-terminal -> list sequence and PASSES. What is left is the check's own shape: it observes
+the retention window for ~60 s in `time.sleep(2)` steps, which is the harness's whole 60 s check budget,
+so it is killed in a sleep whatever the emulator answers.
+
+Cause 3 is NOT fixed and is NOT closed here: the stop-sequence rule itself is already implemented and
+covered (`src/state.rs` `halt_at_stop_sequence`, pinned by `tests/all/inference_stop_sequences.rs`, whose
+first row is this check's own digit and budget — the served text is cut at the first configured sequence
+and the turn reports `stopReason='stop_sequence'`). What the check needs beyond that is a generation
+containing the digits to cut, which is the constant-notice defect: nothing in this emulator can run a
+language model. Its replay key now lives on the open report that owns that defect,
+`issues/things-that-do-not-work/20261028T194707Z-bedrock-runtime-generation-stage-serves-a-constant-emulator.md`
+(which this report's own Cause 3 named as the one describing it).
+
 ## Operation
 StartAsyncInvoke
 

@@ -610,7 +610,7 @@ fn message_of(call: &Call) -> String {
 /// The emulator with this service AND Amazon S3 on one shared engine, behind the
 /// production router — the way `core/router` assembles them, which is what lets an
 /// invocation's output be written into the store Amazon S3 answers reads from.
-fn emulator_with_object_store() -> MultiServiceRouter {
+pub(crate) fn emulator_with_object_store() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -621,7 +621,7 @@ fn emulator_with_object_store() -> MultiServiceRouter {
 
 /// One Amazon S3 request on the same router, path-style and scoped to the `s3` signing
 /// name, which is what routes it to the object store rather than to this service.
-async fn s3_call(
+pub(crate) async fn s3_call(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -651,7 +651,7 @@ async fn s3_call(
 
 /// Create `bucket` the way a caller would before submitting an invocation that writes
 /// into it.
-async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
+pub(crate) async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
     let answer = s3_call(router, "PUT", &format!("/{bucket}"), &[]).await;
     assert!(
         (200..300).contains(&answer.status),
@@ -662,7 +662,7 @@ async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
 }
 
 /// Submit one asynchronous invocation and return its `invocationArn`.
-async fn submit(
+pub(crate) async fn submit(
     router: &MultiServiceRouter,
     case: &str,
     model_id: &str,
@@ -705,7 +705,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Read the invocation `arn` names until it leaves `InProgress`, and report the record it
 /// settled into.
-async fn poll_to_terminal(router: &MultiServiceRouter, case: &str, arn: &str) -> Value {
+pub(crate) async fn poll_to_terminal(router: &MultiServiceRouter, case: &str, arn: &str) -> Value {
     let deadline = Instant::now() + TERMINAL_DEADLINE;
     loop {
         let call = get(router, &format!("/async-invoke/{}", encode_path(arn))).await;

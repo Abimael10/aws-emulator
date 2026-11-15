@@ -17,17 +17,23 @@
 //!
 //! # What it writes and what it will not claim
 //!
-//! One object per finished invocation: the MANIFEST of the job, at
-//! `<prefix>/<invocationId>/manifest.json`, which is what indexes an asynchronous
-//! invocation's output under the prefix every invocation submitted against that location
-//! shares. Everything it states is a fact of the record — which invocation it is, which
-//! model was invoked, when the invocation was submitted and when it ended, and where its
-//! own segment is.
+//! Two objects per finished invocation, both under `<prefix>/<invocationId>/`:
 //!
-//! No language model runs in this emulator, so NO media bytes are written beside it: a
-//! video file nothing rendered would be output synthesised to look computed. The status,
-//! the timestamps, the object and its contents are all real; the frames a model would have
-//! generated are the one thing absent, and nothing here pretends otherwise.
+//! * the generated MEDIA object of the requested modality
+//!   ([`super::async_invoke_video::MEDIA_OBJECT`]), which is what a client polls the
+//!   invocation for and then reads out of its own bucket;
+//! * the MANIFEST of the job, at `manifest.json`, which is what indexes that output under
+//!   the prefix every invocation submitted against that location shares. Everything it
+//!   states is a fact of the record — which invocation it is, which model was invoked, when
+//!   the invocation was submitted and when it ended, and where its own segment is.
+//!
+//! No video model runs in this emulator, and the media object does not pretend one did:
+//! it is a real video file, of the geometry and length the request configured, whose
+//! frames this emulator renders and a maintained encoder writes — and what those frames
+//! SAY is that no model ran, beside the facts of the invocation that was served (see
+//! [`super::async_invoke_video`]). The status, the timestamps, the objects and their
+//! contents are all real; the scene a model would have rendered is the one thing absent,
+//! and nothing here is dressed up as it.
 //!
 //! # Where the delivery happens
 //!
@@ -44,8 +50,8 @@ use crate::ops::types::AsyncInvokeOutputDataConfig;
 
 use super::AsyncInvokeRecord;
 
-/// The object a finished invocation writes under its own segment of the submitted prefix:
-/// the manifest that indexes what the invocation produced.
+/// The object a finished invocation writes under its own segment of the submitted prefix
+/// beside its generated media: the manifest that indexes what the invocation produced.
 pub const MANIFEST_OBJECT: &str = "manifest.json";
 
 /// The version the manifest states for its own layout, so a reader can tell one layout
@@ -60,10 +66,17 @@ pub struct DueInvocation {
     pub invocation_arn: String,
     /// The invocation id inside that ARN, which is the segment its output lives under.
     pub invocation_id: String,
+    /// The id of the call that submitted the invocation, which its delivered output names
+    /// as the request it came from.
+    pub request_id: String,
     /// The model the invocation was submitted against.
     pub model_id: String,
     /// `outputDataConfig` as submitted: where the output goes.
     pub output_data_config: AsyncInvokeOutputDataConfig,
+    /// `modelInput` as submitted, as JSON: what the generated artifact is rendered from —
+    /// the geometry and the length the invoked model's own request schema states
+    /// ([`super::async_invoke_video::plan`]).
+    pub model_input: ::serde_json::Value,
     /// Epoch milliseconds of the submitting call.
     pub submit_time: i64,
     /// Epoch milliseconds the invocation's terminal transition was due at, which is the
@@ -83,8 +96,10 @@ impl DueInvocation {
         Some(Self {
             invocation_arn: record.invocation_arn.clone(),
             invocation_id: invocation_id.to_string(),
+            request_id: record.request_id.clone(),
             model_id: record.model_id.clone(),
             output_data_config: record.output_data_config.clone(),
+            model_input: super::document_to_json(&record.model_input),
             submit_time: record.submit_time,
             settles_at: record.settles_at,
         })
@@ -167,15 +182,26 @@ pub fn manifest_key(prefix: &str, invocation_id: &str) -> String {
     )
 }
 
-/// The manifest document: which invocation this is, what it was invoked against, when it
-/// ran, and where its own segment of the output location is.
+/// The key of the generated media object of the invocation `invocation_id` names, under
+/// `prefix`.
+pub fn media_key(prefix: &str, invocation_id: &str) -> String {
+    format!(
+        "{}/{}",
+        invocation_prefix(prefix, invocation_id),
+        super::async_invoke_video::MEDIA_OBJECT
+    )
+}
+
+/// The manifest document: which invocation this is, which call submitted it, what it was
+/// invoked against, when it ran, and where its own segment of the output location is.
 ///
-/// No recording covers this document's own body, so what it states is exactly what it is
-/// the index of — every member comes off the stored record.
+/// What it states is exactly what it is the index of — every member comes off the stored
+/// record.
 fn manifest_body(invocation: &DueInvocation, bucket: &str, prefix: &str) -> ::serde_json::Value {
     ::serde_json::json!({
         "version": MANIFEST_VERSION,
         "jobId": invocation.invocation_id,
+        "requestId": invocation.request_id,
         "modelId": invocation.model_id,
         "submitTime": super::datetime_of_millis(invocation.submit_time)
             .fmt(::aws_smithy_types::date_time::Format::DateTime)
@@ -189,6 +215,17 @@ fn manifest_body(invocation: &DueInvocation, bucket: &str, prefix: &str) -> ::se
         ),
     })
 }
+
+/// The most invocations ONE read delivers the output of.
+///
+/// A delivery RENDERS and encodes this invocation's video
+/// ([`super::async_invoke_video`]), which is bounded but not free, so the work one read
+/// does is bounded too however many invocations the clock has made due at the same
+/// instant: the rest are materialised by the reads that follow, each of which was owed the
+/// same transition. The invocation a read is ABOUT is always among them
+/// ([`settle_due_invocation`]), so a caller polling one job never waits on another
+/// caller's delivery and never sees its own held back.
+const MAX_DELIVERIES_PER_READ: usize = 8;
 
 /// Materialise every async-invoke transition the clock has already made due at
 /// `now_millis`, having first DELIVERED each invocation's output to the location its
@@ -205,13 +242,40 @@ fn manifest_body(invocation: &DueInvocation, bucket: &str, prefix: &str) -> ::se
 /// this service's store and the object store are never locked at once; an invocation a
 /// concurrent read already settled is left exactly as that read left it
 /// ([`super::ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState::settle_async_invoke`]).
-pub fn settle_due_invocations<Eng: Send + Sync + 'static>(engine: &Eng, now_millis: i64) {
+pub async fn settle_due_invocations<Eng: Send + Sync + 'static>(engine: &Eng, now_millis: i64) {
+    settle_due(engine, now_millis, None).await;
+}
+
+/// The same settle for a read ABOUT one invocation: that one is delivered before any
+/// other, so the bound on how many one read delivers can never leave the invocation the
+/// caller asked about undelivered.
+pub async fn settle_due_invocation<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    now_millis: i64,
+    invocation_arn: &str,
+) {
+    settle_due(engine, now_millis, Some(invocation_arn)).await;
+}
+
+/// Deliver and settle at most [`MAX_DELIVERIES_PER_READ`] due invocations, `first` before
+/// any other when a read named one.
+async fn settle_due<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    now_millis: i64,
+    first: Option<&str>,
+) {
     let Some(state) = super::service_state(engine) else {
         return;
     };
-    let due = state.lock().due_async_invokes(now_millis);
+    let mut due = state.lock().due_async_invokes(now_millis);
+    if let Some(first) = first {
+        // A stable sort on "is not the one asked about" moves that invocation to the front
+        // and leaves the order of the rest as it was.
+        due.sort_by_key(|invocation| invocation.invocation_arn != first);
+    }
+    due.truncate(MAX_DELIVERIES_PER_READ);
     for invocation in due {
-        let failure = deliver(engine, &invocation);
+        let failure = deliver(engine, &invocation).await;
         state
             .lock()
             .settle_async_invoke(&invocation.invocation_arn, failure);
@@ -221,11 +285,20 @@ pub fn settle_due_invocations<Eng: Send + Sync + 'static>(engine: &Eng, now_mill
 /// Write one finished invocation's output into the location its submission named, and
 /// report what stopped it, or `None` once the output is in the caller's bucket.
 ///
+/// BOTH objects are written before anything reports the invocation finished — the
+/// generated media first, then the manifest that indexes it — so a `Completed` a client
+/// reads is never a prefix holding an index of an artifact that is not there. An object
+/// that could not be produced or could not be written is reported as the invocation
+/// FAILING.
+///
 /// The failure is reported in the service's own words
 /// ([`super::ASYNC_INVOKE_FAILURE_MESSAGE`]) and what exactly refused the write is logged
 /// where a developer can see it, with the caller's own values rendered in their escaped
 /// `Debug` form so a bucket name carrying a newline cannot forge a log line.
-fn deliver<Eng: Send + Sync + 'static>(engine: &Eng, invocation: &DueInvocation) -> Option<String> {
+async fn deliver<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    invocation: &DueInvocation,
+) -> Option<String> {
     let failed = || Some(super::ASYNC_INVOKE_FAILURE_MESSAGE.to_string());
     let Some((bucket, prefix)) = output_location(&invocation.output_data_config) else {
         ::tracing::warn!(
@@ -243,29 +316,87 @@ fn deliver<Eng: Send + Sync + 'static>(engine: &Eng, invocation: &DueInvocation)
         );
         return failed();
     };
-    let key = manifest_key(prefix, &invocation.invocation_id);
-    let body = match ::serde_json::to_vec(&manifest_body(invocation, bucket, prefix)) {
-        Ok(body) => body,
+    let mut objects: Vec<(String, Vec<u8>, &str)> = Vec::new();
+    match media(invocation).await {
+        Ok(Some(body)) => objects.push((
+            media_key(prefix, &invocation.invocation_id),
+            body,
+            super::async_invoke_video::MEDIA_MIME,
+        )),
+        // A model this service serves asynchronously but renders no artifact for delivers
+        // its manifest alone rather than nothing at all.
+        Ok(None) => {}
+        Err(detail) => {
+            ::tracing::warn!(
+                invocation = ?invocation.invocation_id,
+                detail,
+                "an async invocation's generated media could not be produced"
+            );
+            return failed();
+        }
+    }
+    match ::serde_json::to_vec(&manifest_body(invocation, bucket, prefix)) {
+        Ok(body) => objects.push((
+            manifest_key(prefix, &invocation.invocation_id),
+            body,
+            super::JSON_MIME,
+        )),
         Err(error) => {
             ::tracing::warn!(%error, "an async invocation's manifest could not be rendered");
             return failed();
         }
-    };
-    let object = s3::state::Object::stored(body, Some(super::JSON_MIME.to_string()));
-    let written = {
-        let mut objects = store.lock();
-        objects.put_object(bucket, &key, object)
-    };
-    match written {
-        Some(s3::state::ObjectWrite::Created | s3::state::ObjectWrite::Replaced) => None,
-        refused => {
-            ::tracing::warn!(
-                bucket = ?bucket,
-                key = ?key,
-                outcome = ?refused,
-                "an async invocation's output could not be written to this emulator's Amazon S3"
-            );
-            failed()
+    }
+    for (key, body, mime) in objects {
+        let object = s3::state::Object::stored(body, Some(mime.to_string()));
+        let written = {
+            let mut store = store.lock();
+            store.put_object(bucket, &key, object)
+        };
+        match written {
+            Some(s3::state::ObjectWrite::Created | s3::state::ObjectWrite::Replaced) => {}
+            refused => {
+                ::tracing::warn!(
+                    bucket = ?bucket,
+                    key = ?key,
+                    outcome = ?refused,
+                    "an async invocation's output could not be written to this emulator's \
+                     Amazon S3"
+                );
+                return failed();
+            }
         }
+    }
+    None
+}
+
+/// The bytes of one invocation's generated media object, or `None` for an invoked model
+/// whose artifact this service renders none of.
+///
+/// Rendering and encoding frames is synchronous, CPU-bound work, so it runs through the
+/// ONE stage this service runs such work in ([`super::turn_composition::off_worker`]):
+/// off the async worker, so a read that materialises a delivery never holds the worker
+/// serving it, and inside that stage's budget.
+///
+/// `Err` carries what stopped the renderer, for [`deliver`] to log: an invocation whose
+/// media could not be produced reports the modelled failure rather than a `Completed`
+/// whose output is not there.
+async fn media(invocation: &DueInvocation) -> Result<Option<Vec<u8>>, String> {
+    let Some(plan) =
+        super::async_invoke_video::plan(&invocation.model_id, &invocation.model_input)
+    else {
+        return Ok(None);
+    };
+    let subject = super::async_invoke_video::VideoSubject {
+        model_id: invocation.model_id.clone(),
+        invocation_id: invocation.invocation_id.clone(),
+    };
+    match super::turn_composition::off_worker(move || {
+        super::async_invoke_video::render(&plan, &subject)
+    })
+    .await
+    {
+        Ok(Ok(media)) => Ok(Some(media)),
+        Ok(Err(detail)) => Err(detail),
+        Err(not_composed) => Err(not_composed.message),
     }
 }

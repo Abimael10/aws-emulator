@@ -2838,6 +2838,7 @@ async fn the_async_invoke_store_evicts_its_oldest_records_past_the_retention_bou
             format!("arn:aws:bedrock:us-east-1:000000000000:async-invoke/{index:012}");
         store.insert_async_invoke(state::AsyncInvokeRecord {
             invocation_arn: invocation_arn.clone(),
+            request_id: format!("request-{index}"),
             model_id: "amazon.nova-lite-v1:0".to_string(),
             model_arn: "arn:aws:bedrock:us-east-1:000000000000:foundation-model/amazon.nova-lite-v1:0"
                 .to_string(),

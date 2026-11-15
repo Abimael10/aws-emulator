@@ -32,11 +32,13 @@
 //! output and presents it as inference: a synchronous completion carries, in the
 //! model family's own response envelope, text that says plainly that no model
 //! ran ([`generation`]), together with the token accounting computed from the
-//! real request; an asynchronous invocation writes the MANIFEST of the job it
-//! ran to the caller's own output location and no media bytes it did not
-//! generate ([`async_invoke_output`]); and the arguments a forced tool call
-//! carries are the instantiation of the schema that tool was DECLARED with
-//! ([`tool_input_arguments`]), not values a model inferred from the conversation.
+//! real request; an asynchronous invocation delivers, to the caller's own output
+//! location, the manifest of the job it ran and a real video file of the geometry
+//! and length the request configured, whose own frames state that no model
+//! rendered them ([`async_invoke_output`], [`async_invoke_video`]); and the
+//! arguments a forced tool call carries are the instantiation of the schema that
+//! tool was DECLARED with ([`tool_input_arguments`]), not values a model inferred
+//! from the conversation.
 //! Everything around that — resolution, validation, status, timestamps, ARNs,
 //! paging and the invocation log — is real and computed from persisted state.
 
@@ -92,6 +94,10 @@ pub mod context_window;
 /// What a finished asynchronous invocation writes to the caller's Amazon S3 location, and
 /// the settle that delivers it.
 pub mod async_invoke_output;
+
+/// The generated media object a finished video invocation delivers: the frames this
+/// emulator renders, encoded as the video file a client reads out of its own bucket.
+pub mod async_invoke_video;
 
 /// The invocation-logging record a served inference delivers to the destination the
 /// control plane's logging configuration installed.
@@ -1679,6 +1685,10 @@ fn input_rule_violation(rule: &InputRule, root: &serde_json::Value) -> Option<St
 #[derive(Debug, Clone)]
 pub struct AsyncInvokeRecord {
     pub invocation_arn: String,
+    /// The id of the submitting call, which the delivered output names as the request it
+    /// came from. Minted when the invocation is accepted and never again, so every read of
+    /// the delivered artifact reports the same id and no two invocations share one.
+    pub request_id: String,
     pub model_id: String,
     pub model_arn: String,
     pub client_request_token: Option<String>,
