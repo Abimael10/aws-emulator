@@ -29,8 +29,10 @@
 //! failed scaling activity whose `StatusMessage` names the target groups that are gone
 //! ("if an attempt to launch instances failed, the StatusCode value is Failed or Cancelled
 //! and the StatusMessage element in the response indicates the cause of the failure",
-//! `DescribeScalingActivities`) — and launches again as soon as the group holds no
-//! attachment that cannot resolve.
+//! `DescribeScalingActivities`). The attachment itself is the CLIENT's: the group keeps
+//! reporting it, and keeps refusing the launch, until the client detaches it — so the
+//! remediation a client performs (detach the target group that is gone, attach one that
+//! exists, ask for the capacity again) is what lifts the block.
 //!
 //! The tables below span what the rule generalises over: how many target groups a group is
 //! attached to, how many instances it holds, how many zones they are spread across, the
@@ -1235,15 +1237,18 @@ async fn reported_desired_capacity(router: &MultiServiceRouter, name: &str) -> S
 }
 
 /// The `StatusMessage` the failed activity of a launch blocked by deleted target groups
-/// carries: Elastic Load Balancing's own `TargetGroupNotFound` refusal for the identifiers
-/// a call names — one identifier, or several, under the plural noun, with the service,
-/// status and code an AWS SDK renders beside it — followed by the launch Amazon EC2 Auto
-/// Scaling therefore did not make.
+/// carries: Amazon EC2 Auto Scaling's own fixed text for a registration it could not make
+/// ('Failed to update target group ') naming the target groups it could not update, then
+/// Elastic Load Balancing's own `TargetGroupNotFound` refusal for the identifiers a call
+/// names — one identifier, or several, under the plural noun, with the service, status and
+/// code an AWS SDK renders beside it — followed by the launch Amazon EC2 Auto Scaling
+/// therefore did not make.
 fn blocked_message(unresolved: &[String]) -> String {
+    let named = unresolved.join(", ");
     format!(
-        "Target groups '{}' not found (Service: ElasticLoadBalancingV2, Status Code: 400, Error \
-         Code: TargetGroupNotFound). Launching EC2 instance failed.",
-        unresolved.join(", ")
+        "Failed to update target group {named}: Target groups '{named}' not found (Service: \
+         ElasticLoadBalancingV2, Status Code: 400, Error Code: TargetGroupNotFound). Launching \
+         EC2 instance failed."
     )
 }
 
@@ -1483,19 +1488,11 @@ async fn a_scale_out_is_refused_while_an_attached_target_group_is_gone() {
                 case.case
             );
         }
-        // The attachment that can never resolve again is no longer one the group holds,
-        // exactly as a detach of it would leave the group, while every attachment that
-        // does resolve is still there.
+        // The attachment is the CLIENT's: the group goes on reporting every target group it
+        // was attached to, the one that is gone included, because only a detach takes an
+        // attachment off a group.
         let attached = attached_identifiers(&router, &name).await;
-        for arn in &gone {
-            assert!(
-                !attached.contains(arn),
-                "case {:?}: expected the group to hold no attachment to the deleted {arn:?}, \
-                 got {attached:?}",
-                case.case
-            );
-        }
-        for arn in &kept {
+        for arn in arns.iter() {
             assert!(
                 attached.contains(arn),
                 "case {:?}: expected the group to keep its attachment to {arn:?}, got \
@@ -1503,13 +1500,43 @@ async fn a_scale_out_is_refused_while_an_attached_target_group_is_gone() {
                 case.case
             );
         }
+        // And the client's own detach of the target group that is gone is served: a group
+        // that reports an attachment cannot refuse the call that removes it. (A traffic
+        // source is removed by `DetachTrafficSources` instead, which this suite's detach
+        // helper does not post, so the rows naming one stop at the assertion above.)
+        if !gone.is_empty() && case.attached_as != AttachedAs::Elbv2TrafficSources {
+            let status = detach(&router, &name, &gone).await;
+            assert_eq!(
+                status, 200,
+                "case {:?}: detaching the deleted target group(s) {gone:?} must be served, got \
+                 {status}",
+                case.case
+            );
+            let attached = attached_identifiers(&router, &name).await;
+            for arn in &gone {
+                assert!(
+                    !attached.contains(arn),
+                    "case {:?}: expected the detached {arn:?} to be gone from the group, got \
+                     {attached:?}",
+                    case.case
+                );
+            }
+            for arn in &kept {
+                assert!(
+                    attached.contains(arn),
+                    "case {:?}: expected the detach to leave {arn:?} attached, got {attached:?}",
+                    case.case
+                );
+            }
+        }
     }
 }
 
-/// The refusal stands until the client asks again: while the group holds an attachment
-/// Elastic Load Balancing v2 cannot resolve the scale-out launches nothing, and once that
-/// attachment has ended with the target group it named — and a fresh target group is
-/// attached — the same scale-out launches the instance and registers it there.
+/// The refusal stands until the CLIENT clears it: while the group holds an attachment
+/// Elastic Load Balancing v2 cannot resolve, every scale-out launches nothing and records
+/// its own refusal, and once the client has detached that attachment — which the group,
+/// still reporting it, serves — and attached a fresh target group, the same scale-out
+/// launches the instance and registers it there.
 #[tokio::test]
 async fn a_scale_out_resumes_once_no_attachment_is_missing() {
     let (router, engine) = emulator();
@@ -1571,16 +1598,52 @@ async fn a_scale_out_resumes_once_no_attachment_is_missing() {
             "the refused scale-out must report its refusal once, got {still:?}"
         );
     }
-    // The attachment that could not resolve has ended with the target group it named.
+    // The attachment the launch could not register into is STILL the group's: only the
+    // client takes an attachment off a group.
+    let attached = attached_identifiers(&router, "asg-resumes").await;
+    assert_eq!(
+        attached,
+        vec![gone.clone()],
+        "expected the group to still hold its attachment to the deleted target group, got \
+         {attached:?}"
+    );
+    // While it is there the block stands, so the SAME capacity change is refused again and
+    // nothing is launched for it.
+    let (status, code, message) = set_desired_capacity(&router, "asg-resumes", 2).await;
+    assert_eq!(
+        status, 200,
+        "the repeated blocked capacity change must be served, got {status} with {code:?} \
+         {message:?}"
+    );
+    let again = failed_activities(&router, "asg-resumes").await;
+    assert_eq!(
+        again.len(),
+        2,
+        "each blocked scale-out must record its own refusal, got {again:?}"
+    );
+    assert!(
+        again.iter().all(|activity| activity.status_message == wanted),
+        "every refusal must report {wanted:?}, got {again:?}"
+    );
+    let held = instance_states(&router, "asg-resumes").await;
+    assert_eq!(
+        held, before,
+        "the repeated blocked scale-out must launch nothing either, got {held:?}"
+    );
+
+    // The client's own remediation: detach the target group that is gone — the group reports
+    // it, so the detach is served — and attach a fresh one in its place. Nothing is in the
+    // way now, so the same capacity change launches the instance and registers it there.
+    let status = detach(&router, "asg-resumes", std::slice::from_ref(&gone)).await;
+    assert_eq!(
+        status, 200,
+        "detaching the deleted target group must be served, got {status}"
+    );
     let attached = attached_identifiers(&router, "asg-resumes").await;
     assert!(
         attached.is_empty(),
-        "expected the group to hold no attachment to the deleted target group, got \
-         {attached:?}"
+        "expected the detach to leave the group with no attachment, got {attached:?}"
     );
-
-    // A fresh target group takes its place and the client asks for the capacity again:
-    // nothing is in the way now, so the launch is made and the instance is registered there.
     let fresh = create_target_group(&router, "tg-fresh", 80, TARGET_TYPE_INSTANCE, &vpc_id).await;
     let (status, code, message) = attach(&router, "asg-resumes", std::slice::from_ref(&fresh)).await;
     assert_eq!(
@@ -1603,7 +1666,240 @@ async fn a_scale_out_resumes_once_no_attachment_is_missing() {
     );
     let failed = failed_activities(&router, "asg-resumes").await;
     assert_eq!(
-        failed, blocked,
+        failed, again,
         "the resumed scale-out must record no further failure, got {failed:?}"
     );
+}
+
+/// The fixed text Amazon EC2 Auto Scaling opens the activity of a launch it could not bring
+/// into a target group with, and the whole of what a client matches such an activity on:
+/// recorded behaviour, where the message reads `Failed to update target group ` and then the
+/// target group's own ARN.
+const FAILED_TARGET_GROUP_UPDATE: &str = "Failed to update target group";
+
+/// One row of the blocked-launch message table: the attachments the group holds, which of
+/// them are deleted out of band, how they were attached, the target group's own port,
+/// whether the group was scaled out once while every attachment still resolved, how many
+/// instances it holds before the blocked change, and the capacity that change asks for.
+struct BlockedMessageRow {
+    case: &'static str,
+    target_groups: usize,
+    /// The indexes, into the row's own target groups, of the ones deleted before the
+    /// scale-out.
+    deleted: &'static [usize],
+    attached_as: AttachedAs,
+    port: i32,
+    /// Whether one scale-out is made while every attachment still resolves, before the
+    /// delete — a launch that must register, and therefore record no failure.
+    positive_control: bool,
+    held: usize,
+    desired: usize,
+}
+
+fn blocked_message_rows() -> Vec<BlockedMessageRow> {
+    vec![
+        BlockedMessageRow {
+            case: "the only attached target group is deleted after a scale-out that worked",
+            target_groups: 1,
+            deleted: &[0],
+            attached_as: AttachedAs::TargetGroupArns,
+            port: 80,
+            positive_control: true,
+            held: 1,
+            desired: 3,
+        },
+        BlockedMessageRow {
+            case: "both attached target groups are deleted, scaling out by two",
+            target_groups: 2,
+            deleted: &[0, 1],
+            attached_as: AttachedAs::TargetGroupArns,
+            port: 8080,
+            positive_control: false,
+            held: 1,
+            desired: 3,
+        },
+        BlockedMessageRow {
+            case: "one of two attached target groups is deleted, named as a traffic source",
+            target_groups: 2,
+            deleted: &[1],
+            attached_as: AttachedAs::Elbv2TrafficSources,
+            port: 80,
+            positive_control: false,
+            held: 1,
+            desired: 2,
+        },
+        BlockedMessageRow {
+            case: "the deleted target group was attached by a later attach",
+            target_groups: 1,
+            deleted: &[0],
+            attached_as: AttachedAs::LaterAttach,
+            port: 8080,
+            positive_control: false,
+            held: 2,
+            desired: 3,
+        },
+    ]
+}
+
+/// Every row: the activity a client polls for after a scale-out that could not be brought
+/// into its target groups is found by the text Amazon EC2 Auto Scaling words that failure
+/// with — a `Failed` activity whose message opens with [`FAILED_TARGET_GROUP_UPDATE`] and
+/// names, by ARN, each target group the launch could not be put into, carries the refusal
+/// the load-balancing service answered for it, and ends with the launch that was therefore
+/// not made. A launch every attachment resolved for records no such activity.
+#[tokio::test]
+async fn a_blocked_launch_names_the_target_group_it_could_not_update() {
+    let (router, engine) = emulator();
+    let subnets = seed_subnets(&engine, 2);
+    let vpc_id = vpc_of(&router, &subnets[0]).await;
+    create_launch_template(&router, "lt-blocked-message").await;
+
+    for (row, case) in blocked_message_rows().into_iter().enumerate() {
+        let name = format!("asg-blocked-message-{row}");
+        let mut arns = Vec::new();
+        for index in 0..case.target_groups {
+            arns.push(
+                create_target_group(
+                    &router,
+                    &format!("tg-blocked-message-{row}-{index}"),
+                    case.port,
+                    TARGET_TYPE_INSTANCE,
+                    &vpc_id,
+                )
+                .await,
+            );
+        }
+        create_group(
+            &router,
+            &name,
+            "lt-blocked-message",
+            &subnets,
+            case.held,
+            &arns,
+            case.attached_as,
+        )
+        .await;
+        let mut held = case.held;
+        settled_instances(&router, case.case, &name, held).await;
+        // The control: while every attachment resolves the scale-out launches and registers,
+        // so nothing before the delete has recorded a failure for a client to find.
+        if case.positive_control {
+            let (status, code, message) = set_desired_capacity(&router, &name, held + 1).await;
+            assert_eq!(
+                status, 200,
+                "case {:?}: the control scale-out must be served, got {status} with {code:?} \
+                 {message:?}",
+                case.case
+            );
+            held += 1;
+            let settled = settled_instances(&router, case.case, &name, held).await;
+            for arn in &arns {
+                let actual = registered_ids(&router, arn).await;
+                assert_eq!(
+                    actual,
+                    instance_ids(&settled),
+                    "case {:?}: expected {arn:?} to hold the group's instances before the \
+                     delete, got {actual:?}",
+                    case.case
+                );
+            }
+            let failed = failed_activities(&router, &name).await;
+            assert!(
+                failed.is_empty(),
+                "case {:?}: the control scale-out must record no failure, got {failed:?}",
+                case.case
+            );
+        }
+
+        let gone: Vec<String> = case
+            .deleted
+            .iter()
+            .map(|index| arns[*index].clone())
+            .collect();
+        for arn in &gone {
+            delete_target_group(&router, arn).await;
+        }
+        let (status, code, message) = set_desired_capacity(&router, &name, case.desired).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the blocked capacity change must be served, got {status} with {code:?} \
+             {message:?}",
+            case.case
+        );
+
+        // What a client does with the activity log: it polls it for the failure AWS words a
+        // blocked registration with, and reads the target group out of the message it finds.
+        let wanted = case.desired - held;
+        let deadline = Instant::now() + poll_budget();
+        let found = loop {
+            let found: Vec<ReportedActivity> = failed_activities(&router, &name)
+                .await
+                .into_iter()
+                .filter(|activity| {
+                    activity.status_message.contains(FAILED_TARGET_GROUP_UPDATE)
+                        || activity.description.contains(FAILED_TARGET_GROUP_UPDATE)
+                })
+                .collect();
+            if found.len() == wanted || Instant::now() >= deadline {
+                break found;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        };
+        assert_eq!(
+            found.len(),
+            wanted,
+            "case {:?}: expected {wanted} activity(ies) a client finds by {:?}, got {found:?}",
+            case.case,
+            FAILED_TARGET_GROUP_UPDATE
+        );
+        let expected_message = blocked_message(&gone);
+        let expected_description = blocked_description(&gone);
+        for activity in &found {
+            assert_eq!(
+                activity.status_code, ACTIVITY_FAILED,
+                "case {:?}: expected the blocked launch to report {ACTIVITY_FAILED}, got \
+                 {activity:?}",
+                case.case
+            );
+            assert_eq!(
+                activity.status_message, expected_message,
+                "case {:?}: expected the activity to report {expected_message:?}, got \
+                 {activity:?}",
+                case.case
+            );
+            assert_eq!(
+                activity.description, expected_description,
+                "case {:?}: expected the activity to describe {expected_description:?}, got \
+                 {activity:?}",
+                case.case
+            );
+            // The target groups the launch could not be put into are named by the ARN the
+            // request carried, which is what a client repoints the group with.
+            for arn in &gone {
+                assert!(
+                    activity.status_message.contains(arn.as_str()),
+                    "case {:?}: expected the activity to name {arn:?}, got {activity:?}",
+                    case.case
+                );
+            }
+            // An attachment that still resolves took no part in the failure, so the message
+            // names none of them.
+            for arn in arns.iter().filter(|arn| !gone.contains(arn)) {
+                assert!(
+                    !activity.status_message.contains(arn.as_str()),
+                    "case {:?}: expected the activity to name no resolvable attachment, got \
+                     {activity:?} naming {arn:?}",
+                    case.case
+                );
+            }
+        }
+        // Nothing else failed: every failed activity of the group is one of these.
+        let failed = failed_activities(&router, &name).await;
+        assert_eq!(
+            failed, found,
+            "case {:?}: expected the group's only failures to be the blocked launches, got \
+             {failed:?}",
+            case.case
+        );
+    }
 }

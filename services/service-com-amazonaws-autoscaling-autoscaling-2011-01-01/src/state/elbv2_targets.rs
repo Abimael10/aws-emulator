@@ -64,9 +64,15 @@
 //! stops the launch that would have to register there: the group launches nothing and
 //! records the refusal that names the target group instead
 //! ([`launch_blocked_message`]), which is what a client reads off the group's scaling
-//! activities. The attachment then ends with the target group it named
-//! (`AutoScalingState::drop_attachments`), because a target group ARN carries the id that
-//! service minted for that one target group and so can never be registered into again.
+//! activities.
+//!
+//! The ATTACHMENT itself is left exactly as the client made it. An attachment is the
+//! client's own association, removed by the call that removes associations
+//! (`DetachLoadBalancerTargetGroups`, `DetachTrafficSources`), so a group goes on
+//! reporting it and goes on refusing the launch until the client takes it off — which is
+//! what makes the remediation a client performs (detach the target group that is gone,
+//! attach one that exists, scale out again) land, and keeps a detach of what the group
+//! still reports from being refused as naming no attachment of the group.
 //!
 //! # A target group this endpoint could never register in
 //!
@@ -294,20 +300,38 @@ const ELBV2_SERVICE_NAME: &str = "ElasticLoadBalancingV2";
 const TARGET_GROUP_NOT_FOUND_CODE: &str = "TargetGroupNotFound";
 const TARGET_GROUP_NOT_FOUND_STATUS: u16 = 400;
 
-/// What the scaling activity of a launch that could not be registered reports as its
-/// `StatusMessage`: the refusal Elastic Load Balancing v2 answered for the target groups
-/// that are gone, and the launch that therefore did not happen.
+/// How Amazon EC2 Auto Scaling itself words a launch it could not bring into a target
+/// group: the fixed text it opens the activity's `StatusMessage` with, followed by the
+/// target group it could not put the instance into.
 ///
-/// The refusal is that service's own — its `TargetGroupNotFound` wording for the
-/// identifiers a call names (`elbv2::target_groups_not_found_message`), with the service,
-/// status and code an AWS SDK renders beside the message of a failed call, so a client
-/// reads here exactly what it would read from a call of its own against the deleted target
-/// group. The sentence that ends it is Amazon EC2 Auto Scaling's own: the launch it did not
-/// make.
+/// RECORDED wording, and the whole of what a client matches on — the message of the
+/// activity Amazon EC2 Auto Scaling records when registering a launched instance with an
+/// attachment fails reads `Failed to update target group ` and then the target group's own
+/// ARN, whatever it was about that target group that made the registration impossible.
+const FAILED_TARGET_GROUP_UPDATE: &str = "Failed to update target group";
+
+/// What the scaling activity of a launch that could not be registered reports as its
+/// `StatusMessage`: the target groups the launch could not be brought into, the refusal
+/// Elastic Load Balancing v2 answered for them, and the launch that therefore did not
+/// happen.
+///
+/// It opens with Amazon EC2 Auto Scaling's own fixed text for a registration that failed
+/// ([`FAILED_TARGET_GROUP_UPDATE`]), naming the target groups it could not update, because
+/// that is the sentence a client reads off the activity to tell a launch blocked by its
+/// load balancing from one blocked by anything else.
+///
+/// What follows is Elastic Load Balancing v2's own refusal — its `TargetGroupNotFound`
+/// wording for the identifiers a call names (`elbv2::target_groups_not_found_message`),
+/// with the service, status and code an AWS SDK renders beside the message of a failed
+/// call, so a client reads here exactly what it would read from a call of its own against
+/// the deleted target group. The sentence that ends it is Amazon EC2 Auto Scaling's own
+/// again: the launch it did not make.
 pub fn launch_blocked_message(unresolved: &[String]) -> String {
     format!(
-        "{} (Service: {ELBV2_SERVICE_NAME}, Status Code: {TARGET_GROUP_NOT_FOUND_STATUS}, Error \
-         Code: {TARGET_GROUP_NOT_FOUND_CODE}). Launching EC2 instance failed.",
+        "{FAILED_TARGET_GROUP_UPDATE} {}: {} (Service: {ELBV2_SERVICE_NAME}, Status Code: \
+         {TARGET_GROUP_NOT_FOUND_STATUS}, Error Code: {TARGET_GROUP_NOT_FOUND_CODE}). Launching \
+         EC2 instance failed.",
+        unresolved.join(", "),
         elbv2::target_groups_not_found_message(unresolved.iter().map(String::as_str))
     )
 }

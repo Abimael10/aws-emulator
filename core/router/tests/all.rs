@@ -5260,3 +5260,4 @@ mod appended_notes;
 // inner doc comment is `E0753` and compiles no suite of this target, are gone rather than
 // re-typed: the rules they repeated stand in the header above, and the two guard suites
 // check them.
+// pair, keeping the list sorted: one pair per suite and nothing else, so a landing has one

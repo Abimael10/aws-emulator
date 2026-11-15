@@ -1429,29 +1429,6 @@ impl AutoScalingState {
         }
     }
 
-    /// Take the attachments `target_group_arns` names off the group `group_name`, in both
-    /// forms an attachment takes — the group's own `TargetGroupARNs` and an `elbv2`
-    /// traffic source — leaving every other attachment where it is.
-    ///
-    /// What a target group that no longer exists leaves behind: an attachment names a
-    /// resource of Elastic Load Balancing v2, and a target group ARN carries the id that
-    /// service minted for that one target group, so an attachment whose target group has
-    /// been deleted can never be registered into again. It therefore ends with it, exactly
-    /// as a `DetachLoadBalancerTargetGroups` of the same ARN would end it, and the launch
-    /// that found it gone is what records the refusal — so the group's activity log says
-    /// why before the attachment goes.
-    fn drop_attachments(&mut self, group_name: &str, target_group_arns: &[String]) {
-        let Some(group) = self.groups.get_mut(group_name) else {
-            return;
-        };
-        if let Some(attached) = group.target_group_arns.as_mut() {
-            attached.retain(|arn| !target_group_arns.contains(arn));
-        }
-        if let Some(sources) = group.traffic_sources.as_mut() {
-            sources.retain(|source| !target_group_arns.contains(&source.identifier));
-        }
-    }
-
     /// Take the instances `instance_ids` names out of service because a CALLER asked
     /// for those instances by id, and answer the scaling activities that did it.
     ///
@@ -1564,10 +1541,12 @@ impl AutoScalingState {
     ///
     /// A launch into the GROUP also owes each of its attachments a registration, so an
     /// attachment whose target group Elastic Load Balancing v2 no longer holds stops it
-    /// before anything is minted: nothing is placed, the sentence the caller records for
+    /// before anything is minted: nothing is placed and the sentence the caller records for
     /// each unplaced unit names that target group
-    /// ([`elbv2_targets::unresolved_attachments`]), and the attachment itself ends with the
-    /// target group it named ([`Self::drop_attachments`]).
+    /// ([`elbv2_targets::unresolved_attachments`]). The ATTACHMENT itself stays exactly as
+    /// the client left it — it is the client's to remove
+    /// (`DetachLoadBalancerTargetGroups`), and a group that reported an attachment the
+    /// client never detached cannot refuse that detach.
     fn launch_into_group<Eng: Send + Sync + 'static>(
         &mut self,
         engine: &Eng,
@@ -1576,15 +1555,18 @@ impl AutoScalingState {
         let Some(group) = self.groups.get(request.group_name) else {
             return GroupLaunchOutcome::unplaced(request.count, None);
         };
-        // The group's instances are the targets of the target groups it is attached to,
-        // so a launch that could not register has not brought an instance into service:
-        // it launches nothing at all, which is also what the warm pool's own instances —
-        // which no attachment takes — are not held to.
+        // Registering the instance is PART of bringing it into service, so an attachment
+        // Elastic Load Balancing v2 can take no registration into stops the launch that
+        // would have to register there: the group launches nothing and records the refusal
+        // that names the target group instead. A warm pool's own instances, which no
+        // attachment takes, are not held to it.
+        //
+        // The attachment STAYS: the group keeps reporting what the client attached until the
+        // client detaches it, so the refusal is the whole of what the launch did.
         if request.count > 0 && request.destination == LaunchDestination::Group {
             let unresolved = elbv2_targets::unresolved_attachments(engine, group);
             if !unresolved.is_empty() {
                 let reason = elbv2_targets::launch_blocked_message(&unresolved);
-                self.drop_attachments(request.group_name, &unresolved);
                 return GroupLaunchOutcome::unplaced(request.count, Some(reason));
             }
         }
