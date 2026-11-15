@@ -19,7 +19,9 @@
 //!    build whose environment cannot be given them runs nothing at all;
 //! 2. the source archive is downloaded and unpacked into the working tree, and the cached
 //!    paths are restored into it ([`super::build_source`], [`super::build_cache`]);
-//! 3. the buildspec's phases run over that tree ([`super::run_commands`]);
+//! 3. the buildspec's phases run over that tree ([`super::run_commands`]), with the TOOLS the
+//!    build environment carries ([`super::build_tools`]), whose calls those commands really
+//!    make;
 //! 4. what the commands produced is put where the build's artifacts say
 //!    ([`super::artifact_upload`]), and the declared cache paths are saved;
 //! 5. the build records what every step answered ([`super::finish_build`]).
@@ -48,7 +50,7 @@ use super::{
     artifact_upload, build_cache, build_secrets, build_source, now_millis, BuildRun, BuildSeed,
     ComAmazonawsCodebuildCodebuild20161006State,
 };
-use crate::ops::types::{Build, BuildArtifacts, ProjectArtifacts};
+use crate::ops::types::{Build, BuildArtifacts, BuildPhase, ProjectArtifacts};
 
 /// One build whose run the clock owes, claimed out of the store
 /// ([`ComAmazonawsCodebuildCodebuild20161006State::claim_due_build_runs`]) by the
@@ -112,6 +114,141 @@ pub struct RecordedRun {
     pub cache_saved_millis: Option<i64>,
 }
 
+/// What the provisioning phase reports for a build whose command session could not be
+/// started at all: the environment it was to run in was not provisioned, so no command of it
+/// ran and nothing is claimed about any.
+///
+/// AWS publishes no sentence for it — a real build environment is a container CodeBuild
+/// starts — so it states the condition in this service's own terms.
+const SESSION_NOT_STARTED_MESSAGE: &str =
+    "The build environment's command session could not be started, so no command of this \
+     build ran";
+
+/// Run `claimed`'s buildspec, on a thread of the runtime's BLOCKING pool.
+///
+/// The session the commands run in is synchronous and the tools its commands use make calls
+/// of their own ([`super::build_tools`]), so the commands are performed off the runtime's
+/// workers: a call is then driven by blocking that thread on the runtime handle, which a
+/// worker may not do. `None` is a session nothing ran, which is reported as a build
+/// environment that was not provisioned rather than as commands that did nothing.
+async fn performed_commands(
+    callback: &EmbeddedEmulator,
+    region: &str,
+    claimed: &ClaimedRun,
+    seed: BuildSeed,
+) -> Option<super::CommandRun> {
+    // The tools this build's commands are given, carrying the role the build RUNS AS: every
+    // call they make is authorized against that role's own permissions. What they write on
+    // standard error is kept where this call can read it back, because the build's log
+    // carries it ([`super::build_tools::ToolDiagnostics`]).
+    let diagnostics = super::build_tools::ToolDiagnostics::default();
+    let tools = super::BuildTools::new(
+        callback,
+        region,
+        claimed.build.service_role.as_deref(),
+        &claimed.id,
+        &diagnostics,
+    );
+    let build = claimed.build.clone();
+    let start_millis = claimed.start_millis;
+    let due_millis = claimed.due_millis;
+    let mut run = ::tokio::task::spawn_blocking(move || {
+        super::run_commands(&build, start_millis, due_millis, seed, tools)
+    })
+    .await
+    .ok()?;
+    run.written.extend(diagnostics.lines());
+    Some(run)
+}
+
+/// The IAM action a build's log delivery is performed under ("Actions defined by Amazon
+/// CloudWatch Logs", IAM Service Authorization Reference).
+const PUT_LOG_EVENTS_ACTION: &str = "logs:PutLogEvents";
+
+/// Deliver what `build`'s commands wrote into the log group and stream the build REPORTS
+/// ([`super::build_logs`]).
+///
+/// A build's output is delivered to CloudWatch Logs as the build runs — which is what makes
+/// `logs.groupName`/`logs.streamName` the documented way to read why a build failed — so the
+/// records go into the very group and stream the build's own record names, through the
+/// workspace's one vended-logs write (`::service_common::cloudwatch_logs`). A build whose
+/// delivery is DISABLED names no group or stream and nothing is delivered.
+///
+/// The delivery is made under the build's service role, so a role whose policies do not allow
+/// `logs:PutLogEvents` on that stream delivers no events — the build still runs and still
+/// reports where its output would have gone, exactly as a build whose log delivery is denied
+/// does.
+async fn deliver_log(
+    callback: &EmbeddedEmulator,
+    region: &str,
+    build: &Build,
+    records: &[String],
+) {
+    if records.is_empty() {
+        return;
+    }
+    let Some(logs) = build.logs.as_ref() else {
+        return;
+    };
+    let (Some(group), Some(stream)) = (logs.group_name.as_deref(), logs.stream_name.as_deref())
+    else {
+        return;
+    };
+    if let Some(role_arn) = build.service_role.as_deref() {
+        // The stream's own ARN is the resource `logs:PutLogEvents` is granted on, and it is
+        // the one the build already reports.
+        let resource = logs.cloud_watch_logs_arn.clone().unwrap_or_default();
+        if let Some(withheld) = super::build_tools::role_withholds(
+            callback,
+            region,
+            role_arn,
+            PUT_LOG_EVENTS_ACTION,
+            &resource,
+        )
+        .await
+        {
+            ::tracing::debug!(
+                role_arn = %role_arn,
+                log_group = %group,
+                withheld = ?withheld,
+                "a build's log events were not delivered: its service role may not put them"
+            );
+            return;
+        }
+    }
+    ::service_common::cloudwatch_logs::delivered_over(callback, region, group, stream, records)
+        .await;
+}
+
+/// The lines the build's AGENT contributes to its log for `phases`: the state each phase it
+/// reached ended in, and the context a phase that did not succeed carries.
+///
+/// A CodeBuild log is not only what the commands wrote: the agent writes the phase
+/// transitions and the context of a phase that failed into the same stream, which is what
+/// makes the log readable as the account of why a build ended as it did — including a build
+/// whose commands never ran, whose whole account is the phase that stopped it. The two lines
+/// are the agent's own (`Phase complete: <phase> State: <state>` and `Phase context status
+/// code: <code> Message: <message>`); every value in them is the phase's own.
+fn agent_lines(phases: &[BuildPhase]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for phase in phases {
+        let Some(phase_type) = phase.phase_type.as_deref() else {
+            continue;
+        };
+        if let Some(state) = phase.phase_status.as_deref() {
+            lines.push(format!("Phase complete: {phase_type} State: {state}"));
+        }
+        for context in phase.contexts.iter().flatten() {
+            lines.push(format!(
+                "Phase context status code: {} Message: {}",
+                context.status_code.clone().unwrap_or_default(),
+                context.message.clone().unwrap_or_default()
+            ));
+        }
+    }
+    lines
+}
+
 /// Perform one claimed build's run: its input, its commands, and its output.
 async fn perform<Eng: Send + Sync + 'static>(
     callback: &EmbeddedEmulator,
@@ -164,12 +301,31 @@ async fn perform<Eng: Send + Sync + 'static>(
             .extend(build_cache::restore(callback, region, &cache, project_name).await);
     }
 
-    let run = super::run_commands(
-        &claimed.build,
-        claimed.start_millis,
-        claimed.due_millis,
-        seed,
-    );
+    let run = match performed_commands(callback, region, claimed, seed).await {
+        Some(run) => run,
+        None => {
+            // The session the build's commands run in could not be started at all, so no
+            // command of this build ran: that is the environment this build was to be given
+            // not having been provisioned, which is the phase that reports it.
+            return RecordedRun {
+                run: super::environment_failure(
+                    claimed.start_millis,
+                    claimed.due_millis,
+                    super::build_source::client_error(SESSION_NOT_STARTED_MESSAGE),
+                ),
+                artifacts: None,
+                secondary_artifacts: Vec::new(),
+                cache_saved_millis: None,
+            };
+        }
+    };
+    // What the commands wrote, and what the agent says about the phases they ran in, goes
+    // where the build says its output goes — before anything else is decided about the
+    // build: the log is how a client reads WHY a build ended as it did, including a build
+    // that ended at the phase that just failed.
+    let mut records = run.written.clone();
+    records.extend(agent_lines(&run.phases));
+    deliver_log(callback, region, &claimed.build, &records).await;
 
     // Nothing is put anywhere for a build that never reached its own finishing work.
     if !run.reached_output {

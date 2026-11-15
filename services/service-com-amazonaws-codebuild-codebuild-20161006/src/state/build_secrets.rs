@@ -224,13 +224,17 @@ pub async fn resolve_environment<Eng: Send + Sync + 'static>(
     ResolvedEnvironment::Resolved(resolved)
 }
 
-/// The ARN of the SESSION a build reads its secrets in: CodeBuild assumes the project's
-/// service role for the build, so the principal the read is made by is an assumed-role session
+/// The ARN of the SESSION a build ACTS IN: CodeBuild assumes the project's service role for
+/// the build, so the principal a call made for the build is made by is an assumed-role session
 /// of that role named after the build it is for
 /// (`arn:<partition>:sts::<account>:assumed-role/<role name>/AWSCodeBuild-<build uuid>`).
 ///
+/// It is the principal of every call a build makes — the secret reads here, and the calls its
+/// own commands make ([`super::build_tools`]) — so there is one answer to "as whom does this
+/// build act".
+///
 /// `None` when `role_arn` is no IAM role ARN — there is no session to name for it.
-fn role_session_arn(role_arn: &str, build_id: &str) -> Option<String> {
+pub fn role_session_arn(role_arn: &str, build_id: &str) -> Option<String> {
     let parsed = ::service_common::arn::parse(role_arn)?;
     let role_name = parsed
         .resource

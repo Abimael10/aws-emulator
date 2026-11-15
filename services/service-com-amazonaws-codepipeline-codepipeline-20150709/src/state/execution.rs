@@ -1006,6 +1006,12 @@ pub enum Job {
         action: usize,
         /// The project the action builds.
         project_name: String,
+        /// The role the action is performed UNDER: its own `roleArn` when the
+        /// declaration gives it one, and otherwise the pipeline's
+        /// (`ActionExecutionInput$roleArn` is "assumed through the roleArn for the
+        /// pipeline"). The call that starts the build is authorized against the
+        /// permissions in force on it.
+        role_arn: String,
         /// The environment variables the action's configuration overrides the project's
         /// with ([`EnvironmentOverrides`]).
         environment_overrides: EnvironmentOverrides,

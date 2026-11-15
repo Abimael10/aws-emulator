@@ -302,6 +302,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every other member comes from the retried build's own record — the
         // settings it resolved when it was started, which is what "restarts a build"
         // runs again — never from this request, which carries no settings at all.
+        //
+        // The delivery of its output is one of those settings, and the retry is its OWN
+        // build: it runs under the retried build's log configuration and writes the
+        // stream its own id names (`crate::state::build_logs_location`).
+        let retried_logs_config = retried.logs.as_ref().map(|logs| LogsConfig {
+            cloud_watch_logs: logs.cloud_watch_logs.clone(),
+            s3_logs: logs.s3_logs.clone(),
+        });
         let build = Build {
             id: Some(id.clone()),
             arn: Some(arn.clone()),
@@ -314,6 +322,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // revision of its own yet.
             resolved_source_version: None,
             phases: Some(crate::state::in_progress_phases(now)),
+            logs: Some(crate::state::build_logs_location(
+                &region,
+                &project_name,
+                &id,
+                retried_logs_config.as_ref(),
+            )),
             build_complete: false,
             initiator: Some(initiator),
             // Allocated when a build container joins the project's VPC; no container

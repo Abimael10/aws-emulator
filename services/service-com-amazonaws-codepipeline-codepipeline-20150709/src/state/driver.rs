@@ -1348,6 +1348,12 @@ fn start_action(
             stage,
             action: index,
             project_name: project_name.clone(),
+            // The action is performed UNDER its own role when it declares one, and
+            // otherwise under the pipeline's — the role `StartBuild` is called as.
+            role_arn: declared
+                .role_arn
+                .clone()
+                .unwrap_or_else(|| declaration.role_arn.clone()),
             environment_overrides,
         });
     }
@@ -1951,6 +1957,7 @@ async fn run_job(
         }
         Job::CodeBuildStart {
             project_name,
+            role_arn,
             environment_overrides,
             ..
         } => {
@@ -1958,6 +1965,7 @@ async fn run_job(
                 callback,
                 region,
                 project_name,
+                role_arn,
                 environment_overrides,
             )
             .await

@@ -20,12 +20,13 @@
 //! EXECUTING half, `brush-core`, is not a dependency of this workspace.
 //!
 //! A build's session is that session with the statuses POSIX gives those conditions, the
-//! shared bounds, and NO output kept: the bytes a command writes are not delivered anywhere
-//! — a build's log group is its own concern — so this shell keeps none of them. What a
-//! performed command contributes to the build is its exit status, the variables it sets (a
-//! buildspec's `env/exported-variables` are read back off this session) and the files it
-//! writes into the session's own working tree, which the commands after it read, and which
-//! is what [`BuildShell`] exposes.
+//! shared bounds, and what its commands WROTE kept for the build's log: the bytes a command
+//! writes are what a build's log group carries ([`super::build_run`] delivers them), so this
+//! session keeps them, bounded by [`MAX_LOG_LINES`] and [`MAX_LOG_LINE_BYTES`]. What a
+//! performed command contributes to the build is its exit status, the lines it wrote, the
+//! variables it sets (a buildspec's `env/exported-variables` are read back off this session)
+//! and the files it writes into the session's own working tree, which the commands after it
+//! read, and which is what [`BuildShell`] exposes.
 //!
 //! That working tree is the build environment's own storage — the source directory a build
 //! runs in — so the session is given the file utilities over it
@@ -35,8 +36,9 @@
 //! produced, which is what the build's artifacts and its cache are selected from.
 //!
 //! The commands the build ENVIRONMENT provides beyond the shell's own utilities are the
-//! programs of the runtimes this build installed ([`super::runtime_versions`]), which the
-//! session asks for a command its catalog does not name.
+//! programs of the runtimes this build installed ([`super::runtime_versions`]) and the TOOLS
+//! the managed image carries ([`super::build_tools`]) — together [`super::BuildPrograms`],
+//! which the session asks for a command its catalog does not name.
 //!
 //! What the environment already HOLDS when the first command runs is the IMAGE's own
 //! filesystem ([`super::build_image`]), seeded into the same tree: the build runs inside
@@ -45,6 +47,17 @@
 //! out of the tree.
 
 use std::collections::BTreeMap;
+
+/// How many lines of what its commands wrote ONE build keeps for its log.
+///
+/// CHOSEN, not an AWS limit: the lines are kept in this process until the build's log is
+/// delivered, so how many one build may keep is bounded here. Past it a line is not kept.
+pub const MAX_LOG_LINES: usize = 2_048;
+
+/// How many bytes one kept line carries; a longer line is truncated rather than dropped, so
+/// what the command wrote is still in the log. CHOSEN for the same reason as
+/// [`MAX_LOG_LINES`].
+pub const MAX_LOG_LINE_BYTES: usize = 16 * 1024;
 
 /// The session one build's commands run in: the shared session, configured as a build's,
 /// with the programs the runtimes this build installed provide.
@@ -57,19 +70,26 @@ pub(super) struct BuildShell {
 }
 
 impl BuildShell {
-    /// A session holding `variables`, with `installed`'s programs, `image_files` already in
+    /// A session holding `variables`, with `programs`' programs, `image_files` already in
     /// its tree and the build's whole command budget left.
     pub(super) fn new(
         variables: BTreeMap<String, String>,
-        installed: super::InstalledRuntimes,
+        programs: super::BuildPrograms,
         image_files: &[(String, String)],
     ) -> Self {
         let mut shell = Self {
             session: ::service_common::posix_shell_session::ShellSession::with_programs(
                 variables,
-                // The shared statuses and bounds, and no output: see this module's header.
-                ::service_common::posix_shell_session::SessionConfig::default(),
-                Box::new(installed),
+                // The shared statuses and bounds, and the lines its commands write kept for
+                // the build's log: see this module's header.
+                ::service_common::posix_shell_session::SessionConfig {
+                    output: Some(::service_common::posix_shell_session::OutputLimits {
+                        lines: MAX_LOG_LINES,
+                        line_bytes: MAX_LOG_LINE_BYTES,
+                    }),
+                    ..::service_common::posix_shell_session::SessionConfig::default()
+                },
+                Box::new(programs),
             )
             // The build environment has a working directory of its own, so the file
             // utilities are commands this session performs over it.
@@ -130,5 +150,19 @@ impl BuildShell {
     /// Run one command LINE and answer the status the shell answered for it.
     pub(super) fn run(&mut self, line: &str) -> i32 {
         self.session.run(line)
+    }
+
+    /// What this build's commands WROTE, as the lines the build's log carries: standard
+    /// output and then standard error, each in the order the commands wrote it.
+    ///
+    /// The session keeps the two streams apart (a diagnostic is not what a redirection takes
+    /// or a substitution captures), and a log carries both, so the delivery joins them here.
+    pub(super) fn written(&self) -> Vec<String> {
+        self.session
+            .output()
+            .iter()
+            .chain(self.session.errors())
+            .cloned()
+            .collect()
     }
 }

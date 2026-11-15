@@ -29,12 +29,27 @@ const BUILD_SUCCEEDED: &str = "SUCCEEDED";
 /// The environment variables the action's configuration declares are the build's own
 /// overrides — "a set of environment variables" the action passes to the project — so they
 /// travel with the start rather than being applied to the project itself.
+///
+/// The start is made UNDER `role_arn` — the role this action is performed as — so it is
+/// authorized against the permissions in force on that role BEFORE anything is started: a
+/// role that may not start a build of the project starts none, and the action fails with
+/// the denial rather than with the outcome of a build nothing should have created.
 pub(super) async fn run_codebuild_start(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     project_name: &str,
+    role_arn: &str,
     environment_overrides: &super::super::execution::EnvironmentOverrides,
 ) -> JobOutcome {
+    if let Some(denial) = start_build_denial(callback, region, role_arn, project_name).await {
+        return JobOutcome::Failed {
+            code: FAILURE_JOB_FAILED.to_string(),
+            message: denial,
+            // No build was started, so the action names no run in another service: a
+            // client reading the result must not find one.
+            external_id: None,
+        };
+    }
     let codebuild = codebuild_client(callback, region);
     let mut started = codebuild.start_build().project_name(project_name);
     for (name, value, kind) in environment_overrides {
@@ -170,6 +185,84 @@ pub(super) async fn run_codebuild_poll(
             .collect(),
         external_id: Some(build_id.to_string()),
     }
+}
+
+/// The IAM action CodePipeline performs a `CodeBuild` action's work with
+/// (`codebuild:StartBuild`, "Actions defined by AWS CodeBuild", IAM Service Authorization
+/// Reference).
+const START_BUILD_ACTION: &str = "codebuild:StartBuild";
+
+/// The ARN namespace, and the resource type, of the project a build action builds
+/// (`arn:<partition>:codebuild:<region>:<account>:project/<name>`, "Resource types defined
+/// by AWS CodeBuild").
+const CODEBUILD_ARN_SERVICE: &str = "codebuild";
+
+/// `Some(message)` when the permissions in force on `role_arn` do NOT let it start a build
+/// of `project_name`, and `None` when they do or when nothing is known about the role.
+///
+/// The question is the one every service asks before it ACTS UNDER a caller-supplied role:
+/// the call CodePipeline makes is authorized against that role's own permissions rather than
+/// against the caller's, so a role whose policies do not allow `codebuild:StartBuild` on the
+/// project cannot make it — and this service must not make it either. It is put to IAM
+/// itself, through the workspace's one reading of what a role may do
+/// (`::service_common::iam_role`).
+///
+/// Which answer counts follows that module's own rule: a role that STATES identity-based
+/// policies is the authority on what it may do, so it has to be ALLOWED the action; a role
+/// IAM holds no policy for says nothing about the action — a pipeline role is routinely
+/// provisioned out of band — so only a statement that DENIES it holds the start back.
+/// Everything that is not an answer (no IAM to ask, a value naming no role of this account,
+/// a failed hop) withholds nothing.
+async fn start_build_denial(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    role_arn: &str,
+    project_name: &str,
+) -> Option<String> {
+    let project = ::engine::emulator_arn(
+        CODEBUILD_ARN_SERVICE,
+        region,
+        &format!("project/{project_name}"),
+    );
+    let states_permissions =
+        ::service_common::iam_role::role_states_permissions_through(callback, region, role_arn)
+            .await;
+    let withheld = if states_permissions {
+        ::service_common::iam_role::role_withholds_action_through(
+            callback,
+            region,
+            role_arn,
+            START_BUILD_ACTION,
+            &project,
+        )
+        .await
+    } else {
+        ::service_common::iam_role::role_denies_action_through(
+            callback,
+            region,
+            role_arn,
+            START_BUILD_ACTION,
+            &project,
+        )
+        .await
+    };
+    withheld.then(|| {
+        // The sentence AWS refuses the call with, worded once for every service that
+        // decides the identity-based question (`::service_common::iam_authorization`): the
+        // principal the call is made by, the action it asked for, the project it asked for,
+        // and which of IAM's rules withheld the grant.
+        let reason = if states_permissions {
+            ::service_common::iam_authorization::no_identity_policy_allows(START_BUILD_ACTION)
+        } else {
+            ::service_common::iam_authorization::IDENTITY_POLICY_EXPLICIT_DENY.to_string()
+        };
+        ::service_common::iam_authorization::not_authorized_by_identity_policy(
+            role_arn,
+            START_BUILD_ACTION,
+            &project,
+            &reason,
+        )
+    })
 }
 
 /// A CodeBuild client over the in-process callback into this same emulator.

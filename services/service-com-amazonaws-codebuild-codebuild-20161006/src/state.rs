@@ -56,6 +56,8 @@ mod batchspec;
 mod build_cache;
 /// The IMAGE a build runs in: the variable naming it and the filesystem it presents.
 mod build_image;
+/// WHERE one build's output went: the log group and stream it reports.
+mod build_logs;
 /// Running the builds the clock owes a run, where the object store can be reached.
 mod build_run;
 /// The variables a build's environment is given whose value another service holds — a
@@ -66,6 +68,9 @@ mod build_secrets;
 mod build_shell;
 /// The source archive a build downloads and runs on.
 mod build_source;
+/// The TOOLS a build environment carries beyond its shell's utilities: the AWS CLI and the
+/// Docker CLI, performing the calls a buildspec's commands really make.
+pub mod build_tools;
 /// The phases a buildspec declares, and what running them answered.
 mod buildspec;
 /// The SHAPE of the identifiers the operations that take one as a plain string accept.
@@ -87,9 +92,11 @@ pub use artifacts::*;
 pub use batchspec::*;
 pub use build_cache::*;
 pub use build_image::*;
+pub use build_logs::*;
 pub use build_run::*;
 pub use build_secrets::*;
 pub use build_source::*;
+pub use build_tools::{BuildPrograms, BuildTools};
 pub use buildspec::*;
 pub use identifiers::*;
 pub use project_reference::*;

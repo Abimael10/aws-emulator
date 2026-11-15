@@ -14,7 +14,9 @@
 //! The catalog is the one `crate::state`'s build shell declares (`BUILT_IN_COMMANDS`);
 //! each row below names a command of it or a program outside it, and asserts the status
 //! the phase context reports. What an INSTALLED runtime's programs answer is the subject of
-//! `runtime_versions`.
+//! `runtime_versions`, and what the TOOLS the managed image carries (the AWS CLI and the
+//! Docker CLI) answer is `ecr_image_push`'s — a command form THEY do not perform is
+//! answered here, the same closed way as a program the environment has none of at all.
 
 use serde_json::{json, Value};
 
@@ -144,8 +146,8 @@ async fn each_command_answers_the_status_the_shell_answers_for_it() {
         ("export setting a variable", "export BUILT=yes", 0),
         ("unset removing one", "unset BUILT", 0),
         ("an assignment on its own", "BUILT=yes", 0),
-        ("a container runtime this environment has none for", "docker build .", 127),
-        ("a command-line tool it has none for", "aws ecr get-login-password", 127),
+        ("a container runtime this environment has none for", "podman build .", 127),
+        ("a CLI command this environment performs nothing of", "aws s3 ls", 127),
         ("a coreutil it has none for", "ls -la", 127),
         ("a working-tree command it has none for", "cd /codebuild/output", 127),
         ("a command whose name an unset parameter expands to", "$MISSING_TOOL --version", 127),

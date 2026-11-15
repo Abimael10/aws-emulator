@@ -37,6 +37,8 @@ mod approval_result_messages;
 mod approval_reviewer;
 #[path = "all/artifact_store_encryption.rs"]
 mod artifact_store_encryption;
+#[path = "all/build_action_authorization.rs"]
+mod build_action_authorization;
 #[path = "all/built_in_execution_variables.rs"]
 mod built_in_execution_variables;
 #[path = "all/codecommit_source_actions.rs"]

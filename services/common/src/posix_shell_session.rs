@@ -269,6 +269,26 @@ pub trait EnvironmentPrograms: ::std::fmt::Debug + Send + Sync {
         arguments: &[String],
         files: &mut dyn ProgramFiles,
     ) -> Option<ProgramOutcome>;
+
+    /// [`Self::run`] for a program that reads STANDARD INPUT: `standard_input` is what the
+    /// stage before it in a pipeline wrote, or the file an input redirection named, and
+    /// `None` when the command was given neither.
+    ///
+    /// This is the form the session asks, so a program that reads its input (a login taking
+    /// a password on standard input, a filter) overrides it; the default performs the
+    /// invocation without reading one, which is what a program that ignores standard input
+    /// does. A name this answers `None` for leaves the input in place for the utility the
+    /// session falls back to.
+    fn run_with_input(
+        &self,
+        name: &str,
+        arguments: &[String],
+        standard_input: Option<&str>,
+        files: &mut dyn ProgramFiles,
+    ) -> Option<ProgramOutcome> {
+        let _ = standard_input;
+        self.run(name, arguments, files)
+    }
 }
 
 /// The FILES of the tree a session works over, as the ENVIRONMENT's own programs reach them.
@@ -1533,18 +1553,34 @@ impl ShellSession {
         redirections: &Redirections,
     ) -> Option<i32> {
         let programs = self.programs.take()?;
+        // What the command would READ on standard input, left in place while the program is
+        // asked: a name this environment provides no program for falls back to a utility of
+        // this session, which reads that same input.
+        let input = self.peeked_standard_input(redirections);
         let answered = {
             let mut files = SessionFiles { session: self };
-            programs.run(name, arguments, &mut files)
+            programs.run_with_input(name, arguments, input.as_deref(), &mut files)
         };
         self.programs = Some(programs);
         let outcome = answered?;
+        // The program performed the invocation, so the stream it was handed is consumed: a
+        // stream is read by whoever reads it, and nothing after this command reads it twice.
+        let _ = self.standard_input(redirections);
         for line in outcome.output {
             if !self.write_stdout(&format!("{line}\n"), redirections) {
                 return Some(self.config.statuses.failure);
             }
         }
         Some(outcome.status)
+    }
+
+    /// What the command being performed would read from STANDARD INPUT, WITHOUT consuming it
+    /// ([`Self::standard_input`] is the reading that does).
+    fn peeked_standard_input(&self, redirections: &Redirections) -> Option<String> {
+        match redirections.input.as_deref() {
+            Some(path) => self.read_path(path),
+            None => self.piped_input.clone(),
+        }
     }
 
     /// One assignment of a simple command as the name and value it sets, or `None` when it

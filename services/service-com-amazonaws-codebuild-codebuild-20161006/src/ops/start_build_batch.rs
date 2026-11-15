@@ -614,7 +614,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &build_artifacts,
                 declaration,
                 &build_id,
-                crate::state::build_arn(&region, &build_id),
+                &region,
                 build_number,
                 now,
             );
@@ -769,7 +769,7 @@ fn group_build(
     artifacts: &crate::state::GroupArtifacts,
     declaration: &crate::state::BatchBuildDeclaration,
     build_id: &str,
-    build_arn: String,
+    region: &str,
     build_number: i64,
     now: i64,
 ) -> Build {
@@ -779,7 +779,7 @@ fn group_build(
     }
     Build {
         id: Some(build_id.to_string()),
-        arn: Some(build_arn),
+        arn: Some(crate::state::build_arn(region, build_id)),
         build_number: Some(build_number),
         start_time: Some(crate::state::datetime(now)),
         end_time: None,
@@ -799,7 +799,15 @@ fn group_build(
         cache: build_batch.cache.clone(),
         environment: build_batch.environment.clone(),
         service_role: build_batch.service_role.clone(),
-        logs: None,
+        // Where this build's output goes, under the log configuration the BATCH runs
+        // with — every build of the batch delivers under that one configuration, each to
+        // the stream its own id names (`crate::state::build_logs_location`).
+        logs: Some(crate::state::build_logs_location(
+            region,
+            build_batch.project_name.as_deref().unwrap_or_default(),
+            build_id,
+            build_batch.log_config.as_ref(),
+        )),
         timeout_in_minutes: build_batch.build_timeout_in_minutes,
         queued_timeout_in_minutes: build_batch.queued_timeout_in_minutes,
         build_complete: false,

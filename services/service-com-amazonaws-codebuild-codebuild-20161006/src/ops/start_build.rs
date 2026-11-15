@@ -487,7 +487,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .service_role_override
                 .clone()
                 .or(project.service_role),
-            logs: logs_config.as_ref().map(logs_location_of),
+            // Where this build's output goes, filled in by the WRITE PASS below: the
+            // stream one build wrote is named after the build's own id, which is
+            // allocated there.
+            logs: None,
             timeout_in_minutes: input
                 .timeout_in_minutes_override
                 .or(project.timeout_in_minutes),
@@ -568,6 +571,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         build.build_number = Some(build_number);
         build.id = Some(id.clone());
         build.arn = Some(crate::state::build_arn(&region, &id));
+        // The group and stream this build's output is delivered to, under the log
+        // configuration it runs with (`crate::state::build_logs_location`).
+        build.logs = Some(crate::state::build_logs_location(
+            &region,
+            &input.project_name,
+            &id,
+            logs_config.as_ref(),
+        ));
         guard.insert_build(
             id.clone(),
             crate::state::StoredBuild {
@@ -690,24 +701,4 @@ fn resolve_environment(
     environment
 }
 
-/// The build's log location, from the resolved logs configuration. The deep links and
-/// the stream ARNs are created with the log stream during PROVISIONING, which an
-/// emulated build never reaches.
-fn logs_location_of(config: &LogsConfig) -> LogsLocation {
-    LogsLocation {
-        group_name: config
-            .cloud_watch_logs
-            .as_ref()
-            .and_then(|logs| logs.group_name.clone()),
-        stream_name: config
-            .cloud_watch_logs
-            .as_ref()
-            .and_then(|logs| logs.stream_name.clone()),
-        deep_link: None,
-        s3_deep_link: None,
-        cloud_watch_logs_arn: None,
-        s3_logs_arn: None,
-        cloud_watch_logs: config.cloud_watch_logs.clone(),
-        s3_logs: config.s3_logs.clone(),
-    }
-}
+

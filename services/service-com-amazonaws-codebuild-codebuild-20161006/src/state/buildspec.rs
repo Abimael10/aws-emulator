@@ -449,6 +449,10 @@ pub struct CommandRun {
     pub spec: Option<Buildspec>,
     /// The files the build's working tree holds now, as `(path, contents)` in path order.
     pub produced: Vec<(String, String)>,
+    /// What the build's commands WROTE, as the lines its log carries
+    /// ([`super::build_shell::BuildShell::written`]) — empty for a build whose commands never
+    /// ran.
+    pub written: Vec<String>,
     /// See [`BuildRun::exported_variables`].
     pub exported_variables: Option<Vec<ExportedEnvironmentVariable>>,
 }
@@ -506,11 +510,16 @@ pub fn environment_failure(start_millis: i64, due_millis: i64, context: PhaseCon
 /// clock owed its terminal transition at, so the queue closes at `due_millis` and every
 /// phase that then ran is reported inside the same instant: this session runs the whole
 /// buildspec at once rather than over wall-clock time.
+///
+/// `tools` are the tools the build environment carries ([`super::build_tools`]), whose calls
+/// this build's commands really make; an environment given none has no program for them, so
+/// a command naming one is one the session could not run.
 pub fn run_commands(
     build: &Build,
     start_millis: i64,
     due_millis: i64,
     seed: BuildSeed,
+    tools: Option<super::BuildTools>,
 ) -> CommandRun {
     let mut phases = leading_phases(start_millis, due_millis);
     // The build environment this emulator provides is created in process, which is what the
@@ -561,6 +570,7 @@ pub fn run_commands(
                 aborted: false,
                 spec: None,
                 produced: Vec::new(),
+                written: Vec::new(),
                 exported_variables: None,
             };
         }
@@ -586,6 +596,7 @@ pub fn run_commands(
                 aborted: false,
                 spec: None,
                 produced: Vec::new(),
+                written: Vec::new(),
                 exported_variables: None,
             };
         }
@@ -602,7 +613,7 @@ pub fn run_commands(
 
     let mut shell = BuildShell::new(
         session_variables(build, &read, start_millis, &seed.resolved_variables),
-        installed,
+        super::BuildPrograms::new(installed, tools),
         // The build runs INSIDE its effective environment's image, so what that image
         // presents is in the environment's filesystem before the first command runs.
         &image_files(effective_image(build)),
@@ -666,6 +677,7 @@ pub fn run_commands(
             .into_iter()
             .map(|(path, contents)| (path.to_string(), contents.to_string()))
             .collect(),
+        written: shell.written(),
         exported_variables: exported_variables(&shell, &read),
         spec: Some(read),
     }
@@ -778,6 +790,20 @@ fn effective_image(build: &Build) -> &str {
         .unwrap_or_default()
 }
 
+/// The Region the build `build` RUNS IN, read off its own ARN
+/// (`arn:<partition>:codebuild:<region>:<account>:build/<id>`) — empty for a record that
+/// carries no ARN to read one from.
+///
+/// It is what the build's own commands are told the Region is: the AWS CLI a command invokes
+/// takes the Region out of the environment when the command names none.
+fn effective_region(build: &Build) -> String {
+    build
+        .arn
+        .as_deref()
+        .and_then(|arn| ::service_common::arn::parse(arn).map(|parsed| parsed.region.to_string()))
+        .unwrap_or_default()
+}
+
 /// The variables one build's session starts with.
 ///
 /// In the order AWS resolves them, so a later one replaces an earlier one of the same
@@ -799,7 +825,14 @@ fn session_variables(
 ) -> BTreeMap<String, String> {
     let mut variables = BTreeMap::new();
     let image = effective_image(build);
-    let provided: [(&str, Option<String>); 7] = [
+    let region = effective_region(build);
+    let in_a_region = (!region.is_empty()).then(|| region.clone());
+    let provided: [(&str, Option<String>); 9] = [
+        // "AWS_DEFAULT_REGION — The Amazon Web Services Region where the build is running"
+        // and its `AWS_REGION` spelling, which CodeBuild sets in the build environment: the
+        // CLI a command invokes reads the Region it acts in from them.
+        ("AWS_DEFAULT_REGION", in_a_region.clone()),
+        ("AWS_REGION", in_a_region),
         ("CODEBUILD_BUILD_ID", build.id.clone()),
         ("CODEBUILD_BUILD_ARN", build.arn.clone()),
         (

@@ -29,6 +29,10 @@ mod build_batch_fan_out;
 mod build_batch_projection;
 #[path = "all/build_image.rs"]
 mod build_image;
+#[path = "all/build_log_delivery.rs"]
+mod build_log_delivery;
+#[path = "all/build_log_location.rs"]
+mod build_log_location;
 #[path = "all/buildspec_execution.rs"]
 mod buildspec_execution;
 #[path = "all/buildspec_file_tree.rs"]
@@ -49,6 +53,8 @@ mod delete_fleet;
 mod delete_project_webhook_disposition;
 #[path = "all/delete_report_group.rs"]
 mod delete_report_group;
+#[path = "all/ecr_image_push.rs"]
+mod ecr_image_push;
 #[path = "all/fleet_lifecycle.rs"]
 mod fleet_lifecycle;
 #[path = "all/identifier_shape_refusals.rs"]

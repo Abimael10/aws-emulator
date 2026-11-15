@@ -40,9 +40,10 @@ const PAST_THE_SETTLE_SPAN: Duration = Duration::from_millis(1_100);
 /// (`startTime`, `endTime`, `currentPhase`, `buildStatus`, `buildComplete`, `phases`),
 /// the members a running build produces (`resolvedSourceVersion`,
 /// `exportedEnvironmentVariables`, `reportArns`, `networkInterface`), the caller
-/// (`initiator`), the batch membership (`buildBatchArn`) and the retry link
-/// (`autoRetryConfig`), each of which is asserted on its own below.
-const CARRIED_MEMBERS: [&str; 17] = [
+/// (`initiator`), the batch membership (`buildBatchArn`), the retry link
+/// (`autoRetryConfig`) and the log location (`logs`, whose STREAM is named after the build
+/// that wrote it), each of which is asserted on its own below.
+const CARRIED_MEMBERS: [&str; 16] = [
     "projectName",
     "source",
     "secondarySources",
@@ -53,7 +54,6 @@ const CARRIED_MEMBERS: [&str; 17] = [
     "cache",
     "environment",
     "serviceRole",
-    "logs",
     "timeoutInMinutes",
     "queuedTimeoutInMinutes",
     "vpcConfig",
@@ -437,6 +437,32 @@ async fn a_retry_starts_a_new_linked_build_from_the_retried_builds_settings() {
                 case.name
             );
         }
+
+        // The log DELIVERY is one of those settings and is carried over; the STREAM is the
+        // retry's OWN, because a build's stream is named after the build that wrote it (see
+        // `CloudWatchLogsConfig$streamName`, "the prefix of the stream name").
+        for member in ["groupName", "cloudWatchLogs", "s3Logs"] {
+            assert_eq!(
+                retry["logs"][member], original["logs"][member],
+                "case {:?}: the log delivery's {member} must be carried over, got {retry}",
+                case.name
+            );
+        }
+        let retry_uuid = retry["id"]
+            .as_str()
+            .unwrap_or_default()
+            .rsplit(':')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            retry["logs"]["streamName"]
+                .as_str()
+                .is_some_and(|stream| stream.ends_with(&retry_uuid))
+                && retry["logs"]["streamName"] != original["logs"]["streamName"],
+            "case {:?}: the retry writes the stream its own id names, got {retry}",
+            case.name
+        );
 
         // The pair is linked, in both directions.
         assert_eq!(

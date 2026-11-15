@@ -71,6 +71,17 @@ service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
 # the value a client reads back from the service that holds it. Only the generated client is
 # needed — the emulator supplies the transport, so the SDK's own HTTPS stack is left out.
 aws-sdk-secretsmanager = { version = "1", default-features = false }
+# The AWS SDK for Amazon ECR, driven over the same in-process callback: a build's own
+# commands log in to that registry and push the image they built to it
+# (`crate::state::build_tools`), which is that service's `GetAuthorizationToken`, its layer
+# uploads and its `PutImage`. A LIBRARY: it opens no connection of its own here.
+aws-sdk-ecr = { version = "1", default-features = false }
+# `tar` and `flate2`: a container image's layer is a gzip-compressed tar archive, so the
+# image a build's `docker build` composes out of its working tree is archived and compressed
+# with the codecs this workspace already reads and writes those formats with. DATA-FORMAT
+# codecs, both pure Rust.
+tar = "0.4"
+flate2 = "1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -79,6 +90,16 @@ emulator-core-build-support = { workspace = true }
 # The settle test has to let real time pass; the timer is enabled for the test
 # targets only, so the production dependency does not carry it.
 tokio = { workspace = true, features = ["time"] }
+# The suite that drives a build's own ECR login and image push end to end mounts the two
+# services that own what the build's commands reach: IAM holds the service role's policies,
+# and Amazon ECR holds the registry the push uploads to. Test-only: the service code reaches
+# ECR through the AWS SDK over the in-process callback, never through that crate.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-ecr-amazonec2containerregistry-v20150921 = { workspace = true }
+# The suite that reads a build's own log events back mounts the service that HOLDS them:
+# a build's output is delivered to CloudWatch Logs, so what the group and stream a build
+# reports hold afterwards is read through that service's own reads.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 
 [lints]
 workspace = true
