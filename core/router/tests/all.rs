@@ -7016,3 +7016,15 @@ mod all_rs_is_a_canonical_declaration_list;
 // A new suite's declaration goes in the sorted list above, as its own `#[path]` / `mod` pair
 // and nothing else. Anything written below this line must be an ordinary `//` comment: past
 // the first item an inner doc comment (`//!`) is `E0753` and compiles no suite of this target.
+//! place to insert and nothing to keep consistent. What a suite covers, and why it belongs
+//! to this cross-service target rather than to one service crate's own, is stated in that
+//! suite's OWN module doc, where it is read beside the test it describes.
+//! A suite that is not declared here compiles nowhere and its tests never run (the crate's
+//! build script refuses one that is not); a suite left at the top level of `tests/` fails
+//! the build; and a suite declared twice is `E0428`, which fails every suite in this target.
+//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of it —
+//! the `#[path]` is what points the module into `tests/all/`.
+//! This header block is the only place an inner doc comment may stand in this file: past the
+//! first item one is `E0753` and compiles no suite of this target, so what goes below is a
+//! DECLARATION, never a note about one.
+//! leaving a note below.

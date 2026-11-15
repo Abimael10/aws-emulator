@@ -100,14 +100,6 @@ fn emulator() -> (MultiServiceRouter, std::sync::Arc<engine::InMemoryEngine>) {
 fn unwritten_operation_rows() -> Vec<Row> {
     vec![
         (
-            "a billing assignment to another account",
-            "AssociateCapacityReservationBillingOwner",
-            vec![
-                param("CapacityReservationId", ABSENT_RESERVATION),
-                param("UnusedReservationBillingOwnerId", ANOTHER_ACCOUNT),
-            ],
-        ),
-        (
             "taking a billing assignment back",
             "DisassociateCapacityReservationBillingOwner",
             vec![

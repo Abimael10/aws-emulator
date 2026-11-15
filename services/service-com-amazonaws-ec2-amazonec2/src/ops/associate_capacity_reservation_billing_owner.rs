@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateCapacityReservationBillingOwner
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateCapacityReservationBillingOwner`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: INITIATES the billing assignment of a Capacity Reservation's unused capacity
+//! to a consumer account — it writes the `pending` billing assignment request
+//! [`crate::state`] holds for that reservation, which
+//! `DescribeCapacityReservationBillingRequests` reports and
+//! `AcceptCapacityReservationBillingOwnership` answers, and reports `Return=true`. The
+//! reservation the request names has to be one this account holds and one that still HOLDS
+//! capacity, so an id this validator cannot resolve is refused malformed and a reservation
+//! outside `active` is refused for the state it is in, neither writing anything. The
+//! consumer account is taken as the request names it: the assignment is to an account
+//! "consolidated under the same Amazon Web Services organizations payer account", and this
+//! emulator holds no organization to read that membership from, so the only reading of that
+//! account is the model's own `AccountID` form, which the boundary already applies. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateCapacityReservationBillingOwner::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +144,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateCapacityReservationBillingOwner` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateCapacityReservationBillingOwnerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — a billing
+        // assignment is between two ACCOUNTS, so the Region a request was signed for does not
+        // narrow the requests the store holds, exactly as it does not for
+        // `AcceptCapacityReservationBillingOwnership` or for the describe that reports what
+        // this writes. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The ID of the Capacity Reservation": its FORM is read before anything is looked
+        // up, so a value EC2 could never have issued is refused as malformed rather than
+        // resolved. The consumer account beside it carries the model's own
+        // `@length(12, 12)` and `^[0-9]{12}$` on `AccountID`
+        // (`smithy_query(query="operation",operation="AssociateCapacityReservationBillingOwner")`),
+        // so the boundary validator has already refused anything that is not an account id.
+        let reservation_id = input.capacity_reservation_id.as_str();
+        state::require_well_formed_capacity_reservation_id(reservation_id)?;
+
+        // DryRun sits AFTER the id's FORM has been read and BEFORE anything is resolved:
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST" (`DryRun`), so the flag is a question about the CALLER rather
+        // than about the reservation the store holds — the same position
+        // `AcceptCapacityReservationBillingOwnership` answers it in, this being the other
+        // side of the same assignment. Nothing is read, so nothing can be written either.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // ONE reading of the wall clock for this call, so the state the reservation is judged
+        // in is the instant the request is recorded as made at.
+        let now = ::std::time::SystemTime::now();
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // Every move the clock already owed is materialised before anything is read, so this
+        // call decides against the state a caller would have been shown anyway.
+        store.materialize_due_transitions();
+
+        // The reservation whose unused capacity the request assigns has to be one this
+        // account holds — there is no unused capacity of a reservation that does not exist —
+        // and this operation's validator answers the MALFORMED half for every id it cannot
+        // resolve ([`crate::state::require_resolvable_capacity_reservation`]), which is its
+        // recorded contract: a `cr-` id of the form the mint issues that this account holds
+        // no reservation under is refused `InvalidCapacityReservationId.Malformed` rather
+        // than reported not found. The view is taken as of `now`, so an expiry the clock
+        // already owed is seen here rather than after the write.
+        let view =
+            state::require_resolvable_capacity_reservation(&store, reservation_id)?.view_at(now);
+
+        // Only a reservation that HOLDS capacity has unused capacity to assign the billing
+        // of: one that has been cancelled, has expired or has failed holds none, and one
+        // still being assessed or scheduled for a future date has not been delivered any yet.
+        // So the assignment is admitted in `active` alone, the same reading every other
+        // operation of this crate that acts on a reservation's capacity applies
+        // (`MoveCapacityReservationInstances`, `CreateCapacityReservationBySplitting`, the
+        // interruptible allocation pair), and a refusal for the state the resource is in is
+        // EC2's `IncorrectState`, worded through the one place this crate words it.
+        let reservation_state = view.state.as_deref().unwrap_or_default();
+        if reservation_state != state::CAPACITY_RESERVATION_STATE_ACTIVE {
+            return Err(state::incorrect_state_of(
+                CAPACITY_RESERVATION,
+                reservation_id,
+                reservation_state,
+            ));
+        }
+
+        // The request as the store holds it, written through the ONE place a billing
+        // assignment request enters this store, so the describe that reports it and the
+        // operations that answer it read exactly what this wrote:
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateCapacityReservationBillingOwner"))
+        // * `pending` — "Initiates a REQUEST to assign billing": the assignment is not made
+        //   here, it is asked for, and the consumer account the request was sent to is the
+        //   one that takes it on (`AcceptCapacityReservationBillingOwnership`) or turns it
+        //   down. So the request carries the catalog's waiting member and no status message;
+        //   "Information about the status" (`$StatusMessage`) has nothing to add to a request
+        //   nobody has answered yet.
+        // * "The ID of the Amazon Web Services account that initiated the request"
+        //   (`$RequestedBy`) is the Capacity Reservation owner, which is the account every
+        //   call of this emulator is made by.
+        // * "The ID of the Amazon Web Services account to which the request was sent"
+        //   (`$UnusedReservationBillingOwnerId`) is the consumer account the request named.
+        // * "Information about the Capacity Reservation" (`$CapacityReservationInfo`) is read
+        //   off the reservation this call just resolved rather than taken from the request:
+        //   its instance type, its Availability Zone and that zone's id, and its tenancy,
+        //   which are the members `CapacityReservationInfo` carries
+        //   (`smithy_query(query="shape",shape="CapacityReservationInfo")`).
+        //
+        // A second assignment of the same reservation REPLACES the request the first one
+        // made: "the ID of the Amazon Web Services account to which billing of the unused
+        // capacity … is assigned" is ONE account, so one reservation has at most one request
+        // outstanding, and the later call is the one that stands — with the account it names
+        // and the instant it was made at.
+        let stored = store.insert_capacity_reservation_billing_request(
+            state::CapacityReservationBillingRequestSpec {
+                capacity_reservation_id: reservation_id.to_string(),
+                requested_by: ::engine::emulator_account_id().to_string(),
+                unused_reservation_billing_owner_id: input
+                    .unused_reservation_billing_owner_id
+                    .clone(),
+                last_update_time: now,
+                status: state::CAPACITY_RESERVATION_BILLING_REQUEST_STATUS_PENDING,
+                status_message: None,
+                capacity_reservation_info: Some(CapacityReservationInfo {
+                    instance_type: view.instance_type.clone(),
+                    availability_zone: view.availability_zone.clone(),
+                    availability_zone_id: view.availability_zone_id.clone(),
+                    tenancy: view.tenancy.clone(),
+                }),
+            },
+        );
+        // The store is full: the request was NOT made, so it is refused with EC2's own code
+        // for a ceiling it publishes no resource-specific one for, rather than reported as an
+        // assignment this emulator does not hold.
+        if !stored {
+            return Err(state::resource_limit_exceeded(format!(
+                "The maximum number of Capacity Reservation billing requests ({}) is already \
+                 stored for this account",
+                state::MAX_STORED_CAPACITY_RESERVATION_BILLING_REQUESTS
+            )));
+        }
+
+        // "Returns true if the request succeeds; otherwise, it returns an error" (`$Return`).
+        Ok(AssociateCapacityReservationBillingOwnerOutput {
+            r#return: Some(true),
+        })
     }
 }
+
+/// The KIND of resource this operation's state refusal names: the Capacity Reservation whose
+/// unused capacity the request would assign, named the way every refusal of this crate that
+/// EC2 answers `IncorrectState` for names its resource ([`crate::state::incorrect_state_of`]).
+const CAPACITY_RESERVATION: &str = "Capacity Reservation";

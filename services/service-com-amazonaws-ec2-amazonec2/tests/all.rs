@@ -821,6 +821,10 @@ mod capacity_manager_attributes;
 // concurrent ec2 landings insert their lines.
 #[path = "all/accept_capacity_reservation_billing_ownership.rs"]
 mod accept_capacity_reservation_billing_ownership;
+// What `AssociateCapacityReservationBillingOwner` writes: the pending billing assignment
+// request a Capacity Reservation owner initiates for a consumer account, and what it refuses.
+#[path = "all/associate_capacity_reservation_billing_owner.rs"]
+mod associate_capacity_reservation_billing_owner;
 #[path = "all/capacity_reservation_billing_requests.rs"]
 mod capacity_reservation_billing_requests;
 // Which Region `CreateCapacityReservationCancellationQuote` resolves the reservation it
