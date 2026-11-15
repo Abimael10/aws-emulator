@@ -873,19 +873,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::state::service_role`]). The same role governs the rollback below.
         let role =
             crate::state::service_role::ServiceRole::of(&*self.engine, role_in_force.as_deref());
-        let materialised = crate::state::service_role::acting_as(
-            ::std::sync::Arc::clone(&role),
-            crate::state::provisioning::reconcile(
-                ctx,
-                &region,
-                &provenance,
-                declared,
-                &previous_resources,
-                refused_deployment,
-                // Executing a change set deploys a template, so a resource it no longer
-                // declares is one CloudFormation stops managing: its own `DeletionPolicy`
-                // decides what becomes of it.
-                crate::state::provisioning::Policies::Honoured,
+        // ...and every ROLE the template hands to an owning service is one the principal whose
+        // credentials this execution's calls are made with has to be allowed to pass
+        // ([`crate::state::pass_role`]), for the reason `CreateStack`'s own gate records.
+        let principal = crate::state::pass_role::principal_of(
+            &*self.engine,
+            ctx,
+            role_in_force.as_deref(),
+        );
+        let materialised = crate::state::pass_role::as_principal(
+            principal,
+            crate::state::service_role::acting_as(
+                ::std::sync::Arc::clone(&role),
+                crate::state::provisioning::reconcile(
+                    ctx,
+                    &region,
+                    &provenance,
+                    declared,
+                    &previous_resources,
+                    refused_deployment,
+                    // Executing a change set deploys a template, so a resource it no longer
+                    // declares is one CloudFormation stops managing: its own `DeletionPolicy`
+                    // decides what becomes of it.
+                    crate::state::provisioning::Policies::Honoured,
+                ),
             ),
         )
         .await;

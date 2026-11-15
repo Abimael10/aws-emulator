@@ -1435,19 +1435,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // uses the role's credentials to make calls on your behalf", so the role in force
         // on the stack decides them ([`crate::state::service_role`]).
         let role = crate::state::service_role::ServiceRole::of(&*self.engine, role_in_force.as_deref());
-        let materialised = crate::state::service_role::acting_as(
-            role,
-            crate::state::provisioning::reconcile(
-                ctx,
-                &region,
-                &provenance,
-                declared,
-                &previous_resources,
-                refused_deployment,
-                // An update is where CloudFormation stops managing a resource the template
-                // no longer declares, so that resource's own `DeletionPolicy` decides what
-                // becomes of it.
-                crate::state::provisioning::Policies::Honoured,
+        // ...and every ROLE the template hands to an owning service is one the principal whose
+        // credentials this update's calls are made with has to be allowed to pass
+        // ([`crate::state::pass_role`]), for the reason `CreateStack`'s own gate records.
+        let principal = crate::state::pass_role::principal_of(
+            &*self.engine,
+            ctx,
+            role_in_force.as_deref(),
+        );
+        let materialised = crate::state::pass_role::as_principal(
+            principal,
+            crate::state::service_role::acting_as(
+                role,
+                crate::state::provisioning::reconcile(
+                    ctx,
+                    &region,
+                    &provenance,
+                    declared,
+                    &previous_resources,
+                    refused_deployment,
+                    // An update is where CloudFormation stops managing a resource the template
+                    // no longer declares, so that resource's own `DeletionPolicy` decides what
+                    // becomes of it.
+                    crate::state::provisioning::Policies::Honoured,
+                ),
             ),
         )
         .await;

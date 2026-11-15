@@ -23,8 +23,8 @@
 
 use serde_json::json;
 
-use crate::harness::{member, router_with_engine, xml_text, REGION};
-use crate::stack_lifecycle::iam;
+use crate::harness::{call_as, member, router_with_engine, xml_text, REGION};
+use crate::stack_lifecycle::user_with_inline_policy;
 use crate::template_by_reference::{create_staging_bucket, stage, STAGING_BUCKET};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -69,74 +69,16 @@ fn access_denied() -> String {
         .to_string()
 }
 
-/// One awsQuery call to CloudFormation signed with `access_key_id`, which is what says WHO
-/// the request speaks for: the emulator resolves the calling principal from the credential
-/// scope, exactly as it does for a client's own SDK.
-async fn call_as(
-    router: &MultiServiceRouter,
-    access_key_id: &str,
-    action: &str,
-    members: &[(String, String)],
-) -> (u16, String) {
-    let mut form = form_urlencoded::Serializer::new(String::new());
-    form.append_pair("Action", action);
-    form.append_pair("Version", "2010-05-15");
-    for (key, value) in members {
-        form.append_pair(key, value);
-    }
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://cloudformation.{REGION}.amazonaws.com/"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/cloudformation/\
-                 aws4_request, SignedHeaders=host, Signature=0123456789abcdef"
-            ),
-        )
-        .body(bytes::Bytes::from(form.finish()))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let body = String::from_utf8(response.into_body().to_vec()).expect("a UTF-8 response body");
-    (status, body)
-}
-
 /// Create an IAM user carrying `document` as its one inline policy, and answer the access key
-/// id a request of that user signs with.
+/// id a request of that user signs with — the shared minting of a principal to call as
+/// ([`user_with_inline_policy`]).
 async fn user_with_policy(
     router: &MultiServiceRouter,
     case: &str,
     user_name: &str,
     document: &str,
 ) -> String {
-    let (code, body) = iam(router, "CreateUser", &[("UserName", user_name)]).await;
-    assert_eq!(
-        code, 200,
-        "case {case:?}: CreateUser({user_name}) must answer, got {code} {body}"
-    );
-    let (code, body) = iam(
-        router,
-        "PutUserPolicy",
-        &[
-            ("UserName", user_name),
-            ("PolicyName", "template-read"),
-            ("PolicyDocument", document),
-        ],
-    )
-    .await;
-    assert_eq!(
-        code, 200,
-        "case {case:?}: PutUserPolicy({user_name}) must answer, got {code} {body}"
-    );
-    let (code, body) = iam(router, "CreateAccessKey", &[("UserName", user_name)]).await;
-    assert_eq!(
-        code, 200,
-        "case {case:?}: CreateAccessKey({user_name}) must answer, got {code} {body}"
-    );
-    xml_text(&body, "AccessKeyId")
-        .unwrap_or_else(|| panic!("case {case:?}: expected a minted access key id, got {body}"))
+    user_with_inline_policy(router, case, user_name, "template-read", document).await
 }
 
 /// A router with the staging bucket created and both objects staged, as a client's own

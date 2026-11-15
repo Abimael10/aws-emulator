@@ -2148,24 +2148,30 @@ pub async fn reconcile(
                 }
                 let applied = match owner_for(&resource.resource_type) {
                     Some(provisioner) => {
-                        // The call is the stack's, made under its service role and about
-                        // THIS resource ([`super::service_role`]).
-                        // BOXED, for the reason the create's own call below records: the
-                        // call's future is the owning service's whole handler, and holding one
-                        // of those inline in this walk's state machine is what takes a
-                        // deployment of a wide template past the thread's stack.
-                        Box::pin(super::service_role::on_resource(
-                            super::service_role::target_of(&resource),
-                            provisioner.update(
-                                ctx,
-                                region,
-                                &resource,
-                                &deployed_properties,
-                                &stack.tags_for(&resource.logical_id),
-                                &stack.capabilities,
-                            ),
-                        ))
-                        .await
+                        // A change that hands an IAM ROLE to this service is applied only if
+                        // the principal that asked for the deployment may pass that role, for
+                        // the reason the create's own gate records ([`super::pass_role`]).
+                        match super::pass_role::refusal(&deployed_properties) {
+                            Some(refused) => Err(refused),
+                            // The call is the stack's, made under its service role and about
+                            // THIS resource ([`super::service_role`]).
+                            // BOXED, for the reason the create's own call below records: the
+                            // call's future is the owning service's whole handler, and holding
+                            // one of those inline in this walk's state machine is what takes a
+                            // deployment of a wide template past the thread's stack.
+                            None => Box::pin(super::service_role::on_resource(
+                                super::service_role::target_of(&resource),
+                                provisioner.update(
+                                    ctx,
+                                    region,
+                                    &resource,
+                                    &deployed_properties,
+                                    &stack.tags_for(&resource.logical_id),
+                                    &stack.capabilities,
+                                ),
+                            ))
+                            .await,
+                        }
                     }
                     // Nothing exists in any owning service for this type, so there is
                     // nothing anywhere to change: the stack's own record IS the resource,
@@ -2676,16 +2682,24 @@ pub async fn reconcile(
                     properties: deployed_properties,
                     ..resource.clone()
                 };
-                // BOXED, for the reason [`roll_back_failed_resource`]'s own call records: the
-                // call's future is the owning service's whole handler, and holding one of
-                // those inline in this walk's state machine is what takes a deployment of a
-                // wide template past the thread's stack — the more so for a walk a READ
-                // resumes, which is already several frames down ([`deferred::resume`]).
-                Box::pin(super::service_role::on_resource(
-                    super::service_role::target_of(&asked),
-                    provisioner.create(ctx, region, &asked, &tags, &stack.capabilities),
-                ))
-                .await
+                // A declaration that hands an IAM ROLE to this service is created only if the
+                // principal that asked for the deployment may pass that role: the owning
+                // service refuses the call otherwise, so the refusal is answered here and the
+                // call is not made at all ([`super::pass_role`]).
+                match super::pass_role::refusal(&asked.properties) {
+                    Some(refused) => Err(refused),
+                    // BOXED, for the reason [`roll_back_failed_resource`]'s own call records:
+                    // the call's future is the owning service's whole handler, and holding one
+                    // of those inline in this walk's state machine is what takes a deployment
+                    // of a wide template past the thread's stack — the more so for a walk a
+                    // READ resumes, which is already several frames down
+                    // ([`deferred::resume`]).
+                    None => Box::pin(super::service_role::on_resource(
+                        super::service_role::target_of(&asked),
+                        provisioner.create(ctx, region, &asked, &tags, &stack.capabilities),
+                    ))
+                    .await,
+                }
             }
             // No provisioner for this type: nothing is asked of any service, and the
             // resource stays DECLARED-ONLY — which the stack still records as a resource it

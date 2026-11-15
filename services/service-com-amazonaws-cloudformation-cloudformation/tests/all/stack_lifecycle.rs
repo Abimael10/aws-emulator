@@ -125,6 +125,49 @@ pub(crate) async fn iam(
     (status, body)
 }
 
+/// Create an IAM user carrying `document` as its one inline policy, and answer the access key
+/// id a request of that user signs with ([`crate::harness::call_as`]).
+///
+/// The ONE place a suite of this crate mints a principal to call as: the suites that decide
+/// something about the CALLER — what it may read by reference, which role it may pass — all
+/// need a user, an inline policy and a key, and they write those three calls once here.
+/// `case` names the row for the assertions, and `policy_name` the inline policy as the
+/// request spells it.
+pub(crate) async fn user_with_inline_policy(
+    router: &MultiServiceRouter,
+    case: &str,
+    user_name: &str,
+    policy_name: &str,
+    document: &str,
+) -> String {
+    let (code, body) = iam(router, "CreateUser", &[("UserName", user_name)]).await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: CreateUser({user_name}) must answer, got {code} {body}"
+    );
+    let (code, body) = iam(
+        router,
+        "PutUserPolicy",
+        &[
+            ("UserName", user_name),
+            ("PolicyName", policy_name),
+            ("PolicyDocument", document),
+        ],
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: PutUserPolicy({user_name}) must answer, got {code} {body}"
+    );
+    let (code, body) = iam(router, "CreateAccessKey", &[("UserName", user_name)]).await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: CreateAccessKey({user_name}) must answer, got {code} {body}"
+    );
+    xml_text(&body, "AccessKeyId")
+        .unwrap_or_else(|| panic!("case {case:?}: expected a minted access key id, got {body}"))
+}
+
 /// One awsQuery call to Amazon SNS over the same router, answered with the HTTP status and
 /// the XML body.
 ///

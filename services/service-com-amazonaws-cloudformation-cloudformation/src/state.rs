@@ -314,6 +314,14 @@ pub mod template_url;
 /// reference, which is the authorization every such read is made under.
 pub mod caller_object_access;
 
+/// The calling principal of one request, and what the account's IAM records say it may do —
+/// the permissions a stack operation that names no role to assume is carried out with.
+pub mod calling_principal;
+
+/// The `iam:PassRole` a resource that hands an IAM role to its owning service needs of the
+/// calling principal, and the refusal a create it is not granted fails with.
+pub mod pass_role;
+
 /// Computing a change set: comparing the stack's template and parameters with the ones a
 /// change set submits, and the resource-level change list that comparison answers.
 pub mod change_plan;

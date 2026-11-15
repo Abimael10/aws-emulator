@@ -15,21 +15,10 @@
 //! reports for a read Amazon S3 would not serve is the same sentence whichever reason that
 //! read was not served for.
 //!
-//! The three pieces, each held in exactly one place:
-//!
-//! 1. **who** — the principal the request's access key id speaks for, read from the SAME
-//!    place `sts:GetCallerIdentity` answers from (`sts_store::resolve_request_caller`, over
-//!    the long-term identity `sts_store::long_term_identity` resolves an IAM user's own key
-//!    to), so the principal judged is the one the caller reads back for the credentials it
-//!    signed with;
-//! 2. **what it may do** — the identity-based policy documents in force on that principal and
-//!    the permissions boundary that caps them, read through the IAM service's OWN accessors
-//!    (`principal_policies`, `permissions_boundary_document`), where the collection rule
-//!    lives — so a policy `iam:PutUserPolicy` wrote takes effect on the next request and
-//!    deleting it lifts it again;
-//! 3. **the decision** — [`::service_common::iam_authorization`], the tree's ONE evaluation of
-//!    those documents against `(action, resource)`, so this service and the service that owns
-//!    the object cannot answer differently about the same documents.
+//! WHO the caller is, what it may do and how the decision is taken are the CALLING
+//! PRINCIPAL's, held in one place for every call this service decides
+//! ([`super::calling_principal`]); what this module owns is the half particular to a
+//! reference: which ACTION the read asks for and which RESOURCE it is about.
 //!
 //! WHICH action is asked about is the one the read itself needs: `s3:GetObject` for the
 //! current version of an object and `s3:GetObjectVersion` for a reference that names a
@@ -37,34 +26,6 @@
 //! reference addressed, built from the bucket and key the URL named — never resolved out of a
 //! store, so the decision is the same whether or not the object is there and a refusal tells
 //! an unauthorized caller nothing about what the account holds.
-//!
-//! ## The callers this decision cannot refuse
-//!
-//! * **The account's own published credential.** A request whose access key id neither STS nor
-//!   IAM holds a record for speaks for the account itself — the position AWS account root
-//!   credentials are in, which no identity-based policy bounds. This is also what every
-//!   in-process call another emulated service makes presents.
-//! * **A principal holding an attachment this emulator cannot read.** An AWS-managed policy is
-//!   owned by AWS rather than by the account, so the account's store holds no document for it;
-//!   refusing on a grant this emulator cannot see would deny a read AWS permits. An explicit
-//!   `Deny` in a document that CAN be read still refuses.
-//! * **An engine carrying no IAM store**, where no identity can hold a policy at all.
-//!
-//! An expired session credential speaks for nobody: it carries no document, so the read it
-//! asks for is refused.
-//!
-//! ## What one decision costs
-//!
-//! The work is bounded by what IAM holds for ONE principal and does not grow with the request:
-//! that principal's inline policies, the managed policies attached to it and — for a user —
-//! the groups it belongs to, each collected once by IAM's own accessor and read once by the
-//! shared evaluator. It is taken with no store of this service locked and writes nothing to
-//! either store it reads.
-
-use std::time::SystemTime;
-
-use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_store;
-use ::service_common::iam_authorization::{self as iam, Decision};
 
 /// The IAM action reading the CURRENT version of one object asks for: "you must have the
 /// `s3:GetObject` permission" (`GetObject`'s own documentation of the permissions a read
@@ -97,26 +58,7 @@ pub fn read_is_unauthorized<Eng: Send + Sync + 'static>(
         GET_OBJECT
     };
     let resource = object_arn(&object.bucket, &object.key);
-    let caller = caller(engine, ctx);
-    // An identity-based document states no `Principal` element, so the decision rests on the
-    // action and the resource the reference addressed.
-    let request = iam::Request::new(action, &resource, &[]);
-    let said = iam::identity_decision(&caller.documents, &request);
-    // IAM's order: an explicit `Deny` in a document that CAN be read refuses the read whatever
-    // else the principal carries; otherwise a grant is needed, which a caller this decision
-    // does not bound has by definition; and a grant is capped by the permissions boundary,
-    // since "a permissions boundary sets the maximum permissions that an identity-based policy
-    // can grant" (IAM, permissions boundaries).
-    if said == Decision::Denied {
-        return true;
-    }
-    if !(iam::is_allowed(said, Decision::NotStated) || caller.identity_is_unbounded()) {
-        return true;
-    }
-    let Some(boundary) = caller.boundary.as_ref() else {
-        return false;
-    };
-    iam::identity_decision(::std::slice::from_ref(boundary), &request) != Decision::Allowed
+    super::calling_principal::Caller::of(engine, ctx).unauthorized(action, &resource)
 }
 
 /// The ARN of the object `key` in `bucket`: `arn:aws:s3:::<bucket>/<key>`.
@@ -128,106 +70,12 @@ fn object_arn(bucket: &str, key: &str) -> String {
     format!("arn:aws:s3:::{bucket}/{key}")
 }
 
-/// The principal a request speaks for, and everything the decision is made from.
-#[derive(Debug, Clone, Default)]
-struct Caller {
-    /// The identity-based policy documents in force on the principal.
-    documents: Vec<String>,
-    /// The permissions boundary in force on it, when it carries one whose document this
-    /// emulator holds.
-    boundary: Option<String>,
-    /// Set when this request presents the account's own published credential, which holds no
-    /// IAM policies (see the module docs).
-    account_credential: bool,
-    /// Set when the principal has a policy attached whose document the IAM store does not hold
-    /// — an AWS-managed policy (see the module docs).
-    unreadable_attachment: bool,
-    /// Set when this engine carries NO IAM store, where no identity can hold a policy at all,
-    /// so nothing could be read about what this caller may do (see the module docs).
-    no_identity_records: bool,
-}
-
-impl Caller {
-    /// Whether nothing this decision found can refuse the caller once no readable document
-    /// DENIES the read: the account's own credential, which holds no IAM policies, a principal
-    /// carrying a grant this emulator cannot read, or an engine holding no identity records at
-    /// all.
-    fn identity_is_unbounded(&self) -> bool {
-        self.account_credential || self.unreadable_attachment || self.no_identity_records
-    }
-}
-
-/// The principal this request speaks for, with the identity-based policies in force on it.
-///
-/// Resolving the caller goes through STS's own resolution, which materialises the session
-/// expiries the clock has already made due before it answers: that write is owed at the same
-/// instant whether or not anybody called.
-fn caller<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    ctx: &::smithy_server_runtime::OperationContext<'_>,
-) -> Caller {
-    let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
-    let iam = sts_store::iam_state(engine);
-    // A LONG-TERM access key speaks for the IAM user that holds it — the map `iam:GetUser`
-    // resolves a caller through — and a key no store holds is the account's own published
-    // credential.
-    let long_term = match &iam {
-        Some(iam) => sts_store::long_term_identity(Some(&iam.lock()), &access_key_id),
-        None => sts_store::ambient_identity(),
-    };
-    let resolved = match sts_store::service_state(engine) {
-        Some(sts) => sts_store::resolve_request_caller(
-            &mut sts.lock(),
-            &access_key_id,
-            SystemTime::now(),
-            ctx.credential_store(),
-            long_term.clone(),
-        )
-        .map(|caller| {
-            (
-                caller.identity.arn.clone(),
-                // WHOSE identity-based documents are in force for this credential is not
-                // always the principal it speaks for: the role behind an assumed-role session,
-                // the IAM user behind a federated-user session, read through STS's one answer
-                // for it.
-                caller.identity_policies_arn().to_string(),
-            )
-        }),
-        // No STS store on this engine: the credential names no session, so it speaks for the
-        // long-term identity it was resolved to and is judged on that identity's documents.
-        None => Ok((long_term.arn.clone(), long_term.arn.clone())),
-    };
-    // An expired session credential speaks for nobody: it carries no document, so the read it
-    // asks for is refused.
-    let Ok((arn, policies_arn)) = resolved else {
-        return Caller::default();
-    };
-    let mut caller = Caller {
-        account_credential: arn == sts_store::ambient_identity().arn,
-        ..Caller::default()
-    };
-    let Some(iam) = iam else {
-        // No IAM store on this engine: no identity can hold a policy at all, so there is
-        // nothing to read about what this caller may do and nothing withholds the read.
-        caller.no_identity_records = true;
-        return caller;
-    };
-    let held = iam.lock();
-    // The documents are IAM's OWN collection of what an identity carries — its inline policies,
-    // the documents of the policies attached to it and, for a user, its groups' — called rather
-    // than re-derived, so this decision reads exactly what IAM itself judges that principal on.
-    if let Some(policies) = held.principal_policies(&policies_arn) {
-        caller.documents = policies.documents;
-        // An attachment the collection resolved no document for is an entry of AWS's own
-        // catalog this emulator does not carry: a grant it cannot read.
-        caller.unreadable_attachment = !policies.uncarried.is_empty();
-    }
-    caller.boundary = held.permissions_boundary_document(&policies_arn);
-    caller
-}
-
+/// The decisions this module's own rule is pinned by: which action a read asks for, and the
+/// object ARN it is about.
 #[cfg(test)]
 mod tests {
+    use ::service_common::iam_authorization::{self as iam, Decision};
+
     use super::*;
 
     /// What one stored document says about reading one object, through the shared evaluator

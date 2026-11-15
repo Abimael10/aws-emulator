@@ -2556,3 +2556,14 @@ mod bedrock_agent_ingestion_populates_its_aoss_index;
 // inner doc comment and no inner attribute in the file at all, no landing can put one past the
 // name is `E0428` and fails every suite in this target too — and declare every file the
 // directory holds, which this crate's `build.rs` requires.
+// suite, sorted by name, and no other line — so two branches landing at once insert two lines
+// appended past the declarations is `E0753` and compiles no suite of this target — which is
+// what the tail of this file had grown into. With no inner doc comment in the file at all, no
+// landing can leave one past the first item.
+// sibling of this file, which the layout check refuses: the `#[path]` above each `mod` is what
+// points it into `tests/all/`. Declare each suite exactly ONCE — a second `mod` for one name
+// belongs in that suite's own module header; `all/appended_notes.rs` and
+// `all/appended_notes_tail.rs` keep the notes earlier landings had appended here.
+// check those rules, for this file and for every service crate's `tests/all.rs`.
+// An inner attribute, like an inner doc comment, is legal only before the first item of the
+// file, so it stands here rather than in the list below.

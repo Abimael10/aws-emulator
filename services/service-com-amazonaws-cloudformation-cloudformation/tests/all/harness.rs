@@ -345,6 +345,37 @@ pub async fn call_in(
     action: &str,
     members: &[(String, String)],
 ) -> (u16, String) {
+    call_as_in(router, region, AMBIENT_ACCESS_KEY_ID, action, members).await
+}
+
+/// The access key id every call of this harness presents unless a case names another: a key
+/// neither IAM nor STS holds a record for, which is the account's own published credential.
+pub const AMBIENT_ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
+
+/// [`call`] signed with `access_key_id`, which is what says WHO the request speaks for: the
+/// emulator resolves the calling principal from the credential scope, exactly as it does for a
+/// client's own SDK.
+///
+/// The ONE place a suite of this target signs as a particular principal, so the suites that
+/// decide something about the CALLER (what it may read by reference, what role it may pass)
+/// cannot disagree about the envelope.
+pub async fn call_as(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    action: &str,
+    members: &[(String, String)],
+) -> (u16, String) {
+    call_as_in(router, REGION, access_key_id, action, members).await
+}
+
+/// [`call_as`], signed for `region`.
+pub async fn call_as_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    access_key_id: &str,
+    action: &str,
+    members: &[(String, String)],
+) -> (u16, String) {
     let mut form = form_urlencoded::Serializer::new(String::new());
     form.append_pair("Action", action);
     form.append_pair("Version", "2010-05-15");
@@ -358,8 +389,8 @@ pub async fn call_in(
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/cloudformation/aws4_request, \
-                 SignedHeaders=host, Signature=0123456789abcdef"
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{region}/cloudformation/\
+                 aws4_request, SignedHeaders=host, Signature=0123456789abcdef"
             ),
         )
         .body(bytes::Bytes::from(form.finish()))

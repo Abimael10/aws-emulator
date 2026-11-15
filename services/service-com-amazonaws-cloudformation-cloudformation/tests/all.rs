@@ -375,6 +375,8 @@ mod parameter_and_change_set_conflicts;
 mod parameter_constraints_precede_the_template;
 #[path = "all/parameter_set_contract.rs"]
 mod parameter_set_contract;
+#[path = "all/pass_role_authorization.rs"]
+mod pass_role_authorization;
 #[path = "all/processing_pipeline_stack_outputs.rs"]
 mod processing_pipeline_stack_outputs;
 #[path = "all/provider_answer_follow_up.rs"]
