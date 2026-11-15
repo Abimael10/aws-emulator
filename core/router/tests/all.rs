@@ -1792,3 +1792,18 @@ mod lambda_sqs_event_source_attempt_reservation;
 //! than restated here.
 #[path = "all/declaration_roots_are_canonical_and_complete.rs"]
 mod declaration_roots_are_canonical_and_complete;
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, keeping the list sorted by name. This
+//! file holds those pairs and NOTHING else, so two branches landing at once insert two lines
+//! in two places and have no prose to duplicate, re-word or mistype.
+//! Four rules fail every suite in this target at once, which is why nothing else belongs
+//! here: a suite no `mod` names compiles nowhere and its tests never run; a suite left at the
+//! top level of `tests/` is a target of its own and fails the build; a suite declared twice is
+//! `E0428`; and an inner doc comment (`//!`) past the first item is `E0753`, so these header
+//! lines are the only place one may stand. `all/all_rs_declares_each_suite_once.rs`,
+//! service crate's `tests/all.rs`, so a note about any of them belongs there.
+//! What a suite covers, and why it lives in this cross-service target rather than in one
+//! service crate's own, belongs in that suite's own module doc, where it is read beside the
+//! test it explains.
+//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod <name>;` would resolve to a
+//! SIBLING of this file (`tests/<name>.rs`), which the layout check refuses: every
+//! declaration carries its own `#[path = "all/<name>.rs"]`.

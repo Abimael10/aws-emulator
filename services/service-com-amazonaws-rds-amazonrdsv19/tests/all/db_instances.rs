@@ -351,7 +351,10 @@ pub(crate) fn subtrees(xml: &str, tag: &str) -> Vec<String> {
 }
 
 /// The one `<DBInstance>` subtree in `xml`.
-fn the_instance(case: &str, xml: &str) -> String {
+///
+/// `pub(crate)` so the sibling suites of this one test target read the one instance a
+/// response carries through this reader rather than growing a copy of it.
+pub(crate) fn the_instance(case: &str, xml: &str) -> String {
     let found = subtrees(xml, "DBInstance");
     assert_eq!(
         found.len(),

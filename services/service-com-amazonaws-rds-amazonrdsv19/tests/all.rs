@@ -101,6 +101,8 @@ mod db_instance_read_replicas;
 mod db_instance_refused_change_publishes_no_event;
 #[path = "all/db_instance_stop.rs"]
 mod db_instance_stop;
+#[path = "all/db_instance_storage_encryption_key.rs"]
+mod db_instance_storage_encryption_key;
 #[path = "all/db_instance_subnet_group_projection.rs"]
 mod db_instance_subnet_group_projection;
 #[path = "all/db_instances.rs"]

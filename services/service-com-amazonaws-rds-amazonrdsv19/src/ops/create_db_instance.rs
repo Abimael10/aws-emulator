@@ -794,7 +794,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .storage_throughput
                 .unwrap_or_else(|| crate::state::default_storage_throughput(&storage_type)),
             storage_type,
-            // `StorageEncrypted`: "By default, it isn't encrypted."
+            // `StorageEncrypted`: "By default, it isn't encrypted." The key the storage is
+            // encrypted under is the one the request named; an instance encrypted without
+            // one named takes the account's default key, resolved once this scope has
+            // released the store's guard (below).
             storage_encrypted: input.storage_encrypted.unwrap_or(false),
             kms_key_id: input.kms_key_id,
             iops: input.iops,
@@ -908,6 +911,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ));
         record
         };
+
+        // `StorageEncrypted` / `KmsKeyId`: an instance created with encryption turned on and
+        // no key named is encrypted under the account's default key for this service ("If
+        // StorageEncrypted is enabled, and you do not specify a value for the KmsKeyId
+        // parameter, then Amazon RDS uses your default KMS key"), so that key's identifier is
+        // what the instance carries — never nothing, which would say an encrypted instance is
+        // encrypted under no key at all. The key is resolved against the KMS this emulator
+        // mounts, which cannot be done under the store's guard, and after every refusal above
+        // has been answered — exactly as its DB CLUSTER sibling resolves it
+        // ([`crate::state::storage_encryption_key_id`]).
+        record.kms_key_id = crate::state::storage_encryption_key_id(
+            ctx,
+            &region,
+            record.kms_key_id.take(),
+            record.storage_encrypted,
+        )
+        .await;
 
         // The secret RDS manages for this instance's master user password, for a request
         // that asked it to: generated, stored in Secrets Manager and reported as
