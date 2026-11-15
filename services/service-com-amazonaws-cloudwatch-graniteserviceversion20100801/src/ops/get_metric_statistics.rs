@@ -289,7 +289,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(invalid_value(message));
             }
         }
-        if end <= requested_start {
+        // The same two classes as every other read of a range: a window that begins exactly
+        // where it ends is the shape of the request ([`crate::state::equal_range_message`]), and
+        // one that runs backwards is a parameter value this read cannot use.
+        if end == requested_start {
+            return Err(GetMetricStatisticsError::validation_error(
+                crate::state::equal_range_message(),
+            ));
+        }
+        if end < requested_start {
             return Err(invalid_value(crate::state::range_order_message()));
         }
         let period = f64::from(input.period);

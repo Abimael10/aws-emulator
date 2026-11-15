@@ -170,17 +170,18 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         );
         // The other two reads of the metric data plane take a namespace from the caller too —
         // the one a query names and the one a catalogue listing filters by — so they are served
-        // through the same wrapper, with the service-wide wording for every refusal they do
-        // make ([`the_service_wide_refusal`]): what the wrapper adds for them is that a
-        // namespace the service accepts is READ BACK rather than refused, so a series published
-        // into one can be retrieved and listed.
+        // through the same wrapper: what it adds for them is that a namespace the service
+        // accepts is READ BACK rather than refused, so a series published into one can be
+        // retrieved and listed. The metric DATA read words its own refusals as the
+        // request-validation layer in front of the service words them
+        // ([`the_request_validation_fault`]), which is the class its recordings carry.
         overridden.add_operation(
             "GetMetricData",
             served(
                 &engine,
                 JudgingTheValuesThisServiceEnforces::new(
                     crate::ops::get_metric_data::GetMetricData::new(Arc::clone(&engine)),
-                    the_service_wide_refusal,
+                    the_request_validation_fault,
                 ),
             ),
         );
@@ -339,8 +340,9 @@ fn served<Eng: Send + Sync + 'static, O: ErasedOperation + 'static>(
 /// same ones its handlers refuse with), and a client branching on the code reaches its
 /// handler:
 ///
-/// * a `Dimensions` collection longer than its cap, named with the cap it broke
-///   ([`dimension_cap_refusal`]);
+/// * a COLLECTION longer than its cap, named with the cap it broke
+///   ([`collection_cap_refusal`]) — a collection past its maximum is a value the service
+///   cannot use, whichever member carries it;
 /// * a required value submitted EMPTY, which is a parameter the request supplied no value for
 ///   ([`empty_required_value_refusal`]);
 /// * a value inside a LIST that is outside the enumerated type the list's member names — a
@@ -364,7 +366,7 @@ fn parameter_fault(refusal: &Refusal) -> Option<Refused> {
     };
     violations
         .iter()
-        .find_map(dimension_cap_refusal)
+        .find_map(collection_cap_refusal)
         .or_else(|| violations.iter().find_map(empty_required_value_refusal))
         .or_else(|| violations.iter().find_map(omitted_required_member_refusal))
         .or_else(|| violations.iter().find_map(list_element_enum_refusal))
@@ -427,24 +429,106 @@ fn omitted_required_member_refusal(
 }
 
 /// The refusal policy of the metric LISTING: a filter value outside the enumerated type its
-/// member names, in the fixed sentence CloudWatch refuses one with, and nothing else — every
-/// other class keeps the service-wide wording behind it ([`the_service_wide_wording`]).
+/// member names, and a filter value supplied with no characters at all, each in the fixed
+/// sentence CloudWatch refuses one with — every other class keeps the service-wide wording
+/// behind it ([`the_service_wide_wording`]).
 ///
 /// The listing's filters are judged as VALUES rather than as the shape of the request: a window
 /// to filter recent activity by that this service does not offer is a parameter value it cannot
 /// use ([`crate::state::request_parameter_invalid_message`], the parameter named as the wire
-/// spells it), under the parameter-value fault the operation's model declares — which is the
-/// only client error it declares at all
+/// spells it), and so is a filter the request supplied EMPTY
+/// ([`unusable_filter_value_refusal`]) — both under the parameter-value fault the operation's
+/// model declares, which is the only client error it declares at all
 /// (`smithy_query(query="operation",operation="ListMetrics")`).
 fn listing_value_fault(violations: &[aws_smithy_schema_server::Violation]) -> Option<Refused> {
-    violations.iter().find_map(|violation| {
-        let aws_smithy_schema_server::ViolationKind::EnumValue(_) = violation.kind else {
-            return None;
-        };
-        Some(Refused {
-            code: PARAMETER_VALUE.shape_name.to_string(),
-            message: crate::state::request_parameter_invalid_message(&violation.path),
+    violations
+        .iter()
+        .find_map(unusable_filter_value_refusal)
+        .or_else(|| {
+            violations.iter().find_map(|violation| {
+                let aws_smithy_schema_server::ViolationKind::EnumValue(_) = violation.kind else {
+                    return None;
+                };
+                Some(Refused {
+                    code: PARAMETER_VALUE.shape_name.to_string(),
+                    message: crate::state::request_parameter_invalid_message(&violation.path),
+                })
+            })
         })
+}
+
+/// The refusal of a value the metric LISTING is narrowed by that the request supplied with no
+/// characters, or `None` when `violation` is not one.
+///
+/// Every member of the listing's request is a filter it narrows the catalogue by, and a filter
+/// carrying no characters narrows it by nothing: the listing judges that as the VALUE it is —
+/// the parameter-value fault its model declares, in the sentence this service states an unusable
+/// value in ([`crate::state::value_is_invalid_message`]), naming the request member path the
+/// value arrived on — rather than as the length its member's own minimum declares, which is what
+/// the request-validation layer in front of the service would have stated.
+///
+/// The value half of that sentence is the one the template leaves UNSUBSTITUTED
+/// ([`crate::state::NO_SUBMITTED_VALUE`]): there is no value to state, which is the whole
+/// condition the refusal is about.
+///
+/// Keyed on the CLASS of violation alone — a minimum length the submitted value broke by being
+/// empty — so it holds for every filter of the listing at any depth: the VALUE of one dimension
+/// filter is the recorded case, and the filter's name, the metric name and the namespace are
+/// stated the same way.
+fn unusable_filter_value_refusal(
+    violation: &aws_smithy_schema_server::Violation,
+) -> Option<Refused> {
+    let aws_smithy_schema_server::ViolationKind::MinLength(_) = violation.kind else {
+        return None;
+    };
+    if !violation.value.as_deref().is_some_and(str::is_empty) {
+        return None;
+    }
+    Some(Refused {
+        code: PARAMETER_VALUE.shape_name.to_string(),
+        message: crate::state::value_is_invalid_message(
+            crate::state::NO_SUBMITTED_VALUE,
+            &crate::state::query_parameter_path(&violation.path),
+        ),
+    })
+}
+
+/// The refusal policy of the metric DATA read: every class keeps the REQUEST-VALIDATION class
+/// and the clause the layer in front of the service states it in, with NO value half.
+///
+/// Which class a refusal carries is a property of the OPERATION ([`parameter_fault_for`] states
+/// the other side of it): this read's refusals are the request-validation layer's — a required
+/// member of one of its queries that the request left out is recorded as that layer's not-null
+/// clause rather than as the missing-parameter fault the service-wide wording states
+/// ([`parameter_fault`], which is what the operations recorded answering a parameter fault
+/// reach) — so the policy words them here, where the operation is known, instead of letting the
+/// request fall through to a wording its recordings contradict.
+///
+/// WHICH HALVES the clause carries is a property of the operation too, and this read is the one
+/// that states NO value: `Value at '<member path>' failed to satisfy constraint: <requirement>`,
+/// whichever requirement was broken and whatever the request carried — where every other
+/// operation's clause quotes the submitted value ([`scalar_enum_refusal`]). Only that choice and
+/// the ORDER a value set is listed in are this service's: the envelope, the clauses, the
+/// requirements and the member paths are the shared renderer's and the framework's, so this and
+/// the walk behind it cannot drift.
+fn the_request_validation_fault(
+    violations: &[aws_smithy_schema_server::Violation],
+) -> Option<Refused> {
+    let stated = Refusal::Invalid(
+        violations
+            .iter()
+            .map(service_common::validation_message::in_hashed_enum_order)
+            .collect(),
+    );
+    let message =
+        service_common::validation_message::aws_validation_refusal_withholding_violations(
+            &stated,
+            |_| true,
+        )?
+        .message;
+    Some(Refused {
+        code: VALIDATION.shape_name.to_string(),
+        message,
     })
 }
 
@@ -577,8 +661,11 @@ fn unanchored_pattern_refusal(refusal: &Refusal) -> Option<Refused> {
 ///   ([`service_common::validation_message::in_hashed_enum_order`]), which is the order this
 ///   service is recorded listing an enumerated type's values in — neither the model's
 ///   declaration order nor a sorted one;
-/// * the clause quotes the SUBMITTED value for every enumerated type but the ones this service
-///   is recorded naming the member alone for ([`VALUE_WITHHELD_ENUM_TYPES`]).
+/// * the clause quotes the SUBMITTED value, which is what tells a client which of the values it
+///   sent was rejected — a near miss of a declared value (a mis-cased one, say) cannot be told
+///   from an unsupported one without it. WHETHER a clause carries that half is a property of the
+///   OPERATION, not of the type: the one read whose clauses state no value at all words its own
+///   ([`the_request_validation_fault`]).
 fn scalar_enum_refusal(violations: &[aws_smithy_schema_server::Violation]) -> Option<Refused> {
     if !violations.iter().any(is_scalar_enum_violation) {
         return None;
@@ -589,51 +676,12 @@ fn scalar_enum_refusal(violations: &[aws_smithy_schema_server::Violation]) -> Op
             .map(service_common::validation_message::in_hashed_enum_order)
             .collect(),
     );
-    // The whole envelope is the shared renderer's; only the CODE and which clauses carry a
-    // value half are this service's.
-    let message =
-        service_common::validation_message::aws_validation_refusal_withholding_violations(
-            &stated,
-            withholds_the_submitted_value,
-        )?
-        .message;
+    // The whole envelope is the shared renderer's; only the CODE and the order a value set is
+    // listed in are this service's.
+    let message = service_common::validation_message::aws_validation_refusal(&stated)?.message;
     Some(Refused {
         code: VALIDATION.shape_name.to_string(),
         message,
-    })
-}
-
-/// The enumerated TYPES whose refusal states NO submitted value, each row holding the values
-/// its type declares.
-///
-/// WHICH HALVES a clause carries — the member path alone (`Value at '<path>'`) or the member
-/// path and the value the request sent (`Value '<value>' at '<path>'`) — is a property of the
-/// enumerated TYPE, exactly as the ORDER that type's values are listed in is
-/// ([`service_common::validation_message::in_hashed_enum_order`]): it is read off what this
-/// service is recorded answering for the type and derives from nothing the model carries, so
-/// one type is stated alike wherever it is carried — whichever operation was called, whichever
-/// member the value arrived on and at whatever depth. One type so far: the SCAN DIRECTION a
-/// read is ordered by, whose refusal names the member alone. A type with no row keeps the value
-/// half the framework's clause carries, which is what tells a client which of the values it
-/// sent was rejected — a near miss of a declared value (a mis-cased one, say) cannot be told
-/// from an unsupported one without it.
-const VALUE_WITHHELD_ENUM_TYPES: &[&[&str]] = &[crate::ops::types::shared_types::SCAN_BY_VALUES];
-
-/// Whether the clause for `violation` states no submitted value: a value outside one of the
-/// enumerated types stated without one ([`VALUE_WITHHELD_ENUM_TYPES`]), and nothing else.
-///
-/// The type is recognised by the values the violation carries, matched as a SET, so a row holds
-/// however the schema presented those values and wherever the value sat in the request — the
-/// member path is not consulted at all.
-fn withholds_the_submitted_value(violation: &aws_smithy_schema_server::Violation) -> bool {
-    let aws_smithy_schema_server::ViolationKind::EnumValue(ref carried) = violation.kind else {
-        return false;
-    };
-    let admissible: std::collections::BTreeSet<&str> =
-        carried.iter().map(String::as_str).collect();
-    VALUE_WITHHELD_ENUM_TYPES.iter().any(|withheld| {
-        withheld.len() == admissible.len()
-            && withheld.iter().all(|value| admissible.contains(value))
     })
 }
 
@@ -647,25 +695,35 @@ fn is_scalar_enum_violation(violation: &aws_smithy_schema_server::Violation) -> 
     ) && !is_list_element(&violation.path)
 }
 
-/// The refusal of a `Dimensions` collection longer than the dimensions it may carry, or
-/// `None` when `violation` is not one.
+/// The refusal of a COLLECTION carrying more entries than its cap, or `None` when `violation`
+/// is not one.
 ///
-/// The cap CloudWatch enforces on a dimension collection is the per-metric dimension maximum
-/// ([`crate::state::MAX_METRIC_DIMENSIONS`]), whatever the operation; `ListMetricsInput`'s own
-/// filter list is modelled BELOW it (`length 0..10`), and a collection inside the per-metric
-/// maximum but outside that member's own bound is refused naming THAT bound — the refusal
-/// names the cap the collection actually broke, and this seam chooses the words of a refusal
-/// rather than whether there is one.
-fn dimension_cap_refusal(violation: &aws_smithy_schema_server::Violation) -> Option<Refused> {
+/// CloudWatch names the collection and the cap it broke and nothing of the entries themselves
+/// ([`crate::state::collection_too_large_message`]), under the parameter-value fault: a
+/// collection past its maximum is a VALUE the service cannot use, which is the class its
+/// handlers refuse one with too (`crate::ops::put_metric_data`,
+/// `crate::ops::put_metric_stream`), so a cap the boundary catches and one a handler catches
+/// read alike. The cap stated is the one the collection ACTUALLY broke — the member's own
+/// modelled maximum, except for a dimension collection, whose cap is the per-metric dimension
+/// maximum this service enforces ([`crate::state::MAX_METRIC_DIMENSIONS`]) wherever such a
+/// collection is submitted: `ListMetricsInput`'s own filter list is modelled BELOW it
+/// (`length 0..10`), and a collection inside the per-metric maximum but outside that member's
+/// own bound is one the service still APPLIES ([`is_applicable_dimension_filter`]).
+///
+/// Keyed on the CLASS of violation alone — a maximum length broken by a value the walk rendered
+/// as a collection's SIZE, which is a rendering no caller can send for a scalar member — so it
+/// holds for every collection of every operation whose refusals this service words, at any
+/// depth: the statistics a metric read asks for and the dimension set it names are the recorded
+/// cases.
+fn collection_cap_refusal(violation: &aws_smithy_schema_server::Violation) -> Option<Refused> {
     let aws_smithy_schema_server::ViolationKind::MaxLength(declared) = violation.kind else {
         return None;
     };
-    if !is_dimension_collection(&violation.path) {
-        return None;
-    }
     let submitted =
         service_common::validation_message::list_item_count(violation.value.as_deref()?)?;
-    let cap = if submitted > crate::state::MAX_METRIC_DIMENSIONS {
+    let cap = if is_dimension_collection(&violation.path)
+        && submitted > crate::state::MAX_METRIC_DIMENSIONS
+    {
         crate::state::MAX_METRIC_DIMENSIONS
     } else {
         usize::try_from(declared).ok()?
@@ -747,19 +805,63 @@ const REFUSAL_STATUS: u16 = 400;
 /// `GetMetricStatistics` declares `InvalidParameterValueException` ("The value of an input
 /// parameter is bad or out-of-range", the class [`PARAMETER_VALUE`]) beside
 /// the combination and missing-parameter faults, so a client of it branches on that code and
-/// the sentence is this service's own: the dimension cap first, then a required value supplied
-/// empty, then a value outside an
-/// enumerated type, in the SAME order as the service-wide seam ([`parameter_fault`]), so one
-/// operation cannot answer a request that breaks two of them differently from every other. An
-/// operation that declares none of those faults keeps the request-validation class
-/// instead ([`scalar_enum_refusal`]).
+/// the sentence is this service's own: a collection over its cap first
+/// ([`collection_cap_refusal`], the same rule the service-wide seam applies), then a required
+/// value supplied
+/// empty, then a required member the request left out, then a granularity that names no span of
+/// time ([`non_positive_period_refusal`]), then a value outside an
+/// enumerated type, in the SAME order as the service-wide seam ([`parameter_fault`]) for the
+/// classes they share, so one operation cannot answer a request that breaks two of them
+/// differently from every other. An operation that declares none of those faults keeps the
+/// request-validation class instead ([`scalar_enum_refusal`],
+/// [`the_request_validation_fault`]).
 fn parameter_fault_for(violations: &[aws_smithy_schema_server::Violation]) -> Option<Refused> {
     violations
         .iter()
-        .find_map(dimension_cap_refusal)
+        .find_map(collection_cap_refusal)
         .or_else(|| violations.iter().find_map(empty_required_value_refusal))
         .or_else(|| violations.iter().find_map(omitted_required_member_refusal))
+        .or_else(|| violations.iter().find_map(non_positive_period_refusal))
         .or_else(|| violations.iter().find_map(enum_value_refusal))
+}
+
+/// The refusal of a `Period` that names no span of time at all, or `None` when `violation` is
+/// not one.
+///
+/// A period is a number of SECONDS, so the smallest one there is is a single second — the bound
+/// the member itself declares (`Period`, `range min 1`) — and a value at or below it names no
+/// granularity a series could be folded at. CloudWatch states that against the bound a span has
+/// to be above rather than against the sub-minute set a short period has to come from, by the
+/// one rule every operation that takes a period is judged by
+/// ([`crate::state::period_error`], which the handlers behind this seam call too), under the
+/// parameter-value fault ([`PARAMETER_VALUE`]): the value is one the service read and cannot
+/// use.
+///
+/// Keyed on the CLASS of violation and the member — a range minimum broken by a period — so it
+/// holds wherever that member is submitted, at any depth, and the bound the sentence states is
+/// the member's own.
+fn non_positive_period_refusal(
+    violation: &aws_smithy_schema_server::Violation,
+) -> Option<Refused> {
+    let aws_smithy_schema_server::ViolationKind::MinValue(_) = violation.kind else {
+        return None;
+    };
+    if !is_period(&violation.path) {
+        return None;
+    }
+    let submitted: i32 = violation.value.as_deref()?.trim().parse().ok()?;
+    Some(Refused {
+        code: PARAMETER_VALUE.shape_name.to_string(),
+        message: crate::state::period_error(submitted)?,
+    })
+}
+
+/// Whether `path` points at the member an operation states a metric's granularity on, in the
+/// spelling the validating walk reports — at whatever depth it sits, which is the last segment
+/// of the path the walk builds (`GetMetricStatisticsInput$Period`, `MetricStat$Period`,
+/// `MetricDataQuery$Period`).
+fn is_period(path: &str) -> bool {
+    path.split('.').next_back() == Some("period")
 }
 
 /// Whether `violation` broke a constraint this service does NOT enforce on the wire.

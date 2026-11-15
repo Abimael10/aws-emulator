@@ -384,7 +384,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(invalid_value(message));
             }
         }
-        if end <= requested_start {
+        // A range is read forwards from its start, so a request whose end does not come after
+        // its start names no window — and WHICH of the two it is decides the class: a range that
+        // begins exactly where it ends is the SHAPE of the request, refused by the layer in
+        // front of the service ([`crate::state::equal_range_message`]), while one that runs
+        // backwards is a parameter value this read cannot use.
+        if end == requested_start {
+            return Err(GetMetricDataError::validation_error(
+                crate::state::equal_range_message(),
+            ));
+        }
+        if end < requested_start {
             return Err(invalid_value(crate::state::range_order_message()));
         }
         let now = crate::state::now_secs();

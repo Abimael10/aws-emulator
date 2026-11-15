@@ -6,10 +6,10 @@
 //! RULE: a value outside an enumerated type is refused under this service's request-validation
 //! class with the counting envelope, naming the member path the value arrived on and the whole
 //! set the type admits in the order the set's own table is walked; whether that clause ALSO
-//! states the value the request sent is a property of the enumerated TYPE, read off what this
-//! service answers for that type and derivable from nothing the model carries — so one type is
-//! stated alike whichever operation was called, whichever member carried the value, and at
-//! whatever depth the value sat.
+//! states the value the request sent is a property of the OPERATION, read off what this service
+//! answers for it and derivable from nothing the model carries — one read states no value in any
+//! of its clauses, whichever requirement was broken, and every other operation quotes the value
+//! that was sent, whichever member carried it and at whatever depth it sat.
 //!
 //! The rows differ along what the rule generalises over: WHICH enumerated type the member
 //! targets, which operation the value arrived on, HOW the value misses the type's set (a word
@@ -73,27 +73,23 @@ const DECLARED_COMPARISON_OPERATORS: [&str; 7] = [
     "GreaterThanUpperThreshold",
 ];
 
-/// The enumerated TYPES this service states a refusal of with NO submitted value, each row
-/// holding the set its type admits.
+/// The OPERATIONS whose request-validation clauses state NO submitted value.
 ///
 /// Recorded from the service's own refusals, exactly as the stated ORDER of a type's values is:
-/// one type so far, the scan DIRECTION a read is ordered by. Every other type's refusal states
-/// the value that was sent.
-const VALUE_WITHHELD_TYPES: [&[&str]; 1] = [&DECLARED_SCAN_BY];
+/// one operation so far, the read that answers a metric's datapoints, whose clauses name the
+/// member and the requirement alone whichever constraint was broken. Every other operation's
+/// clause states the value that was sent.
+const VALUE_WITHHELD_OPERATIONS: [&str; 1] = ["GetMetricData"];
 
-/// Whether a refusal of a value outside the type admitting `declared` states the value that was
-/// sent: every type but the ones listed above, matched as a SET so the row holds however the
-/// values were presented.
-fn states_the_submitted_value(declared: &[&str]) -> bool {
-    !VALUE_WITHHELD_TYPES.iter().any(|withheld| {
-        withheld.len() == declared.len() && withheld.iter().all(|value| declared.contains(value))
-    })
+/// Whether a refusal `operation` answers states the value that was sent.
+fn states_the_submitted_value(operation: &str) -> bool {
+    !VALUE_WITHHELD_OPERATIONS.contains(&operation)
 }
 
 /// The whole sentence a refusal of `submitted` at `path` states, for a member targeting the type
-/// admitting `declared`.
-fn expected_refusal(path: &str, declared: &[&str], submitted: &str) -> String {
-    let half = if states_the_submitted_value(declared) {
+/// admitting `declared`, as `operation` states it.
+fn expected_refusal(operation: &str, path: &str, declared: &[&str], submitted: &str) -> String {
+    let half = if states_the_submitted_value(operation) {
         format!("Value '{submitted}' at '{path}'")
     } else {
         format!("Value at '{path}'")
@@ -207,8 +203,9 @@ async fn the_stated_order_of_a_value_set_is_derived_from_the_values_themselves()
 async fn a_value_outside_an_enumerated_type_is_refused_with_the_halves_that_type_states() {
     let mut rows: Vec<Row> = Vec::new();
 
-    // The scan DIRECTION, the one type stated without the value that was sent, on both
-    // operations that carry it and over three ways of missing its set.
+    // The scan DIRECTION, on both operations that carry it and over three ways of missing its
+    // set — on the read that states no value at all and on one that quotes it, so the same type
+    // is seen stated both ways.
     for submitted in ["NotAValidScanByValue", "timestampascending", ""] {
         rows.push(Row {
             case: "the order a metric read scans in",
@@ -309,14 +306,15 @@ async fn a_value_outside_an_enumerated_type_is_refused_with_the_halves_that_type
              {status} with {body}"
         );
         let message = error_message(&body);
-        let expected = expected_refusal(path, declared, submitted);
+        let expected = expected_refusal(operation, path, declared, submitted);
         assert_eq!(
             message, expected,
             "case {case:?} ({operation}, {submitted:?}): expected {expected:?}, got {message:?}"
         );
-        // Stated separately, because withholding the value is the point: a type stated without
-        // it carries no trace of what the caller sent, wherever in the sentence it might sit.
-        if !states_the_submitted_value(declared) && !submitted.is_empty() {
+        // Stated separately, because withholding the value is the point: an operation that
+        // states none carries no trace of what the caller sent, wherever in the sentence it
+        // might sit.
+        if !states_the_submitted_value(operation) && !submitted.is_empty() {
             assert!(
                 !message.contains(submitted),
                 "case {case:?} ({operation}): expected no trace of the submitted value \

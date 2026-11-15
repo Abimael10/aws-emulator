@@ -363,6 +363,15 @@ pub fn value_is_invalid_message(value: &str, parameter: &str) -> String {
     format!("The value {value} for parameter {parameter} is invalid.")
 }
 
+/// What the value half of that sentence states when the request supplied NO value to state.
+///
+/// The sentence quotes the value the request carried, bare — so a refusal about a parameter
+/// supplied with no characters has nothing to put in that half, and CloudWatch answers it with
+/// the template's own positional placeholder, left as written. It is fixed text of that
+/// refusal class, exactly as the surrounding words are, and the only variable part of such a
+/// sentence stays the member path.
+pub const NO_SUBMITTED_VALUE: &str = "{1}";
+
 /// How CloudWatch states a value outside the SET its member accepts: the member path and the
 /// whole accepted set, and nothing of the submitted value.
 ///
@@ -482,11 +491,37 @@ pub fn range_order_message() -> String {
     format!("The parameter {START_TIME} must be less than the parameter {END_TIME}.")
 }
 
+/// How CloudWatch states a read whose range ends exactly where it starts: the two members and
+/// the requirement that they differ, and nothing of the instant submitted.
+///
+/// A range that begins at the moment it ends names NO window — not a backwards one
+/// ([`range_order_message`]) — and the layer that judges the SHAPE of a request is the one that
+/// says so, which is why the sentence carries that layer's terminator
+/// ([`request_validation_message`]). Shared by every read that takes a range, so the one
+/// requirement is stated in one sentence.
+pub fn equal_range_message() -> String {
+    request_validation_message(&format!(
+        "The parameter {START_TIME} must not equal parameter {END_TIME}."
+    ))
+}
+
 /// The member a read's range starts at, as that sentence names it.
 pub const START_TIME: &str = "StartTime";
 
 /// The member it ends before.
 pub const END_TIME: &str = "EndTime";
+
+/// How CloudWatch states a DATE range whose start is not before its end: the two instants the
+/// request named, written as this service writes an instant inside a refusal
+/// ([`utc_instant`]), and the requirement between them.
+///
+/// The members a date range arrives on carry whole DATES rather than a window's bounds
+/// (`DescribeAlarmHistoryInput$StartDate`, `$EndDate`), and the refusal names the two moments
+/// instead of the two member names: which bound is wrong is not derivable from the member
+/// names alone. Fixed text apart from those two instants, which come from the request.
+pub fn date_range_order_message(start: &str, end: &str) -> String {
+    format!("Start date {start} must be before end date {end}")
+}
 
 /// Why `instant` is not a moment a metric read can name, or `None` when it is.
 ///
@@ -521,6 +556,29 @@ const EARLIEST_READABLE_INSTANT: &str = "Fri Jan 01 00:00:00 UTC 1700";
 /// How it writes the last.
 const LATEST_READABLE_INSTANT: &str = "Fri Dec 31 23:59:59 UTC 9999";
 
+/// `secs` as CloudWatch writes an instant inside a REFUSAL, or `None` for a moment outside the
+/// calendar the renderer represents.
+///
+/// The two sentences above write their bounds in this form — the weekday and month in English,
+/// the day of the month zero-padded, the zone written out, then the year — and a refusal that
+/// names an instant the REQUEST carried writes it the same way
+/// ([`date_range_order_message`]), so one renderer answers for both and the two cannot drift.
+/// It is not the form the modelled timestamp type reports an instant in ([`rfc3339`]): a
+/// document's instants are the model's, and a refusal's sentence is the service's own.
+///
+/// The calendar arithmetic is the maintained date library's, as every other instant this crate
+/// derives is.
+pub fn utc_instant(secs: f64) -> Option<String> {
+    #[allow(clippy::cast_possible_truncation)]
+    let whole_seconds = secs.floor() as i64;
+    let at = ::chrono::DateTime::from_timestamp(whole_seconds, 0)?;
+    Some(at.format(REFUSAL_INSTANT_FORMAT).to_string())
+}
+
+/// The form [`utc_instant`] writes: `EEE MMM dd HH:mm:ss 'UTC' yyyy`, in the date library's own
+/// field spelling.
+const REFUSAL_INSTANT_FORMAT: &str = "%a %b %d %H:%M:%S UTC %Y";
+
 /// How CloudWatch states a request parameter whose VALUE it cannot use at all, naming the
 /// parameter in the spelling the wire gives it and nothing of the value: the whole sentence is
 /// fixed apart from the parameter.
@@ -530,6 +588,34 @@ const LATEST_READABLE_INSTANT: &str = "Fri Dec 31 23:59:59 UTC 9999";
 /// enumerated the declared set instead.
 pub fn request_parameter_invalid_message(parameter: &str) -> String {
     format!("Request parameter {parameter} value is invalid")
+}
+
+/// How CloudWatch states a request parameter it cannot READ AT ALL, naming the parameter in the
+/// spelling the wire gives it and nothing of the value: the whole sentence is fixed apart from
+/// the parameter.
+///
+/// The sibling of [`request_parameter_invalid_message`], for a parameter whose value the service
+/// never gets as far as judging — an opaque cursor it did not mint, which carries no position in
+/// any enumeration — where that one states a value the service read and cannot use.
+pub fn parameter_invalid_message(parameter: &str) -> String {
+    format!("Request parameter {parameter} is invalid")
+}
+
+/// The member every paginated read carries a cursor on, as a refusal names it: the member name
+/// the model declares (`ListMetricsInput$NextToken`).
+pub const NEXT_TOKEN_PARAMETER: &str = "NextToken";
+
+/// How CloudWatch refuses a pagination token it did not issue, where the refusal is one of the
+/// service's PARAMETER faults: the fixed sentence for a parameter it cannot read
+/// ([`parameter_invalid_message`]), naming the member the token arrived on.
+///
+/// Shared so no two such reads word one unusable token differently. A read whose model declares
+/// the token error of its own answers THAT instead — `InvalidNextToken`, whose recorded refusal
+/// carries an empty message (`crate::ops::get_metric_data`) — and the Contributor Insights
+/// listings state the coded form their own recordings show
+/// ([`insight_rule_records::invalid_page_token_message`]).
+pub fn unusable_page_token_message() -> String {
+    parameter_invalid_message(NEXT_TOKEN_PARAMETER)
 }
 
 /// How CloudWatch states a value it understands but cannot serve on the member it arrived on —
@@ -787,25 +873,25 @@ fn upper_camel(segment: &str) -> String {
 /// A period is a span of seconds, so it is at least one — the model says so (`Period` carries
 /// `range min 1`) and so do the members above. Stated here as well, so the rule the windows
 /// are built on does not depend on the boundary validator having run.
-/// Why `period` is not a granularity a metric can be read at, or `None` when it is. Shared
-/// by every operation that takes a `Period`, so one rule answers them all; each maps the
-/// message onto the parameter error ITS model declares.
 ///
-/// A period is a span of seconds, so it is at least one — the model says so (`Period` carries
-/// `range min 1`) and so do the members above. Stated here as well, so the rule the windows
-/// are built on does not depend on the boundary validator having run.
-///
-/// The REQUIREMENT a period broke is what CloudWatch states, and which of the two it is depends
-/// on where the period sits: "For metrics with regular resolution, a period can be as short as
-/// one minute (60 seconds) and must be a multiple of 60. For high-resolution metrics […] the
-/// period can be 1, 5, 10, 20, 30, 60, or any multiple of 60" (`MetricStat$Period`) — so a
+/// The REQUIREMENT a period broke is what CloudWatch states, and which of the three it is
+/// depends on where the period sits. "For metrics with regular resolution, a period can be as
+/// short as one minute (60 seconds) and must be a multiple of 60. For high-resolution metrics […]
+/// the period can be 1, 5, 10, 20, 30, 60, or any multiple of 60" (`MetricStat$Period`) — so a
 /// period SHORTER than a minute had to be one of the sub-minute divisions of one, stated as the
 /// value outside the set its member accepts ([`value_in_set_message`]), while a longer one had
-/// to be a whole number of minutes, stated as the multiple it was not.
+/// to be a whole number of minutes, stated as the multiple it was not. A period at or below zero
+/// is neither: a granularity is a span of seconds, so a value naming no span at all is stated
+/// against the bound it broke ([`non_positive_period_message`]) rather than against a set of
+/// granularities it could never have come from.
 pub fn period_error(period: i32) -> Option<String> {
-    let documented = period >= 1 && (SUB_MINUTE_PERIODS.contains(&period) || period % 60 == 0);
+    let documented = period >= SHORTEST_PERIOD_SECS
+        && (SUB_MINUTE_PERIODS.contains(&period) || period % 60 == 0);
     if documented {
         return None;
+    }
+    if period < SHORTEST_PERIOD_SECS {
+        return Some(non_positive_period_message());
     }
     if period < REGULAR_PERIOD_SECS {
         // The set the sentence enumerates is the sub-minute granularities, the values a caller
@@ -821,6 +907,23 @@ pub fn period_error(period: i32) -> Option<String> {
 /// The granularity every regular-resolution metric is stored at, in seconds — a minute, which is
 /// also the step a longer period has to be a whole number of.
 const REGULAR_PERIOD_SECS: i32 = 60;
+
+/// The shortest span a period can name: one second, the minimum the member itself declares
+/// (`Period` carries `range min 1`). A value below it names no span of time at all.
+const SHORTEST_PERIOD_SECS: i32 = 1;
+
+/// How CloudWatch states a period that names no span at all: the member and the bound a span of
+/// seconds has to be above, and nothing of the submitted value.
+///
+/// Wholly fixed text apart from the member — a period at or under zero broke the same bound
+/// whatever its value — and the member is the one every operation that takes a period spells it
+/// with ([`PERIOD_PARAMETER`]).
+pub fn non_positive_period_message() -> String {
+    format!("The parameter {PERIOD_PARAMETER} must be greater than {NO_SPAN_AT_ALL}.")
+}
+
+/// The bound that sentence states: a span of seconds is a positive number of them.
+const NO_SPAN_AT_ALL: i32 = 0;
 
 /// The request member a period arrives on, as every operation that takes one spells it
 /// (`GetMetricStatisticsInput$Period`, `MetricStat$Period`, `MetricDataQuery$Period`).

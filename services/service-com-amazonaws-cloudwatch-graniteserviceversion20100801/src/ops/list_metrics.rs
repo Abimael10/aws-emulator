@@ -183,15 +183,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The token returned by a previous call to indicate that there is more data available."
         // (`ListMetricsInput$NextToken`) — a token this service did not mint names no page of
-        // this enumeration and is refused; an EMPTY one is no token at all and asks for the
-        // first page, by the one rule every paginated read of this service reads a token under
+        // this enumeration and is refused as the parameter it is, in the one sentence this
+        // service states an unreadable request parameter in
+        // ([`crate::state::unusable_page_token_message`]), under the parameter-value fault this
+        // operation models; an EMPTY one is no token at all and asks for the first page, by the
+        // one rule every paginated read of this service reads a token under
         // ([`crate::state::requested_page`]).
         let start_at = match crate::state::requested_page(input.next_token.as_deref()) {
             None => None,
             Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
                 ListMetricsErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
-                        message: Some("NextToken is not a token this service issued".into()),
+                        message: Some(crate::state::unusable_page_token_message()),
                     },
                 )
             })?),

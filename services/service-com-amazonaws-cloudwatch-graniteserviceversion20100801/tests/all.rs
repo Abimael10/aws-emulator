@@ -191,6 +191,8 @@ mod metric_range_selection;
 mod metric_read_identity;
 #[path = "all/metric_read_input_decisions.rs"]
 mod metric_read_input_decisions;
+#[path = "all/metric_read_refusal_classes.rs"]
+mod metric_read_refusal_classes;
 #[path = "all/metric_storage_resolution.rs"]
 mod metric_storage_resolution;
 #[path = "all/metric_stream_additional_statistics.rs"]

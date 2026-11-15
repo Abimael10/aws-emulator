@@ -32,7 +32,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    alarm_history_items, alarm_stamp, build_router, call, described_alarm, error_code, AlarmKind,
+    alarm_history_items, alarm_stamp, build_router, call, described_alarm, error_code,
+    error_message, AlarmKind,
 };
 
 /// Long enough for the instant the disable is stamped with to be DISTINGUISHABLE from the one
@@ -372,7 +373,9 @@ async fn a_name_no_alarm_carries_is_ignored_and_a_list_past_the_bound_is_refused
          updates, got {updates}"
     );
 
-    // One name past the modelled bound is refused at the boundary, so nothing is written.
+    // One name past the modelled bound is refused, so nothing is written: a collection over its
+    // cap is a parameter VALUE this service cannot use, named with the cap it broke
+    // (`crate::metric_read_refusal_classes` holds that rule and the sentence).
     let past_bound: Vec<String> = (0..=MAX_ALARM_NAMES)
         .map(|index| format!("absent-{index}"))
         .collect();
@@ -390,7 +393,12 @@ async fn a_name_no_alarm_carries_is_ignored_and_a_list_past_the_bound_is_refused
     );
     assert_eq!(
         error_code(&body),
-        "ValidationException",
-        "a list past the modelled maximum is refused at the boundary, got {body}"
+        "InvalidParameterValueException",
+        "a list past the modelled maximum is refused as the value it is, got {body}"
+    );
+    assert_eq!(
+        error_message(&body),
+        format!("The collection AlarmNames must not have a size greater than {MAX_ALARM_NAMES}."),
+        "the refusal names the collection and the cap it broke, got {body}"
     );
 }

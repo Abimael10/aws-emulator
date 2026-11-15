@@ -1395,9 +1395,19 @@ async fn refusals_carry_the_modelled_status_and_code() {
             "InvalidParameterValueException",
         ),
         (
-            "an end time at or before the start time",
+            // A range that begins exactly where it ends names no window, which is the SHAPE of
+            // the request; one that runs backwards is a parameter value the read cannot use
+            // (`crate::metric_read_refusal_classes` tables both).
+            "an end time equal to the start time",
             "GetMetricStatistics",
             statistics_request("Refused", 60, 0.0, &["Sum"]),
+            400,
+            "ValidationException",
+        ),
+        (
+            "an end time before the start time",
+            "GetMetricStatistics",
+            statistics_request("Refused", 60, -60.0, &["Sum"]),
             400,
             "InvalidParameterValueException",
         ),

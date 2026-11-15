@@ -4790,3 +4790,15 @@ mod appended_notes;
 //! every suite in this target.
 //! the first item one is `E0753` and compiles no suite of this target, so a note further
 //! down must be an ordinary `//` comment. Below, add a declaration — not a note about one.
+//! never run; a suite left at the top level of `tests/` fails the build.
+//! Two rules bind every declaration, because this file is ONE crate root:
+//! 1. Declare each suite EXACTLY ONCE — a second `mod` for the same name is `E0428` and
+//!    fails every suite in this target.
+//! 2. THIS BLOCK IS THE ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE:
+//!    past the first item one is `E0753`, which also fails every suite in this target. A
+//!    note further down must be an ordinary `//` comment — better still, put it in the
+//!    suite's own file.
+//! for this file and for every service crate's `tests/all.rs`. Below, add a DECLARATION —
+//! not a note about one: this list carries nothing but the pairs, so two landings in the
+//! same window conflict on one line instead of on a paragraph.
+//! each module into `tests/all/`.

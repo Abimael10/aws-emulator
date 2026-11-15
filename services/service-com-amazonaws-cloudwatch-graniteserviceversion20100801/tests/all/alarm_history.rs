@@ -536,7 +536,11 @@ async fn bad_requests_carry_the_modelled_status_and_code() {
             "an inverted date range",
             json!({"StartDate": 1_700_000_600.0, "EndDate": 1_700_000_000.0}),
             400,
-            "ValidationException",
+            // A date range that runs backwards is a VALUE this read cannot use, which is the
+            // parameter fault, where the rows below are the SHAPE of the request
+            // (`tests/all/metric_read_refusal_classes.rs` holds the rule and both instants the
+            // sentence names).
+            "InvalidParameterValueException",
         ),
         (
             "MaxRecords below the modelled minimum",

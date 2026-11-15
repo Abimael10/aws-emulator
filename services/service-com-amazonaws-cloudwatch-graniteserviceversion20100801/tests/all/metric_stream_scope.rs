@@ -586,7 +586,7 @@ async fn a_value_outside_a_modelled_enum_is_refused_with_this_services_validatio
     // member refused as a parameter VALUE instead, below.
     //
     // The last column is whether the clause states the value the request sent, which is a
-    // property of the enumerated TYPE rather than of the operation or the member — the suite
+    // property of the OPERATION rather than of the enumerated type or the member — the suite
     // that owns that rule, and the whole sentence each row states, is
     // `crate::enum_refusal_value_half`.
     let cases: Vec<(&str, &str, Value, &str, &str, bool)> = vec![
@@ -628,7 +628,7 @@ async fn a_value_outside_a_modelled_enum_is_refused_with_this_services_validatio
             json!({"ScanBy": "Alphabetical"}),
             "scanBy",
             "Alphabetical",
-            false,
+            true,
         ),
         (
             "the kind of alarm history asked for",
@@ -667,9 +667,10 @@ async fn a_value_outside_a_modelled_enum_is_refused_with_this_services_validatio
                 "case {case:?}: expected the refusal to state {expected:?}, got {message:?}"
             );
         }
-        // A type whose refusal states the submitted value lets a client tell WHICH of the
+        // A refusal that states the submitted value lets a client tell WHICH of the
         // values it sent was rejected — a mis-cased declared value from one the type never
-        // offered; a type stated without one names the member alone, whatever was sent.
+        // offered; the one read whose clauses state no value names the member alone, whatever
+        // was sent.
         let expected_half = if states_the_value {
             format!("Value '{value}' at '{path}'")
         } else {

@@ -88,6 +88,11 @@
 //! ## Errors
 //!
 //! * `InvalidNextToken` (HTTP 400) — The next token specified is invalid.
+//! * `InternalServiceFault` (HTTP 500) — widened in through `extra_errors` (see below): this
+//!   service's own server fault, the only honest answer when the shared store cannot be reached.
+//! * `InvalidParameterValueException` (HTTP 400) — widened in through `extra_errors` (see
+//!   below): the value of an input parameter is bad or out-of-range, which is the class this
+//!   read's refusal of a date range it cannot answer carries.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -107,14 +112,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // `InternalServiceFault` is widened in: it is THIS service's own server fault (every
 // metric operation declares it), and it is the only honest answer when the shared store
 // cannot be reached. Reporting that as a 4xx would tell the caller to fix its request.
+//
+// `InvalidParameterValueException` is widened in for the same reason: this SERVICE models it
+// ("The value of an input parameter is bad or out-of-range") and it is the class this read's
+// recorded refusal of a DATE RANGE it cannot answer carries — the operation shape lists only
+// the token error, and a refusal about the two dates is about neither the token nor the shape
+// of the request.
 #[smithy_macros::operation_error(
     "com.amazonaws.cloudwatch#DescribeAlarmHistory",
-    extra_errors = ["InternalServiceFault"]
+    extra_errors = ["InternalServiceFault", "InvalidParameterValueException"]
 )]
 #[derive(Debug)]
 pub enum DescribeAlarmHistoryErrorModeled {
     InvalidNextToken(InvalidNextToken),
     InternalServiceFault(InternalServiceFault),
+    InvalidParameterValueException(InvalidParameterValueException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -200,11 +212,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let end_date = input.end_date.as_ref().map(crate::state::from_timestamp);
         if let (Some(start), Some(end)) = (start_date, end_date) {
             if start > end {
-                // `StartDate` and `EndDate` bound ONE range, so an inverted range is a
-                // request the service cannot answer and the model declares no error for.
-                return Err(crate::scaffolded::Scaffolded::validation(
-                    "StartDate must not be later than EndDate",
-                ));
+                // `StartDate` and `EndDate` bound ONE range, read forwards from its start, so a
+                // request whose start does not come before its end names no range of history
+                // at all. That is a VALUE this read cannot use rather than a request whose
+                // shape it could not read, so it is refused as the parameter fault this service
+                // models, naming both instants the request carried
+                // ([`crate::state::date_range_order_message`]) — which is what tells the caller
+                // which of the two bounds to move.
+                return Err(inverted_date_range(start, end));
             }
         }
 
@@ -322,6 +337,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
         })
     }
+}
+
+/// Refuse a `StartDate`/`EndDate` pair that bounds no range, naming both instants.
+///
+/// The class is the parameter-value fault this service models ("The value of an input parameter
+/// is bad or out-of-range"), and the sentence is the shared one every refusal about a date range
+/// states ([`crate::state::date_range_order_message`]), over the instants written as this
+/// service writes one inside a refusal ([`crate::state::utc_instant`]). An instant the renderer
+/// cannot write — one outside the calendar it represents — leaves that half of the sentence
+/// empty rather than losing the refusal: the request is still one this read cannot answer.
+fn inverted_date_range(start_secs: f64, end_secs: f64) -> DescribeAlarmHistoryError {
+    let written = |secs: f64| crate::state::utc_instant(secs).unwrap_or_default();
+    DescribeAlarmHistoryErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(crate::state::date_range_order_message(
+                &written(start_secs),
+                &written(end_secs),
+            )),
+        },
+    )
+    .into()
 }
 
 /// The sort and paging key of one stored history item.

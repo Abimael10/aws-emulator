@@ -731,9 +731,12 @@ async fn a_request_outside_the_contract_is_refused() {
             "ValidationException",
         ),
         (
+            // A range that begins exactly where it ends is the SHAPE of the request — it names
+            // no window at all — where one that runs BACKWARDS is a parameter value the read
+            // cannot use (`crate::metric_read_refusal_classes` tables both).
             "EndTime equal to StartTime",
             json!({"MetricDataQueries": [query.clone()], "StartTime": base, "EndTime": base}),
-            "InvalidParameterValueException",
+            "ValidationException",
         ),
         (
             "EndTime before StartTime",
