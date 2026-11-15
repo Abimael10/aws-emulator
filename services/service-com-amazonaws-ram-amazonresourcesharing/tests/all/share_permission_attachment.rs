@@ -24,6 +24,13 @@
 //! * WHICH VERSION of the permission the share is governed by: the one it attached, which
 //!   a later version of the permission does not move, and the one a replacing attach
 //!   updates it to;
+//! * WHAT the `replace` parameter governs: it answers for the collision with another
+//!   permission of the same resource type only, so an attach that collides with nothing
+//!   is served however the request sets it;
+//! * WHICH SHARE an attach reaches: the one it names, and no other share of the same
+//!   resource;
+//! * WHAT a `clientToken` answers for: a repeat of THIS operation's call, so a token
+//!   another operation spent, or one a refused attach carried, still serves an attach;
 //! * WHAT an attach that cannot be made answers: a value that is not an ARN of the
 //!   resource it names, a share or permission nothing answers to, a deleted share, a
 //!   version the permission does not carry or that is not its default, a second
@@ -179,15 +186,27 @@ async fn listed_arns(router: &MultiServiceRouter, case: &str, share_arn: &str) -
 
 /// Attach `permission_arn` to `share_arn`, asserting the attach succeeded.
 async fn attach_ok(router: &MultiServiceRouter, case: &str, share_arn: &str, permission_arn: &str) {
-    let (status, answered) = attach(
-        router,
-        &json!({"resourceShareArn": share_arn, "permissionArn": permission_arn}),
-    )
-    .await;
+    attach_served(router, case, share_arn, permission_arn, None).await;
+}
+
+/// The same, for a request that says something about `replace`: `None` omits the member,
+/// `Some(..)` sends that value.
+async fn attach_served(
+    router: &MultiServiceRouter,
+    case: &str,
+    share_arn: &str,
+    permission_arn: &str,
+    replace: Option<bool>,
+) {
+    let mut request = json!({"resourceShareArn": share_arn, "permissionArn": permission_arn});
+    if let Some(replace) = replace {
+        request["replace"] = json!(replace);
+    }
+    let (status, answered) = attach(router, &request).await;
     assert_eq!(
         status, 200,
-        "case {case:?}: expected HTTP 200 attaching {permission_arn}, got {status} with \
-         {answered:?}"
+        "case {case:?}: expected HTTP 200 attaching {permission_arn} with replace {replace:?}, \
+         got {status} with {answered:?}"
     );
     assert_eq!(
         answered.get("returnValue").and_then(Value::as_bool),
@@ -203,7 +222,8 @@ async fn attach_ok(router: &MultiServiceRouter, case: &str, share_arn: &str, per
     );
 }
 
-/// One row of the attachment table.
+/// One row of an attachment table: a share, the permissions attached to it afterwards
+/// and the permission set it must then report.
 struct AttachRow {
     case: &'static str,
     /// The resources the share shares, so which defaults it derives varies.
@@ -212,8 +232,47 @@ struct AttachRow {
     created_with: Vec<String>,
     /// The permissions attached after creation, in order.
     attached: Vec<String>,
+    /// What every attach of this row says about `replace`: nothing at all, `false` or
+    /// `true`.
+    replace: Option<bool>,
     /// Every permission ARN the share must report afterwards.
     expected: Vec<String>,
+}
+
+impl AttachRow {
+    /// Create this row's share, make its attaches and assert the share then reports
+    /// exactly [`AttachRow::expected`], in the permission ARN order a read pages in.
+    async fn run(&self, router: &MultiServiceRouter, name: &str) {
+        let case = self.case;
+        let share_arn = share_with(
+            router,
+            case,
+            &json!({
+                "name": name,
+                "resourceArns": self.resource_arns,
+                "permissionArns": self.created_with,
+            }),
+        )
+        .await;
+        // Before the attach the share carries only what it was created with and what it
+        // derives, so the attach is what the row observes.
+        let before = listed_arns(router, case, &share_arn).await;
+        for permission_arn in &self.attached {
+            attach_served(router, case, &share_arn, permission_arn, self.replace).await;
+        }
+        // A read reports a share's permissions in permission ARN order, so the
+        // expectation is the row's set in that order.
+        let mut wanted = self.expected.clone();
+        wanted.sort();
+        assert_eq!(
+            listed_arns(router, case, &share_arn).await,
+            wanted,
+            "case {case:?}: attaching {:?} with replace {:?} to a share carrying {before:?} must \
+             leave exactly {wanted:?}",
+            self.attached,
+            self.replace
+        );
+    }
 }
 
 #[tokio::test]
@@ -234,6 +293,7 @@ async fn an_attached_managed_permission_joins_the_shares_permission_set() {
             resource_arns: vec![],
             created_with: vec![],
             attached: vec![component_reader.clone()],
+            replace: None,
             expected: vec![component_reader.clone()],
         },
         AttachRow {
@@ -241,6 +301,7 @@ async fn an_attached_managed_permission_joins_the_shares_permission_set() {
             resource_arns: vec![],
             created_with: vec![],
             attached: vec![managed("AWSRAMPermissionGlueDatabaseReadWrite")],
+            replace: None,
             expected: vec![managed("AWSRAMPermissionGlueDatabaseReadWrite")],
         },
         AttachRow {
@@ -248,6 +309,7 @@ async fn an_attached_managed_permission_joins_the_shares_permission_set() {
             resource_arns: vec![GLUE_DATABASE],
             created_with: vec![],
             attached: vec![managed("AWSRAMPermissionGlueDatabaseReadWrite")],
+            replace: None,
             expected: vec![managed("AWSRAMPermissionGlueDatabaseReadWrite")],
         },
         AttachRow {
@@ -255,6 +317,7 @@ async fn an_attached_managed_permission_joins_the_shares_permission_set() {
             resource_arns: vec![LOCAL_RESOURCE],
             created_with: vec![],
             attached: vec![component_reader.clone()],
+            replace: None,
             expected: vec![
                 managed("AWSRAMDefaultPermissionSubnet"),
                 component_reader.clone(),
@@ -265,6 +328,7 @@ async fn an_attached_managed_permission_joins_the_shares_permission_set() {
             resource_arns: vec![COMPONENT],
             created_with: vec![],
             attached: vec![component_reader.clone()],
+            replace: None,
             expected: vec![component_reader.clone()],
         },
         AttachRow {
@@ -275,6 +339,7 @@ async fn an_attached_managed_permission_joins_the_shares_permission_set() {
                 managed("AWSRAMPermissionGlueDatabaseReadWrite"),
                 managed("AWSRAMDefaultPermissionPrefixList"),
             ],
+            replace: None,
             expected: vec![
                 managed("AWSRAMDefaultPermissionPrefixList"),
                 managed("AWSRAMPermissionGlueDatabaseReadWrite"),
@@ -285,6 +350,7 @@ async fn an_attached_managed_permission_joins_the_shares_permission_set() {
             resource_arns: vec![],
             created_with: vec![],
             attached: vec![component_reader.clone(), component_reader.clone()],
+            replace: None,
             expected: vec![component_reader.clone()],
         },
         AttachRow {
@@ -292,6 +358,7 @@ async fn an_attached_managed_permission_joins_the_shares_permission_set() {
             resource_arns: vec![],
             created_with: vec![managed("AWSRAMDefaultPermissionSubnet")],
             attached: vec![component_reader.clone()],
+            replace: None,
             expected: vec![
                 managed("AWSRAMDefaultPermissionSubnet"),
                 component_reader.clone(),
@@ -300,39 +367,7 @@ async fn an_attached_managed_permission_joins_the_shares_permission_set() {
     ];
 
     for (index, row) in rows.iter().enumerate() {
-        let AttachRow {
-            case,
-            resource_arns,
-            created_with,
-            attached,
-            expected,
-        } = row;
-        let share_arn = share_with(
-            &router,
-            case,
-            &json!({
-                "name": format!("attach-row-{index}"),
-                "resourceArns": resource_arns,
-                "permissionArns": created_with,
-            }),
-        )
-        .await;
-        // Before the attach the share carries only what it was created with and what it
-        // derives, so the attach is what the row observes.
-        let before = listed_arns(&router, case, &share_arn).await;
-        for permission_arn in attached {
-            attach_ok(&router, case, &share_arn, permission_arn).await;
-        }
-        // The permissions are reported in ARN order, so the expectation is the row's
-        // set in that order.
-        let mut wanted = expected.clone();
-        wanted.sort();
-        assert_eq!(
-            listed_arns(&router, case, &share_arn).await,
-            wanted,
-            "case {case:?}: attaching {attached:?} to a share carrying {before:?} must leave \
-             exactly {wanted:?}"
-        );
+        row.run(&router, &format!("attach-row-{index}")).await;
     }
 }
 
@@ -1231,5 +1266,247 @@ async fn a_permission_version_that_cannot_be_written_is_refused() {
              versions. Delete one of the existing versions before creating a new one."
         ),
         "case {case:?}: the refusal names the permission and the cap, got {refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_attach_with_nothing_to_replace_is_served_whatever_replace_says() {
+    let router = emulator();
+    let component_reader = mint(
+        &router,
+        "mint a component permission",
+        "ComponentReader",
+        COMPONENT_TYPE,
+        "imagebuilder:GetComponent",
+    )
+    .await;
+    // The AWS managed permission the catalog publishes as `ec2:Subnet`'s default, which
+    // is the type of LOCAL_RESOURCE: a share of one derives this permission without
+    // attaching it by name.
+    let subnet_default = managed("AWSRAMDefaultPermissionSubnet");
+
+    // `replace` governs only the collision with ANOTHER permission of the same resource
+    // type: "Use true to replace the current permissions. Use false to add the permission
+    // to a resource share that currently doesn't have a permission"
+    // (AssociateResourceSharePermission$replace). So an attach that collides with nothing
+    // is served however the request sets it, and the share ends up carrying the attached
+    // permission exactly once.
+    let rows = [
+        AttachRow {
+            case: "replace true with no permission of that type attached",
+            resource_arns: vec![],
+            created_with: vec![],
+            attached: vec![component_reader.clone()],
+            replace: Some(true),
+            expected: vec![component_reader.clone()],
+        },
+        AttachRow {
+            case: "replace false with no permission of that type attached",
+            resource_arns: vec![],
+            created_with: vec![],
+            attached: vec![component_reader.clone()],
+            replace: Some(false),
+            expected: vec![component_reader.clone()],
+        },
+        AttachRow {
+            case: "the shared type's own default attached by name",
+            resource_arns: vec![LOCAL_RESOURCE],
+            created_with: vec![],
+            attached: vec![subnet_default.clone()],
+            replace: None,
+            expected: vec![subnet_default.clone()],
+        },
+        AttachRow {
+            case: "the shared type's own default attached by name with replace true",
+            resource_arns: vec![LOCAL_RESOURCE],
+            created_with: vec![],
+            attached: vec![subnet_default.clone()],
+            replace: Some(true),
+            expected: vec![subnet_default.clone()],
+        },
+        AttachRow {
+            case: "a replacing attach of the permission the create named",
+            resource_arns: vec![],
+            created_with: vec![subnet_default.clone()],
+            attached: vec![subnet_default.clone()],
+            replace: Some(true),
+            expected: vec![subnet_default.clone()],
+        },
+        AttachRow {
+            case: "a permission of each of two types, each attached with replace true",
+            resource_arns: vec![LOCAL_RESOURCE],
+            created_with: vec![],
+            attached: vec![
+                component_reader.clone(),
+                managed("AWSRAMPermissionGlueDatabaseReadWrite"),
+            ],
+            replace: Some(true),
+            expected: vec![
+                subnet_default.clone(),
+                component_reader.clone(),
+                managed("AWSRAMPermissionGlueDatabaseReadWrite"),
+            ],
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        row.run(&router, &format!("no-collision-row-{index}")).await;
+    }
+}
+
+#[tokio::test]
+async fn an_attachment_is_the_state_of_the_one_share_it_was_made_to() {
+    let router = emulator();
+    let case = "an attach reaches one share only";
+    let permission_arn = mint(
+        &router,
+        case,
+        "ComponentReaderOnlyOne",
+        COMPONENT_TYPE,
+        "imagebuilder:GetComponent",
+    )
+    .await;
+    // Two shares of the same resource, so the pair differs only in which one the attach
+    // names.
+    let attached_to = share_with(
+        &router,
+        case,
+        &json!({"name": "attached-share", "resourceArns": [COMPONENT]}),
+    )
+    .await;
+    let untouched = share_with(
+        &router,
+        case,
+        &json!({"name": "untouched-share", "resourceArns": [COMPONENT]}),
+    )
+    .await;
+
+    attach_ok(&router, case, &attached_to, &permission_arn).await;
+
+    assert_eq!(
+        listed_arns(&router, case, &attached_to).await,
+        vec![permission_arn.clone()],
+        "case {case:?}: the share named by the attach carries the permission"
+    );
+    assert_eq!(
+        listed_arns(&router, case, &untouched).await,
+        Vec::<String>::new(),
+        "case {case:?}: the share the attach did not name carries nothing"
+    );
+
+    // The same permission attached to the second share too: each share's permission set
+    // is its own, so both now carry it.
+    attach_ok(&router, case, &untouched, &permission_arn).await;
+    assert_eq!(
+        (
+            listed_arns(&router, case, &attached_to).await,
+            listed_arns(&router, case, &untouched).await,
+        ),
+        (
+            vec![permission_arn.clone()],
+            vec![permission_arn.clone()]
+        ),
+        "case {case:?}: both shares carry the permission each attached"
+    );
+}
+
+#[tokio::test]
+async fn an_idempotency_token_is_spent_only_by_the_call_it_served() {
+    let router = emulator();
+    let case = "a token another operation already used";
+    let permission_arn = mint(
+        &router,
+        case,
+        "ComponentReaderToken",
+        COMPONENT_TYPE,
+        "imagebuilder:GetComponent",
+    )
+    .await;
+    // "Passing the same value to a later call to an operation requires that you also
+    // pass the same value for all other parameters" (clientToken's own documentation):
+    // the token answers for a repeat of THAT operation, so one spent on a create is not
+    // a repeat of an attach.
+    let token = "ram-shared-token";
+    let created = create_ok(
+        &router,
+        case,
+        &json!({
+            "name": "token-share",
+            "resourceArns": [COMPONENT],
+            "clientToken": token,
+        }),
+    )
+    .await;
+    let share_arn = arn_of(case, &created);
+
+    let request = json!({
+        "resourceShareArn": share_arn,
+        "permissionArn": permission_arn,
+        "clientToken": token,
+    });
+    let (status, answered) = attach(&router, &request).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 for the first attach under this token, got {status} \
+         with {answered:?}"
+    );
+    assert_eq!(
+        answered.get("clientToken").and_then(Value::as_str),
+        Some(token),
+        "case {case:?}: the attach reports the token it was given, got {answered:?}"
+    );
+    assert_eq!(
+        listed_arns(&router, case, &share_arn).await,
+        vec![permission_arn.clone()],
+        "case {case:?}: the attach was made"
+    );
+
+    // A refusal spends nothing: a token a refused attach carried still serves a later
+    // attach that can be made.
+    let case = "a token a refused attach carried";
+    let other_share = share_with(
+        &router,
+        case,
+        &json!({"name": "second-token-share", "resourceArns": [COMPONENT]}),
+    )
+    .await;
+    let spent_on_a_refusal = "ram-refused-token";
+    let (status, refused) = attach(
+        &router,
+        &json!({
+            "resourceShareArn": other_share,
+            "permissionArn": customer("NeverCreatedAtAll"),
+            "clientToken": spent_on_a_refusal,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400 for a permission nothing answers to, got {status} \
+         with {refused:?}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "UnknownResourceException",
+        "case {case:?}: expected UnknownResourceException, got {refused:?}"
+    );
+    let (status, answered) = attach(
+        &router,
+        &json!({
+            "resourceShareArn": other_share,
+            "permissionArn": permission_arn,
+            "clientToken": spent_on_a_refusal,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 reusing the token of a refused attach, got {status} \
+         with {answered:?}"
+    );
+    assert_eq!(
+        listed_arns(&router, case, &other_share).await,
+        vec![permission_arn],
+        "case {case:?}: the served attach was made"
     );
 }
