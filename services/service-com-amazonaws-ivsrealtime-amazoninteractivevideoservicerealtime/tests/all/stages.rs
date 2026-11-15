@@ -302,8 +302,10 @@ async fn create_stage_mints_an_arn_and_one_token_per_configuration() {
 }
 
 /// One row of a reported-token table: the case, the row's own `Value` (the request it
-/// sends, or the `userId` its token must report), and the `duration` and `capabilities`
-/// the token must report — `None` where the request carried the member not at all.
+/// sends, or the `userId` its token must report), the `duration` the token must report
+/// (the EFFECTIVE one, so the documented default where the request sized nothing) and the
+/// `capabilities` it must report — `None` where the request carried that member not at
+/// all.
 type ReportedTokenRow = (
     &'static str,
     Value,
@@ -312,8 +314,9 @@ type ReportedTokenRow = (
 );
 
 /// Each configuration's own values reach its token, the model's documented
-/// defaults fill in what the configuration leaves out, and a default the service applied
-/// is not echoed back as the member the configuration left out.
+/// defaults fill in what the configuration leaves out, every token states the effective
+/// lifetime it was issued for, and a capability set the service defaulted is not echoed
+/// back as the member the configuration left out.
 #[tokio::test]
 async fn create_stage_applies_each_configuration_to_its_own_token() {
     let emulator = Emulator::new();
@@ -335,8 +338,10 @@ async fn create_stage_applies_each_configuration_to_its_own_token() {
         .unwrap_or_default();
     assert_eq!(tokens.len(), 3, "expected three tokens, got {response}");
 
-    // The third and fourth columns are what the token must REPORT for `duration` and
-    // `capabilities`: `None` where the configuration carried the member not at all.
+    // The third and fourth columns are what the token must REPORT: `duration` is always
+    // the effective lifetime (the documented default where the configuration sized
+    // nothing), while `capabilities` is `None` where the configuration carried it not at
+    // all.
     let expected: Vec<ReportedTokenRow> = vec![
         (
             "explicit duration and one capability",
@@ -347,7 +352,7 @@ async fn create_stage_applies_each_configuration_to_its_own_token() {
         (
             "defaults for duration and capabilities",
             json!("bob"),
-            None,
+            Some(DEFAULT_DURATION),
             None,
         ),
         (
@@ -378,8 +383,7 @@ async fn create_stage_applies_each_configuration_to_its_own_token() {
             reported, capabilities,
             "case {case:?}: expected capabilities {capabilities:?}, got {reported:?}"
         );
-        // Whatever the token reports, its expiry is computed from the EFFECTIVE duration:
-        // the documented default where the configuration sized nothing.
+        // The reported lifetime is the one the expiry was computed from.
         let expiry = timestamp_secs(&token["expirationTime"]);
         let minutes = duration.unwrap_or(DEFAULT_DURATION);
         assert!(
@@ -761,11 +765,11 @@ async fn list_stages_refuses_a_pagination_token_it_did_not_issue() {
 /// The token reflects the request, the model's documented defaults fill in what the
 /// request omits, and `expirationTime` is the issue instant plus the effective duration.
 ///
-/// A default the SERVICE applied is not echoed back as the member the caller left out:
-/// `duration` and `capabilities` are reported exactly when the request carried them, so a
-/// client can tell "the caller sized this token" from "the service defaulted it". What
-/// the default did is visible in `expirationTime`, which lands the documented 720 minutes
-/// out for a request that sized nothing.
+/// `duration` is reported on every token, whether the caller sized it or the service
+/// defaulted it, because the reported member documents the default itself: it is the
+/// lifetime the token was issued for, the one `expirationTime` is computed from. A
+/// `capabilities` set the SERVICE defaulted is not echoed back as the member the caller
+/// left out.
 #[tokio::test]
 async fn create_participant_token_reflects_the_request_and_its_defaults() {
     let emulator = Emulator::new();
@@ -774,19 +778,19 @@ async fn create_participant_token_reflects_the_request_and_its_defaults() {
     // Rows differ along every member the rule covers: duration (absent, both
     // modelled bounds, a middle value), capabilities (absent, one, both), userId
     // and attributes (absent, present). The third and fourth columns are what the
-    // RESPONSE must carry for `duration` and `capabilities` — `None` where the request
-    // carried the member not at all.
+    // RESPONSE must carry for `duration` and `capabilities` — the effective duration in
+    // every row, and `None` for a `capabilities` the request carried not at all.
     let cases: Vec<ReportedTokenRow> = vec![
         (
             "every member omitted",
             json!({ "stageArn": stage_arn }),
-            None,
+            Some(DEFAULT_DURATION),
             None,
         ),
         (
             "userId only, so both defaults apply",
             json!({ "stageArn": stage_arn, "userId": "bob" }),
-            None,
+            Some(DEFAULT_DURATION),
             None,
         ),
         (
@@ -877,9 +881,10 @@ async fn create_participant_token_reflects_the_request_and_its_defaults() {
              got the already-issued {issued:?}"
         );
 
-        // `expirationTime` is the issue instant plus the EFFECTIVE duration — the one the
-        // request asked for, or the documented default where it asked for none — rendered
-        // as the ISO-8601 date-time string the model's `@timestampFormat` requires.
+        // `expirationTime` is the issue instant plus the duration the token reports — the
+        // one the request asked for, or the documented default where it asked for none —
+        // rendered as the ISO-8601 date-time string the model's `@timestampFormat`
+        // requires.
         let rendered = &token["expirationTime"];
         assert!(
             rendered.is_string(),
@@ -1309,8 +1314,9 @@ fn default_recording_configuration() -> Value {
 }
 
 /// All four `StageEndpoints` members are present on `stage`, and each is well-formed for
-/// its protocol: the scheme, the per-stage host and the path are what a client parses out
-/// of an endpoint. The HOSTS themselves are environment-specific and are not asserted.
+/// its protocol: the scheme and the path are what a client parses out of an endpoint, and
+/// the host is this emulator's own address (asserted against the caller's address in
+/// `announced_stage_endpoints.rs`; here only that it is on no upstream Amazon host).
 fn assert_stage_endpoints(case: &str, stage: &Value) {
     let arn = stage["arn"].as_str().unwrap_or_default();
     let stage_id = arn.rsplit('/').next().unwrap_or_default();
@@ -1320,27 +1326,26 @@ fn assert_stage_endpoints(case: &str, stage: &Value) {
     );
     let endpoints = &stage["endpoints"];
 
-    // The events endpoint is one global host carrying no per-stage part.
-    let events = endpoints["events"].as_str();
-    assert!(
-        events.is_some_and(|value| value.starts_with("wss://")),
-        "case {case:?}: expected a wss:// events endpoint, got {events:?}"
-    );
-
-    // Rows: the member, its scheme, and the path a client publishes to.
+    // Rows: the member, its scheme, and the path a client dials under the host.
     for (member, scheme, path) in [
+        ("events", "wss://", ""),
         ("whip", "https://", ""),
         ("rtmp", "rtmp://", "/app/"),
         ("rtmps", "rtmps://", "/app/"),
     ] {
         let actual = endpoints[member].as_str();
         assert!(
-            actual.is_some_and(|value| value.starts_with(scheme)
-                && value.ends_with(path)
-                && value.contains(stage_id)),
-            "case {case:?}: expected {member} to start with {scheme:?}, end with {path:?} \
-             and name the stage id {stage_id:?}, got {actual:?}"
+            actual.is_some_and(|value| value.starts_with(scheme) && value.ends_with(path)),
+            "case {case:?}: expected {member} to start with {scheme:?} and end with \
+             {path:?}, got {actual:?}"
         );
+        for domain in ["live-video.net", "amazonaws.com"] {
+            assert!(
+                actual.is_some_and(|value| !value.contains(domain)),
+                "case {case:?}: expected {member} to name this emulator rather than a \
+                 {domain} host, got {actual:?}"
+            );
+        }
     }
 }
 
@@ -1461,10 +1466,12 @@ async fn every_stage_projection_carries_endpoints_a_recording_configuration_and_
     }
 }
 
-/// A stage's endpoints are assigned to that stage: identical on every read of it, and
-/// distinct between stages.
+/// A stage's endpoints do not change: identical on every read of it — and they are the
+/// DEPLOYMENT's rather than a stage's, so every stage this emulator serves reports the
+/// same set (which stage a connection joins is carried by the participant token the client
+/// presents, not by the address).
 #[tokio::test]
-async fn stage_endpoints_are_assigned_per_stage_and_do_not_change() {
+async fn stage_endpoints_are_the_deployments_and_do_not_change() {
     let emulator = Emulator::new();
     let mut whip_endpoints: BTreeSet<String> = BTreeSet::new();
     let stages = 4;
@@ -1486,18 +1493,24 @@ async fn stage_endpoints_are_assigned_per_stage_and_do_not_change() {
              {first} then {second}"
         );
         assert_stage_endpoints(&name, &first["stage"]);
-        whip_endpoints.insert(
-            first["stage"]["endpoints"]["whip"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
+        let stage_id = arn.rsplit('/').next().unwrap_or_default();
+        let whip = first["stage"]["endpoints"]["whip"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !whip.contains(stage_id),
+            "stage {name}: the endpoint a client dials is the deployment's, so it carries \
+             no part of the stage's own identity, got {whip:?} for stage {stage_id:?}"
         );
+        whip_endpoints.insert(whip);
     }
 
     assert_eq!(
         whip_endpoints.len(),
-        stages,
-        "expected one distinct WHIP endpoint per stage, got {whip_endpoints:?}"
+        1,
+        "expected every stage of this deployment to report one WHIP endpoint, got \
+         {whip_endpoints:?}"
     );
 }
 

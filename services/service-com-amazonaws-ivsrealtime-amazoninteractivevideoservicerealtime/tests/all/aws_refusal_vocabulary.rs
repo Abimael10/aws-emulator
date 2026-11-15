@@ -16,11 +16,13 @@
 //!    resource came to be missing. Every resource-specific read of the very same ARN keeps
 //!    the modelled `ResourceNotFoundException` and names the ARN, so a client can tell a
 //!    tagging target from a resource.
-//! 2. A DEFAULT THE SERVICE APPLIED IS NOT ECHOED. `CreateParticipantTokenRequest`'s
-//!    `duration` and `capabilities` are optional members carrying a documented default, so
-//!    the reported token carries each one exactly when the request did; what the default
-//!    DID is visible in the token's `expirationTime` and in the capabilities the
-//!    participant really holds.
+//! 2. A TOKEN STATES THE LIFETIME IT WAS ISSUED FOR, AND ECHOES NO OTHER DEFAULT.
+//!    `ParticipantToken$duration` documents the default on the REPORTED member ("Default:
+//!    720 (12 hours)"), so every reported token carries the effective duration — the one
+//!    the request sized, or the documented default — which is the lifetime its
+//!    `expirationTime` is computed from. `capabilities` documents no default on the
+//!    reported member, so it is reported exactly when the request carried it and what the
+//!    default DID is visible in the capabilities the participant really holds.
 //! 3. A DOCUMENTED-BUT-UNMODELLED RULE ABOUT ONE MEMBER IS REFUSED IN THE MEMBER
 //!    -CONSTRAINT ENVELOPE: `Request member: <member> failed to satisfy the constraints:
 //!    <requirement>`, naming the member whose own documentation carries the rule. The
@@ -492,15 +494,16 @@ async fn a_resultant_tag_set_past_the_modelled_maximum_is_a_bad_request() {
     }
 }
 
-/// RULE 2: the reported token carries `duration` and `capabilities` exactly when the
-/// request carried them, on BOTH operations that issue a token — and the documented
-/// default is still what an omitted member is applied as, which `expirationTime` shows.
+/// RULE 2: the reported token carries the EFFECTIVE `duration` always and `capabilities`
+/// exactly when the request carried it, on BOTH operations that issue a token — and the
+/// documented default is what an omitted member is applied as, which `expirationTime`
+/// shows.
 ///
 /// The rows differ along what the rule generalises over: each member present or absent
 /// independently, both published bounds of `duration`, an explicitly empty capability list
 /// and each non-empty subset.
 #[tokio::test]
-async fn a_token_reports_only_the_members_the_request_carried() {
+async fn a_token_states_its_effective_duration_and_reports_no_other_default() {
     let realtime = RealTime::new();
     let stage_arn = realtime.stage("the token's stage", &json!({})).await;
 
@@ -580,9 +583,9 @@ async fn a_token_reports_only_the_members_the_request_carried() {
     }
 }
 
-/// One reported token against rule 2: each member is there exactly when the request
-/// carried it, and the token expires the EFFECTIVE duration out — the documented default
-/// where the request named none.
+/// One reported token against rule 2: `duration` is the EFFECTIVE lifetime — the
+/// documented default where the request named none — the token expires that far out, and
+/// `capabilities` is there exactly when the request carried it.
 fn assert_reported_presence(
     case: &str,
     operation: &str,
@@ -590,10 +593,11 @@ fn assert_reported_presence(
     duration: Option<i64>,
     capabilities: Option<&Vec<&str>>,
 ) {
+    let effective = duration.unwrap_or(DEFAULT_DURATION_MINUTES);
     assert_eq!(
         token.get("duration").and_then(Value::as_i64),
-        duration,
-        "case {case:?} ({operation}): expected duration {duration:?}, got {token}"
+        Some(effective),
+        "case {case:?} ({operation}): expected duration {effective:?}, got {token}"
     );
     // A capability list the caller asked for is reported as asked; an empty one holds no
     // entry, so the member is omitted the way an empty `attributes` map is.
@@ -612,7 +616,6 @@ fn assert_reported_presence(
     );
 
     let expiry = string_member(token, "expirationTime");
-    let effective = duration.unwrap_or(DEFAULT_DURATION_MINUTES);
     let seconds = seconds_until(&expiry);
     let expected_seconds = effective * 60;
     assert!(

@@ -280,14 +280,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags,
             // Resolved and defaulted above, through the seam `UpdateStage` uses too.
             auto_participant_recording_configuration: recording_configuration,
-            // Assigned at creation, which is where the model's `StageEndpoints` doc
-            // tells a caller to cache them.
-            endpoints: crate::state::stage_endpoints(&arn),
             created_at: ::std::time::SystemTime::now(),
             sequence,
         };
 
-        let stage = record.to_stage();
+        let stage = record.to_stage(ctx);
         // Reported only when the request asked for tokens: the model's doc for
         // `participantTokens` is "Participant tokens attached to the stage. These
         // correspond to the participants in the request", so a request that named no

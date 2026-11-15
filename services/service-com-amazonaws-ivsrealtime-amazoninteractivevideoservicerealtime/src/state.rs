@@ -14,7 +14,8 @@
 //! modelled defaults they apply live here rather than in any one operation's file.
 //!
 //! The module is split by concern: the stage sessions and the participants, events and
-//! replications inside them in [`sessions`], the pagination tokens every listing pages
+//! replications inside them in [`sessions`], the addresses every stage this service
+//! reports announces in [`stage_endpoints`], the pagination tokens every listing pages
 //! with in [`page_tokens`], and how this service words and classifies the failures it
 //! answers in [`refusals`]. Each part is re-exported here, so a handler reaches all of
 //! it as `crate::state::…`.
@@ -39,7 +40,7 @@ use crate::ops::types::{
     PublicKeySummary, RecordingConfiguration, RedundantIngestCredential,
     ResourceNotFoundException,
     S3DestinationConfiguration, S3StorageConfiguration,
-    ServiceQuotaExceededException, Stage, StageEndpoints, StageSession, StageSessionSummary,
+    ServiceQuotaExceededException, Stage, StageSession, StageSessionSummary,
     StageSummary,
     StartParticipantReplicationOutput, StopParticipantReplicationOutput, StorageConfiguration,
     StorageConfigurationSummary, UpdateIngestConfigurationOutput, ValidationException, Video,
@@ -459,40 +460,12 @@ pub fn resolved_stage_association(
 // A stage's data-plane endpoints
 //
 // The model's `StageEndpoints` doc tells a caller to cache these values "at stage
-// creation", so every stage carries all four from the moment it exists. The HOSTS are
-// this emulator's, built from the stage's own id the way the sibling `ivs` emulator
-// builds a channel's ingest endpoint and playback URL: derived from persisted state,
-// identical on every read of one stage and distinct between stages. The scheme, port and
-// path of each are the forms AWS was recorded reporting, which is what a client parsing
-// an endpoint depends on.
+// creation", so every stage carries all four from the moment it exists — and each names
+// THIS emulator, because this emulator is the thing serving the stage. They are composed
+// per request from the address that request reached this process at rather than stored,
+// which is why they live in [`stage_endpoints`] beside the rest of the addressing rather
+// than on the record: see that module.
 // ---------------------------------------------------------------------------
-
-/// The `events` endpoint of every stage: one global host, carrying no per-stage part,
-/// as AWS was recorded reporting it.
-pub const STAGE_EVENTS_ENDPOINT: &str = "wss://global.events.live-video.net";
-
-/// Host suffix of a stage's WHIP endpoint.
-const WHIP_HOST_SUFFIX: &str = "global-bm.whip.live-video.net";
-
-/// Host suffix of a stage's RTMP and RTMPS endpoints — the same contribution host the
-/// sibling `ivs` emulator names in a channel's ingest endpoint.
-const CONTRIBUTE_HOST_SUFFIX: &str = "global-contribute.live-video.net";
-
-/// The four endpoints of the stage `stage_arn` names.
-///
-/// Keyed off the ARN's own resource id, so the endpoints of a stage are a function of
-/// the stage and nothing else.
-pub fn stage_endpoints(stage_arn: &str) -> StageEndpoints {
-    let stage_id = stage_arn.rsplit('/').next().unwrap_or(stage_arn);
-    StageEndpoints {
-        events: Some(STAGE_EVENTS_ENDPOINT.to_string()),
-        whip: Some(format!("https://{stage_id}.{WHIP_HOST_SUFFIX}")),
-        rtmp: Some(format!("rtmp://{stage_id}.{CONTRIBUTE_HOST_SUFFIX}/app/")),
-        rtmps: Some(format!(
-            "rtmps://{stage_id}.{CONTRIBUTE_HOST_SUFFIX}:443/app/"
-        )),
-    }
-}
 
 /// What `activeSessionId` reports for a stage no session is active in.
 ///
@@ -1237,10 +1210,6 @@ pub struct StageRecord {
     /// stage has one, with the modelled defaults where the creating request supplied
     /// none ([`effective_recording_configuration`]).
     pub auto_participant_recording_configuration: AutoParticipantRecordingConfiguration,
-    /// The stage's data-plane endpoints, assigned at creation ([`stage_endpoints`]).
-    /// Not optional: the model's `StageEndpoints` doc tells a caller to cache them "at
-    /// stage creation", so a stage without them is not a stage a client can use.
-    pub endpoints: StageEndpoints,
     /// When the stage was created. No member of the modelled `Stage` /
     /// `StageSummary` reports it and pagination orders by [`Self::sequence`], so
     /// nothing reads it yet; it is recorded because the stage-session and
@@ -1253,8 +1222,13 @@ pub struct StageRecord {
 }
 
 impl StageRecord {
-    /// The modelled `Stage` this record reports.
-    pub fn to_stage(&self) -> Stage {
+    /// The modelled `Stage` this record reports to the request in `ctx`.
+    ///
+    /// Everything but the endpoints is the record as it is stored; the endpoints are
+    /// composed for the address this request reached the emulator at
+    /// ([`announced_stage_endpoints`]), because they are addresses a client then dials and
+    /// this emulator is the thing serving the stage.
+    pub fn to_stage(&self, ctx: &::smithy_server_runtime::OperationContext<'_>) -> Stage {
         Stage {
             arn: self.arn.clone(),
             name: self.name.clone(),
@@ -1266,7 +1240,7 @@ impl StageRecord {
             auto_participant_recording_configuration: Some(
                 self.auto_participant_recording_configuration.clone(),
             ),
-            endpoints: Some(self.endpoints.clone()),
+            endpoints: Some(announced_stage_endpoints(ctx)),
         }
     }
 
@@ -1293,11 +1267,8 @@ pub struct ParticipantTokenRecord {
     pub attributes: HashMap<String, String>,
     /// The lifetime the token was issued for: what the request asked for, or
     /// [`DEFAULT_TOKEN_DURATION_MINUTES`] when it asked for none. What
-    /// [`expiration_time`] was computed from, and not what the token REPORTS.
+    /// [`expiration_time`] was computed from, and what the token REPORTS.
     pub duration_minutes: i32,
-    /// The `duration` the REQUEST carried, `None` when it carried none — the presence
-    /// the reported token keeps (see [`Self::to_participant_token`]).
-    pub requested_duration: Option<i32>,
     /// The capabilities the token really grants: what the request asked for, or
     /// [`default_token_capabilities`] when it asked for none. What every reader of this
     /// participant decides from, and not what the token REPORTS.
@@ -1311,24 +1282,25 @@ pub struct ParticipantTokenRecord {
 impl ParticipantTokenRecord {
     /// The modelled `ParticipantToken` this record reports.
     ///
-    /// `duration` and `capabilities` keep the REQUEST's presence: both are optional
-    /// members carrying a documented default ("Default: 720 (12 hours)", "Default:
-    /// `PUBLISH, SUBSCRIBE`"), and a default this service applied is what the token was
-    /// issued and computed with — `expirationTime` lands 720 minutes out, and the
-    /// capability set a reader decides from is the full one — not a value the caller
-    /// asked for, so it is not echoed back as the member. That is what lets a client
-    /// tell "the caller sized this token" from "the service defaulted it".
+    /// `duration` reports the EFFECTIVE lifetime, always: the model documents the default
+    /// on the reported member itself — `ParticipantToken$duration` "Duration (in minutes),
+    /// after which the participant token expires. Default: 720 (12 hours)." — so the
+    /// member states how long the token this service just issued is valid for, which is
+    /// the value its `expirationTime` was computed from, whether the caller sized it or
+    /// the service defaulted it. `capabilities` keeps the REQUEST's presence instead,
+    /// because the reported member ("Set of capabilities that the user is allowed to
+    /// perform in the stage.") documents no default and is `@length 0..2`, so a caller may
+    /// legally ask for an empty set and a token that grants no capability carries no
+    /// `capabilities` member rather than an empty list.
     pub fn to_participant_token(&self) -> ParticipantToken {
         ParticipantToken {
             participant_id: Some(self.participant_id.clone()),
             token: Some(self.token.clone()),
             user_id: self.user_id.clone(),
             attributes: (!self.attributes.is_empty()).then(|| self.attributes.clone()),
-            duration: self.requested_duration,
+            duration: Some(self.duration_minutes),
             // Reported only when the request named something, the same way `attributes`
-            // is: `capabilities` is `@length 0..2`, so a caller may legally ask for an
-            // empty set, and a token that grants no capability carries no capabilities
-            // member rather than an empty list.
+            // is (see the rule above).
             capabilities: self
                 .requested_capabilities
                 .clone()
@@ -3986,10 +3958,10 @@ pub fn issue_token_record(
     });
 
     // The documented defaults are applied to what the token IS — the lifetime its
-    // expiry is computed from, and the capability set every reader of this participant
-    // decides from — while the members the request carried are kept as it carried them,
-    // because a default this service chose is not something the caller asked for and is
-    // not reported back as one (see `ParticipantTokenRecord::to_participant_token`).
+    // expiry is computed from and which it reports, and the capability set every reader of
+    // this participant decides from (see
+    // `ParticipantTokenRecord::to_participant_token` for which of the two the reported
+    // token restates).
     let duration_minutes = requested
         .duration
         .unwrap_or(DEFAULT_TOKEN_DURATION_MINUTES);
@@ -4004,7 +3976,6 @@ pub fn issue_token_record(
         user_id: requested.user_id,
         attributes: requested.attributes.unwrap_or_default(),
         duration_minutes,
-        requested_duration: requested.duration,
         capabilities: requested
             .capabilities
             .clone()
@@ -4341,7 +4312,9 @@ mod page_tokens;
 mod recording_bucket;
 mod refusals;
 mod sessions;
+mod stage_endpoints;
 pub use page_tokens::*;
 pub use recording_bucket::*;
 pub use refusals::*;
 pub use sessions::*;
+pub use stage_endpoints::*;

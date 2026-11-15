@@ -1570,3 +1570,26 @@ mod lambda_delivery_grant_is_each_sources_own;
 // into `tests/all/`. The `all/all_rs_*.rs`, `all/declaration_roots_*.rs` and
 // `all/every_suite_file_is_declared.rs` suites pin all of that, for this file and for every
 // service crate's own `tests/all.rs`, so check there rather than leaving a note here.
+// `mod <name>;` pair into the sorted list below, in the one place its name sorts to. The
+// list holds those pairs and no other line — no prose between them, and NOTHING after the
+// last one — so two branches landing at once insert two lines in two places and have
+// nothing to duplicate, re-word or mistype.
+// EVERY comment in this file is an ORDINARY `//` one, this header included: a doc comment
+// of the enclosing module is legal only ahead of the first item, so one left below the list
+// compiles no suite of this target at all, and with none anywhere in the file there is no
+// such line to copy. A suite file no `mod` names is compiled nowhere and its tests never
+// run; a suite left at the top level of `tests/` fails the build; and a name declared twice
+// is `E0428`, which compiles neither copy. This file is a test-target CRATE ROOT, so a bare
+// `mod` would resolve to a SIBLING of it under `tests/`, which the layout check refuses:
+// the `#[path]` above each `mod` is what points it into `tests/all/`. Some of the files
+// below are shared harnesses or probes rather than suites; every one of them is declared,
+// because a file no declaration names is compiled nowhere.
+// What a suite covers, and why it drives the assembled router rather than one service
+// explains; a note about THIS file belongs in `all/appended_notes.rs`, declared below like
+// any other file. The suites `all/all_rs_carries_no_inner_doc_comment.rs`,
+// above, for this file and for every service crate's own `tests/all.rs`, so check there
+// rather than leaving a note here.
+// The paragraphs above wrap without the indentation `clippy::doc_lazy_continuation` asks of
+// a doc list item; the lint is allowed here so a header line is a header line rather than a
+// build failure. An inner attribute, like an inner doc comment, is legal only before the
+// first item, so it stands here rather than in the list.

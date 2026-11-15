@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         Ok(GetStageOutput {
-            stage: Some(record.to_stage()),
+            stage: Some(record.to_stage(ctx)),
         })
     }
 }
