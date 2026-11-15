@@ -41,7 +41,9 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=0000000000000000000000000000000000000000000000000000000000000000";
 
 /// A well-formed ARN in this service's namespace, percent-encoded so it occupies the
-/// single `{arn}` path label the tagging routes bind.
+/// single `{arn}` path label the tagging routes bind. The campaign id it names is one
+/// neither version's store holds, so the answer is whichever version claimed the route
+/// reporting, over its OWN store, that the resource is not there.
 macro_rules! encoded_arn {
     () => {
         "arn%3Aaws%3Aconnect-campaigns%3Aus-east-1%3A000000000000%3Acampaign%2F000000000000"
@@ -329,12 +331,18 @@ async fn each_connect_campaigns_api_version_serves_its_own_route_space() {
             Expect::Error("ResourceNotFoundException"),
         ),
         (
-            "v1 ListTagsForResource (still a stub)",
+            // v1 implements its tag plane now, so this answers from ITS store: the ARN
+            // names a campaign id v1 holds nothing under (the v1 create row above mints
+            // its own), and v1's tag plane reports that miss with the wire code the
+            // recorded tag refusals of this service carry — neither a router refusal nor
+            // the V2 version, whose every route is `/v2/`-prefixed, can produce it for
+            // this path.
+            "v1 ListTagsForResource for a campaign no store holds",
             "GET",
             concat!("/tags/", encoded_arn!()),
             "",
-            501,
-            Expect::Error("NotImplemented"),
+            404,
+            Expect::Error("NotFoundException"),
         ),
     ];
 

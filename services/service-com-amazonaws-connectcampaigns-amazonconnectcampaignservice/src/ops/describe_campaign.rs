@@ -166,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 connect_instance_id: stored.connect_instance_id.clone(),
                 dialer_config: stored.dialer_config.clone(),
                 outbound_call_config: stored.outbound_call_config.clone(),
-                tags: (!stored.tags.is_empty()).then(|| stored.tags.clone()),
+                tags: stored.tags_for_response(),
             }),
         })
     }

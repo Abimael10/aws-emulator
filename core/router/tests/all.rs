@@ -1814,3 +1814,16 @@ mod zz_probe_whole_emulator;
 // `all/appended_notes.rs` and `all/appended_notes_tail.rs`. The `all_rs_*` suites,
 // `all/declaration_roots_are_canonical_and_complete.rs` pin every rule above, for this file
 // and for every service crate's `tests/all.rs`, so check there rather than leaving a note
+// file under `tests/all/`, sorted by name, and no other line — so two branches landing at
+// once insert two lines in two places and have no prose to duplicate, re-word or mistype.
+// Put a new suite at `tests/all/<name>.rs` and insert its pair where its name sorts to; what
+// that suite covers, and why it drives the assembled router rather than one service crate,
+// belongs in that suite's OWN module header, where it is read beside the test it explains,
+// and a note about THIS file belongs in `all/appended_notes.rs`.
+// EVERY comment in this file is an ORDINARY `//` one, this header included, and no inner
+// attribute (`#![..]`) stands anywhere in it: both are legal only before the first item, so
+// one a landing leaves past the declarations compiles no suite of this target at all. With
+// none in the file, no merge of two landings can produce one.
+// `mod` is what points it into `tests/all/`. A suite no `mod` here names compiles nowhere and
+// its tests never run, and a suite declared twice is `E0428` — each fails EVERY suite of this
+// target. `all/all_rs_carries_no_inner_doc_comment.rs`,

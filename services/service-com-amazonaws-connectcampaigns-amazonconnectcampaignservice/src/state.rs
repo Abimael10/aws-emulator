@@ -136,6 +136,98 @@ impl StoredCampaign {
             .retain(|_, request| !deadline_passed(request.expires_at, now));
         before - self.dial_requests.len()
     }
+
+    /// The stored tags as a response `TagMap`, absent when the campaign carries none —
+    /// the member is optional and an empty map is not reported.
+    ///
+    /// The one place a stored tag map becomes an OPTIONAL response member, so every
+    /// operation that reports a `Campaign` (the create, the describe) reports the same
+    /// map the same way. The tag LISTING is the other form: it always carries the member
+    /// ([`Self::tags_listing`]).
+    pub fn tags_for_response(&self) -> Option<HashMap<String, String>> {
+        (!self.tags.is_empty()).then(|| self.tags.clone())
+    }
+
+    /// The stored tags as the tag listing reports them: the map itself, EMPTY for a
+    /// resource holding no tag rather than absent.
+    ///
+    /// Kept apart from [`Self::tags_for_response`] because the two differ exactly there:
+    /// the recorded `ListTagsForResource` response always carries its `tags` member, so a
+    /// client reads it unconditionally, while the `Campaign` shape's own optional member
+    /// is omitted for a campaign carrying no tag.
+    pub fn tags_listing(&self) -> HashMap<String, String> {
+        self.tags.clone()
+    }
+
+    /// Merge `pairs` into this campaign's tags, or report why nothing was written.
+    ///
+    /// Tagging is a MERGE: a key the resource already carries takes the new value, and a
+    /// key the request does not name is left alone. The merged map is weighed against
+    /// [`MAX_TAGS_PER_RESOURCE`] BEFORE anything is written, so a refused call leaves the
+    /// resource's tags exactly as they were; the refusal carries the count the resource
+    /// would have been left holding, which is what the caller's sentence states.
+    pub fn merge_tags(&mut self, pairs: &HashMap<String, String>) -> Result<(), TagsRejected> {
+        let mut merged = self.tags.clone();
+        for (key, value) in pairs {
+            merged.insert(key.clone(), value.clone());
+        }
+        if merged.len() > MAX_TAGS_PER_RESOURCE {
+            return Err(TagsRejected::TooManyTags(merged.len()));
+        }
+        self.tags = merged;
+        Ok(())
+    }
+
+    /// Remove the tags `keys` names from this campaign, and report how many were there
+    /// to remove.
+    ///
+    /// A key the resource does not carry is NOT an error: untagging is stated as the set
+    /// of keys the resource is left WITHOUT, so asking for one that is already absent has
+    /// nothing left to do — which is what makes a retry after a timeout succeed.
+    pub fn remove_tags(&mut self, keys: &[String]) -> usize {
+        let before = self.tags.len();
+        self.tags.retain(|key, _| !keys.iter().any(|named| named == key));
+        before - self.tags.len()
+    }
+}
+
+/// Why a tag merge wrote nothing, as [`StoredCampaign::merge_tags`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagsRejected {
+    /// The merged map would have taken the resource past [`MAX_TAGS_PER_RESOURCE`],
+    /// carrying how many tags it would then have held.
+    TooManyTags(usize),
+}
+
+/// How many tags one resource of this service holds at once.
+///
+/// Source: `TagKeyList`, the shape `UntagResource$tagKeys` takes, whose `@length` is
+/// 0..50 (`smithy_query(query="operation", operation="UntagResource")`) — a resource
+/// whose every tag can be named in one untag call holds at most that many.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The member a tag map arrives under, as a refusal clause spells it: the Smithy member
+/// name of `TagResource$tags`.
+const TAGS_MEMBER: &str = "tags";
+
+/// What this service answers when a tag call would leave one resource holding more than
+/// [`MAX_TAGS_PER_RESOURCE`] tags, stating how many that would be.
+///
+/// The envelope, the member path and the requirement come from the framework's own
+/// constraint renderer — exactly as [`campaign_ids_over_cap_message`] takes them — so a
+/// ceiling this service enforces is stated as one the model declares, and the value half
+/// is the map's own entry count rather than anything the caller sent.
+pub fn tags_over_cap_message(count: usize) -> String {
+    let violation = ::aws_smithy_schema_server::Violation {
+        path: ::aws_smithy_schema_server::constraints::path::member(TAGS_MEMBER),
+        kind: ::aws_smithy_schema_server::ViolationKind::MaxLength(MAX_TAGS_PER_RESOURCE as i64),
+        // The `<n> entries` form the framework displays a MAP's own length with.
+        value: Some(format!("{count} entries")),
+        sensitive: false,
+    };
+    // One violation always renders an envelope; the fallback keeps this infallible rather
+    // than answering a refusal with no sentence at all.
+    ::aws_smithy_schema_server::envelope(&[violation]).unwrap_or_default()
 }
 
 /// One dial request a campaign's buffer holds: the id this service minted for it, and
@@ -500,6 +592,57 @@ impl ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState {
         // `created_at`, whose resolution is coarser than two consecutive creates.
         all.sort_by(|a, b| a.sequence.cmp(&b.sequence).then_with(|| a.id.cmp(&b.id)));
         all
+    }
+
+    /// The campaign whose ARN is `arn`, or `None` when this store holds none carrying it.
+    ///
+    /// Resolved through [`Self::arn_index`], so the WHOLE ARN is what is matched and not
+    /// just the id it ends with: an ARN names a partition, a region and an account as well
+    /// as a resource, so one naming a different region or account names a different
+    /// resource and resolves to nothing here.
+    pub fn campaign_by_arn(&self, arn: &str) -> Option<&StoredCampaign> {
+        self.campaigns.get(self.arn_index.get(arn)?)
+    }
+
+    /// The campaign whose ARN is `arn`, for a handler that writes to it. Resolved exactly
+    /// as [`Self::campaign_by_arn`] resolves it.
+    pub fn campaign_by_arn_mut(&mut self, arn: &str) -> Option<&mut StoredCampaign> {
+        let id = self.arn_index.get(arn)?.clone();
+        self.campaigns.get_mut(&id)
+    }
+
+    /// The campaign a tag operation's `arn` names, or the refusal that operation answers
+    /// instead.
+    ///
+    /// The one place the resolve-or-refuse step of `/tags/{arn}` lives, so every tag
+    /// operation refuses an ARN it cannot resolve at the same point, with the same wire
+    /// code, status and sentence: an ARN whose resource path is not one of this service's
+    /// own is a bad request, decided before any existence check, and a campaign ARN this
+    /// store holds nothing under is a not-found. Generic over the calling operation's
+    /// modelled error enum, which neither refusal names — both codes are the RECORDED
+    /// wire codes rather than shape names (see [`TAG_BAD_REQUEST_CODE`],
+    /// [`TAG_NOT_FOUND_CODE`] and [`crate::scaffolded::WireCoded`]).
+    pub fn tagged_campaign<E>(
+        &self,
+        arn: &str,
+    ) -> Result<&StoredCampaign, crate::scaffolded::Scaffolded<E>> {
+        if campaign_id_from_arn(arn).is_none() {
+            return Err(tag_arn_bad_request());
+        }
+        self.campaign_by_arn(arn).ok_or_else(tag_arn_not_found)
+    }
+
+    /// The campaign a tag operation's `arn` names, for a handler that writes to it, or
+    /// the refusal it answers instead. Resolved exactly as [`Self::tagged_campaign`]
+    /// resolves it.
+    pub fn tagged_campaign_mut<E>(
+        &mut self,
+        arn: &str,
+    ) -> Result<&mut StoredCampaign, crate::scaffolded::Scaffolded<E>> {
+        if campaign_id_from_arn(arn).is_none() {
+            return Err(tag_arn_bad_request());
+        }
+        self.campaign_by_arn_mut(arn).ok_or_else(tag_arn_not_found)
     }
 }
 
@@ -1134,6 +1277,81 @@ pub fn audit_onboarding_change(
 /// The ARN of a campaign: `arn:aws:connect-campaigns:<region>:<account>:campaign/<id>`.
 pub fn campaign_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("campaign/{id}"))
+}
+
+/// The resource-type segment of the only ARN family this service's tag operations
+/// recognise: a campaign, the one resource of this service that carries tags and the one
+/// it mints an ARN for ([`campaign_arn`]).
+pub const CAMPAIGN_RESOURCE_TYPE: &str = "campaign";
+
+/// The wire error code this service answers a tag operation with when the ARN is well
+/// formed but names no resource this account holds, at HTTP 404.
+///
+/// The recorded responses of the tag plane carry this code, which is NOT the name of the
+/// model's corresponding shape (`ResourceNotFoundException`); a client branches on the
+/// code it is sent, so the emulator sends this one through
+/// [`crate::scaffolded::Scaffolded::wire_coded`].
+pub const TAG_NOT_FOUND_CODE: &str = "NotFoundException";
+
+/// What a tag operation answers alongside [`TAG_NOT_FOUND_CODE`]: a FIXED sentence,
+/// carrying nothing of the ARN the request named.
+pub const TAG_ARN_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The wire error code this service answers a tag operation with when the ARN's resource
+/// path is not one of its own resources, at HTTP 400 — refused before any existence
+/// check. Recorded in the same way as [`TAG_NOT_FOUND_CODE`], and not the name of the
+/// model's corresponding shape (`ValidationException`).
+pub const TAG_BAD_REQUEST_CODE: &str = "BadRequestException";
+
+/// What a tag operation answers alongside [`TAG_BAD_REQUEST_CODE`]: also a fixed
+/// sentence, so an ARN of another vendor is refused without being echoed back.
+pub const TAG_ARN_BAD_REQUEST_MESSAGE: &str = "Invalid input resource arn";
+
+/// The refusal a tag operation answers for an ARN whose resource path is not one of this
+/// service's own: HTTP 400 under [`TAG_BAD_REQUEST_CODE`]. Reached through
+/// [`ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState::tagged_campaign`],
+/// which is what decides when it is answered.
+fn tag_arn_bad_request<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::wire_coded(
+        TAG_BAD_REQUEST_CODE,
+        400,
+        TAG_ARN_BAD_REQUEST_MESSAGE,
+    )
+}
+
+/// The refusal a tag operation answers for a well-formed campaign ARN this store holds
+/// nothing under: HTTP 404 under [`TAG_NOT_FOUND_CODE`].
+fn tag_arn_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::wire_coded(TAG_NOT_FOUND_CODE, 404, TAG_ARN_NOT_FOUND_MESSAGE)
+}
+
+/// The campaign id a `/tags/{arn}` ARN names, or `None` when `arn` does not name a
+/// campaign of this service at all.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`; the resource
+/// portion may itself contain `:`, so only the first five fields are split off. The ARN
+/// names a campaign when its service field is this service's ARN namespace and its
+/// resource portion is `campaign/<id>` with a non-empty id. Anything else — another
+/// vendor's ARN, an unknown resource type, a bare resource with no id — is a resource
+/// path this service cannot resolve, which its tag operations refuse as a bad request
+/// BEFORE asking whether any resource exists.
+pub fn campaign_id_from_arn(arn: &str) -> Option<&str> {
+    let mut fields = arn.splitn(6, ':');
+    let ("arn", Some(_partition), Some(service), Some(_region), Some(_account), Some(resource)) = (
+        fields.next()?,
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return None;
+    };
+    if service != ARN_NAMESPACE {
+        return None;
+    }
+    let (resource_type, id) = resource.split_once('/')?;
+    (resource_type == CAMPAIGN_RESOURCE_TYPE && !id.is_empty()).then_some(id)
 }
 
 /// What this service answers when a well-formed campaign id names no campaign, for the

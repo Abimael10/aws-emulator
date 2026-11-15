@@ -35,6 +35,8 @@ mod instance_onboarding;
 mod onboarding_job_deletion;
 #[path = "all/outbound_call_config_update.rs"]
 mod outbound_call_config_update;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/shared_connect_instance_gate.rs"]
 mod shared_connect_instance_gate;
 #[path = "all/signing_name_path_claim.rs"]

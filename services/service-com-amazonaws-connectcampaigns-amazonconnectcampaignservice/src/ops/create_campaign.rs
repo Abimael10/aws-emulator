@@ -274,9 +274,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Answered from what was stored, so a response that differs from the stored
         // campaign cannot happen.
         Ok(CreateCampaignOutput {
+            tags: stored.tags_for_response(),
             id: Some(stored.id),
             arn: Some(stored.arn),
-            tags: (!stored.tags.is_empty()).then_some(stored.tags),
         })
     }
 }
