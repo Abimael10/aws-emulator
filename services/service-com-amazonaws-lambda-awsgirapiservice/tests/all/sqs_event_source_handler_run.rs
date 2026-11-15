@@ -44,19 +44,16 @@ use service_com_amazonaws_lambda_awsgirapiservice::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mappings::{
-    await_function_active, await_mapping_state, call, call_sqs, create_mapping, create_queue,
-    create_running_function, get_mapping, messages_held, queue_held, queue_message_counts,
-    router_with_queues, send_message, LOOK_AGAIN, MAPPINGS_URI, STATE_DISABLED,
+    await_function_active, await_mapping_state, call, call_sqs, create_queue,
+    create_running_function, get_mapping, given_enabled_mapping, messages_held, queue_held,
+    queue_message_counts, router_with_queues, send_message, LOOK_AGAIN, MAPPINGS_URI,
+    STATE_DISABLED,
 };
 use crate::synchronous_invoke_run::package;
 
 /// Where `CreateFunction` and `UpdateFunctionCode` are bound (`POST /2015-03-31/functions`,
 /// `PUT /2015-03-31/functions/{FunctionName}/code`).
 const FUNCTIONS_URI: &str = "/2015-03-31/functions";
-
-/// The `State` a mapping reports once it polls its event source
-/// (`EventSourceMappingConfiguration$State`).
-const STATE_ENABLED: &str = "Enabled";
 
 /// The `VisibilityTimeout` every source queue below hides a delivered message for, and the
 /// `Timeout` of the function it maps onto: a queue only maps onto a function it outlasts, and
@@ -132,23 +129,6 @@ const PROCESSING_HANDLER: &str = r#"
 def lambda_handler(event, context):
     return {"processed": [record["messageId"] for record in event["Records"]]}
 "#;
-
-/// Create the mapping and wait until it reports `Enabled`, answering its UUID.
-async fn given_enabled_mapping(router: &MultiServiceRouter, case: &str, request: &Value) -> String {
-    let created = create_mapping(router, request).await;
-    assert_eq!(
-        created.status,
-        202,
-        "case {case:?}: CreateEventSourceMapping answered {} {}",
-        created.status,
-        created.text()
-    );
-    let uuid = created
-        .string("UUID")
-        .unwrap_or_else(|| panic!("case {case:?}: no UUID in {}", created.text()));
-    await_mapping_state(router, case, &uuid, STATE_ENABLED).await;
-    uuid
-}
 
 /// Every body the queue `url` addresses still holds, read through `ReceiveMessage` until it
 /// hands over nothing more.

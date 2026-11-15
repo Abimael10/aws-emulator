@@ -527,6 +527,8 @@ mod sns_queue_event_source_pipeline;
 mod sqs_event_source_handler_run;
 #[path = "all/sqs_event_source_hold.rs"]
 mod sqs_event_source_hold;
+#[path = "all/sqs_event_source_log_delivery.rs"]
+mod sqs_event_source_log_delivery;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stream_mapping_iterator_age_series.rs"]

@@ -299,6 +299,32 @@ pub(crate) async fn create_mapping(router: &MultiServiceRouter, body: &Value) ->
     call(router, "POST", MAPPINGS_URI, body).await
 }
 
+/// Create the mapping `request` states, wait until it reports [`STATE_ENABLED`] — the state
+/// in which it polls its event source — and answer its UUID.
+///
+/// THE ONE creator of a polling mapping in these suites: every suite over what a mapping
+/// DOES starts from a mapping that is already polling, so the create, the 202 and the wait
+/// for the state the clock owes live here rather than in a copy per suite.
+pub(crate) async fn given_enabled_mapping(
+    router: &MultiServiceRouter,
+    case: &str,
+    request: &Value,
+) -> String {
+    let created = create_mapping(router, request).await;
+    assert_eq!(
+        created.status,
+        202,
+        "case {case:?}: expected CreateEventSourceMapping to answer 202, got {} {}",
+        created.status,
+        created.text()
+    );
+    let uuid = created
+        .string("UUID")
+        .unwrap_or_else(|| panic!("case {case:?}: no UUID in {}", created.text()));
+    await_mapping_state(router, case, &uuid, STATE_ENABLED).await;
+    uuid
+}
+
 /// `GetEventSourceMapping` on the mapping `uuid` names.
 pub(crate) async fn get_mapping(router: &MultiServiceRouter, uuid: &str) -> Answer {
     call(
