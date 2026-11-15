@@ -50,8 +50,8 @@ use crate::emulator::{
 /// Both values `ApproximateCreationDateTimePrecision` declares
 /// (`smithy_query(query="shape",shape="ApproximateCreationDateTimePrecision")`:
 /// `MILLISECOND | MICROSECOND`).
-const MILLISECOND: &str = "MILLISECOND";
-const MICROSECOND: &str = "MICROSECOND";
+pub(crate) const MILLISECOND: &str = "MILLISECOND";
+pub(crate) const MICROSECOND: &str = "MICROSECOND";
 
 /// DynamoDB's refusal of an enable the table's streaming state cannot serve.
 fn not_enableable_message() -> String {
@@ -63,7 +63,7 @@ fn not_enableable_message() -> String {
 
 /// Start replication of `table` to `stream_arn`, under `precision` where a row names one,
 /// and answer the body the command reported.
-async fn enable(
+pub(crate) async fn enable(
     router: &MultiServiceRouter,
     table: &str,
     stream_arn: &str,
@@ -124,7 +124,11 @@ async fn delete_item(router: &MultiServiceRouter, table: &str, id: &str) {
 /// The drain itself is the harness's ([`crate::emulator::drain_kinesis_stream`]); this
 /// suite is about the records rather than where in the shard map they landed, so the shard
 /// each came from is dropped here.
-async fn delivered(router: &MultiServiceRouter, case: &str, stream: &str) -> Vec<Value> {
+pub(crate) async fn delivered(
+    router: &MultiServiceRouter,
+    case: &str,
+    stream: &str,
+) -> Vec<Value> {
     crate::emulator::drain_kinesis_stream(router, case, stream)
         .await
         .into_iter()
@@ -145,7 +149,7 @@ fn now_millis() -> u128 {
 /// The two units are a factor of a thousand apart, so a generous window around the test's
 /// own clock pins WHICH unit the number is in: microseconds read as milliseconds would be
 /// tens of thousands of years from now.
-fn assert_creation_time(case: &str, record: &Value, precision: &str) {
+pub(crate) fn assert_creation_time(case: &str, record: &Value, precision: &str) {
     let modification = &record["dynamodb"];
     assert_eq!(
         modification["ApproximateCreationDateTimePrecision"],

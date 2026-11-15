@@ -1357,3 +1357,22 @@ mod zz_probe_whole_emulator;
 // for every service crate's `tests/all.rs`. `all/appended_notes.rs`,
 // `all/appended_notes_tail.rs`, `all/appended_header_notes.rs` and `all/appended_prose.rs`
 // keep the notes earlier landings appended here.
+// Single integration-test target for the router: the declaration list for every
+// cross-service suite under tests/all/, and nothing else.
+// Put a new suite at tests/all/<name>.rs and declare it below with one
+// `#[path = "all/<name>.rs"]` attribute and the matching `mod <name>;` line, inserted in
+// the one place its name sorts to. One pair per suite and no other line, so two branches
+// landing at once insert two lines in two places and have nothing to duplicate, re-word or
+// mistype.
+// Three rules bind this file, each pinned by a suite of its own:
+// a suite no `mod` here names compiles nowhere and its tests never run; a suite declared
+// twice is E0428; and an inner doc comment is legal only before the first item, so one
+// written past a declaration is E0753. Each of the last two fails EVERY suite of this
+// target, which is why this header is written in ordinary comments throughout, and why
+// NOTHING - not even an ordinary comment - belongs after the first declaration.
+// This file is a test-target crate root, where a bare `mod` would resolve to a sibling of
+// it (tests/<name>.rs) and the layout check refuses that, so the `#[path]` above each
+// declaration is what points it into tests/all/.
+// What a suite covers, and why it drives the assembled router rather than one service
+// crate, belongs in that suite's own module doc, where it is read beside the test it
+// explains; a note about this file belongs in all/appended_notes.rs.

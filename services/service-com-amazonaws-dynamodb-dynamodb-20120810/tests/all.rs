@@ -135,6 +135,8 @@ mod kinesis_destination_command_member_sets;
 mod kinesis_destination_consumer_positions;
 #[path = "all/kinesis_destination_delivery.rs"]
 mod kinesis_destination_delivery;
+#[path = "all/kinesis_destination_precision_switch.rs"]
+mod kinesis_destination_precision_switch;
 #[path = "all/kinesis_destination_record_delivery.rs"]
 mod kinesis_destination_record_delivery;
 #[path = "all/kinesis_destination_region_inventory.rs"]
