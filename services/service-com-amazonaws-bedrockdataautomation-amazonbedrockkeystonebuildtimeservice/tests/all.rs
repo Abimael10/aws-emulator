@@ -23,6 +23,8 @@ mod constraint_requirement_wording;
 mod data_automation_library_lifecycle;
 #[path = "all/data_automation_library_listing.rs"]
 mod data_automation_library_listing;
+#[path = "all/data_automation_library_update.rs"]
+mod data_automation_library_update;
 #[path = "all/data_automation_project_lifecycle.rs"]
 mod data_automation_project_lifecycle;
 #[path = "all/data_automation_project_listing.rs"]

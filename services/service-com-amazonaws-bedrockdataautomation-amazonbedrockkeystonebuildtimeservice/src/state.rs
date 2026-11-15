@@ -8,7 +8,8 @@
 //! DataAutomationProject
 //! record `CreateDataAutomationProject`, `GetDataAutomationProject` and
 //! `UpdateDataAutomationProject` share, the DataAutomationLibrary record
-//! `CreateDataAutomationLibrary` mints and `GetDataAutomationLibrary` reports,
+//! `CreateDataAutomationLibrary` mints, `UpdateDataAutomationLibrary` revises and
+//! `GetDataAutomationLibrary` reports,
 //! and the blueprint-optimization job record
 //! `InvokeBlueprintOptimizationAsync` mints and `GetBlueprintOptimizationStatus`
 //! reports, plus
