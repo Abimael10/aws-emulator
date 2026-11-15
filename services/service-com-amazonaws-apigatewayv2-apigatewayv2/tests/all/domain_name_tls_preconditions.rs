@@ -61,7 +61,11 @@ use crate::api_lifecycle::{as_str, call_in_region, emulator, error_code};
 /// The Region every request in this suite is signed for, and the Region the certificate
 /// client asks in. Deliberately not the emulator's default, so nothing region-derived can
 /// be hardcoded.
-const REGION: &str = "us-west-2";
+///
+/// `pub(crate)`: the sibling `custom_domain_certificate_presentation` suite signs for the
+/// same Region, because it drives the same harness ([`emulator_with_certificates`]), whose
+/// certificate client asks in this one.
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The TLS version the catalog carries BELOW the floor — the one value of
 /// `SecurityPolicy` (`TLS_1_0 | TLS_1_2`, from
@@ -426,9 +430,13 @@ async fn update_domain_name_is_held_to_the_same_floor_and_changes_nothing_when_r
 /// This service and the service that OWNS certificates on one shared engine, plus a
 /// certificate client over the router's own in-process callback — the seam the precondition
 /// under test reaches that service through.
-struct Emulator {
-    router: MultiServiceRouter,
-    certificates: ::aws_sdk_acm::Client,
+///
+/// `pub(crate)` with [`emulator_with_certificates`] below, so the sibling
+/// `custom_domain_certificate_presentation` suite drives the two services over ONE harness
+/// rather than a second copy of it.
+pub(crate) struct Emulator {
+    pub(crate) router: MultiServiceRouter,
+    pub(crate) certificates: ::aws_sdk_acm::Client,
 }
 
 /// A certificate-manager client for [`REGION`] over `callback`, the in-process seam this
@@ -449,7 +457,7 @@ fn certificate_client(callback: &EmbeddedEmulator) -> ::aws_sdk_acm::Client {
     ::aws_sdk_acm::Client::from_conf(config)
 }
 
-fn emulator_with_certificates() -> Emulator {
+pub(crate) fn emulator_with_certificates() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are not the subject of these tests; the requests still carry the SigV4

@@ -401,25 +401,21 @@ struct ConnectionPlan {
 /// policy `ssl_policy` answers a handshake with, or `None` when there is no certificate to
 /// present — in which case the caller falls back to the core's own TLS server.
 ///
-/// The certificate is chosen per handshake by the name the `ClientHello` asks for
-/// ([`SelectedByServerName`]), so one listener serves every name its certificate list
+/// The certificate is chosen per handshake by the name the `ClientHello` asks for (the one
+/// selection [`::service_common::acm_certificate_termination`] states), so one listener serves
+/// every name its certificate list
 /// covers. The protocol versions are the ones the listener's security policy negotiates
 /// ([`negotiated_versions`]), so a client reads the version that policy allows rather than
-/// whatever this library would prefer. The provider is named explicitly rather than taken
-/// from the process default: this process links more than one, and a configuration that has
-/// to work whichever was installed cannot depend on which.
+/// whatever this library would prefer.
 fn tls_server_config(
     certificates: &[Arc<CertificateKeyMaterial>],
     ssl_policy: Option<&str>,
 ) -> Option<Arc<::rustls::ServerConfig>> {
-    let resolver = SelectedByServerName::of(certificates)?;
-    let provider = Arc::new(::rustls::crypto::aws_lc_rs::default_provider());
-    let config = ::rustls::ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&negotiated_versions(ssl_policy))
-        .ok()?
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(resolver));
-    Some(Arc::new(config))
+    ::service_common::acm_certificate_termination::server_config(
+        certificates,
+        &negotiated_versions(ssl_policy),
+        None,
+    )
 }
 
 /// The TLS protocol versions a listener on the security policy `ssl_policy` completes a
@@ -463,99 +459,6 @@ fn negotiated_versions(ssl_policy: Option<&str>) -> Vec<&'static ::rustls::Suppo
 /// published catalogue writes them.
 const TLS_1_2: &str = "TLSv1.2";
 const TLS_1_3: &str = "TLSv1.3";
-
-/// The certificates one listener presents, and the selection among them: the entry whose
-/// own names cover the name the `ClientHello` asked for, and the listener's DEFAULT
-/// certificate for a client that asked for a name none of them covers or for no name at
-/// all.
-struct SelectedByServerName {
-    /// Each certificate's loaded key, beside the material it was loaded from — in the order
-    /// the listener holds them, default certificate first.
-    loaded: Vec<(Arc<CertificateKeyMaterial>, Arc<::rustls::sign::CertifiedKey>)>,
-}
-
-impl SelectedByServerName {
-    /// The selection over `certificates`, or `None` when none of them loads as a key a
-    /// handshake can be run with — material a `rustls` provider does not accept is material
-    /// this emulator cannot present, and a resolver that answers nothing for every name
-    /// would fail every handshake with no certificate having been tried.
-    fn of(certificates: &[Arc<CertificateKeyMaterial>]) -> Option<Self> {
-        let loaded: Vec<(Arc<CertificateKeyMaterial>, Arc<::rustls::sign::CertifiedKey>)> =
-            certificates
-                .iter()
-                .filter_map(|material| {
-                    certified_key(material).map(|key| (Arc::clone(material), Arc::new(key)))
-                })
-                .collect();
-        (!loaded.is_empty()).then_some(Self { loaded })
-    }
-}
-
-impl std::fmt::Debug for SelectedByServerName {
-    /// The names the selection can serve, and nothing of the keys.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SelectedByServerName")
-            .field(
-                "domain_names",
-                &self
-                    .loaded
-                    .iter()
-                    .map(|(material, _)| material.domain_names.clone())
-                    .collect::<Vec<_>>(),
-            )
-            .finish()
-    }
-}
-
-impl ::rustls::server::ResolvesServerCert for SelectedByServerName {
-    fn resolve(
-        &self,
-        client_hello: ::rustls::server::ClientHello<'_>,
-    ) -> Option<Arc<::rustls::sign::CertifiedKey>> {
-        let asked_for = client_hello.server_name();
-        if let Some(asked_for) = asked_for {
-            if let Some((_, key)) = self
-                .loaded
-                .iter()
-                .find(|(material, _)| material.covers(asked_for))
-            {
-                return Some(Arc::clone(key));
-            }
-        }
-        // The listener's DEFAULT certificate: the first entry, which is the one
-        // `CreateListener` set.
-        self.loaded.first().map(|(_, key)| Arc::clone(key))
-    }
-}
-
-/// The signing key and certificate chain one certificate's material loads as, or `None` for
-/// material a `rustls` provider does not accept — a key whose algorithm it cannot sign
-/// with, or PEM it cannot read.
-///
-/// The leaf is sent first and the chain after it, which is the order a TLS handshake sends a
-/// certificate chain in.
-fn certified_key(material: &CertificateKeyMaterial) -> Option<::rustls::sign::CertifiedKey> {
-    let mut chain = Vec::new();
-    for pem in [
-        Some(material.certificate_pem.as_str()),
-        material.certificate_chain_pem.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let mut reader = ::std::io::BufReader::new(pem.as_bytes());
-        for certificate in ::rustls_pemfile::certs(&mut reader) {
-            chain.push(certificate.ok()?);
-        }
-    }
-    if chain.is_empty() {
-        return None;
-    }
-    let mut reader = ::std::io::BufReader::new(material.private_key_pem.as_bytes());
-    let key = ::rustls_pemfile::private_key(&mut reader).ok()??;
-    let signing_key = ::rustls::crypto::aws_lc_rs::sign::any_supported_type(&key).ok()?;
-    Some(::rustls::sign::CertifiedKey::new(chain, signing_key))
-}
 
 /// How long one request may take, from its first header byte to the answer: the core's own
 /// HTTP request deadline, so this address bounds a request exactly as the core's HTTP

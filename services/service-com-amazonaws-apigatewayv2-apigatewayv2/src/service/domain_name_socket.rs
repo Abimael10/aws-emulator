@@ -16,10 +16,29 @@
 //! ([`crate::state::domain_name_transport`]) and publishes the `host:port` that socket
 //! answers on. This module is the handler the core hands each connection accepted there:
 //!
-//! 1. encryption is negotiated in band, with the core's own TLS server
-//!    ([`::service_common::in_band_tls`]), because the address is published for `https`
-//!    callers and the handshake's first bytes have to be read by this socket to tell a TLS
-//!    client from a plaintext one;
+//! 1. encryption is negotiated in band, because the address is published for `https` callers
+//!    and the handshake's first bytes have to be read by this socket to tell a TLS client
+//!    from a plaintext one ([`::service_common::in_band_tls`] states that reading);
+//!
+//!    a TLS connection is terminated HERE, under the certificate Certificate Manager holds
+//!    for the `CertificateArn` the addressed endpoint names: "an AWS-managed certificate that
+//!    will be used by the edge-optimized endpoint for this domain name. AWS Certificate
+//!    Manager is the only supported source" (`DomainNameConfiguration$CertificateArn`), so
+//!    the certificate a client of the custom domain is presented is that one and no other.
+//!    The core's own TLS server presents the EMULATOR's certificate and takes no other
+//!    ([`::emulator_server::TlsUpgrader`]), so it serves only the connections this address
+//!    has no certificate of the account's for — a certificate ACM issued rather than one a
+//!    caller imported key material for, and one whose material the directory no longer
+//!    holds. Nothing is invented for those.
+//!
+//!    The material is read from the ONE shared directory the certificate's owner writes
+//!    ([`::service_common::acm_certificate_key_material`]) and never leaves this process: it
+//!    is held in memory, used to answer a handshake, and named in no log. It is read PER
+//!    CONNECTION, off the record this socket serves, so a `CertificateArn` an
+//!    `UpdateDomainName` swapped is presented on the next handshake; and WHICH certificate is
+//!    presented follows the name the `ClientHello` asks for (RFC 6066 §3), through the one
+//!    selection every presenting service of this tree shares
+//!    ([`::service_common::acm_certificate_termination`]);
 //! 2. the request is read, bounded and handed on by the one HTTP endpoint both core-owned
 //!    sockets of this service share ([`super::websocket::endpoint_http`]);
 //! 3. before it is handed on, it is RE-ADDRESSED: the api mapping whose base path the
@@ -37,10 +56,15 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ::emulator_server::{ListenerConn, NativeHandler, TlsUpgrader};
-use ::service_common::in_band_tls::negotiated;
+use ::service_common::acm_certificate_key_material::{
+    CertificateKeyMaterial, CertificateKeyMaterialDirectory,
+};
+use ::service_common::in_band_tls::{Prefixed, TLS_RECORD_FIRST_BYTE};
 use ::smithy_server_runtime::EmbeddedEmulator;
+use ::tokio::io::AsyncReadExt as _;
 
 use super::websocket::endpoint_http::{Addressed, Readdress};
 use crate::state::ComAmazonawsApigatewayv2Apigatewayv2State as ServiceStore;
@@ -62,6 +86,23 @@ const FORBIDDEN_MESSAGE: &str = super::data_plane::FORBIDDEN_MESSAGE;
 /// authority it named (RFC 9110 §15.5.22) — and the sentence beside it.
 const MISDIRECTED_REQUEST: u16 = 421;
 const NOT_THIS_DOMAIN_NAME: &str = "Misdirected Request";
+
+/// How long a TLS handshake on this address may take, matching the deadline the core puts on
+/// a handshake its own TLS server runs: a client that completes TCP and then stalls the
+/// handshake cannot hold the connection permit the core issued for it.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How many DISTINCT certificates ONE connection loads key material for.
+///
+/// A connection presents one certificate, chosen by the name the `ClientHello` asked for, so
+/// what this bounds is the SELECTION the choice is made over: the loading a single connection
+/// costs is capped by a constant rather than by how many configuration entries a caller sent.
+/// It is the shared ceiling on how many certificates ONE resource can reference at all
+/// ([`::service_common::acm_certificate_associations::MAX_CERTIFICATES_PER_RESOURCE`], the
+/// ceiling this service already resolves a request's certificates under), so no certificate a
+/// domain name can actually hold is left out of the selection.
+const MAX_CERTIFICATES_PRESENTED: usize =
+    ::service_common::acm_certificate_associations::MAX_CERTIFICATES_PER_RESOURCE;
 
 /// Open the socket `domain_name` is reached on, answering the socket itself and the
 /// `host:port` it landed on — the address that record publishes as its `ApiGatewayDomainName`.
@@ -94,9 +135,16 @@ pub async fn open_for_domain_name<Eng: Send + Sync + 'static>(
         state: state.clone(),
         domain_name: domain_name.to_string(),
         callback,
-        // The core's own TLS server, for a client that dialled `https`. A core that cannot
-        // prepare it leaves this `None`, and such a client is then refused at the first byte
-        // rather than being answered in the clear.
+        // The shared directory the key material of the certificate this domain name PRESENTS
+        // lives in: that certificate is Certificate Manager's resource, in that service's
+        // store, which this one cannot see.
+        key_material: crate::state::domain_name_transport::certificate_key_material_directory(
+            engine,
+        ),
+        // The core's own TLS server, for a client that dialled `https` where this address has
+        // no certificate of the account's to present. A core that cannot prepare it leaves
+        // this `None`, and such a client is then refused at the first byte rather than being
+        // answered in the clear.
         upgrader: listeners.tls_upgrader().ok(),
     };
     // Opened on a task of its OWN, so a runtime that cannot bind a socket at all — one built
@@ -148,6 +196,9 @@ struct DomainNameSocket {
     state: ::engine::ServiceState<ServiceStore>,
     domain_name: String,
     callback: EmbeddedEmulator,
+    /// The shared directory the serving material of an imported Certificate Manager
+    /// certificate lives in, and `None` on an engine that carries none.
+    key_material: Option<::engine::ServiceState<CertificateKeyMaterialDirectory>>,
     upgrader: Option<TlsUpgrader>,
 }
 
@@ -159,8 +210,11 @@ impl NativeHandler for DomainNameSocket {
         let domain_name = self.domain_name.clone();
         let callback = self.callback.clone();
         let upgrader = self.upgrader.clone();
+        let key_material = self.key_material.clone();
         Box::pin(async move {
-            let Some(conn) = negotiated(conn, upgrader).await else {
+            let Some(conn) =
+                negotiated(conn, &state, &domain_name, key_material.as_ref(), upgrader).await
+            else {
                 return;
             };
             let readdress: Readdress = Arc::new(move |parts: &::http::request::Parts| {
@@ -174,6 +228,120 @@ impl NativeHandler for DomainNameSocket {
             .await;
         })
     }
+}
+
+/// The connection with encryption negotiated: terminated HERE under the certificate the
+/// record's addressed endpoint names, handed to the core's own TLS server when this address
+/// holds no material for any certificate the record names, and read as it stands when the
+/// client sent its request in the clear.
+///
+/// `None` when there is nothing to serve on the connection: a client that sent nothing, a TLS
+/// handshake that was not completed, and a TLS connection on an emulator with no certificate
+/// to present and no TLS server of its own prepared.
+///
+/// The protocol versions are the library's defaults, TLS 1.2 and TLS 1.3. `SecurityPolicy` is
+/// a MINIMUM — the service serves a domain name under
+/// [`crate::state::ENFORCED_SECURITY_POLICY`] only, and every version negotiated here is at
+/// or above it — so no record's policy admits a version this address would refuse.
+async fn negotiated(
+    mut conn: ListenerConn,
+    state: &::engine::ServiceState<ServiceStore>,
+    domain_name: &str,
+    key_material: Option<&::engine::ServiceState<CertificateKeyMaterialDirectory>>,
+    upgrader: Option<TlsUpgrader>,
+) -> Option<ListenerConn> {
+    let mut first = [0u8; 1];
+    match conn.read(&mut first).await {
+        Ok(1) => {}
+        _ => return None,
+    }
+    let prefixed: ListenerConn = Box::new(Prefixed::new(first.to_vec(), conn));
+    if first[0] != TLS_RECORD_FIRST_BYTE {
+        return Some(prefixed);
+    }
+    // The whole handshake, the key loading its selection needs included, is bounded by ONE
+    // deadline, taken before that loading starts: a client that completes TCP cannot hold the
+    // core's connection permit for longer than this however many certificates the record
+    // names — and how many it loads at all is capped by [`MAX_CERTIFICATES_PRESENTED`].
+    let deadline = ::tokio::time::Instant::now() + HANDSHAKE_DEADLINE;
+    let certificates = presented_certificates(state, domain_name, key_material);
+    let Some(config) =
+        ::service_common::acm_certificate_termination::server_config(&certificates, &[], None)
+    else {
+        // No certificate of the account's to present: the connection is served by the core's
+        // own TLS server, under the emulator's own certificate. Nothing is invented for it.
+        let upgrader = upgrader?;
+        // ALPN `None`: a client of this address offers `http/1.1` or nothing, and what follows
+        // is HTTP/1.1 either way.
+        return match upgrader.accept(prefixed, None).await {
+            Ok((upgraded, _negotiated)) => Some(upgraded),
+            Err(error) => {
+                ::tracing::debug!(
+                    %error,
+                    "a TLS handshake on a custom domain name's own address was not completed \
+                     by the core's TLS server"
+                );
+                None
+            }
+        };
+    };
+    let acceptor = ::tokio_rustls::TlsAcceptor::from(config);
+    match ::tokio::time::timeout_at(deadline, acceptor.accept(prefixed)).await {
+        Ok(Ok(stream)) => Some(Box::new(stream) as ListenerConn),
+        Ok(Err(error)) => {
+            ::tracing::debug!(
+                %error,
+                "a TLS handshake on a custom domain name's own address was not completed"
+            );
+            None
+        }
+        Err(_timed_out) => None,
+    }
+}
+
+/// The serving material of each certificate the record `domain_name` names, in the order its
+/// `DomainNameConfigurations` name them, each certificate only once and at most
+/// [`MAX_CERTIFICATES_PRESENTED`] of them, skipping every certificate this emulator holds no
+/// material for.
+///
+/// Empty for a record this store no longer holds, for one whose endpoints name no certificate,
+/// and for certificates Certificate Manager ISSUED rather than ones a caller imported key
+/// material for — no private key for those exists anywhere here.
+///
+/// The work ONE connection costs is therefore capped by a constant rather than by how many
+/// configuration entries the caller sent: a list naming the same certificate many times loads
+/// it once, and a longer list than a domain name can reference at all is cut to the ceiling.
+///
+/// LOCK ORDER: this service's own store first and the shared directory second, which is the
+/// order that directory documents; neither is held while the handshake runs.
+fn presented_certificates(
+    state: &::engine::ServiceState<ServiceStore>,
+    domain_name: &str,
+    key_material: Option<&::engine::ServiceState<CertificateKeyMaterialDirectory>>,
+) -> Vec<Arc<CertificateKeyMaterial>> {
+    let certificate_arns: Vec<String> = {
+        let store = state.lock();
+        let Some(record) = store.domain_names.get(domain_name) else {
+            return Vec::new();
+        };
+        let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        record
+            .configurations
+            .iter()
+            .filter_map(|endpoint| endpoint.certificate_arn.as_deref())
+            .filter(|arn| seen.insert(arn))
+            .take(MAX_CERTIFICATES_PRESENTED)
+            .map(str::to_string)
+            .collect()
+    };
+    let Some(directory) = key_material else {
+        return Vec::new();
+    };
+    let directory = directory.lock();
+    certificate_arns
+        .iter()
+        .filter_map(|arn| directory.material(arn))
+        .collect()
 }
 
 /// Where a request `parts` addresses goes on the custom domain name `domain_name`: the stage

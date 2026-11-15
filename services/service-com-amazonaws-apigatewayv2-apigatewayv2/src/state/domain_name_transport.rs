@@ -40,3 +40,35 @@ pub use super::listener_registry::authority_of;
 /// the sockets those domain names are reached at are read under ONE lock and cannot drift
 /// apart.
 pub type DomainNameTransport = super::listener_registry::ListenerRegistry;
+
+/// The SHARED certificate key-material directory in the shared engine: call it with a
+/// handler's `&*self.engine`.
+///
+/// What a custom domain name PRESENTS on the wire is the certificate Certificate Manager
+/// holds for its endpoint's `CertificateArn` — that service's resource, in that service's
+/// store, which this one cannot see. The material a handshake needs (the leaf, its chain and
+/// the private key that matches it) is held in ONE directory under one shared type
+/// ([`::service_common::acm_certificate_key_material::CertificateKeyMaterialDirectory`]),
+/// written by the service that holds the certificate and read by the socket that terminates
+/// the connection ([`crate::service::domain_name_socket`]). The engine keys state by TYPE, so
+/// a copy of its own in this service's state would be invisible to the writer.
+///
+/// LOCK ORDER: a reader takes [`crate::state::service_state`] first and this directory
+/// second, and nothing holds this one while taking another store, so the order cannot invert.
+///
+/// `None` on an engine carrying no directory, which presents no certificate of the account's.
+pub fn certificate_key_material_directory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<
+    ::engine::ServiceState<
+        ::service_common::acm_certificate_key_material::CertificateKeyMaterialDirectory,
+    >,
+> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::acm_certificate_key_material::CertificateKeyMaterialDirectory,
+            >,
+        )
+}

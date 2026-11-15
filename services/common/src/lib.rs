@@ -276,6 +276,10 @@ pub mod acm_certificate_associations;
 /// that matches it — written by ACM when a caller imports key material into it and read by
 /// the service that TERMINATES a connection presenting that certificate.
 pub mod acm_certificate_key_material;
+/// The TLS server a service that TERMINATES a connection under an ACM certificate answers
+/// a handshake with: the key each certificate's material loads as, and the selection among
+/// several of them by the server name the `ClientHello` asked for.
+pub mod acm_certificate_termination;
 /// The inventory of which Active Directory directories the account holds, written by the
 /// AWS Directory Service control plane — which creates and deletes them — and read by the
 /// Directory Service DATA plane, which serves the objects inside a directory and creates

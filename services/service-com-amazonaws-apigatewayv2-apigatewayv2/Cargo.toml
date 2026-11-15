@@ -77,6 +77,16 @@ httparse = "1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+# The TLS termination a CUSTOM DOMAIN NAME's own address performs: the address is published
+# for `https` callers, and what it presents there is the Certificate Manager certificate the
+# domain name's endpoint names, which the core's own TLS server cannot present (it presents
+# the emulator's own certificate and takes no other). `tokio-rustls` drives that handshake
+# over the core-owned socket; the certificate selection and the key loading themselves are
+# `service-common`'s one shared statement of them
+# (`acm_certificate_termination`). The same versions the sibling API Gateway and Elastic Load
+# Balancing crates terminate a listener's handshake with.
+rustls = { workspace = true }
+tokio-rustls = "0.26"
 # Matches an `IntegrationResponseKey` written as a regular expression (`/2\d\d/`), which is
 # how a WebSocket integration's responses are selected by the status a call produced.
 regex = "1"
@@ -169,10 +179,9 @@ rcgen = "0.13"
 # `+`. DEV-ONLY.
 percent-encoding = "2"
 # The CLIENT half of the in-band TLS upgrade a client of AWS performs before its opening
-# handshake: a WEBSOCKET api announces a `wss://` address, so a case dials it with TLS the
-# way that client does. DEV-ONLY.
-rustls = { workspace = true }
-tokio-rustls = "0.26"
+# handshake (a WEBSOCKET api announces a `wss://` address, and a custom domain name's own
+# address is dialled with TLS too) is driven by the `rustls`/`tokio-rustls` pair declared
+# above as this crate's own dependencies.
 
 [lints]
 workspace = true

@@ -35,7 +35,9 @@
 //!
 //! WHICH certificate is presented follows the name the `ClientHello` asks for (SNI), so the
 //! material covering the custom domain is the one presented and a client that asks for no
-//! name is presented the first certificate the record names.
+//! name is presented the first certificate the record names — through the one selection every
+//! presenting service of this tree shares
+//! ([`::service_common::acm_certificate_termination`]).
 //!
 //! Two connections are handed to the core's own TLS server instead, under the emulator's own
 //! certificate: one to a domain name that enforces no mutual TLS and whose certificate this
@@ -596,9 +598,10 @@ fn minted_material(domain_name: &str) -> Option<Arc<CertificateKeyMaterial>> {
 /// is no certificate to present — in which case the caller falls back to the core's own TLS
 /// server.
 ///
-/// The certificate is chosen per handshake by the name the `ClientHello` asks for
-/// ([`SelectedByServerName`]), so one address serves every name the record's certificates
-/// cover. `mutual_tls` is what decides whether a CLIENT certificate is asked for, and it is
+/// The certificate is chosen per handshake by the name the `ClientHello` asks for (the one
+/// selection [`::service_common::acm_certificate_termination`] states), so one address serves
+/// every name the record's certificates cover. `mutual_tls` is what decides whether a CLIENT
+/// certificate is asked for, and it is
 /// asked for as MANDATORY: "clients must present a trusted certificate to access your API",
 /// so a client that presents none is refused at the TLS layer. Whether the certificate it
 /// presents is TRUSTED is decided after the handshake, against the truststore's own anchors
@@ -609,29 +612,22 @@ fn minted_material(domain_name: &str) -> Option<Arc<CertificateKeyMaterial>> {
 /// (`smithy_query(query="shape", shape="SecurityPolicy")`) — and both of those are satisfied
 /// by every version negotiated here, so no record's policy admits a version this address
 /// would refuse.
-///
-/// The provider is named explicitly rather than taken from the process default: this process
-/// links more than one, and a configuration that has to work whichever was installed cannot
-/// depend on which.
 fn tls_server_config(
     certificates: &[Arc<CertificateKeyMaterial>],
     mutual_tls: bool,
 ) -> Option<Arc<::rustls::ServerConfig>> {
-    let resolver = SelectedByServerName::of(certificates)?;
-    let provider = Arc::new(::rustls::crypto::aws_lc_rs::default_provider());
-    let builder = ::rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
-        .with_safe_default_protocol_versions()
-        .ok()?;
-    let config = if mutual_tls {
-        builder
-            .with_client_cert_verifier(Arc::new(RequiresAClientCertificate(provider)))
-            .with_cert_resolver(Arc::new(resolver))
-    } else {
-        builder
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(resolver))
-    };
-    Some(Arc::new(config))
+    let client_certificates: Option<Arc<dyn client_certificates::ClientCertVerifier>> = mutual_tls
+        .then(|| {
+            Arc::new(RequiresAClientCertificate(
+                ::service_common::acm_certificate_termination::provider(),
+            )) as Arc<dyn client_certificates::ClientCertVerifier>
+        });
+    // No protocol versions are named, so the library's safe defaults are negotiated.
+    ::service_common::acm_certificate_termination::server_config(
+        certificates,
+        &[],
+        client_certificates,
+    )
 }
 
 /// The client-certificate verifier of a mutual-TLS address: a certificate is MANDATORY and
@@ -701,80 +697,6 @@ impl client_certificates::ClientCertVerifier for RequiresAClientCertificate {
     fn supported_verify_schemes(&self) -> Vec<::rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
     }
-}
-
-/// The certificate this address presents, chosen by the name the `ClientHello` asked for:
-/// the first of the record's certificates that covers it, and the first certificate for a
-/// client that asks for a name none of them covers or for no name at all.
-#[derive(Debug)]
-struct SelectedByServerName {
-    /// Each certificate's names and the handshake key loaded from its material, in the
-    /// order the record names them.
-    loaded: Vec<(Arc<CertificateKeyMaterial>, Arc<::rustls::sign::CertifiedKey>)>,
-}
-
-impl SelectedByServerName {
-    /// The resolver over `certificates`, or `None` when none of them yields a key a
-    /// handshake can be run with — material a `rustls` provider does not accept is material
-    /// this address cannot present.
-    fn of(certificates: &[Arc<CertificateKeyMaterial>]) -> Option<Self> {
-        let loaded: Vec<(Arc<CertificateKeyMaterial>, Arc<::rustls::sign::CertifiedKey>)> =
-            certificates
-                .iter()
-                .filter_map(|material| {
-                    certified_key(material)
-                        .map(|key| (Arc::clone(material), Arc::new(key)))
-                })
-                .collect();
-        (!loaded.is_empty()).then_some(Self { loaded })
-    }
-}
-
-impl ::rustls::server::ResolvesServerCert for SelectedByServerName {
-    fn resolve(
-        &self,
-        client_hello: ::rustls::server::ClientHello<'_>,
-    ) -> Option<Arc<::rustls::sign::CertifiedKey>> {
-        let asked_for = client_hello.server_name();
-        if let Some(asked_for) = asked_for {
-            if let Some((_material, key)) = self
-                .loaded
-                .iter()
-                .find(|(material, _key)| material.covers(asked_for))
-            {
-                return Some(Arc::clone(key));
-            }
-        }
-        self.loaded.first().map(|(_material, key)| Arc::clone(key))
-    }
-}
-
-/// The handshake key of one certificate's material: its chain and the private key that
-/// signs with it, as a `rustls` provider reads them.
-///
-/// `None` for material a provider does not accept — a key whose algorithm it cannot sign
-/// with, a chain it cannot read — which is material this address cannot present.
-fn certified_key(material: &CertificateKeyMaterial) -> Option<::rustls::sign::CertifiedKey> {
-    let mut chain: Vec<::rustls::pki_types::CertificateDer<'static>> = Vec::new();
-    for pem in [
-        Some(material.certificate_pem.as_str()),
-        material.certificate_chain_pem.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let mut reader = ::std::io::BufReader::new(pem.as_bytes());
-        for certificate in ::rustls_pemfile::certs(&mut reader) {
-            chain.push(certificate.ok()?);
-        }
-    }
-    if chain.is_empty() {
-        return None;
-    }
-    let mut reader = ::std::io::BufReader::new(material.private_key_pem.as_bytes());
-    let key = ::rustls_pemfile::private_key(&mut reader).ok()??;
-    let signing_key = ::rustls::crypto::aws_lc_rs::sign::any_supported_type(&key).ok()?;
-    Some(::rustls::sign::CertifiedKey::new(chain, signing_key))
 }
 
 /// Answer one request on a custom domain name's own address.

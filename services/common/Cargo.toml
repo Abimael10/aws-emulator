@@ -197,6 +197,22 @@ brush-parser = { version = "0.4", default-features = false }
 # ... and the path of that URI spells an Amazon S3 key, so its percent-escaping is resolved
 # by the maintained encoder the URL parser itself uses.
 percent-encoding = "2"
+# `acm_certificate_termination`: the TLS server a service terminating a connection under a
+# Certificate Manager certificate answers a handshake with — one statement of the
+# certificate selection and the key loading for every presenting service. The TLS
+# implementation this workspace already terminates every handshake with, at the workspace's
+# own version, so no second one arrives with this declaration.
+rustls = { workspace = true }
+# ... and the reader that turns the PEM material a certificate was imported as into the DER
+# that handshake sends: the maintained PEM reader this tree already reads certificate
+# material with, rather than a hand-written framing reader.
+rustls-pemfile = "2"
+
+[dev-dependencies]
+# `acm_certificate_termination`'s own cases load REAL certificate material, minted by the
+# maintained generator the sibling services mint certificate material with — something
+# other than the code under test. DEV-ONLY.
+rcgen = "0.13"
 
 [lints]
 workspace = true

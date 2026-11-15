@@ -69,6 +69,8 @@ mod constraint_refusal;
 mod control_plane_request_validation;
 #[path = "all/create_api_modelled_outcomes.rs"]
 mod create_api_modelled_outcomes;
+#[path = "all/custom_domain_certificate_presentation.rs"]
+mod custom_domain_certificate_presentation;
 #[path = "all/custom_domain_hosted_zone.rs"]
 mod custom_domain_hosted_zone;
 #[path = "all/custom_domain_mapping_invoke.rs"]
