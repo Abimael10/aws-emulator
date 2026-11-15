@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCapacityProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCapacityProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCapacityProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes a capacity provider, over the capacity-provider store this service's state
+//! holds: the provider is retired when no live cluster is associated with it, and the
+//! delete an association holds off is reported on the provider itself.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +166,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCapacityProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCapacityProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteCapacityProviderErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // An ARN is a WHOLE identifier, Region and account included, so both segments are
+        // checked, for both identifiers the request carries, before either is resolved
+        // ([`crate::state::request_arn_violation`]).
+        if let Some(message) = crate::state::request_arn_violation(
+            ctx,
+            [
+                input.cluster.as_deref(),
+                Some(input.capacity_provider.as_str()),
+            ]
+            .into_iter()
+            .flatten(),
+        ) {
+            return Err(
+                DeleteCapacityProviderErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The short name or full Amazon Resource Name (ARN) of the capacity provider to
+        // delete": both forms name the same provider, which the store holds under its NAME.
+        let name = crate::state::capacity_provider_name_from_reference(&input.capacity_provider);
+        // The `cluster` member names "the cluster that contains the capacity provider to
+        // delete", by short name or ARN — and names NO cluster when the request omits it,
+        // since an Auto Scaling group provider belongs to the account rather than to one
+        // cluster.
+        let cluster_name = input
+            .cluster
+            .as_deref()
+            .map(|reference| crate::state::cluster_name_from_reference(Some(reference)));
+
+        let mut guard = state.lock();
+        let now = ::std::time::SystemTime::now();
+        guard.advance_clock(now);
+
+        // A deleted cluster is not one this operation may act in ("The cluster has been
+        // deleted"), so a tombstone is refused under the same error code a name that never
+        // existed earns — with the sentence that says it is still there, inactive.
+        if let Some(cluster_name) = cluster_name.as_deref() {
+            if !guard.has_active_cluster(cluster_name) {
+                return Err(
+                    DeleteCapacityProviderErrorModeled::ClusterNotFoundException(
+                        ClusterNotFoundException {
+                            message: Some(crate::state::cluster_refusal_message(
+                                guard.clusters.get(cluster_name),
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "The FARGATE and FARGATE_SPOT capacity providers are reserved and can't be
+        // deleted": they are resolved rather than stored
+        // ([`crate::state::managed_capacity_provider`]), so a delete that names one names a
+        // provider of Amazon ECS's own — refused for the parameter it carried, with nothing
+        // written.
+        if crate::state::MANAGED_CAPACITY_PROVIDERS.contains(&name.as_str()) {
+            return Err(
+                DeleteCapacityProviderErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::RESERVED_CAPACITY_PROVIDER_DELETE_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Only capacity providers that aren't associated with a cluster can be deleted. To
+        // remove a capacity provider from a cluster, you can either use
+        // PutClusterCapacityProviders or delete the cluster."
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCapacityProvider"))
+        // That condition is reported on the PROVIDER rather than raised: the call is
+        // ANSWERED, the provider keeps the status it had, and its update status is what says
+        // the delete did not happen ([`crate::state::CapacityProviderRecord::report_delete_failed`])
+        // — the one signal a caller gets that an association still holds the provider. Read
+        // BEFORE the provider is taken out of the map to be written, so one borrow covers
+        // the whole of the write.
+        let associated = guard.capacity_provider_is_associated(&name);
+
+        // A name that resolves to no provider of this account names nothing to delete, and
+        // is refused with the one sentence every operation that resolves a provider by name
+        // answers ([`crate::state::CAPACITY_PROVIDER_NOT_FOUND_MESSAGE`]).
+        let Some(stored) = guard.capacity_providers.get_mut(&name) else {
+            return Err(
+                DeleteCapacityProviderErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::CAPACITY_PROVIDER_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `DeleteCapacityProvider$cluster`: "Managed instances capacity providers are
+        // cluster-scoped and can only be deleted from their associated cluster" — so a
+        // provider scoped to a cluster is deleted THROUGH that cluster, and a request that
+        // names another one, or none at all, is not the delete of this provider.
+        if stored
+            .cluster
+            .as_deref()
+            .is_some_and(|scope| cluster_name.as_deref() != Some(scope))
+        {
+            return Err(
+                DeleteCapacityProviderErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::CLUSTER_SCOPED_CAPACITY_PROVIDER_DELETE_MESSAGE
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A provider no live cluster lists is retired: `INACTIVE` from this instant, with
+        // the release of the capacity it bound onto left in flight for the clock to finish
+        // ([`crate::state::CapacityProviderRecord::retire`]). The operation's other
+        // documented precondition — the provider must first be out of every service's
+        // `capacityProviderStrategy` — needs no separate test here: while a service's
+        // strategy names the provider, the association cannot be removed either, as
+        // [`crate::state::capacity_provider_deletion`] records.
+        if associated {
+            stored.report_delete_failed();
+        } else {
+            stored.retire(now);
+        }
+
+        // `DeleteCapacityProvider` has no `include` member to narrow the response with, so
+        // the provider it acted on is reported with the tags it holds.
+        Ok(DeleteCapacityProviderOutput {
+            capacity_provider: Some(stored.view(true)),
+        })
     }
 }

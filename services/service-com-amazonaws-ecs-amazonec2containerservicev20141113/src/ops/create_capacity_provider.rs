@@ -474,6 +474,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             update_status: stands_up_capacity
                 .then(|| crate::state::CAPACITY_PROVIDER_CREATE_IN_PROGRESS.to_string()),
             active_due_at: stands_up_capacity.then(|| now + crate::state::TRANSITION_SPAN),
+            // Nothing has deleted a provider this call is creating.
+            delete_due_at: None,
             cluster: cluster_name,
             auto_scaling_group_provider: input.auto_scaling_group_provider.clone(),
             // `CapacityProvider$type` names the class of capacity the provider binds onto:

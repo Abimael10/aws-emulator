@@ -1204,3 +1204,13 @@ mod zz_probe_whole_emulator;
 // keeps a landing clear of the sorted span above, where two branches adding neighbouring
 // names collide. Keep it to the two lines of the declaration — a note belongs in the
 // suite's own module doc, and `//!` here is `E0753`.
+//! Put a new suite at `tests/all/<name>.rs` and declare it below with a `#[path]` / `mod`
+//! pair, keeping the list sorted: one pair per suite and NOTHING else, so a landing has one
+//! place to insert and nothing to keep consistent.
+//! A suite that is not declared here compiles nowhere and its tests never run, and a suite
+//! left at the top level of `tests/` fails the build. Declare each suite exactly ONCE: this
+//! is one crate root, so a second `mod` for the same name is `E0428` and fails every suite
+//! in this target. THIS BLOCK IS THE ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN
+//! THIS FILE: past the first item one is `E0753` and compiles no suite of this target, so
+//! add a declaration below, never a note about one.
+//! `all/all_rs_declares_each_suite_once.rs` and

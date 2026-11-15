@@ -38,6 +38,16 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                         Some(CAPACITY_PROVIDER_CREATE_COMPLETE.to_string());
                 }
             }
+            // And the capacity an accepted delete released: once the release is due the
+            // delete has finished, whether or not anybody called to look, so the provider
+            // reports it complete beside the `INACTIVE` status the delete left it under.
+            if let Some(due) = provider.delete_due_at {
+                if due <= now {
+                    provider.delete_due_at = None;
+                    provider.update_status =
+                        Some(CAPACITY_PROVIDER_DELETE_COMPLETE.to_string());
+                }
+            }
         }
         for task in self.tasks.values_mut() {
             // The elastic network interface an `awsvpc` task was allocated is created and

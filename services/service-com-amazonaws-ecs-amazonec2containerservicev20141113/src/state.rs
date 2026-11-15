@@ -332,6 +332,11 @@ pub use rolling_update::*;
 mod ec2_capacity;
 pub use ec2_capacity::*;
 
+/// RETIRING a capacity provider: the cluster association that holds its delete off, and
+/// the `(status, updateStatus)` pair each outcome of that delete leaves behind.
+mod capacity_provider_deletion;
+pub use capacity_provider_deletion::*;
+
 /// The ECS MANAGED DAEMON scheduler: the revisions a daemon's configuration is captured as,
 /// the deployments that roll them out, and the one daemon task each container instance of
 /// the daemon's capacity providers runs.
@@ -2776,6 +2781,10 @@ pub struct CapacityProviderRecord {
     /// [`CAPACITY_PROVIDER_CREATE_COMPLETE`]. Cleared when it is materialised, so it
     /// happens once.
     pub active_due_at: Option<SystemTime>,
+    /// When the delete of this provider finishes releasing the capacity it bound onto,
+    /// after which its delete is [`CAPACITY_PROVIDER_DELETE_COMPLETE`]. `None` for a
+    /// provider nothing has deleted. Cleared when it is materialised, so it happens once.
+    pub delete_due_at: Option<SystemTime>,
     /// `CapacityProvider$cluster`: the cluster a MANAGED-INSTANCES provider is scoped to
     /// ("Managed instances capacity providers are cluster-scoped"). `None` for an Auto
     /// Scaling group provider, which the account holds rather than one cluster.

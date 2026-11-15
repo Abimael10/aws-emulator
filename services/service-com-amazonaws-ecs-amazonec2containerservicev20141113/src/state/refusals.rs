@@ -1975,6 +1975,8 @@ pub fn managed_capacity_provider(name: &str, region: &str) -> Option<CapacityPro
         status: CAPACITY_PROVIDER_ACTIVE.to_string(),
         update_status: None,
         active_due_at: None,
+        // Nothing deletes a provider Amazon ECS manages, so none has a delete in flight.
+        delete_due_at: None,
         cluster: None,
         auto_scaling_group_provider: None,
         managed_instances_provider: None,
