@@ -98,6 +98,7 @@ pub mod sampling_rules;
 pub mod sampling_statistics;
 pub mod span_delivery;
 pub mod trace_id_reads;
+pub mod trace_pages;
 // The two parts of the trace tree a reader is answered with: the nodes this
 // service infers for the calls a trace's documents made, and how those documents
 // are assembled into one tree. Reached only through the re-exports below, as
@@ -118,6 +119,7 @@ pub use retrievals::*;
 pub use sampling_rules::*;
 pub use sampling_statistics::*;
 pub use trace_id_reads::*;
+pub use trace_pages::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};

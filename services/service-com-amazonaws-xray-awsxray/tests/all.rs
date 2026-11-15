@@ -157,6 +157,10 @@ mod trace_segment_destination;
 
 #[path = "all/trace_summary_client_service_id.rs"]
 mod trace_summary_client_service_id;
+
+#[path = "all/trace_summaries_window_paging.rs"]
+mod trace_summaries_window_paging;
+
 #[path = "all/trace_tree_assembly.rs"]
 mod trace_tree_assembly;
 

@@ -171,6 +171,41 @@ impl Xray {
         self.call("/TraceSummaries", &body).await
     }
 
+    /// Every `TraceSummary` the window `[start, end)` holds, walked across the
+    /// pages the query serves it in: a query's pages are SLICES of its own
+    /// window, so a reader that wants the whole window follows `NextToken`
+    /// until the service stops issuing one. `filter` is the optional filter
+    /// expression every page is queried with.
+    pub async fn paged_summaries(&self, start: f64, end: f64, filter: Option<&str>) -> Vec<Value> {
+        /// More pages than any window this harness asks about is cut into, so a
+        /// walk that does not terminate fails the case instead of hanging.
+        const MAX_PAGES: usize = 200;
+
+        let mut summaries: Vec<Value> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = self
+                .query_summaries(start, end, filter, token.as_deref())
+                .await;
+            assert_eq!(
+                page.status, 200,
+                "walking the pages of [{start}, {end}) must succeed, got {page:?}"
+            );
+            summaries.extend(array(&page.body, "TraceSummaries").iter().cloned());
+            token = page.get("NextToken").as_str().map(str::to_string);
+            pages += 1;
+            assert!(
+                pages <= MAX_PAGES,
+                "walking the pages of [{start}, {end}) must terminate, stopped after {pages} pages"
+            );
+            if token.is_none() {
+                break;
+            }
+        }
+        summaries
+    }
+
     pub async fn batch_get(&self, ids: &[String], token: Option<&str>) -> Answer {
         let mut body = json!({ "TraceIds": ids });
         if let Some(token) = token {

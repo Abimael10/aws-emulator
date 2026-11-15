@@ -1930,3 +1930,22 @@ mod zz_probe_whole_emulator;
 // (`tests/<name>.rs`) that the layout check refuses: the `#[path]` above each declaration is
 // belongs in that suite's OWN module doc, where it is read beside the test it explains; a
 // note about THIS file belongs in `all/appended_notes.rs`.
+// Single integration-test target for the router: the canonical DECLARATION LIST of every
+// Two branches landing at once then insert two lines in two places and have no prose here to
+// the declarations compiles no suite of this target at all — and with none in the file, no
+// appended, re-typed or merged copy of a line of it can be one.
+// A suite file no `mod` here names is compiled nowhere and its tests never run, a suite left
+// at the top level of `tests/` fails the build, and a name declared twice compiles neither
+// copy. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a
+// SIBLING of this file, which the layout check refuses: the `#[path]` above each `mod` is
+// what points the declaration into `tests/all/`.
+// The suites whose names begin `all_rs_`, plus `all/every_suite_file_is_declared.rs` and
+// `all/declaration_roots_are_canonical_and_complete.rs`, check all of that rather than
+// restating it. What a suite covers, and why it drives the assembled router rather than one
+// service crate, belongs in that suite's OWN module header, where it is read beside the test
+// it explains; the notes earlier landings had appended to this file live in
+// `all/appended_prose.rs`, each declared below like any other file.
+// A suite's own module header may wrap a list item without the indentation
+// `clippy::doc_lazy_continuation` asks for, so the lint is allowed for this whole test target
+// here. An inner attribute, like an inner doc comment, is legal only before the first item,
+// which is why it stands in this header rather than in the list below.

@@ -15,6 +15,11 @@
 //! per stored trace, so the graph is derived from the traces that group selects
 //! — an empty graph when none of them matches, never a refusal.
 //!
+//! `StartTime` and `EndTime` report the window the graph WAS GENERATED for, so
+//! they are reported only where a graph was generated: a window the derivation
+//! resolved no service in carries neither, rather than echoing the request's own
+//! bounds back as a window a map was materialised over.
+//!
 //! Two refusals, both `InvalidRequestException` (400):
 //!
 //! * a `[StartTime, EndTime]` window that names no interval of recorded traffic,
@@ -261,8 +266,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(refuse)?;
 
         Ok(GetServiceGraphOutput {
-            start_time: Some(input.start_time),
-            end_time: Some(input.end_time),
+            // "The start of the time frame for which THE GRAPH WAS GENERATED"
+            // and its end: both describe the graph this call produced, not the
+            // window the request named — so a call that produced no graph at all
+            // reports neither, and a reader cannot mistake an echo of its own
+            // request for a window the service materialised a map over. (The
+            // graph reads whose window members the model documents as "the
+            // provided start time" echo them unconditionally, because there the
+            // member IS the request's value.)
+            start_time: (!services.is_empty()).then_some(input.start_time),
+            end_time: (!services.is_empty()).then_some(input.end_time),
             services: Some(page.services),
             // The graph is derived from the stored segments at read time, never
             // from a cached older version of a group's filter expression.

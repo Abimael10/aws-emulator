@@ -23,6 +23,14 @@
 //! for the callers of each root segment — so the services a summary reports and
 //! the nodes a service map draws for the same stored segments cannot disagree.
 //!
+//! The answer is PAGED by the window itself: the pages of one query are
+//! hour-long slices of `[StartTime, EndTime)` walked from the end of the window
+//! backwards ([`crate::state::trace_pages`]), so `ApproximateTime` is the start
+//! of the slice this page served and a `NextToken` is due while the query has
+//! anything left to serve — the rest of a slice holding more summaries than one
+//! page carries ([`TRACE_SUMMARIES_PAGE_SIZE`]), or the slice before it while
+//! the window reaches into one.
+//!
 //! A request outside what this read serves is REFUSED with
 //! `InvalidRequestException` rather than answered over part of it: an inverted
 //! time range, a window wider than the longest one this read serves
@@ -354,26 +362,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let resume = input.next_token.as_deref();
+        // WHICH PAGE of the window this call serves. The pages of one query are
+        // SLICES of its own window walked from the end of the window backwards
+        // ([`crate::state::window_page_boundaries`]), so the window and the
+        // token together name one slice: a request carrying no token asks for
+        // the slice the window ends in — "the most recent results, closest to
+        // the end of the time frame" — and a token names the slice the previous
+        // page stopped in. A token naming a slice this window is not paged by
+        // never came from a query over this window, and a value that is no
+        // cursor of this read at all cannot be resumed from; both are refused in
+        // the crate's one wording for such a token, which reports it verbatim.
+        let supplied = input.next_token.as_deref();
+        let boundaries = crate::state::window_page_boundaries(start, end);
+        let mut resume: Option<&str> = None;
+        let page: Option<crate::state::WindowPage> = match supplied {
+            None => boundaries
+                .first()
+                .map(|boundary| crate::state::window_page(start, end, *boundary)),
+            Some(token) => {
+                let (boundary, trace) = crate::state::parse_page_token(token)
+                    .filter(|(boundary, _)| boundaries.contains(boundary))
+                    .ok_or_else(|| {
+                        invalid_request(crate::state::invalid_next_token_message(token))
+                    })?;
+                resume = trace;
+                Some(crate::state::window_page(start, end, boundary))
+            }
+        };
 
-        // PASS ONE, under the lock: which traces the window holds, and which of
-        // them this page starts at. Only ids and a count are taken, so the
-        // critical section is one walk of the keyspace with no caller-supplied
-        // work in it.
+        // PASS ONE, under the lock: which traces the window holds, which of them
+        // this page's own slice holds, and which of those this page starts at.
+        // Only ids and a count are taken, so the critical section is one walk of
+        // the keyspace with no caller-supplied work in it.
         let (candidates, traces_processed) = {
             let store = state.lock();
 
-            // A token this service issued names the trace the next page starts
-            // at. One still inside the keyspace being walked is honoured even
-            // if that exact trace has since been evicted, so an eviction
+            // A token that resumes INSIDE a slice names the trace the next page
+            // starts at. One still inside the keyspace being walked is honoured
+            // even if that exact trace has since been evicted, so an eviction
             // between pages does not fail an in-flight paginator; one beyond it
             // never came from here.
-            if let Some(token) = resume {
+            if let (Some(token), Some(trace)) = (supplied, resume) {
                 let within_keyspace = store
                     .traces
                     .keys()
                     .next_back()
-                    .is_some_and(|last| token <= last.as_str());
+                    .is_some_and(|last| trace <= last.as_str());
                 if !within_keyspace {
                     return Err(invalid_request(
                         crate::state::invalid_next_token_message(token),
@@ -383,11 +417,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // `traces` is a `BTreeMap`, so the walk is in trace-id order and a
             // page resumes at the first id at or after the token. The whole
-            // keyspace is walked on every page — the token no longer narrows the
-            // walk, because the count below is of the window rather than of the
-            // part of it this page starts at — which is bounded by the stored
-            // trace cap ([`crate::state::MAX_TRACES`]), the same bound the
-            // unpaged walk already had.
+            // keyspace is walked on every page — neither the token nor the slice
+            // narrows the walk, because the count below is of the window rather
+            // than of the page — which is bounded by the stored trace cap
+            // ([`crate::state::MAX_TRACES`]), the same bound the unpaged walk
+            // already had.
             //
             // `TracesProcessedCount` is "the total number of traces processed,
             // including traces that did not match the specified filter
@@ -408,7 +442,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     continue;
                 }
                 processed = processed.saturating_add(1);
-                if resume.is_none_or(|token| trace.id.as_str() >= token) {
+                // And of those, the ones THIS PAGE's slice holds, from the
+                // trace a token resumed it at. A window naming no interval is
+                // paged by no slice at all, so it selects nothing.
+                let Some(page) = page else {
+                    continue;
+                };
+                if instant < page.start || instant >= page.end {
+                    continue;
+                }
+                if resume.is_none_or(|from| trace.id.as_str() >= from) {
                     candidates.push(trace.id.clone());
                 }
             }
@@ -427,10 +470,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is for a paginator resuming after an eviction.
         let mut budget = crate::state::filter::QueryBudget::new();
         let mut selected: Vec<TraceSummary> = Vec::new();
-        // The earliest windowed instant the page carries, which is what
-        // `ApproximateTime` reports ("the start time of this page of results").
-        let mut page_start: Option<f64> = None;
-        let mut next_token = None;
+        // The trace the NEXT page of this same slice starts at, when the slice
+        // holds more summaries than one page carries.
+        let mut resume_at: Option<String> = None;
         for (position, trace_id) in candidates.iter().enumerate() {
             // Checked FIRST, and before the non-match path can `continue` past
             // it: once the budget is spent, evaluation answers "no match" for
@@ -465,35 +507,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if selected.len() == TRACE_SUMMARIES_PAGE_SIZE {
                     // One past the page: the token names where the next page
                     // starts, and nothing after it needs evaluating.
-                    next_token = Some(trace.id.clone());
+                    resume_at = Some(trace.id.clone());
                 } else {
-                    let instant = window_instant(trace);
-                    page_start = Some(page_start.map_or(instant, |earliest: f64| earliest.min(instant)));
                     selected.push(summary_of(trace));
                 }
             }
-            if next_token.is_some() {
+            if resume_at.is_some() {
                 break;
             }
         }
         // And once more for the last candidate, whose evaluation the loop's own
         // check cannot see. A page that filled is complete and carries its
         // token, so only an unfinished walk is refused.
-        if next_token.is_none() && budget.exhausted() {
+        if resume_at.is_none() && budget.exhausted() {
             return Err(budget_spent());
         }
 
+        // "If the requested time frame contained more than one page of results,
+        // you can use this token to retrieve the next page": a token is due
+        // while this query has anything LEFT to serve — the rest of this slice
+        // when the slice holds more summaries than a page carries, otherwise the
+        // slice before this one while the requested window still reaches into
+        // one. A page with neither is the last page of the window, and only such
+        // a page answers without a token; a window of several slices therefore
+        // pages on even where a slice held nothing, because a client that stops
+        // at the first empty page has read only the end of the range it asked
+        // about.
+        let next_token = match (resume_at, page.and_then(|page| page.earlier)) {
+            (Some(trace), _) => page
+                .map(|page| crate::state::page_token(page.boundary, Some(trace.as_str()))),
+            (None, Some(earlier)) => Some(crate::state::page_token(earlier, None)),
+            (None, None) => None,
+        };
+
         Ok(GetTraceSummariesOutput {
             trace_summaries: Some(selected),
-            // "The start time of this page of results": the earliest instant
-            // this page's own summaries were windowed on, and the start of the
-            // REQUESTED window for a page that carries none — a query that
-            // matched nothing is an accepted query over that window, so the
-            // instant it reports is inside it. Never the clock: when this
-            // response was built is not a time any result was recorded at, and
-            // for a window in the past it is not even inside the window asked
-            // about.
-            approximate_time: Some(crate::state::timestamp_of(page_start.unwrap_or(start))),
+            // "The start time of this page of results": where this page's own
+            // SLICE of the requested window starts — the top of the hour that
+            // begins it, or where the requested window starts for the page the
+            // window starts inside, so the instant reported is always inside the
+            // window asked about. Never the clock: when this response was built
+            // is not a time any result was recorded at, and for a window in the
+            // past it is not even inside the window asked about.
+            approximate_time: Some(crate::state::timestamp_of(
+                page.map_or(start, |page| page.start),
+            )),
             traces_processed_count: Some(traces_processed),
             next_token,
         })
@@ -506,8 +564,9 @@ const FILTER_YIELD_EVERY: usize = 32;
 /// How many `TraceSummary` values one page carries.
 ///
 /// The model declares no page size for `GetTraceSummaries`, so this is the
-/// emulator's: a `NextToken` is emitted only when the selection exceeded it, and
-/// resuming from that token returns the remainder.
+/// emulator's: it bounds how many summaries one page of one hour-long slice of
+/// the window carries ([`crate::state::TRACE_PAGE_SECONDS`]), and a slice
+/// holding more is served over as many pages as it takes.
 pub const TRACE_SUMMARIES_PAGE_SIZE: usize = 5;
 
 /// `TimeRangeType` `TraceId`: the window is applied to each trace's own start

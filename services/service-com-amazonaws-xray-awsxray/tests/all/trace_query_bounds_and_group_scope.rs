@@ -722,16 +722,17 @@ async fn a_query_scoped_to_a_stored_group_is_narrowed_by_that_group() {
             "case {label:?}: the window holds both traces however the query is scoped, got \
              {answered:?}"
         );
-        // "The start time of this page of results": the earliest instant this
-        // page's own summaries were windowed on, which is the selected trace's
-        // start and not the other trace's, nor the clock.
+        // "The start time of this page of results": where this page's own slice
+        // of the requested window starts, which for a window inside one slice is
+        // the window's own start — not the selected trace's instant, and not the
+        // clock.
         assert!(
             answered
                 .get("ApproximateTime")
                 .as_f64()
-                .is_some_and(|at| close(at, BASE + 10.0)),
-            "case {label:?}: expected ApproximateTime {} (the page's own start), got {answered:?}",
-            BASE + 10.0
+                .is_some_and(|at| close(at, BASE)),
+            "case {label:?}: expected ApproximateTime {BASE} (the page's own start), got \
+             {answered:?}"
         );
     }
 }

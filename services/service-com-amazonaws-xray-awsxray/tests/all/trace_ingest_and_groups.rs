@@ -631,13 +631,14 @@ async fn an_unreadable_document_is_reported_and_the_rest_of_the_batch_still_land
             "case {label:?}: the well-formed document in the same batch must still be stored, got {traces:?}"
         );
         // A window inside the widest one this read serves, holding the stored
-        // document's own instant.
-        let summaries = xray.summaries(0.0, 86_400.0, None).await;
+        // document's own instant. The window spans several of the hour-long
+        // slices a query pages by, so the whole of it is read by following the
+        // tokens the query issues.
+        let summaries = xray.paged_summaries(0.0, 86_400.0, None).await;
         assert_eq!(
-            array(&summaries.body, "TraceSummaries").len(),
+            summaries.len(),
             1,
-            "case {label:?}: only the accepted document created a trace, got {:?}",
-            summaries.get("TraceSummaries")
+            "case {label:?}: only the accepted document created a trace, got {summaries:?}"
         );
     }
 }
@@ -676,12 +677,11 @@ async fn the_time_window_is_half_open_and_selects_on_the_stored_start_time() {
     ];
 
     for (label, start, end, expected_rows) in rows {
-        let got = xray.summaries(start, end, None).await;
-        assert_eq!(
-            got.status, 200,
-            "case {label:?}: GetTraceSummaries must succeed, got {got:?}"
-        );
-        let ids: Vec<&str> = array(&got.body, "TraceSummaries")
+        // A window wider than one of the hour-long slices a query pages by is
+        // served over several pages, so what the WINDOW selects is read by
+        // following the tokens the query issues.
+        let selected = xray.paged_summaries(start, end, None).await;
+        let ids: Vec<&str> = selected
             .iter()
             .filter_map(|summary| summary.get("Id").and_then(Value::as_str))
             .collect();
@@ -692,6 +692,11 @@ async fn the_time_window_is_half_open_and_selects_on_the_stored_start_time() {
         assert_eq!(
             ids, expected,
             "case {label:?}: window [{start}, {end}) must select {expected:?}, got {ids:?}"
+        );
+        let got = xray.summaries(start, end, None).await;
+        assert_eq!(
+            got.status, 200,
+            "case {label:?}: GetTraceSummaries must succeed, got {got:?}"
         );
         // The count is of the traces the REQUESTED WINDOW holds, so it moves
         // with the window rather than reporting the whole store: a window past

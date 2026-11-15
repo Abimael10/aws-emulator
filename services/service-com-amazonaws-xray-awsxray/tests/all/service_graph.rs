@@ -679,3 +679,119 @@ async fn an_instant_no_timestamp_can_carry_is_refused_at_ingest_and_the_far_edge
         );
     }
 }
+
+// =============================================================================
+// 5. The reported window describes the graph that was generated
+// =============================================================================
+
+#[tokio::test]
+async fn the_window_is_reported_only_where_a_graph_was_generated() {
+    let xray = Xray::new();
+    let recorded = now() - 120.0;
+    let trace = trace_id(77);
+    let put = xray
+        .put_segments(&[root_document(
+            "00000000000000c1",
+            &trace,
+            "checkout",
+            recorded,
+            Some(recorded + 0.5),
+        )
+        .to_string()])
+        .await;
+    assert_eq!(put.status, 200, "seeding one trace must succeed, got {put:?}");
+    let created = xray
+        .call(
+            "/CreateGroup",
+            &json!({"GroupName": "selects-nothing", "FilterExpression": "service(\"nobody\")"}),
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "creating the group must succeed, got {created:?}"
+    );
+
+    // `GetServiceGraphResult$StartTime` is "the start of the time frame for
+    // which THE GRAPH WAS GENERATED" and `EndTime` its end, so both are reported
+    // only where this call generated a graph. The rows differ along WHY a
+    // derivation resolves no service — a window before any traffic, one after
+    // it, a zero-width window, and a window holding traffic that the group the
+    // request scopes itself to selects none of — and each is set against the
+    // same window that does resolve one.
+    let rows: Vec<(&str, Value, bool)> = vec![
+        (
+            "a window holding the stored traffic",
+            json!({"StartTime": recorded - 60.0, "EndTime": recorded + 60.0}),
+            true,
+        ),
+        (
+            "a window before the stored traffic",
+            json!({"StartTime": recorded - 3_600.0, "EndTime": recorded - 1_800.0}),
+            false,
+        ),
+        (
+            "a window after the stored traffic",
+            json!({"StartTime": recorded + 30.0, "EndTime": recorded + 60.0}),
+            false,
+        ),
+        (
+            "a window of a single instant",
+            json!({"StartTime": recorded, "EndTime": recorded}),
+            false,
+        ),
+        (
+            "a group that selects none of the traffic in the window",
+            json!({
+                "StartTime": recorded - 60.0,
+                "EndTime": recorded + 60.0,
+                "GroupName": "selects-nothing",
+            }),
+            false,
+        ),
+        (
+            "the reserved group, which selects all of it",
+            json!({
+                "StartTime": recorded - 60.0,
+                "EndTime": recorded + 60.0,
+                "GroupName": "Default",
+            }),
+            true,
+        ),
+    ];
+
+    for (label, body, generated) in rows {
+        let answered = xray.call("/ServiceGraph", &body).await;
+        assert_eq!(
+            answered.status, 200,
+            "case {label:?}: the window must be answered, got {answered:?}"
+        );
+        let services = array(&answered.body, "Services");
+        assert_eq!(
+            !services.is_empty(),
+            generated,
+            "case {label:?}: expected a graph of services: {generated}, got {answered:?}"
+        );
+        for member in ["StartTime", "EndTime"] {
+            let requested = body
+                .get(member)
+                .and_then(Value::as_f64)
+                .expect("the row states the window");
+            if generated {
+                assert!(
+                    answered
+                        .get(member)
+                        .as_f64()
+                        .is_some_and(|value| close(value, requested)),
+                    "case {label:?}: a generated graph reports {member} {requested}, got \
+                     {answered:?}"
+                );
+            } else {
+                assert!(
+                    answered.get(member).is_null(),
+                    "case {label:?}: a call that generated no graph reports no {member}, got \
+                     {answered:?}"
+                );
+            }
+        }
+    }
+}
