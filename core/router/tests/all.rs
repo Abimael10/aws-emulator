@@ -2008,3 +2008,11 @@ mod every_suite_file_is_declared;
 // collected.
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING
 // of this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what
+//! pair, keeping the list sorted: one pair per suite and NOTHING else, so two branches
+//! landing at once insert two lines in two places and have no prose to duplicate.
+//! is one crate root, so a second `mod` for the same name is `E0428`. An inner doc comment
+//! (`//!`) is legal only BEFORE the first item, so THIS header is the only place one may
+//! stand — past it, `//!` is `E0753` and compiles no suite of this target.
+//! What a suite covers, and why it lives in THIS target rather than in a service crate's
+//! own, belongs in that suite's own module header, where it is read beside the test it
+//! explains.

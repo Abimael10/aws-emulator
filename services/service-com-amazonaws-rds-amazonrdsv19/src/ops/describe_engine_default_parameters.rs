@@ -287,31 +287,63 @@ pub(crate) fn engine_default_parameters(
     family: &str,
 ) -> Option<&'static [crate::state::ClusterParameterSpec]> {
     let engine = family_engine(family)?;
-    // The MySQL-compatible engines share one parameter vocabulary, and so do the
-    // PostgreSQL-compatible ones: Aurora MySQL is MySQL's, Amazon RDS for MariaDB is
-    // MySQL's, and Aurora PostgreSQL is PostgreSQL's. The RDS Custom engines run the same
-    // Oracle and SQL Server engines as their non-custom counterparts.
-    Some(match engine {
+    // Amazon DocumentDB's catalog is the SHARED one (the cluster-parameter-group
+    // operations of this front door validate values against the same table through
+    // `crate::state::published_parameters`), which that module publishes per FAMILY, so the
+    // family selects it rather than the engine alone. Which versions of an engine exist is
+    // a question for the engine-version report and for the create that stores a group, not
+    // for this one, so a DocumentDB family that table covers no release of still reports the
+    // engine's own list.
+    if engine == crate::state::DOCDB_ENGINE {
+        return Some(
+            crate::state::published_parameters(family)
+                .unwrap_or(crate::state::DOCDB_CLUSTER_PARAMETERS),
+        );
+    }
+    Some(engine_parameter_vocabulary(engine))
+}
+
+/// The DB (instance) parameter vocabulary this front door publishes for `engine`: the one
+/// catalog every family of that engine reads a parameter's published record from.
+///
+/// The MySQL-compatible engines share one parameter vocabulary, and so do the
+/// PostgreSQL-compatible ones: Aurora MySQL is MySQL's, Amazon RDS for MariaDB is MySQL's,
+/// and Aurora PostgreSQL is PostgreSQL's. The RDS Custom engines run the same Oracle and SQL
+/// Server engines as their non-custom counterparts.
+///
+/// An engine this emulator publishes no parameter catalog for publishes an EMPTY vocabulary
+/// rather than invented entries: a name, default or allowed-value set this front door made up
+/// would be a constraint AWS never published, and a caller reading it would configure against
+/// a parameter that does not exist.
+///
+/// It is the ENGINE's vocabulary, so it is read both by [`engine_default_parameters`], which
+/// reports the defaults of one family, and by the resolution that answers which engine a
+/// parameter name belongs to at all (`crate::state::published_for_another_engine`).
+pub(crate) fn engine_parameter_vocabulary(
+    engine: &str,
+) -> &'static [crate::state::ClusterParameterSpec] {
+    match engine {
         _ if engine.ends_with("mysql") || engine == "mariadb" => MYSQL_PARAMETERS,
         _ if is_postgres_engine(engine) => POSTGRES_PARAMETERS,
         _ if engine.contains("oracle") => ORACLE_PARAMETERS,
         _ if engine.contains("sqlserver") => SQLSERVER_PARAMETERS,
-        // Amazon DocumentDB's catalog is the SHARED one (the cluster-parameter-group
-        // operations of this front door validate values against the same table through
-        // `crate::state::published_parameters`), reported here for every version of that
-        // engine by the same rule as every other engine above: the parameters are the
-        // engine's, and which versions of an engine exist is a question for the
-        // engine-version report and for the create that stores a group, not for this one.
-        "docdb" => crate::state::published_parameters(family)
-            .unwrap_or(crate::state::DOCDB_CLUSTER_PARAMETERS),
+        "docdb" => crate::state::DOCDB_CLUSTER_PARAMETERS,
         "neptune" => NEPTUNE_PARAMETERS,
-        // An engine this emulator publishes no parameter catalog for reports no
-        // parameters rather than invented ones: a name, default or allowed-value set this
-        // front door made up would be a constraint AWS never published, and a caller
-        // reading it would configure against a parameter that does not exist. The family
-        // itself is a real one, so the report is a 200 carrying an empty list.
         _ => &[],
-    })
+    }
+}
+
+/// Every engine this front door serves: the ones `CreateDBInstance` publishes, plus the two
+/// sibling control planes' own, which this service claims too.
+///
+/// Stated once so the resolution of a family's engine ([`family_engine`]) and the resolution
+/// of which engines publish a parameter name (`crate::state::published_for_another_engine`)
+/// read the one list.
+pub(crate) fn served_engines() -> impl Iterator<Item = &'static str> {
+    crate::state::DB_INSTANCE_ENGINES
+        .iter()
+        .chain(crate::state::SIBLING_CONTROL_PLANE_ENGINES.iter())
+        .copied()
 }
 
 /// The engine `family` names, or `None` when it names none.
@@ -333,24 +365,19 @@ pub(crate) fn engine_default_parameters(
 /// reports is asked — and the two must not disagree about what is one.
 pub(crate) fn family_engine(family: &str) -> Option<&'static str> {
     let lowered = family.to_ascii_lowercase();
-    // The engines this front door serves: the ones `CreateDBInstance` publishes, plus the
-    // two sibling control planes' own (`docdb`, `neptune`), which this service claims too.
-    crate::state::DB_INSTANCE_ENGINES
-        .iter()
-        .chain(crate::state::SIBLING_CONTROL_PLANE_ENGINES.iter())
+    served_engines()
         .filter(|engine| {
-            let Some(version) = lowered.strip_prefix(**engine) else {
+            let Some(version) = lowered.strip_prefix(*engine) else {
                 return false;
             };
             let version = version.strip_prefix('-').unwrap_or(version);
             if version.is_empty() {
-                return VERSIONLESS_FAMILY_ENGINES.contains(*engine);
+                return VERSIONLESS_FAMILY_ENGINES.contains(engine);
             }
             version.starts_with(|c: char| c.is_ascii_digit())
                 && version.chars().all(|c| c.is_ascii_digit() || c == '.')
         })
         .max_by_key(|engine| engine.len())
-        .copied()
 }
 
 /// How this front door refuses a `DBParameterGroupFamily` it does not publish: the one

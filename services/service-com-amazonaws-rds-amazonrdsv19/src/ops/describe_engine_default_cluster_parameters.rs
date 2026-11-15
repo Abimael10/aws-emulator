@@ -264,25 +264,39 @@ fn cluster_engine_default_parameters(
         );
     }
     // The MySQL-compatible cluster engines share one cluster vocabulary (Aurora MySQL's is
-    // MySQL's), and so do the PostgreSQL-compatible ones.
-    Ok(match engine {
+    // MySQL's), and so do the PostgreSQL-compatible ones; Amazon DocumentDB's is the SHARED
+    // catalog, which that module publishes per FAMILY, so the family selects it rather than
+    // the engine alone. Which versions of an engine exist is a question for the
+    // engine-version report, not for this one.
+    if engine == crate::state::DOCDB_ENGINE {
+        return Ok(crate::state::published_parameters(family)
+            .unwrap_or(crate::state::DOCDB_CLUSTER_PARAMETERS));
+    }
+    Ok(engine_cluster_parameter_vocabulary(engine))
+}
+
+/// The DB CLUSTER parameter vocabulary this front door publishes for `engine`: the one
+/// catalog every cluster family of that engine reads a parameter's published record from.
+///
+/// The engine-level sibling of
+/// [`super::describe_engine_default_parameters::engine_parameter_vocabulary`], read by
+/// [`cluster_engine_default_parameters`] for one family's report and by the resolution that
+/// answers which engine a parameter name belongs to at all
+/// (`crate::state::published_for_another_engine`). An engine with no cluster catalog — one
+/// that runs only as a single DB instance, or one added to the cluster list without a
+/// catalog — publishes an EMPTY vocabulary rather than invented entries.
+pub(crate) fn engine_cluster_parameter_vocabulary(
+    engine: &str,
+) -> &'static [crate::state::ClusterParameterSpec] {
+    match engine {
         _ if engine.ends_with("mysql") => MYSQL_CLUSTER_PARAMETERS,
         _ if super::describe_engine_default_parameters::is_postgres_engine(engine) => {
             POSTGRES_CLUSTER_PARAMETERS
         }
-        // Amazon DocumentDB keeps every parameter in a DB CLUSTER parameter group, so its
-        // catalog is the SHARED one the cluster-parameter-group operations of this front door
-        // already validate values against (`crate::state::published_parameters`), reported
-        // here for every version of that engine by the same rule as the engines above: the
-        // parameters are the engine's, and which versions of an engine exist is a question
-        // for the engine-version report, not for this one.
-        "docdb" => crate::state::published_parameters(family)
-            .unwrap_or(crate::state::DOCDB_CLUSTER_PARAMETERS),
+        "docdb" => crate::state::DOCDB_CLUSTER_PARAMETERS,
         "neptune" => NEPTUNE_CLUSTER_PARAMETERS,
-        // Every engine with a cluster form is covered above; one added to that list without a
-        // cluster catalog reports no parameters rather than invented ones.
         _ => &[],
-    })
+    }
 }
 
 /// The cluster parameters the MySQL-compatible cluster engines publish — Aurora MySQL, and

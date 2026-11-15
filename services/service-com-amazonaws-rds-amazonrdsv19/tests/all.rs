@@ -47,6 +47,8 @@ mod control_plane_operations;
 mod create_path_refusal_wording;
 #[path = "all/create_resolved_defaults.rs"]
 mod create_resolved_defaults;
+#[path = "all/cross_engine_parameter_names.rs"]
+mod cross_engine_parameter_names;
 #[path = "all/custom_db_engine_versions.rs"]
 mod custom_db_engine_versions;
 #[path = "all/custom_engine_version_engine_availability.rs"]

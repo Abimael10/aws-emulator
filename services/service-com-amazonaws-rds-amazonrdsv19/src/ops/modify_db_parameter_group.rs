@@ -238,9 +238,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // parameter admits and the parameter one the engine lets a caller modify;
             // anything else is the AWS Query `InvalidParameterValue`, whose message names
             // the parameter and what it admits. A name the published catalog does not carry
-            // is taken as sent: that catalog is a sample of the family's list rather than
-            // the whole of it (see `crate::state::published_db_parameters`), so refusing an
-            // unpublished name would reject a parameter the engine has.
+            // is taken as sent UNLESS it is a parameter of another engine this front door
+            // serves (`crate::state::validate_db_parameter_name`): that catalog is a sample
+            // of the family's list rather than the whole of it (see
+            // `crate::state::published_db_parameters`), so refusing every unpublished name
+            // would reject a parameter the engine has — but one engine's parameter is no
+            // parameter of another engine's family however the sample was drawn.
             crate::state::validate_db_parameter_setting(&family, name, value)
                 .map_err(ModifyDBParameterGroupError::invalid_parameter_value)?;
             // A STATIC parameter cannot be applied immediately — "changes to static

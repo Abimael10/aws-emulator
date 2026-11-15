@@ -215,11 +215,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every entry of the request is read BEFORE the store is touched, so a request
         // carrying a malformed one changes nothing at all. A name the family's published
-        // catalog does not carry is taken as sent: that catalog is a SAMPLE of the family's
-        // parameter list rather than the whole of it
-        // (`crate::state::published_db_parameters`), so refusing an unpublished name would
-        // reject a parameter the engine has — and a name the group holds no setting under
-        // clears nothing in any case.
+        // catalog does not carry is taken as sent unless it is another engine's parameter
+        // (`crate::state::validate_db_parameter_name`, checked once the group's family is
+        // known): that catalog is a SAMPLE of the family's parameter list rather than the
+        // whole of it (`crate::state::published_db_parameters`), so refusing every
+        // unpublished name would reject a parameter the engine has — and a name the group
+        // holds no setting under clears nothing in any case.
         let mut to_clear: Vec<String> = Vec::with_capacity(named.len());
         for parameter in &named {
             let Some(name) = parameter.parameter_name.as_deref() else {
@@ -239,7 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the group is looked up by the lowercased name in the region the request was signed
         // for; a name that matches none is the modelled 404.
         let key = (region, input.db_parameter_group_name.to_ascii_lowercase());
-        let Some(group) = store.db_parameter_groups.get_mut(&key) else {
+        let Some(group) = store.db_parameter_groups.get(&key) else {
             return Err(
                 ResetDBParameterGroupErrorModeled::DBParameterGroupNotFoundFault(
                     DBParameterGroupNotFoundFault {
@@ -250,6 +251,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        };
+        let family = group.family.clone();
+
+        // A reset names a parameter the group could carry. A parameter of ANOTHER engine this
+        // front door serves is none of this family's
+        // (`crate::state::validate_db_parameter_name`, the same resolution the modify's name
+        // check reads, so the two operations cannot disagree about which parameters a group
+        // has), so there is no such parameter to put back to its default either. Every name
+        // is resolved before any setting is dropped, so a request carrying one such name
+        // clears nothing at all.
+        for name in &to_clear {
+            crate::state::validate_db_parameter_name(&family, name)
+                .map_err(ResetDBParameterGroupError::invalid_parameter_value)?;
+        }
+
+        let Some(group) = store.db_parameter_groups.get_mut(&key) else {
+            // The group was read under this same lock a moment ago, so its disappearance
+            // would be this emulator's own failure rather than the caller's, and a 501 would
+            // misreport an implemented operation as unwritten.
+            return Err(ResetDBParameterGroupError::internal_failure(
+                "the parameter group was read a moment ago and is now gone",
+            ));
         };
 
         // Dropping a setting is what returns its parameter to "the engine/system default
