@@ -9,11 +9,18 @@
 //! the `propertyAlias` bound to it, and its video is kept as the segments the producer
 //! ingested ([`crate::state::CaptureSegment`]) — the `mp4` files a `CreateBulkImportJob`
 //! into that workspace brings in ([`crate::state::read_capture_files`]). A segment is
-//! ATOMIC — this emulator
-//! stores media exactly as it arrived and decodes nothing — so one answer carries one
+//! ATOMIC — a stored segment is kept exactly as it arrived and is never cut — so one
+//! answer carries one
 //! segment, reports the span that segment really covers, and hands back the `nextToken`
 //! that resumes at the following overlapping segment. Reading writes nothing: the
 //! resume point is carried in the token rather than recorded.
+//!
+//! What the answer's MEDIA is in is the request's business: `formatSettings` names the
+//! output format for video processing, and the segment's pictures are decoded and encoded
+//! again at the rate and geometry it asks for
+//! ([`crate::state::render_capture`]) over the same span, so a read that asks for no
+//! processing — and a target the media already meets — is the one answered with the
+//! stored bytes.
 //!
 //! ## Shape of an operation
 //!
@@ -210,118 +217,244 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // `formatSettings` asks for the OUTPUT to be re-encoded (frame rate, width,
-        // height). This emulator serves the media exactly as the producer ingested it
-        // and runs no encoder, so the settings change neither which segments are
-        // selected nor the bytes returned — a recorded limitation, not a refusal: the
-        // request is one the real service accepts.
-        let _ = &input.format_settings;
-
-        let store = state.lock();
-
-        // The workspace is what "contains the capture source", so a workspace this
-        // store does not hold is reported as the absent resource it is, before the
-        // source is looked for inside it.
-        if !store.workspaces.contains_key(&input.workspace_name) {
-            return Err(not_found(crate::state::not_found_message(
-                crate::state::RESOURCE_WORKSPACE,
-                &input.workspace_name,
-            )));
-        }
-        let source = match identifier {
-            Identifier::TimeSeriesId(time_series_id) => {
-                store.capture_source_by_id(&input.workspace_name, time_series_id)
-            }
-            Identifier::Alias(alias) => {
-                store.capture_source_by_alias(&input.workspace_name, alias)
-            }
-        }
-        .ok_or_else(|| {
-            not_found(crate::state::not_found_message(
-                crate::state::RESOURCE_TIME_SERIES,
-                identifier.requested(),
-            ))
-        })?;
-
-        // Every stored segment that carries video INSIDE the window, oldest first: the
-        // window is half-open, so a segment ending exactly where it begins (or
-        // beginning exactly where it ends) covers none of it. The log is already
-        // sorted ascending by start time, so this selection needs no sort.
-        let selected: Vec<&crate::state::CaptureSegment> = source
-            .segments
-            .iter()
-            .filter(|segment| {
-                crate::state::timestamp_key(&segment.start_time) < end
-                    && crate::state::timestamp_key(&segment.end_time) > start
-            })
-            .collect();
-
-        // Which enumeration a token of this read belongs to: the capture source
-        // selected from (resolved, so either identifying form names the same one) and
-        // the window that selects its segments. A segment's start time is no identity
-        // of a position on its own, because two sources of one workspace can hold
-        // segments starting at the same instant and another window selects a different
-        // list, so the token carries this scope beside the instant.
-        let scope = crate::state::pagination_scope(&[
-            &source.workspace_name,
-            &source.time_series_id,
-            &start,
-            &end,
-        ]);
-
-        // `nextToken` is "the token from a previous response used to continue
-        // retrieving data": this enumeration's resume point, the start time of the
-        // next segment to deliver. A token whose resume point is not in this
-        // enumeration is refused rather than answered with an empty chunk, which
-        // would report absence as success — and a token minted for ANOTHER
-        // enumeration is one of those.
-        let at = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = crate::state::decode_timestamp_token(token, &scope)
-                    .ok_or_else(invalid_token)?;
-                selected
-                    .iter()
-                    .position(|segment| {
-                        crate::state::timestamp_key(&segment.start_time) == resume
-                    })
-                    .ok_or_else(invalid_token)?
-            }
-            None => 0,
+        // `formatSettings` is "the optional format settings for the output", under a shape
+        // documented as "Contains the output format configuration for video processing":
+        // the target frame rate, width and height the media the answer carries is to be
+        // in. They describe the OUTPUT and not the selection, so they change neither which
+        // segments overlap the window nor the span reported for the one answered with —
+        // they are applied to that segment's MEDIA, whose pictures are decoded and encoded
+        // again at the asked rate and geometry
+        // ([`crate::state::render_capture`]). Each member is a `PositiveInteger` (range
+        // 1..), so a count below one is refused at the boundary before this handler runs
+        // and a member the request leaves out names no target at all.
+        let settings = input.format_settings.as_ref();
+        let format = crate::state::OutputFormat {
+            frames_per_second: requested_target(
+                settings.and_then(|settings| settings.frames_per_second),
+            ),
+            width_in_pixels: requested_target(
+                settings.and_then(|settings| settings.width_in_pixels),
+            ),
+            height_in_pixels: requested_target(
+                settings.and_then(|settings| settings.height_in_pixels),
+            ),
         };
+        // What the ASK alone says about the work it would take: a rate or a geometry past
+        // what this emulator renders is refused here, before the capture source is looked
+        // for and before anything is sized from one of those numbers. The ceilings that
+        // need the media are applied where it is read.
+        if let Some(message) = format.past_asked_budget() {
+            return Err(invalid_request(message));
+        }
 
-        // A window the source holds no video in is an EMPTY answer, not an absent
-        // resource: the source exists and simply recorded nothing then. There is no
-        // span of returned data to report, so the requested bounds are echoed as the
-        // range the (empty) answer covers.
-        let Some(chunk) = selected.get(at) else {
-            return Ok(GetCaptureDataOutput {
-                data: Vec::new(),
-                start_time: input.start_time.clone(),
-                end_time: input.end_time.clone(),
-                data_type: source.data_type.clone(),
-                next_token: None,
+        // Everything this answer is made of, read off the store inside ONE critical
+        // section: the media is then rendered with no lock held, because decoding and
+        // encoding a segment's pictures is work no other caller of this store should wait
+        // for.
+        let Answered {
+            media,
+            start_time,
+            end_time,
+            data_type,
+            next_token,
+        } = {
+            let store = state.lock();
+
+            // The workspace is what "contains the capture source", so a workspace this
+            // store does not hold is reported as the absent resource it is, before the
+            // source is looked for inside it.
+            if !store.workspaces.contains_key(&input.workspace_name) {
+                return Err(not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_WORKSPACE,
+                    &input.workspace_name,
+                )));
+            }
+            let source = match identifier {
+                Identifier::TimeSeriesId(time_series_id) => {
+                    store.capture_source_by_id(&input.workspace_name, time_series_id)
+                }
+                Identifier::Alias(alias) => {
+                    store.capture_source_by_alias(&input.workspace_name, alias)
+                }
+            }
+            .ok_or_else(|| {
+                not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_TIME_SERIES,
+                    identifier.requested(),
+                ))
+            })?;
+
+            // Every stored segment that carries video INSIDE the window, oldest first: the
+            // window is half-open, so a segment ending exactly where it begins (or
+            // beginning exactly where it ends) covers none of it. The log is already
+            // sorted ascending by start time, so this selection needs no sort.
+            let selected: Vec<&crate::state::CaptureSegment> = source
+                .segments
+                .iter()
+                .filter(|segment| {
+                    crate::state::timestamp_key(&segment.start_time) < end
+                        && crate::state::timestamp_key(&segment.end_time) > start
+                })
+                .collect();
+
+            // Which enumeration a token of this read belongs to: the capture source
+            // selected from (resolved, so either identifying form names the same one) and
+            // the window that selects its segments. A segment's start time is no identity
+            // of a position on its own, because two sources of one workspace can hold
+            // segments starting at the same instant and another window selects a different
+            // list, so the token carries this scope beside the instant.
+            let scope = crate::state::pagination_scope(&[
+                &source.workspace_name,
+                &source.time_series_id,
+                &start,
+                &end,
+            ]);
+
+            // `nextToken` is "the token from a previous response used to continue
+            // retrieving data": this enumeration's resume point, the start time of the
+            // next segment to deliver. A token whose resume point is not in this
+            // enumeration is refused rather than answered with an empty chunk, which
+            // would report absence as success — and a token minted for ANOTHER
+            // enumeration is one of those.
+            let at = match input.next_token.as_deref() {
+                Some(token) => {
+                    let resume = crate::state::decode_timestamp_token(token, &scope)
+                        .ok_or_else(invalid_token)?;
+                    selected
+                        .iter()
+                        .position(|segment| {
+                            crate::state::timestamp_key(&segment.start_time) == resume
+                        })
+                        .ok_or_else(invalid_token)?
+                }
+                None => 0,
+            };
+
+            // A window the source holds no video in is an EMPTY answer, not an absent
+            // resource: the source exists and simply recorded nothing then. There is no
+            // span of returned data to report, so the requested bounds are echoed as the
+            // range the (empty) answer covers.
+            let Some(chunk) = selected.get(at) else {
+                return Ok(GetCaptureDataOutput {
+                    data: Vec::new(),
+                    start_time: input.start_time.clone(),
+                    end_time: input.end_time.clone(),
+                    data_type: source.data_type.clone(),
+                    next_token: None,
+                });
+            };
+
+            // One answer carries ONE segment: the media is stored as it was ingested and
+            // this emulator neither splices nor re-cuts it, so a chunk is a stored
+            // segment and the response reports that segment's own span. The token is
+            // absent on the last one — "Absent if no more data is available".
+            let next_token = selected.get(at.saturating_add(1)).map(|segment| {
+                crate::state::encode_timestamp_token(
+                    crate::state::timestamp_key(&segment.start_time),
+                    &scope,
+                )
             });
+
+            Answered {
+                media: chunk.data.clone(),
+                start_time: chunk.start_time.clone(),
+                end_time: chunk.end_time.clone(),
+                data_type: source.data_type.clone(),
+                next_token,
+            }
         };
 
-        // One answer carries ONE segment: the media is stored as it was ingested and
-        // this emulator neither re-encodes nor splices it, so a chunk is a stored
-        // segment and the response reports that segment's own span. The token is
-        // absent on the last one — "Absent if no more data is available".
-        let next_token = selected.get(at.saturating_add(1)).map(|segment| {
-            crate::state::encode_timestamp_token(
-                crate::state::timestamp_key(&segment.start_time),
-                &scope,
+        // The asked output format, applied to that segment's media. The span is the
+        // segment's either way: the output shows the same pictures over the same time,
+        // which is what "the actual start time"/"the actual end time of the returned data"
+        // report.
+        //
+        // Decoding and encoding pictures is CPU-bound and synchronous, so it runs on a
+        // blocking worker rather than on an async one, under a wall-clock ceiling the
+        // RENDER ITSELF stops at — a blocking task cannot be taken back by whoever stopped
+        // waiting for it, so the timeout bounds the wait and the deadline inside the render
+        // bounds the work. How many renders may run at once is bounded as well, since each
+        // one holds a blocking thread; past that the read is refused the rate limit this
+        // operation models. A read that asked for no processing at all needs none of that.
+        let data = if format.names_no_target() {
+            media
+        } else {
+            let Some(permit) = crate::state::RenderPermit::take() else {
+                // The rate limit is reported in the words the model gives that error class;
+                // which ceiling this read met is traced beside it rather than returned.
+                tracing::warn!(
+                    operation = <Self as smithy_server_runtime::Operation>::NAME,
+                    renders = crate::state::MAX_CONCURRENT_RENDERS,
+                    "a read arrived while this emulator was rendering as much as it renders at once"
+                );
+                return Err(throttled());
+            };
+            let media = ::std::sync::Arc::new(media);
+            let rendered = ::std::sync::Arc::clone(&media);
+            let rendering = ::tokio::time::timeout(
+                crate::state::MAX_RENDER_TIME,
+                ::tokio::task::spawn_blocking(move || {
+                    // The permit travels WITH the work, so it is given back when the
+                    // rendering ends rather than when this request stops waiting for it.
+                    let _permit = permit;
+                    crate::state::render_capture(&rendered, &format)
+                }),
             )
-        });
+            .await;
+            match rendering {
+                Ok(Ok(crate::state::CaptureRendering::Rendered(file))) => file,
+                // The rendering task is done, so this holds the only reference left and
+                // the stored media moves out of it rather than being copied again.
+                Ok(Ok(crate::state::CaptureRendering::AsStored)) => {
+                    ::std::sync::Arc::try_unwrap(media)
+                        .unwrap_or_else(|shared| shared.as_ref().clone())
+                }
+                Ok(Ok(crate::state::CaptureRendering::PastBudget(message))) => {
+                    return Err(invalid_request(message))
+                }
+                Ok(Ok(crate::state::CaptureRendering::Failed(failure))) => {
+                    tracing::warn!(
+                        operation = <Self as smithy_server_runtime::Operation>::NAME,
+                        failure = failure.as_str(),
+                        "the requested output format could not be rendered"
+                    );
+                    return Err(internal_failure());
+                }
+                Ok(Err(_)) | Err(_) => {
+                    tracing::warn!(
+                        operation = <Self as smithy_server_runtime::Operation>::NAME,
+                        seconds = crate::state::MAX_RENDER_TIME.as_secs(),
+                        "the requested output format did not render inside the budget"
+                    );
+                    return Err(internal_failure());
+                }
+            }
+        };
 
         Ok(GetCaptureDataOutput {
-            data: chunk.data.clone(),
-            start_time: chunk.start_time.clone(),
-            end_time: chunk.end_time.clone(),
-            data_type: source.data_type.clone(),
+            data,
+            start_time,
+            end_time,
+            data_type,
             next_token,
         })
     }
+}
+
+/// What the store answers one read with: the segment this answer carries, read off the
+/// store while its lock was held, so nothing of it borrows the store afterwards.
+#[derive(Debug)]
+struct Answered {
+    /// The stored media of the segment the answer carries.
+    media: Vec<u8>,
+    /// That segment's own start — "the actual start time of the returned data".
+    start_time: TimeInNanos,
+    /// Its own end.
+    end_time: TimeInNanos,
+    /// The `VideoDataType` of the source's media.
+    data_type: String,
+    /// The token that resumes at the next overlapping segment, when there is one.
+    next_token: Option<String>,
 }
 
 /// Which capture source of the workspace a well-formed request named.
@@ -353,6 +486,39 @@ fn invalid_token() -> GetCaptureDataError {
 fn invalid_request(message: String) -> GetCaptureDataError {
     GetCaptureDataError::Modeled(GetCaptureDataErrorModeled::InvalidRequestException(
         InvalidRequestException { message },
+    ))
+}
+
+/// One target of the asked output format, as the positive count the model bounds it to
+/// (`PositiveInteger`, range 1..): a member the request left out, and one the boundary's
+/// constraint walk would have refused, names no target.
+fn requested_target(value: Option<i32>) -> Option<u32> {
+    u32::try_from(value?).ok().filter(|count| *count >= 1)
+}
+
+/// HTTP 429 `ThrottlingException`, as the model words it: the rate limit a read arriving
+/// while this emulator is already rendering as much as it renders at once is answered with.
+fn throttled() -> GetCaptureDataError {
+    GetCaptureDataError::Modeled(GetCaptureDataErrorModeled::ThrottlingException(
+        ThrottlingException {
+            message: "Your request exceeded a rate limit. For example, you might have exceeded \
+                      the number of IoT SiteWise assets that can be created per second, the \
+                      allowed number of messages per second, and so on. For more information, \
+                      see Quotas in the IoT SiteWise User Guide."
+                .to_string(),
+        },
+    ))
+}
+
+/// HTTP 500 `InternalFailureException`, as the model words it: the answer to a read this
+/// emulator could take no media out of, which is a failure on the serving side rather
+/// than anything the caller asked wrongly for.
+fn internal_failure() -> GetCaptureDataError {
+    GetCaptureDataError::Modeled(GetCaptureDataErrorModeled::InternalFailureException(
+        InternalFailureException {
+            message: "IoT SiteWise can't process your request right now. Try again later."
+                .to_string(),
+        },
     ))
 }
 

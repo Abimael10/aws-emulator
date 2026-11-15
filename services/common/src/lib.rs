@@ -426,6 +426,11 @@ pub mod front_door;
 /// `greengrass` — the 2017-06-07 and 2020-11-30 API versions of one product, which AWS
 /// serves from one endpoint and tells apart by the `restJson1` route a request addresses.
 pub mod greengrass;
+/// The ONE framing seam between an H.264 byte stream and the MP4 file that carries it —
+/// the length-prefixed samples a track holds, the parameter sets its configuration record
+/// states, and the Annex B form a decoder reads back — for every service that renders or
+/// re-renders video in this process.
+pub mod h264_mp4;
 pub mod iam_authorization;
 /// The ONE reading of the published form of an IAM entity PATH, for every service that takes
 /// one or builds one — the form IAM's own `pathType` publishes in prose and that its

@@ -139,6 +139,8 @@ use crate::ops::types::{
 //   capture records an asset's samples live in.
 // * `capture_ingest` — how an import's `mp4` files become the video a
 //   workspace's capture sources hold.
+// * `capture_rendering` — the other side of that: the output format a read of
+//   that video asks for, applied to the media it answers with.
 // * `workspace_records` — the gateway-capability, dataset, data-segment,
 //   workspace and compute-node-execution records.
 // * `pipeline_task_records` — the pipeline, portal, project, access-policy,
@@ -165,6 +167,7 @@ mod asset_model_settle;
 mod assistant;
 mod asset_records;
 mod capture_ingest;
+mod capture_rendering;
 mod computation_models;
 mod id_references;
 mod jobs;
@@ -180,6 +183,7 @@ pub use asset_model_settle::*;
 pub use asset_records::*;
 pub use assistant::*;
 pub use capture_ingest::*;
+pub use capture_rendering::*;
 pub use computation_models::*;
 pub use id_references::*;
 pub use jobs::*;

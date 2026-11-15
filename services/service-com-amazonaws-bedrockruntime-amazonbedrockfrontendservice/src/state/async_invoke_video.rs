@@ -30,8 +30,6 @@
 //! submitted `modelInput` configured (a provider's `dimension`, or its `resolution` and
 //! `aspect_ratio`), and the file's duration is the one it asked for.
 
-use ::std::io::Cursor;
-
 use ::font8x8::legacy::BASIC_LEGACY;
 
 /// The object name a finished video invocation writes its generated media to, under the
@@ -247,7 +245,7 @@ pub fn render(plan: &VideoPlan, subject: &VideoSubject) -> Result<Vec<u8>, Strin
     let frames = plan.frames();
     let total_millis = u64::from(plan.duration_seconds).saturating_mul(1_000);
     let annex_b = encode_frames(&plan, subject, frames)?;
-    let units = nal_units(&annex_b);
+    let units = ::service_common::h264_mp4::annex_b_units(&annex_b);
     mux(&plan, &units, frames, total_millis)
 }
 
@@ -453,183 +451,57 @@ fn write_line(plane: &mut [u8], frame: Frame, line: &str, at: (usize, usize), sc
     }
 }
 
-/// One network abstraction layer unit of an H.264 stream: its type, and its payload with
-/// no start code.
-#[derive(Debug, Clone)]
-struct NalUnit<'a> {
-    /// The `nal_unit_type` field, which is what says whether the unit is a parameter set
-    /// or a coded picture.
-    kind: u8,
-    bytes: &'a [u8],
-}
-
-/// Split an Annex B byte stream into its units.
-///
-/// Annex B delimits each unit with a three- or four-byte start code and nothing else, which
-/// is the whole framing: the units are handed to the MP4 writer, which frames them by
-/// length instead.
-fn nal_units(stream: &[u8]) -> Vec<NalUnit<'_>> {
-    // Where each unit's own bytes begin, which is just past its start code.
-    let mut payloads: Vec<usize> = Vec::new();
-    let mut at = 0usize;
-    while at + 3 <= stream.len() {
-        if stream[at..at + 3] == [0, 0, 1] {
-            payloads.push(at + 3);
-            at += 3;
-        } else {
-            at += 1;
-        }
-    }
-    let mut units = Vec::with_capacity(payloads.len());
-    for (index, payload) in payloads.iter().enumerate() {
-        let end = payloads
-            .get(index + 1)
-            .map_or(stream.len(), |next| trimmed_end(stream, *next - 3));
-        let bytes = &stream[*payload..end.max(*payload)];
-        if let Some(header) = bytes.first() {
-            units.push(NalUnit {
-                kind: header & 0x1F,
-                bytes,
-            });
-        }
-    }
-    units
-}
-
-/// Where a unit ends when the next start code is a four-byte one: the leading zero of
-/// `00 00 00 01` belongs to the delimiter, not to the unit before it.
-fn trimmed_end(stream: &[u8], next_start: usize) -> usize {
-    if next_start > 0 && stream.get(next_start - 1) == Some(&0) {
-        next_start - 1
-    } else {
-        next_start
-    }
-}
-
-/// Whether a unit is a coded slice of a picture, which is what starts a new sample.
-fn is_picture(kind: u8) -> bool {
-    (1..=5).contains(&kind)
-}
-
-/// The `nal_unit_type` of a coded slice of an instantaneous decoding refresh picture: the
-/// unit a player may start decoding at, which is what an MP4 sample reports as a sync
-/// sample.
-const IDR_PICTURE: u8 = 5;
-
 /// Write the encoded units into an MP4 file with one video track of `frames` samples
 /// spanning `total_millis`.
 fn mux(
     plan: &VideoPlan,
-    units: &[NalUnit<'_>],
+    units: &[::service_common::h264_mp4::NalUnit<'_>],
     frames: u32,
     total_millis: u64,
 ) -> Result<Vec<u8>, String> {
-    let parameter_set = |kind: u8| {
-        units
-            .iter()
-            .find(|unit| unit.kind == kind)
-            .map(|unit| unit.bytes.to_vec())
-    };
-    let (Some(seq_param_set), Some(pic_param_set)) = (parameter_set(7), parameter_set(8)) else {
+    let (Some(seq_param_set), Some(pic_param_set)) = (
+        ::service_common::h264_mp4::parameter_set(
+            units,
+            ::service_common::h264_mp4::SEQUENCE_PARAMETER_SET,
+        ),
+        ::service_common::h264_mp4::parameter_set(
+            units,
+            ::service_common::h264_mp4::PICTURE_PARAMETER_SET,
+        ),
+    ) else {
         return Err("the encoded stream carries no parameter sets".to_string());
     };
-    let samples = samples(units);
+    let samples = ::service_common::h264_mp4::avcc_samples(units);
     if samples.is_empty() {
         return Err("the encoded stream carries no coded picture".to_string());
     }
-    let config = ::mp4::Mp4Config {
-        major_brand: ::mp4::FourCC::from(*b"isom"),
-        minor_version: 512,
-        compatible_brands: ::std::vec![
-            ::mp4::FourCC::from(*b"isom"),
-            ::mp4::FourCC::from(*b"iso2"),
-            ::mp4::FourCC::from(*b"avc1"),
-            ::mp4::FourCC::from(*b"mp41"),
-        ],
+    let track = ::service_common::h264_mp4::VideoTrack {
+        width: u16::try_from(plan.width).unwrap_or(u16::MAX),
+        height: u16::try_from(plan.height).unwrap_or(u16::MAX),
         timescale: TIMESCALE,
+        seq_param_set,
+        pic_param_set,
     };
-    let mut writer = ::mp4::Mp4Writer::write_start(Cursor::new(Vec::new()), &config)
-        .map_err(|error| format!("the MP4 writer could not be started: {error}"))?;
-    let track = ::mp4::TrackConfig {
-        track_type: ::mp4::TrackType::Video,
-        timescale: TIMESCALE,
-        language: "und".to_string(),
-        media_conf: ::mp4::MediaConfig::AvcConfig(::mp4::AvcConfig {
-            width: u16::try_from(plan.width).unwrap_or(u16::MAX),
-            height: u16::try_from(plan.height).unwrap_or(u16::MAX),
-            seq_param_set,
-            pic_param_set,
-        }),
-    };
-    writer
-        .add_track(&track)
-        .map_err(|error| format!("the MP4 writer refused the video track: {error}"))?;
     // The samples span exactly the configured length: each one lasts the same, and the last
     // carries whatever the division left over, so the file's duration is the request's.
     let count = u64::from(frames).max(samples.len() as u64);
     let each = total_millis.checked_div(count).unwrap_or(0).max(1);
-    let mut start_time = 0u64;
+    let mut written = 0u64;
+    let mut timed = Vec::with_capacity(samples.len());
     for (index, sample) in samples.iter().enumerate() {
         let last = index + 1 == samples.len();
         let duration = if last {
-            total_millis.saturating_sub(start_time).max(1)
+            total_millis.saturating_sub(written).max(1)
         } else {
             each
         };
-        writer
-            .write_sample(
-                1,
-                &::mp4::Mp4Sample {
-                    start_time,
-                    duration: u32::try_from(duration).unwrap_or(u32::MAX),
-                    rendering_offset: 0,
-                    is_sync: sample.sync,
-                    bytes: ::bytes::Bytes::from(sample.bytes.clone()),
-                },
-            )
-            .map_err(|error| format!("a sample could not be written: {error}"))?;
-        start_time = start_time.saturating_add(duration);
+        written = written.saturating_add(duration);
+        timed.push(::service_common::h264_mp4::TimedSample {
+            sample: sample.clone(),
+            duration: u32::try_from(duration).unwrap_or(u32::MAX),
+        });
     }
-    writer
-        .write_end()
-        .map_err(|error| format!("the MP4 file could not be finished: {error}"))?;
-    Ok(writer.into_writer().into_inner())
-}
-
-/// One coded picture as an MP4 track carries it.
-struct Sample {
-    /// Its units, each framed by its length rather than by a start code.
-    bytes: Vec<u8>,
-    /// Whether a player may start decoding here, which holds for a refresh picture.
-    sync: bool,
-}
-
-/// One sample per coded picture, in the length-prefixed framing an MP4 track carries:
-/// every unit that is not a parameter set, with the units that precede a picture attached
-/// to it.
-fn samples(units: &[NalUnit<'_>]) -> Vec<Sample> {
-    let mut samples: Vec<Sample> = Vec::new();
-    let mut pending: Vec<u8> = Vec::new();
-    for unit in units {
-        if unit.kind == 7 || unit.kind == 8 {
-            continue;
-        }
-        let length = u32::try_from(unit.bytes.len()).unwrap_or(u32::MAX);
-        pending.extend_from_slice(&length.to_be_bytes());
-        pending.extend_from_slice(unit.bytes);
-        if is_picture(unit.kind) {
-            samples.push(Sample {
-                bytes: ::std::mem::take(&mut pending),
-                sync: unit.kind == IDR_PICTURE,
-            });
-        }
-    }
-    if !pending.is_empty() {
-        if let Some(last) = samples.last_mut() {
-            last.bytes.extend_from_slice(&pending);
-        }
-    }
-    samples
+    ::service_common::h264_mp4::mux_avc(&track, &timed)
 }
 
 #[cfg(test)]
@@ -813,7 +685,7 @@ mod tests {
                 bytes.len()
             );
             let size = bytes.len() as u64;
-            let file = ::mp4::Mp4Reader::read_header(Cursor::new(bytes), size)
+            let file = ::mp4::Mp4Reader::read_header(::std::io::Cursor::new(bytes), size)
                 .unwrap_or_else(|error| panic!("case {case:?}: not a readable MP4: {error}"));
             let track = file
                 .tracks()

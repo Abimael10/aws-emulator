@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-// Single integration-test target for the router: one `#[path = "all/<name>.rs"]` /
-// `mod <name>;` pair per file under `tests/all/`, sorted by name, and no other line.
-// `all/all_rs_carries_no_inner_doc_comment.rs`, `all/all_rs_declares_each_suite_once.rs`,
-// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
-// `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`
-// pin that shape; `all/appended_prose.rs` keeps what landings had appended here.
-// Single integration-test target for the router: the declaration list, and nothing else.
-//
-// Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
 // Single integration-test target for the router: the canonical DECLARATION LIST of every
 // cross-service suite under `tests/all/`, and nothing else.
+//
 // Single integration-test target for the router: a declaration list, and nothing else.
 // This file holds this header and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair
 // per suite file under `tests/all/`, sorted by name, and no other line. Put a new suite at
@@ -43,6 +35,7 @@
 // test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of it, which the layout
 // check refuses: the `#[path]` above each `mod` is what points it into `tests/all/`.
 // Suites of this target pin all of that rather than restate it:
+// Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
 // suite file, sorted by name, and no other line — no prose between the pairs, no blank line,
 // and nothing after the last pair. Two branches landing at once then insert two lines in two
 // places and have no prose to duplicate, re-word or mistype, which is what had gone wrong
@@ -69,6 +62,8 @@
 // this header that kept arriving in its tail had done. With none anywhere below this block, no
 // merge of two landings can leave one there.
 // note about THIS file belongs in `all/appended_notes.rs`. The suites
+// `all/all_rs_carries_no_inner_doc_comment.rs`, `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
 // `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs` and
 // `all/declaration_roots_are_canonical_and_complete.rs` check all of the above, for this file
 // The header paragraphs above wrap without the indentation `clippy::doc_lazy_continuation`
@@ -117,6 +112,8 @@ mod apigateway_cognito_authorizer_app_client_audience;
 mod apigateway_cognito_authorizer_spares_the_proxy_lambda;
 #[path = "all/apigateway_cognito_user_pools_authorizer.rs"]
 mod apigateway_cognito_user_pools_authorizer;
+#[path = "all/apigateway_custom_domain_dns_alias.rs"]
+mod apigateway_custom_domain_dns_alias;
 #[path = "all/apigateway_dynamodb_service_integration.rs"]
 mod apigateway_dynamodb_service_integration;
 #[path = "all/apigateway_iam_authenticated_invoke.rs"]
@@ -385,6 +382,8 @@ mod cloudformation_provisions_appsync_resources;
 mod cloudformation_provisions_backup_resources;
 #[path = "all/cloudformation_provisions_batch_resources.rs"]
 mod cloudformation_provisions_batch_resources;
+#[path = "all/cloudformation_provisions_bedrock_flows.rs"]
+mod cloudformation_provisions_bedrock_flows;
 #[path = "all/cloudformation_provisions_bedrock_guardrails.rs"]
 mod cloudformation_provisions_bedrock_guardrails;
 #[path = "all/cloudformation_provisions_braket_spending_limits.rs"]
@@ -809,6 +808,8 @@ mod eks_logging_update_reaches_cloudwatch_logs;
 mod eks_nodegroup_capacity;
 #[path = "all/eks_nodegroup_lifecycle_convergence.rs"]
 mod eks_nodegroup_lifecycle_convergence;
+#[path = "all/eks_nodegroup_nodes_join_the_cluster_api.rs"]
+mod eks_nodegroup_nodes_join_the_cluster_api;
 #[path = "all/eks_pod_identity_role_trust.rs"]
 mod eks_pod_identity_role_trust;
 #[path = "all/eks_service_cidr_vpc_overlap.rs"]

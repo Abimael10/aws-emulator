@@ -60,6 +60,22 @@ service-common = { path = "../common" }
 # media reader: the span a stored segment covers is the duration the media itself
 # declares rather than a guess.
 mp4 = "0.14"
+# The H.264 codec the output format a read of capture data asks for is really rendered
+# with (`src/state/capture_rendering.rs`): the stored media's pictures are DECODED and
+# ENCODED again at the requested rate and geometry rather than the settings being dropped.
+# `openh264` is a NATIVE component: its `-sys` crate compiles the bundled Cisco C++ sources
+# with `cc` at build time (as `aws-lc-sys` already does here, and as the Amazon Bedrock
+# Runtime crate takes this same codec for its rendered video), and it is a library
+# computing over frames in-process — it opens no listener, starts no process, reads no file
+# and makes no outbound connection. The work one request can ask of it is bounded before
+# any of it starts (`MAX_RENDERED_FRAMES`, `MAX_RENDERED_FRAME_PIXELS`,
+# `MAX_RENDERED_PIXELS`) and runs on the blocking pool under a wall-clock ceiling.
+openh264 = "0.9"
+# Resamples a decoded picture to the geometry that read asked its output to be, through the
+# maintained resampler this workspace already scales frames with (the Kinesis Video Streams
+# reader among them). `default-features = false`: no image FORMAT is wanted here, only the
+# resampler, so none of its codecs is built.
+image = { version = "0.25", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -207,6 +207,13 @@ rustls = { workspace = true }
 # that handshake sends: the maintained PEM reader this tree already reads certificate
 # material with, rather than a hand-written framing reader.
 rustls-pemfile = "2"
+# `h264_mp4`: the MP4 file an H.264 byte stream is written into, and the track a
+# stored file's samples are read out of — through the maintained ISO base media
+# implementation this workspace already reads and writes those containers with,
+# rather than a second laying-out of the boxes.
+mp4 = "0.14"
+# ... and the buffer type that writer takes one sample's bytes as.
+bytes = { workspace = true }
 
 [dev-dependencies]
 # `acm_certificate_termination`'s own cases load REAL certificate material, minted by the
