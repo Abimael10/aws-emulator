@@ -326,6 +326,10 @@ struct Row {
     access_key_id: String,
     /// The principal the entry must name.
     expected_principal: String,
+    /// The username the entry must authenticate as: the principal itself for an
+    /// IAM user, which presents its own credential, and the assumed-role form for
+    /// a ROLE, which authenticates as a session of itself.
+    expected_username: String,
     /// Whether that principal is also what `sts:GetCallerIdentity` reports for the
     /// same credential: it is, except for a role session, whose own ARN no access
     /// entry may carry.
@@ -353,6 +357,7 @@ async fn the_bootstrap_access_entry_names_the_principal_the_create_was_signed_by
             case: "the account's own published credential",
             cluster: "creator-ambient",
             access_key_id: AMBIENT_KEY.to_string(),
+            expected_username: ambient_principal.clone(),
             expected_principal: ambient_principal,
             agrees_with_sts: true,
         },
@@ -360,6 +365,7 @@ async fn the_bootstrap_access_entry_names_the_principal_the_create_was_signed_by
             case: "an IAM user's own long-term access key",
             cluster: "creator-user",
             access_key_id: user_key,
+            expected_username: user_arn.clone(),
             expected_principal: user_arn,
             agrees_with_sts: true,
         },
@@ -367,6 +373,13 @@ async fn the_bootstrap_access_entry_names_the_principal_the_create_was_signed_by
             case: "an assumed-role session of a role under a path",
             cluster: "creator-session",
             access_key_id: role_session_key,
+            // A session principal names the role by its NAME, without the path
+            // the role itself is addressed under, and the session's own name is
+            // the request's to fill in.
+            expected_username: format!(
+                "arn:aws:sts::{}:assumed-role/ClusterCreatorRole/{{{{SessionName}}}}",
+                engine::emulator_account_id()
+            ),
             expected_principal: role_arn.clone(),
             agrees_with_sts: false,
         },
@@ -378,6 +391,7 @@ async fn the_bootstrap_access_entry_names_the_principal_the_create_was_signed_by
             cluster,
             access_key_id,
             expected_principal,
+            expected_username,
             agrees_with_sts,
         } = row;
 
@@ -422,8 +436,9 @@ async fn the_bootstrap_access_entry_names_the_principal_the_create_was_signed_by
         );
         assert_eq!(
             described["accessEntry"]["username"].as_str(),
-            Some(expected_principal.as_str()),
-            "case {case:?}: the entry must authenticate as its principal, got {described}"
+            Some(expected_username.as_str()),
+            "case {case:?}: the entry must authenticate as the identity its principal \
+             presents, got {described}"
         );
 
         if *agrees_with_sts {

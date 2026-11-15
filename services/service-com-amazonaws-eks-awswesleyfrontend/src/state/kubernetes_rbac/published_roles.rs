@@ -351,26 +351,45 @@ pub(super) const ADMIN_VIEW_RULES: &[PublishedRule] = &[PublishedRule {
     non_resource_urls: &[],
 }];
 
-/// `system:discovery`: the discovery documents every authenticated client reads
-/// before anything else, which Kubernetes binds to `system:authenticated`.
-pub(super) const DISCOVERY_RULES: &[PublishedRule] = &[PublishedRule {
-    api_groups: &[],
-    resources: &[],
-    verbs: &["get"],
-    non_resource_urls: &[
-        "/api",
-        "/api/*",
-        "/apis",
-        "/apis/*",
-        "/healthz",
-        "/livez",
-        "/openapi",
-        "/openapi/*",
-        "/readyz",
-        "/version",
-        "/version/",
-    ],
-}];
+/// The permissions Kubernetes binds to `system:authenticated` on every cluster:
+/// the two ClusterRoles it binds to that group — `system:discovery`, the
+/// discovery documents every authenticated client reads before anything else, and
+/// `system:basic-user`, "allows a user read-only access to basic information
+/// about themselves", which is what lets a client ask the API server which
+/// identity it is serving it as
+/// ([`super::kubernetes_self_subject_review`]).
+pub(super) const AUTHENTICATED_GROUP_RULES: &[PublishedRule] = &[
+    PublishedRule {
+        api_groups: &[],
+        resources: &[],
+        verbs: &["get"],
+        non_resource_urls: &[
+            "/api",
+            "/api/*",
+            "/apis",
+            "/apis/*",
+            "/healthz",
+            "/livez",
+            "/openapi",
+            "/openapi/*",
+            "/readyz",
+            "/version",
+            "/version/",
+        ],
+    },
+    PublishedRule {
+        api_groups: &["authentication.k8s.io"],
+        resources: &["selfsubjectreviews"],
+        verbs: &["create"],
+        non_resource_urls: &[],
+    },
+    PublishedRule {
+        api_groups: &["authorization.k8s.io"],
+        resources: &["selfsubjectaccessreviews", "selfsubjectrulesreviews"],
+        verbs: &["create"],
+        non_resource_urls: &[],
+    },
+];
 
 /// The permissions the EKS access policy `policy_name` grants, or `None` for a
 /// published policy whose permissions this emulator does not state.
@@ -399,7 +418,7 @@ pub fn access_policy_rules(policy_name: &str) -> Option<&'static [PublishedRule]
 pub(super) fn published_group_rules(group: &str) -> Option<&'static [PublishedRule]> {
     match group {
         MASTERS_GROUP => Some(CLUSTER_ADMIN_RULES),
-        AUTHENTICATED_GROUP => Some(DISCOVERY_RULES),
+        AUTHENTICATED_GROUP => Some(AUTHENTICATED_GROUP_RULES),
         _ => None,
     }
 }

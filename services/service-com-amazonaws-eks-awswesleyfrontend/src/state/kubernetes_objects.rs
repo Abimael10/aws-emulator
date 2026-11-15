@@ -170,20 +170,50 @@ pub struct ServiceAccountObject {
 }
 
 /// How long a pod that has been bound to a node reports `Pending` before the
-/// clock owes it `Running`.
+/// clock owes it the phase it ENDS in.
 ///
-/// A pod is scheduled by the control plane and then STARTED on the node it was
+/// A pod is scheduled by the control plane and then handed to the node it was
 /// bound to, so the move is owed a span rather than being instant: a client that
-/// reads the pod straight after creating it sees the phase a pod that has not
-/// started yet is in. The span is the one this service owes its other
+/// reads the pod straight after creating it sees the phase a pod the node has not
+/// taken yet is in. The span is the one this service owes its other
 /// asynchronous moves ([`UPDATE_COMPLETION_DELAY`]), it is non-zero, and the due
 /// instant is stored on the pod — nothing sleeps for it.
 pub const POD_START_DELAY: Duration = UPDATE_COMPLETION_DELAY;
 
-/// The `Pod$status.phase` a pod reports before its containers have started.
+/// The `Pod$status.phase` a pod reports before the node has taken it.
 pub const POD_PHASE_PENDING: &str = "Pending";
-/// The phase a pod whose containers have started reports.
-pub const POD_PHASE_RUNNING: &str = "Running";
+
+/// The phase a pod whose containers were never started ends in: "all containers
+/// in the pod have terminated, and at least one container has terminated in
+/// failure" — the terminal phase, which is what a client polling for one reaches.
+///
+/// A pod's work is a CONTAINER IMAGE, and this emulator has no runtime for one:
+/// "containers and external processes are not available to a generated emulator
+/// yet" (`vendor/engine`'s module documentation), which also forbids reporting a
+/// result for work nothing performed. So the start the node would have done never
+/// happens, no retry could make it happen, and the pod ends in the phase
+/// Kubernetes reports for containers that terminated without running — with the
+/// runtime's own reason for a container it could not start
+/// ([`POD_START_ERROR_REASON`]) and the sentence naming that condition
+/// ([`POD_NO_CONTAINER_RUNTIME_MESSAGE`]) rather than a phase, an exit status or a
+/// duration invented for a run.
+pub const POD_PHASE_FAILED: &str = "Failed";
+
+/// The `reason` a container runtime reports for a container it could not START,
+/// which the pod carries beside it.
+pub const POD_START_ERROR_REASON: &str = "StartError";
+
+/// What a pod of this emulator ends with: the condition that stopped it, naming
+/// nothing from the pod itself.
+pub const POD_NO_CONTAINER_RUNTIME_MESSAGE: &str =
+    "This emulator does not run containers, so the pod's containers were never started";
+
+/// The code a container runtime reports for a container it could not start.
+///
+/// `ContainerStateTerminated$exitCode` is a required member, so a container that
+/// terminated reports one; this is the start-failure code the runtime reports for
+/// a container that never ran, not an exit status of anything that did.
+const POD_START_ERROR_EXIT_CODE: i64 = 128;
 
 /// One pod object: what the create admitted, the node the cluster scheduled it
 /// on, and the phase it has reached there.
@@ -213,13 +243,13 @@ pub struct PodObject {
     pub node_name: Option<String>,
     /// The phase the pod has reached, a `Pod$status.phase` value.
     pub phase: String,
-    /// When set, the instant at which the clock owes this pod the move from
-    /// `Pending` to `Running` on the node it was bound to. Cleared once the move
-    /// is materialised.
-    pub running_at: Option<SystemTime>,
-    /// The instant the pod's containers started, which is what
-    /// `status.startTime` and each container's `state.running.startedAt` report.
-    /// `None` until the clock owes that move.
+    /// When set, the instant at which the clock owes this pod the move out of
+    /// `Pending` on the node it was bound to. Cleared once the move is
+    /// materialised.
+    pub concludes_at: Option<SystemTime>,
+    /// The instant the node took the pod, which is what `status.startTime`
+    /// reports ("when the object was acknowledged by the Kubelet") and when its
+    /// containers' start was attempted. `None` until the clock owes that move.
     pub started_at: Option<SystemTime>,
 }
 
@@ -230,23 +260,27 @@ impl PodObject {
     ///
     /// The due instant is computed from the two stored instants — the pod's
     /// creation and the node's join — rather than from the call that bound it, so
-    /// the pod reports the same start time to every caller.
+    /// the pod reports the same instants to every caller.
     pub fn bind_to(&mut self, node: &super::kubernetes_nodes::ClusterNode) {
         self.spec["nodeName"] = ::serde_json::json!(node.name);
         self.node_name = Some(node.name.clone());
-        self.running_at = Some(self.created_at.max(node.joined_at) + POD_START_DELAY);
+        self.concludes_at = Some(self.created_at.max(node.joined_at) + POD_START_DELAY);
     }
 
     /// Unbind this pod from the node it was bound to, which is what the cluster
     /// no longer holding that node leaves it as: a pod waiting for capacity, in
-    /// the phase a pod that has not started is in.
+    /// the phase a pod no node has taken is in.
+    ///
+    /// Nothing of its stay on that node is history to keep: no container of it
+    /// ever ran there ([`POD_PHASE_FAILED`]), so the pod is one waiting for
+    /// capacity again rather than a workload on capacity that is gone.
     pub fn unbind(&mut self) {
         if let Some(spec) = self.spec.as_object_mut() {
             spec.remove("nodeName");
         }
         self.node_name = None;
         self.phase = POD_PHASE_PENDING.to_string();
-        self.running_at = None;
+        self.concludes_at = None;
         self.started_at = None;
     }
 
@@ -256,27 +290,27 @@ impl PodObject {
     /// instant whether or not anybody called, so applying it on a read does not
     /// change what a later caller sees. `started_at` is the DUE instant rather
     /// than the instant of the call that noticed it, so every caller reads the
-    /// same start time.
+    /// same instants.
     pub fn materialize_due_transitions(&mut self, now: SystemTime) {
-        if let Some(due) = self.running_at.filter(|due| now >= *due) {
-            self.phase = POD_PHASE_RUNNING.to_string();
+        if let Some(due) = self.concludes_at.filter(|due| now >= *due) {
+            self.phase = POD_PHASE_FAILED.to_string();
             self.started_at = Some(due);
-            self.running_at = None;
+            self.concludes_at = None;
         }
     }
 
-    /// Whether the pod's containers have started.
+    /// Whether the pod has reached the phase it ends in.
     #[must_use]
-    pub fn is_running(&self) -> bool {
-        self.phase == POD_PHASE_RUNNING
+    pub fn has_concluded(&self) -> bool {
+        self.phase == POD_PHASE_FAILED
     }
 
     /// The containers the pod's spec declares, as `status.containerStatuses`
-    /// reports them: one entry per container, ready and started exactly when the
-    /// pod itself is running.
+    /// reports them: one entry per container, each terminated without having run
+    /// once the node has tried to start it, and waiting to be created until then.
     fn container_statuses(&self) -> Vec<::serde_json::Value> {
-        let running = self.is_running();
-        let started_at = self.started_at.map(rfc3339_seconds);
+        let concluded = self.has_concluded();
+        let finished_at = self.started_at.map(rfc3339_seconds);
         self.spec
             .get("containers")
             .and_then(::serde_json::Value::as_array)
@@ -292,10 +326,15 @@ impl PodObject {
                     .get("image")
                     .and_then(::serde_json::Value::as_str)
                     .unwrap_or_default();
-                let state = match (running, started_at.as_ref()) {
-                    (true, Some(at)) => {
-                        ::serde_json::json!({ "running": { "startedAt": at } })
-                    }
+                let state = match (concluded, finished_at.as_ref()) {
+                    (true, Some(at)) => ::serde_json::json!({
+                        "terminated": {
+                            "reason": POD_START_ERROR_REASON,
+                            "message": POD_NO_CONTAINER_RUNTIME_MESSAGE,
+                            "exitCode": POD_START_ERROR_EXIT_CODE,
+                            "finishedAt": at,
+                        }
+                    }),
                     _ => ::serde_json::json!({
                         "waiting": { "reason": "ContainerCreating" }
                     }),
@@ -312,8 +351,10 @@ impl PodObject {
                     // rather than left out because the member is a required one
                     // of the status a client deserialises.
                     "imageID": "",
-                    "ready": running,
-                    "started": running,
+                    // A container that never ran is neither ready nor started,
+                    // whatever phase the pod has reached.
+                    "ready": false,
+                    "started": false,
                     "restartCount": 0,
                     "state": state,
                 })
@@ -324,7 +365,7 @@ impl PodObject {
     /// The pod's `status`, computed from the phase it has reached and the node it
     /// was bound to.
     fn status_json(&self) -> ::serde_json::Value {
-        let running = self.is_running();
+        let concluded = self.has_concluded();
         let scheduled_at = rfc3339_seconds(self.created_at);
         let statuses = self.container_statuses();
         let unready: Vec<&str> = statuses
@@ -354,22 +395,20 @@ impl PodObject {
                 .started_at
                 .map(rfc3339_seconds)
                 .unwrap_or_else(|| scheduled_at.clone());
-            let readiness = if unready.is_empty() && running {
-                ::serde_json::json!({ "status": "True" })
-            } else {
-                ::serde_json::json!({
-                    "status": "False",
-                    "reason": "ContainersNotReady",
-                    "message": format!("containers with unready status: [{}]", unready.join(" ")),
-                })
-            };
+            let readiness = ::serde_json::json!({
+                "status": "False",
+                "reason": "ContainersNotReady",
+                "message": format!("containers with unready status: [{}]", unready.join(" ")),
+            });
             for condition in ["Initialized", "ContainersReady", "Ready"] {
                 let mut entry = ::serde_json::json!({
                     "type": condition,
                     "lastTransitionTime": started_at,
                 });
+                // A pod the node has taken was initialized, whatever became of
+                // its containers; a pod it has not is not initialized yet.
                 let state = if condition == "Initialized" {
-                    ::serde_json::json!({ "status": if running { "True" } else { "False" } })
+                    ::serde_json::json!({ "status": if concluded { "True" } else { "False" } })
                 } else {
                     readiness.clone()
                 };
@@ -388,6 +427,12 @@ impl PodObject {
         });
         if let Some(started_at) = self.started_at {
             status["startTime"] = ::serde_json::json!(rfc3339_seconds(started_at));
+        }
+        // What a pod ENDED on, which is the pod-level reading of what its
+        // containers report ([`POD_PHASE_FAILED`]).
+        if concluded {
+            status["reason"] = ::serde_json::json!(POD_START_ERROR_REASON);
+            status["message"] = ::serde_json::json!(POD_NO_CONTAINER_RUNTIME_MESSAGE);
         }
         status
     }
@@ -656,7 +701,7 @@ impl ClusterObjects {
                 spec,
                 node_name: None,
                 phase: POD_PHASE_PENDING.to_string(),
-                running_at: None,
+                concludes_at: None,
                 started_at: None,
             },
         );

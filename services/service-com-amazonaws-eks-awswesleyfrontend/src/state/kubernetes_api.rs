@@ -47,9 +47,10 @@
 //! server serves one, in that order:
 //!
 //! 1. the credential the request presents names an IAM principal, and the cluster's
-//!    ACCESS ENTRY for that principal is the Kubernetes identity the request is
-//!    served as ([`super::kubernetes_authentication`]); a principal no entry names
-//!    authenticates as nobody;
+//!    own mapping for that principal — its ACCESS ENTRY, else the `aws-auth`
+//!    ConfigMap of a cluster whose mode includes `CONFIG_MAP` — is the Kubernetes
+//!    identity the request is served as ([`super::kubernetes_authentication`]); a
+//!    principal neither mapping names authenticates as nobody;
 //! 2. the cluster's RBAC objects and the access policies its entry associates decide
 //!    whether that identity may do what the request addresses
 //!    ([`super::kubernetes_rbac`]); one that may not is refused before anything is
@@ -93,6 +94,7 @@ use super::kubernetes_authentication::{self as authentication, ApiServerPrincipa
 use super::kubernetes_lists::ListRequest;
 use super::kubernetes_objects::{ApiRefusal, ClusterObjects};
 use super::kubernetes_rbac::{self as rbac, RbacResource};
+use super::kubernetes_self_subject_review as self_review;
 use super::pod_identity_plane::AuthPlane;
 use super::ComAmazonawsEksAwswesleyfrontendState as ServiceStore;
 
@@ -599,8 +601,9 @@ pub struct Served {
 ///
 /// The ONE place a Kubernetes request is served, so the published address and any
 /// later in-process caller answer identically. It is the API server's own sequence:
-/// the credential names an IAM principal, the cluster's ACCESS ENTRY maps that
-/// principal to a Kubernetes identity ([`authentication::authenticate`]), the RBAC
+/// the credential names an IAM principal, the cluster's own mapping for that
+/// principal — its access entry, else its `aws-auth` ConfigMap — is the Kubernetes
+/// identity the request is served as ([`authentication::authenticate`]), the RBAC
 /// objects and access policies decide whether that identity may do what the request
 /// addresses ([`rbac::admits`]), the request is routed only then, and the whole thing
 /// is recorded in the cluster's audit log.
@@ -635,13 +638,13 @@ pub fn serve(
         };
     };
     let access_key_id = authentication::presented_access_key_id(request.authorization);
-    let principal_arn =
-        access_key_id.and_then(|access_key_id| principals.principal_arn(&access_key_id, received_at));
+    let caller =
+        access_key_id.and_then(|access_key_id| principals.caller(&access_key_id, received_at));
 
-    let authenticated = match principal_arn {
-        Some(principal_arn) => {
+    let authenticated = match caller {
+        Some(caller) => {
             let store = state.lock();
-            authentication::authenticate(&store, key, &principal_arn)
+            authentication::authenticate(&store, key, &caller)
         }
         // A credential this server cannot read, and one naming a session that has run
         // out, both speak for nobody.
@@ -674,7 +677,10 @@ pub fn serve(
                     .map(|plane| rbac::admits(&plane.objects, &identity, &attributes))
             };
             match decided {
-                Ok(true) => (Some(identity), true, route(state, auth, key, request)),
+                Ok(true) => {
+                    let answer = route(state, auth, key, request, &identity);
+                    (Some(identity), true, answer)
+                }
                 Ok(false) => {
                     let refusal = attributes.forbidden(&identity.username);
                     (Some(identity), false, Err(refusal))
@@ -722,11 +728,16 @@ pub fn serve(
 
 /// Route one request the authorizer admitted to the objects that answer it: the HTTP
 /// status and the document, or the `Status` the API server refuses it with.
+///
+/// `identity` is who the request is served as, which one resource answers WITH:
+/// a `SelfSubjectReview` is the user information the API server has about the
+/// client that asked ([`super::kubernetes_self_subject_review`]).
 fn route(
     state: &::engine::ServiceState<ServiceStore>,
     auth: Option<&AuthPlane>,
     key: &(String, String),
     request: &ApiRequest<'_>,
+    identity: &rbac::SubjectIdentity,
 ) -> Result<(u16, ::serde_json::Value), ApiRefusal> {
     let ApiRequest {
         method,
@@ -762,12 +773,12 @@ fn route(
                 ::serde_json::json!({
                     "kind": "APIGroupList",
                     "apiVersion": super::kubernetes_objects::CORE_API_VERSION,
-                    "groups": [rbac::api_group_entry()],
+                    "groups": [rbac::api_group_entry(), self_review::api_group_entry()],
                 }),
             ));
         }
-        // The discovery documents of the one group beside the core API this server
-        // serves: a client reads them before it addresses the group at all.
+        // The discovery documents of the two groups beside the core API this server
+        // serves: a client reads them before it addresses a group at all.
         ["apis", group] if *group == rbac::RBAC_API_GROUP => {
             return Ok((200, rbac::api_group_document()));
         }
@@ -780,6 +791,33 @@ fn route(
             if *group == rbac::RBAC_API_GROUP && *version == rbac::RBAC_GROUP_VERSION =>
         {
             return route_rbac(state, key, request, rest, now);
+        }
+        ["apis", group] if *group == self_review::AUTHENTICATION_API_GROUP => {
+            return Ok((200, self_review::api_group_document()));
+        }
+        ["apis", group, version]
+            if *group == self_review::AUTHENTICATION_API_GROUP
+                && *version == self_review::AUTHENTICATION_GROUP_VERSION =>
+        {
+            return Ok((200, self_review::api_resource_list_document()));
+        }
+        // A client asks the API server which identity it is being served as by
+        // CREATING a self subject review, and the answer is that identity.
+        ["apis", group, version, resource]
+            if *group == self_review::AUTHENTICATION_API_GROUP
+                && *version == self_review::AUTHENTICATION_GROUP_VERSION
+                && *resource == self_review::SELF_SUBJECT_REVIEWS_RESOURCE =>
+        {
+            if method != ::http::Method::POST.as_str() {
+                return Err(ApiRefusal::method_not_allowed(method, path));
+            }
+            // The body is read as a manifest like every other create's, so a body
+            // this server cannot read is refused the way one is anywhere else;
+            // nothing in it decides the answer.
+            read_manifest(content_type, body)?;
+            let store = state.lock();
+            plane(&store, key)?;
+            return Ok((201, self_review::self_subject_review(identity)));
         }
         _ => {}
     }
@@ -807,13 +845,32 @@ fn route(
             // A cluster this store no longer holds answers nothing, as every
             // other path on this address does.
             plane(&store, key)?;
+            // The collection is chunked and label-selected like every other one
+            // this server lists ([`super::kubernetes_lists`]), which is how a
+            // client asks for the nodes of ONE node group.
+            let nodes = store.cluster_nodes(&key.0, &key.1);
+            let names: Vec<String> = nodes
+                .iter()
+                .filter_map(|node| {
+                    node.get("metadata")
+                        .and_then(|metadata| metadata.get("name"))
+                        .and_then(::serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect();
+            let listing = ListRequest::from_query(query)?;
             return Ok((
                 200,
-                ::serde_json::json!({
-                    "kind": "NodeList",
-                    "apiVersion": super::kubernetes_objects::CORE_API_VERSION,
-                    "metadata": {},
-                    "items": store.cluster_nodes(&key.0, &key.1),
+                super::kubernetes_lists::listed("NodeList", &names, &listing, |name| {
+                    nodes
+                        .iter()
+                        .find(|node| {
+                            node.get("metadata")
+                                .and_then(|metadata| metadata.get("name"))
+                                .and_then(::serde_json::Value::as_str)
+                                == Some(name)
+                        })
+                        .cloned()
                 }),
             ));
         }
@@ -910,6 +967,15 @@ fn route(
             if method == ::http::Method::GET.as_str() =>
         {
             Ok((200, objects.config_map_json(namespace, name)?))
+        }
+        (method, ["namespaces", namespace, "configmaps", name])
+            if method == ::http::Method::PUT.as_str() =>
+        {
+            let document = read_manifest(content_type, body)?;
+            Ok((
+                200,
+                objects.replace_config_map(namespace, name, &document)?,
+            ))
         }
         (method, ["namespaces", namespace, "serviceaccounts"])
             if method == ::http::Method::POST.as_str() =>
@@ -1040,6 +1106,10 @@ fn core_api_resource_list() -> ::serde_json::Value {
 
     let read = ["get", "list"];
     let read_create = ["create", "get", "list"];
+    // A ConfigMap is also UPDATED through this server: the mapping a cluster
+    // authenticates through is kept in one (`super::kubernetes_aws_auth`), and a
+    // client maintains it by replacing the object.
+    let read_create_update = ["create", "get", "list", "update"];
     ::serde_json::json!({
         "kind": "APIResourceList",
         "apiVersion": super::kubernetes_objects::CORE_API_VERSION,
@@ -1048,7 +1118,7 @@ fn core_api_resource_list() -> ::serde_json::Value {
             resource("namespaces", "Namespace", false, &["ns"], &read_create),
             resource("nodes", "Node", false, &["no"], &read),
             resource("pods", "Pod", true, &["po"], &read_create),
-            resource("configmaps", "ConfigMap", true, &["cm"], &read_create),
+            resource("configmaps", "ConfigMap", true, &["cm"], &read_create_update),
             resource(
                 "serviceaccounts",
                 "ServiceAccount",

@@ -137,6 +137,55 @@ impl ClusterObjects {
         self.config_map_json(namespace, &name)
     }
 
+    /// `PUT /api/v1/namespaces/{namespace}/configmaps/{name}`: replace what the
+    /// ConfigMap holds, keeping the identity the create minted for it — which is
+    /// what an update of an object does, and how the mapping a cluster
+    /// authenticates through is maintained
+    /// ([`super::kubernetes_aws_auth`]).
+    ///
+    /// The manifest is read and validated exactly as a create's is, so an update
+    /// cannot store what a create would have refused; a manifest naming a
+    /// different object than the path addresses is refused the way the API server
+    /// refuses one, before anything is written.
+    pub fn replace_config_map(
+        &mut self,
+        namespace: &str,
+        name: &str,
+        manifest: &::serde_json::Value,
+    ) -> Result<::serde_json::Value, ApiRefusal> {
+        let named = manifest_name(manifest, "ConfigMap")?;
+        if named != name {
+            return Err(ApiRefusal::bad_request(format!(
+                "the name of the object ({named}) does not match the name on the URL ({name})"
+            )));
+        }
+        let data = config_map_values(name, manifest, "data")?;
+        let binary_data = config_map_values(name, manifest, "binaryData")?;
+        let stored_bytes = stored_bytes(&data) + binary_stored_bytes(name, &binary_data)?;
+        if stored_bytes > MAX_CONFIG_MAP_BYTES {
+            return Err(ApiRefusal::invalid(format!(
+                "ConfigMap \"{name}\" is invalid: []: Too long: must have at most \
+                 {MAX_CONFIG_MAP_BYTES} bytes"
+            )));
+        }
+        let metadata = ObjectMetadata::from_manifest("ConfigMap", name, manifest)?;
+        let held = self
+            .namespaces
+            .get_mut(namespace)
+            .ok_or_else(|| ApiRefusal::not_found("namespaces", namespace))?;
+        let config_map = held
+            .config_maps
+            .get_mut(name)
+            .ok_or_else(|| ApiRefusal::not_found("configmaps", name))?;
+        // The object's own identity is the create's: a replace changes what it
+        // carries, not which object it is, so the uid and the creation instant
+        // stand.
+        config_map.metadata = metadata;
+        config_map.data = data;
+        config_map.binary_data = binary_data;
+        self.config_map_json(namespace, name)
+    }
+
     /// `GET /api/v1/namespaces/{namespace}/configmaps/{name}`.
     pub fn config_map_json(
         &self,

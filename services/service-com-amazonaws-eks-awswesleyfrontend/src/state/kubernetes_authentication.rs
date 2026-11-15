@@ -24,8 +24,13 @@
 //! emulated service does; this service never checks a signature, which is the
 //! emulator's own authentication layer's work.
 //!
-//! A principal NO access entry of the cluster names authenticates as nobody, and is
+//! A principal NEITHER mapping of the cluster names authenticates as nobody, and is
 //! answered the `401 Unauthorized` the API server answers a credential it cannot map.
+//!
+//! There are two mappings, and [`authenticate`] consults them in the order Amazon
+//! EKS does: the cluster's ACCESS ENTRIES, then its `aws-auth` ConfigMap for a
+//! cluster whose `authenticationMode` includes `CONFIG_MAP`
+//! ([`super::kubernetes_aws_auth`]).
 
 use super::kubernetes_objects::ApiRefusal;
 use super::kubernetes_rbac::{AccessPolicyGrant, SubjectIdentity};
@@ -76,21 +81,24 @@ impl ApiServerPrincipals {
         }
     }
 
-    /// The ARN of the IAM principal the access key id `access_key_id` speaks for,
-    /// and `None` for a credential that speaks for nobody — one naming a session
-    /// whose window has run out.
+    /// WHO the access key id `access_key_id` speaks for, and `None` for a
+    /// credential that speaks for nobody — one naming a session whose window has
+    /// run out.
     ///
     /// Reading only: no session is minted, moved or pruned here — a request to a
     /// cluster's API server is not what expires a credential. Call it with no store
     /// of THIS service held: it takes the other services' locks.
     #[must_use]
-    pub fn principal_arn(&self, access_key_id: &str, now: SystemTime) -> Option<String> {
+    pub fn caller(&self, access_key_id: &str, now: SystemTime) -> Option<ApiCaller> {
         // A request that presents NO credential names no session and no key any
         // registry holds, so it speaks for the identity this emulator publishes and
         // neither of the other services' stores is asked at all: the common request on
         // this address does not queue behind their locks.
         if access_key_id == no_credential_key_id() {
-            return Some(sts_store::long_term_identity(None, access_key_id).arn);
+            return Some(ApiCaller::of(
+                sts_store::long_term_identity(None, access_key_id).arn,
+                None,
+            ));
         }
         if let Some(sessions) = &self.sessions {
             let store = sessions.lock();
@@ -102,13 +110,14 @@ impl ApiServerPrincipals {
                 }
                 // "The temporary security credentials … have the permissions of the
                 // role": the permanent principal behind a role session is that role,
-                // and the role is what an access entry is filed under.
-                return Some(
-                    session
-                        .role_arn
-                        .clone()
-                        .unwrap_or_else(|| session.identity.arn.clone()),
-                );
+                // and the role is what an access entry is filed under. The session's
+                // OWN principal is what the caller presents, which is the identity
+                // the API server names it by.
+                let presented = session.identity.arn.clone();
+                return Some(ApiCaller::of(
+                    session.role_arn.clone().unwrap_or_else(|| presented.clone()),
+                    Some(presented),
+                ));
             }
         }
         let identity = match &self.identities {
@@ -117,7 +126,53 @@ impl ApiServerPrincipals {
             }
             None => sts_store::long_term_identity(None, access_key_id),
         };
-        Some(identity.arn)
+        Some(ApiCaller::of(identity.arn, None))
+    }
+}
+
+/// WHO one request to a cluster's Kubernetes API server speaks for.
+///
+/// Two ARNs, because an IAM principal and the identity it PRESENTS are not always
+/// the same: a role session's permanent principal is the role — the principal an
+/// access entry and an `aws-auth` mapping are filed under — while the identity it
+/// presents is the session itself, which is the name the API server knows it by
+/// ([`super::access_entry_usernames`]).
+#[derive(Debug, Clone)]
+pub struct ApiCaller {
+    /// The permanent IAM principal the credential speaks for: a role, an IAM
+    /// user, or whatever other principal the registries resolved it to.
+    pub principal_arn: String,
+    /// The name of the assumed-role session the credential was minted for, and
+    /// `None` for a long-term credential, which names no session.
+    pub session_name: Option<String>,
+    /// The account that principal belongs to, as its ARN names it.
+    pub account_id: String,
+}
+
+impl ApiCaller {
+    /// The caller behind `principal_arn`, which `presented_arn` is the session
+    /// principal of when the credential was a session's.
+    fn of(principal_arn: String, presented_arn: Option<String>) -> Self {
+        let session_name = presented_arn.as_deref().and_then(|presented| {
+            super::access_entry_usernames::assumed_role_session_name(presented)
+                .map(str::to_string)
+        });
+        Self {
+            account_id: super::access_entry_usernames::arn_account_id(&principal_arn).to_string(),
+            principal_arn,
+            session_name,
+        }
+    }
+
+    /// `template` as the username THIS caller authenticates under: the
+    /// placeholders Amazon EKS resolves per request, filled in from the
+    /// credential this request presented.
+    fn username(&self, template: &str) -> String {
+        super::access_entry_usernames::resolved_username(
+            template,
+            self.session_name.as_deref(),
+            &self.account_id,
+        )
     }
 }
 
@@ -169,33 +224,61 @@ fn no_credential_key_id() -> String {
     ::service_common::request_access_key_id(&parts)
 }
 
-/// The Kubernetes identity the cluster keyed `key` maps the IAM principal
-/// `principal_arn` to, or the `401 Unauthorized` a principal the cluster maps to
-/// nobody is answered with.
+/// The Kubernetes identity the cluster keyed `key` maps the calling IAM principal
+/// to, or the `401 Unauthorized` a principal the cluster maps to nobody is answered
+/// with.
+///
+/// The cluster has two mappings, and they are consulted in the order Amazon EKS
+/// consults them: the ACCESS ENTRY for the principal first, then — for a cluster
+/// whose `authenticationMode` includes `CONFIG_MAP` — the `aws-auth` ConfigMap
+/// ([`super::kubernetes_aws_auth`]). So an access entry for a principal takes
+/// precedence over a ConfigMap mapping of the same principal, and deleting that
+/// entry falls back to the ConfigMap; a cluster in `API` mode alone has no
+/// ConfigMap mapping to fall back to.
+///
+/// Either way the username is the mapping's own, with the placeholders Amazon EKS
+/// resolves per request filled in from the credential THIS request presented
+/// ([`ApiCaller::username`]).
 pub fn authenticate(
     store: &ServiceStore,
     key: &(String, String),
-    principal_arn: &str,
+    caller: &ApiCaller,
 ) -> Result<SubjectIdentity, ApiRefusal> {
-    let entry = store
-        .clusters
-        .get(key)
-        .and_then(|record| record.access_entries.get(principal_arn))
-        .ok_or_else(ApiRefusal::unauthorized)?;
-    let grants = entry
-        .associated_policies
-        .values()
-        .filter_map(|association| {
-            Some(AccessPolicyGrant {
-                policy_name: super::access_policy_name(&association.policy_arn)?.to_string(),
-                namespaces: (association.scope_type == super::ACCESS_SCOPE_TYPE_NAMESPACE)
-                    .then(|| association.namespaces.clone()),
+    let cluster = store.clusters.get(key).ok_or_else(ApiRefusal::unauthorized)?;
+    if let Some(entry) = cluster.access_entries.get(&caller.principal_arn) {
+        let grants = entry
+            .associated_policies
+            .values()
+            .filter_map(|association| {
+                Some(AccessPolicyGrant {
+                    policy_name: super::access_policy_name(&association.policy_arn)?.to_string(),
+                    namespaces: (association.scope_type == super::ACCESS_SCOPE_TYPE_NAMESPACE)
+                        .then(|| association.namespaces.clone()),
+                })
             })
-        })
-        .collect();
-    Ok(SubjectIdentity {
-        username: entry.username.clone(),
-        groups: SubjectIdentity::authenticated_groups(&entry.kubernetes_groups),
-        grants,
-    })
+            .collect();
+        return Ok(SubjectIdentity {
+            username: caller.username(&entry.username),
+            groups: SubjectIdentity::authenticated_groups(&entry.kubernetes_groups),
+            grants,
+        });
+    }
+    if cluster.authenticates_through_config_map() {
+        if let Some(mapping) = store
+            .kubernetes_api
+            .get(key)
+            .and_then(|plane| plane.objects.aws_auth_mapping(&caller.principal_arn))
+        {
+            return Ok(SubjectIdentity {
+                username: caller.username(&mapping.username),
+                groups: SubjectIdentity::authenticated_groups(&mapping.groups),
+                // The ConfigMap maps a principal to a username and groups and
+                // nothing else: EKS access policies are associated to an access
+                // ENTRY, so a principal mapped this way carries none and what it
+                // may do is decided by the cluster's own RBAC objects alone.
+                grants: Vec::new(),
+            });
+        }
+    }
+    Err(ApiRefusal::unauthorized())
 }

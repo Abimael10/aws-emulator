@@ -1359,24 +1359,33 @@ pub const DEFAULT_USERNAME_FARGATE: &str = "system:node:{{SessionName}}";
 /// The username an access entry reports when `CreateAccessEntry` is called without
 /// one.
 ///
-/// Every type other than the node types authenticates as the IAM principal itself,
-/// so the principal ARN is the username; the node types get the `system:node:`
-/// username for their platform (see [`DEFAULT_USERNAME_EC2_NODE`]).
+/// Every type other than the node types authenticates as the IAM principal ITSELF
+/// — as the identity that principal presents to the API server, which for an IAM
+/// user is its own ARN and for an IAM ROLE is the assumed-role session a caller
+/// signs with ([`assumed_role_session_username`]): a role cannot present itself.
+/// The node types get the `system:node:` username for their platform (see
+/// [`DEFAULT_USERNAME_EC2_NODE`]).
 ///
 /// Only the types whose `system:node:` username the user guide publishes are
 /// templated here — the self-managed Amazon EC2 ones and Fargate. `EC2` (EKS Auto
 /// Mode), `HYBRID_LINUX` and `HYPERPOD_LINUX` are node types for the purpose of
-/// [`is_node_access_entry_type`] (their principal must be a role) but no username
-/// template is published for them, so rather than invent one this reports the
-/// principal ARN, which is a username the principal really authenticates as.
+/// [`is_node_access_entry_type`] (their principal must be a role) but no
+/// `system:node:` username is published for them, so they get the username their
+/// principal authenticates as, like every other type here.
+///
+/// A `principal_arn` that is not an IAM user or role ARN is a principal no access
+/// entry can be filed under ([`parse_iam_principal_arn`]), and is reported back as
+/// written rather than rewritten into a session principal of something.
 pub fn default_username(entry_type: &str, principal_arn: &str) -> String {
     if is_self_managed_node_entry_type(entry_type) {
-        DEFAULT_USERNAME_EC2_NODE.to_string()
-    } else if entry_type == ACCESS_ENTRY_TYPE_FARGATE_LINUX {
-        DEFAULT_USERNAME_FARGATE.to_string()
-    } else {
-        principal_arn.to_string()
+        return DEFAULT_USERNAME_EC2_NODE.to_string();
     }
+    if entry_type == ACCESS_ENTRY_TYPE_FARGATE_LINUX {
+        return DEFAULT_USERNAME_FARGATE.to_string();
+    }
+    parse_iam_principal_arn(principal_arn)
+        .and_then(|principal| assumed_role_session_username(&principal))
+        .unwrap_or_else(|| principal_arn.to_string())
 }
 
 /// The Kubernetes group a node authenticates through: the group Kubernetes's own
@@ -1433,6 +1442,11 @@ pub const ACCOUNT_ID_DIGITS: usize = 12;
 /// The parts of an IAM principal ARN an access entry is keyed and named by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IamPrincipalArn<'a> {
+    /// The partition the principal's account is in, as the ARN spells it — what
+    /// every other ARN of the same principal carries too, the STS session
+    /// principal of a role among them
+    /// ([`assumed_role_session_username`]).
+    pub partition: &'a str,
     /// The resource type: `role` or `user`.
     pub kind: &'a str,
     /// The [`ACCOUNT_ID_DIGITS`]-digit account the principal belongs to.
@@ -1469,6 +1483,7 @@ pub fn parse_iam_principal_arn(arn: &str) -> Option<IamPrincipalArn<'_>> {
     }
     let (kind, name) = resource.split_once('/')?;
     ((kind == "role" || kind == "user") && !name.is_empty()).then_some(IamPrincipalArn {
+        partition,
         kind,
         account,
         name,
@@ -4815,6 +4830,7 @@ macro_rules! callback_client {
 #[cfg(test)]
 mod tests;
 mod access_entry_modes;
+mod access_entry_usernames;
 mod addon_catalog;
 mod certificate_authority;
 mod certificate_material;
@@ -4832,6 +4848,7 @@ mod fargate_networking;
 pub mod kubernetes_api;
 pub mod kubernetes_audit;
 pub mod kubernetes_authentication;
+pub mod kubernetes_aws_auth;
 pub mod kubernetes_config_maps;
 pub mod kubernetes_lists;
 pub mod kubernetes_metadata;
@@ -4839,6 +4856,7 @@ pub mod kubernetes_nodes;
 pub mod kubernetes_objects;
 pub mod kubernetes_pod_spec;
 pub mod kubernetes_rbac;
+pub mod kubernetes_self_subject_review;
 mod nodegroup_capacity;
 mod nodegroups;
 mod pass_role;
@@ -4848,6 +4866,7 @@ mod store;
 mod taggable_resources;
 pub use addon_catalog::*;
 pub use access_entry_modes::*;
+pub use access_entry_usernames::*;
 pub use certificate_authority::*;
 pub use certificate_material::*;
 pub use cluster_creator_access::*;
@@ -4862,6 +4881,7 @@ pub use kubernetes_api::KubernetesApiPlane;
 // The data plane's helper modules are re-exported by NAME for the same reason: a
 // `stored_pod_spec` or a `MAX_CONFIG_MAP_BYTES` says what it is only under the
 // module that owns it.
+pub use kubernetes_aws_auth::*;
 pub use kubernetes_config_maps::{ConfigMapObject, MAX_CONFIG_MAPS_PER_NAMESPACE};
 pub use kubernetes_metadata::ObjectMetadata;
 pub use kubernetes_nodes::NodeInstance;

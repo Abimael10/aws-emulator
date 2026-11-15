@@ -20,6 +20,12 @@ use super::*;
 /// out).
 pub const ACCESS_ENTRY_AUTHENTICATION_MODES: &[&str] = &["API", "API_AND_CONFIG_MAP"];
 
+/// The one `authenticationMode` member that does NOT include the `aws-auth`
+/// ConfigMap: "API — the cluster relies only on access entries"
+/// (`AuthenticationMode`), which is the far end of
+/// [`AUTHENTICATION_MODE_LADDER`].
+pub const API_ONLY_AUTHENTICATION_MODE: &str = "API";
+
 /// The sentence an access-entry call on a cluster that serves no access-entry
 /// API is refused with.
 ///
@@ -58,5 +64,16 @@ impl ClusterRecord {
     /// none for it to act on.
     pub fn serves_access_entries(&self) -> bool {
         ACCESS_ENTRY_AUTHENTICATION_MODES.contains(&self.authentication_mode())
+    }
+
+    /// Whether this cluster authenticates Kubernetes callers through its
+    /// `aws-auth` ConfigMap ([`super::kubernetes_aws_auth`]).
+    ///
+    /// The two modes that include the ConfigMap are the ones
+    /// [`ACCESS_ENTRY_AUTHENTICATION_MODES`] leaves out and the one it shares
+    /// with them, so the set is read off [`AUTHENTICATION_MODE_LADDER`] rather
+    /// than written out a second time: every mode but the API-only one.
+    pub fn authenticates_through_config_map(&self) -> bool {
+        self.authentication_mode() != API_ONLY_AUTHENTICATION_MODE
     }
 }

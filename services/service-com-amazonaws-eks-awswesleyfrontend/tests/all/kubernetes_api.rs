@@ -186,6 +186,22 @@ pub(crate) async fn dial_as(
     content_type: &str,
     body: Option<&serde_json::Value>,
 ) -> ApiAnswer {
+    dial_with(config, case, method, path, content_type, None, body).await
+}
+
+/// The same request again, PRESENTING a credential: the `Authorization` header a
+/// kubeconfig's credential plugin sets, which is what tells the API server which
+/// IAM principal the request speaks for. `None` presents none, which is the
+/// account's own published credential — the caller every other dialler here is.
+pub(crate) async fn dial_with(
+    config: &Kubeconfig,
+    case: &str,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    authorization: Option<&str>,
+    body: Option<&serde_json::Value>,
+) -> ApiAnswer {
     let authority = config
         .endpoint
         .strip_prefix("https://")
@@ -248,9 +264,12 @@ pub(crate) async fn dial_as(
         });
 
     let payload = body.map(serde_json::Value::to_string).unwrap_or_default();
+    let credential = authorization
+        .map(|header| format!("Authorization: {header}\r\n"))
+        .unwrap_or_default();
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: {content_type}\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        "{method} {path} HTTP/1.1\r\nHost: {authority}\r\n{credential}Content-Type: \
+         {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         payload.len()
     );
     tls.write_all(request.as_bytes())

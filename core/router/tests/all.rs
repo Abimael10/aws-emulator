@@ -1418,3 +1418,21 @@ mod zz_probe_whole_emulator;
 // doc list item; the lint is allowed here so a header line is a header line rather than a build
 // failure. An inner attribute, like an inner doc comment, is legal only before the first item,
 // so it stands here rather than in the list.
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`, sorted by
+// name, and no other line — no prose between the pairs and nothing after the last one, so two
+// branches landing at once insert two lines in two places and have no prose to duplicate,
+// re-word or mistype. Put a new suite at `tests/all/<name>.rs` and insert its pair where its
+// name sorts to; what that suite covers, and why it drives the assembled router rather than
+// one service crate, belongs in that suite's OWN module header, where it is read beside the
+// test it explains, and a note about THIS file belongs in `all/appended_notes.rs` and its
+// siblings, each declared below like any other file.
+// declarations compiles no suite of this target at all — which is what the tail of this file
+// repeatedly became. A suite file no `mod` names is compiled nowhere and its tests never run,
+// a name declared twice compiles neither copy, and a suite left at the top level of `tests/`
+// fails the build. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve
+// to a SIBLING of this file, which the layout check refuses: the `#[path]` above each `mod` is
+// what points the declaration into `tests/all/`.
+// The `all/all_rs_*` suites, `all/every_suite_file_is_declared.rs`,
+// one this target needs stands in the header above rather than in the list below.
+#[path = "all/eks_nodegroup_nodes_join_the_cluster_api.rs"]
+mod eks_nodegroup_nodes_join_the_cluster_api;

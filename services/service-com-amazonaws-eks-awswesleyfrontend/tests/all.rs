@@ -159,10 +159,14 @@ mod kubernetes_api;
 mod kubernetes_rbac;
 #[path = "all/kubernetes_list_chunking.rs"]
 mod kubernetes_list_chunking;
+#[path = "all/kubernetes_list_label_selector.rs"]
+mod kubernetes_list_label_selector;
 #[path = "all/kubernetes_pod_and_config_map_objects.rs"]
 mod kubernetes_pod_and_config_map_objects;
 #[path = "all/kubernetes_cluster_resources.rs"]
 mod kubernetes_cluster_resources;
+#[path = "all/kubernetes_identity_mapping.rs"]
+mod kubernetes_identity_mapping;
 #[path = "all/list_pod_identity_associations.rs"]
 mod list_pod_identity_associations;
 #[path = "all/marketplace_addon_install.rs"]

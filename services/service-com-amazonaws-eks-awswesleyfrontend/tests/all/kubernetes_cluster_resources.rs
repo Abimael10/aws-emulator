@@ -33,7 +33,9 @@
 
 use std::time::{Duration, Instant};
 
-use service_com_amazonaws_eks_awswesleyfrontend::state::kubernetes_objects::POD_START_DELAY;
+use service_com_amazonaws_eks_awswesleyfrontend::state::kubernetes_objects::{
+    POD_NO_CONTAINER_RUNTIME_MESSAGE, POD_PHASE_FAILED, POD_START_DELAY, POD_START_ERROR_REASON,
+};
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
     ComAmazonawsEksAwswesleyfrontendState, NodeInstance,
 };
@@ -512,10 +514,10 @@ async fn an_admitted_pod_carries_the_spec_it_was_admitted_with() {
     }
 }
 
-/// A pod is scheduled onto a node of the cluster, and reaches the phase a started
-/// pod is in — and a cluster with no node has nowhere to put it.
+/// A pod is scheduled onto a node of the cluster and reaches the phase it ends in
+/// there — and a cluster with no node has nowhere to put it.
 #[tokio::test]
-async fn a_pod_is_scheduled_onto_a_node_of_the_cluster_and_then_runs() {
+async fn a_pod_is_scheduled_onto_a_node_of_the_cluster_and_reaches_a_terminal_phase() {
     let cluster = "pod-scheduling-cluster";
     let (router, engine, config) = published_cluster(cluster).await;
 
@@ -575,13 +577,16 @@ async fn a_pod_is_scheduled_onto_a_node_of_the_cluster_and_then_runs() {
     assert_eq!(
         created.body["status"]["phase"],
         serde_json::json!("Pending"),
-        "case \"a node\": a pod reads Pending until its containers start, got {created:?}"
+        "case \"a node\": a pod reads Pending until the node has taken it, got {created:?}"
     );
 
-    // And it reaches the phase a started pod is in, with its one container ready.
-    // The wait is for the CONDITION, re-read until it holds.
+    // And it reaches the phase it ENDS in: this emulator runs no containers, so
+    // the start the node would have performed never happens and the pod reports
+    // the terminal phase Kubernetes reports for containers that terminated
+    // without running, naming that condition. The wait is for the CONDITION,
+    // re-read until it holds.
     let deadline = Instant::now() + DEADLINE;
-    let running = loop {
+    let concluded = loop {
         let read = dial(
             &config,
             "a cluster with a node",
@@ -590,32 +595,55 @@ async fn a_pod_is_scheduled_onto_a_node_of_the_cluster_and_then_runs() {
             None,
         )
         .await;
-        if read.body["status"]["phase"] == serde_json::json!("Running") {
+        if read.body["status"]["phase"] == serde_json::json!(POD_PHASE_FAILED) {
             break read;
         }
         assert!(
             Instant::now() < deadline,
-            "case \"a node\": the pod never reached Running; the last answer was {read:?}"
+            "case \"a node\": the pod never reached a terminal phase; the last answer was \
+             {read:?}"
         );
         tokio::time::sleep(POD_START_DELAY / 4).await;
     };
-    let statuses = running.body["status"]["containerStatuses"]
+    assert_eq!(
+        (
+            concluded.body["status"]["reason"].clone(),
+            concluded.body["status"]["message"].clone(),
+        ),
+        (
+            serde_json::json!(POD_START_ERROR_REASON),
+            serde_json::json!(POD_NO_CONTAINER_RUNTIME_MESSAGE),
+        ),
+        "case \"a node\": the pod must name what stopped it, got {concluded:?}"
+    );
+    let statuses = concluded.body["status"]["containerStatuses"]
         .as_array()
         .cloned()
         .unwrap_or_default();
     assert_eq!(
         statuses.len(),
         1,
-        "case \"a node\": one status per container, got {running:?}"
+        "case \"a node\": one status per container, got {concluded:?}"
     );
     assert_eq!(
         statuses[0]["ready"],
-        serde_json::json!(true),
-        "case \"a node\": a started container is ready, got {statuses:?}"
+        serde_json::json!(false),
+        "case \"a node\": a container that never ran is not ready, got {statuses:?}"
+    );
+    assert_eq!(
+        statuses[0]["state"]["terminated"]["reason"],
+        serde_json::json!(POD_START_ERROR_REASON),
+        "case \"a node\": the container reports the runtime's reason for one it could not \
+         start, got {statuses:?}"
     );
     assert!(
-        statuses[0]["state"]["running"]["startedAt"].is_string(),
-        "case \"a node\": a started container reports when it started, got {statuses:?}"
+        statuses[0]["state"]["terminated"]["finishedAt"].is_string(),
+        "case \"a node\": a terminated container reports when it ended, got {statuses:?}"
+    );
+    assert_eq!(
+        statuses[0]["state"]["terminated"]["message"],
+        serde_json::json!(POD_NO_CONTAINER_RUNTIME_MESSAGE),
+        "case \"a node\": the container names what stopped it, got {statuses:?}"
     );
 
     // And the pod that was admitted while the cluster had no node is bound as soon
@@ -631,13 +659,13 @@ async fn a_pod_is_scheduled_onto_a_node_of_the_cluster_and_then_runs() {
             None,
         )
         .await;
-        if read.body["status"]["phase"] == serde_json::json!("Running") {
+        if read.body["status"]["phase"] == serde_json::json!(POD_PHASE_FAILED) {
             break read;
         }
         assert!(
             Instant::now() < deadline,
-            "case \"admitted first\": the pod never reached Running once a node was there; \
-             the last answer was {read:?}"
+            "case \"admitted first\": the pod never reached a terminal phase once a node was \
+             there; the last answer was {read:?}"
         );
         tokio::time::sleep(POD_START_DELAY / 4).await;
     };

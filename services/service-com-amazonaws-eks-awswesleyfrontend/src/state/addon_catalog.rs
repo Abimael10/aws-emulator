@@ -2677,7 +2677,12 @@ pub fn read_addon_configuration(values: Option<&str>) -> AddonConfiguration {
 /// is the point at which an alias would be expanded (see
 /// [`read_addon_configuration`]). The events are discarded, so this costs the
 /// bytes the document already occupies and nothing more.
-fn references_an_anchor(text: &str) -> bool {
+///
+/// Visible to the whole state module because every reader of caller-supplied YAML
+/// here has to ask it before loading — the `aws-auth` mapping
+/// ([`super::kubernetes_aws_auth`]) as well as an add-on's configuration — and a
+/// second copy of the question is a second place it can be forgotten.
+pub(super) fn references_an_anchor(text: &str) -> bool {
     struct AliasDetector {
         found: bool,
     }

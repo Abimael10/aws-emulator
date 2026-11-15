@@ -41,6 +41,14 @@ fn role_arn(name: &str) -> String {
     format!("arn:aws:iam::{ACCOUNT}:role/{name}")
 }
 
+/// The username Amazon EKS specifies for an access entry whose principal is the
+/// IAM role `name` and whose caller supplied none: the assumed-role form of that
+/// role, since a role authenticates as the SESSION a caller signs with, with the
+/// session's own name left for the request that presents one.
+fn role_session_username(name: &str) -> String {
+    format!("arn:aws:sts::{ACCOUNT}:assumed-role/{name}/{{{{SessionName}}}}")
+}
+
 async fn create_cluster(router: &MultiServiceRouter, name: &str) -> Answer {
     call(
         router,
@@ -738,7 +746,7 @@ async fn a_created_access_entry_reads_back_exactly_as_stored() {
             "only the required member",
             serde_json::json!({ "principalArn": role_arn("standard") }),
             ACCESS_ENTRY_TYPE_STANDARD,
-            role_arn("standard"),
+            role_session_username("standard"),
         ),
         (
             "every member this slice stores",
@@ -766,7 +774,7 @@ async fn a_created_access_entry_reads_back_exactly_as_stored() {
             "a blank username, which names nobody and so falls back to the default",
             serde_json::json!({ "principalArn": role_arn("blank-username"), "username": "   " }),
             ACCESS_ENTRY_TYPE_STANDARD,
-            role_arn("blank-username"),
+            role_session_username("blank-username"),
         ),
         (
             "a self-managed Linux node entry, whose username EKS templates",
@@ -790,7 +798,7 @@ async fn a_created_access_entry_reads_back_exactly_as_stored() {
             "a hybrid-node entry",
             serde_json::json!({ "principalArn": role_arn("hybrid"), "type": "HYBRID_LINUX" }),
             "HYBRID_LINUX",
-            role_arn("hybrid"),
+            role_session_username("hybrid"),
         ),
     ];
 
