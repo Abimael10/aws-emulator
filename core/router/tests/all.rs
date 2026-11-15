@@ -1365,3 +1365,8 @@ mod cloudformation_provisions_appsync_event_and_merged_apis;
 // `all/appended_notes_tail.rs`, `all/appended_header_notes.rs` and `all/appended_prose.rs`,
 // each declared below like any other file. An inner attribute, like an inner doc comment, is
 // legal only before the first item, so the one this target needs stands here.
+// note about THIS file belongs in `all/appended_notes.rs`, declared below like any other suite.
+// The suites `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/all_rs_declares_each_suite_once.rs`,
+// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` pin all of that, for
+// this file and for every service crate's own `tests/all.rs`.

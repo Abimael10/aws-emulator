@@ -125,6 +125,9 @@ pub mod regions;
 pub mod account_regions;
 pub mod trusted_advisor_checks;
 mod framework_lens;
+/// The CANONICAL JSON document of a custom lens — what `ExportLens` answers, written from
+/// the stored lens rather than from the bytes an import carried.
+mod lens_document;
 /// The document ONE lens review is REPORTED as (`GetLensReviewReport`), derived from the
 /// stored review exactly as the review's own projection is.
 mod lens_review_report;
@@ -147,6 +150,7 @@ pub use agents::*;
 pub use shares::*;
 pub use refusals::*;
 pub use framework_lens::*;
+pub use lens_document::*;
 pub use lens_review_report::*;
 pub use consolidated_report::*;
 pub(crate) use report_pdf::*;
@@ -490,9 +494,11 @@ impl FrameworkQuestion {
                     id: self.choice_id(index),
                     title: best_practice.title.to_string(),
                     description: best_practice.description.map(str::to_string),
-                    // Per-choice improvement-plan prose "only applies to custom lenses"
-                    // (`Choice$ImprovementPlan`), so an AWS-official lens's catalog row
-                    // carries none.
+                    // Per-choice improvement-plan and helpful-resource prose "only applies
+                    // to custom lenses" (`Choice$ImprovementPlan`,
+                    // `Choice$HelpfulResource`), so an AWS-official lens's catalog row
+                    // carries neither.
+                    helpful_resource: None,
                     improvement_plan: None,
                 })
                 .collect(),
@@ -533,12 +539,13 @@ impl ReviewQuestion {
     /// It is the only place a client can discover the `ChoiceId`s that
     /// `UpdateAnswer$SelectedChoices` and `ChoiceUpdates` name, so every projection of a
     /// question reports it from here and they cannot disagree. `ImprovementPlan` is "the
-    /// improvement plan (both text and URL) for a particular choice" and "only applies to
-    /// custom lenses" (`smithy_query(query="shape", shape="Choice")`), so it is reported
-    /// for a choice whose lens content declares one and left off for a choice whose lens
-    /// declares none. `HelpfulResource` and `AdditionalResources` are left off: they only
-    /// apply to custom lenses too and are not content this emulator's lens documents record
-    /// ([`parse_lens_json`]), so there is nothing to report in them, and both are optional.
+    /// improvement plan (both text and URL) for a particular choice" and `HelpfulResource`
+    /// "the helpful resource (both text and URL) for a particular choice", each "only
+    /// applies to custom lenses" (`smithy_query(query="shape", shape="Choice")`), so each is
+    /// reported for a choice whose lens document declares it ([`parse_lens_json`]) and left
+    /// off for a choice whose lens declares none. `AdditionalResources` is left off: it
+    /// applies to custom lenses too and is not a property the lens JSON format
+    /// specification declares, so there is nothing to report in it, and it is optional.
     pub fn choices(&self) -> Vec<Choice> {
         self.best_practices
             .iter()
@@ -548,7 +555,10 @@ impl ReviewQuestion {
                 // "The description of a choice" — the prose the lens publishes for this
                 // best practice, and absent for a lens that publishes none.
                 description: best_practice.description.clone(),
-                helpful_resource: None,
+                helpful_resource: best_practice
+                    .helpful_resource
+                    .as_ref()
+                    .map(LensChoiceContent::to_choice_content),
                 improvement_plan: best_practice
                     .improvement_plan
                     .as_ref()
@@ -2644,6 +2654,11 @@ pub struct LensChoice {
     /// `Choice$Description` — the prose the lens publishes for this best practice, and
     /// `None` for a lens that publishes none.
     pub description: Option<String>,
+    /// The helpful resource this best practice points at: "the helpful resource (both text
+    /// and URL) for a particular choice" (`Choice$HelpfulResource`), which "only applies
+    /// to custom lenses" — the `helpfulResource` a custom lens document declares for the
+    /// choice, and `None` for a lens whose content declares none.
+    pub helpful_resource: Option<LensChoiceContent>,
     /// The improvement plan this best practice carries: "the improvement plan (both text
     /// and URL) for a particular choice" (`Choice$ImprovementPlan`), which "only applies
     /// to custom lenses" — the `improvementPlan` a custom lens document declares for the
@@ -2693,6 +2708,13 @@ pub struct LensRiskRule {
 pub struct LensQuestion {
     pub id: String,
     pub title: String,
+    /// The `description` the lens document writes for the question, and `None` for a
+    /// question the document describes no further: the property is optional in the lens
+    /// JSON format specification.
+    pub description: Option<String>,
+    /// The `helpfulResource` the lens document declares on the question, and `None` for a
+    /// question that declares none — the same `{displayText, url}` entry a choice carries.
+    pub helpful_resource: Option<LensChoiceContent>,
     pub choices: Vec<LensChoice>,
     pub risk_rules: Vec<LensRiskRule>,
 }
@@ -2757,9 +2779,11 @@ impl LensDefinition {
 }
 
 /// One version of a lens's content: the document as it was imported, and the definition
-/// parsed out of it. The raw document is kept because it is the resource `ExportLens`
-/// returns, and the parsed definition because it is what the service reads the lens's
-/// name, pillars and questions from.
+/// parsed out of it. The parsed definition is what the service reads the lens's name,
+/// pillars and questions from, and what an export of the lens is serialized from
+/// ([`canonical_lens_json`]); the document AS SENT is kept because it is the content a
+/// publish was asked to publish, which is what tells a lens's draft from the content a
+/// version already carries ([`LensRecord::published_version`]).
 #[derive(Debug, Clone)]
 pub struct LensContent {
     pub json: String,
@@ -3094,6 +3118,16 @@ const LENS_CHOICE_CONTENT_URL_LENGTH: (usize, usize) = (1, 1024);
 /// `ChoiceImprovementPlan` report.
 const LENS_JSON_IMPROVEMENT_PLAN: &str = "improvementPlan";
 
+/// The `helpfulResource` property of a question or a choice in the lens JSON format
+/// specification: the resource the lens author points a reader at, which
+/// `Choice$HelpfulResource` reports for a choice.
+const LENS_JSON_HELPFUL_RESOURCE: &str = "helpfulResource";
+
+/// `QuestionDescription`'s modelled length bounds
+/// (`smithy_query(query="shape", shape="QuestionDescription")`: length 1..1024), which a
+/// question's `description` in the lens document becomes.
+const LENS_QUESTION_DESCRIPTION_LENGTH: (usize, usize) = (1, 1024);
+
 /// The type an instance HAS, in the vocabulary a schema declares a type in — what a finding
 /// about a type names the instance by.
 fn lens_json_type(value: &::serde_json::Value) -> &'static str {
@@ -3162,8 +3196,9 @@ fn lens_json_string(
     Ok(text.to_string())
 }
 
-/// One per-choice CONTENT entry of a lens document — a `{displayText, url}` object the
-/// format declares on a choice — or `None` when the document declares none under `member`.
+/// One CONTENT entry of a lens document — a `{displayText, url}` object the format
+/// declares on a choice or on a question — or `None` when the document declares none under
+/// `member`.
 ///
 /// The entry says nothing without its text, so `displayText` is required of an entry that
 /// is there at all, and `url` is optional: both are read within the bounds the modelled
@@ -3301,6 +3336,21 @@ pub fn parse_lens_json(document: &str) -> Result<LensDefinition, LensJsonRejecti
             let question_id = lens_json_string(question_value, "id", (1, 128))?;
             lens_json_unique(&mut question_ids, &question_id, "lens")?;
             let title = lens_json_string(question_value, "title", (1, 1024))?;
+            // "The description of the question" (`QuestionDescription`) and the question's
+            // own helpful resource: optional properties of the lens JSON format
+            // specification, kept because the lens document is the resource — what the
+            // document declares about a question is what an export of the lens reports
+            // ([`canonical_lens_json`]).
+            let description = match question_value.get("description") {
+                None | Some(::serde_json::Value::Null) => None,
+                Some(_) => Some(lens_json_string(
+                    question_value,
+                    "description",
+                    LENS_QUESTION_DESCRIPTION_LENGTH,
+                )?),
+            };
+            let helpful_resource =
+                lens_json_choice_content(question_value, LENS_JSON_HELPFUL_RESOURCE)?;
 
             let mut choice_ids = std::collections::BTreeSet::new();
             let mut choices = Vec::new();
@@ -3313,6 +3363,13 @@ pub fn parse_lens_json(document: &str) -> Result<LensDefinition, LensJsonRejecti
                     // The lens JSON format specification carries no per-choice prose, so
                     // an imported lens publishes none.
                     description: None,
+                    // "The helpful resource details" the lens AUTHOR writes for this best
+                    // practice: the document's own `helpfulResource` entry, kept for the
+                    // same reason its improvement plan is.
+                    helpful_resource: lens_json_choice_content(
+                        choice_value,
+                        LENS_JSON_HELPFUL_RESOURCE,
+                    )?,
                     // "The improvement plan details" the lens AUTHOR writes for this best
                     // practice: the document's own `improvementPlan` entry, kept so the
                     // question's choice catalog and the improvement plan of a review of
@@ -3354,6 +3411,8 @@ pub fn parse_lens_json(document: &str) -> Result<LensDefinition, LensJsonRejecti
             questions.push(LensQuestion {
                 id: question_id,
                 title,
+                description,
+                helpful_resource,
                 choices,
                 risk_rules,
             });

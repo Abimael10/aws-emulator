@@ -44,8 +44,8 @@
 use serde_json::Value;
 
 use super::custom_lens_import::{
-    export, import, imported_arn, lens_document, member, wait_for_the_import_to_land,
-    ABSENT_LENS_ARN,
+    export, exported_form, import, imported_arn, lens_document, member,
+    wait_for_the_import_to_land, ABSENT_LENS_ARN,
 };
 use super::custom_lens_versions::create_version;
 use super::lens_shares::{create_share, record_lens_share, stored_shares, PRINCIPALS};
@@ -435,12 +435,12 @@ async fn deleting_the_draft_leaves_the_lens_at_its_latest_published_version() {
                 let current = export(&client, &lens.arn, None).await;
                 assert_eq!(
                     member(&current, "LensJSON"),
-                    document.as_str(),
+                    exported_form(document),
                     "case {case:?}: the lens's content must be that version's, got {current:?}"
                 );
                 assert_ne!(
                     member(&current, "LensJSON"),
-                    discarded.as_str(),
+                    exported_form(&discarded),
                     "case {case:?}: the deleted draft must not be the lens's content any more"
                 );
                 // Every published version is untouched, and the lens is listed as a
@@ -449,7 +449,7 @@ async fn deleting_the_draft_leaves_the_lens_at_its_latest_published_version() {
                     let pinned = export(&client, &lens.arn, Some(held)).await;
                     assert_eq!(
                         member(&pinned, "LensJSON"),
-                        published.as_str(),
+                        exported_form(published),
                         "case {case:?}: version {held} must survive the draft's delete, got \
                          {pinned:?}"
                     );
@@ -505,7 +505,7 @@ async fn deleting_the_published_versions_leaves_the_lens_as_a_draft() {
         let current = export(&client, &lens.arn, None).await;
         assert_eq!(
             member(&current, "LensJSON"),
-            content.as_str(),
+            exported_form(&content),
             "case {case:?}: the lens must keep the content it carried, got {current:?}"
         );
         for (version, _) in &lens.versions {
@@ -621,7 +621,7 @@ async fn a_status_the_lens_carries_nothing_in_is_a_not_found() {
             let pinned = export(&client, &lens.arn, Some(version)).await;
             assert_eq!(
                 member(&pinned, "LensJSON"),
-                document.as_str(),
+                exported_form(document),
                 "case {case:?}: a refused delete must leave version {version}, got {pinned:?}"
             );
         }
@@ -725,7 +725,7 @@ async fn a_lens_or_status_that_cannot_be_deleted_is_refused() {
     let exported = export(&client, &lens.arn, Some(&lens.versions[0].0)).await;
     assert_eq!(
         member(&exported, "LensJSON"),
-        lens.versions[0].1.as_str(),
+        exported_form(&lens.versions[0].1),
         "a refused delete must leave the published version's content, got {exported:?}"
     );
     assert!(

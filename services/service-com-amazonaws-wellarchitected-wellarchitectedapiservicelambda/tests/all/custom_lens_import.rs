@@ -6,11 +6,12 @@
 //! The rules pinned here, each over a table of inputs rather than one recorded request:
 //!
 //! 1. `ImportLens` RECORDS the lens document it is given, under a minted lens ARN, and
-//!    answers the import's `ImportLensStatus`; `ExportLens` answers that same document
-//!    back from the moment the import is ACCEPTED. Rows differ along the SHAPE of the
-//!    document — how many pillars, questions, choices and risk rules it defines, and
-//!    whether it carries a description — because the document is the resource, so every
-//!    shape of it must round-trip.
+//!    answers the import's `ImportLensStatus`; `ExportLens` answers that same lens back
+//!    from the moment the import is ACCEPTED, as the service's canonical serialization of
+//!    it ([`exported_form`], whose byte form `super::exported_lens_document` pins). Rows
+//!    differ along the SHAPE of the document — how many pillars, questions, choices and
+//!    risk rules it defines, and whether it carries a description — because the document is
+//!    the resource, so every shape of it must round-trip.
 //! 2. A payload that is not a lens imports NOTHING and is refused 400
 //!    `ValidationException`, with `CANNOT_PARSE` when it is not JSON at all and
 //!    `FIELD_VALIDATION_FAILED` when it is JSON that breaks a rule of the lens JSON
@@ -26,9 +27,9 @@
 //! in production. The HTTP client is the shared `super::workload_harness`.
 //!
 //! The wire helpers here (`lens_document`, `import`, `export`, `imported_arn`,
-//! `wait_for_the_import_to_land`) are `pub(crate)` because the version suite,
-//! `super::custom_lens_versions`, publishes versions of the lenses THIS suite's import
-//! helper records — one spelling of each lens request for both.
+//! `exported_form`, `wait_for_the_import_to_land`) are `pub(crate)` because the version
+//! suite, `super::custom_lens_versions`, publishes versions of the lenses THIS suite's
+//! import helper records — one spelling of each lens request for both.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -156,6 +157,20 @@ pub(crate) fn imported_arn(answer: &Answer, case: &str) -> String {
     arn
 }
 
+/// The document `ExportLens` answers for the lens `document` was imported as: the
+/// service's canonical serialization of it ([`state::canonical_lens_json`]), which is what
+/// an export of a lens IS — `LensJSON` is a string, so its member order, its separators
+/// and the `number` ordinals it carries on each question and choice are part of its value,
+/// and they come from the lens rather than from the bytes an import carried. The form
+/// itself is pinned, byte for byte and independently of this code, by
+/// `super::exported_lens_document`; a suite that only has to say WHICH document a lens
+/// holds reads it through here.
+pub(crate) fn exported_form(document: &str) -> String {
+    let definition = state::parse_lens_json(document)
+        .unwrap_or_else(|rejection| panic!("not a lens document: {rejection:?}"));
+    state::canonical_lens_json(&definition)
+}
+
 /// Wait for an accepted import's job to report `COMPLETE`. The span is the service's own
 /// ([`state::LENS_IMPORT_DURATION`]), plus a margin, and it is non-zero on purpose: that
 /// is what makes the `IN_PROGRESS` status observable to a caller. The lens's CONTENT does
@@ -172,11 +187,12 @@ pub(crate) fn wait_for_the_import_to_land() {
     std::thread::sleep(state::LENS_IMPORT_DURATION + Duration::from_millis(250));
 }
 
-/// Rule 1. Every shape of lens document is recorded under its own ARN and exported back
-/// VERBATIM from the moment the import is accepted, while the import's own job reports
-/// `IN_PROGRESS` until its span has passed.
+/// Rule 1. Every shape of lens document is recorded under its own ARN and exported back —
+/// as the service's canonical serialization of it ([`exported_form`]) — from the moment the
+/// import is accepted, while the import's own job reports `IN_PROGRESS` until its span has
+/// passed.
 #[tokio::test]
-async fn an_imported_lens_document_is_recorded_and_exported_back_verbatim() {
+async fn an_imported_lens_document_is_recorded_and_exported_back() {
     let cases: Vec<(&str, Value)> = vec![
         (
             "one-pillar-one-question-two-choices",
@@ -231,8 +247,8 @@ async fn an_imported_lens_document_is_recorded_and_exported_back_verbatim() {
         );
         assert_eq!(
             member(&early, "LensJSON"),
-            document.as_str(),
-            "case {case:?}: ExportLens must answer the document as imported, got {early:?}"
+            exported_form(&document),
+            "case {case:?}: ExportLens must answer the document imported, got {early:?}"
         );
         imported.push((case, arn, document));
     }
@@ -254,8 +270,8 @@ async fn an_imported_lens_document_is_recorded_and_exported_back_verbatim() {
         );
         assert_eq!(
             member(&exported, "LensJSON"),
-            document.as_str(),
-            "case {case:?}: ExportLens must answer the document as imported, got {exported:?}"
+            exported_form(document),
+            "case {case:?}: ExportLens must answer the document imported, got {exported:?}"
         );
 
         // The same token with the same parameters replays the original import, whose job
@@ -356,7 +372,7 @@ async fn the_recorded_definition_matches_the_document_that_was_imported() {
         let exported = export(&client, &arn, None).await;
         assert_eq!(
             member(&exported, "LensJSON"),
-            document.as_str(),
+            exported_form(&document),
             "case {case:?}: the stored document must be the one imported, got {exported:?}"
         );
     }
@@ -675,7 +691,7 @@ async fn importing_with_a_lens_arn_updates_that_lens_and_without_one_mints_anoth
         let during = export(&client, &arn, None).await;
         assert_eq!(
             member(&during, "LensJSON"),
-            replacement.as_str(),
+            exported_form(&replacement),
             "case {case:?}: an accepted update must replace the readable lens, got {during:?}"
         );
 
@@ -683,7 +699,7 @@ async fn importing_with_a_lens_arn_updates_that_lens_and_without_one_mints_anoth
         let after = export(&client, &arn, None).await;
         assert_eq!(
             member(&after, "LensJSON"),
-            replacement.as_str(),
+            exported_form(&replacement),
             "case {case:?}: the lens keeps exporting the new document, got {after:?}"
         );
 
@@ -698,7 +714,7 @@ async fn importing_with_a_lens_arn_updates_that_lens_and_without_one_mints_anoth
         let unchanged = export(&client, &arn, None).await;
         assert_eq!(
             member(&unchanged, "LensJSON"),
-            replacement.as_str(),
+            exported_form(&replacement),
             "case {case:?}: minting another lens must not touch this one, got {unchanged:?}"
         );
     }
@@ -900,7 +916,7 @@ async fn an_import_is_idempotent_per_client_request_token() {
             let exported = export(&client, &arn, None).await;
             assert_eq!(
                 member(&exported, "LensJSON"),
-                first.as_str(),
+                exported_form(&first),
                 "case {case:?}: a replay must not change the lens, got {exported:?}"
             );
         } else {
@@ -928,7 +944,7 @@ async fn an_import_is_idempotent_per_client_request_token() {
             let exported = export(&client, &arn, None).await;
             assert_eq!(
                 member(&exported, "LensJSON"),
-                first.as_str(),
+                exported_form(&first),
                 "case {case:?}: a refused replay must not change the lens, got {exported:?}"
             );
         }

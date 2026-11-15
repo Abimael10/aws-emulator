@@ -34,8 +34,8 @@ use std::time::SystemTime;
 use serde_json::{json, Value};
 
 use super::custom_lens_import::{
-    export, import, imported_arn, lens_document, member, wait_for_the_import_to_land,
-    ABSENT_LENS_ARN,
+    export, exported_form, import, imported_arn, lens_document, member,
+    wait_for_the_import_to_land, ABSENT_LENS_ARN,
 };
 use super::workload_harness::{encode_path_segment, Answer, Client};
 
@@ -160,7 +160,7 @@ async fn publishing_a_version_records_the_draft_and_exports_it_back() {
         );
         assert_eq!(
             member(&exported, "LensJSON"),
-            document.as_str(),
+            exported_form(document),
             "case {case:?}: the published version must carry the draft document, got {exported:?}"
         );
 
@@ -257,7 +257,7 @@ async fn each_published_version_keeps_the_draft_it_was_published_from() {
             let exported = export(&client, &arn, Some(version)).await;
             assert_eq!(
                 member(&exported, "LensJSON"),
-                document.as_str(),
+                exported_form(document),
                 "case {case:?}: version {version} must export the draft it captured, got \
                  {exported:?}"
             );
@@ -334,13 +334,13 @@ async fn a_published_version_is_immutable_and_its_name_cannot_be_reused() {
         let versioned = export(&client, &arn, Some("1.0")).await;
         assert_eq!(
             member(&versioned, "LensJSON"),
-            original.as_str(),
+            exported_form(&original),
             "case {case:?}: a published version must not follow the draft, got {versioned:?}"
         );
         let current = export(&client, &arn, None).await;
         assert_eq!(
             member(&current, "LensJSON"),
-            replacement.as_str(),
+            exported_form(&replacement),
             "case {case:?}: the lens's current content is the new draft, got {current:?}"
         );
 
@@ -374,7 +374,7 @@ async fn a_published_version_is_immutable_and_its_name_cannot_be_reused() {
         let second = export(&client, &arn, Some("2.0")).await;
         assert_eq!(
             member(&second, "LensJSON"),
-            replacement.as_str(),
+            exported_form(&replacement),
             "case {case:?}: version 2.0 must carry the current draft, got {second:?}"
         );
         assert_eq!(

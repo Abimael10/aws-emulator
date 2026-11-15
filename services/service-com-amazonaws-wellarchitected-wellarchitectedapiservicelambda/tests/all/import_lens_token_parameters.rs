@@ -37,7 +37,8 @@
 use serde_json::{json, Value};
 
 use super::custom_lens_import::{
-    export, import, imported_arn, lens_document, member, wait_for_the_import_to_land,
+    export, exported_form, import, imported_arn, lens_document, member,
+    wait_for_the_import_to_land,
 };
 use super::custom_lens_versions::create_version;
 use super::resource_tags::list_tags;
@@ -333,14 +334,14 @@ async fn an_update_retry_replays_exactly_when_its_parameters_name_the_same_impor
         let updated = export(&client, updated_arn, None).await;
         assert_eq!(
             member(&updated, "LensJSON"),
-            landed_document.as_str(),
+            exported_form(landed_document),
             "case {case:?}: the lens must still hold the document the landed update imported, \
              got {updated:?}"
         );
         let bystander = export(&client, bystander_arn, None).await;
         assert_eq!(
             member(&bystander, "LensJSON"),
-            bystander_document.as_str(),
+            exported_form(bystander_document),
             "case {case:?}: a retry naming another lens must import nothing over it, got \
              {bystander:?}"
         );
@@ -404,7 +405,7 @@ async fn a_create_retry_replays_for_every_retry_that_specifies_no_arn() {
     let exported = export(&client, &arn, None).await;
     assert_eq!(
         member(&exported, "LensJSON"),
-        document.as_str(),
+        exported_form(&document),
         "the created lens must still hold the document the create imported, got {exported:?}"
     );
 }

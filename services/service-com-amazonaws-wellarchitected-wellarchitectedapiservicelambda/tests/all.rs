@@ -369,3 +369,7 @@ mod consolidated_report;
 mod answered_choice_projection;
 #[path = "all/custom_lens_improvement_plans.rs"]
 mod custom_lens_improvement_plans;
+// Appended at the end for the reason the notes above give: an insertion into this list's
+// sorted middle is what repeatedly refused to merge.
+#[path = "all/exported_lens_document.rs"]
+mod exported_lens_document;

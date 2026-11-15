@@ -34,7 +34,7 @@
 use serde_json::Value;
 
 use super::custom_lens_import::{
-    export, import, imported_arn, lens_document, member, ABSENT_LENS_ARN,
+    export, exported_form, import, imported_arn, lens_document, member, ABSENT_LENS_ARN,
 };
 use super::custom_lens_versions::create_version;
 use super::workload_harness::{encode_path_segment, Answer, Client};
@@ -134,8 +134,8 @@ async fn an_accepted_import_is_exportable_publishable_and_then_retrievable() {
         );
         assert_eq!(
             member(&exported, "LensJSON"),
-            document.as_str(),
-            "case {case:?}: ExportLens must answer the document as imported, got {exported:?}"
+            exported_form(&document),
+            "case {case:?}: ExportLens must answer the document imported, got {exported:?}"
         );
 
         // Rule 2, before the publish: the lens is not retrievable through `GetLens`.
@@ -226,7 +226,7 @@ async fn an_accepted_import_is_exportable_publishable_and_then_retrievable() {
         let pinned = export(&client, &arn, Some(&row.version)).await;
         assert_eq!(
             member(&pinned, "LensJSON"),
-            document.as_str(),
+            exported_form(&document),
             "case {case:?}: the published version must carry the imported document, got \
              {pinned:?}"
         );

@@ -2,7 +2,9 @@
 
 //! @op ExportLens
 //! IMPLEMENTED: reads back the lens document `ImportLens` recorded in
-//! [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lenses`].
+//! [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lenses`],
+//! serialized as the service's canonical lens document
+//! ([`crate::state::canonical_lens_json`]).
 //! A pure read: it writes nothing, and answers the document from the moment `ImportLens`
 //! accepted it.
 //!
@@ -207,7 +209,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(ExportLensOutput {
-            lens_json: Some(content.json.clone()),
+            // "The JSON representation of a lens": the document the service publishes for
+            // the lens it holds, written by the one serializer every export goes through
+            // ([`crate::state::canonical_lens_json`]) rather than echoed from the bytes
+            // whatever import carried — `LensJSON` is a STRING, so the member order, the
+            // separators and the per-question and per-choice `number` ordinals are part of
+            // its value, and two exports of one lens have to agree on them byte for byte.
+            lens_json: Some(crate::state::canonical_lens_json(&content.definition)),
         })
     }
 }
