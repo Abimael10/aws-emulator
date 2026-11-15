@@ -4750,3 +4750,15 @@ mod appended_notes;
 //!   Past the first item one is `E0753` and compiles no suite of this target, so add a
 //!   declaration here — never a note about one, and never a copy of this header.
 //! file and for every service crate's `tests/all.rs`.
+//! never run (the crate's build script refuses an undeclared file under `tests/all/`); a
+//! suite left at the top level of `tests/` fails the build; and a suite declared twice is
+//! `E0428`, which fails every suite in this target.
+//! DECLARATION — not a note about one. `all/all_rs_declares_each_suite_once.rs` and
+//! This file is a DECLARATION LIST and nothing else. It is appended to by every landing, so
+//! prose accumulates here faster than anywhere else in the tree: successive landings had
+//! appended copies of this header past the first item (each one `E0753`), duplicate `mod`
+//! lines (each one `E0428`) and then notes about both, until the notes outweighed the
+//! declarations and the file passed the project's 5000-line limit. The declarations are
+//! what the compiler, the build script and the two guard suites above read, so the list
+//! below is kept to them; what each suite covers belongs in that suite's own module doc,
+//! where it is read with the test it describes.

@@ -87,6 +87,10 @@ pub mod list_entitled_applications_types;
 pub mod list_export_image_tasks_types;
 pub mod list_tags_for_resource_types;
 pub mod shared_types;
+// The stack every reader reports, whose wire form carries a member the on-disk model does
+// not declare — so its schema and codec are written out rather than derived. See that
+// module's own note.
+pub mod stack_wire;
 pub mod start_app_block_builder_types;
 pub mod start_fleet_types;
 pub mod start_image_builder_types;
@@ -251,6 +255,8 @@ pub use list_export_image_tasks_types::*;
 pub use list_tags_for_resource_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use shared_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use stack_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use start_app_block_builder_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

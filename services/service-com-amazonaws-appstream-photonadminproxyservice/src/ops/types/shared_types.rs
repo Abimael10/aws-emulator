@@ -506,27 +506,9 @@ pub struct AgentAccessSetting {
     pub permission: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appstream#Stack")]
-#[derive(Debug, Clone, Default)]
-pub struct Stack {
-    pub arn: Option<String>,
-    pub name: String,
-    pub description: Option<String>,
-    pub display_name: Option<String>,
-    pub created_time: Option<::aws_smithy_types::DateTime>,
-    pub storage_connectors: Option<Vec<StorageConnector>>,
-    pub redirect_url: Option<String>,
-    pub feedback_url: Option<String>,
-    pub stack_errors: Option<Vec<StackError>>,
-    pub user_settings: Option<Vec<UserSetting>>,
-    pub application_settings: Option<ApplicationSettingsResponse>,
-    pub access_endpoints: Option<Vec<AccessEndpoint>>,
-    pub embed_host_domains: Option<Vec<String>>,
-    pub streaming_experience_settings: Option<StreamingExperienceSettings>,
-    pub content_redirection: Option<ContentRedirection>,
-    pub agent_access_config: Option<AgentAccessConfig>,
-    pub storage_connector_authentication: Option<String>,
-}
+// `Stack` is declared in `types/stack_wire.rs`, not here: AppStream reports a member on it
+// that the on-disk model does not declare, so its schema and codec cannot come from the
+// derive. See that module's own note.
 
 #[smithy_macros::smithy(shape = "com.amazonaws.appstream#StackError")]
 #[derive(Debug, Clone, Default)]

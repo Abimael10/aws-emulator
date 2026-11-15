@@ -39,12 +39,16 @@ mod refusal_messages;
 mod resource_tags;
 #[path = "all/stack_access_endpoints.rs"]
 mod stack_access_endpoints;
+#[path = "all/stack_create_retry.rs"]
+mod stack_create_retry;
 #[path = "all/stack_fleet_lifecycle.rs"]
 mod stack_fleet_lifecycle;
 #[path = "all/stack_registry.rs"]
 mod stack_registry;
 #[path = "all/stack_server_side_defaults.rs"]
 mod stack_server_side_defaults;
+#[path = "all/stack_state.rs"]
+mod stack_state;
 #[path = "all/stack_theme.rs"]
 mod stack_theme;
 #[path = "all/state_roundtrip.rs"]

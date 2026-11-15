@@ -90,3 +90,13 @@ pub fn default_streaming_experience_settings() -> StreamingExperienceSettings {
         preferred_protocol: Some(DEFAULT_PREFERRED_PROTOCOL.to_string()),
     }
 }
+
+/// The lifecycle state a created stack reports.
+///
+/// A stack is a configuration — the fleet it associates, the user access policies it
+/// applies and the storage it connects — with nothing to provision, so `CreateStack`
+/// answers with a stack that is already usable and no operation of the service moves it out
+/// of that state. It is written onto the stored record by the create and projected from
+/// there, like the three configuration members above.
+pub const CREATED_STACK_STATE: &str = "ACTIVE";
+

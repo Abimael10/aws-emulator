@@ -7,7 +7,10 @@
 //! request leaves unset is stored as the value the created stack has anyway — which user
 //! actions a streaming session permits, whether application settings persist, the
 //! streaming protocol the stack prefers ([`crate::state::stack_defaults`]) — so a reader
-//! that did not perform the create still sees the effective configuration. A second create
+//! that did not perform the create still sees the effective configuration. The created
+//! stack's lifecycle state is written onto the record the same way
+//! ([`crate::state::CREATED_STACK_STATE`]), so this response and every later read project
+//! one state. A second create
 //! of the same `Name` answers `ResourceAlreadyExistsException` (HTTP 400). An
 //! `AccessEndpoints` list whose entry carries no `VpceId`, or which names one
 //! `EndpointType` twice, is refused on the request's own shape
@@ -320,6 +323,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             content_redirection: input.content_redirection,
             agent_access_config: input.agent_access_config,
             storage_connector_authentication: input.storage_connector_authentication,
+            // A created stack is already usable, which is the state it reports from here on
+            // ([`crate::state::CREATED_STACK_STATE`]).
+            state: crate::state::CREATED_STACK_STATE.to_string(),
             // A freshly created stack carries no errors.
             stack_errors: Vec::new(),
             tags: input.tags.unwrap_or_default().into_iter().collect(),

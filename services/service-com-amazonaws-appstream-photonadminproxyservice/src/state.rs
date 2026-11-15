@@ -743,6 +743,10 @@ pub struct StackRecord {
     pub content_redirection: Option<ContentRedirection>,
     pub agent_access_config: Option<AgentAccessConfig>,
     pub storage_connector_authentication: Option<String>,
+    /// The lifecycle state this stack reports, written once by the create
+    /// ([`stack_defaults::CREATED_STACK_STATE`]) and projected from here, so the create's
+    /// own response, every update's response and every read report one state.
+    pub state: String,
     pub stack_errors: Vec<StackError>,
     pub tags: BTreeMap<String, String>,
 }
@@ -782,6 +786,7 @@ impl StackRecord {
             content_redirection: self.content_redirection.clone(),
             agent_access_config: self.agent_access_config.clone(),
             storage_connector_authentication: self.storage_connector_authentication.clone(),
+            state: Some(self.state.clone()),
         }
     }
 }
