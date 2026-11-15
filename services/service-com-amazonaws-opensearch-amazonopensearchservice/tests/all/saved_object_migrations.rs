@@ -235,6 +235,25 @@ fn rows() -> Vec<Row> {
             selected: 2,
         },
         Row {
+            case: "a published conflict resolution spelled in the other case",
+            name: "migration-overwrite-upper",
+            options: json!({
+                "source": { "datasourceArn": SOURCE },
+                "workspace": { "workspaceId": "ws-reporting" },
+                "exportOptions": {
+                    "objects": [
+                        { "type": "dashboard", "id": "sales" },
+                        { "type": "search", "id": "late-orders" },
+                    ],
+                },
+                // The published set spells one value in upper case and the other in lower
+                // ([`CONFLICT_RESOLUTION_VALUES`]), so the strategy is named by its WORD:
+                // the same strategy spelled the other way names the same strategy.
+                "conflictResolution": CONFLICT_RESOLUTION_VALUES[1].to_uppercase(),
+            }),
+            selected: 2,
+        },
+        Row {
             case: "a source ARN in another partition",
             name: "migration-other-partition",
             options: json!({
@@ -655,17 +674,6 @@ async fn a_request_the_service_cannot_run_is_refused_and_starts_nothing() {
                 "source": { "datasourceArn": SOURCE },
                 "workspace": { "workspaceId": "ws-reporting" },
                 "conflictResolution": "REPLACE_EVERYTHING",
-            }),
-            400,
-            "ValidationException",
-        ),
-        (
-            "a published conflict resolution in another case",
-            id.clone(),
-            json!({
-                "source": { "datasourceArn": SOURCE },
-                "workspace": { "workspaceId": "ws-reporting" },
-                "conflictResolution": "OVERWRITE",
             }),
             400,
             "ValidationException",

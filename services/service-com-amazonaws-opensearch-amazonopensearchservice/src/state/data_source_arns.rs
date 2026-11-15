@@ -27,9 +27,11 @@ use ::service_common::arn;
 
 use crate::ops::types::ValidationException;
 
-/// The resource types of this service an application can attach as a data source: a
+/// The resource types of THIS SERVICE an application can attach as a data source: a
 /// DOMAIN, whose indexes hold the data, and a DIRECT QUERY data source, which reaches data
-/// held elsewhere.
+/// held elsewhere. An OpenSearch Serverless collection is a data source too, and is
+/// recognised by the reading that resolves it in the store holding it
+/// ([`super::serverless_collections`]).
 ///
 /// `AttachDataSource` documents "the data source must be an Amazon OpenSearch Service
 /// domain", and the account's own data sources of this service are the two resources the
@@ -49,6 +51,13 @@ const DATA_SOURCE_RESOURCE_TYPES: [&str; 2] = ["domain", "datasource"];
 /// first.
 #[must_use]
 pub fn names_a_data_source(arn: &str) -> bool {
+    // One kind is a resource this service does NOT hold and reads where it is held
+    // ([`super::serverless_collections`]): an OpenSearch Serverless COLLECTION, which an
+    // application reads exactly the way it reads a domain. The kind is recognised by the one
+    // reading that resolution makes of its ARN.
+    if super::serverless_collections::names_a_collection(arn) {
+        return true;
+    }
     arn::parse(arn).is_some_and(|parsed| {
         let of_this_service = parsed.vendor == super::ARN_NAMESPACE
             && DATA_SOURCE_RESOURCE_TYPES.contains(&parsed.resource_type());

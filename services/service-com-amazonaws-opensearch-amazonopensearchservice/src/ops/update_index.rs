@@ -210,6 +210,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        // Whether this operation is available at all is decided from the DOMAIN, before the
+        // index the request names is looked up: an index's mappings, settings and semantic
+        // enrichment are written on the domain's own engine, so a domain running an engine
+        // that serves none of that cannot serve this call — and a caller told an index does
+        // not exist would go on to create one it still could not manage. The service's own
+        // software-version sentence states it
+        // ([`crate::state::index_management_refusal`]).
+        if let Some(refusal) = crate::state::index_management_refusal(domain) {
+            return Err(UpdateIndexErrorModeled::ValidationException(refusal).into());
+        }
+
         // The schema is a set of named sections, so a document carrying a scalar or
         // an array instead names no change to make and is refused rather than
         // becoming this index's schema. `IndexSchema` is a modelled document, so this
@@ -222,9 +233,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // What the request itself carries is bounded before it is merged or compared
-        // against the stored schema: a document nesting past the emulator's own depth
-        // bound, or already holding more values than one index may, could never be
+        // "This operation allows modification of field mappings and semantic search settings
+        // for text fields": the SETTINGS of the index itself are not something an update
+        // writes — they are chosen when the index is created and changed through the index's
+        // own settings API — so a schema carrying that section at all is refused with the
+        // service's own sentence for it, whatever the section holds and before the mappings
+        // beside it are read ([`crate::state::index_settings_update_unsupported`]).
+        if crate::state::names_index_settings(&input.index_schema) {
+            return Err(UpdateIndexErrorModeled::ValidationException(
+                crate::state::index_settings_update_unsupported(),
+            )
+            .into());
+        }
+
+        // What the request itself carries is bounded before it is walked, merged or
+        // compared against the stored schema: a document nesting past the emulator's own
+        // depth bound, or already holding more values than one index may, could never be
         // accepted, so it is refused rather than walked.
         let depth = crate::state::index_schema_depth(&input.index_schema);
         if depth > crate::state::INDEX_SCHEMA_MAX_DEPTH {
@@ -238,6 +262,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateIndexErrorModeled::ValidationException(
                 crate::state::index_schema_over_quota(requested),
             )
+            .into());
+        }
+
+        // And the mapping it carries has to be one the engine could BUILD: a mapping section
+        // or a field mapping that is not a set of members is one the mapping parser cannot
+        // read at all, so merging it onto the stored schema is work the service cannot
+        // finish — its `InternalException` — while a mapping it reads and that names a field
+        // type the engine has no mapper for, or a `dynamic` value it does not know, is the
+        // caller's input and so its `ValidationException`
+        // ([`crate::state::index_schema_violation`]). Walked after the bounds above, so the
+        // walk's cost is tied to the size of a document this service would accept, and
+        // before anything is merged, so a refused update leaves the index exactly as it was.
+        if let Some(violation) = crate::state::index_schema_violation(&input.index_schema) {
+            return Err(if violation.unreadable_mapping {
+                UpdateIndexErrorModeled::InternalException(violation.internal())
+            } else {
+                UpdateIndexErrorModeled::ValidationException(violation.validation())
+            }
             .into());
         }
 

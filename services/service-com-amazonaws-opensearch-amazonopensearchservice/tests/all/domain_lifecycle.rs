@@ -177,6 +177,45 @@ impl Emulator {
         emulator
     }
 
+    /// The same emulator with Amazon OpenSearch Serverless mounted on the SAME shared
+    /// engine, so a suite can create the COLLECTION an application attaches as a data
+    /// source through that service's own `CreateCollection` — the store this service
+    /// resolves a collection's `dataSourceArn` in — rather than by hand-building a
+    /// collection record.
+    pub(crate) fn with_collections() -> Self {
+        let mut emulator = Self::new();
+        emulator.router.register_service(
+            service_com_amazonaws_opensearchserverless_opensearchserverless::EmulatedService::new(
+                std::sync::Arc::clone(&emulator.engine),
+            ),
+        );
+        emulator
+    }
+
+    /// Call `operation` of the OpenSearch Serverless service mounted on the same router
+    /// ([`Emulator::with_collections`]), the way an SDK drives it: `POST /` with
+    /// `X-Amz-Target: OpenSearchServerless.<Op>`, signed for that service's own signing
+    /// name (`aoss`) so the router can name it.
+    pub(crate) async fn collections_call(&self, operation: &str, body: Value) -> Answer {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", format!("aoss.{REGION}.amazonaws.com"))
+            .header("content-type", "application/x-amz-json-1.0")
+            .header("x-amz-target", format!("OpenSearchServerless.{operation}"))
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 \
+                     Credential={DEFAULT_ACCESS_KEY_ID}/20260101/{REGION}/aoss/\
+                     aws4_request, SignedHeaders=host;x-amz-target, Signature=0"
+                ),
+            )
+            .body(Bytes::from(body.to_string()))
+            .expect("the test request is well formed");
+        self.dispatch(request).await
+    }
+
     /// The same emulator with the Service Quotas service mounted on the SAME shared
     /// engine, so a suite can raise the account quota this service reads a ceiling from
     /// through that service's OWN `RequestServiceQuotaIncrease` — the store

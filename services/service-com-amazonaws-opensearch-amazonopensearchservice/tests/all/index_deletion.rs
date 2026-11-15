@@ -31,7 +31,9 @@ use super::data_source_registry::created_domain;
 use super::domain_lifecycle::{
     error_code, string_member, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS,
 };
-use super::index_registry::{created_index, delete_domain, get, stored_names, wide_schema};
+use super::index_registry::{
+    created_index, delete_domain, get, reported_schema, stored_names, wide_schema,
+};
 
 /// `DeleteIndex`: `DELETE /opensearch/domain/{DomainName}/index/{IndexName}`
 /// (`smithy_query(query="operation",operation="DeleteIndex")`).
@@ -187,7 +189,7 @@ async fn a_delete_removes_exactly_the_named_index_and_reports_deleted() {
             read.status, read.body
         );
         assert_eq!(
-            read.body["IndexSchema"], row.schema,
+            reported_schema(&read, row.name), row.schema,
             "case GetIndex({case}): expected the schema as created, got {:?}",
             read.body["IndexSchema"]
         );
@@ -271,7 +273,7 @@ async fn a_name_a_delete_freed_can_be_created_again() {
             read.status, read.body
         );
         assert_eq!(
-            read.body["IndexSchema"], replacement,
+            reported_schema(&read, row.name), replacement,
             "case GetIndex({case}, re-created): expected the schema the second create carried, \
              got {:?}",
             read.body["IndexSchema"]

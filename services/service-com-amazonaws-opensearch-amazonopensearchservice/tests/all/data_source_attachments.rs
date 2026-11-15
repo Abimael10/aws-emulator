@@ -61,7 +61,7 @@ pub(crate) async fn attach(emulator: &Emulator, id: &str, body: Value) -> Answer
 }
 
 /// `DetachDataSource`: `POST /2021-01-01/opensearch/application/{id}/detachDataSource`.
-async fn detach(emulator: &Emulator, id: &str, data_source_arn: &str) -> Answer {
+pub(crate) async fn detach(emulator: &Emulator, id: &str, data_source_arn: &str) -> Answer {
     emulator
         .call(
             "POST",
@@ -803,7 +803,10 @@ async fn a_detached_data_source_leaves_the_set() {
     let id = application(&emulator, "detach-ui").await;
     let first = domain(&emulator, "detach-src0").await;
     let second = domain(&emulator, "detach-src1").await;
-    tokio::time::sleep(SETTLE_WAIT).await;
+    // The CONDITION each attach below is decided by — the domain's provisioning having
+    // landed — is polled for rather than waited out.
+    settled_domain(&emulator, "detach-src0").await;
+    settled_domain(&emulator, "detach-src1").await;
     for arn in [&first, &second] {
         let answer = attach(&emulator, &id, json!({ "dataSourceArn": arn })).await;
         assert_eq!(
@@ -840,29 +843,60 @@ async fn a_detached_data_source_leaves_the_set() {
         vec![second.clone()],
         "case detach: only the detached data source left the set, got {remaining:?}"
     );
-    for (case, answer) in [
-        (
-            "a read of a detached data source",
-            describe_attachment(&emulator, &id, &first).await,
-        ),
-        (
-            "a second detach of one data source",
-            detach(&emulator, &id, &first).await,
-        ),
-    ] {
-        assert_eq!(
-            answer.status, RECORDED_NOT_FOUND_STATUS,
-            "case {case}: expected {RECORDED_NOT_FOUND_STATUS}, got {} with {:?}",
-            answer.status, answer.body
-        );
-        assert_eq!(
-            error_code(&answer),
-            "ResourceNotFoundException",
-            "case {case}: a data source the application holds no record for is not found, got \
-             {:?}",
-            answer.body
-        );
-    }
+    let read = describe_attachment(&emulator, &id, &first).await;
+    assert_eq!(
+        read.status, RECORDED_NOT_FOUND_STATUS,
+        "case a read of a detached data source: expected {RECORDED_NOT_FOUND_STATUS}, got {} with \
+         {:?}",
+        read.status, read.body
+    );
+    assert_eq!(
+        error_code(&read),
+        "ResourceNotFoundException",
+        "case a read of a detached data source: a data source the application holds no record for \
+         is not found, got {:?}",
+        read.body
+    );
+
+    // Removing the data source from the application is work the service does: while that
+    // removal is in flight a SECOND detach of the same attachment meets it and is refused
+    // the conflict, which is what tells a caller racing another detach apart from one that
+    // was never attached...
+    let racing = detach(&emulator, &id, &first).await;
+    assert_eq!(
+        racing.status, 409,
+        "case a second detach while the removal is in flight: expected 409, got {} with {:?}",
+        racing.status, racing.body
+    );
+    assert_eq!(
+        error_code(&racing),
+        "ConflictException",
+        "case a second detach while the removal is in flight: expected the modelled conflict, got \
+         {:?}",
+        racing.body
+    );
+
+    // ... and once that removal has landed the record is gone, so a later detach of it is
+    // the missing-resource refusal. The CONDITION is polled for rather than waited out: a
+    // detach that answers the miss removes nothing, so looking again changes nothing.
+    poll_until("the removal of the detached attachment landing", || async {
+        detach(&emulator, &id, &first).await.status == RECORDED_NOT_FOUND_STATUS
+    })
+    .await;
+    let later = detach(&emulator, &id, &first).await;
+    assert_eq!(
+        later.status, RECORDED_NOT_FOUND_STATUS,
+        "case a detach after the removal landed: expected {RECORDED_NOT_FOUND_STATUS}, got {} with \
+         {:?}",
+        later.status, later.body
+    );
+    assert_eq!(
+        error_code(&later),
+        "ResourceNotFoundException",
+        "case a detach after the removal landed: a data source the application holds no record \
+         for is not found, got {:?}",
+        later.body
+    );
 
     // A PENDING attachment is one still being made, so a detach of it is refused rather
     // than removing a record the clock is still owed a move on.

@@ -14,7 +14,9 @@
 //! > whose own constraints hold (the grammar an ARN has to satisfy, which this model
 //! > declares as `@pattern(".*")`) is reached only for a request the boundary accepted. So
 //! > one request never states both, and the clause a declared constraint earns is never
-//! > spoken over.
+//! > spoken over. Past the boundary the APPLICATION the request addresses is resolved
+//! > before those checks of its own, because every one of them is about an attachment OF
+//! > that application.
 //!
 //! The rows span what the rule generalises over: WHY the `id` is outside the expression an
 //! application id satisfies (a GUID, a leading hyphen, below the minimum length, past the
@@ -22,9 +24,12 @@
 //! ARN the service's own grammar refuses, and one it accepts — so a row cannot pass by
 //! refusing whatever came last. The recorded case is ONE row.
 //!
-//! Two control rows hold the other side of the rule: a well-formed `id` with an ARN the
-//! grammar refuses IS answered with that member's clause, and a well-formed `id` with an
-//! ARN the grammar admits reaches the application lookup.
+//! Two control rows hold the other side of the rule: a well-formed `id` of an application
+//! the account holds, with an ARN the grammar refuses, IS answered with that member's
+//! clause, and one with an ARN the grammar admits reaches the attachment itself — while a
+//! well-formed `id` that names no application is answered with the missing resource, which
+//! is the refusal this service's own recording shows for an attach whose referenced
+//! resource does not exist.
 
 use serde_json::json;
 
@@ -114,23 +119,22 @@ async fn the_label_s_own_clause_is_the_whole_refusal() {
     }
 }
 
-/// A well-formed `id` carries the request past the boundary, so the service's own check of
-/// the ARN's grammar is the one that speaks — at the `dataSourceArn` member, and about no
-/// other.
+/// A well-formed `id` carries the request past the boundary, so the next verdict is the
+/// service's own: the application the label names is resolved, and the ARN's grammar is
+/// checked for a request that addresses an application there is — at the `dataSourceArn`
+/// member, and about no other.
 #[tokio::test]
 async fn a_request_the_boundary_accepts_reaches_the_service_s_own_check() {
     let emulator = Emulator::new();
     let held = application(&emulator, "boundary-first-app").await;
 
-    // Every well-formed id: the one an application was minted under, and two more inside
-    // the expression (the minimum length, and a longer lower-case token) that name no
-    // application — the grammar check runs before the application is resolved, so all three
-    // state it.
-    for id in [held.as_str(), "absentapplication", "abc"] {
-        let case = format!("the well-formed id {id:?} with an ARN the grammar refuses");
+    // The id of an application this account HOLDS: the request is about an attachment of
+    // that application, so what speaks is the service's own check of the ARN's grammar.
+    {
+        let case = format!("the well-formed id {held:?} with an ARN the grammar refuses");
         let answer = attach(
             &emulator,
-            id,
+            &held,
             json!({ "dataSourceArn": UNSUPPORTED_ARN }),
         )
         .await;
@@ -148,28 +152,33 @@ async fn a_request_the_boundary_accepts_reaches_the_service_s_own_check() {
         );
     }
 
-    // And an ARN the grammar admits leaves nothing for either check to state: the request
-    // reaches the application the label names, which is what answers it.
+    // A well-formed id no application was minted under addresses nothing the rest of the
+    // request could be about, so the missing resource is what is stated — whatever the body
+    // carries, the ARN the service's own grammar would refuse included.
+    for id in ["absentapplication", "abc"] {
+        for (carries, arn) in [
+            ("an ARN the service's grammar refuses", UNSUPPORTED_ARN.to_string()),
+            ("an ARN the service's grammar admits", supported_arn()),
+        ] {
+            let case = format!("the well-formed id {id:?} of no application, with {carries}");
+            let answer = attach(&emulator, id, json!({ "dataSourceArn": arn })).await;
+            assert_eq!(
+                (answer.status, error_code(&answer).as_str()),
+                (RECORDED_NOT_FOUND_STATUS, "ResourceNotFoundException"),
+                "case {case}: expected the modelled not-found, got {} with {:?}",
+                answer.status,
+                answer.body
+            );
+        }
+    }
+
+    // And an ARN the grammar admits, for an application the account holds, leaves nothing
+    // for either check to state: the attach is served.
     let case = "the well-formed id of an application the account holds";
     let answer = attach(&emulator, &held, json!({ "dataSourceArn": supported_arn() })).await;
     assert_eq!(
         answer.status, 200,
         "case {case}: expected the attach to be served, got {} with {:?}",
         answer.status, answer.body
-    );
-
-    let case = "a well-formed id no application was minted under";
-    let answer = attach(
-        &emulator,
-        "absentapplication",
-        json!({ "dataSourceArn": supported_arn() }),
-    )
-    .await;
-    assert_eq!(
-        (answer.status, error_code(&answer).as_str()),
-        (RECORDED_NOT_FOUND_STATUS, "ResourceNotFoundException"),
-        "case {case}: expected the modelled not-found, got {} with {:?}",
-        answer.status,
-        answer.body
     );
 }

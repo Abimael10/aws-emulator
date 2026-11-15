@@ -178,13 +178,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(DescribeDataSourceAttachmentErrorModeled::AccessDeniedException)?;
 
         let now = ::std::time::SystemTime::now();
+        // Where every data source another service holds stands, read from those services'
+        // own stores BEFORE this one is locked, so no call holds two service stores at once.
+        let foreign = crate::state::foreign_data_sources::foreign_data_sources(&*self.engine);
         let mut store = state.lock();
 
         // The ONLY writes this report makes, and each writes only what the clock
         // already owed a record at this instant had nobody called: an application whose
         // provisioning has landed is active, and a pending attachment that has fallen
         // due is reported in the status it is then in.
-        store.settle_for_attachments(now);
+        store.settle_for_attachments(now, &foreign);
 
         // The attachment belongs to the application, so an id naming none holds no
         // attachment to report.

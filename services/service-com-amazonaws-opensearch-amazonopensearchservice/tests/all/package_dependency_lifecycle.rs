@@ -44,7 +44,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
     package_reference_path, DOMAIN_PACKAGE_STATUS_ACTIVE, DOMAIN_PACKAGE_STATUS_ASSOCIATING,
     DOMAIN_PACKAGE_STATUS_DISSOCIATING, DOMAIN_PACKAGE_STATUS_DISSOCIATION_FAILED,
-    PACKAGE_ASSOCIATION_CHANGE, PACKAGE_IN_USE, PACKAGE_TYPE_TXT_DICTIONARY,
+    INDEX_SETTINGS_UPDATE_UNSUPPORTED, PACKAGE_ASSOCIATION_CHANGE, PACKAGE_IN_USE,
+    PACKAGE_TYPE_TXT_DICTIONARY,
 };
 
 use super::domain_lifecycle::{
@@ -573,7 +574,7 @@ async fn a_schema_naming_a_file_no_package_in_place_provides_is_refused_and_serv
 }
 
 #[tokio::test]
-async fn an_update_naming_a_file_no_package_in_place_provides_is_refused_and_changes_nothing() {
+async fn an_update_does_not_write_the_analysis_settings_a_package_file_is_named_in() {
     let emulator = Emulator::new();
     let domain = "unresolved-update";
     let package_id = domain_and_package(&emulator, domain, "unresolved-update-package").await;
@@ -581,12 +582,16 @@ async fn an_update_naming_a_file_no_package_in_place_provides_is_refused_and_cha
     let created = plain_change();
     created_index(&emulator, domain, "updated-index", &created, "update").await;
 
+    // A package file is named BY AN INDEX'S ANALYSIS SETTINGS, and an update writes an
+    // index's mappings and semantic enrichment rather than its settings: the update is
+    // refused for naming a settings section at all, whether or not the package it points
+    // at is in place, and the index keeps the schema the create left.
     let row = &use_rows()[0];
     let schema = (row.schema)(&path);
     let refused = update_index(&emulator, domain, "updated-index", &schema).await;
     assert_eq!(
         refused.status, 400,
-        "case update: expected 400 for a file no package provides, got {} with {:?}",
+        "case update: expected 400 for an update naming a settings section, got {} with {:?}",
         refused.status, refused.body
     );
     assert_eq!(
@@ -597,8 +602,8 @@ async fn an_update_naming_a_file_no_package_in_place_provides_is_refused_and_cha
     );
     assert_eq!(
         string_member(&refused.body, "message", "update"),
-        row.message,
-        "case update: expected the engine's unreadable-file sentence, got {:?}",
+        INDEX_SETTINGS_UPDATE_UNSUPPORTED,
+        "case update: expected the service's sentence for a settings update, got {:?}",
         refused.body
     );
     let stored = read_schema(&emulator, domain, "updated-index", "update").await;
@@ -607,9 +612,10 @@ async fn an_update_naming_a_file_no_package_in_place_provides_is_refused_and_cha
         "case update: a refused update must change nothing, got {stored:?}"
     );
 
-    // The identical update lands once the package is in place.
+    // The CREATE is the call that writes an index's settings, so the very schema the
+    // update would not take is served by a create once the package is in place.
     associated(&emulator, domain, &package_id, "update").await;
-    updated_index(&emulator, domain, "updated-index", &schema, "update").await;
+    created_index(&emulator, domain, "created-with-the-package", &schema, "update").await;
 }
 
 #[tokio::test]

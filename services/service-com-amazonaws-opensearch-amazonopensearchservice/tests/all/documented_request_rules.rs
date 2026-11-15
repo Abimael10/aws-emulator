@@ -533,12 +533,13 @@ struct ArnRow {
     accepted: bool,
 }
 
-/// RULE: `AttachDataSource` takes the ARN of a data source this service can attach — "the
-/// data source must be an Amazon OpenSearch Service domain" — held by the account the
-/// request was made for: an ARN naming another KIND of resource, and one naming another
-/// ACCOUNT's resource, are the malformed values they are. Whether the named resource exists
-/// is the attachment's own asynchronous outcome, so an ARN of the right kind and owner is
-/// accepted whether or not it resolves.
+/// RULE: `AttachDataSource` takes the ARN of a data source this service can read — a domain
+/// of this account, a direct query data source of it, this account's Glue Data Catalog or an
+/// OpenSearch Serverless collection of it — held by the account the request was made for: an
+/// ARN naming another KIND of resource, and one naming another ACCOUNT's resource, are the
+/// malformed values they are. Whether the named resource exists is the attachment's own
+/// asynchronous outcome, so an ARN of the right kind and owner is accepted whether or not it
+/// resolves.
 #[tokio::test]
 async fn an_attach_resolves_the_kind_and_the_owner_of_the_arn_it_is_given() {
     let emulator = Emulator::new();
@@ -564,6 +565,16 @@ async fn an_attach_resolves_the_kind_and_the_owner_of_the_arn_it_is_given() {
             "this account's Glue Data Catalog",
             format!("arn:aws:glue:{REGION}:{account}:catalog"),
             true,
+        ),
+        row(
+            "an OpenSearch Serverless collection of this account",
+            format!("arn:aws:aoss:{REGION}:{account}:collection/attachrulescollection"),
+            true,
+        ),
+        row(
+            "an OpenSearch Serverless collection of another account",
+            format!("arn:aws:aoss:{REGION}:555555555555:collection/elsewherecollection"),
+            false,
         ),
         row(
             "a domain of another account",

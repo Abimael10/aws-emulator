@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: the DECLARATION LIST, and nothing else.
+//
 //! Single integration-test target for the router.
 //!
 //! This file is a LIST: one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file
@@ -155,10 +157,13 @@
 // a note here is prose two landing branches duplicate, re-word and mistype.
 // Three rules this file lives or dies by, each pinned by a suite of its own
 // (`all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
 // `all/all_rs_is_a_canonical_declaration_list.rs`): one declaration per suite (a second
 // is `E0428`), every comment an ORDINARY `//` one (an inner `//!` past the first item is
 // `E0753`), and nothing in the list but declaration pairs. Each failure compiles no suite
 // of this target at all, so the list holds pairs only.
+//! Single integration-test target for the router.
+//!
 //! One `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted, and nothing else:
 //! a landing has one place to insert and nothing to keep consistent.
 //! A suite that is not declared here compiles nowhere and its tests never run, and a suite
@@ -168,17 +173,25 @@
 //! lines are the only place one may stand — past the first item `//!` is `E0753` and compiles
 //! no suite of this target, so a note further down this file must be an ordinary `//` comment,
 //! and the notes landings have appended to this file's tail live in `all/appended_notes.rs`.
+//! `all/all_rs_declares_each_suite_once.rs`,
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
 //! `all/all_rs_is_a_canonical_declaration_list.rs` check those rules, for this file and for
 //! every service crate's `tests/all.rs`.
 //! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 //! (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what points each
 //! declaration into `tests/all/`.
+// Single integration-test target for the router.
 // Put a new suite at `tests/all/<name>.rs` and declare it below with a `#[path]`/`mod`
 // pair, keeping the list sorted: one pair per suite, and nothing else that a landing has to
 // keep consistent.
 // level of `tests/` fails the build; and a suite declared twice is `E0428`, which fails every
 // suite in this target.
+// EVERY comment in this file is an ORDINARY one, this block included, and that is
+// deliberate: an inner doc comment is legal only before the first item, so one that lands
+// past the declarations — which is what concurrent landings appending to this file kept
+// producing — is `E0753` and compiles no suite of this target. With no inner doc comment
 // anywhere, no merge of two landings can put one past the first item.
+// `all/all_rs_declares_each_suite_once.rs`,
 // `all/all_rs_is_a_canonical_declaration_list.rs` check those rules — the list holds one
 // pair per suite, sorted, and no other line — for this file and for every service crate's
 // `tests/all.rs`, so check there rather than leaving a note here.
@@ -196,6 +209,9 @@
 //! nothing, so add a declaration below rather than a note about one — the notes earlier
 //! landings appended live in `all/appended_notes.rs`.
 //! `all/all_rs_is_a_canonical_declaration_list.rs` check those rules — the first two for
+//! this file and for every service crate's `tests/all.rs`.
+// (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is what points each
+// declaration into `tests/all/`.
 // (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is what points each
 // declaration into `tests/all/`.
 // of this target at all, so the list holds pairs only — and with no `//!` anywhere in this

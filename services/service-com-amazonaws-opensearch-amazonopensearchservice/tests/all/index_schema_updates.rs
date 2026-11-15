@@ -82,6 +82,9 @@ pub(crate) async fn updated_index(
 }
 
 /// The schema `GetIndex` reports for `index`, with the case named on failure.
+///
+/// The answer is keyed by the index name, the way the engine's own mapping API reports one
+/// index, so the schema is taken out from under the name the read asked about.
 pub(crate) async fn read_schema(emulator: &Emulator, domain: &str, index: &str, case: &str) -> Value {
     let read = get_index(emulator, domain, index).await;
     assert_eq!(
@@ -89,7 +92,7 @@ pub(crate) async fn read_schema(emulator: &Emulator, domain: &str, index: &str, 
         "case GetIndex({case}): expected 200, got {} with {:?}",
         read.status, read.body
     );
-    read.body["IndexSchema"].clone()
+    read.body["IndexSchema"][index].clone()
 }
 
 /// One merge case: the schema the index is created with, the update to apply and the
@@ -180,31 +183,47 @@ fn merge_rows() -> Vec<MergeRow> {
         },
         MergeRow {
             case: "a section the stored schema does not carry",
-            created: json!({ "mappings": { "properties": { "title": { "type": "text" } } } }),
-            update: json!({ "settings": { "index": { "number_of_replicas": 2 } } }),
+            created: json!({ "settings": { "index": { "number_of_replicas": 2 } } }),
+            update: json!({ "mappings": { "properties": { "title": { "type": "text" } } } }),
             merged: json!({
-                "mappings": { "properties": { "title": { "type": "text" } } },
-                "settings": { "index": { "number_of_replicas": 2 } }
+                "settings": { "index": { "number_of_replicas": 2 } },
+                "mappings": { "properties": { "title": { "type": "text" } } }
             }),
         },
         MergeRow {
-            case: "one setting rewritten, its siblings left alone",
+            case: "one member of a mapped field rewritten, its siblings left alone",
             created: json!({
-                "settings": { "index": { "number_of_replicas": 1, "knn": true } }
+                "mappings": {
+                    "properties": { "title": { "type": "text", "analyzer": "english" } }
+                }
             }),
-            update: json!({ "settings": { "index": { "number_of_replicas": 4 } } }),
+            update: json!({
+                "mappings": { "properties": { "title": { "analyzer": "standard" } } }
+            }),
             merged: json!({
-                "settings": { "index": { "number_of_replicas": 4, "knn": true } }
+                "mappings": {
+                    "properties": { "title": { "type": "text", "analyzer": "standard" } }
+                }
             }),
         },
         MergeRow {
             case: "a list is one value, so it is replaced rather than appended to",
             created: json!({
-                "settings": { "analysis": { "filter": ["lowercase", "stop"], "char": [] } }
+                "mappings": {
+                    "properties": {
+                        "title": { "type": "text", "copy_to": ["all", "searchable"] }
+                    }
+                }
             }),
-            update: json!({ "settings": { "analysis": { "filter": ["asciifolding"] } } }),
+            update: json!({
+                "mappings": { "properties": { "title": { "copy_to": ["all_fields"] } } }
+            }),
             merged: json!({
-                "settings": { "analysis": { "filter": ["asciifolding"], "char": [] } }
+                "mappings": {
+                    "properties": {
+                        "title": { "type": "text", "copy_to": ["all_fields"] }
+                    }
+                }
             }),
         },
         MergeRow {
@@ -302,19 +321,27 @@ fn merge_rows() -> Vec<MergeRow> {
             case: "an index created with no sections at all",
             created: json!({}),
             update: json!({
-                "mappings": { "properties": { "title": { "type": "text" } } },
-                "settings": { "index": { "number_of_shards": 3 } }
+                "mappings": { "properties": { "title": { "type": "text" } } }
             }),
             merged: json!({
-                "mappings": { "properties": { "title": { "type": "text" } } },
-                "settings": { "index": { "number_of_shards": 3 } }
+                "mappings": { "properties": { "title": { "type": "text" } } }
             }),
         },
         MergeRow {
-            case: "a setting that is a value where a set of members stood",
-            created: json!({ "settings": { "index": { "knn": { "enabled": true } } } }),
-            update: json!({ "settings": { "index": { "knn": false } } }),
-            merged: json!({ "settings": { "index": { "knn": false } } }),
+            case: "a mapping member that is a value where a set of members stood",
+            created: json!({
+                "mappings": {
+                    "properties": { "title": { "type": "text", "index": { "enabled": true } } }
+                }
+            }),
+            update: json!({
+                "mappings": { "properties": { "title": { "index": false } } }
+            }),
+            merged: json!({
+                "mappings": {
+                    "properties": { "title": { "type": "text", "index": false } }
+                }
+            }),
         },
     ]
 }
@@ -474,9 +501,9 @@ fn type_rows() -> Vec<TypeRow> {
                     "properties": {
                         "summary": { "type": "text" },
                         "views": { "type": "keyword" }
-                    }
-                },
-                "settings": { "index": { "number_of_replicas": 2 } }
+                    },
+                    "_meta": { "revision": 2 }
+                }
             }),
             outcome: Outcome::Refused("views", "integer", "keyword"),
         },
@@ -527,12 +554,6 @@ fn type_rows() -> Vec<TypeRow> {
             })),
         },
         TypeRow {
-            case: "a type member outside the mappings is not a field's type",
-            created: json!({ "settings": { "store": { "type": "fs" } } }),
-            update: json!({ "settings": { "store": { "type": "niofs" } } }),
-            outcome: Outcome::Merged(json!({ "settings": { "store": { "type": "niofs" } } })),
-        },
-        TypeRow {
             case: "an index with no mappings at all has no settled type",
             created: json!({}),
             update: json!({ "mappings": { "properties": { "title": { "type": "text" } } } }),
@@ -541,21 +562,20 @@ fn type_rows() -> Vec<TypeRow> {
             ),
         },
         TypeRow {
-            // The rule is about the type the index already carries, whatever stands
-            // where the type name belongs: a value there is settled the same way.
-            case: "a type that is not a name is settled all the same",
-            created: json!({ "mappings": { "properties": { "views": { "type": 7 } } } }),
-            update: json!({ "mappings": { "properties": { "views": { "type": "integer" } } } }),
-            outcome: Outcome::Refused("views", "7", "integer"),
-        },
-        TypeRow {
-            case: "the same value restated where a type name belongs is no change",
-            created: json!({ "mappings": { "properties": { "views": { "type": 7 } } } }),
+            // A field's type is settled by the write that first maps it, so an update
+            // RESTATING that type names no change: the rows above refuse the ones that
+            // change it, and this one is served.
+            case: "the same type restated beside another member is no change",
+            created: json!({ "mappings": { "properties": { "views": { "type": "integer" } } } }),
             update: json!({
-                "mappings": { "properties": { "views": { "type": 7, "index": false } } }
+                "mappings": {
+                    "properties": { "views": { "type": "integer", "index": false } }
+                }
             }),
             outcome: Outcome::Merged(json!({
-                "mappings": { "properties": { "views": { "type": 7, "index": false } } }
+                "mappings": {
+                    "properties": { "views": { "type": "integer", "index": false } }
+                }
             })),
         },
     ]
@@ -747,7 +767,7 @@ async fn an_update_that_would_grow_one_schema_past_the_emulators_own_bound_is_re
         &emulator,
         "schema-bound",
         "bounded",
-        &json!({ "settings": { "index": { "number_of_replicas": 1 } } }),
+        &json!({ "mappings": { "_meta": { "owner": "search-team" } } }),
         "inside the bound",
     )
     .await;
@@ -775,8 +795,8 @@ async fn an_update_that_would_grow_one_schema_past_the_emulators_own_bound_is_re
     // left, and the index still takes an update that stays inside the bound.
     let read = read_schema(&emulator, "schema-bound", "bounded", "past the bound").await;
     assert_eq!(
-        read["mappings"], inside["mappings"],
-        "case past the bound: expected the mappings the create wrote, got {read:?}"
+        read["mappings"]["properties"], inside["mappings"]["properties"],
+        "case past the bound: expected the properties the create wrote, got {read:?}"
     );
 
     // The same bound holds for the create that would PERSIST such a document, so no
@@ -817,7 +837,7 @@ async fn an_update_that_would_grow_one_schema_past_the_emulators_own_bound_is_re
         &emulator,
         "schema-bound",
         "bounded",
-        &json!({ "settings": { "index": { "number_of_replicas": 2 } } }),
+        &json!({ "mappings": { "_meta": { "revision": 2 } } }),
         "after the refusal",
     )
     .await;

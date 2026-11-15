@@ -196,6 +196,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        // Whether this operation is available at all is decided from the DOMAIN, before the
+        // index the request names is looked up: an index managed through these operations
+        // lives on a domain whose engine serves them, so one that does not cannot serve this
+        // call either — the same gate `CreateIndex`, `GetIndex` and `UpdateIndex` run
+        // ([`crate::state::index_management_refusal`]).
+        if let Some(refusal) = crate::state::index_management_refusal(domain) {
+            return Err(DeleteIndexErrorModeled::ValidationException(refusal).into());
+        }
+
         // The domain exists; the name it carries names no index OF it. A delete
         // removes an existing resource, so a name the domain does not hold is the
         // modelled missing-resource refusal rather than a success — which is also

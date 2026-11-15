@@ -215,6 +215,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        // Whether this operation is available at all is decided from the DOMAIN, before
+        // anything about the request body or the index is: an index's mappings, settings and
+        // semantic enrichment are written on the domain's own engine, so a domain running an
+        // engine that serves none of that cannot serve this call, and says so in the
+        // service's own software-version sentence
+        // ([`crate::state::index_management_refusal`]) — the same gate `UpdateIndex`,
+        // `GetIndex` and `DeleteIndex` run.
+        if let Some(refusal) = crate::state::index_management_refusal(domain) {
+            return Err(CreateIndexErrorModeled::ValidationException(refusal).into());
+        }
+
         // The schema is a set of named sections, so a document carrying a scalar or
         // an array instead is refused rather than persisted as this index's schema.
         // `IndexSchema` is a modelled document, so this is the service's own rule about
@@ -232,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // than persisted, so what an index carries stays tied to the size of the
         // request that wrote it and no stored schema starts out past the bound every
         // later update is held to. The same two bounds `UpdateIndex` applies to the
-        // change it merges.
+        // change it merges, and they are applied before the document is walked.
         let depth = crate::state::index_schema_depth(&input.index_schema);
         if depth > crate::state::INDEX_SCHEMA_MAX_DEPTH {
             return Err(CreateIndexErrorModeled::ValidationException(
@@ -246,6 +257,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::index_schema_over_quota(values),
             )
             .into());
+        }
+
+        // And the sections it carries have to be a schema the engine could BUILD an index
+        // from, by the one rule both index writes apply
+        // ([`crate::state::index_schema_violation`]): a mapping or settings section that is
+        // not a set of members, a field mapping that is not one, a field type the engine has
+        // no mapper for or a setting carrying a value of the wrong kind is refused naming
+        // the offending part of the document, and nothing is stored.
+        if let Some(violation) = crate::state::index_schema_violation(&input.index_schema) {
+            return Err(CreateIndexErrorModeled::ValidationException(violation.validation()).into());
         }
 
         // An index's name identifies it within its domain, so a create cannot land on

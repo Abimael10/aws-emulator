@@ -279,7 +279,9 @@ fn rows() -> Vec<Row> {
         Row {
             // A declaration carrying no such property at all: nothing is sent for it, and the
             // deployed domain serves the index calls just the same. The shortest name its
-            // length bound allows, and an update writing a SECTION the create never carried.
+            // length bound allows, and an update writing a mapping SECTION the create never
+            // carried (an update writes an index's mappings and semantic enrichment, not the
+            // settings of the index itself).
             case: "a domain declaring no access policy, then an update adding a new section",
             stack: "sim-cfnidx-none-stack",
             domain: "sim-cfnidx-none",
@@ -290,11 +292,13 @@ fn rows() -> Vec<Row> {
                 "aliases": { "current": {} },
                 "mappings": { "properties": { "amount": { "type": "double" } } },
             }),
-            update: json!({ "settings": { "refresh_interval": "30s" } }),
+            update: json!({ "mappings": { "_meta": { "owner": "search-team" } } }),
             merged: json!({
                 "aliases": { "current": {} },
-                "mappings": { "properties": { "amount": { "type": "double" } } },
-                "settings": { "refresh_interval": "30s" },
+                "mappings": {
+                    "properties": { "amount": { "type": "double" } },
+                    "_meta": { "owner": "search-team" },
+                },
             }),
         },
     ]
@@ -499,8 +503,11 @@ async fn a_deployed_domain_serves_the_index_control_plane() {
             status, 200,
             "case {case:?}: expected 200 from GetIndex, got {status} with {body}"
         );
+        // The read reports the index's schema under the index's own NAME, the way the
+        // engine's mapping API reports one index, so the schema is taken out from under the
+        // name the read asked about.
         assert_eq!(
-            body.get("IndexSchema"),
+            body.get("IndexSchema").and_then(|schema| schema.get(row.index)),
             Some(&row.created),
             "case {case:?}: expected the created schema to read back, got {body}"
         );
@@ -523,7 +530,7 @@ async fn a_deployed_domain_serves_the_index_control_plane() {
              {body}"
         );
         assert_eq!(
-            body.get("IndexSchema"),
+            body.get("IndexSchema").and_then(|schema| schema.get(row.index)),
             Some(&row.merged),
             "case {case:?}: expected the update to merge onto the created schema, got {body}"
         );

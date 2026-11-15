@@ -125,9 +125,8 @@ fn update_rows() -> Vec<Row> {
             unconfigured: false,
         },
         Row {
-            case: "a custom analyzer this same write defines under settings.analysis",
-            created: json!({ "mappings": { "properties": { "body": { "type": "text" } } } }),
-            update: json!({
+            case: "a custom analyzer the create defined under settings.analysis",
+            created: json!({
                 "settings": {
                     "analysis": {
                         "analyzer": {
@@ -135,15 +134,17 @@ fn update_rows() -> Vec<Row> {
                         }
                     }
                 },
+                "mappings": { "properties": { "body": { "type": "text" } } }
+            }),
+            update: json!({
                 "mappings": { "properties": { "body": { "analyzer": "house_analyzer" } } }
             }),
             analyzer: "house_analyzer",
             unconfigured: false,
         },
         Row {
-            case: "a custom analyzer this same write defines under settings.index.analysis",
-            created: json!({ "mappings": { "properties": { "body": { "type": "text" } } } }),
-            update: json!({
+            case: "a custom analyzer the create defined under settings.index.analysis",
+            created: json!({
                 "settings": {
                     "index": {
                         "analysis": {
@@ -153,6 +154,9 @@ fn update_rows() -> Vec<Row> {
                         }
                     }
                 },
+                "mappings": { "properties": { "body": { "type": "text" } } }
+            }),
+            update: json!({
                 "mappings": { "properties": { "body": { "analyzer": "nested_analyzer" } } }
             }),
             analyzer: "nested_analyzer",
@@ -251,14 +255,16 @@ fn update_rows() -> Vec<Row> {
             unconfigured: true,
         },
         Row {
-            case: "an analyzer DEFINED in the write, beside one nothing configures",
-            created: json!({ "mappings": { "properties": { "title": { "type": "text" } } } }),
-            update: json!({
+            case: "an analyzer the index already defines, beside one nothing configures",
+            created: json!({
                 "settings": {
                     "analysis": {
                         "analyzer": { "defined_one": { "type": "custom", "tokenizer": "standard" } }
                     }
                 },
+                "mappings": { "properties": { "title": { "type": "text" } } }
+            }),
+            update: json!({
                 "mappings": {
                     "properties": {
                         "a": { "type": "text", "analyzer": "defined_one" },
@@ -485,7 +491,7 @@ async fn a_create_naming_an_analyzer_nothing_configures_is_refused_and_persists_
                     read.status, read.body
                 );
                 assert_eq!(
-                    read.body["IndexSchema"], row.schema,
+                    read.body["IndexSchema"][&index], row.schema,
                     "case {case:?}: expected the schema it was created with, got {:?}",
                     read.body["IndexSchema"]
                 );

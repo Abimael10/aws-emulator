@@ -186,13 +186,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
 
+        // IAM decides whether the caller may do this BEFORE the application, the
+        // attachment or the data source is looked up, so a caller no identity-based
+        // policy permits is told it is not authorized rather than told anything about
+        // the resources the request names — and nothing is mutated on that path.
+        crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::account_domain_resource(ctx),
+        )
+        .map_err(AttachDataSourceErrorModeled::AccessDeniedException)?;
+
+        let now = ::std::time::SystemTime::now();
+        // Where every data source another service holds stands, read from those services'
+        // own stores BEFORE this one is locked, so no call holds two service stores at once
+        // ([`crate::state::foreign_data_sources`]).
+        let foreign = crate::state::foreign_data_sources::foreign_data_sources(&*self.engine);
+        let mut store = state.lock();
+
+        // Whatever the clock already owed the records this call reads is materialised
+        // first, so the decisions below are made on the state at `now`: a domain whose
+        // provisioning has landed is up — which this call reads to decide whether the
+        // attachment can complete — an application that has finished provisioning is
+        // active, and a pending attachment that has fallen due has landed.
+        store.settle_all(now);
+        store.settle_for_attachments(now, &foreign);
+
+        // The ATTACHMENT this request asks for belongs to the application, so the id is
+        // resolved FIRST: everything else the request carries — the data source it names,
+        // the workspace it names and the token it carries — is about an attachment OF that
+        // application, so an id naming none is answered as the missing resource it is
+        // rather than with a verdict on the rest of the request. This path's refusal names
+        // the account the id was resolved in beside the id itself
+        // ([`crate::state::application_not_found_for_account`]).
+        let application = store.applications.get(&input.id).ok_or_else(|| {
+            AttachDataSourceErrorModeled::ResourceNotFoundException(
+                application_not_found_for_account(&input.id),
+            )
+        })?;
+
         // This operation holds `dataSourceArn` to the ARN GRAMMAR a data source is named
         // with, a requirement no trait of this model expresses, and states it the way the
         // request boundary states a `@pattern` ([`stated_input_refusal`]). It runs HERE, in
         // the handler, because a handler is reached only for a request whose modelled
         // constraints all hold: a request that also breaks one of those — the `id` the URI
         // label carries, say — is refused with that member's clause by the boundary, and a
-        // check of this service's own never speaks over it.
+        // check of this service's own never speaks over it. And it runs after the
+        // application is resolved, for the reason stated above.
         if let Some(refusal) = stated_input_refusal(&input.data_source_arn) {
             return Err(AttachDataSourceErrorModeled::ValidationException(refusal).into());
         }
@@ -210,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ARN` is `@length(20..2048)` with pattern `.*`, so the request boundary
         // enforces only the length: a value no ARN parser would accept names no data
-        // source, and is refused as the malformed input it is rather than looked up.
+        // source, and is refused as the malformed input it is.
         if !is_arn(&input.data_source_arn) {
             return Err(AttachDataSourceErrorModeled::ValidationException(malformed_arn(
                 "dataSourceArn",
@@ -220,12 +261,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The data source must be an Amazon OpenSearch Service domain": the ARN has to
-        // name a KIND of resource this service can attach as a data source
-        // ([`crate::state::data_source_arns`]), so one naming a resource of any other
-        // type — of this service or of another — names no data source the application
-        // could ever read, and no attachment is minted for it. Read off the VALUE, before
-        // anything is resolved, unlike whether the data source exists: that outcome is
-        // the attachment's status to carry, as this operation documents.
+        // name a KIND of resource an application can read its data from
+        // ([`crate::state::data_source_arns`]), so one naming a resource of any other type
+        // — of this service or of another — names no data source the application could ever
+        // read, and no attachment is minted for it. Read off the VALUE, unlike whether the
+        // data source EXISTS: that outcome is the attachment's status to carry, as this
+        // operation documents.
         if let Some(refusal) = crate::state::data_source_arns::unsupported_data_source_refusal(
             "dataSourceArn",
             &input.data_source_arn,
@@ -245,39 +286,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(AttachDataSourceErrorModeled::ValidationException(refusal).into());
         }
 
-        // IAM decides whether the caller may do this BEFORE the application, the
-        // attachment or the data source is looked up, so a caller no identity-based
-        // policy permits is told it is not authorized rather than told anything about
-        // the resources the request names — and nothing is mutated on that path.
-        crate::state::authorization::authorize(
-            &*self.engine,
-            ctx,
-            Self::NAME,
-            &crate::state::authorization::account_domain_resource(ctx),
-        )
-        .map_err(AttachDataSourceErrorModeled::AccessDeniedException)?;
+        // The attach is asynchronous: "if both the application and the data source are
+        // active, the attachment completes immediately with a status of ATTACHED.
+        // Otherwise, the operation returns PENDING and completes the attachment
+        // automatically once both become active. If the attachment cannot be completed, its
+        // status becomes FAILED." So whether the ARN resolves to a data source is carried
+        // by the attachment's STATUS, not by refusing the call — the same way this service
+        // accepts a cross-cluster connection whose far domain does not resolve and reports
+        // the outcome on the connection. Where the data source stands is resolved in this
+        // store for a resource of this service and in the store that holds it for one of
+        // another ([`foreign`]), so a data source that is already active completes the
+        // attachment AT ONCE, which is the documented rule.
+        let data_source_up_at = match store.data_source_activation(
+            &input.data_source_arn,
+            now,
+            &foreign,
+        ) {
+            DataSourceActivation::Active => None,
+            DataSourceActivation::ActiveAt(due) => Some(due),
+            // An ARN naming no data source of this account has nothing that becomes
+            // active, so the attachment is owed its outcome a span from here, and settles
+            // as the non-retryable FAILED unless the account holds that data source by
+            // then.
+            DataSourceActivation::Absent => Some(now + PROVISIONING),
+        };
 
-        let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-
-        // Whatever the clock already owed the records this call reads is materialised
-        // first, so the decisions below are made on the state at `now`: a domain whose
-        // provisioning has landed is up — which this call reads to decide whether the
-        // attachment can complete — an application that has finished provisioning is
-        // active, and a pending attachment that has fallen due has landed.
-        store.settle_all(now);
-        store.settle_for_attachments(now);
-
-        // The attachment belongs to the application, so an id naming none has nothing
-        // to attach a data source to. This path's refusal names the account the id was
-        // resolved in beside the id itself
-        // ([`crate::state::application_not_found_for_account`]).
-        let application = store.applications.get(&input.id).ok_or_else(|| {
-            AttachDataSourceErrorModeled::ResourceNotFoundException(
-                application_not_found_for_account(&input.id),
-            )
-        })?;
-
+        // A detach of this data source that has not landed yet has taken the attachment
+        // with it: the data source is not attached any more, so this call is a FRESH attach
+        // of it rather than a repeat ([`crate::state::Application::attachment`] reports no
+        // detached record), and the record it mints stands in place of the detached one.
+        //
         // "A unique, case-sensitive identifier to ensure idempotency of the request. If
         // you retry a request with the same client token and the SAME PARAMETERS, the
         // retry succeeds without performing any further actions": what the token
@@ -309,29 +347,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let attachments_held = application.attachments.len();
         let replaces_failed = held.is_some();
 
-        // The attach is asynchronous: "if both the application and the data source are
-        // active, the attachment completes immediately with a status of ATTACHED.
-        // Otherwise, the operation returns PENDING and completes the attachment
-        // automatically once both become active. If the attachment cannot be completed,
-        // its status becomes FAILED." So whether the ARN resolves to a data source is
-        // carried by the attachment's status, not by refusing the call — the same way
-        // this service accepts a cross-cluster connection whose far domain does not
-        // resolve and reports the outcome on the connection. A data source that is
-        // already active therefore completes AT ONCE, which is the documented rule; a
-        // caller that observes PENDING first for such an attach observed the service
-        // catching up with itself rather than a state of its own.
-        let data_source_up_at = match store.data_source_activation(&input.data_source_arn) {
-            // The state of the data source the ARN names is what decides whether the
-            // attachment completes now or is owed to the clock.
-            DataSourceActivation::Active => None,
-            DataSourceActivation::ActiveAt(due) => Some(due),
-            // An ARN naming no data source of this account has nothing that becomes
-            // active, so the attachment is owed its outcome a span from here, and
-            // settles as the non-retryable FAILED unless the account holds that data
-            // source by then.
-            DataSourceActivation::Absent => Some(now + PROVISIONING),
-        };
-
         // The set is bounded: past its quota an attach is refused rather than adding
         // another record, so a caller looping with fresh data sources cannot grow one
         // application's state without end. Replacing the record of a data source whose
@@ -343,9 +358,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Both the application and the data source must be active for the attachment to
-        // complete, so what a pending one waits for is whichever of the two becomes
-        // active LAST.
+        // "If both the application and the data source are active, the attachment completes
+        // immediately with a status of ATTACHED. Otherwise, the operation returns PENDING
+        // and completes the attachment automatically once both become active. If the
+        // attachment cannot be completed, its status becomes FAILED." So what a pending
+        // attachment waits for is whichever of the two becomes active LAST, and a data
+        // source that goes away before then is what leaves it FAILED
+        // ([`crate::state::DataSourceAttachment::settle`]).
         let active_at = [application_active_at, data_source_up_at]
             .into_iter()
             .flatten()
@@ -358,6 +377,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             owed,
             created_at: now,
             client_token: input.client_token,
+            // No detach has been asked of an attachment this call is minting.
+            detaching_until: None,
         };
 
         // Stored on the application the data source is attached to, and answered with

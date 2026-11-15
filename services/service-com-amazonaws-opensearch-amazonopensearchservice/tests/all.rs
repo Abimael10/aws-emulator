@@ -89,6 +89,8 @@ mod data_plane_unreadable_identity_grant;
 mod data_source_attachment_authorization;
 #[path = "all/data_source_attachments.rs"]
 mod data_source_attachments;
+#[path = "all/data_source_collection_attachments.rs"]
+mod data_source_collection_attachments;
 #[path = "all/data_source_create_rules.rs"]
 mod data_source_create_rules;
 #[path = "all/data_source_kinds.rs"]
@@ -179,6 +181,8 @@ mod index_authorization;
 mod index_deletion;
 #[path = "all/index_document_writes.rs"]
 mod index_document_writes;
+#[path = "all/index_management_rules.rs"]
+mod index_management_rules;
 #[path = "all/index_modelled_answers.rs"]
 mod index_modelled_answers;
 #[path = "all/index_registry.rs"]

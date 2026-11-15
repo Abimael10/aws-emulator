@@ -114,6 +114,15 @@ pub(crate) async fn created_index(
     );
 }
 
+/// The schema a `GetIndex` answer reports for `index`.
+///
+/// The report mirrors the engine's own mapping API: it is KEYED BY THE INDEX NAME, so a
+/// reader takes the schema out from under the name it asked about. The one reading of a read
+/// in this suite and in the suites that drive the same reader.
+pub(crate) fn reported_schema(read: &Answer, index: &str) -> Value {
+    read.body["IndexSchema"][index].clone()
+}
+
 /// One create to make: the index's name and the `IndexSchema` document it carries.
 struct Row {
     name: String,
@@ -218,7 +227,7 @@ async fn every_created_index_is_read_back_with_the_schema_it_was_created_with() 
             read.status, read.body
         );
         assert_eq!(
-            read.body["IndexSchema"], row.schema,
+            reported_schema(&read, &row.name), row.schema,
             "case GetIndex({case}): expected the schema as created, got {:?}",
             read.body["IndexSchema"]
         );
@@ -450,7 +459,7 @@ async fn a_create_on_a_name_the_domain_holds_is_refused_and_leaves_the_schema_as
 
         let read = get(&emulator, "already-exists", &row.name).await;
         assert_eq!(
-            read.body["IndexSchema"], row.schema,
+            reported_schema(&read, &row.name), row.schema,
             "case GetIndex({case}, after the refused create): expected the schema the accepted \
              create carried, got {:?}",
             read.body["IndexSchema"]

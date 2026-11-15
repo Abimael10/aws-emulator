@@ -210,7 +210,7 @@ impl Fixture {
             "case {case:?}: the fixture index must stay readable, got {} with {:?}",
             read.status, read.body
         );
-        read.body["IndexSchema"].clone()
+        read.body["IndexSchema"][INDEX].clone()
     }
 }
 

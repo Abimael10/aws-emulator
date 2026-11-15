@@ -136,6 +136,12 @@ service-com-amazonaws-servicequotas-servicequotasv20190624 = { workspace = true 
 # rendering rather than code written here.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The Amazon OpenSearch Serverless store, which holds the collections an OpenSearch UI
+# application can attach as a data source: an `AttachDataSource` may name a collection by
+# ARN, and that collection is resolved — for its own status — in the store
+# `aoss:CreateCollection` writes (`state::serverless_collections`), the way the IAM,
+# Cognito, S3, CloudWatch Logs, KMS and Certificate Manager stores above are read.
+service-com-amazonaws-opensearchserverless-opensearchserverless = { workspace = true }
 # The Amazon CloudWatch store the `AWS/ES` series a domain's cluster publishes about itself
 # go into (`state::cluster_metrics`): a service's own metric never travels over
 # `PutMetricData`, which reserves the `AWS/` namespaces for the services that own them, so

@@ -1,0 +1,477 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end tests for the rules the INDEX-MANAGEMENT operations share — `CreateIndex`,
+//! `GetIndex`, `UpdateIndex` and `DeleteIndex` — driven over the real wire path (a
+//! `restJson1` HTTP request through the multi-service router into the mounted service), so
+//! what is asserted is what a client sees.
+//!
+//! The rules under test, each over a table spanning what it generalises over rather than one
+//! recorded call:
+//!
+//! * a READ reports one index's schema KEYED BY THE INDEX NAME, the way the engine's own
+//!   mapping API reports an index, so `IndexSchema[<indexName>]` is where a client reads the
+//!   sections from — over rows differing in the sections the index carries, in the name's
+//!   character classes and length, and over two indexes of one domain;
+//! * an `UpdateIndex` writes an index's mappings and semantic enrichment and NOT the
+//!   settings of the index itself: a schema naming a settings section at all is refused,
+//!   whatever that section holds and however it is spelled, and the index keeps its schema;
+//! * a mapping document the engine's mapping parser cannot READ (a value where a set of
+//!   members belongs) leaves the merge the service's own work unfinished, so the update
+//!   answers the modelled `InternalException`, while a mapping it reads and that names
+//!   something the engine has no mapper for — a field type outside its catalog, a `dynamic`
+//!   value it does not know — is the caller's input and so its `ValidationException`; both
+//!   leave the index exactly as it was;
+//! * these operations are served by a domain whose ENGINE serves them: a domain running an
+//!   engine release that does not is refused `ValidationException` with the service's
+//!   software-version sentence, and that refusal is answered BEFORE the index is looked up,
+//!   so a name no index of the domain carries earns it too.
+
+use serde_json::{json, Value};
+use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
+    self, INDEX_MANAGEMENT_ENGINE_VERSION, INDEX_SETTINGS_UPDATE_UNSUPPORTED,
+    INTERNAL_SERVICE_ERROR, MAPPING_FIELD_TYPES,
+};
+
+use super::data_source_registry::created_domain;
+use super::domain_lifecycle::{error_code, settled_domain, string_member, Emulator, PREFIX};
+use super::index_registry::{create as create_index, created_index, get as get_index};
+use super::index_schema_updates::{read_schema, update as update_index, updated_index};
+
+/// `DeleteIndex`: `DELETE /opensearch/domain/{DomainName}/index/{IndexName}`, the fourth
+/// index-management operation the gate below is asserted over.
+async fn delete_index(emulator: &Emulator, domain: &str, index: &str) -> super::domain_lifecycle::Answer {
+    emulator
+        .call(
+            "DELETE",
+            &format!("{PREFIX}/opensearch/domain/{domain}/index/{index}"),
+            None,
+        )
+        .await
+}
+
+/// One index a read reports: the name it was created under and the schema it carries.
+struct ReadRow {
+    case: &'static str,
+    name: &'static str,
+    schema: Value,
+}
+
+/// RULE: `GetIndex` reports the index's schema under the index's own NAME, so a client that
+/// asked about an index by name reads its sections from `IndexSchema[<indexName>]`, and the
+/// document under that name is the one the write persisted.
+#[tokio::test]
+async fn a_read_reports_one_indexs_schema_keyed_by_its_name() {
+    let emulator = Emulator::new();
+    created_domain(&emulator, "keyed-reads").await;
+
+    // The rows differ along the sections the schema carries, the JSON value types in it and
+    // the name's own character classes and length — not along one recorded index.
+    let rows = [
+        ReadRow {
+            case: "mappings alone",
+            name: "logs-2026.01_v2",
+            schema: json!({ "mappings": { "properties": { "title": { "type": "text" } } } }),
+        },
+        ReadRow {
+            case: "mappings and settings together",
+            name: "a",
+            schema: json!({
+                "mappings": { "properties": { "body": { "type": "keyword" } } },
+                "settings": { "index": { "number_of_shards": 2 } }
+            }),
+        },
+        ReadRow {
+            case: "semantic enrichment beside the mapping",
+            name: "semantic-index",
+            schema: json!({
+                "mappings": {
+                    "properties": {
+                        "summary": { "type": "text", "semantic_enrichment": { "enabled": true } }
+                    }
+                }
+            }),
+        },
+        ReadRow {
+            case: "an index created with no sections at all",
+            name: "bare",
+            schema: json!({}),
+        },
+    ];
+
+    for row in &rows {
+        created_index(&emulator, "keyed-reads", row.name, &row.schema, row.case).await;
+    }
+
+    for row in &rows {
+        let read = get_index(&emulator, "keyed-reads", row.name).await;
+        assert_eq!(
+            read.status, 200,
+            "case {}: expected 200 from GetIndex, got {} with {:?}",
+            row.case, read.status, read.body
+        );
+        let reported = read.body["IndexSchema"].clone();
+        assert!(
+            reported.get(row.name).is_some(),
+            "case {}: expected the schema under the index name {:?}, got {reported:?}",
+            row.case,
+            row.name
+        );
+        assert_eq!(
+            reported[row.name], row.schema,
+            "case {}: expected the stored schema under that name, got {reported:?}",
+            row.case
+        );
+        // The report is about the index the request named and no other: it carries exactly
+        // one entry, which is that index's.
+        assert_eq!(
+            reported.as_object().map(|sections| sections.len()),
+            Some(1),
+            "case {}: expected exactly the named index in the report, got {reported:?}",
+            row.case
+        );
+        for other in rows.iter().filter(|other| other.name != row.name) {
+            assert!(
+                reported.get(other.name).is_none(),
+                "case {}: expected no other index in the report, got {reported:?}",
+                row.case
+            );
+        }
+    }
+}
+
+/// One update that must be refused: what it carries, and the channel and sentence the
+/// service answers it on.
+struct RefusedRow {
+    case: &'static str,
+    /// The `IndexSchema` the update carries.
+    schema: Value,
+    /// The HTTP status and error code the refusal is answered on.
+    status: u16,
+    code: &'static str,
+    /// The whole message, where the service's sentence for the class is fixed; `None` where
+    /// the sentence names the offending part of the document, which the row checks for
+    /// instead.
+    message: Option<&'static str>,
+    /// A part of the document the refusal must name, for a sentence built from the path.
+    names: Option<&'static str>,
+}
+
+/// RULE: an `UpdateIndex` writes an index's mappings and semantic enrichment and not the
+/// settings of the index itself, a mapping document the mapping parser cannot read is the
+/// service's own internal failure, and a mapping that names something the engine has no
+/// mapper for is refused as the input it is — every one of them leaving the index exactly as
+/// it was.
+#[tokio::test]
+async fn an_update_refuses_a_settings_section_and_a_mapping_the_engine_cannot_build() {
+    let emulator = Emulator::new();
+    created_domain(&emulator, "update-rules").await;
+    let created = json!({
+        "mappings": { "properties": { "title": { "type": "text" } } },
+        "settings": { "index": { "number_of_shards": 1 } }
+    });
+
+    // The rows differ along WHICH part of the document offends and along how it offends:
+    // the settings section in each spelling a client writes it in, a mapping section that is
+    // not a set of members at each level one can stand at, and a mapping that is read and
+    // names a type or a `dynamic` value the engine has none of.
+    let rows = [
+        RefusedRow {
+            case: "settings spelled directly",
+            schema: json!({ "settings": { "number_of_replicas": 2 } }),
+            status: 400,
+            code: "ValidationException",
+            message: Some(INDEX_SETTINGS_UPDATE_UNSUPPORTED),
+            names: None,
+        },
+        RefusedRow {
+            case: "settings spelled under the index section",
+            schema: json!({ "settings": { "index": { "number_of_replicas": 2 } } }),
+            status: 400,
+            code: "ValidationException",
+            message: Some(INDEX_SETTINGS_UPDATE_UNSUPPORTED),
+            names: None,
+        },
+        RefusedRow {
+            case: "a settings name written flattened",
+            schema: json!({ "settings": { "index.number_of_replicas": 2 } }),
+            status: 400,
+            code: "ValidationException",
+            message: Some(INDEX_SETTINGS_UPDATE_UNSUPPORTED),
+            names: None,
+        },
+        RefusedRow {
+            case: "a settings section naming no setting at all",
+            schema: json!({ "settings": {} }),
+            status: 400,
+            code: "ValidationException",
+            message: Some(INDEX_SETTINGS_UPDATE_UNSUPPORTED),
+            names: None,
+        },
+        RefusedRow {
+            case: "a settings section that is not a set of members",
+            schema: json!({ "settings": "number_of_replicas=2" }),
+            status: 400,
+            code: "ValidationException",
+            message: Some(INDEX_SETTINGS_UPDATE_UNSUPPORTED),
+            names: None,
+        },
+        RefusedRow {
+            case: "settings beside a mapping that would otherwise land",
+            schema: json!({
+                "mappings": { "properties": { "summary": { "type": "text" } } },
+                "settings": { "index": { "number_of_replicas": 2 } }
+            }),
+            status: 400,
+            code: "ValidationException",
+            message: Some(INDEX_SETTINGS_UPDATE_UNSUPPORTED),
+            names: None,
+        },
+        RefusedRow {
+            case: "a mappings section that is not a set of members",
+            schema: json!({ "mappings": "properties" }),
+            status: 500,
+            code: "InternalException",
+            message: Some(INTERNAL_SERVICE_ERROR),
+            names: None,
+        },
+        RefusedRow {
+            case: "a properties section that is not a set of members",
+            schema: json!({ "mappings": { "properties": ["title"] } }),
+            status: 500,
+            code: "InternalException",
+            message: Some(INTERNAL_SERVICE_ERROR),
+            names: None,
+        },
+        RefusedRow {
+            case: "a field mapping that is not a set of members",
+            schema: json!({ "mappings": { "properties": { "summary": "text" } } }),
+            status: 500,
+            code: "InternalException",
+            message: Some(INTERNAL_SERVICE_ERROR),
+            names: None,
+        },
+        RefusedRow {
+            case: "a multi-field section that is not a set of members",
+            schema: json!({
+                "mappings": { "properties": { "title": { "fields": 7 } } }
+            }),
+            status: 500,
+            code: "InternalException",
+            message: Some(INTERNAL_SERVICE_ERROR),
+            names: None,
+        },
+        RefusedRow {
+            case: "a field type the engine has no mapper for",
+            schema: json!({
+                "mappings": { "properties": { "summary": { "type": "stringy" } } }
+            }),
+            status: 400,
+            code: "ValidationException",
+            message: None,
+            names: Some("summary"),
+        },
+        RefusedRow {
+            case: "a field type that is not a name at all",
+            schema: json!({ "mappings": { "properties": { "summary": { "type": 7 } } } }),
+            status: 400,
+            code: "ValidationException",
+            message: None,
+            names: Some("summary"),
+        },
+        RefusedRow {
+            case: "a type the engine has no mapper for on a multi-field",
+            schema: json!({
+                "mappings": {
+                    "properties": { "title": { "fields": { "raw": { "type": "keywordish" } } } }
+                }
+            }),
+            status: 400,
+            code: "ValidationException",
+            message: None,
+            names: Some("raw"),
+        },
+        RefusedRow {
+            case: "a dynamic value outside the engine's set",
+            schema: json!({ "mappings": { "dynamic": "sometimes" } }),
+            status: 400,
+            code: "ValidationException",
+            message: None,
+            names: Some("dynamic"),
+        },
+    ];
+
+    for (at, row) in rows.iter().enumerate() {
+        let index = format!("update-row-{at}");
+        created_index(&emulator, "update-rules", &index, &created, row.case).await;
+
+        let answer = update_index(&emulator, "update-rules", &index, &row.schema).await;
+        assert_eq!(
+            answer.status, row.status,
+            "case {}: expected HTTP {}, got {} with {:?}",
+            row.case, row.status, answer.status, answer.body
+        );
+        assert_eq!(
+            error_code(&answer),
+            row.code,
+            "case {}: expected {}, got {:?}",
+            row.case,
+            row.code,
+            answer.body
+        );
+        let said = string_member(&answer.body, "message", row.case);
+        if let Some(message) = row.message {
+            assert_eq!(
+                said, message,
+                "case {}: expected the service's sentence for the class, got {said:?}",
+                row.case
+            );
+        }
+        if let Some(part) = row.names {
+            assert!(
+                said.contains(part),
+                "case {}: expected the refusal to name {part:?}, got {said:?}",
+                row.case
+            );
+        }
+
+        // A refused update changes nothing: the index reads back as the create left it.
+        let stored = read_schema(&emulator, "update-rules", &index, row.case).await;
+        assert_eq!(
+            stored, created,
+            "case {}: a refused update must leave the stored schema alone, got {stored:?}",
+            row.case
+        );
+    }
+
+    // And the mapping an accepted update carries still lands, so the refusals above are
+    // about what those documents named rather than about updating at all. Every field type
+    // the engine's catalog publishes is one such document: a handful spanning its groups is
+    // driven here, including types this issue's reports never named.
+    for kind in ["keyword", "long", "date", "boolean", "geo_point", "knn_vector"] {
+        assert!(
+            MAPPING_FIELD_TYPES.contains(&kind),
+            "case {kind}: the catalog the service publishes must hold the type this case drives"
+        );
+        let index = format!("accepted-{kind}");
+        created_index(&emulator, "update-rules", &index, &created, kind).await;
+        let update = json!({ "mappings": { "properties": { kind: { "type": kind } } } });
+        updated_index(&emulator, "update-rules", &index, &update, kind).await;
+        let stored = read_schema(&emulator, "update-rules", &index, kind).await;
+        assert_eq!(
+            stored["mappings"]["properties"][kind]["type"],
+            json!(kind),
+            "case {kind}: expected the accepted mapping in the stored schema, got {stored:?}"
+        );
+    }
+}
+
+/// RULE: the index-management operations are served by a domain whose engine serves them. A
+/// domain running an engine that does not is refused `ValidationException` with the
+/// service's software-version sentence, and that refusal comes BEFORE the index lookup — so
+/// a request naming an index the domain never held earns the gate rather than a not-found.
+#[tokio::test]
+async fn the_index_operations_are_served_only_by_an_engine_that_carries_them() {
+    let emulator = Emulator::new();
+
+    // The rows differ along the engine the domain runs: the two engine types the service
+    // offers, and releases of the supporting one on either side of the bound these
+    // operations arrived in.
+    let bound = state::upgrade_rank(INDEX_MANAGEMENT_ENGINE_VERSION);
+    let rows: Vec<(&str, &str, bool)> = state::published_engine_versions()
+        .into_iter()
+        .filter(|version| {
+            [
+                "Elasticsearch_7.10",
+                "Elasticsearch_1.5",
+                "OpenSearch_1.3",
+                INDEX_MANAGEMENT_ENGINE_VERSION,
+                "OpenSearch_2.11",
+            ]
+            .contains(version)
+        })
+        .map(|version| {
+            let served = state::upgrade_rank(version) >= bound
+                && state::engine_type_of(version) == Some(state::ENGINE_TYPE_OPENSEARCH);
+            (version, version, served)
+        })
+        .collect();
+    assert!(
+        rows.iter().any(|(_, _, served)| *served) && rows.iter().any(|(_, _, served)| !*served),
+        "the table must span engines that serve these operations and engines that do not, got \
+         {rows:?}"
+    );
+
+    for (at, (case, version, served)) in rows.iter().enumerate() {
+        let domain = format!("gated-domain-{at}");
+        let answer = emulator
+            .create(json!({ "DomainName": domain, "EngineVersion": version }))
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected the domain to be created, got {} with {:?}",
+            answer.status, answer.body
+        );
+        settled_domain(&emulator, &domain).await;
+
+        let schema = json!({ "mappings": { "properties": { "title": { "type": "text" } } } });
+        let created = create_index(
+            &emulator,
+            &domain,
+            json!({ "IndexName": "gated-index", "IndexSchema": schema }),
+        )
+        .await;
+        if *served {
+            assert_eq!(
+                created.status, 200,
+                "case {case}: expected the create to be served, got {} with {:?}",
+                created.status, created.body
+            );
+            let read = get_index(&emulator, &domain, "gated-index").await;
+            assert_eq!(
+                read.status, 200,
+                "case {case}: expected the read to be served, got {} with {:?}",
+                read.status, read.body
+            );
+            continue;
+        }
+
+        // Every one of the four operations is refused alike — the read and the delete of an
+        // index this domain never held among them, which is what shows the gate is answered
+        // before the index is looked up.
+        let refusals = [
+            ("CreateIndex", created),
+            (
+                "GetIndex",
+                get_index(&emulator, &domain, "never-created").await,
+            ),
+            (
+                "UpdateIndex",
+                update_index(&emulator, &domain, "never-created", &schema).await,
+            ),
+            (
+                "DeleteIndex",
+                delete_index(&emulator, &domain, "never-created").await,
+            ),
+        ];
+        for (operation, answer) in refusals {
+            assert_eq!(
+                answer.status, 400,
+                "case {case}/{operation}: expected HTTP 400, got {} with {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                error_code(&answer),
+                "ValidationException",
+                "case {case}/{operation}: expected ValidationException, got {:?}",
+                answer.body
+            );
+            assert_eq!(
+                string_member(&answer.body, "message", case),
+                state::DOMAIN_NOT_ON_LATEST_SOFTWARE_VERSION,
+                "case {case}/{operation}: expected the service's software-version sentence, got \
+                 {:?}",
+                answer.body
+            );
+        }
+    }
+}

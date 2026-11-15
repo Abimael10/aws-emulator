@@ -6,6 +6,8 @@
 
 use super::*;
 
+use super::foreign_data_sources::ForeignDataSources;
+
 /// Per-service state for com-amazonaws-opensearch-amazonopensearchservice. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
@@ -498,23 +500,38 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// Materialise the status move the clock owes every data source attachment of every
     /// stored application, for a caller about to report on any of them.
     ///
-    /// The data sources the account still holds are resolved FIRST, because that is
-    /// what decides whether a pending attachment that has fallen due completes or
-    /// fails: an attachment whose data source is gone can never complete. Each DISTINCT
-    /// ARN the attachments name is resolved once, so two applications attached to one
-    /// data source cost one resolution rather than two.
-    pub fn settle_attachments(&mut self, now: SystemTime) {
-        let mut data_sources: BTreeSet<String> = self
+    /// The data sources the attachments name are resolved FIRST, because that is what
+    /// decides whether a pending attachment that has fallen due completes, waits longer or
+    /// fails: an attachment whose data source is gone can never complete, and one whose
+    /// data source is still coming up waits for it. Each DISTINCT ARN is resolved once, so
+    /// two applications attached to one data source cost one resolution rather than two.
+    ///
+    /// `foreign` is where every data source another service holds stands, resolved before
+    /// this store was locked ([`crate::state::foreign_data_sources`]).
+    pub fn settle_attachments(&mut self, now: SystemTime, foreign: &ForeignDataSources) {
+        let named: BTreeSet<String> = self
             .applications
             .values()
             .flat_map(|application| application.attachments.keys())
             .cloned()
             .collect();
-        data_sources.retain(|arn| self.holds_data_source(arn));
+        let activations: BTreeMap<String, DataSourceActivation> = named
+            .into_iter()
+            .map(|arn| {
+                let activation = self.data_source_activation(&arn, now, foreign);
+                (arn, activation)
+            })
+            .collect();
         for application in self.applications.values_mut() {
             for attachment in application.attachments.values_mut() {
-                attachment.settle(now, &data_sources);
+                attachment.settle(now, &activations);
             }
+            // A detach whose own span has passed has taken its attachment with it, so the
+            // record it was serializing further detaches on is released here — what was
+            // owed at `now` whether or not anybody called.
+            application
+                .attachments
+                .retain(|_, attachment| !attachment.detach_landed(now));
         }
     }
 
@@ -523,9 +540,9 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     ///
     /// The ONE place the attachment operations settle, so the four of them cannot drift
     /// apart over which records they report at `now`.
-    pub fn settle_for_attachments(&mut self, now: SystemTime) {
+    pub fn settle_for_attachments(&mut self, now: SystemTime, foreign: &ForeignDataSources) {
         self.settle_applications(now);
-        self.settle_attachments(now);
+        self.settle_attachments(now, foreign);
     }
 
     /// The domain `arn` names, if this account holds one — how an operation that takes
@@ -541,16 +558,43 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     ///
     /// An application's data source is any of the kinds this service attaches to one, so
     /// the ARN is resolved against every kind the account can hold rather than against
-    /// its domains alone: a domain of this account, a direct query data source of it, or
-    /// this account's AWS Glue Data Catalog. Anything else names no data source of this
+    /// its domains alone: a domain of this account, a direct query data source of it,
+    /// this account's AWS Glue Data Catalog, or an OpenSearch Serverless collection, which
+    /// another service holds and which is resolved from `foreign`, the snapshot of that
+    /// service's own store
+    /// ([`crate::state::foreign_data_sources`]). Anything else names no data source of this
     /// account, which is what an attachment can never complete against.
     ///
     /// The ONE resolution of a data source ARN, so the attach that decides an
     /// attachment's outcome and the settlement that lands it cannot disagree about what
     /// the account holds.
     ///
+    /// `now` is the instant the resolution is made at: a data source whose own activation
+    /// has already fallen due at `now` is ACTIVE, whether or not its record has been
+    /// settled yet, so a report of an attachment does not wait for the data source's own
+    /// reader to materialise what the clock already owed it.
+    ///
     /// Reads ONLY.
-    pub fn data_source_activation(&self, arn: &str) -> DataSourceActivation {
+    pub fn data_source_activation(
+        &self,
+        arn: &str,
+        now: SystemTime,
+        foreign: &ForeignDataSources,
+    ) -> DataSourceActivation {
+        let activation = self.held_data_source_activation(arn, foreign);
+        match activation {
+            DataSourceActivation::ActiveAt(due) if now >= due => DataSourceActivation::Active,
+            held => held,
+        }
+    }
+
+    /// Where the data source `arn` names stands by its own RECORD, before the clock is read
+    /// against it — [`Self::data_source_activation`]'s one lookup.
+    fn held_data_source_activation(
+        &self,
+        arn: &str,
+        foreign: &ForeignDataSources,
+    ) -> DataSourceActivation {
         // A domain is provisioned, so the state of the domain the ARN names is what
         // decides whether its data is reachable yet.
         if let Some(domain) = self.domain_of_arn(arn) {
@@ -573,13 +617,21 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
         if is_account_glue_data_catalog_arn(arn) {
             return DataSourceActivation::Active;
         }
-        DataSourceActivation::Absent
+        // Everything else is resolved where it is held, which for a kind of resource this
+        // store knows nothing about is another service's store.
+        foreign.activation(arn)
     }
 
-    /// Whether this account holds a data source under `arn` — what decides whether a
-    /// pending attachment that has fallen due completes or fails.
-    pub fn holds_data_source(&self, arn: &str) -> bool {
-        self.data_source_activation(arn) != DataSourceActivation::Absent
+    /// Whether this account holds a data source under `arn` — what decides whether an
+    /// attach can be served at all, and whether a pending attachment that has fallen due
+    /// completes or fails.
+    pub fn holds_data_source(
+        &self,
+        arn: &str,
+        now: SystemTime,
+        foreign: &ForeignDataSources,
+    ) -> bool {
+        self.data_source_activation(arn, now, foreign) != DataSourceActivation::Absent
     }
 
     /// Materialise the status move the clock owes every stored VPC endpoint, for a

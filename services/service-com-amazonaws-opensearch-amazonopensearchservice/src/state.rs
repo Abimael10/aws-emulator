@@ -77,6 +77,14 @@ pub mod log_destinations;
 /// and which kinds of resource can be one at all.
 pub mod data_source_arns;
 
+/// The OpenSearch Serverless collection a data source ARN can name, read in the store that
+/// service holds its collections in.
+pub mod serverless_collections;
+
+/// The data sources an application attaches that another service holds, resolved where they
+/// are held.
+pub mod foreign_data_sources;
+
 /// Whether the custom endpoint a domain's endpoint options name is a fully qualified
 /// domain name — the one input constraint of those options the request boundary cannot
 /// apply, so the create path and the update path apply it before they resolve anything.
@@ -165,6 +173,9 @@ mod analyzers;
 pub mod analysis;
 /// An index of a domain, the schema it carries and the settings around it.
 mod indexes;
+/// The rules the index-management operations share: whether a domain serves them, what a
+/// legal `IndexSchema` is, and how a read reports one.
+mod index_schema;
 /// The snapshot repositories a domain's cluster has registered, and the snapshots it has
 /// taken into one.
 mod snapshots;
@@ -192,6 +203,7 @@ pub use analyzers::*;
 pub use capabilities::*;
 pub use domains::*;
 pub use indexes::*;
+pub use index_schema::*;
 pub use instance_types::*;
 pub use package_catalog::*;
 pub use packages::*;
@@ -1444,11 +1456,20 @@ impl Application {
         self.owed.as_ref().map(|owed| owed.due)
     }
 
-    /// The attachment of `data_source_arn`, if this application holds one.
+    /// The attachment of `data_source_arn` a READ of this application reports, if it holds
+    /// one.
+    ///
+    /// A record whose detach has been accepted is not one of them: "this operation removes
+    /// the data source saved object from the application and deletes the attachment record",
+    /// so from the moment the detach answers the data source is not attached — the record
+    /// lives on only until its removal lands ([`DataSourceAttachment::detached`]), which is
+    /// what a second detach of it meets.
     ///
     /// Reads ONLY.
     pub fn attachment(&self, data_source_arn: &str) -> Option<&DataSourceAttachment> {
-        self.attachments.get(data_source_arn)
+        self.attachments
+            .get(data_source_arn)
+            .filter(|attachment| !attachment.detached())
     }
 
     /// The attachment an attach carrying `client_token` already minted on this
@@ -1460,6 +1481,7 @@ impl Application {
     pub fn attachment_of_client_token(&self, client_token: &str) -> Option<&DataSourceAttachment> {
         self.attachments
             .values()
+            .filter(|attachment| !attachment.detached())
             .find(|attachment| attachment.client_token.as_deref() == Some(client_token))
     }
 
@@ -1469,9 +1491,14 @@ impl Application {
     /// Two attachments made at one instant are ordered by the data source they attach,
     /// which is unique per attachment — so the order is TOTAL, and the same set reports
     /// the same order twice however the records are held. That is what lets a page token
-    /// name a place in the set.
+    /// name a place in the set. A record whose detach has been accepted is left out, for
+    /// the reason [`Self::attachment`] states.
     pub fn attachments_in_creation_order(&self) -> Vec<&DataSourceAttachment> {
-        let mut attachments: Vec<&DataSourceAttachment> = self.attachments.values().collect();
+        let mut attachments: Vec<&DataSourceAttachment> = self
+            .attachments
+            .values()
+            .filter(|attachment| !attachment.detached())
+            .collect();
         attachments.sort_by(|one, other| {
             one.created_at
                 .cmp(&other.created_at)
@@ -1662,26 +1689,73 @@ pub struct DataSourceAttachment {
     /// succeeds without performing any further actions", so a repeat is answered
     /// with THIS record rather than minting a second attachment.
     pub client_token: Option<String>,
+    /// When the detach of this attachment lands, while one is in flight — set by the
+    /// detach that accepted it ([`Self::begin_detach`]) and `None` for an attachment no
+    /// detach has been asked of.
+    ///
+    /// Removing the data source from the application is work the service does rather than
+    /// an instant: the record stays while it is in flight, so a SECOND detach of the same
+    /// attachment meets the one already running and is refused the conflict rather than
+    /// told the attachment never existed ([`Self::detach_in_flight`]), and reads report the
+    /// attachment as the gone record it is ([`Self::detached`]).
+    pub detaching_until: Option<SystemTime>,
 }
 
 impl DataSourceAttachment {
     /// Materialise the status move the clock owes this attachment, if `now` is past
     /// its due instant: a pending attachment "completes automatically once both
-    /// become active", and one whose data source the account no longer holds can
-    /// never complete, which is the non-retryable outcome `FAILED` reports.
+    /// become active", one whose data source is still coming up stays pending until the
+    /// instant that data source becomes active, and one whose data source the account no
+    /// longer holds can never complete, which is the non-retryable outcome `FAILED`
+    /// reports.
     ///
-    /// `data_sources` are the ARNs the account still holds a data source under.
+    /// `activations` is where each attached data source stands, by the ARN that names it
+    /// ([`ComAmazonawsOpensearchAmazonopensearchserviceState::data_source_activation`]).
     /// This is the only write a reporting operation makes, and it writes only what
     /// was already owed at the same instant had nobody called.
-    pub fn settle(&mut self, now: SystemTime, data_sources: &BTreeSet<String>) {
+    pub fn settle(&mut self, now: SystemTime, activations: &BTreeMap<String, DataSourceActivation>) {
         let Some(owed) = self.owed.take_if(|owed| now >= owed.due) else {
             return;
         };
-        self.status = if data_sources.contains(&self.data_source_arn) {
-            owed.status
-        } else {
-            ATTACHMENT_STATUS_FAILED.to_string()
-        };
+        match activations
+            .get(&self.data_source_arn)
+            .copied()
+            .unwrap_or(DataSourceActivation::Absent)
+        {
+            DataSourceActivation::Active => self.status = owed.status,
+            // The data source is not up yet, so the attachment it is waited on for is
+            // still pending: what the clock owes it is owed from the instant that data
+            // source becomes active.
+            DataSourceActivation::ActiveAt(due) => {
+                self.owed = Some(OwedStatus { due, ..owed });
+            }
+            DataSourceActivation::Absent => self.status = ATTACHMENT_STATUS_FAILED.to_string(),
+        }
+    }
+
+    /// Record that a detach of this attachment is in flight from `now`, so the removal it
+    /// starts is what every later call about this attachment meets.
+    pub fn begin_detach(&mut self, now: SystemTime) {
+        self.detaching_until = Some(now + PROVISIONING);
+    }
+
+    /// Whether a detach of this attachment is still in flight at `now` — what makes a
+    /// second detach of it the modelled conflict rather than a miss.
+    pub fn detach_in_flight(&self, now: SystemTime) -> bool {
+        self.detaching_until.is_some_and(|until| now < until)
+    }
+
+    /// Whether the detach of this attachment has landed by `now`, so the record is one the
+    /// store no longer holds.
+    pub fn detach_landed(&self, now: SystemTime) -> bool {
+        self.detaching_until.is_some_and(|until| now >= until)
+    }
+
+    /// Whether a detach has been accepted for this attachment at all: the data source is no
+    /// longer attached to the application from the moment that detach answered, so no read
+    /// reports the record whether or not its removal has landed yet.
+    pub fn detached(&self) -> bool {
+        self.detaching_until.is_some()
     }
 
     /// This attachment as `DataSourceAttachmentSummary` — what
@@ -1827,6 +1901,23 @@ pub fn attachment_client_token_taken(
     }
 }
 
+/// The `ConflictException` payload for a detach of an attachment whose removal is already
+/// in flight ([`DataSourceAttachment::detach_in_flight`]).
+///
+/// Removing the data source from the application is work the service does, and it does one
+/// such removal per attachment at a time: a second detach arriving while the first is still
+/// running is told the attachment is in use — "the client attempts to remove a resource that
+/// is currently in use" is what this API models `ConflictException` for — rather than told
+/// the attachment never existed, which is what a caller racing another detach has to be able
+/// to tell apart.
+pub fn attachment_detach_in_flight(id: &str, data_source_arn: &str) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "Data source {data_source_arn} is being detached from application {id}."
+        )),
+    }
+}
+
 /// The `ValidationException` payload for an attach naming both an existing workspace and
 /// one to create: `workspaceId` is "mutually exclusive with workspaceConfiguration", so
 /// a request carrying both asks for two different workspaces at once.
@@ -1903,6 +1994,19 @@ pub const MIGRATION_STATUS_VALUES: [&str; 4] = [
 /// (`smithy_query(query="doc",shape="MigrationOptions",member="conflictResolution")`) —
 /// spelled there exactly as below.
 pub const CONFLICT_RESOLUTION_VALUES: [&str; 2] = ["CREATE_NEW_COPIES", "overwrite"];
+
+/// Whether `value` names one of those strategies.
+///
+/// The documentation spells one of the two values in upper case and the other in lower
+/// case, which is the service telling a caller the value is not read case-sensitively: the
+/// strategy is named by its WORD, so a request spelling it the other way names the same
+/// strategy rather than one the import has no rule for.
+#[must_use]
+pub fn names_conflict_resolution(value: &str) -> bool {
+    CONFLICT_RESOLUTION_VALUES
+        .iter()
+        .any(|published| published.eq_ignore_ascii_case(value))
+}
 
 /// How many migration jobs ONE application holds before a start is refused rather than
 /// minting another.

@@ -258,7 +258,7 @@ async fn every_update_answer_is_one_the_model_declares_for_the_operation() {
             "case {:?}: the fixture index must stay readable, got {} with {:?}",
             row.case, read.status, read.body
         );
-        let stored = read.body["IndexSchema"].clone();
+        let stored = read.body["IndexSchema"][INDEX].clone();
         match row.refused_with {
             Some(_) => assert_eq!(
                 stored,

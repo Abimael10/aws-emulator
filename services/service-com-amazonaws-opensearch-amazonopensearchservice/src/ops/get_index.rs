@@ -193,6 +193,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.domain_name,
             ))
         })?;
+        // Whether this operation is available at all is decided from the DOMAIN, before the
+        // index the request names is looked up: it reports an index's mappings, settings and
+        // semantic enrichment, which a domain whose engine serves none of that has none of —
+        // the same gate `CreateIndex`, `UpdateIndex` and `DeleteIndex` run
+        // ([`crate::state::index_management_refusal`]).
+        if let Some(refusal) = crate::state::index_management_refusal(domain) {
+            return Err(GetIndexErrorModeled::ValidationException(refusal).into());
+        }
         // The domain exists; the name it carries names no index OF it. An index is a
         // resource of its own, so that is the modelled missing-resource refusal, in
         // the fixed wording the service uses for a missing index.
@@ -203,10 +211,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // "The JSON schema of the index including mappings, settings, and semantic
-        // enrichment configuration" is the document the create persisted, reported
-        // back verbatim.
+        // enrichment configuration" is the document the create persisted and every later
+        // update left behind, reported the way the engine's own mapping API reports one
+        // index: KEYED BY THE INDEX NAME, so the answer says which index the schema belongs
+        // to ([`crate::state::reported_index_schema`]).
         Ok(GetIndexOutput {
-            index_schema: index.schema.clone(),
+            index_schema: crate::state::reported_index_schema(&input.index_name, &index.schema),
         })
     }
 }

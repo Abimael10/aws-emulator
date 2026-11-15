@@ -89,9 +89,9 @@
 use super::types::*;
 
 use crate::state::{
-    application_not_active, application_not_found_named, attachment_pending,
-    data_source_not_attached, service_state, state_unavailable, APPLICATION_STATUS_ACTIVE,
-    ATTACHMENT_STATUS_PENDING,
+    application_not_active, application_not_found_named, attachment_detach_in_flight,
+    attachment_pending, data_source_not_attached, service_state, state_unavailable,
+    APPLICATION_STATUS_ACTIVE, ATTACHMENT_STATUS_PENDING,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -182,13 +182,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(DetachDataSourceErrorModeled::AccessDeniedException)?;
 
         let now = ::std::time::SystemTime::now();
+        // Where every data source another service holds stands, read from those services'
+        // own stores BEFORE this one is locked, so no call holds two service stores at once.
+        let foreign = crate::state::foreign_data_sources::foreign_data_sources(&*self.engine);
         let mut store = state.lock();
 
         // Whatever the clock already owed the records this call reads is materialised
         // first, so the decisions below are made on the state at `now`: an application
-        // whose provisioning has landed is active, and a pending attachment that has
-        // fallen due is no longer pending.
-        store.settle_for_attachments(now);
+        // whose provisioning has landed is active, a pending attachment that has
+        // fallen due is no longer pending, and an attachment whose own detach has landed is
+        // a record the store no longer holds.
+        store.settle_for_attachments(now, &foreign);
 
         // The attachment belongs to the application, so an id naming none holds no
         // data source to detach.
@@ -213,12 +217,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // attachment": an attachment still being made is in use by the call that is
         // making it, so it is not one this call removes.
         let attachment = application
-            .attachment(&input.data_source_arn)
+            .attachments
+            .get_mut(&input.data_source_arn)
             .ok_or_else(|| {
                 DetachDataSourceErrorModeled::ResourceNotFoundException(
                     data_source_not_attached(&input.id, &input.data_source_arn),
                 )
             })?;
+        // A detach of this attachment that is already in flight is the removal this one
+        // asked for, running: the service performs one removal per attachment at a time, so
+        // the second caller is told the attachment is in use rather than told it is not
+        // attached — what lets a client racing another detach tell a serialization conflict
+        // from a data source that was never attached. Decided BEFORE the record is read for
+        // its status, so the loser of a race cannot be answered on a half-removed record.
+        if attachment.detach_in_flight(now) {
+            return Err(DetachDataSourceErrorModeled::ConflictException(
+                attachment_detach_in_flight(&input.id, &input.data_source_arn),
+            )
+            .into());
+        }
+        // And a record whose removal has been accepted but has not landed yet is a data
+        // source this application no longer holds attached at all, so a detach of it is the
+        // miss [`data_source_not_attached`] states — the same answer a caller gets once the
+        // record is gone.
+        if attachment.detached() {
+            return Err(DetachDataSourceErrorModeled::ResourceNotFoundException(
+                data_source_not_attached(&input.id, &input.data_source_arn),
+            )
+            .into());
+        }
         if attachment.status == ATTACHMENT_STATUS_PENDING {
             return Err(DetachDataSourceErrorModeled::ConflictException(attachment_pending(
                 &input.id,
@@ -228,9 +255,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "This operation removes the data source saved object from the application and
-        // deletes the attachment record", so the record is gone from the store and a
-        // later read of it is the missing-resource refusal.
-        application.attachments.remove(&input.data_source_arn);
+        // deletes the attachment record": the data source is not attached from here on, so
+        // no read reports it any more. The record itself stays until its removal lands
+        // ([`crate::state::DataSourceAttachment::begin_detach`]), which is what a second
+        // detach of the same attachment meets instead of finding nothing.
+        attachment.begin_detach(now);
 
         Ok(DetachDataSourceOutput {
             id: Some(application.id.clone()),

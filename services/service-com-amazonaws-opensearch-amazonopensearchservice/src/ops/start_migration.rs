@@ -102,7 +102,7 @@ use super::types::*;
 use crate::state::{
     migration_client_token_taken, migration_quota_exceeded, migration_workspace_refusal,
     service_state, state_unavailable, unsupported_conflict_resolution, Migration,
-    CONFLICT_RESOLUTION_VALUES, MIGRATION_QUOTA, MIGRATION_STATUS_PENDING,
+    MIGRATION_QUOTA, MIGRATION_STATUS_PENDING,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -231,10 +231,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `conflictResolution` is typed as a plain string, so the values its
-        // documentation publishes are the ones this service honours: a strategy outside
-        // that set names behaviour the import has no rule for.
+        // documentation publishes are the ones this service honours — by the WORD each
+        // names rather than by its spelling, since the published set spells one in upper
+        // case and the other in lower ([`crate::state::names_conflict_resolution`]): a
+        // strategy outside that set names behaviour the import has no rule for.
         if let Some(resolution) = options.conflict_resolution.as_deref() {
-            if !CONFLICT_RESOLUTION_VALUES.contains(&resolution) {
+            if !crate::state::names_conflict_resolution(resolution) {
                 return Err(StartMigrationErrorModeled::ValidationException(
                     unsupported_conflict_resolution(resolution),
                 )
