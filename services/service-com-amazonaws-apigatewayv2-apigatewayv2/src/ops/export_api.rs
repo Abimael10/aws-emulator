@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExportApi
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExportApi`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: serializes the api's CURRENT persisted configuration as an OpenAPI 3.0
+//! document and answers it as the requested output type. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExportApi::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Which configuration is exported is what `StageName` selects: "The name of the API
+//! stage to export. If you don't specify this property, a representation of the latest
+//! API configuration is exported" (`ExportApi$StageName`). The latest configuration is
+//! the api's own [`crate::state::Api::routes`] and [`crate::state::Api::integrations`];
+//! a named stage's is the one the deployment that stage serves FROZE
+//! ([`crate::state::Deployment::configuration`]), so a stage pinned to an older
+//! deployment exports what it still answers for rather than what the api holds now.
+//!
+//! The document is the INVERSE of the definition this service already reads
+//! ([`super::import_api::parse_definition`]): `info` carries the api's name, description
+//! and version, `paths` one operation per route, and — unless `IncludeExtensions` turns
+//! them off — the API Gateway extensions that reader reads back (the integration behind
+//! each route, the api's CORS configuration and its endpoint configuration). Every value
+//! comes from the store, so an exported definition re-imported describes the same api.
+//! What the reader does not read is not written into it: an api's tags and its
+//! authorizers are reported by the operations that own them, never invented into a
+//! document nothing could read back.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +94,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::serde_json::{Map, Value};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -152,18 +166,565 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExportApi` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExportApiErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExportApi"))
+        let _ = ctx;
+        // What the request asks for is resolved against the three catalogs this
+        // operation's own members document, BEFORE the store is read: a request naming a
+        // specification, an output type or an export version this service does not serve
+        // describes no export at all.
+        if input.specification != OAS30_SPECIFICATION {
+            return Err(bad_request(format!(
+                "Invalid value for Specification: '{}'. Valid values are: \
+                 {OAS30_SPECIFICATION}.",
+                input.specification
+            )));
+        }
+        if !OUTPUT_TYPE_VALUES.contains(&input.output_type.as_str()) {
+            return Err(bad_request(format!(
+                "Invalid value for OutputType: '{}'. Valid values are: {}.",
+                input.output_type,
+                OUTPUT_TYPE_VALUES.join(", ")
+            )));
+        }
+        if let Some(export_version) = &input.export_version {
+            if export_version != LATEST_EXPORT_VERSION {
+                return Err(bad_request(format!(
+                    "Invalid value for ExportVersion: '{export_version}'. Valid values \
+                     are: {LATEST_EXPORT_VERSION}."
+                )));
+            }
+        }
+        // "API Gateway extensions are included by default"
+        // (`ExportApi$IncludeExtensions`).
+        let include_extensions = input.include_extensions.unwrap_or(true);
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("ExportApi"));
+        };
+        // A reporting operation: it reads the store and writes nothing, so exporting an
+        // api leaves every later caller seeing exactly what this one saw.
+        let store = state.lock();
+        let Some(api) = store.apis.get(&input.api_id) else {
+            return Err(not_found(crate::state::invalid_api_identifier_message(
+                &input.api_id,
+            )));
+        };
+        // An OpenAPI definition describes an api whose operations are PATHS, which is
+        // what an HTTP api's route keys name; a WebSocket api's keys name no path, so it
+        // has no definition to serialize and the sub-resource the URI addresses
+        // (`/v2/apis/{ApiId}/exports/{Specification}`) exists on no api of that protocol
+        // — refused through the one gate every protocol-restricted resource of this
+        // service goes through.
+        if let Err(message) = crate::state::validate_protocol_restricted_resource(
+            &api.protocol_type,
+            EXPORT_RESOURCE_PLURAL,
+            crate::state::HTTP_PROTOCOL_TYPE,
+        ) {
+            return Err(bad_request(message));
+        }
+
+        // The configuration this export serializes, and the stage it is served under.
+        // A stage with no deployment released to it serves no route at all, so the
+        // configuration exported for it is empty rather than the api's current one.
+        let undeployed = crate::state::DeployedConfiguration::default();
+        let (routes, integrations, stage_name) = match input.stage_name.as_deref() {
+            Some(stage_name) => {
+                let Some(stage) = api.stages.get(stage_name) else {
+                    return Err(not_found(crate::state::invalid_identifier_message(
+                        crate::state::STAGE_RESOURCE,
+                    )));
+                };
+                let served = stage
+                    .deployment_id
+                    .as_deref()
+                    .and_then(|deployment_id| api.deployments.get(deployment_id))
+                    .map_or(&undeployed, |deployment| &deployment.configuration);
+                (
+                    &served.routes,
+                    &served.integrations,
+                    Some(stage.stage_name.as_str()),
+                )
+            }
+            None => (&api.routes, &api.integrations, None),
+        };
+
+        let document = exported_document(api, routes, integrations, stage_name, include_extensions);
+        // "Represents an exported definition of an API in a particular output format, for
+        // example, YAML" (`ExportedApi`): the one document, spelled as the request asked
+        // for it.
+        let json = json_text(&document);
+        let body = if input.output_type == YAML_OUTPUT_TYPE {
+            yaml_text(&json)
+        } else {
+            json
+        };
+        Ok(ExportApiOutput {
+            body: Some(body.into_bytes()),
+        })
+    }
+}
+
+/// This operation's refusal of a request that describes no export, with the reason in the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect").
+fn bad_request(message: String) -> ExportApiError {
+    ExportApiErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's refusal of a path label that addresses nothing, reported the way
+/// every other reader of that level reports one.
+fn not_found(message: String) -> ExportApiError {
+    ExportApiErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+        resource_type: ::std::option::Option::None,
+    })
+    .into()
+}
+
+// ---------------------------------------------------------------------------
+// The exported definition
+// ---------------------------------------------------------------------------
+
+/// The one `Specification` this operation serves: "OAS30, for OpenAPI 3.0, is the only
+/// supported value" (`ExportApi$Specification`).
+const OAS30_SPECIFICATION: &str = "OAS30";
+
+/// The version an exported OAS30 document DECLARES (`openapi`, the member every OpenAPI 3
+/// document carries): the OpenAPI 3.0 patch release this exporter writes. Within 3.0, so
+/// it is the specification `OAS30` names, and a spelling this service's own definition
+/// reader reads back (`super::import_api`, which takes any document declaring `openapi`).
+const OAS30_DOCUMENT_VERSION: &str = "3.0.1";
+
+/// The output type an export is serialized as JSON for, from "Valid values are JSON and
+/// YAML" (`ExportApi$OutputType`).
+const JSON_OUTPUT_TYPE: &str = "JSON";
+
+/// The output type an export is serialized as YAML for, from the same sentence.
+const YAML_OUTPUT_TYPE: &str = "YAML";
+
+/// The output types this operation serves, in the order that sentence lists them.
+const OUTPUT_TYPE_VALUES: &[&str] = &[JSON_OUTPUT_TYPE, YAML_OUTPUT_TYPE];
+
+/// The export algorithm version an export runs under: "API Gateway uses the latest
+/// version by default. Currently, the only supported version is 1.0"
+/// (`ExportApi$ExportVersion`), so a request naming none runs under this one.
+const LATEST_EXPORT_VERSION: &str = "1.0";
+
+/// How the protocol gate names this sub-resource in its refusal: the `exports` of
+/// `/v2/apis/{ApiId}/exports/{Specification}`, in the plural that gate's sentence takes.
+const EXPORT_RESOURCE_PLURAL: &str = "Exports";
+
+/// The key of the Response Object an exported operation declares. An HTTP api's route
+/// holds no response resource of its own — route responses and integration responses are
+/// WebSocket-only children — while the OpenAPI Operation Object requires a `responses`
+/// map, so the one response declared is the default one every call to the route is
+/// answered under.
+const DEFAULT_RESPONSE_KEY: &str = "default";
+
+/// The route key that catches what no other route of the api matches: "a default route of
+/// $default is created. The $default route acts as a catch-all for any request made to your
+/// API" (`CreateApi$RouteKey`) — the key quick create mints alongside an api
+/// (`super::create_api`). It names neither a method nor a path.
+const DEFAULT_ROUTE_KEY: &str = "$default";
+
+/// The operation key a path item declares the catch-all method under: API Gateway's own
+/// extension, which is how a definition spells a method a route key names no HTTP verb for
+/// — the entry of [`super::import_api::OPERATION_KEYS`] whose method is the catch-all, read
+/// from that one catalog rather than spelled a second time here.
+fn any_method_key() -> &'static str {
+    super::import_api::OPERATION_KEYS
+        .iter()
+        .find(|(_, method)| *method == super::import_api::ANY_METHOD)
+        .map_or(super::import_api::ANY_METHOD, |(key, _)| key)
+}
+
+/// The whole exported document: the api's members, the server its configuration is served
+/// at, and one path item per route of the configuration being exported.
+fn exported_document(
+    api: &crate::state::Api,
+    routes: &::std::collections::BTreeMap<String, crate::state::Route>,
+    integrations: &::std::collections::BTreeMap<String, crate::state::Integration>,
+    stage_name: Option<&str>,
+    include_extensions: bool,
+) -> Value {
+    let mut document = Map::new();
+    document.insert(
+        "openapi".to_string(),
+        Value::String(OAS30_DOCUMENT_VERSION.to_string()),
+    );
+    document.insert("info".to_string(), info_object(api));
+    document.insert(
+        "servers".to_string(),
+        Value::Array(vec![Value::Object(server_object(api, stage_name))]),
+    );
+    if include_extensions {
+        if let Some(cors) = &api.cors_configuration {
+            document.insert(
+                super::import_api::CORS_EXTENSION.to_string(),
+                Value::Object(cors_extension(cors)),
+            );
+        }
+        // "The default value is false" (`Api$DisableExecuteApiEndpoint`), so a document
+        // that names it nowhere describes an api whose default endpoint is reachable —
+        // which is this api exactly when the member is not set.
+        if api.disable_execute_api_endpoint {
+            let mut configuration = Map::new();
+            configuration.insert("disableExecuteApiEndpoint".to_string(), Value::Bool(true));
+            document.insert(
+                super::import_api::ENDPOINT_CONFIGURATION_EXTENSION.to_string(),
+                Value::Object(configuration),
+            );
+        }
+    }
+    document.insert(
+        "paths".to_string(),
+        paths_object(routes, integrations, include_extensions),
+    );
+    Value::Object(document)
+}
+
+/// The document's Info Object: the api's own name, description and version.
+///
+/// `title` is the api's `Name` and `description` its `Description` — the two members this
+/// service's definition reader takes out of `info` — and `version` is the api's `Version`
+/// when it carries one. The Info Object REQUIRES a version, so an api that carries none
+/// states its own creation instant there: a value the record already holds, so two
+/// exports of an unchanged api carry the same one.
+fn info_object(api: &crate::state::Api) -> Value {
+    let mut info = Map::new();
+    info.insert("title".to_string(), Value::String(api.name.clone()));
+    if let Some(description) = &api.description {
+        info.insert(
+            "description".to_string(),
+            Value::String(description.clone()),
+        );
+    }
+    let version = api
+        .version
+        .clone()
+        .or_else(|| created_instant(api.created_date))
+        .unwrap_or_else(|| LAST_RESORT_INFO_VERSION.to_string());
+    info.insert("version".to_string(), Value::String(version));
+    Value::Object(info)
+}
+
+/// The version an exported Info Object states when the api carries none and its creation
+/// instant cannot be rendered either — a value that cannot be empty, because the Info
+/// Object requires a version and a document stating an empty one is not the OAS30 document
+/// this export declares itself to be.
+const LAST_RESORT_INFO_VERSION: &str = "1.0";
+
+/// One instant as a document states it: the `date-time` of RFC 3339, the form every
+/// timestamp this service reports carries. `None` for an instant that has no such
+/// rendering, so a version is never stated as the empty string.
+fn created_instant(at: ::std::time::SystemTime) -> Option<String> {
+    crate::state::to_timestamp(at)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
+        .filter(|rendered| !rendered.is_empty())
+}
+
+/// The document's one Server Object: the address the exported configuration is CALLED at.
+///
+/// "The stage name is typically appended to this URI to form a complete path to a deployed
+/// API stage" (`Api$ApiEndpoint`), so a named stage's export is served under its name,
+/// while the stage that serves the api's root ([`crate::state::DEFAULT_STAGE_NAME`]) is
+/// reached with no stage segment at all. The path of this url is also the base path this
+/// service's own definition reader takes out of `servers`, so an export re-imported under
+/// `prepend` carries the paths it was served under.
+fn server_object(api: &crate::state::Api, stage_name: Option<&str>) -> Map<String, Value> {
+    let url = match stage_name {
+        Some(stage_name) if stage_name != crate::state::DEFAULT_STAGE_NAME => {
+            format!("{}/{stage_name}", api.api_endpoint)
+        }
+        _ => api.api_endpoint.clone(),
+    };
+    let mut server = Map::new();
+    server.insert("url".to_string(), Value::String(url));
+    server
+}
+
+/// The document's Paths Object: one Path Item per path the configuration's route keys
+/// name, each carrying one operation per route of that path.
+///
+/// A route key of the `{Method} {Path}` form names an operation of a path, which is what
+/// this service's definition reader builds a route FROM, so the export of one is that
+/// reading run backwards.
+///
+/// The CATCH-ALL key is the one route key of an HTTP api that names neither: "a default
+/// route of $default is created. The $default route acts as a catch-all for any request
+/// made to your API" (`CreateApi$RouteKey`), so a definition carries it as a path item
+/// under the KEY ITSELF, with the catch-all method key the route answers every method
+/// under. It is the one key this service's own reader does not read back — that reader
+/// takes a path, and this key is not one — so an api holding it is exported with the route
+/// stated rather than dropped, which is the only reading under which the document
+/// describes what the api serves.
+///
+/// Any OTHER key names no operation of an OpenAPI document at all (a key naming a method
+/// outside the catalog, or a WebSocket key, which an HTTP api holds none of), so it is
+/// serialized as nothing rather than as a path item nothing could read.
+fn paths_object(
+    routes: &::std::collections::BTreeMap<String, crate::state::Route>,
+    integrations: &::std::collections::BTreeMap<String, crate::state::Integration>,
+    include_extensions: bool,
+) -> Value {
+    let mut paths: ::std::collections::BTreeMap<String, Map<String, Value>> =
+        ::std::collections::BTreeMap::new();
+    for route in routes.values() {
+        let Some((path, operation_key)) = path_item_of(&route.route_key) else {
+            continue;
+        };
+        paths.entry(path.to_string()).or_default().insert(
+            operation_key.to_string(),
+            operation_object(route, integrations, include_extensions),
+        );
+    }
+    Value::Object(
+        paths
+            .into_iter()
+            .map(|(path, item)| (path, Value::Object(item)))
+            .collect(),
+    )
+}
+
+/// The path item key and the operation key `route_key` is exported under, or `None` for a
+/// key that names no operation of an OpenAPI document (see [`paths_object`]).
+fn path_item_of(route_key: &str) -> Option<(&str, &'static str)> {
+    if route_key == DEFAULT_ROUTE_KEY {
+        return Some((route_key, any_method_key()));
+    }
+    let (method, path) = route_key.split_once(' ')?;
+    if !path.starts_with('/') {
+        return None;
+    }
+    let (operation_key, _) = super::import_api::OPERATION_KEYS
+        .iter()
+        .find(|(_, candidate)| *candidate == method)?;
+    Some((path, operation_key))
+}
+
+/// One route as an OpenAPI Operation Object.
+fn operation_object(
+    route: &crate::state::Route,
+    integrations: &::std::collections::BTreeMap<String, crate::state::Integration>,
+    include_extensions: bool,
+) -> Value {
+    let mut operation = Map::new();
+    // "The operation name for the route" (`Route$OperationName`) is what the Operation
+    // Object's `operationId` names, so a route that carries one is exported with it.
+    if let Some(operation_name) = &route.operation_name {
+        operation.insert(
+            "operationId".to_string(),
+            Value::String(operation_name.clone()),
+        );
+    }
+    let mut response = Map::new();
+    response.insert(
+        "description".to_string(),
+        Value::String(format!("Default response for {}", route.route_key)),
+    );
+    let mut responses = Map::new();
+    responses.insert(DEFAULT_RESPONSE_KEY.to_string(), Value::Object(response));
+    operation.insert("responses".to_string(), Value::Object(responses));
+    // The integration the route's `Target` addresses, as the extension the definition
+    // reader reads one from. A route wired to nothing, and one whose target names an
+    // integration this configuration does not hold, carry no extension: the document
+    // states the backend the route HAS, never one it might have had.
+    if include_extensions {
+        if let Some(integration) = route
+            .target_integration_id()
+            .and_then(|integration_id| integrations.get(integration_id))
+        {
+            operation.insert(
+                super::import_api::INTEGRATION_EXTENSION.to_string(),
+                Value::Object(integration_extension(integration)),
+            );
+        }
+    }
+    Value::Object(operation)
+}
+
+/// One integration as the `x-amazon-apigateway-integration` extension: the members this
+/// service's definition reader reads out of one, projected back onto the keys it reads
+/// them under.
+///
+/// The extension spells the integration's `type` in lower case (the reader upper-cases it
+/// onto the modelled `IntegrationType`), while every other value is the one the record
+/// holds. A member the integration does not carry is written as nothing rather than as a
+/// key with no value.
+fn integration_extension(integration: &crate::state::Integration) -> Map<String, Value> {
+    let mut extension = Map::new();
+    extension.insert(
+        "type".to_string(),
+        Value::String(integration.integration_type.to_ascii_lowercase()),
+    );
+    if let Some(integration_method) = &integration.integration_method {
+        extension.insert(
+            "httpMethod".to_string(),
+            Value::String(integration_method.clone()),
+        );
+    }
+    if let Some(uri) = &integration.integration_uri {
+        extension.insert("uri".to_string(), Value::String(uri.clone()));
+    }
+    if let Some(subtype) = &integration.integration_subtype {
+        extension.insert(
+            "integrationSubtype".to_string(),
+            Value::String(subtype.clone()),
+        );
+    }
+    extension.insert(
+        "connectionType".to_string(),
+        Value::String(integration.connection_type.clone()),
+    );
+    if let Some(connection_id) = &integration.connection_id {
+        extension.insert(
+            "connectionId".to_string(),
+            Value::String(connection_id.clone()),
+        );
+    }
+    if let Some(credentials_arn) = &integration.credentials_arn {
+        extension.insert(
+            "credentials".to_string(),
+            Value::String(credentials_arn.clone()),
+        );
+    }
+    if let Some(payload_format_version) = &integration.payload_format_version {
+        extension.insert(
+            "payloadFormatVersion".to_string(),
+            Value::String(payload_format_version.clone()),
+        );
+    }
+    extension.insert(
+        "timeoutInMillis".to_string(),
+        Value::Number(integration.timeout_in_millis.into()),
+    );
+    if !integration.request_parameters.is_empty() {
+        extension.insert(
+            "requestParameters".to_string(),
+            Value::Object(string_map(&integration.request_parameters)),
+        );
+    }
+    if !integration.response_parameters.is_empty() {
+        let mapped = integration
+            .response_parameters
+            .iter()
+            .map(|(selection, parameters)| {
+                (selection.clone(), Value::Object(string_map(parameters)))
+            })
+            .collect();
+        extension.insert("responseParameters".to_string(), Value::Object(mapped));
+    }
+    if let Some(server_name) = integration
+        .tls_config
+        .as_ref()
+        .and_then(|config| config.server_name_to_verify.as_ref())
+    {
+        let mut tls = Map::new();
+        tls.insert(
+            "serverNameToVerify".to_string(),
+            Value::String(server_name.clone()),
+        );
+        extension.insert("tlsConfig".to_string(), Value::Object(tls));
+    }
+    extension
+}
+
+/// The api's CORS configuration as the `x-amazon-apigateway-cors` extension: each member
+/// the configuration carries, under the key this service's definition reader reads it
+/// from.
+fn cors_extension(cors: &Cors) -> Map<String, Value> {
+    let mut extension = Map::new();
+    if let Some(allow_credentials) = cors.allow_credentials {
+        extension.insert(
+            "allowCredentials".to_string(),
+            Value::Bool(allow_credentials),
+        );
+    }
+    for (key, values) in [
+        ("allowHeaders", &cors.allow_headers),
+        ("allowMethods", &cors.allow_methods),
+        ("allowOrigins", &cors.allow_origins),
+        ("exposeHeaders", &cors.expose_headers),
+    ] {
+        if let Some(values) = values {
+            extension.insert(
+                key.to_string(),
+                Value::Array(
+                    values
+                        .iter()
+                        .map(|value| Value::String(value.clone()))
+                        .collect(),
+                ),
+            );
+        }
+    }
+    if let Some(max_age) = cors.max_age {
+        extension.insert("maxAge".to_string(), Value::Number(max_age.into()));
+    }
+    extension
+}
+
+/// One stored string map as a document object.
+fn string_map(values: &::std::collections::BTreeMap<String, String>) -> Map<String, Value> {
+    values
+        .iter()
+        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+        .collect()
+}
+
+/// The document as JSON text.
+///
+/// Indented, because an exported definition is a document a caller reads and edits. The
+/// indented rendering is infallible for a document built here (no non-string map key and
+/// no non-finite number); a document that somehow had one is still stated in full, in the
+/// compact rendering `serde_json` writes without failing, rather than answered as an empty
+/// document a caller could not tell from an api holding nothing.
+fn json_text(document: &Value) -> String {
+    ::serde_json::to_string_pretty(document).unwrap_or_else(|_| document.to_string())
+}
+
+/// The document as YAML text, read back out of its JSON spelling.
+///
+/// "an exported definition of an API in a particular output format, for example, YAML"
+/// (`ExportedApi`): the YAML spelling is EMITTED as YAML rather than handed back as its
+/// JSON spelling. YAML 1.2 is a SUPERSET of JSON, so the one maintained YAML
+/// implementation this tree reads and writes YAML with does both halves of that — it
+/// loads the document's JSON spelling and emits the same tree in the YAML one — and
+/// nothing here translates between two document trees by hand.
+///
+/// Every step of that is infallible for a document this exporter built — its JSON spelling
+/// is a YAML document, and the emitter writes into a string — and where one somehow failed,
+/// the answer is the SAME document in the JSON spelling it was read from, which YAML 1.2
+/// admits, rather than an empty document a caller could not tell from an api holding
+/// nothing.
+fn yaml_text(json: &str) -> String {
+    let emitted = ::yaml_rust2::YamlLoader::load_from_str(json)
+        .ok()
+        .as_deref()
+        .and_then(<[::yaml_rust2::Yaml]>::first)
+        .and_then(|document| {
+            let mut text = String::new();
+            ::yaml_rust2::YamlEmitter::new(&mut text)
+                .dump(document)
+                .ok()
+                .map(|()| text)
+        });
+    let Some(text) = emitted else {
+        return json.to_string();
+    };
+    // The emitter opens what it writes with YAML's document-start marker; an exported
+    // definition is the document itself, so that line — and only it — is dropped.
+    let body = match text.strip_prefix("---") {
+        Some(rest) => rest.strip_prefix('\n').unwrap_or(rest),
+        None => text.as_str(),
+    };
+    if body.is_empty() {
+        json.to_string()
+    } else {
+        body.to_string()
     }
 }

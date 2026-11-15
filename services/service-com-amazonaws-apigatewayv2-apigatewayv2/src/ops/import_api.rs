@@ -429,7 +429,12 @@ pub(crate) fn route_methods() -> impl Iterator<Item = &'static str> {
 const UNSUPPORTED_OPERATION_KEYS: &[&str] = &["trace", "connect"];
 
 /// The extension an OpenAPI operation carries its API Gateway integration in.
-const INTEGRATION_EXTENSION: &str = "x-amazon-apigateway-integration";
+///
+/// `pub(crate)`, like the three constants below and [`OPERATION_KEYS`]: the key an
+/// extension is READ from is the key an EXPORT writes it under, so `ExportApi` — which
+/// serializes a definition this reader can read back — names it from here rather than
+/// keeping a second spelling of it (`super::export_api`).
+pub(crate) const INTEGRATION_EXTENSION: &str = "x-amazon-apigateway-integration";
 
 /// Why an integration extension that names no `IntegrationType` cannot be created, as API
 /// Gateway words it: `IntegrationType` is the modelled member the extension's `type` names,
@@ -491,11 +496,12 @@ const UNDETERMINABLE_OAS_VERSION: &str =
 
 /// The document-level extension an OpenAPI definition carries an HTTP api's CORS
 /// configuration in — the `CorsConfiguration` member's counterpart in a definition.
-const CORS_EXTENSION: &str = "x-amazon-apigateway-cors";
+pub(crate) const CORS_EXTENSION: &str = "x-amazon-apigateway-cors";
 /// The document-level extension an OpenAPI definition carries an api's endpoint
 /// configuration in; its `disableExecuteApiEndpoint` member is the
 /// `DisableExecuteApiEndpoint` member's counterpart in a definition.
-const ENDPOINT_CONFIGURATION_EXTENSION: &str = "x-amazon-apigateway-endpoint-configuration";
+pub(crate) const ENDPOINT_CONFIGURATION_EXTENSION: &str =
+    "x-amazon-apigateway-endpoint-configuration";
 
 /// The root members of an OpenAPI 3 / Swagger 2.0 document that describe something this
 /// service holds no resource for, so an import reads none of them. Each one PRESENT in a

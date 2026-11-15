@@ -1,5 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router.
+//
+// This file is a CANONICAL DECLARATION LIST: this header, then one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted by name, and no other
+// line. Two branches landing at once then insert two lines in two places and have no prose
+// to duplicate, re-word or mistype — which is what had happened here: the tail of this file
+// had grown hundreds of re-typed copies of a `//!` header, many of them past the first item
+// (`E0753`), so no suite of this target compiled at all.
+// EVERY comment in this file is an ORDINARY `//` one, this header included: with no inner
+// doc comment anywhere in it, no appended, re-typed or merged copy of one of its lines can
+// be one past the first item, because there is no such line to copy. That is the rule
+// `all/all_rs_carries_no_inner_doc_comment.rs` pins;
+// `all/all_rs_is_a_canonical_declaration_list.rs` pins the shape, and
+// `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
+// `all/every_suite_file_is_declared.rs` pin the rest: a module declared twice is `E0428`,
+// an inner doc comment past the first item is `E0753`, and a suite file no `mod` names
+// compiles nowhere. Each of those fails every suite in this target, so put a new suite at
+// `tests/all/<name>.rs`, insert its pair into the sorted list below, and leave what it
+// covers — and why it drives the assembled router rather than one service crate — to that
+// suite's own module doc, where it is read beside the test it explains.
+// The `#[path]` attribute is what points each declaration into `tests/all/`: this file is a
+// test-target CRATE ROOT, where a bare `mod` would resolve to a sibling of it, which the
+// layout check refuses. What goes below this header is a declaration — never a note about
+// one, and never a copy of this header; a note about this file itself belongs in
+// `all/appended_notes.rs`.
 // Single integration-test target for the router: the canonical declaration list of every
 // cross-service suite under `tests/all/`, and nothing else.
 // Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per

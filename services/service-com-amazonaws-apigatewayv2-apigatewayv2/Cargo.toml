@@ -96,6 +96,12 @@ regex = "1"
 # published under). Both are URLs a caller sends, so they are read by this maintained parser
 # rather than by splitting the text here.
 url = "2"
+# Emits the YAML spelling of an exported API definition ("an exported definition of an API
+# in a particular output format, for example, YAML", `ExportedApi`): yaml-rust2 is the
+# pure-Rust YAML 1.2 implementation the other services in this tree read and write YAML
+# with, so the one output type `ExportApi` serves beside JSON is produced by a maintained
+# emitter rather than written by hand.
+yaml-rust2 = { version = "0.10", default-features = false }
 # The ONE renderer of an API Gateway mapping template ("a map of Velocity templates",
 # `Integration$RequestTemplates`): a WEBSOCKET api's MOCK integration carries the same
 # `TemplateMap` values the REST data plane renders, so this crate drives that renderer

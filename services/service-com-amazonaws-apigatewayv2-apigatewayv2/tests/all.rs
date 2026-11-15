@@ -23,6 +23,8 @@ mod api_endpoint_announced_address;
 mod api_endpoint_documented_form;
 #[path = "all/api_endpoint_scheme.rs"]
 mod api_endpoint_scheme;
+#[path = "all/api_export.rs"]
+mod api_export;
 #[path = "all/api_import.rs"]
 mod api_import;
 #[path = "all/api_import_advisory_report.rs"]
