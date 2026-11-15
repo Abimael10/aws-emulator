@@ -2422,3 +2422,5 @@ mod delete_transit_gateway_metering_policy_entry;
 // of two other compute families — and the whole member set each of them carries. Declared
 #[path = "all/published_network_optimized_compute_catalog_rows.rs"]
 mod published_network_optimized_compute_catalog_rows;
+#[path = "all/provision_ipam_pool_cidr.rs"]
+mod provision_ipam_pool_cidr;

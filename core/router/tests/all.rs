@@ -1903,3 +1903,19 @@ mod cloudformation_cloudfront_published_edge_address;
 // service crate's own, is stated in that suite's own module doc, where it is read beside the
 // test it explains; `all/appended_notes.rs` and `all/appended_notes_tail.rs` keep the notes
 // earlier landings had appended here.
+// Single integration-test target for the router: the canonical declaration list of every
+// cross-service suite under `tests/all/`, and nothing else.
+// suite, sorted by name, and no other line, so two branches landing at once insert two lines
+// in two places and have no prose to duplicate, re-word or mistype.
+// deliberate: an inner doc comment is legal only before the first item, so one appended past
+// the declarations is `E0753` and compiles no suite of this target. With none in the file at
+// all, no landing can leave one past the first item.
+// declaration into `tests/all/`. Declare each suite exactly ONCE — a second `mod` for one
+// name is `E0428`, and a suite file no `mod` here names compiles nowhere.
+// The suites under `tests/all/` whose names begin `all_rs_`, plus
+// `all/declaration_roots_are_canonical_and_complete.rs`, pin those rules rather than
+// restating them here.
+// What a suite covers, and why it belongs to this cross-service target rather than to one
+// service crate's own, belongs in that suite's own module header, where it is read beside the
+// test it explains; a note about THIS file belongs in `all/appended_notes.rs`.
+#![allow(clippy::doc_lazy_continuation)]
