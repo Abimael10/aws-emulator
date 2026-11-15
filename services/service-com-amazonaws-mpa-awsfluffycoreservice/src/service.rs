@@ -49,11 +49,15 @@
 //!
 //! An operation this service restricts to the organization's MANAGEMENT ACCOUNT (the
 //! creates that set an organization's multi-party approval up) is
-//! authorized from the CALLER and the recorded organization alone — no value in the
-//! request takes part in that decision — so the decision does not wait for the request
-//! to be read or validated: a request whose body breaks a modelled constraint earns the
-//! same 403 `AccessDeniedException` as a conforming one, and a refused caller never
-//! learns whether its body would also have been refused.
+//! authorized from the CALLER and the organization AWS Organizations records alone — no
+//! value in the request takes part in that decision — so the decision does not wait for
+//! the request to be read or validated: a request whose body breaks a modelled constraint
+//! earns the same 403 `AccessDeniedException` as a conforming one, and a refused caller
+//! never learns whether its body would also have been refused.
+//!
+//! Which account that is belongs to AWS Organizations, so the gate ASKS it over the
+//! in-process callback rather than reading a copy of its own
+//! ([`crate::state::organization`]).
 //!
 //! That ordering is unreachable from inside a handler. The framework's centralized walk
 //! (deserialize -> validate -> `handle` -> serialize) refuses every modelled constraint
@@ -115,7 +119,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            gates: management_account_gates::<Eng>(&engine),
+            gates: management_account_gates::<Eng>(),
             entry: crate::ServiceDefinition::new(engine),
             protocol: iso_timestamps::IsoTimestampRestJson::new(),
         }
@@ -129,7 +133,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// cannot drift from the model. Multi-party approval is an AWS Organizations feature, and
 /// the operations that SET AN ORGANIZATION'S MULTI-PARTY APPROVAL UP are the ones its
 /// management account owns: every handler whose authorization decision is
-/// `state::is_management_account(state::caller_account_id())` belongs here, and the gate
+/// `state::organization::caller_is_management_account` belongs here, and the gate
 /// is how that decision is reached ahead of validation. Today that is
 /// `CreateApprovalTeam` (the operation the recorded refusal was observed on) and
 /// `CreateIdentitySource` (the same check, in `ops::create_identity_source`). Adding
@@ -142,7 +146,6 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// field), so it belongs after the request is read — it is
 /// [`crate::state::authorize_resource_arn`], applied in each of those handlers.
 fn management_account_gates<Eng: Send + Sync + 'static>(
-    engine: &Arc<Eng>,
 ) -> HashMap<&'static str, Box<dyn ErasedOperation>> {
     let mut gates: HashMap<&'static str, Box<dyn ErasedOperation>> = HashMap::new();
     macro_rules! gate {
@@ -151,8 +154,7 @@ fn management_account_gates<Eng: Send + Sync + 'static>(
                 let name = <crate::ops::$module::$operation<Eng> as Operation>::NAME;
                 gates.insert(
                     name,
-                    Box::new(ManagementAccountGate::new(Arc::clone(engine), name))
-                        as Box<dyn ErasedOperation>,
+                    Box::new(ManagementAccountGate::new(name)) as Box<dyn ErasedOperation>,
                 );
             })+
         };
@@ -280,38 +282,34 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 /// One operation this service restricts to the organization's management account, served
 /// behind that authorization gate.
 ///
-/// Holds no operation of its own — only the shared engine (the same `Arc` the generated
-/// entry holds, never a second store) and the routing key of the operation it stands in
-/// front of. A caller the store records as the management account is served by that one
-/// generated operation, which runs the whole framework sequence over the same bytes.
-struct ManagementAccountGate<Eng> {
-    engine: Arc<Eng>,
+/// Holds no operation and no store of its own — only the routing key of the operation it
+/// stands in front of. The organization the decision is made against belongs to AWS
+/// Organizations and is read from there per call ([`crate::state::organization`]), and a
+/// caller it reports as the management account is served by that one generated operation,
+/// which runs the whole framework sequence over the same bytes.
+struct ManagementAccountGate {
     /// The routing key of the gated operation, taken from its own `Operation::NAME`.
     operation: &'static str,
 }
 
-impl<Eng: Send + Sync + 'static> ManagementAccountGate<Eng> {
-    const fn new(engine: Arc<Eng>, operation: &'static str) -> Self {
-        Self { engine, operation }
+impl ManagementAccountGate {
+    const fn new(operation: &'static str) -> Self {
+        Self { operation }
     }
 
-    /// Whether this service's store refuses the calling account.
+    /// Whether the organization AWS Organizations records refuses the calling account.
     ///
-    /// A READ: the store's lock is taken for the comparison and released again, and
-    /// nothing is materialised or written, so consulting the gate cannot change what a
-    /// later caller sees. A store this service cannot reach at all refuses nobody here —
-    /// the operation's own handler answers that with the modelled server error rather
-    /// than this reporting a denial it did not decide.
-    fn denies_the_caller(&self) -> bool {
-        crate::state::service_state(&*self.engine).is_some_and(|store| {
-            !store
-                .lock()
-                .is_management_account(crate::state::caller_account_id())
-        })
+    /// A READ of another service: it asks `DescribeOrganization` over the in-process
+    /// callback and writes nothing anywhere, so consulting the gate cannot change what a
+    /// later caller sees. An account that belongs to no organization — including an
+    /// emulator serving no Organizations at all — is a standalone account, which this
+    /// operation is not available to.
+    async fn denies_the_caller(&self, ctx: &OperationContext<'_>) -> bool {
+        !crate::state::organization::caller_is_management_account(ctx).await
     }
 }
 
-impl<Eng: Send + Sync + 'static> ErasedOperation for ManagementAccountGate<Eng> {
+impl ErasedOperation for ManagementAccountGate {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
@@ -320,7 +318,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for ManagementAccountGate<Eng> 
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
             let started = Instant::now();
-            if self.denies_the_caller() {
+            if self.denies_the_caller(ctx).await {
                 // Decided from the caller and the recorded organization alone, so it is
                 // decided HERE: ahead of the deserialize-and-validate boundary the
                 // generated walk below runs, and therefore ahead of every answer that

@@ -31,6 +31,12 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# AWS Organizations is mounted beside this service on one engine in every suite that
+# creates an approval team or an identity source, because the organization whose
+# MANAGEMENT ACCOUNT those creates are restricted to is that service's own record: the
+# gate reads it over the in-process callback, so the organization a suite needs is
+# created through Organizations' own `CreateOrganization` rather than seeded here.
+service-com-amazonaws-organizations-awsorganizationsv20161128 = { workspace = true }
 
 [lints]
 workspace = true

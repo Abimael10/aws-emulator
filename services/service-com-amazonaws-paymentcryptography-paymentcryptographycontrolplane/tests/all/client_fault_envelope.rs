@@ -151,9 +151,13 @@ const POLL_DEADLINE: Duration = Duration::from_secs(60);
 /// loop observes the transition rather than a time of its own choosing.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// A router serving this service beside AWS Multi-Party Approval on ONE engine, with the
-/// caller's account recorded as the organization's management account — the state in which
-/// MPA's own `CreateApprovalTeam` is permitted.
+/// A router serving this service beside AWS Multi-Party Approval and AWS Organizations on
+/// ONE engine — the state in which MPA's own `CreateApprovalTeam` is permitted.
+///
+/// MPA restricts that create to the management account of the organization AWS
+/// Organizations records, and mounting that control plane establishes the organization the
+/// emulated account is the management account of, so the three services are mounted here
+/// exactly as the assembled emulator mounts them.
 ///
 /// A case that needs an approval team mints it through MPA's own API, so the team
 /// `AssociateMpaTeam` resolves is one that service really holds, exactly as the assembled
@@ -170,9 +174,11 @@ fn router_with_mpa() -> MultiServiceRouter {
     router.register_service(
         service_com_amazonaws_mpa_awsfluffycoreservice::EmulatedService::new(Arc::clone(&engine)),
     );
-    let mpa_store = service_com_amazonaws_mpa_awsfluffycoreservice::state::service_state(&*engine)
-        .expect("the multi-party approval store");
-    mpa_store.lock().organization_management_account_id = Some(account());
+    router.register_service(
+        service_com_amazonaws_organizations_awsorganizationsv20161128::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
     router
 }
 

@@ -209,9 +209,10 @@
 //!   addressed by a SESSION ARN is refused with `AccessDeniedException` (403) when that
 //!   ARN resolves to no session the caller can see, because this service does not
 //!   disclose whether such a session exists.
-//! * [`ComAmazonawsMpaAwsfluffycoreserviceState::is_management_account`] /
-//!   [`not_management_account`] — an operation an organization restricts to its
-//!   management account is refused the same way for any other caller.
+//! * [`organization::caller_is_management_account`] / [`not_management_account`] — an
+//!   operation an organization restricts to its management account is refused the same
+//!   way for any other caller. Which account that is belongs to AWS Organizations, so it
+//!   is read out of that service rather than copied here.
 //!
 //! # How this service words a rejection
 //!
@@ -254,6 +255,8 @@
 //! service declares is `@length(max: 1000)` while the members a refusal quotes back run
 //! to 2048 characters on their own, so every message built by interpolating a request
 //! value is held to that bound by [`bounded_message`].
+
+pub mod organization;
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -3003,19 +3006,6 @@ pub struct ComAmazonawsMpaAwsfluffycoreserviceState {
     /// [`idempotency_key`] and the same token used on two different creates replays each
     /// against its own resource instead of overwriting the other's record.
     pub idempotency_tokens: BTreeMap<String, IdempotentCreate>,
-    /// The account that is the MANAGEMENT account of the organization this store
-    /// records, if any.
-    ///
-    /// Multi-party approval is an AWS Organizations feature, and the operations
-    /// that set an organization's approval teams up are restricted to its
-    /// management account — a call from a member or standalone account is refused
-    /// with `AccessDeniedException` (403). This emulator presents a single account
-    /// ([`caller_account_id`]) and runs no Organizations control plane, so there is
-    /// no organization and no management account to record: the field is `None` and
-    /// every caller is a standalone account. Read it through
-    /// [`ComAmazonawsMpaAwsfluffycoreserviceState::is_management_account`], which
-    /// therefore answers `false` for every caller until something records one.
-    pub organization_management_account_id: Option<String>,
     /// The policy catalog, keyed by each policy's ARN — the stable ordering
     /// `ListPolicies` pages over.
     ///
@@ -3041,7 +3031,7 @@ pub struct ComAmazonawsMpaAwsfluffycoreserviceState {
 }
 
 impl Default for ComAmazonawsMpaAwsfluffycoreserviceState {
-    /// A fresh store: no team, no organization, and the policy catalog seeded — the
+    /// A fresh store: no team and the policy catalog seeded — the
     /// engine builds this service's state with `Default` on first touch, so this is the
     /// only place the catalog comes into being.
     fn default() -> Self {
@@ -3049,7 +3039,6 @@ impl Default for ComAmazonawsMpaAwsfluffycoreserviceState {
             approval_teams: BTreeMap::new(),
             name_index: BTreeMap::new(),
             idempotency_tokens: BTreeMap::new(),
-            organization_management_account_id: None,
             policies: seeded_policy_catalog(),
             identity_sources: BTreeMap::new(),
             sessions: BTreeMap::new(),
@@ -3062,15 +3051,6 @@ impl Default for ComAmazonawsMpaAwsfluffycoreserviceState {
 }
 
 impl ComAmazonawsMpaAwsfluffycoreserviceState {
-    /// Whether `account_id` is the management account of the organization this store
-    /// records. False whenever no management account is recorded, which is the only
-    /// state this emulator reaches on its own: an organization-only operation is then
-    /// available to nobody.
-    #[must_use]
-    pub fn is_management_account(&self, account_id: &str) -> bool {
-        self.organization_management_account_id.as_deref() == Some(account_id)
-    }
-
     /// Apply every change the clock already owes at `now`, so each handler reads a
     /// store that is current. Idempotent, and a no-op when nothing is due.
     ///

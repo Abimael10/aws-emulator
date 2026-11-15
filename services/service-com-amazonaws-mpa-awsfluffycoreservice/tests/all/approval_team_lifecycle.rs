@@ -130,29 +130,55 @@ pub(crate) struct Harness {
 }
 
 impl Harness {
-    /// The harness these lifecycle tables use: the caller's own account recorded as
-    /// the organization's management account, the only state in which
-    /// `CreateApprovalTeam` is permitted. These tables are about what the lifecycle
-    /// operations DO once the caller may create a team; the gate itself is tested in
-    /// `authorization_gate.rs`.
+    /// The harness these lifecycle tables use: the emulator as it is mounted, with the
+    /// caller's own account the management account of the organization AWS Organizations
+    /// records — the only state in which `CreateApprovalTeam` is permitted. These tables
+    /// are about what the lifecycle operations DO once the caller may create a team; the
+    /// gate itself is tested in `authorization_gate.rs` and
+    /// `management_account_from_organizations.rs`.
     pub(crate) fn new() -> Self {
-        let harness = Self::without_organization();
-        harness.record_management_account(engine::emulator_account_id());
+        Self::mounted()
+    }
+
+    /// Both services mounted in a router over one engine, with the Organizations store
+    /// put back into the state of an account that belongs to NO organization — and so
+    /// is the management account of none.
+    pub(crate) fn without_organization() -> Self {
+        let harness = Self::mounted();
+        *harness.organizations_store().lock() = Default::default();
         harness
     }
 
-    /// The service mounted in a router with the store left as it starts: no
-    /// organization, and therefore no management account.
-    pub(crate) fn without_organization() -> Self {
+    /// This service mounted in a router beside AWS Organizations, both over ONE engine.
+    ///
+    /// Organizations is mounted because the organization whose MANAGEMENT ACCOUNT the
+    /// gated creates are restricted to is that service's record, which this service reads
+    /// over the in-process callback; mounting that control plane establishes the
+    /// organization the emulated account belongs to, exactly as the running emulator does.
+    fn mounted() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signature verification is the emulator's, not this service's; these requests
         // carry a credential scope so they ROUTE, not a real signature.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(
+            service_com_amazonaws_organizations_awsorganizationsv20161128::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
         let harness = Self { router, engine };
         harness.record_attachable_policies();
         harness
+    }
+
+    /// The AWS Organizations store this harness mounts that control plane over.
+    pub(crate) fn organizations_store(
+        &self,
+    ) -> engine::ServiceState<
+        service_com_amazonaws_organizations_awsorganizationsv20161128::state::ComAmazonawsOrganizationsAwsorganizationsv20161128State,
+    > {
+        self.engine.state()
     }
 
     /// Record the catalog entries the tables in this crate's suites attach, so every
@@ -189,12 +215,26 @@ impl Harness {
         }
     }
 
-    /// Record `account_id` as the management account of the organization the store
-    /// describes. No MPA operation records it, so a test that needs a created team
-    /// sets it directly, as [`Harness::expire_deletion_window`] sets a due instant.
+    /// Record `account_id` as the management account of the organization the emulator's
+    /// AWS Organizations control plane holds — the record this service's gate reads.
+    ///
+    /// No MPA operation records it (it is Organizations' own fact), so a suite that needs
+    /// a management account OTHER than the caller's writes it into that service's store,
+    /// as [`Harness::expire_deletion_window`] sets a due instant. The organization itself
+    /// is built by Organizations' own single writer.
     pub(crate) fn record_management_account(&self, account_id: &str) {
-        let store = state::service_state(&*self.engine).expect("the service store");
-        store.lock().organization_management_account_id = Some(account_id.to_string());
+        let store = self.organizations_store();
+        let mut guard = store.lock();
+        if guard.organization.is_none() {
+            guard.create_organization(
+                service_com_amazonaws_organizations_awsorganizationsv20161128::state::DEFAULT_FEATURE_SET,
+            );
+        }
+        guard
+            .organization
+            .as_mut()
+            .expect("the organization just established")
+            .master_account_id = account_id.to_string();
     }
 
     /// Dispatch one request and return `(status, parsed JSON body)`.

@@ -2,11 +2,11 @@
 
 //! End-to-end tests for WHEN this service's organization gate is decided: an operation
 //! restricted to the organization's management account is authorized from the CALLER and
-//! the recorded organization alone, so that decision is made BEFORE the request's
-//! modelled input constraints are validated.
+//! the organization AWS Organizations records alone, so that decision is made BEFORE the
+//! request's modelled input constraints are validated.
 //!
 //! The rule, over the class these tables span: for EVERY operation this service gates on
-//! the management account, a caller the store does not record as that account is refused
+//! the management account, a caller that is not that account is refused
 //! with HTTP 403 `AccessDeniedException` whatever the request body carries — a body that
 //! breaks a modelled constraint earns exactly the refusal a conforming body earns, the
 //! refusal quotes nothing from the request, and nothing is written. The same bodies sent
@@ -17,7 +17,7 @@
 //! The rows differ along the gated OPERATION (`CreateApprovalTeam`,
 //! `CreateIdentitySource` — the creates that set an organization's multi-party approval
 //! up, i.e. every handler whose decision is
-//! `state::is_management_account(state::caller_account_id())`), along WHICH modelled
+//! `state::organization::caller_is_management_account`), along WHICH modelled
 //! constraint the body breaks and in what way (a `@pattern`, a `@length` maximum, a
 //! `@length` minimum, a `@range` minimum, an absent `@required` member), and along WHERE
 //! that member sits (top level, inside a nested structure, inside a list element, inside
@@ -328,7 +328,7 @@ struct GatedOperation {
 
 /// Every operation this service gates on the management account — the same set
 /// `crate::service`'s gate table holds, which is every handler whose decision is
-/// `state::is_management_account(state::caller_account_id())`.
+/// `state::organization::caller_is_management_account`.
 fn gated_operations() -> Vec<GatedOperation> {
     vec![
         GatedOperation {

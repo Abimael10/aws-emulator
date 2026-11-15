@@ -20,9 +20,10 @@
 //! Setting an organization's identity source up is restricted to its MANAGEMENT
 //! account, the same rule `create_approval_team.rs` enforces for an approval team: a
 //! caller that is not it earns `AccessDeniedException` (403) before any state is
-//! written, and the store records who that account is (none, until something records
-//! one — this emulator runs no Organizations control plane), so the gate reads state
-//! rather than deciding per request. Recorded AWS behaviour refuses
+//! written. Which account that is belongs to AWS Organizations, so it is read out of
+//! that service over the in-process callback ([`crate::state::organization`]) rather
+//! than from a copy of this service's own, and an account that belongs to no
+//! organization is a standalone account and is refused. Recorded AWS behaviour refuses
 //! `CreateIdentitySource` from an account outside the organization's management account
 //! with exactly this error, and decides it BEFORE it validates the request body. That
 //! ordering is now what this emulator does too: the decision takes no value from the
@@ -202,6 +203,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Setting an organization's identity source up is restricted to its MANAGEMENT
+        // account: a call from any other account is refused before state is touched, so
+        // a caller that is not entitled to create one never records one. Which account
+        // that is belongs to AWS Organizations, so it is read out of that service per
+        // call (`crate::state::organization`); an account that belongs to no
+        // organization is a standalone account, and this is the answer to its call.
+        //
+        // Decided before this service's store is even reached, both because the decision
+        // needs nothing from it and because the answer comes from another service: a
+        // refused caller leaves nothing of this store touched.
+        //
+        // A refused caller does not normally reach here: the decision needs nothing from
+        // the request, so `crate::service` makes it ahead of the framework's constraint
+        // boundary for every operation this service gates on the management account.
+        // This is the same rule at the store's own door, so the store cannot be written
+        // for an unauthorized caller even if a request reached this handler without
+        // passing that gate.
+        if !crate::state::organization::caller_is_management_account(ctx).await {
+            return Err(CreateIdentitySourceErrorModeled::AccessDeniedException(
+                crate::state::not_management_account(),
+            )
+            .into());
+        }
+
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateIdentitySourceError::Modeled(
                 CreateIdentitySourceErrorModeled::InternalServerException(
@@ -214,27 +239,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         let now = ::std::time::SystemTime::now();
         state.materialize_due(now);
-
-        // Setting an organization's identity source up is restricted to its MANAGEMENT
-        // account: a call from any other account is refused before state is touched, so
-        // a caller that is not entitled to create one never records one. This emulator
-        // runs no Organizations control plane and so records no management account (see
-        // `state::ComAmazonawsMpaAwsfluffycoreserviceState::
-        // organization_management_account_id`), which makes every caller a standalone
-        // account and this the answer to every call until one is recorded.
-        //
-        // A refused caller does not reach here: the decision needs nothing from the
-        // request, so `crate::service` makes it ahead of the framework's constraint
-        // boundary for every operation this service gates on the management account.
-        // This is the same rule at the store's own door, so the store cannot be written
-        // for an unauthorized caller even if a request reached this handler without
-        // passing that gate.
-        if !state.is_management_account(crate::state::caller_account_id()) {
-            return Err(CreateIdentitySourceErrorModeled::AccessDeniedException(
-                crate::state::not_management_account(),
-            )
-            .into());
-        }
 
         // `@idempotencyToken` replay: the same token answers with the ANSWER the first
         // call gave, rather than minting a second identity source. The token is recorded
