@@ -39,6 +39,90 @@ pub fn validate_tags(tags: &[crate::ops::types::Tag]) -> Result<(), String> {
     Ok(())
 }
 
+/// [`validate_optional_tags`] for the request being SERVED, which is what decides whether a
+/// key in the reserved namespace is "for external use" at all.
+///
+/// A tag under the reserved prefix is a tag the SERVICE that owns the namespace decides, and
+/// an AWS service deploying a stack for one of its own resources is that service rather than
+/// an external caller: Service Catalog's launch of a provisioned product carries the
+/// `aws:servicecatalog:*` tags that record the launch, and nothing a caller sends can.
+///
+/// Which service is making the call is read from the credential the request PRESENTS — the
+/// one thing about a request a client cannot choose for itself — through the shared directory
+/// of the calls a service is making as its own service principal
+/// ([`::service_common::service_principal_calls`]), and such a call may carry keys in ITS
+/// OWN namespace only. Every other request is held to [`validate_optional_tags`]: a caller
+/// cannot claim a service's keys by naming them.
+pub fn validate_optional_tags_from<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    tags: Option<&[crate::ops::types::Tag]>,
+) -> Result<(), String> {
+    let reserved: Vec<&str> = tags
+        .unwrap_or_default()
+        .iter()
+        .map(|tag| tag.key.as_str())
+        .filter(|key| is_reserved_tag_key(key))
+        .collect();
+    if reserved.is_empty() {
+        return Ok(());
+    }
+    let calling_service = calling_service(engine, ctx);
+    let permitted = |key: &&str| {
+        calling_service
+            .as_deref()
+            .is_some_and(|service_id| service_owns_tag_key(service_id, key))
+    };
+    match reserved.iter().all(permitted) {
+        true => Ok(()),
+        false => Err(RESERVED_TAG_KEY.to_string()),
+    }
+}
+
+/// Whether `key` is a tag key the service whose id is `service_id` owns: the namespace
+/// `aws:<service id>:`, which is where the tags a service applies to what it deploys live.
+fn service_owns_tag_key(service_id: &str, key: &str) -> bool {
+    is_reserved_tag_key(key)
+        && key
+            .get(RESERVED_TAG_KEY_PREFIX.len()..)
+            .and_then(|rest| rest.strip_prefix(service_id))
+            .is_some_and(|rest| rest.starts_with(':'))
+}
+
+/// The id of the service whose own principal is making this request, for a request another
+/// emulated service is making as its service principal on behalf of one of its resources.
+///
+/// The id is the first label of that principal (`servicecatalog.amazonaws.com` →
+/// `servicecatalog`), which is the label its reserved tag namespace carries.
+fn calling_service<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> Option<String> {
+    let directory = service_principal_calls(engine)?;
+    let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+    let account = ::engine::emulator_account_id();
+    let now = ::std::time::SystemTime::now();
+    let held = directory.lock();
+    let call = held.call(&access_key_id, account, now)?;
+    let service_id = call.principal.split('.').next().unwrap_or_default();
+    (!service_id.is_empty()).then(|| service_id.to_string())
+}
+
+/// The shared directory of the calls another service is making as its own service
+/// principal, in the one shared engine: written by that service, read here.
+fn service_principal_calls<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::service_principal_calls::ServicePrincipalCalls>>
+{
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::service_principal_calls::ServicePrincipalCalls,
+            >,
+        )
+}
+
 /// [`validate_tags`] for a request whose `Tags` member may be absent, which is every
 /// operation that takes one: a request naming no tags states no key to hold to the rule.
 pub fn validate_optional_tags(tags: Option<&[crate::ops::types::Tag]>) -> Result<(), String> {
@@ -61,6 +145,26 @@ mod tests {
         crate::ops::types::Tag {
             key: key.to_string(),
             value: "v".to_string(),
+        }
+    }
+
+    /// A service may apply the `aws:` keys of ITS OWN namespace and no other's: the rows
+    /// differ along which namespace the key is in and how it is cased.
+    #[test]
+    fn a_calling_service_owns_the_keys_of_its_own_namespace() {
+        for (case, service_id, key, owned) in [
+            ("its own namespace", "servicecatalog", "aws:servicecatalog:portfolioArn", true),
+            ("its own namespace, uppercase prefix", "servicecatalog", "AWS:servicecatalog:productArn", true),
+            ("another service's namespace", "servicecatalog", "aws:cloudformation:stack-name", false),
+            ("the bare prefix", "servicecatalog", "aws:", false),
+            ("a prefix without the separator", "servicecatalog", "aws:servicecatalogue", false),
+            ("a key outside the namespace", "servicecatalog", "team", false),
+        ] {
+            let judged = service_owns_tag_key(service_id, key);
+            assert_eq!(
+                judged, owned,
+                "case {case:?}: expected {owned} for {key:?} as {service_id}, got {judged}"
+            );
         }
     }
 

@@ -177,6 +177,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The Region this request was signed for: where the provisioned product's ARN
         // is minted, and where the stack its launch stands up lives.
         let region = crate::state::request_region(ctx);
+        // WHO asked for this launch, as `sts:GetCallerIdentity` reports it for the
+        // credential the request was signed with: one of the things the deployed stack
+        // records about the launch. Resolved against the account's identity records
+        // BEFORE this service's own store is locked, so no two stores are held at once.
+        let provisioning_principal_arn = crate::state::request_principal_arn(&*self.engine, ctx);
 
         // Everything this request resolves and stores is done under the lock, which is
         // released before the launch itself: the stack is stood up by a call into
@@ -308,8 +313,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let template = crate::state::template_source(&artifact.info);
 
         let product_id = product.id.clone();
+        // The two resources the resolved launch path NAMES, as the deployed stack records
+        // them: the product launched and the portfolio whose path granted the launch.
+        let product_arn = product.arn.clone();
         let provisioned_product_type =
             crate::state::provisioned_product_type(&product.product_type).to_string();
+        let portfolio_arn = state
+            .portfolios
+            .get(&path_id)
+            .map(|portfolio| portfolio.arn.clone())
+            .unwrap_or_default();
+        // The TagOptions this launch path forces onto everything launched through it, read
+        // through the same function `DescribeProvisioningParameters` offers them with, so
+        // what a caller was offered is what the launch applies.
+        let offered_tag_options = crate::state::launch_tag_options(&state, &path_id, &product_id);
 
         // `ProvisionedProductName` "must be unique for the Amazon Web Services account
         // and cannot be updated after the product is provisioned", so a name this
@@ -370,6 +387,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `UNDER_CHANGE`.
         let completed_at = now + crate::state::PROVISIONING_COMPLETES_AFTER;
 
+        // The GRAPH this launch went through, which the stack it deploys records: the
+        // portfolio whose path granted the launch, the product and version launched, the
+        // principal that asked for it and the provisioned product it is for. Every value
+        // comes from what this request resolved and from what this call minted.
+        let launch_graph = crate::state::LaunchGraph {
+            portfolio_arn,
+            product_arn,
+            provisioning_artifact_id: artifact_id.clone(),
+            provisioning_principal_arn,
+            provisioned_product_arn: arn.clone(),
+        };
         // What the launch stands up. A product type that is not CloudFormation-backed
         // launches no stack, so there is nothing for CloudFormation to stand up for it.
         let launch = (provisioned_product_type == crate::state::PROVISIONED_PRODUCT_TYPE_CFN_STACK)
@@ -386,10 +414,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into_iter()
                     .filter_map(|parameter| parameter.key.map(|key| (key, parameter.value)))
                     .collect(),
-                tags: tags.clone(),
+                // The stack Service Catalog deploys for a provisioned product carries
+                // more than the request's own `Tags`: the TagOptions the launch path
+                // inherits onto it and the tags recording the launch graph, which are the
+                // only machine-readable link from the deployed stack back to what produced
+                // it (`crate::state::launch_stack_tags`).
+                tags: crate::state::launch_stack_tags(&tags, &offered_tag_options, &launch_graph),
                 // "Passed to CloudFormation. The SNS topic ARNs to which to publish
                 // stack-related events", which the stack is created with.
                 notification_arns: input.notification_arns.unwrap_or_default(),
+                // The resource this launch is for, which the call Service Catalog makes as
+                // its own service principal to deploy the stack names.
+                provisioned_product_arn: launch_graph.provisioned_product_arn.clone(),
             });
 
         let record = crate::state::Record {
@@ -457,7 +493,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // will not stand up does not un-accept it: the stack is simply not there, and
         // the provisioned product reports no stack resource and no outputs.
         if let Some(launch) = launch {
-            match crate::state::create_launch_stack(ctx, &region, &launch).await {
+            match crate::state::create_launch_stack(&*self.engine, ctx, &region, &launch).await {
                 Ok(stack_id) => {
                     if let Some(provisioned) = state
                         .lock()

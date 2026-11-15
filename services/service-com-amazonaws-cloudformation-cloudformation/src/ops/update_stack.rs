@@ -579,9 +579,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // The same rule a create's tags are held to: a key in AWS's own reserved namespace
         // is refused before the stack is touched, so an update cannot put a key the service
-        // itself owns onto the stack (`crate::state::stack_tags`).
-        crate::state::stack_tags::validate_optional_tags(input.tags.as_deref())
-            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // itself owns onto the stack — unless the service that owns the namespace is the one
+        // updating it (`crate::state::stack_tags`).
+        crate::state::stack_tags::validate_optional_tags_from(
+            &*self.engine,
+            ctx,
+            input.tags.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // "Only one of the Capabilities and ResourceType parameters can be specified": the
         // two members state two different bounds on this update, so a request stating both
         // states no one bound and is refused for its SHAPE, before either is weighed

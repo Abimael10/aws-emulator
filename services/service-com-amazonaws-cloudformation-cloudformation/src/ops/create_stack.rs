@@ -476,9 +476,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // A tag key in AWS's own reserved namespace is not a tag a caller may set
         // (`crate::state::stack_tags`): refused HERE, so nothing is created carrying a key
-        // the service itself owns.
-        crate::state::stack_tags::validate_optional_tags(input.tags.as_deref())
-            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // the service itself owns — unless the service that owns the namespace is the one
+        // deploying the stack.
+        crate::state::stack_tags::validate_optional_tags_from(
+            &*self.engine,
+            ctx,
+            input.tags.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // The ceiling the SOURCE that carried this template is held to: the documented
         // `TemplateBody` maximum for a body the request carried inline, which the model
         // carries no `@length` for, and the documented maximum of a template read from an

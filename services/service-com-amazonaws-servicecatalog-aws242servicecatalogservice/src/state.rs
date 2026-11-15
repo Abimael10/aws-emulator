@@ -14,8 +14,21 @@ use std::time::SystemTime;
 mod principal_identity;
 
 pub use principal_identity::{
-    association_principal_identifier, principal_identifier, IamState, PRINCIPAL_TYPE_IAM_PATTERN,
+    association_principal_identifier, principal_identifier, request_principal_arn, IamState,
+    PRINCIPAL_TYPE_IAM_PATTERN,
 };
+
+/// What the stack behind a provisioned product is TAGGED with: its own concern, in its
+/// own file.
+mod launch_tags;
+
+pub use launch_tags::*;
+
+/// The identity a call this service makes OF ITS OWN presents: its own concern, in its own
+/// file.
+mod service_principal_call;
+
+pub use service_principal_call::{ServicePrincipalCall, SERVICE_CATALOG_SERVICE_PRINCIPAL};
 
 use crate::ops::types::{
     ConstraintDetail, ConstraintSummary, PortfolioDetail, ProductViewDetail, ProductViewSummary,

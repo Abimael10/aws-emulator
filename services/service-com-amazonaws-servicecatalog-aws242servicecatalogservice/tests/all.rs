@@ -21,6 +21,8 @@ mod copy_lineage_and_lookup_messages;
 mod end_user_product_view_messages;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/launch_governance_tags.rs"]
+mod launch_governance_tags;
 #[path = "all/launch_paths.rs"]
 mod launch_paths;
 #[path = "all/portfolio_lifecycle.rs"]

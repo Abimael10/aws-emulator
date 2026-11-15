@@ -65,6 +65,34 @@ pub fn association_principal_identifier<Eng: Send + Sync + 'static>(
     Some(principal_identifier(&held, principal_arn))
 }
 
+/// The ARN of the principal THIS REQUEST speaks for, as `sts:GetCallerIdentity` reports it
+/// for the credential the request was signed with — what a launch records as the principal
+/// that asked for it.
+///
+/// The question is IAM's, so IAM's own resolution answers it against the records in this
+/// same shared engine: the user that holds the long-term access key, or the role session a
+/// temporary credential was vended for. Every credential those records name no identity for
+/// — the long-term pair this emulator publishes at start among them — resolves to the one
+/// principal STS reports for all of them, which is the identity such a caller reads back for
+/// itself. Nothing here spells an identity out of the access key id's text: a client that
+/// reads its own identity and then reads what the launch recorded has to see one principal.
+///
+/// LOCK ORDER: the IAM store is taken on its own and released before this service's own
+/// store is locked, so no two stores are held at once — call it BEFORE locking this
+/// service's state.
+pub fn request_principal_arn<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    match iam_state::service_state(engine) {
+        Some(iam) => iam_state::authorization::caller_principal_arn(&iam.lock(), ctx),
+        // No identity records on this engine: the only credential a request can present
+        // there is the one this emulator publishes, which speaks for the account's own
+        // principal.
+        None => ::service_common::caller_principal::ambient_user_arn(),
+    }
+}
+
 /// [`association_principal_identifier`] for a CONCRETE principal against identity records
 /// already locked: the unique id those records hold for the principal the ARN names.
 ///

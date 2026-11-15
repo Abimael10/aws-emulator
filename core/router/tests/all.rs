@@ -1473,3 +1473,7 @@ mod declaration_roots_end_with_their_last_declaration;
 mod cloudformation_rds_credential_rotation_estate;
 #[path = "all/lambda_handler_reaches_amazon_rds.rs"]
 mod lambda_handler_reaches_amazon_rds;
+// The lint allowed below is for the suite files this root compiles: a wrapped paragraph in
+// one of their module headers is a note rather than a build failure. An inner attribute,
+// like an inner doc comment, is legal only before the first item, so it stands here rather
+// than in the list.

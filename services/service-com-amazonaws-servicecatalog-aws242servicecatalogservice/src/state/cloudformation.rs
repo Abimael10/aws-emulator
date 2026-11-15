@@ -106,6 +106,10 @@ pub struct Launch {
     /// "Passed to CloudFormation. The SNS topic ARNs to which to publish stack-related
     /// events."
     pub notification_arns: Vec<String>,
+    /// The ARN of the provisioned product this launch is for: the resource Service Catalog
+    /// deploys the stack ON BEHALF OF, which is what the call it makes as its own service
+    /// principal names ([`super::ServicePrincipalCall`]).
+    pub provisioned_product_arn: String,
 }
 
 /// Stand `launch`'s stack up and answer the stack id CloudFormation minted for it — or
@@ -114,12 +118,31 @@ pub struct Launch {
 /// The launch IS the stack: the resources behind a provisioned product are the ones that
 /// stack creates, and its outputs are what the provisioned product's outputs are read
 /// from afterwards ([`launch_outputs`]).
-pub async fn create_launch_stack(
+///
+/// The stack is deployed as SERVICE CATALOG's own call, on behalf of the provisioned
+/// product it is for ([`super::ServicePrincipalCall`]): the tags the launch records its
+/// graph under are in AWS's reserved namespace, which is the service's to write and not a
+/// caller's. A deployment this service cannot make as its own principal submits the tags a
+/// caller's own may carry instead ([`super::caller_owned_tags`]), so the stack a launch
+/// stands up is deployed either way.
+pub async fn create_launch_stack<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     launch: &Launch,
 ) -> Result<String, String> {
-    let cloudformation = in_process_cloudformation(ctx, region);
+    let as_service =
+        super::ServicePrincipalCall::begin(engine, ctx, &launch.provisioned_product_arn);
+    let (cloudformation, tags) = match &as_service {
+        Some(call) => (
+            call.cloudformation(ctx, region),
+            std::borrow::Cow::Borrowed(&launch.tags),
+        ),
+        None => (
+            in_process_cloudformation(ctx, region),
+            std::borrow::Cow::Owned(super::caller_owned_tags(&launch.tags)),
+        ),
+    };
     let mut request = cloudformation
         .create_stack()
         .stack_name(&launch.stack_name)
@@ -133,7 +156,7 @@ pub async fn create_launch_stack(
     for arn in &launch.notification_arns {
         request = request.notification_arns(arn);
     }
-    for (key, value) in &launch.tags {
+    for (key, value) in tags.iter() {
         request = request.tags(
             ::aws_sdk_cloudformation::types::Tag::builder()
                 .key(key)
@@ -257,6 +280,9 @@ pub struct PlannedChange {
     /// "Passed to CloudFormation. The SNS topic ARNs to which to publish stack-related
     /// events."
     pub notification_arns: Vec<String>,
+    /// The ARN of the provisioned product the planned change is for: the resource Service
+    /// Catalog plans the change ON BEHALF OF ([`super::ServicePrincipalCall`]).
+    pub provisioned_product_arn: String,
 }
 
 /// What the change set behind a plan says about that plan right now: the plan's status,
@@ -283,12 +309,31 @@ pub struct PlanReport {
 /// A stack a previous CREATE change set brought into existence carries no template yet —
 /// it is in `REVIEW_IN_PROGRESS` until that change set is executed — so there is still
 /// nothing to update, and the plan of it is a CREATE change set too.
-pub async fn plan_change_set(
+///
+/// The change set is asked for as SERVICE CATALOG's own call, on behalf of the provisioned
+/// product it plans a change to, for the same reason the launch itself is
+/// ([`create_launch_stack`]): the change set carries the tags the stack it would deploy
+/// would be tagged with, the record of the launch graph among them — and a plan this service
+/// cannot ask for as its own principal is asked for with the tags a caller's own may carry
+/// ([`super::caller_owned_tags`]), so the change is planned either way.
+pub async fn plan_change_set<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     planned: &PlannedChange,
 ) -> Result<String, String> {
-    let cloudformation = in_process_cloudformation(ctx, region);
+    let as_service =
+        super::ServicePrincipalCall::begin(engine, ctx, &planned.provisioned_product_arn);
+    let (cloudformation, tags) = match &as_service {
+        Some(call) => (
+            call.cloudformation(ctx, region),
+            std::borrow::Cow::Borrowed(&planned.tags),
+        ),
+        None => (
+            in_process_cloudformation(ctx, region),
+            std::borrow::Cow::Owned(super::caller_owned_tags(&planned.tags)),
+        ),
+    };
     let deployed = cloudformation
         .describe_stacks()
         .stack_name(&planned.stack_name)
@@ -325,7 +370,7 @@ pub async fn plan_change_set(
     for arn in &planned.notification_arns {
         request = request.notification_arns(arn);
     }
-    for (key, value) in &planned.tags {
+    for (key, value) in tags.iter() {
         request = request.tags(
             ::aws_sdk_cloudformation::types::Tag::builder()
                 .key(key)
@@ -578,13 +623,31 @@ pub fn in_process_cloudformation(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> ::aws_sdk_cloudformation::Client {
+    cloudformation_signed_as(ctx, region, None)
+}
+
+/// [`in_process_cloudformation`], signing with `credentials` when a call carries an identity
+/// of its own — the credential minted for one call made as this service's service principal
+/// ([`super::ServicePrincipalCall`]) — and with the emulator's own credentials otherwise.
+///
+/// The ONE place this crate builds a CloudFormation client, so every call it makes goes over
+/// the same in-process transport however it is signed.
+pub(super) fn cloudformation_signed_as(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    credentials: Option<::aws_sdk_cloudformation::config::Credentials>,
+) -> ::aws_sdk_cloudformation::Client {
     let region = addressable_region(region);
-    let config = ::aws_sdk_cloudformation::Config::builder()
+    let mut config = ::aws_sdk_cloudformation::Config::builder()
         .behavior_version(::aws_sdk_cloudformation::config::BehaviorVersion::latest())
         .region(::aws_sdk_cloudformation::config::Region::new(region.clone()))
         .endpoint_url(format!("https://cloudformation.{region}.amazonaws.com"))
-        .credentials_provider(ctx.callback().aws_credentials_provider())
-        .http_client(ctx.callback().http_client())
+        .http_client(ctx.callback().http_client());
+    config = match credentials {
+        Some(credentials) => config.credentials_provider(credentials),
+        None => config.credentials_provider(ctx.callback().aws_credentials_provider()),
+    };
+    let config = config
         .retry_config(::aws_sdk_cloudformation::config::retry::RetryConfig::disabled())
         .timeout_config(::aws_sdk_cloudformation::config::timeout::TimeoutConfig::disabled())
         .identity_cache(::aws_sdk_cloudformation::config::IdentityCache::no_cache())

@@ -29,6 +29,7 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::harness::{call_as, router_with_engine};
 use crate::stack_lifecycle::{
     call, create_stack, describe_stack, member, router, wait_for_the_transition, xml_text,
     xml_texts,
@@ -221,6 +222,152 @@ async fn stored_tag_keys(router: &MultiServiceRouter, op: TakesTags) -> Vec<Stri
         return Vec::new();
     }
     xml_texts(&body, "Key")
+}
+
+/// The access key id the service-principal rows below sign with: a credential the emulator
+/// minted for ONE cross-service call, which is what the directory of in-flight calls is keyed
+/// on.
+const SERVICE_CALL_ACCESS_KEY_ID: &str = "EMULATORAKSERVICECATALOG";
+
+/// The service principal Service Catalog deploys a provisioned product's stack as.
+const SERVICE_CATALOG_PRINCIPAL: &str = "servicecatalog.amazonaws.com";
+
+/// How long the seeded record stays readable: long enough that no row can outlive it, and
+/// nothing here waits for it.
+const SEEDED_RECORD_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Record, in the shared directory both sides read, that the call signed with
+/// [`SERVICE_CALL_ACCESS_KEY_ID`] is `principal`'s own, made on behalf of `source_arn` — the
+/// write the CALLING service performs before it signs such a call
+/// (`service_common::service_principal_calls`).
+fn remember_service_principal_call(
+    engine: &std::sync::Arc<engine::InMemoryEngine>,
+    principal: &str,
+    source_arn: &str,
+) {
+    let now = std::time::SystemTime::now();
+    let recorded = engine
+        .state::<service_common::service_principal_calls::ServicePrincipalCalls>()
+        .lock()
+        .remember(
+            SERVICE_CALL_ACCESS_KEY_ID,
+            service_common::service_principal_calls::ServicePrincipalCall {
+                principal: principal.to_string(),
+                source_arn: source_arn.to_string(),
+                source_account: crate::stack_lifecycle::ACCOUNT_ID.to_string(),
+                expires_at: now + SEEDED_RECORD_WINDOW,
+            },
+            now,
+        );
+    assert!(
+        recorded,
+        "the directory must hold the seeded in-flight call for {principal}"
+    );
+}
+
+/// A tag key under the reserved prefix is admitted from the SERVICE that owns that namespace
+/// — a call made as its own service principal, which is how Service Catalog records a launch
+/// on the stack it deploys for a provisioned product — and from nobody else: another service's
+/// namespace, and the same key presented by an ordinary caller, are refused exactly as before.
+#[tokio::test]
+async fn a_reserved_key_is_admitted_only_from_the_service_that_owns_its_namespace() {
+    // Rows differ along WHO is calling (Service Catalog's own principal, an ordinary caller)
+    // and WHOSE namespace the key is in (the caller's own, another service's).
+    let rows: &[(&str, bool, &str, bool)] = &[
+        (
+            "the owning service's own namespace",
+            true,
+            "aws:servicecatalog:portfolioArn",
+            true,
+        ),
+        (
+            "the owning service's namespace, a second key of it",
+            true,
+            "aws:servicecatalog:provisionedProductArn",
+            true,
+        ),
+        (
+            "another service's namespace, from a service principal",
+            true,
+            "aws:cloudformation:stack-name",
+            false,
+        ),
+        (
+            "the bare reserved prefix, from a service principal",
+            true,
+            "aws:",
+            false,
+        ),
+        (
+            "the owning service's namespace, from an ordinary caller",
+            false,
+            "aws:servicecatalog:portfolioArn",
+            false,
+        ),
+    ];
+    for (case, as_service, key, admitted) in rows {
+        let (router, engine) = router_with_engine();
+        if *as_service {
+            remember_service_principal_call(
+                &engine,
+                SERVICE_CATALOG_PRINCIPAL,
+                // The resource the call is made on behalf of: a provisioned product of this
+                // account, as Service Catalog addresses one.
+                &format!(
+                    "arn:aws:servicecatalog:us-east-1:{}:stack/app/pp-abcdefghijkl",
+                    crate::stack_lifecycle::ACCOUNT_ID
+                ),
+            );
+        }
+        let mut members = vec![
+            member("StackName", STACK),
+            member("TemplateBody", TEMPLATE),
+        ];
+        members.extend(tag_members(&[key]));
+        let (status_code, body) = call_as(
+            &router,
+            match as_service {
+                true => SERVICE_CALL_ACCESS_KEY_ID,
+                false => crate::harness::AMBIENT_ACCESS_KEY_ID,
+            },
+            "CreateStack",
+            &members,
+        )
+        .await;
+        match admitted {
+            true => {
+                assert_eq!(
+                    status_code, 200,
+                    "case {case:?}: expected {key:?} to be admitted, got {status_code} {body}"
+                );
+                let stored = stored_tag_keys(&router, TakesTags::CreateStack).await;
+                assert_eq!(
+                    stored,
+                    vec![(*key).to_string()],
+                    "case {case:?}: expected the key stored as sent, got {stored:?}"
+                );
+            }
+            false => {
+                assert_eq!(
+                    status_code, 400,
+                    "case {case:?}: expected {key:?} to be refused, got {status_code} {body}"
+                );
+                assert_eq!(
+                    (
+                        xml_text(&body, "Code").unwrap_or_default(),
+                        xml_text(&body, "Message").unwrap_or_default()
+                    ),
+                    ("ValidationError".to_string(), RESERVED_KEY.to_string()),
+                    "case {case:?}: expected the reserved-namespace refusal, got {body}"
+                );
+                let stored = stored_tag_keys(&router, TakesTags::CreateStack).await;
+                assert!(
+                    stored.is_empty(),
+                    "case {case:?}: a refused request must write no tag, got {stored:?}"
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]

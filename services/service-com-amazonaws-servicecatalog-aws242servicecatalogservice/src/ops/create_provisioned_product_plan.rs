@@ -177,6 +177,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(crate::state::state_unavailable)?;
         let region = crate::state::request_region(ctx);
         let now = std::time::SystemTime::now();
+        // WHO asked for the change this plan plans, as `sts:GetCallerIdentity` reports it
+        // for the credential the request was signed with: one of the things the stack this
+        // plan would deploy records about the launch. Resolved against the account's
+        // identity records BEFORE this service's own store is locked, so no two stores are
+        // held at once.
+        let provisioning_principal_arn = crate::state::request_principal_arn(&*self.engine, ctx);
 
         // Everything this service itself holds is resolved and stored under the lock,
         // which is RELEASED before the change set behind the plan is asked for: no store
@@ -264,8 +270,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             };
             let product_id = product.id.clone();
+            // The two resources the resolved launch path NAMES, as the stack this plan
+            // would deploy records them: the product launched and the portfolio whose path
+            // granted the launch.
+            let product_arn = product.arn.clone();
             let provisioned_product_type =
                 crate::state::provisioned_product_type(&product.product_type).to_string();
+            let portfolio_arn = state
+                .portfolios
+                .get(&path_id)
+                .map(|portfolio| portfolio.arn.clone())
+                .unwrap_or_default();
+            // The TagOptions this launch path forces onto everything launched through it,
+            // read through the same function `DescribeProvisioningParameters` offers them
+            // with, so what a caller was offered is what the change would apply.
+            let offered_tag_options =
+                crate::state::launch_tag_options(&state, &path_id, &product_id);
 
             // A plan holds each tag key once, so a repeated key in `Tags` collapses to
             // its last value. The modelled 0..50 bound on the input list is already
@@ -376,6 +396,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 };
 
+            // The GRAPH the launch this change plans goes through, which the stack it
+            // would deploy records: the portfolio whose path granted it, the product and
+            // version launched, the principal that asked for the change and the
+            // provisioned product it is for. Every value comes from what this request
+            // resolved and from what this call minted.
+            let launch_graph = crate::state::LaunchGraph {
+                portfolio_arn,
+                product_arn,
+                provisioning_artifact_id: artifact_id.clone(),
+                provisioning_principal_arn,
+                provisioned_product_arn: state
+                    .provisioned_products
+                    .get(&provisioned_product_id)
+                    .map(|provisioned| provisioned.arn.clone())
+                    .unwrap_or_default(),
+            };
+
             let plan_id = state.next_provisioned_product_plan_id();
             let plan = crate::state::ProvisionedProductPlan {
                 id: plan_id.clone(),
@@ -405,8 +442,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stack_name: crate::state::provisioned_product_stack_name(&provisioned_product_id),
                 template,
                 parameters: plan.provisioning_parameters.clone(),
-                tags: plan.tags.clone(),
+                // The stack Service Catalog deploys for a provisioned product carries more
+                // than the request's own `Tags`: the TagOptions the launch path inherits
+                // onto it and the tags recording the launch graph, which are the only
+                // machine-readable link from the deployed stack back to what produced it
+                // (`crate::state::launch_stack_tags`).
+                tags: crate::state::launch_stack_tags(
+                    &plan.tags,
+                    &offered_tag_options,
+                    &launch_graph,
+                ),
                 notification_arns: plan.notification_arns.clone(),
+                // The resource this change is planned for, which the call Service Catalog
+                // makes as its own service principal to plan it names.
+                provisioned_product_arn: launch_graph.provisioned_product_arn.clone(),
             };
             state
                 .provisioned_product_plans
@@ -431,10 +480,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is opened, no host name is resolved, and nothing this request carries — the
         // template the version names, the stack name, the parameters, the Region — can
         // make this process connect anywhere (`crate::state::in_process_cloudformation`).
-        let change_set = match crate::state::plan_change_set(ctx, &region, &planned).await {
-            Ok(id) => crate::state::PlanChangeSet::Created(id),
-            Err(reason) => crate::state::PlanChangeSet::Refused(reason),
-        };
+        let change_set =
+            match crate::state::plan_change_set(&*self.engine, ctx, &region, &planned).await {
+                Ok(id) => crate::state::PlanChangeSet::Created(id),
+                Err(reason) => crate::state::PlanChangeSet::Refused(reason),
+            };
         if let Some(plan) = state.lock().provisioned_product_plans.get_mut(&plan_id) {
             plan.change_set = Some(change_set);
         }

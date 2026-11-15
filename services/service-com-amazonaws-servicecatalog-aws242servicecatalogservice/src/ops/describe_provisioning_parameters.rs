@@ -355,7 +355,10 @@ fn resolve(
             .iter()
             .map(|constraint| constraint.summary())
             .collect(),
-        tag_options: tag_option_summaries(state, &path_id, &product.id),
+        // The ONE reading of a launch's TagOptions (`crate::state::launch_tag_options`),
+        // which is also the set `ProvisionProduct` applies to the stack it deploys: what a
+        // caller is offered here and what the deployed stack carries cannot disagree.
+        tag_options: crate::state::launch_tag_options(state, &path_id, &product.id),
         preferences: stack_set_preferences(&constraints),
     })
 }
@@ -392,72 +395,6 @@ fn resolve_path(
             _ => Err(crate::state::PATH_REQUIRED.to_string()),
         },
     }
-}
-
-/// "Information about the TagOptions associated with the resource": the TagOptions this
-/// launch offers, one entry per KEY, with the values the launch may use for it.
-///
-/// A launch is a product reached through a portfolio, so the TagOptions associated with
-/// EITHER of those two resources apply to it — the same stored associations
-/// `AssociateTagOptionWithResource` writes and `DescribeProduct`'s admin view reports.
-/// Only an ACTIVE TagOption is offered: `TagOptionDetail$Active` is what says whether a
-/// TagOption may be used, and `UpdateTagOption` is what sets it.
-///
-/// Where the two resources carry the same key, the values this launch may use are the
-/// ones they AGREE on, which is empty exactly when they agree on none: "if the output
-/// contains a TagOption key with an empty list of values, there is a TagOption conflict
-/// for that key", which this operation's own documentation describes as a conflict the
-/// end user cannot fix and which does not block the launch.
-fn tag_option_summaries(
-    state: &crate::state::ComAmazonawsServicecatalogAws242servicecatalogserviceState,
-    portfolio_id: &str,
-    product_id: &str,
-) -> Vec<TagOptionSummary> {
-    let portfolio_values = active_tag_option_values(state, portfolio_id);
-    let product_values = active_tag_option_values(state, product_id);
-    let mut keys: Vec<&String> = portfolio_values.keys().chain(product_values.keys()).collect();
-    keys.sort();
-    keys.dedup();
-    keys.into_iter()
-        .map(|key| {
-            let values = match (portfolio_values.get(key), product_values.get(key)) {
-                (Some(portfolio), Some(product)) => {
-                    portfolio.intersection(product).cloned().collect()
-                }
-                (Some(only), None) | (None, Some(only)) => only.iter().cloned().collect(),
-                // Unreachable: the key came from one of the two maps.
-                (None, None) => Vec::new(),
-            };
-            TagOptionSummary {
-                key: Some(key.clone()),
-                values: Some(values),
-            }
-        })
-        .collect()
-}
-
-/// The values the ACTIVE TagOptions associated with one resource offer, by TagOption
-/// key: a `BTreeMap` of `BTreeSet`s, so the keys and the values a launch reports are in
-/// one stable order whichever resource contributed them.
-fn active_tag_option_values(
-    state: &crate::state::ComAmazonawsServicecatalogAws242servicecatalogserviceState,
-    resource_id: &str,
-) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
-    let mut values: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
-        std::collections::BTreeMap::new();
-    for tag_option in state
-        .resource_tag_option_ids(resource_id)
-        .into_iter()
-        .flatten()
-        .filter_map(|id| state.tag_options.get(id))
-        .filter(|tag_option| tag_option.active)
-    {
-        values
-            .entry(tag_option.key.clone())
-            .or_default()
-            .insert(tag_option.value.clone());
-    }
-    values
 }
 
 /// "An object that contains information about preferences, such as Regions and

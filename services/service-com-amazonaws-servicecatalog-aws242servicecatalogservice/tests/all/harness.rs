@@ -74,6 +74,42 @@ pub(crate) fn emulator_with_template_services() -> MultiServiceRouter {
     router
 }
 
+/// One emulator carrying the services [`emulator_with_template_services`] mounts PLUS the
+/// account's identity records, all on the ONE shared engine, exactly as
+/// `core/router/src/lib.rs` mounts them.
+///
+/// WHO a request speaks for is a question about the account's identities, which IAM holds:
+/// a suite that asserts what a launch recorded about its caller must have those records
+/// there, so a request signed with a user's own access key resolves to that user.
+pub(crate) fn emulator_with_identity_services() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    // The harness signs nothing, so authentication is off for this router only.
+    router.set_request_authentication(false);
+    router.register_service(
+        service_com_amazonaws_servicecatalog_aws242servicecatalogservice::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_cloudformation_cloudformation::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
+    );
+    router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
+    router.register_service(
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
+    );
+    router
+}
+
+/// The access key id every call this harness makes presents unless a case picks another.
+pub(crate) const HARNESS_ACCESS_KEY_ID: &str = "AKIDTESTHARNESS";
+
 /// Drive one Amazon S3 request through the same router, as a client's own SDK sends it.
 pub(crate) async fn s3(
     router: &MultiServiceRouter,
@@ -138,6 +174,22 @@ pub(crate) async fn call_in(
     operation: &str,
     body: &Value,
 ) -> (u16, Value) {
+    call_signed_by(router, HARNESS_ACCESS_KEY_ID, region, operation, body).await
+}
+
+/// Send one awsJson1_1 request whose SigV4 credential scope presents `access_key_id`.
+///
+/// The one transport every call of this crate's suites goes through ([`call_in`] and
+/// [`call`] are this call with the harness's own key id): WHICH credential a request
+/// presents is what a service resolves its caller from, so a suite that drives two callers
+/// drives them through this.
+pub(crate) async fn call_signed_by(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = ::http::Request::builder()
         .method("POST")
         .uri("/")
@@ -146,7 +198,7 @@ pub(crate) async fn call_in(
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTHARNESS/20260101/{region}/servicecatalog/\
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{region}/servicecatalog/\
                  aws4_request, SignedHeaders=host;x-amz-target, Signature=0"
             ),
         )
