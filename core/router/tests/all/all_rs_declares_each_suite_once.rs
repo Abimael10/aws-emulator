@@ -153,7 +153,9 @@ fn unreachable_declarations(tests: &Path, declared: &[Declaration]) -> Vec<Strin
     reports
 }
 
-fn all_rs() -> String {
+/// This crate's declaration root, read from disk. A sibling suite checking another rule of
+/// the same file reads it from here rather than opening it again.
+pub(crate) fn all_rs() -> String {
     let path = tests_dir().join("all.rs");
     fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
 }

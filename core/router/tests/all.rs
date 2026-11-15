@@ -6853,3 +6853,23 @@ mod appended_notes;
 // (A run of notes about suites this file already declares once, and about why each lives in
 // this cross-service target, stood here. They are pruned: each suite's own module header
 // carries that, and this file has a 5,000-line ceiling.)
+//! pair, keeping the list sorted by name. `tests/all.rs` is a test-target CRATE ROOT, so a
+//! bare `mod` would resolve to a sibling of this file (`tests/<name>.rs`), which the layout
+//! check refuses: the `#[path]` is what points the module into `tests/all/`.
+//! The list below holds those pairs and NOTHING else — no prose between them, and none after
+//! them. A landing branch then has one place to insert, one line pair to insert there, and
+//! nothing to keep consistent; a note about a suite belongs in that suite's own file. Three
+//! rules make that the only safe shape, and each fails the whole target rather than one suite:
+//! * A suite no `mod` names compiles nowhere and its tests never run, and a suite left at
+//!   the top level of `tests/` fails the build.
+//! * A suite declared twice is `E0428`, which compiles neither copy.
+//! * This header is the only place an inner doc comment (`//!`) may stand: the language
+//!   accepts one only before the first item, so past the list's first declaration it is
+//!   `E0753`.
+//! `all/all_rs_declares_each_suite_once.rs`,
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check those rules — the first two for
+//! this file and for every service crate's `tests/all.rs` — so a rule they already pin
+//! wants no restatement here.
+#[path = "all/all_rs_is_a_canonical_declaration_list.rs"]
+mod all_rs_is_a_canonical_declaration_list;
