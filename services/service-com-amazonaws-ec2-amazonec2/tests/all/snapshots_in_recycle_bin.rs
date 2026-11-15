@@ -47,12 +47,9 @@
 //! rule through the `rbin` service that OWNS it, mounted on the same engine — exactly as the
 //! assembled emulator mounts them.
 
-use std::future::Future;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use service_com_amazonaws_ec2_amazonec2 as ec2;
-use service_com_amazonaws_rbin_amazonrecyclebin as rbin;
 
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, INVALID_SNAPSHOT_ID_MALFORMED,
@@ -62,6 +59,10 @@ use ec2::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::ec2_query::{call, element, elements, error_code, error_message, indexed, unescaped};
+use super::rbin_retention_rules::{
+    OTHER_REGION, RESOURCE_TYPE_SNAPSHOT, RESOURCE_TYPE_VOLUME, RetentionRule,
+    emulator_with_retention_rules, poll_until,
+};
 use super::volume_lifecycle::{REGION, p, zone_name};
 
 /// The HTTP status EC2 answers `DryRunOperation` with: the request was refused because a
@@ -72,16 +73,6 @@ const DRY_RUN_STATUS: u16 = 412;
 /// `RetentionPeriod` of the Recycle Bin rule that retained the snapshot, which is the `rbin`
 /// service's value rather than one this crate owns.
 const LONG_RETENTION: Duration = Duration::from_secs(3_600);
-
-/// How long a poll keeps looking for a condition before the suite gives up on it.
-///
-/// Far above every span this service owes, so a loaded or a slow host reaches the condition
-/// well inside it: the suite waits for the CONDITION and never for a fixed time, so its
-/// outcome does not depend on how fast the host runs.
-const POLL_DEADLINE: Duration = Duration::from_secs(60);
-
-/// How long a poll waits between two looks.
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// One row of the restore table: the case, the size of the volume the snapshot is taken of,
 /// whether that volume is encrypted, and the description and tags the snapshot carries.
@@ -100,26 +91,6 @@ async fn invoke(
     params: &[(String, String)],
 ) -> (u16, String) {
     call(router, REGION, action, params).await
-}
-
-/// Look again until `probe` answers `true`, or [`POLL_DEADLINE`] has passed — which is the
-/// suite's way of waiting for a condition instead of for a span.
-async fn poll_until<P, F>(case: &str, waiting_for: &str, mut probe: P)
-where
-    P: FnMut() -> F,
-    F: Future<Output = bool>,
-{
-    let started = Instant::now();
-    loop {
-        if probe().await {
-            return;
-        }
-        assert!(
-            started.elapsed() < POLL_DEADLINE,
-            "case {case:?}: gave up waiting for {waiting_for}"
-        );
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
 }
 
 /// Mint one volume of `size` GiB, encrypted or not, and answer its id — the volume the row's
@@ -684,16 +655,6 @@ async fn a_retention_period_with_no_representable_end_refuses_the_move() {
 // RULE 6: what a Recycle Bin retention rule does to a delete
 // =============================================================================
 
-/// The `ResourceType` values a retention rule may name.
-/// Source: `smithy_query(query="shape",shape="ResourceType")` on the `rbin` model — the same
-/// catalog [`rbin::state::RESOURCE_TYPE_EBS_SNAPSHOT`] names one member of.
-const RESOURCE_TYPE_SNAPSHOT: &str = "EBS_SNAPSHOT";
-const RESOURCE_TYPE_VOLUME: &str = "EBS_VOLUME";
-
-/// A Region whose endpoint is NOT the one the snapshot suites call, for the row about a rule
-/// another Region holds.
-const OTHER_REGION: &str = "us-east-1";
-
 /// One row of the retention table: the rule the account holds, the Region it was created in,
 /// the tags the deleted snapshot carries, and whether that rule retains the delete.
 struct RuleRow {
@@ -709,119 +670,23 @@ struct RuleRow {
     retained: bool,
 }
 
-/// Both services on ONE engine, which is what makes the `rbin` rules the rules this service's
-/// delete is decided by — exactly as the assembled emulator mounts them.
-fn emulator_with_retention_rules() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(ec2::EmulatedService::new(Arc::clone(&engine)));
-    router.register_service(rbin::EmulatedService::new(Arc::clone(&engine)));
-    (router, engine)
-}
-
-/// One `rbin` call signed for `region`, which is the Region the rule it creates exists in.
-async fn rbin_call(
-    router: &MultiServiceRouter,
-    region: &str,
-    method: &str,
-    path: &str,
-    body: Option<serde_json::Value>,
-) -> (u16, serde_json::Value) {
-    let payload = match &body {
-        Some(value) => bytes::Bytes::from(serde_json::to_vec(value).expect("a serializable body")),
-        None => bytes::Bytes::new(),
-    };
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!("https://rbin.{region}.amazonaws.com{path}"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEC2TEST/20260101/{region}/rbin/aws4_request, \
-                 SignedHeaders=host;x-amz-date, Signature=deadbeef"
-            ),
-        )
-        .header("content-type", "application/json")
-        .body(payload)
-        .expect("a well-formed test request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let bytes = response.into_body();
-    let parsed = if bytes.is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-            panic!(
-                "{method} {path} answered {status} with a non-JSON body ({error}): {}",
-                String::from_utf8_lossy(&bytes)
-            )
-        })
-    };
-    (status, parsed)
-}
-
-/// The resource tags of a row, as `CreateRule` takes them.
-fn resource_tags(tags: &[(&str, &str)]) -> serde_json::Value {
-    serde_json::Value::Array(
-        tags.iter()
-            .map(|(key, value)| {
-                serde_json::json!({ "ResourceTagKey": key, "ResourceTagValue": value })
-            })
-            .collect(),
-    )
-}
-
 /// Create the row's retention rule through the service that OWNS retention rules, wait until
-/// it is in the one state that retains anything, and answer its identifier.
+/// it is in the one state that retains anything, and answer its identifier — both through the
+/// cross-service harness every suite about a retention rule shares
+/// ([`super::rbin_retention_rules`]).
 async fn create_available_rule(router: &MultiServiceRouter, row: &RuleRow) -> String {
-    let case = row.case;
-    let mut body = serde_json::json!({
-        "ResourceType": row.resource_type,
-        "RetentionPeriod": {
-            "RetentionPeriodValue": row.retention_days,
-            "RetentionPeriodUnit": "DAYS",
+    super::rbin_retention_rules::create_available_rule(
+        router,
+        row.case,
+        &RetentionRule {
+            resource_type: row.resource_type,
+            retention_days: row.retention_days,
+            resource_tags: row.resource_tags,
+            exclude_resource_tags: row.exclude_resource_tags,
+            region: row.rule_region,
         },
-    });
-    if !row.resource_tags.is_empty() {
-        body["ResourceTags"] = resource_tags(row.resource_tags);
-    }
-    if !row.exclude_resource_tags.is_empty() {
-        body["ExcludeResourceTags"] = resource_tags(row.exclude_resource_tags);
-    }
-    let (status, answer) = rbin_call(router, row.rule_region, "POST", "/rules", Some(body)).await;
-    assert!(
-        (200..300).contains(&status),
-        "case {case:?}: expected the retention rule to be created, got {status} with {answer}"
-    );
-    let identifier = answer
-        .get("Identifier")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_else(|| panic!("case {case:?}: no Identifier in {answer}"))
-        .to_string();
-
-    // "Only retention rules that are in the `available` state retain resources"
-    // (`CreateRuleResponse$Status`), and a freshly created rule starts out `pending`: the
-    // suite waits for the state the rule reports rather than for a span.
-    let rule_region = row.rule_region;
-    let probe_identifier = identifier.clone();
-    poll_until(case, "the retention rule to become available", || {
-        let probe_identifier = probe_identifier.clone();
-        async move {
-            let (status, answer) = rbin_call(
-                router,
-                rule_region,
-                "GET",
-                &format!("/rules/{probe_identifier}"),
-                None,
-            )
-            .await;
-            status == 200
-                && answer.get("Status").and_then(serde_json::Value::as_str) == Some("available")
-        }
-    })
-    .await;
-    identifier
+    )
+    .await
 }
 
 /// `ListSnapshotsInRecycleBin` with `params`: the HTTP status and the body.

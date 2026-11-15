@@ -1980,7 +1980,10 @@ pub use snapshot_recycle_bin::{
 // The RETENTION RULES a delete of an EBS resource is decided by, which are the `rbin`
 // service's resources and are read out of that service's own store.
 mod recycle_bin_rules;
-pub use recycle_bin_rules::{RECYCLE_BIN_RESOURCE_TYPE_SNAPSHOT, recycle_bin_retention_period};
+pub use recycle_bin_rules::{
+    RECYCLE_BIN_RESOURCE_TYPE_SNAPSHOT, RECYCLE_BIN_RESOURCE_TYPE_VOLUME,
+    recycle_bin_retention_period,
+};
 
 /// The account's KEY PAIRS: the record one is stored as, the bounds a create holds a
 /// request to, the quota and name refusals EC2 answers about one, and the one writer that

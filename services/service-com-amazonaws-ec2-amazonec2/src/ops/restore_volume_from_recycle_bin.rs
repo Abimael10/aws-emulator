@@ -13,11 +13,10 @@
 //!
 //! Which volumes the bin holds, and the permanent deletion the clock owes each one at the
 //! end of its retention period, are [`crate::state`]'s — see its "Recycle Bin" module
-//! docs. Nothing in this service's implemented surface puts a volume IN the bin: a deleted
-//! resource is retained only when a Recycle Bin retention rule covers it, retention rules
-//! are the `rbin` service's resources rather than EC2's, and `DeleteVolume` — which has no
-//! rule of its own to find, so it deletes permanently — is the operation that will consult
-//! one.
+//! docs. What puts a volume IN the bin is a `DeleteVolume` a Recycle Bin retention rule
+//! covers: retention rules are the `rbin` service's resources rather than EC2's, and that
+//! delete asks them through [`crate::state::recycle_bin_retention_period`] — so a delete no
+//! rule covers is a permanent one and leaves this operation nothing to restore.
 //!
 //! ## Shape of an operation
 //!

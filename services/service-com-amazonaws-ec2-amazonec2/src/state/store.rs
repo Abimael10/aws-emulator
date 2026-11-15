@@ -2762,11 +2762,10 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// covers it ([`Self::move_volume_to_recycle_bin`]), and leaves it when it is restored
     /// (`RestoreVolumeFromRecycleBin`, through [`Self::restore_recycled_volume`]) or when
     /// its retention period runs out — a permanent deletion the CLOCK owes, applied by
-    /// [`Self::materialize_due_transitions`]. Nothing in this service's implemented surface
-    /// puts a volume IN the bin: a deleted resource is retained only when a Recycle Bin
-    /// retention rule covers it, retention rules are the `rbin` service's resources, and
-    /// `DeleteVolume` — which has no rule of its own to find, so it deletes permanently — is
-    /// the operation that will consult one.
+    /// [`Self::materialize_due_transitions`]. `DeleteVolume` is the operation that consults
+    /// those rules — they are the `rbin` service's resources, read through
+    /// [`crate::state::recycle_bin_retention_period`] — so a delete no rule covers is still a
+    /// permanent one and puts nothing here.
     pub volumes_in_recycle_bin: BTreeMap<String, RecycledVolumeRecord>,
     /// Every AMI usage report the account holds, by `ReportId`, as the modelled
     /// [`ImageUsageReport`] shape the describe reports. `CreateImageUsageReport` is the

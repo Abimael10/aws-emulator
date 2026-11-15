@@ -1345,6 +1345,13 @@ mod security_group_filter_limits;
 mod security_groups;
 #[path = "all/snapshot_block_public_access.rs"]
 mod snapshot_block_public_access;
+// The cross-service harness every suite about a Recycle Bin retention rule shares: both
+// services on one engine, and the rule creation and deletion a case is set up with. Declared
+// beside the suites that drive it rather than in sorted position, for the reason the note at
+// the head of this file gives: a landing inserts its two lines where the neighbourhood it
+// belongs to already stands.
+#[path = "all/rbin_retention_rules.rs"]
+mod rbin_retention_rules;
 // `RestoreSnapshotFromRecycleBin`: what the snapshot Recycle Bin gives back, and what it
 // refuses.
 #[path = "all/snapshots_in_recycle_bin.rs"]
@@ -1411,6 +1418,12 @@ mod volume_modifications;
 // volumes, and how `VolumeIds`, the filters and the page size narrow it.
 #[path = "all/volume_status.rs"]
 mod volume_status;
+// What a Recycle Bin RETENTION RULE does to `DeleteVolume`: which deletes it retains, for how
+// long, and which ones stay permanent. Driven through both services' own wires. Declared
+// beside the other volume suites rather than in sorted position, for the reason the note at
+// the head of this file gives.
+#[path = "all/volume_retention_rules.rs"]
+mod volume_retention_rules;
 // `RestoreVolumeFromRecycleBin`: what the bin gives back, and what it refuses.
 #[path = "all/volumes_in_recycle_bin.rs"]
 mod volumes_in_recycle_bin;

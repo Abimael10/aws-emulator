@@ -37,8 +37,8 @@ use ::service_com_amazonaws_rbin_amazonrecyclebin::ops::types::{
     RETENTION_PERIOD_UNIT_VALUES, ResourceTag, RetentionPeriod,
 };
 use ::service_com_amazonaws_rbin_amazonrecyclebin::state::{
-    self as rbin_store, RESOURCE_TYPE_EBS_SNAPSHOT, RULE_STATUS_AVAILABLE, RULE_STATUS_PENDING,
-    Rule, SECONDS_PER_DAY,
+    self as rbin_store, RESOURCE_TYPE_EBS_SNAPSHOT, RESOURCE_TYPE_EBS_VOLUME,
+    RULE_STATUS_AVAILABLE, RULE_STATUS_PENDING, Rule, SECONDS_PER_DAY,
 };
 
 use crate::ops::types::Tag;
@@ -48,6 +48,12 @@ use crate::ops::types::Tag;
 /// [`recycle_bin_retention_period`] names the type through the other service's own catalog
 /// rather than a word of its own.
 pub const RECYCLE_BIN_RESOURCE_TYPE_SNAPSHOT: &str = RESOURCE_TYPE_EBS_SNAPSHOT;
+
+/// The `ResourceType` a retention rule names to retain deleted EBS VOLUMES (`rbin`'s
+/// `ResourceType` enum), under this crate's own name for it — the sibling of
+/// [`RECYCLE_BIN_RESOURCE_TYPE_SNAPSHOT`], so `DeleteVolume` asks about the type the other
+/// service's own catalog names rather than a word of its own.
+pub const RECYCLE_BIN_RESOURCE_TYPE_VOLUME: &str = RESOURCE_TYPE_EBS_VOLUME;
 
 /// The seconds one day of a retention period holds, as the service that owns retention rules
 /// counts a day ([`SECONDS_PER_DAY`]): "the unit of time in which the retention period is

@@ -3,7 +3,11 @@
 //! @op DeleteVolume
 //! IMPLEMENTED: removes a stored EBS volume once no instance holds an attachment of it, so
 //! every later read of that id — `DescribeVolumes` above all — answers
-//! `InvalidVolume.NotFound` rather than reporting a volume that is no longer there.
+//! `InvalidVolume.NotFound` rather than reporting a volume that is no longer there. Unless a
+//! Recycle Bin retention rule covers the delete, in which case the volume is RETAINED in the
+//! bin for that rule's retention period instead of being permanently deleted — the rules are
+//! the `rbin` service's own resources, read through
+//! [`crate::state::recycle_bin_retention_period`].
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -57,6 +61,8 @@
 //!   required permissions, the error response is DryRunOperation. Otherwise, it is
 //!   UnauthorizedOperation.
 //! * `VolumeId` (VolumeId) **required** — The ID of the volume.
+
+use std::time::SystemTime;
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -149,14 +155,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
             dry_run_operation, incorrect_state_of, internal_error,
-            invalid_volume_id_not_found, require_readable_volume_id, require_service_state,
-            volume_in_use, VolumeRecord,
+            invalid_volume_id_not_found, recycle_bin_retention_period, request_region,
+            require_readable_volume_id, require_service_state, volume_in_use,
+            volume_limit_exceeded, RECYCLE_BIN_RESOURCE_TYPE_VOLUME, VolumeRecord,
         };
 
-        // A volume carries its own Availability Zone and is named by id, so nothing here
-        // depends on the Region the request was signed for; the store is reached through the
-        // engine held on `self`.
-        let _ = ctx;
+        // A volume carries its own Availability Zone and is named by id, so WHICH volume this
+        // deletes does not depend on the Region the request was signed for; the Region is read
+        // only to find the Recycle Bin retention rules in force, which exist in one Region
+        // each. The store is reached through the engine held on `self`.
+        let region = request_region(ctx.parts());
 
         let state_handle = require_service_state(&*self.engine)?;
         let mut store = state_handle.lock();
@@ -182,6 +190,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // attachments, so a detach the clock already finished is applied before it is asked:
         // the move was due at that instant whether or not anybody called.
         record.materialize_due_detachments(now);
+
+        // The tags the volume carries, read off the record while it is resolved: they are what
+        // the tag filters of a Recycle Bin retention rule are matched against below, and the
+        // record is the one place that holds them, so they are taken here rather than looked
+        // up a second time.
+        let tags = record.view.tags.clone().unwrap_or_default();
 
         // "The volume must be in the available state (not attached to an instance)"
         // (`DeleteVolume`) — so an attachment the volume still holds refuses the delete, and
@@ -220,6 +234,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Nothing has been removed yet, and nothing is.
         if input.dry_run.unwrap_or(false) {
             return Err(dry_run_operation());
+        }
+
+        // Unless the volume is RETAINED instead of deleted: "resources (of the specified type)
+        // that have at least one of these tag key and value pairs are automatically retained in
+        // the Recycle Bin upon deletion", and a Region-level rule "retains all deleted
+        // resources of the specified resource type in the Region in which the rule is created,
+        // even if the resources are not tagged" (`rbin`'s `CreateRuleRequest$ResourceTags`). So
+        // a delete asks the retention rules of the Region it was signed for — the `rbin`
+        // service's own resources, read through [`recycle_bin_retention_period`] — and a
+        // covered volume MOVES into the bin for that rule's retention period rather than being
+        // permanently deleted: it stops being one of the account's volumes, which is what this
+        // delete reports, and `RestoreVolumeFromRecycleBin` can take it back until the
+        // retention period runs out.
+        //
+        // ONE reading of the moment this delete runs at: the rules in force are the rules as of
+        // it, and the two instants the Recycle Bin entry reports are read off the same moment,
+        // so a retained volume's retention period cannot start before the rule that retained it
+        // was consulted.
+        let now_wall = SystemTime::now();
+        if let Some(retention) = recycle_bin_retention_period(
+            &*self.engine,
+            &region,
+            RECYCLE_BIN_RESOURCE_TYPE_VOLUME,
+            &tags,
+            now_wall,
+        ) {
+            // The bin is bounded like every other store here, and the question is asked BEFORE
+            // the volume leaves this store, so a delete that cannot be retained refuses rather
+            // than permanently deleting a volume a rule says to keep. The ceiling is this
+            // emulator's, not an AWS quota, and a volume the Recycle Bin holds still counts
+            // against the account's stored volumes — so the refusal is the quota code EC2
+            // answers for the volumes an account holds, which is the closest thing the service
+            // models to "no room for another stored volume". (`move_volume_to_recycle_bin` asks
+            // the same question again for itself, so no path can get past the ceiling by
+            // forgetting to.)
+            if !store.has_volume_recycle_bin_capacity() {
+                return Err(volume_limit_exceeded(
+                    "the Recycle Bin holds as many retained volumes as this emulator stores",
+                ));
+            }
+            if store
+                .move_volume_to_recycle_bin(&input.volume_id, now_wall, retention)
+                .is_none()
+            {
+                return Err(internal_error(
+                    "the volume checked a moment ago could not be retained in the Recycle Bin",
+                ));
+            }
+            return Ok(DeleteVolumeOutput);
         }
 
         // `remove_volume` is what takes the client token that minted the volume and the

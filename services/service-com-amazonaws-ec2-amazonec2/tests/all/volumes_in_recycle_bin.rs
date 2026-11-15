@@ -28,12 +28,12 @@
 //! in, whether it carries tags and whether it is encrypted, and which way an id can fail to
 //! name an entry — so no row is the specification.
 //!
-//! Nothing in this service's implemented surface puts a volume INTO the Recycle Bin: a
-//! deleted resource is retained only when a Recycle Bin retention rule covers it, and
-//! retention rules are the `rbin` service's resources rather than EC2's, so `DeleteVolume`
-//! has no rule of its own to find and its delete is permanent. These suites therefore retain
-//! a volume the way a covered delete will, by calling the state primitive the bin is written
-//! through
+//! What puts a volume INTO the Recycle Bin is a `DeleteVolume` a retention rule covers —
+//! retention rules are the `rbin` service's resources rather than EC2's, and
+//! [`super::volume_retention_rules`] is the suite that drives that whole path, through both
+//! services' own wires. The suites here are about the RESTORE alone, so each of them retains
+//! a volume the way that covered delete does, by calling the state primitive the bin is
+//! written through
 //! ([`Ec2State::move_volume_to_recycle_bin`]) — the same seam the other suites in this
 //! crate seed a store through.
 
@@ -608,8 +608,9 @@ async fn a_retention_period_that_has_run_out_deletes_the_volume_permanently() {
 /// and the byte budget is unchanged — every fallible step of the move is taken before its
 /// first mutation.
 ///
-/// Driven through the state primitive, because no retention rule this service can see
-/// carries a period onto this path: `DeleteVolume` has none of its own to find.
+/// Driven through the state primitive, because no retention rule carries a period onto this
+/// path: a rule's period is bounded by `RetentionPeriod$RetentionPeriodValue`'s own
+/// `@range(min: 1, max: 3650)`, so a delete can never ask for one this long.
 #[tokio::test]
 async fn a_retention_period_with_no_representable_end_refuses_the_move() {
     let (router, engine) = super::ec2_query::emulator();

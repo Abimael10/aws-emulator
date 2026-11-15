@@ -1789,3 +1789,15 @@ mod cloudtrail_iam_credential_write_audit;
 // Four suites of this target check the rules above rather than restating them:
 // the test it explains and cannot collide with a concurrent landing. A note about this
 // file itself belongs in `all/appended_notes.rs`, declared below like any other module.
+// Single integration-test target for the router: the canonical DECLARATION LIST.
+// per suite file under `tests/all/`, sorted strictly by name, and no other line. A landing
+// therefore inserts two lines in one place and has no prose here to duplicate, re-word or
+// deliberate: an inner doc comment (`//!`) is legal only before the first item, so a copy of
+// this header appended past the declarations is `E0753` and compiles no suite of this target.
+// With no `//!` anywhere, no merge of two landings can leave one past the first item.
+// A suite file no `mod` here names compiles nowhere and its tests never run (the crate's
+// build-time layout check fails the build for it); a suite left at the top level of `tests/`
+// fails the build; and a second `mod` for one name is `E0428`, which compiles neither copy.
+// this file: the `#[path]` is what points each declaration into `tests/all/`.
+// the test it explains; `all/appended_notes.rs` keeps the notes landings had appended here.
+// Three suites of this target pin the shape above rather than restating it:
