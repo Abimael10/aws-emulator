@@ -395,6 +395,8 @@ mod parameter_set_contract;
 mod pass_role_authorization;
 #[path = "all/processing_pipeline_stack_outputs.rs"]
 mod processing_pipeline_stack_outputs;
+#[path = "all/protected_resource_blocked_teardown_still_purges.rs"]
+mod protected_resource_blocked_teardown_still_purges;
 #[path = "all/provider_answer_follow_up.rs"]
 mod provider_answer_follow_up;
 #[path = "all/provisioned_ecr_repository.rs"]

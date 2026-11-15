@@ -3381,7 +3381,93 @@ pub async fn delete(
     resources: &[StoredResource],
     walk: &Teardown<'_>,
 ) -> Deleted {
-    delete_pass(ctx, region, resources, walk, &mut BTreeSet::new()).await
+    let mut outcome = delete_pass(ctx, region, resources, walk, &mut BTreeSet::new()).await;
+    settle_accepted_removals(ctx, region, &mut outcome).await;
+    outcome
+}
+
+/// How many times a teardown whose own FAILURE ends the stack operation asks the owning
+/// services whether the removals it had already accepted have been carried out.
+///
+/// A refusal CONCLUDES the operation — the stack takes its failed status on the spot — and
+/// the waits a teardown leaves behind ([`Deleted::removing`]) are released by an operation
+/// that is still in flight, which a concluded one is not. So a walk that is about to report a
+/// failure asks those services itself. The bound is generous, for the reason
+/// [`UNWIND_ATTEMPTS`] is: together with [`ACCEPTED_REMOVAL_RETRY_DELAY`] it has to outlast
+/// the spans the services of this emulator take to carry a removal out, or a resource one of
+/// them was about to let go of would be reported as one it still holds.
+const ACCEPTED_REMOVAL_ATTEMPTS: usize = 40;
+
+/// How long that wait leaves between asks. Chosen: short enough that the removals a teardown
+/// accepted are noticed as soon as they land, rather than one span after.
+const ACCEPTED_REMOVAL_RETRY_DELAY: ::std::time::Duration =
+    ::std::time::Duration::from_millis(100);
+
+/// Carry out the removals a teardown that FAILED had already accepted, before the failure it
+/// is about to report concludes the operation.
+///
+/// CloudFormation reports a resource `DELETE_COMPLETE` only once the service that owns it no
+/// longer holds it, and it does not report an operation finished — completed or failed —
+/// while a resource it deleted is still there. A teardown that goes through holds to that
+/// through the waits it leaves behind ([`Deleted::removing`], released by
+/// [`outstanding_teardown`] as the operation goes on); one whose own refusal ends the
+/// operation has no such later pass, so the answers are read here, from the owning services'
+/// own reads ([`super::provisioner::Provisioner::removal`]) and never a span this crate
+/// assumed. Every resource reported gone loses its wait: the stack's failure then reports a
+/// deletion that really happened.
+///
+/// Nothing is waited for where the walk has no failure to report, where it accepted no
+/// removal, or where the only waits left are a CUSTOM RESOURCE's — what ends one of those is
+/// the answer its provider PUTs to the request, which no read of this crate's can bring
+/// forward. A removal an owning service has not carried out inside the bound keeps its wait,
+/// exactly as it would without this pass.
+async fn settle_accepted_removals(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    outcome: &mut Deleted,
+) {
+    if outcome.failure.is_none() {
+        return;
+    }
+    for attempt in 0..ACCEPTED_REMOVAL_ATTEMPTS {
+        if !outcome.removing.iter().any(answered_by_a_read) {
+            return;
+        }
+        if attempt > 0 {
+            ::tokio::time::sleep(ACCEPTED_REMOVAL_RETRY_DELAY).await;
+        }
+        let mut still_removing: Vec<Stabilising> = Vec::new();
+        for pending in ::std::mem::take(&mut outcome.removing) {
+            if !answered_by_a_read(&pending) {
+                still_removing.push(pending);
+                continue;
+            }
+            let gone = match owner_for(&pending.resource_type) {
+                // BOXED, for the reason the walk's own calls are: the read is the owning
+                // service's whole handler.
+                Some(provisioner) => matches!(
+                    Box::pin(provisioner.removal(ctx, region, &pending.physical_resource_id))
+                        .await,
+                    Ok(Removal::Gone)
+                ),
+                // No service of this emulator owns the type, so no read will ever answer
+                // for it: there is nothing left holding the resource and nothing to wait
+                // for.
+                None => true,
+            };
+            if !gone {
+                still_removing.push(pending);
+            }
+        }
+        outcome.removing = still_removing;
+    }
+}
+
+/// Whether what ends this wait is a READ of the service that owns the resource — which is
+/// every resource but a CUSTOM RESOURCE, whose wait is the answer its own provider owes the
+/// request it was sent ([`custom_resource`]).
+fn answered_by_a_read(pending: &Stabilising) -> bool {
+    pending.awaited == super::stabilising::Awaited::Gone && pending.provider_request.is_none()
 }
 
 /// What one teardown walk is judged by, beside the resources it is walking: the records the
@@ -4124,6 +4210,9 @@ pub async fn unwind(
         removing.append(&mut outcome.removing);
         outcome.removing = removing;
     }
+    // The last attempt's refusal is the rollback's own failure, which concludes the
+    // operation: the removals these passes accepted are carried out before it does.
+    settle_accepted_removals(ctx, region, &mut outcome).await;
     outcome
 }
 

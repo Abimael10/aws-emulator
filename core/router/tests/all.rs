@@ -1542,3 +1542,5 @@ mod cloudformation_generated_table_name_resolves_in_dynamodb;
 // is a note rather than a build failure.
 #[path = "all/all_rs_carries_one_header_block.rs"]
 mod all_rs_carries_one_header_block;
+// here to duplicate, re-word or mistype.
+// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` pin every rule
