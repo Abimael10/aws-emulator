@@ -1105,18 +1105,17 @@ async fn a_job_with_no_name_anywhere_is_refused() {
 }
 
 #[tokio::test]
-async fn a_yaml_template_needs_a_name_override() {
+async fn a_yaml_templates_name_is_read_the_way_a_json_templates_is() {
     let emulator = Emulator::new();
     let farm_id = emulator.farm("yaml").await;
     let queue_id = emulator.queue(&farm_id, "yaml").await;
     let path = format!("/2023-10-12/farms/{farm_id}/queues/{queue_id}/jobs");
 
-    // The rule: a job's name comes from `nameOverride`, else from the template — and a
-    // YAML template cannot be read in this build (no YAML parser), so the one case that
-    // would need that read answers the scaffold's 501 rather than inventing a name or
-    // refusing a request the real service accepts. Every other YAML case works. The rows
-    // differ along what names the job: nothing, an override, and a source job.
-    let (status, body) = emulator
+    // The rule: a job's name comes from `nameOverride`, else from the name its template
+    // declares, read with the parser `templateType` names — `JSON` or `YAML`, the two
+    // languages `JobTemplateType` spells. The rows differ along what names the job: the
+    // template itself, an override, and a source job.
+    let (status, created) = emulator
         .post(
             &path,
             json!({
@@ -1127,18 +1126,20 @@ async fn a_yaml_template_needs_a_name_override() {
         )
         .await;
     assert_eq!(
-        status, 501,
-        "a YAML template with no nameOverride: expected the scaffold's 501, got {status} \
-         with {body}"
+        status, 201,
+        "a YAML template with no nameOverride: expected 201, got {status} with {created}"
     );
+    let from_template = id_of(&created, "jobId");
+    let (status, job) = emulator.get(&format!("{path}/{from_template}")).await;
+    assert_eq!(status, 200, "GetJob: expected 200, got {status} with {job}");
     assert_eq!(
-        error_code(&body),
-        "NotImplemented",
-        "a YAML template with no nameOverride: expected NotImplemented, got {body}"
+        string_at(&job, "name"),
+        "named-in-the-template",
+        "a YAML template with no nameOverride: expected the template's own name, got {job}"
     );
 
-    // With a name in the request, the YAML template needs no reading: the job is created
-    // and the template is stored as given.
+    // With a name in the request, the override is what names the job, exactly as it does
+    // for a JSON template.
     let (status, created) = emulator
         .post(
             &path,
@@ -1163,8 +1164,26 @@ async fn a_yaml_template_needs_a_name_override() {
         "expected the overridden name, got {job}"
     );
 
-    // And a job copied from that one inherits its stored name, so no template is read for
-    // it either.
+    // A YAML document that is not YAML is refused the way a JSON one that is not JSON is.
+    let (status, body) = emulator
+        .post(
+            &path,
+            json!({
+                "priority": 50,
+                "template": "name: 'unterminated\n",
+                "templateType": "YAML",
+            }),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&body)),
+        (400, "ValidationException".to_string()),
+        "a template that isn't the YAML it said it was: expected a 400, got {status} with \
+         {body}"
+    );
+
+    // And a job copied from a YAML-templated job inherits its stored name, so no template
+    // is read for it at all.
     let (status, copied) = emulator
         .post(&path, json!({"priority": 50, "sourceJobId": job_id}))
         .await;

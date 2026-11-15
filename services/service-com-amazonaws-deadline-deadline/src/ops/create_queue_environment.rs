@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateQueueEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateQueueEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateQueueEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an environment under a queue and persists it there under the
+//! `queueEnvironmentId` it mints, named by the template the request carried.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +155,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateQueueEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateQueueEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // FIRST, with no lock held and before the store is even reached: read the name out
+        // of the caller's template, in the language `templateType` names. Parsing is the
+        // one step whose cost a caller controls, so it must not run while every other
+        // request of this service is waiting on the shared store lock.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateQueueEnvironment"))
+        // A queue environment's `name` is `@required` on every read of it and no member of
+        // this request carries it, so the template is where it comes from: a document that
+        // is not the language it said it was earns the modeled 400 for an unparseable
+        // payload, and one that parses but names no environment is refused too rather than
+        // stored as an environment no read could report.
+        let declared =
+            crate::state::environment_template_name(&input.template, &input.template_type)
+                .map_err(|message| {
+                    CreateQueueEnvironmentError::from(
+                        CreateQueueEnvironmentErrorModeled::ValidationException(
+                            crate::state::cannot_parse("template", &message),
+                        ),
+                    )
+                })?;
+        // `EnvironmentName` is a name: a template that declares an empty one has declared
+        // nothing.
+        let Some(name) = declared.filter(|name| !name.is_empty()) else {
+            return Err(CreateQueueEnvironmentErrorModeled::ValidationException(
+                crate::state::environment_template_unnamed(),
+            )
+            .into());
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateQueueEnvironmentErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // An environment lives under a queue of a farm: either one missing is a 404 and
+        // nothing is created.
+        if store.farm(&input.farm_id).is_none() {
+            return Err(CreateQueueEnvironmentErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+        if store.queue(&input.farm_id, &input.queue_id).is_none() {
+            return Err(CreateQueueEnvironmentErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+            )
+            .into());
+        }
+
+        // `clientToken` is `@idempotencyToken`: a retry of the same create must answer
+        // with the environment the first call made, not make a second one.
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, &input.queue_id, token));
+        if let Some(key) = token.as_deref() {
+            if let Some(queue_environment_id) = store.remembered_resource(key).map(str::to_string) {
+                if store
+                    .queue_environment(&input.farm_id, &input.queue_id, &queue_environment_id)
+                    .is_some()
+                {
+                    return Ok(CreateQueueEnvironmentOutput {
+                        queue_environment_id,
+                    });
+                }
+            }
+        }
+
+        // A queue holds at most this many environments, and the stored templates share one
+        // byte budget with the job templates: each one is a caller-driven insert that only
+        // a delete releases, so both the count and the bytes are bounded.
+        if store
+            .queue(&input.farm_id, &input.queue_id)
+            .is_some_and(|queue| {
+                queue.environments.len() >= crate::state::MAX_ENVIRONMENTS_PER_QUEUE
+            })
+        {
+            return Err(
+                CreateQueueEnvironmentErrorModeled::ServiceQuotaExceededException(
+                    crate::state::quota_exceeded(
+                        crate::state::RESOURCE_TYPE_ENVIRONMENT,
+                        "You exceeded the number of queue environments this emulator stores \
+                         for one queue. Delete an environment and try again.",
+                    ),
+                )
+                .into(),
+            );
+        }
+        let template_bytes = input.template.len();
+        if !store.template_bytes_fit(template_bytes) {
+            return Err(
+                CreateQueueEnvironmentErrorModeled::ServiceQuotaExceededException(
+                    crate::state::quota_exceeded(
+                        crate::state::RESOURCE_TYPE_ENVIRONMENT,
+                        "You exceeded the total template size this emulator stores. Delete a \
+                         queue environment or a job and try again.",
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let queue_environment_id = store.mint_id("queueenv");
+        let environment = crate::state::QueueEnvironment {
+            queue_environment_id: queue_environment_id.clone(),
+            queue_id: input.queue_id.clone(),
+            farm_id: input.farm_id.clone(),
+            name,
+            priority: input.priority,
+            template_type: input.template_type,
+            template: input.template,
+            created_at: ::std::time::SystemTime::now(),
+            created_by: crate::state::caller_principal(ctx),
+            updated_at: None,
+            updated_by: None,
+        };
+
+        let Some(queue) = store.queue_mut(&input.farm_id, &input.queue_id) else {
+            return Err(CreateQueueEnvironmentErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+            )
+            .into());
+        };
+        queue
+            .environments
+            .insert(queue_environment_id.clone(), environment);
+        store.charge_template_bytes(template_bytes);
+        if let Some(key) = token {
+            store.remember_resource(key, &queue_environment_id);
+        }
+
+        Ok(CreateQueueEnvironmentOutput {
+            queue_environment_id,
+        })
     }
 }

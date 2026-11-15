@@ -181,6 +181,20 @@ async fn create_legal_hold(router: &MultiServiceRouter, request: &Value) -> (u16
     call(router, "POST", "/legal-holds", Some(&request.to_string())).await
 }
 
+/// How far apart two readings of ONE instant may be and still be that instant.
+///
+/// A `DateRange` bound is a caller-supplied instant carried over the wire as
+/// fractional epoch seconds, so what comes back is an `f64` built from the same
+/// nanoseconds rather than the identical bit pattern: at an epoch of ~1.8e9 the
+/// last representable step of an `f64` second is already a fraction of a
+/// microsecond, so comparing the two for EXACT equality fails or passes
+/// according to the nanoseconds the clock happened to read. A millisecond is far
+/// below anything this range selects on (`legal_hold_date_range.rs` pins the
+/// boundaries at millisecond resolution) and far above that representation
+/// step, so it separates "the same instant" from "a rewritten one" without
+/// depending on chance.
+const SAME_INSTANT: f64 = 1e-3;
+
 /// A recovery-point selection with every timestamp of its `DateRange` read as
 /// the fractional epoch seconds the protocol serialises one as, so a comparison
 /// is about the INSTANT rather than about whether the number was written with a
@@ -199,6 +213,16 @@ fn selection_instants(selection: Option<&Value>) -> (Option<&Value>, Vec<Option<
     (names, bounds)
 }
 
+/// Whether two readings of one `DateRange` bound are the same instant: both
+/// absent, or both present within [`SAME_INSTANT`] of each other.
+fn same_bound(sent: Option<f64>, answered: Option<f64>) -> bool {
+    match (sent, answered) {
+        (None, None) => true,
+        (Some(sent), Some(answered)) => (sent - answered).abs() <= SAME_INSTANT,
+        _ => false,
+    }
+}
+
 /// Whether `answered` reports the selection `sent` was created with: the vault
 /// names as sent, the resource identifiers as sent, and each `DateRange` bound
 /// at the same instant.
@@ -208,8 +232,15 @@ fn reports_the_selection(sent: Option<&Value>, answered: Option<&Value>) -> bool
             .and_then(|selection| selection.get("ResourceIdentifiers"))
             .cloned()
     };
+    let (sent_names, sent_bounds) = selection_instants(sent);
+    let (answered_names, answered_bounds) = selection_instants(answered);
     identifiers(sent) == identifiers(answered)
-        && selection_instants(sent) == selection_instants(answered)
+        && sent_names == answered_names
+        && sent_bounds.len() == answered_bounds.len()
+        && sent_bounds
+            .into_iter()
+            .zip(answered_bounds)
+            .all(|(sent, answered)| same_bound(sent, answered))
 }
 
 /// The one entry the account's listing reports, with the case named when it

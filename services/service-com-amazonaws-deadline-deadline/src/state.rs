@@ -14,6 +14,14 @@ use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
+/// Reading a name out of the template a request carried, in the language it named.
+mod templates;
+pub use templates::*;
+
+/// The queue environments a queue holds, and how this service names and refuses one.
+mod queue_environments;
+pub use queue_environments::*;
+
 /// `QueueStatus` value a freshly created queue carries.
 ///
 /// From `smithy_query(query="shape", shape="QueueStatus")`: `IDLE`, `SCHEDULING`,
@@ -261,12 +269,15 @@ pub const MAX_LIMITS_PER_FARM: usize = 500;
 /// what refuses it.
 pub const FORBIDDEN_MAX_COUNT: i32 = 0;
 
-/// How many bytes of job templates this emulator stores at once.
+/// How many bytes of caller-supplied templates this emulator stores at once.
 ///
 /// A job template is the one request member that can be a megabyte on its own
 /// (`JobTemplate, len 1..1000000`), and `sourceJobId` lets a small request store another
-/// copy of one, so the templates are budgeted by BYTE as well as by count. The budget is
-/// released when the jobs holding those bytes are deleted.
+/// copy of one, so the templates are budgeted by BYTE as well as by count. A queue
+/// environment's template (`EnvironmentTemplate, len 1..15000`) is charged to the same
+/// budget, so the product of the per-level counts cannot hold more template text than this
+/// however it is spread. The budget is released when the resources holding those bytes are
+/// deleted.
 pub const MAX_STORED_TEMPLATE_BYTES: usize = 8 * 1024 * 1024;
 
 /// `quotaCode` this service reports when a create would pass one of those bounds.
@@ -710,6 +721,11 @@ pub struct Queue {
     /// association is reachable only through its own queue and a queue holds at most one
     /// of them per limit.
     pub limit_associations: HashMap<String, QueueLimitAssociation>,
+    /// Every environment of this queue, keyed by `queueEnvironmentId`, exactly as the
+    /// model's paths nest it
+    /// (`/2023-10-12/farms/{farmId}/queues/{queueId}/environments/{queueEnvironmentId}`),
+    /// so an environment is reachable only through its own queue.
+    pub environments: HashMap<String, QueueEnvironment>,
 }
 
 impl Queue {

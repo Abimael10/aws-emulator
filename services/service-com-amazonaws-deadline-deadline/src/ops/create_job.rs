@@ -142,27 +142,6 @@ impl From<CreateJobErrorModeled> for CreateJobError {
     }
 }
 
-/// The name an Open Job Description template declares at its top level.
-///
-/// From `smithy_query(query="shape", shape="JobTemplateType")` a template is written in
-/// one of two languages: `JSON` or `YAML`. Only JSON is read here — see the note in
-/// [`CreateJob::handle`] on why a YAML template whose name would have to be read answers
-/// the scaffold's 501 instead of a guess.
-///
-/// `serde_json` bounds what the DOCUMENT can cost against what the REQUEST already bounds
-/// (`JobTemplate, len 1..1000000`): it builds a value linear in the input and enforces its
-/// own recursion limit, returning an error rather than growing the call stack — so a
-/// template of pure nesting is a modeled 400, not a process abort. It is never reached
-/// while the shared store lock is held: the caller resolves the name BEFORE it locks.
-fn json_template_name(template: &str) -> Result<Option<String>, String> {
-    let document: serde_json::Value = serde_json::from_str(template)
-        .map_err(|error| format!("The template isn't valid JSON: {error}"))?;
-    Ok(document
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string))
-}
-
 /// The `CreateJob` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -200,21 +179,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // FIRST, with no lock held and before the store is even reached: validate the
-        // caller-supplied template and read the name out of it. Parsing is the one step
-        // whose cost a caller controls, so it must not run while every other request of
-        // this service is waiting on the shared store lock.
+        // caller-supplied template and read the name out of it, in the language
+        // `templateType` names (`crate::state::job_template_name`). Parsing is the one
+        // step whose cost a caller controls, so it must not run while every other request
+        // of this service is waiting on the shared store lock.
         //
         // Only the template THIS request carries is ever parsed. When the template comes
         // from a source job instead, that job's name was resolved and stored when IT was
         // created, so it is read from state rather than parsed again.
-        //
-        // A `YAML` template is the one case this slice cannot read: a YAML reader needs a
-        // YAML parser, no crate in this build provides one, and a hand-written subset
-        // would be a guess at a language rather than a reading of it. So when the name
-        // would have to come out of a YAML template, the operation answers the scaffold's
-        // 501 — "nobody has written this yet" — instead of inventing a name or refusing a
-        // request the real service accepts. Everything else about a YAML template works:
-        // pass `nameOverride` and the job is created and the template stored verbatim.
         if input.template.is_some() && input.template_type.is_none() {
             return Err(CreateJobErrorModeled::ValidationException(
                 crate::state::field_validation_failed(
@@ -227,20 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The converse is NOT refused: the model marks both members optional, and a
         // templateType that describes no template is a stray value the service can
         // simply not read a template from, not a request it is documented to reject.
-        let name_from_template = match (
-            input.template.as_deref(),
-            input.template_type.as_deref(),
-            input.name_override.as_deref(),
-        ) {
-            (Some(body), Some("JSON"), _) => json_template_name(body).map_err(|message| {
-                CreateJobError::from(CreateJobErrorModeled::ValidationException(
-                    crate::state::cannot_parse("template", &message),
-                ))
-            })?,
-            (Some(_), Some("YAML"), None) => {
-                return Err(crate::scaffolded::Scaffolded::not_implemented(
-                    "CreateJob reading a job name out of a YAML template (pass nameOverride)",
-                ))
+        let name_from_template = match (input.template.as_deref(), input.template_type.as_deref()) {
+            (Some(body), Some(language)) => {
+                crate::state::job_template_name(body, language).map_err(|message| {
+                    CreateJobError::from(CreateJobErrorModeled::ValidationException(
+                        crate::state::cannot_parse("template", &message),
+                    ))
+                })?
             }
             _ => None,
         }

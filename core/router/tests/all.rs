@@ -1,5 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: the canonical declaration list.
+//
+// This file is the license line, this header, and then one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite under `tests/all/`, sorted by
+// name, and NO other line. Put a new suite at `tests/all/<name>.rs` and insert its pair in
+// order; what a suite covers, and why it belongs to this cross-service target rather than
+// to one service crate's own, is stated in that suite's own module doc, and a note about
+// THIS file belongs in `all/appended_notes.rs`, which is declared below like any other
+// module and holds comments alone.
+//
+// A suite no `mod` names compiles nowhere and its tests never run; a suite declared twice
+// is `E0428`; and an inner doc comment (`//!`) is legal only before the first item, so one
+// written past the declarations is `E0753`. Each of those fails EVERY suite of this
+// target, which is why `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs` and
+// `all/every_suite_file_is_declared.rs` pin the shape above. Every comment here is an
+// ordinary `//` one, this header included, so no merge of two landings can leave a doc
+// comment past the first item.
+//
 // Single integration-test target for the router.
 //
 // This file is a CANONICAL DECLARATION LIST: this header, then one
@@ -75,7 +95,7 @@
 // of this target at all, so the list holds pairs only — and with no `//!` anywhere in this
 // file, no merge of two landings can leave a doc comment past the first item.
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
-// (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is what points each
+// (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what points each
 // declaration into `tests/all/`.
 // The note paragraphs concurrent landings had appended to this file wrapped without the
 // indentation `clippy::doc_lazy_continuation` asks of a doc list item; the lint is allowed

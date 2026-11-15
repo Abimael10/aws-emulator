@@ -27,6 +27,11 @@ tracing = { workspace = true }
 # Mints the 32-hex-character resource ids the farm/queue/job label patterns require.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Reads the name out of a caller-supplied job or environment template written in YAML (the
+# other of the two languages `JobTemplateType` / `EnvironmentTemplateType` spell, beside
+# the JSON `serde_json` reads); yaml-rust2 is the pure-Rust YAML 1.2 implementation the
+# other services that read caller-supplied YAML in this workspace use.
+yaml-rust2 = { version = "0.10", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

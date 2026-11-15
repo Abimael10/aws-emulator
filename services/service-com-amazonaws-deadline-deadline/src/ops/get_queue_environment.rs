@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetQueueEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetQueueEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetQueueEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the environment the create stored under its queue, including the name its
+//! template declared.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +154,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetQueueEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetQueueEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetQueueEnvironment"))
+        // A read: nothing about a queue environment is owed by the clock, so this reports
+        // the stored environment and writes nothing at all.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetQueueEnvironmentErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        // Every level the path names is reported as itself, so a caller learns which one
+        // this emulator does not hold.
+        if store.farm(&input.farm_id).is_none() {
+            return Err(GetQueueEnvironmentErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+        if store.queue(&input.farm_id, &input.queue_id).is_none() {
+            return Err(GetQueueEnvironmentErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+            )
+            .into());
+        }
+        let Some(environment) = store.queue_environment(
+            &input.farm_id,
+            &input.queue_id,
+            &input.queue_environment_id,
+        ) else {
+            return Err(GetQueueEnvironmentErrorModeled::ResourceNotFoundException(
+                crate::state::queue_environment_not_found(&input.queue_environment_id),
+            )
+            .into());
+        };
+
+        Ok(GetQueueEnvironmentOutput {
+            queue_environment_id: environment.queue_environment_id.clone(),
+            name: environment.name.clone(),
+            priority: environment.priority,
+            template_type: environment.template_type.clone(),
+            template: environment.template.clone(),
+            created_at: crate::state::timestamp(environment.created_at),
+            created_by: environment.created_by.clone(),
+            updated_at: environment.updated_at.map(crate::state::timestamp),
+            updated_by: environment.updated_by.clone(),
+        })
     }
 }

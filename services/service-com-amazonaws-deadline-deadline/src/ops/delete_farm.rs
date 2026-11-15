@@ -161,8 +161,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A client token outlives nothing: the tokens of every resource this delete
         // removed are released with it, so the idempotency record cannot grow past the
-        // resources it describes. The template bytes those jobs held go back to the
-        // store's budget for the same reason.
+        // resources it describes. The template bytes those jobs and queue environments held
+        // go back to the store's budget for the same reason.
         let mut removed = vec![removed_farm.farm_id.clone()];
         let mut released_template_bytes = 0;
         for budget in removed_farm.budgets.values() {
@@ -173,6 +173,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             for job in queue.jobs.values() {
                 removed.push(job.job_id.clone());
                 released_template_bytes += job.template.as_deref().map_or(0, str::len);
+            }
+            for environment in queue.environments.values() {
+                removed.push(environment.queue_environment_id.clone());
+                released_template_bytes += environment.template.len();
             }
         }
         for fleet in removed_farm.fleets.values() {

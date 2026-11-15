@@ -388,12 +388,22 @@ async fn the_refusal_lists_the_domain_names_whose_mappings_hold_the_record() {
 
         // The sentence names the domain names and nothing else: no base path of any
         // mapping rides on it, which is what tells the caller to remove ALL of them.
+        //
+        // Searched with the values the sentence is REQUIRED to carry masked out first — the
+        // record's identifier and the domain names — because a minted `restApiId` is ten
+        // characters of lowercase alphanumerics and can CONTAIN a short base path
+        // (`v137i7gk2u` holds `v1`), which would fail this row by chance rather than for
+        // the behaviour under test.
         for message in [&refused_api, &refused_stage] {
             let stated = message.body["message"].as_str().unwrap_or_default();
+            let mut searched = stated.replace(&api, "<restApiId>").replace(&stage, "<stage>");
+            for domain_name in &listed {
+                searched = searched.replace(domain_name, "<domainName>");
+            }
             for base_paths in row.mappings {
                 for base_path in *base_paths {
                     assert!(
-                        !stated.contains(base_path),
+                        !searched.contains(base_path),
                         "case {}: the refusal must name no base path, got {stated:?} naming \
                          {base_path:?}",
                         row.case

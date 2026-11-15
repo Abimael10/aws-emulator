@@ -176,14 +176,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The client tokens of the queue and of its jobs are released with them, so the
-        // idempotency record cannot grow past the resources it describes, and the
-        // template bytes those jobs held go back to the store's budget.
+        // The client tokens of the queue, of its jobs and of its environments are released
+        // with them, so the idempotency record cannot grow past the resources it describes,
+        // and the template bytes those jobs and environments held go back to the store's
+        // budget.
         let mut removed = vec![removed_queue.queue_id.clone()];
         let mut released_template_bytes = 0;
         for job in removed_queue.jobs.values() {
             removed.push(job.job_id.clone());
             released_template_bytes += job.template.as_deref().map_or(0, str::len);
+        }
+        for environment in removed_queue.environments.values() {
+            removed.push(environment.queue_environment_id.clone());
+            released_template_bytes += environment.template.len();
         }
         store.forget_resources(&removed);
         store.release_template_bytes(released_template_bytes);

@@ -39,6 +39,8 @@ mod limit;
 mod list_limits;
 #[path = "all/not_found_message_template.rs"]
 mod not_found_message_template;
+#[path = "all/queue_environment.rs"]
+mod queue_environment;
 #[path = "all/queue_fleet_association.rs"]
 mod queue_fleet_association;
 #[path = "all/queue_limit_association.rs"]

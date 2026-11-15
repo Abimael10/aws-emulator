@@ -62,6 +62,7 @@ async fn rows(emulator: &Emulator) -> Vec<NotFound> {
     let absent_budget = absent_id("budget", &format!("{:032x}", 0x06));
     let absent_limit = absent_id("limit", &format!("{:032x}", 0x07));
     let absent_profile = absent_id("sp", &format!("{:032x}", 0x08));
+    let absent_environment = absent_id("queueenv", &format!("{:032x}", 0x0a));
 
     vec![
         NotFound {
@@ -125,6 +126,15 @@ async fn rows(emulator: &Emulator) -> Vec<NotFound> {
             ),
             resource_type: "queue-fleet-association",
             resource_id: association_id(&farm_id, &queue_id, &fleet_id),
+        },
+        NotFound {
+            // Nested under its queue, so the token is the segment that names it there.
+            case: "a queue environment, at /environments/",
+            path: format!(
+                "/2023-10-12/farms/{farm_id}/queues/{queue_id}/environments/{absent_environment}"
+            ),
+            resource_type: "environment",
+            resource_id: absent_environment,
         },
         NotFound {
             // The parent level is refused by its own kind, not by the kind of the resource
