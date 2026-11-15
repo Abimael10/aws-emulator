@@ -20,6 +20,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_marketplacediscovery_awsmarketplacediscovery::ops::types::{
     SEARCH_FACET_TYPE_VALUES, SEARCH_FILTER_TYPE_VALUES,
 };
+use service_com_amazonaws_marketplacediscovery_awsmarketplacediscovery::state::category_id;
 use service_com_amazonaws_marketplacediscovery_awsmarketplacediscovery::EmulatedService;
 
 /// The model's `POST /2026-02-05/<op>` route prefix (`OPERATIONS.md`).
@@ -177,7 +178,7 @@ fn queries() -> Vec<(&'static str, Value)> {
         ),
         (
             "CATEGORY=machine-learning",
-            json!({ "filters": [{ "filterType": "CATEGORY", "filterValues": ["machine-learning"] }] }),
+            json!({ "filters": [{ "filterType": "CATEGORY", "filterValues": [category_id("machine-learning")] }] }),
         ),
         (
             "PRICING_MODEL=CONTRACT|USAGE",

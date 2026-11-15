@@ -2,21 +2,20 @@
 
 //! How MANY fulfillment options a catalog product offers, and what follows from that.
 //!
-//! THE RULE UNDER TEST: a product of this catalog is fulfilled one-to-MANY — `Product`
-//! carries a `FulfillmentOptionsList` and `ListFulfillmentOptions` is `@paginated` with a
-//! `maxResults` of its own — so a product is offered through every route of its delivery
-//! family: the fulfillment option types that deliver it the same way
-//! (`state::fulfilled_through`). Three things follow, and each is asserted here:
+//! THE RULE UNDER TEST: a product's fulfillment options are the ones ITS OWN RECORD carries
+//! — `Product` carries a `FulfillmentOptionsList`, so a record offers one route or several,
+//! and `ListFulfillmentOptions` is `@paginated` with a `maxResults` of its own so a client
+//! can page the ones it offers. Two things follow, and each is asserted here:
 //!
-//! 1. a product the catalog exposes through `SearchListings` offers SEVERAL fulfillment
-//!    options, so the truncation and continuation paths of this paginated operation are
-//!    reachable at all;
+//! 1. the catalog holds products offering several options, so the truncation and
+//!    continuation paths of this paginated operation are reachable at all;
 //! 2. a page is bounded by `maxResults` — exactly `maxResults` items while items remain,
 //!    with a `nextToken` for the remainder — and walking the tokens yields every option
-//!    once, in the order one whole page reports them;
-//! 3. the options of one product are one DEPLOYMENT: every type of a delivery family
-//!    implies the same `deployedOnAws`, so offering a product its whole family says nothing
-//!    new about where it runs.
+//!    once, in the order one whole page reports them.
+//!
+//! That the options a product reports are exactly the ones its record offers — and that
+//! nothing else the product reports contradicts them — is asserted in
+//! `fulfillment_option_records`.
 //!
 //! Every request goes through the `MultiServiceRouter`, so the protocol, the routing table
 //! and the handlers are all exercised end to end.
@@ -26,17 +25,11 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_marketplacediscovery_awsmarketplacediscovery::ops::types::{
-    FULFILLMENT_OPTION_TYPE_VALUES,
-};
-use service_com_amazonaws_marketplacediscovery_awsmarketplacediscovery::state::{
-    deployment_status, fulfilled_through,
-};
-
 use crate::catalog_drilldown::{array, call, ok, router, text};
 
-/// How many listing summaries the scan below reads, which is the page a client takes first.
-const SCANNED_LISTINGS: i32 = 20;
+/// How many listing summaries the scan below reads: the model's largest `SearchListings`
+/// page, which the catalog fits (`catalog_record_breadth` asserts it does).
+const SCANNED_LISTINGS: i32 = 100;
 
 /// The `fulfillmentOptionType` of every option on one page, read from the union member each
 /// option carries.
@@ -52,8 +45,7 @@ fn option_types(page: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Every product id the first page of `SearchListings` reaches, through the listings it
-/// summarises.
+/// Every product id `SearchListings` reaches, through the listings it summarises.
 async fn scanned_product_ids(router: &MultiServiceRouter) -> Vec<String> {
     let page = ok(
         router,
@@ -80,21 +72,16 @@ async fn scanned_product_ids(router: &MultiServiceRouter) -> Vec<String> {
     product_ids
 }
 
-/// RULE 1: the catalog a client sees first exposes products with SEVERAL fulfillment
-/// options, so a paginating client is exercised at all.
-#[tokio::test]
-async fn the_catalog_exposes_products_with_several_fulfillment_options() {
-    let router = router();
-    let product_ids = scanned_product_ids(&router).await;
-
-    let mut multi_option = 0_usize;
-    for product_id in &product_ids {
+/// The ids of the products the catalog reports more than one fulfillment option for.
+async fn multi_option_product_ids(router: &MultiServiceRouter) -> Vec<String> {
+    let mut multi: Vec<String> = Vec::new();
+    for product_id in scanned_product_ids(router).await {
         // The model's largest page (50) is more than any product offers, so one page is all
         // of them.
         let page = ok(
-            &router,
+            router,
             "listFulfillmentOptions",
-            &json!({ "productId": product_id, "maxResults": 50 }),
+            &json!({ "productId": product_id.clone(), "maxResults": 50 }),
         )
         .await;
         let types = option_types(&page);
@@ -109,24 +96,35 @@ async fn the_catalog_exposes_products_with_several_fulfillment_options() {
             "case {product_id}: a product offers each delivery route once, got {types:?}"
         );
         if types.len() > 1 {
-            multi_option += 1;
+            multi.push(product_id);
         }
     }
-    assert_eq!(
-        multi_option,
-        product_ids.len(),
-        "case the first page of the catalog: every product it reaches must offer 2 or more \
-         fulfillment options, got {multi_option} of {} products",
-        product_ids.len()
+    multi
+}
+
+/// RULE 1: the catalog holds products whose records offer several fulfillment options, so a
+/// paginating client is exercised at all.
+#[tokio::test]
+async fn the_catalog_holds_products_with_several_fulfillment_options() {
+    let router = router();
+    let multi = multi_option_product_ids(&router).await;
+    assert!(
+        multi.len() > 1,
+        "case the whole catalog: several products must offer more than one fulfillment \
+         option, got {multi:?}"
     );
 }
 
 /// RULE 2: `maxResults` bounds a page and `nextToken` walks the rest, over a table of page
-/// sizes against a product offering several options.
+/// sizes against the products that offer several options.
 #[tokio::test]
 async fn max_results_truncates_a_page_and_next_token_walks_the_remainder() {
     let router = router();
-    let product_ids = scanned_product_ids(&router).await;
+    let product_ids = multi_option_product_ids(&router).await;
+    assert!(
+        !product_ids.is_empty(),
+        "case setup: this rule needs a product with several options"
+    );
 
     let mut exercised = 0_usize;
     for product_id in product_ids.iter().take(4) {
@@ -204,97 +202,6 @@ async fn max_results_truncates_a_page_and_next_token_walks_the_remainder() {
         exercised > 4,
         "case the scanned products: expected several page sizes per product, exercised only \
          {exercised}"
-    );
-}
-
-/// RULE 3: a delivery family is ONE deployment — every type it names implies the same
-/// `deployedOnAws` — and a family starts with the type it was derived from, naming it once.
-///
-/// Asserted over EVERY `FulfillmentOptionType` the model declares, which is a row the issue
-/// never cited for most of them.
-#[test]
-fn a_delivery_family_names_one_deployment_and_its_own_type_first() {
-    for option_type in FULFILLMENT_OPTION_TYPE_VALUES {
-        let family = fulfilled_through(option_type);
-        assert_eq!(
-            family.first().map(String::as_str),
-            Some(*option_type),
-            "case {option_type}: a product's own fulfillment type comes first, got {family:?}"
-        );
-        let distinct: BTreeSet<&String> = family.iter().collect();
-        assert_eq!(
-            distinct.len(),
-            family.len(),
-            "case {option_type}: a family names each type once, got {family:?}"
-        );
-        let expected = deployment_status(option_type);
-        for member in &family {
-            assert_eq!(
-                deployment_status(member),
-                expected,
-                "case {option_type}: every type of the family must imply the deployment \
-                 {expected}, but {member} implies {}",
-                deployment_status(member)
-            );
-        }
-    }
-}
-
-/// RULE 3 end to end: every product's `deployedOnAws` is the one its own options imply, and
-/// every modelled status is still reachable across the catalog — so offering a product its
-/// whole delivery family changed no product's deployment claim.
-#[tokio::test]
-async fn a_products_deployment_is_still_the_one_its_options_imply() {
-    let router = router();
-    let mut reported: BTreeSet<String> = BTreeSet::new();
-    // The whole catalog: the model's largest `SearchListings` page is 100 and the catalog
-    // fits one, which `catalog_record_breadth` asserts.
-    let page = ok(&router, "searchListings", &json!({ "maxResults": 100 })).await;
-    for summary in array(&page, "listingSummaries") {
-        for entity in array(&summary, "associatedEntities") {
-            let Some(product) = entity.get("product") else {
-                continue;
-            };
-            let product_id = text(product, "productId");
-            let detail = ok(
-                &router,
-                "getProduct",
-                &json!({ "productId": product_id.clone() }),
-            )
-            .await;
-            let options = ok(
-                &router,
-                "listFulfillmentOptions",
-                &json!({ "productId": product_id.clone(), "maxResults": 50 }),
-            )
-            .await;
-            let types = option_types(&options);
-            // The strongest claim the product's own options support, which is what
-            // `Product$deployedOnAws` reports.
-            let expected = if types.iter().any(|t| deployment_status(t) == "DEPLOYED") {
-                "DEPLOYED"
-            } else if types.iter().any(|t| deployment_status(t) == "NOT_DEPLOYED") {
-                "NOT_DEPLOYED"
-            } else {
-                "NOT_APPLICABLE"
-            };
-            let actual = text(&detail, "deployedOnAws");
-            assert_eq!(
-                actual, expected,
-                "case {product_id} fulfilled as {types:?}: expected deployedOnAws {expected}, \
-                 got {actual:?}"
-            );
-            reported.insert(actual);
-        }
-    }
-    assert_eq!(
-        reported,
-        ["DEPLOYED", "NOT_APPLICABLE", "NOT_DEPLOYED"]
-            .iter()
-            .map(|status| (*status).to_string())
-            .collect::<BTreeSet<String>>(),
-        "case the whole catalog: every modelled deployment status must stay reachable, got \
-         {reported:?}"
     );
 }
 

@@ -23,6 +23,8 @@ mod discovery_ordering_and_refusals;
 mod duplicate_filter_types;
 #[path = "all/fulfillment_option_families.rs"]
 mod fulfillment_option_families;
+#[path = "all/fulfillment_option_records.rs"]
+mod fulfillment_option_records;
 #[path = "all/fulfillment_options.rs"]
 mod fulfillment_options;
 #[path = "all/iam_authorization.rs"]

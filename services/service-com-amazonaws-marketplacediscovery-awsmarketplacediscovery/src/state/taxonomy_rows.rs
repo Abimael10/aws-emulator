@@ -53,7 +53,8 @@ const SEQUENCE_BLOCK: usize = 201;
 /// What kind of product each row is, cycled over the rows.
 ///
 /// Marketplace listings are not all one kind of thing, and the word is part of what a
-/// `searchText` keyword can match, so the catalog carries several.
+/// `searchText` keyword can match, so the catalog carries several. The kind also says how
+/// the record is DELIVERED ([`KIND_FULFILLMENT`]).
 const PRODUCT_KINDS: &[&str] = &[
     "Platform",
     "Suite",
@@ -64,6 +65,40 @@ const PRODUCT_KINDS: &[&str] = &[
     "Gateway",
     "Studio",
 ];
+
+/// How a row of this tier is fulfilled, by the kind of product it is: `(kind,
+/// FulfillmentOptionType)`.
+///
+/// A record's fulfillment is a property of the record, so this tier reads it off the same
+/// thing the rest of the row is derived from — what the product IS — rather than from the
+/// row's position in the model's enum: seller-hosted software (a platform, a suite, a
+/// service, a studio) is reached over the web and so delivered as SaaS; a hub runs in the
+/// buyer's own cluster, as a container; a workbench is an image the buyer launches; a
+/// toolkit is build components; a gateway is provisioned into the buyer's network from a
+/// template. Spanning the whole `FulfillmentOptionType` union is [`BREADTH_ROWS`]' job,
+/// which names every one of its values.
+const KIND_FULFILLMENT: &[(&str, &str)] = &[
+    ("Platform", "SAAS"),
+    ("Suite", "SAAS"),
+    ("Service", "SAAS"),
+    ("Hub", "CONTAINER"),
+    ("Workbench", "AMAZON_MACHINE_IMAGE"),
+    ("Toolkit", "EC2_IMAGE_BUILDER_COMPONENT"),
+    ("Gateway", "CLOUDFORMATION_TEMPLATE"),
+    ("Studio", "SAAS"),
+];
+
+/// The `FulfillmentOptionType` a product of `kind` is delivered through, per
+/// [`KIND_FULFILLMENT`].
+///
+/// A kind this table does not name is delivered as SaaS, the way a product the catalog
+/// knows nothing more about than that its seller hosts it is reached.
+fn fulfillment_for_kind(kind: &str) -> &'static str {
+    KIND_FULFILLMENT
+        .iter()
+        .find(|(candidate, _)| *candidate == kind)
+        .map_or("SAAS", |(_, option_type)| *option_type)
+}
 
 /// Seed one listing (with its product, offer and terms) per subcategory of the taxonomy.
 pub(super) fn seed_taxonomy_rows(
@@ -123,6 +158,9 @@ struct BuiltRow {
     name: String,
     short_description: String,
     categories: Vec<&'static str>,
+    /// The fulfillment option types this row's record offers, read off the kind of product
+    /// it is ([`fulfillment_for_kind`]).
+    fulfillment: Vec<&'static str>,
     support_phone: String,
 }
 
@@ -146,6 +184,7 @@ impl BuiltRow {
                 paired_name.to_lowercase()
             ),
             categories: vec![category, paired],
+            fulfillment: vec![fulfillment_for_kind(kind)],
             support_phone: format!(
                 "+1-{}-555-{:04}",
                 PHONE_AREA_CODES[(index / PHONE_LINES) % PHONE_AREA_CODES.len()],
@@ -163,13 +202,9 @@ impl BuiltRow {
             name: &self.name,
             short_description: &self.short_description,
             categories: &self.categories,
-            // Every fulfillment option type the catalog displays
-            // ([`FULFILLMENT_OPTION_TYPE_DISPLAY_NAMES`], read off the model's
-            // `FulfillmentOptionType` enum), taken in turn, so this tier spans the whole
-            // fulfillment union as well.
-            fulfillment: FULFILLMENT_OPTION_TYPE_DISPLAY_NAMES
-                [index % FULFILLMENT_OPTION_TYPE_DISPLAY_NAMES.len()]
-            .0,
+            // The options the record offers, which this tier reads off the kind of product
+            // the row is rather than from the row's position in the model's enum.
+            fulfillment: &self.fulfillment,
             seller: BREADTH_SELLERS[index % BREADTH_SELLERS.len()],
             // The pricing model, unit and review summary are offset from one another, so two
             // rows of this tier rarely carry the same combination of them.

@@ -31,7 +31,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_marketplacediscovery_awsmarketplacediscovery::ops::types::FULFILLMENT_OPTION_TYPE_VALUES;
 use service_com_amazonaws_marketplacediscovery_awsmarketplacediscovery::state::{
-    category_parent, CATEGORY_TAXONOMY,
+    category_id, category_parent, category_parent_key, CATEGORY_TAXONOMY,
 };
 use service_com_amazonaws_marketplacediscovery_awsmarketplacediscovery::EmulatedService;
 
@@ -50,7 +50,9 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 const DEFAULT_MAX_RESULTS: usize = 25;
 
 /// Subcategory/parent pairs of the catalog's taxonomy that listings sit at, each checked
-/// against what [`CATEGORY_TAXONOMY`] says and against what the service reports.
+/// against what [`CATEGORY_TAXONOMY`] says and against what the service reports. Written as
+/// the taxonomy's own keys; what the wire carries is the identifier the catalog issues for
+/// each of them (`state::category_id`).
 const NESTED_CATEGORIES: &[(&str, &str)] = &[
     ("storage", "infrastructure-software"),
     ("network-infrastructure", "infrastructure-software"),
@@ -172,7 +174,7 @@ async fn every_purchase_option(router: &MultiServiceRouter) -> Vec<Value> {
     rows
 }
 
-/// The catalog's taxonomy is a tree: every id is declared once, every parent is itself a
+/// The catalog's taxonomy is a tree: every key is declared once, every parent is itself a
 /// declared category, no category is its own ancestor, and every row has a display name.
 #[test]
 fn the_category_taxonomy_is_a_tree() {
@@ -180,7 +182,7 @@ fn the_category_taxonomy_is_a_tree() {
     assert_eq!(
         ids.len(),
         CATEGORY_TAXONOMY.len(),
-        "case CATEGORY_TAXONOMY: every categoryId must be declared once, got {} ids for {} rows",
+        "case CATEGORY_TAXONOMY: every key must be declared once, got {} keys for {} rows",
         ids.len(),
         CATEGORY_TAXONOMY.len()
     );
@@ -212,7 +214,7 @@ fn the_category_taxonomy_is_a_tree() {
                         depth <= CATEGORY_TAXONOMY.len(),
                         "case {id}: walking up the taxonomy must terminate, got depth {depth}"
                     );
-                    cursor = category_parent(current);
+                    cursor = category_parent_key(current);
                 }
             }
         }
@@ -224,16 +226,40 @@ fn the_category_taxonomy_is_a_tree() {
     );
     for (child, parent) in NESTED_CATEGORIES {
         assert_eq!(
-            category_parent(child),
+            category_parent_key(child),
             Some(*parent),
             "case {child}: expected parent {parent}, got {:?}",
-            category_parent(child)
+            category_parent_key(child)
+        );
+        // And on the wire: the identifier the catalog issues for a subcategory reports the
+        // identifier it issues for the parent.
+        assert_eq!(
+            category_parent(&category_id(child)),
+            Some(category_id(parent)),
+            "case {child}: expected the issued parent identifier {:?}, got {:?}",
+            category_id(parent),
+            category_parent(&category_id(child))
+        );
+        // The identifier is the category's own rather than a form of the text it is
+        // displayed by, so a client that reads one back handles the shape this service
+        // issues.
+        assert_ne!(
+            category_id(child),
+            *child,
+            "case {child}: the issued identifier must not be the catalog's internal key"
         );
     }
     assert_eq!(
+        category_parent_key("no-such-category"),
+        None,
+        "case no-such-category: a key the taxonomy does not hold has no parent, got {:?}",
+        category_parent_key("no-such-category")
+    );
+    assert_eq!(
         category_parent("no-such-category"),
         None,
-        "case no-such-category: an id the taxonomy does not hold has no parent, got {:?}",
+        "case no-such-category: an identifier this catalog did not issue has no parent, got \
+         {:?}",
         category_parent("no-such-category")
     );
 }
@@ -250,7 +276,7 @@ async fn category_facet_values_report_their_taxonomy_parent() {
         ("searchText=data", json!({ "searchText": "data" })),
         (
             "CATEGORY=infrastructure-software",
-            json!({ "filters": [{ "filterType": "CATEGORY", "filterValues": ["infrastructure-software"] }] }),
+            json!({ "filters": [{ "filterType": "CATEGORY", "filterValues": [category_id("infrastructure-software")] }] }),
         ),
         (
             "searchText=zzz-not-in-the-catalog",
@@ -261,7 +287,7 @@ async fn category_facet_values_report_their_taxonomy_parent() {
     let mut without_parent = 0_usize;
     for (case, query) in queries {
         for (value, facet) in category_facets(&router, &query).await {
-            let expected = category_parent(&value).map(str::to_string);
+            let expected = category_parent(&value);
             let actual = facet
                 .get("parent")
                 .filter(|parent| !parent.is_null())
@@ -289,7 +315,8 @@ async fn category_facet_values_report_their_taxonomy_parent() {
     // can refine from the parent to the child with the same CATEGORY filter.
     let facets = category_facets(&router, &json!({})).await;
     for (child, parent) in NESTED_CATEGORIES {
-        let facet = facets.get(*child).unwrap_or_else(|| {
+        let (child_id, parent_id) = (category_id(child), category_id(parent));
+        let facet = facets.get(&child_id).unwrap_or_else(|| {
             panic!(
                 "case CATEGORY={child}: the catalog must hold a listing in it, got {:?}",
                 facets.keys().collect::<Vec<_>>()
@@ -297,10 +324,10 @@ async fn category_facet_values_report_their_taxonomy_parent() {
         });
         assert_eq!(
             text(facet, "parent"),
-            *parent,
+            parent_id,
             "case CATEGORY={child}: expected parent {parent}, got {facet}"
         );
-        let parent_facet = facets.get(*parent).unwrap_or_else(|| {
+        let parent_facet = facets.get(&parent_id).unwrap_or_else(|| {
             panic!("case CATEGORY={parent}: the parent must be a facet value too, got {facets:?}")
         });
         let child_count = facet.get("count").and_then(Value::as_i64).unwrap_or(-1);
@@ -319,7 +346,8 @@ async fn category_facet_values_report_their_taxonomy_parent() {
 async fn a_listing_is_classified_under_its_whole_taxonomy_path() {
     let router = router();
     for (child, parent) in NESTED_CATEGORIES {
-        let summaries = listings_in_category(&router, child).await;
+        let (child_id, parent_id) = (category_id(child), category_id(parent));
+        let summaries = listings_in_category(&router, &child_id).await;
         assert!(
             !summaries.is_empty(),
             "case CATEGORY={child}: the catalog must hold a listing in it"
@@ -336,22 +364,18 @@ async fn a_listing_is_classified_under_its_whole_taxonomy_path() {
                 .iter()
                 .map(|category| text(category, "categoryId"))
                 .collect();
-            for required in [*child, *parent] {
+            for (name, required) in [(child, &child_id), (parent, &parent_id)] {
                 assert!(
-                    categories.contains(&required.to_string()),
-                    "case getListing {listing_id} in {child}: categories must carry {required}, \
+                    categories.contains(required),
+                    "case getListing {listing_id} in {child}: categories must carry {name}, \
                      got {categories:?}"
                 );
             }
-            // The parent comes before the child: the path runs outermost first.
-            let parent_at = categories.iter().position(|id| id == parent);
-            let child_at = categories.iter().position(|id| id == child);
-            assert!(
-                parent_at < child_at,
-                "case getListing {listing_id}: expected {parent} before {child}, got {categories:?}"
-            );
+            // Which order the path comes back in is asserted in `catalog_record_breadth`:
+            // the list leads with a category the record is classified under and carries the
+            // ones it is nested under as well, which is what this browse relies on.
             // Browsing the parent finds the listing the child selected.
-            let in_parent = listings_in_category(&router, parent).await;
+            let in_parent = listings_in_category(&router, &parent_id).await;
             assert!(
                 in_parent
                     .iter()

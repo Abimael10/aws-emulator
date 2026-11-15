@@ -44,7 +44,7 @@ use service_com_amazonaws_marketplacediscovery_awsmarketplacediscovery::ops::typ
     RESOURCE_TYPE_VALUES, SEARCH_FACET_TYPE_VALUES,
 };
 use service_com_amazonaws_marketplacediscovery_awsmarketplacediscovery::state::{
-    category_parent, FULFILLMENT_DEPLOYMENT_STATUS,
+    category_id, category_parent, FULFILLMENT_DEPLOYMENT_STATUS,
 };
 
 // The router, the `POST /2026-02-05/<op>` dispatch and the JSON readers are this crate's
@@ -85,7 +85,7 @@ fn facet_queries() -> Vec<(&'static str, Value)> {
         ("searchText=data", json!({ "searchText": "data" })),
         (
             "CATEGORY=infrastructure-software",
-            json!({ "filters": [{ "filterType": "CATEGORY", "filterValues": ["infrastructure-software"] }] }),
+            json!({ "filters": [{ "filterType": "CATEGORY", "filterValues": [category_id("infrastructure-software")] }] }),
         ),
         (
             "searchText=zzz-not-in-the-catalog",
@@ -416,9 +416,10 @@ async fn every_record_spans_the_modelled_resource_kinds() {
 }
 
 /// A record's `categories` are the whole taxonomy path of each category it is classified
-/// under: every entry's parent is in the list and comes before it, nothing repeats, and the
-/// catalog holds records at each depth the taxonomy nests — including one classified under
-/// two categories at once.
+/// under: every entry's parent is in the list, the list leads with a category the record is
+/// classified under rather than one it merely inherits, nothing repeats, and the catalog
+/// holds records at each depth the taxonomy nests — including one classified under two
+/// categories at once.
 #[tokio::test]
 async fn a_records_categories_are_its_whole_taxonomy_path() {
     let router = router();
@@ -456,22 +457,49 @@ async fn a_records_categories_are_its_whole_taxonomy_path() {
                     !text(&category, "displayName").trim().is_empty(),
                     "case {case}: Category$displayName is required and non-blank, got {category}"
                 );
-                // The path is ancestor-closed and runs outermost first, so a client walking
-                // it from the root never meets a category whose parent it has not seen.
+                // The path is ancestor-closed: a category a record carries brings the ones
+                // it is nested under, so browsing an ancestor finds the record.
                 let mut depth = 1_usize;
                 let mut cursor = category_parent(&id);
                 while let Some(parent) = cursor {
-                    let parent_at = ids.iter().position(|held| held == parent);
-                    let child_at = ids.iter().position(|held| *held == id);
                     assert!(
-                        parent_at.is_some() && parent_at < child_at,
+                        ids.contains(&parent),
                         "case {case}: {id} sits under {parent}, so {parent} must be in the path \
-                         before it, got {ids:?}"
+                         too, got {ids:?}"
                     );
                     depth += 1;
-                    cursor = category_parent(parent);
+                    cursor = category_parent(&parent);
                 }
                 deepest = deepest.max(depth);
+            }
+            // `Category` models no parent, so the ORDER is what tells a client which of the
+            // categories the record is actually classified under: the list leads with one
+            // of those rather than with a category the record only inherits — nothing else
+            // in the list sits under the first entry — and that classification is followed
+            // by its own chain, outward to the top of the taxonomy.
+            let lead = ids[0].clone();
+            for id in &ids[1..] {
+                let mut cursor = category_parent(id);
+                while let Some(parent) = cursor {
+                    assert_ne!(
+                        parent, lead,
+                        "case {case}: {lead} is an ancestor of {id}, so the list must not lead \
+                         with it, got {ids:?}"
+                    );
+                    cursor = category_parent(&parent);
+                }
+            }
+            let mut position = 1_usize;
+            let mut cursor = category_parent(&lead);
+            while let Some(parent) = cursor {
+                assert_eq!(
+                    ids.get(position),
+                    Some(&parent),
+                    "case {case}: the categories {lead} is nested under must follow it \
+                     outward, expected {parent} at index {position}, got {ids:?}"
+                );
+                position += 1;
+                cursor = category_parent(&parent);
             }
             widest = widest.max(ids.len());
         }
@@ -504,7 +532,7 @@ async fn the_category_facet_refines_through_every_level_of_the_taxonomy() {
             .map(|facet| (text(&facet, "value"), facet))
             .collect();
         for (value, facet) in &values {
-            let expected = category_parent(value).map(str::to_string);
+            let expected = category_parent(value);
             let actual = facet
                 .get("parent")
                 .filter(|parent| !parent.is_null())
@@ -525,7 +553,7 @@ async fn the_category_facet_refines_through_every_level_of_the_taxonomy() {
                 // reported, so refinement can run grandparent -> parent -> value.
                 if let Some(grandparent) = category_parent(parent) {
                     assert!(
-                        values.contains_key(grandparent),
+                        values.contains_key(&grandparent),
                         "case {case} / CATEGORY={value}: its grandparent {grandparent} must be \
                          a facet value too, got {:?}",
                         values.keys().collect::<Vec<_>>()
@@ -536,7 +564,7 @@ async fn the_category_facet_refines_through_every_level_of_the_taxonomy() {
                     // everything its descendants find.
                     let selected = listings_in_category(&router, value).await;
                     let in_parent = listings_in_category(&router, parent).await;
-                    let in_grandparent = listings_in_category(&router, grandparent).await;
+                    let in_grandparent = listings_in_category(&router, &grandparent).await;
                     assert!(
                         !selected.is_empty()
                             && selected.is_subset(&in_parent)

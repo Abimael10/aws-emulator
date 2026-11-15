@@ -196,56 +196,6 @@ pub fn fulfillment_option_display_name(option_type: &str) -> String {
         .map_or_else(|| option_type.to_string(), |(_, name)| (*name).to_string())
 }
 
-/// The fulfillment option types that deliver a product the SAME way, grouped: a machine
-/// image and the two artifacts that place one, the three container-and-cluster artifacts,
-/// the two seller-hosted ways to reach a hosted product, the two Amazon SageMaker
-/// artifacts, and a data set with the services engagement that integrates it.
-///
-/// Why the catalog groups them: `Product` carries a `FulfillmentOptionsList` — a product
-/// is fulfilled one-to-MANY — and a real AWS Marketplace product is commonly offered
-/// through several routes a buyer picks between (a container image and the Helm chart that
-/// installs it, say), which is exactly what makes `ListFulfillmentOptions` a `@paginated`
-/// operation with a `maxResults` of its own. Each group is also one DEPLOYMENT: every type
-/// in it implies the same `deployedOnAws` ([`FULFILLMENT_DEPLOYMENT_STATUS`]), so offering
-/// a product its whole group says nothing new about where it runs.
-const DELIVERY_FAMILIES: &[&[&str]] = &[
-    &[
-        "AMAZON_MACHINE_IMAGE",
-        "CLOUDFORMATION_TEMPLATE",
-        "EC2_IMAGE_BUILDER_COMPONENT",
-    ],
-    &["CONTAINER", "HELM", "EKS_ADD_ON"],
-    &["SAAS", "API"],
-    &["SAGEMAKER_ALGORITHM", "SAGEMAKER_MODEL"],
-    &["DATA_EXCHANGE", "PROFESSIONAL_SERVICES"],
-];
-
-/// Every fulfillment option type a product whose PRIMARY fulfillment is `primary` is
-/// offered through: `primary` first, then the rest of its delivery family
-/// ([`DELIVERY_FAMILIES`]).
-///
-/// A type no family names is offered on its own, so a `FulfillmentOptionType` the model
-/// gains later still seeds a product rather than being grouped by guess.
-///
-/// Public so a test can assert the relation this seeds — a product with more than one
-/// option, all of one deployment — over the catalog it produces.
-#[must_use]
-pub fn fulfilled_through(primary: &str) -> Vec<String> {
-    let mut offered: Vec<String> = vec![primary.to_string()];
-    for family in DELIVERY_FAMILIES {
-        if !family.contains(&primary) {
-            continue;
-        }
-        offered.extend(
-            family
-                .iter()
-                .filter(|value| **value != primary)
-                .map(|value| (*value).to_string()),
-        );
-    }
-    offered
-}
-
 /// The `fulfillmentOptionId` of a fulfillment option, whichever member of the
 /// `FulfillmentOption` union it is: every member of the union declares the member.
 pub fn fulfillment_option_id(option: &FulfillmentOption) -> &str {
@@ -1636,8 +1586,13 @@ fn rating_bound(filter_type: &str, values: &[String]) -> Result<f64, String> {
 // ---------------------------------------------------------------------------
 
 /// The catalog's category tree: one row per category as
-/// `(categoryId, displayName, parent categoryId)`, the parent being `None` for a top-level
+/// `(taxonomy key, displayName, parent key)`, the parent being `None` for a top-level
 /// category.
+///
+/// The key is the catalog's INTERNAL handle for a category — it never reaches the wire.
+/// What a response carries is the identifier the catalog issues for that key
+/// ([`category_id`]), because `Category$categoryId` is the category's machine-readable
+/// identifier rather than a form of its display name.
 ///
 /// Why the catalog owns a TREE rather than a flat list: `ListingFacet$parent` is "The
 /// parent facet value for hierarchical facets, such as subcategories"
@@ -1651,7 +1606,7 @@ fn rating_bound(filter_type: &str, values: &[String]) -> Result<f64, String> {
 /// Professional Services, Industries), the subcategories published under each of them, and
 /// the sub-subcategories published under some of those (Data Analytics' Data Integration,
 /// Data Preparation and Data Visualization; Financial Services Data's Market Data and
-/// Reference Data). The ids are this catalog's own slugs; the nesting and the display names
+/// Reference Data). The keys are this catalog's own slugs; the nesting and the display names
 /// are the taxonomy's. The tree is three levels deep, so a record classified at a leaf
 /// carries a three-category path and a `CATEGORY` facet value can report a parent that
 /// itself has one.
@@ -1845,58 +1800,125 @@ pub const CATEGORY_TAXONOMY: &[(&str, &str, Option<&str>)] = &[
     ("public-sector", "Public Sector", Some("industries")),
 ];
 
-/// The taxonomy row for `category_id`, or `None` for an id the taxonomy does not hold.
-fn taxonomy_row(category_id: &str) -> Option<&'static (&'static str, &'static str, Option<&'static str>)>
+/// The namespace the catalog mints its category identifiers in: one fixed identifier of its
+/// own, so the identifier a category is issued is the same on every boot.
+const CATEGORY_ID_NAMESPACE: ::uuid::Uuid =
+    ::uuid::Uuid::from_u128(0x6f4b_2c18_9e3a_4d57_b0c6_2a7d_85f1_e934);
+
+/// The identifier this catalog issues for each category of its taxonomy, minted once.
+///
+/// `Category` models the identifier and the name as two different members — `categoryId` is
+/// "The machine-readable identifier of the category" and `displayName` "The human-readable
+/// name of the category" (`smithy_query(query="shape",shape="Category")`) — so the
+/// identifier is the catalog's own opaque handle for the category and carries none of the
+/// name it is displayed by: a client that persists one, or passes it back as a `CATEGORY`
+/// filter value, handles an identifier of the shape this service issues rather than a form
+/// of the text it renders. Minted as a name-based identifier over the taxonomy's own key, so
+/// it is opaque yet stable across restarts and the same for every record classified under
+/// that category.
+static CATEGORY_IDS: LazyLock<Vec<(&'static str, String)>> = LazyLock::new(|| {
+    CATEGORY_TAXONOMY
+        .iter()
+        .map(|(key, _, _)| {
+            (
+                *key,
+                ::uuid::Uuid::new_v5(&CATEGORY_ID_NAMESPACE, key.as_bytes()).to_string(),
+            )
+        })
+        .collect()
+});
+
+/// The taxonomy row for `key`, or `None` for a key the taxonomy does not hold.
+fn taxonomy_row(key: &str) -> Option<&'static (&'static str, &'static str, Option<&'static str>)>
 {
-    CATEGORY_TAXONOMY.iter().find(|(id, _, _)| *id == category_id)
+    CATEGORY_TAXONOMY.iter().find(|(id, _, _)| *id == key)
 }
 
-/// The category `category_id` sits under, or `None` when it is top-level (or unknown).
+/// The identifier the catalog issues for the taxonomy category `key`.
+///
+/// A key the taxonomy does not hold is identified by itself, which keeps
+/// `Category$categoryId` (required, non-blank) satisfiable for a record classified under a
+/// category added to the catalog before the taxonomy names it.
+///
+/// Public so a test — and any caller that has to name a category on the wire — asks the
+/// catalog for the identifier rather than assuming one.
+pub fn category_id(key: &str) -> String {
+    CATEGORY_IDS
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+        .map_or_else(|| key.to_string(), |(_, id)| id.clone())
+}
+
+/// The taxonomy key the issued identifier `category_id` names, or `None` for one this
+/// catalog did not issue.
+fn taxonomy_key(category_id: &str) -> Option<&'static str> {
+    CATEGORY_IDS
+        .iter()
+        .find(|(_, id)| id == category_id)
+        .map(|(key, _)| *key)
+}
+
+/// The taxonomy key of the category `key` sits under, or `None` when it is top-level (or
+/// unknown).
+///
+/// This is the nesting itself, over the taxonomy's own keys: the catalog seeds records with
+/// it, and [`category_parent`] answers the same question about the identifiers the wire
+/// carries.
+pub fn category_parent_key(key: &str) -> Option<&'static str> {
+    taxonomy_row(key).and_then(|(_, _, parent)| *parent)
+}
+
+/// The identifier of the category the one `issued_id` names sits under, or `None` when it
+/// sits at the top of the taxonomy (or was not issued by this catalog).
 ///
 /// This is the value `ListingFacet$parent` carries for a `CATEGORY` facet value: the
 /// PARENT'S value, which is itself a `CATEGORY` filter value.
-pub fn category_parent(category_id: &str) -> Option<&'static str> {
-    taxonomy_row(category_id).and_then(|(_, _, parent)| *parent)
+pub fn category_parent(issued_id: &str) -> Option<String> {
+    category_parent_key(taxonomy_key(issued_id)?).map(category_id)
 }
 
-/// The category record for `category_id`, with the taxonomy's display name.
+/// The category record for the taxonomy key `key`: the identifier the catalog issues for it
+/// and the taxonomy's display name.
 ///
-/// A `categoryId` the taxonomy does not hold is displayed by its own id, which keeps
+/// A key the taxonomy does not hold is displayed by itself, which keeps
 /// `Category$displayName` (required, non-blank) satisfiable for a record classified under a
 /// category added to the catalog before the taxonomy names it.
-pub fn taxonomy_category(category_id: &str) -> Category {
+pub fn taxonomy_category(key: &str) -> Category {
     Category {
-        category_id: category_id.to_string(),
-        display_name: taxonomy_row(category_id)
-            .map_or_else(|| category_id.to_string(), |(_, name, _)| (*name).to_string()),
+        category_id: category_id(key),
+        display_name: taxonomy_row(key)
+            .map_or_else(|| key.to_string(), |(_, name, _)| (*name).to_string()),
     }
 }
 
-/// The categories a record classified under `leaves` carries: each leaf's taxonomy PATH,
-/// outermost ancestor first and the leaf last, with no category repeated.
+/// The categories a record classified under `leaves` carries: each category it is
+/// classified under FIRST, followed by the categories that one is nested under, outward to
+/// the top of the taxonomy, with no category repeated.
 ///
 /// A record classified under a subcategory is classified under that subcategory's parents
 /// too — browsing "Infrastructure Software" finds what is listed under "Storage" — so the
-/// path, not the leaf alone, is what a listing or product carries.
+/// whole path, not the leaf alone, is what a listing or product carries. `Category` models
+/// no parent member, so the order is what tells a client which of them the record is
+/// actually classified under: the category it was classified under leads, and the ones it
+/// inherits follow it.
 pub fn classified_under(leaves: &[&str]) -> Vec<Category> {
     let mut path: Vec<Category> = Vec::new();
     for leaf in leaves {
-        // Ancestors of this leaf, outermost first.
-        let mut ancestors: Vec<&str> = Vec::new();
-        let mut cursor = category_parent(leaf);
-        while let Some(parent) = cursor {
-            if ancestors.contains(&parent) {
+        let mut walked: Vec<&str> = Vec::new();
+        let mut cursor = Some(*leaf);
+        while let Some(key) = cursor {
+            if walked.contains(&key) {
                 break;
             }
-            ancestors.insert(0, parent);
-            cursor = category_parent(parent);
-        }
-        ancestors.push(leaf);
-        for category_id in ancestors {
-            if path.iter().any(|held| held.category_id == category_id) {
-                continue;
+            walked.push(key);
+            let category = taxonomy_category(key);
+            if !path
+                .iter()
+                .any(|held| held.category_id == category.category_id)
+            {
+                path.push(category);
             }
-            path.push(taxonomy_category(category_id));
+            cursor = category_parent_key(key);
         }
     }
     path
@@ -1923,11 +1945,14 @@ fn aws_service(service_type: &str, display_name: &str, description: &str) -> Aws
 }
 
 /// A SaaS fulfillment option: the seller hosts the software and the buyer reaches it over
-/// the web, so the option carries registration and launch URLs rather than a version.
+/// the web, so the option carries a registration URL rather than a version.
+///
+/// `launchUrl` ("The URL that a buyer uses to launch the seller's SaaS product") is
+/// optional, so it is carried only for a record that has one.
 fn saas_option(
     id: &str,
     fulfillment_url: &str,
-    launch_url: &str,
+    launch_url: Option<&str>,
     quick_launch: &str,
     usage_instructions: &str,
     available_from: i64,
@@ -1940,7 +1965,7 @@ fn saas_option(
             fulfillment_url: Some(fulfillment_url.to_string()),
             usage_instructions: Some(usage_instructions.to_string()),
             available_from_time: Some(datetime(available_from)),
-            launch_url: Some(launch_url.to_string()),
+            launch_url: launch_url.map(ToString::to_string),
             quick_launch: quick_launch.to_string(),
         },
     ))
@@ -2600,7 +2625,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 saas_option(
                     "fo-0001-analytics-saas",
                     "https://example.com/acme/register",
-                    "https://example.com/acme/launch",
+                    Some("https://example.com/acme/launch"),
                     "ENABLED",
                     "Register with your AWS account, then invite your analysts from the Acme \
                      console.",
@@ -3293,7 +3318,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 saas_option(
                     "fo-0013-backup-saas",
                     "https://example.com/vertex/register",
-                    "https://example.com/vertex/launch",
+                    Some("https://example.com/vertex/launch"),
                     "DISABLED",
                     "Grant the collector read-only access to your backup inventories, then \
                      open the Vertex console.",
@@ -3374,11 +3399,11 @@ struct BreadthRow {
     /// with it through [`classified_under`]. A record may sit at more than one category
     /// (`CategoryList` holds up to 30), and then carries every one of their paths.
     categories: &'static [&'static str],
-    /// The `FulfillmentOptionType` its single product is fulfilled through FIRST, which
-    /// also decides the product's `deployedOnAws` ([`Product::deployed_on_aws`]). The
-    /// product is offered through that type's whole delivery family
-    /// ([`fulfilled_through`]), so it carries more than one fulfillment option.
-    fulfillment: &'static str,
+    /// The `FulfillmentOptionType`s its single product is fulfilled through — the options
+    /// the record itself offers, the first of them being the one its prose names and the
+    /// one its `deployedOnAws` follows ([`Product::deployed_on_aws`]). A record that is
+    /// delivered one way names one type; one a seller offers through two routes names both.
+    fulfillment: &'static [&'static str],
 }
 
 /// The catalog's breadth rows, one listing each.
@@ -3393,7 +3418,9 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         name: "Aurora Hardened Linux",
         short_description: "Hardened Linux images with CIS benchmark profiles applied.",
         categories: &["operating-systems"],
-        fulfillment: "AMAZON_MACHINE_IMAGE",
+        // Two routes this record offers: the image itself, and the Image Builder component
+        // that bakes it into the buyer's own image.
+        fulfillment: &["AMAZON_MACHINE_IMAGE", "EC2_IMAGE_BUILDER_COMPONENT"],
     },
     BreadthRow {
         slug: "borealis-market-data",
@@ -3402,140 +3429,142 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         // Two leaves of one subtree: the listing carries both paths, so its categories run
         // three levels deep and name two sibling subcategories.
         categories: &["market-data", "reference-data"],
-        fulfillment: "DATA_EXCHANGE",
+        fulfillment: &["DATA_EXCHANGE"],
     },
     BreadthRow {
         slug: "cirrus-waf",
         name: "Cirrus Web Application Firewall",
         short_description: "Managed web application firewall rules for edge and VPC traffic.",
         categories: &["security"],
-        fulfillment: "CLOUDFORMATION_TEMPLATE",
+        fulfillment: &["CLOUDFORMATION_TEMPLATE"],
     },
     BreadthRow {
         slug: "delta-vision-labeler",
         name: "Delta Vision Labeler",
         short_description: "Image classification models for industrial inspection.",
         categories: &["computer-vision"],
-        fulfillment: "SAGEMAKER_MODEL",
+        fulfillment: &["SAGEMAKER_MODEL"],
     },
     BreadthRow {
         slug: "equinox-fleet-telemetry",
         name: "Equinox Fleet Telemetry",
         short_description: "Telemetry ingestion and alerting for connected equipment.",
         categories: &["iot-analytics"],
-        fulfillment: "SAAS",
+        // A hosted service the buyer subscribes to, reachable through its own API as well.
+        fulfillment: &["SAAS", "API"],
     },
     BreadthRow {
         slug: "aurora-object-vault",
         name: "Aurora Object Vault",
         short_description: "Immutable object storage with compliance retention.",
         categories: &["storage"],
-        fulfillment: "CONTAINER",
+        // A container image and the Helm chart that installs it.
+        fulfillment: &["CONTAINER", "HELM"],
     },
     BreadthRow {
         slug: "borealis-health-atlas",
         name: "Borealis Health Atlas",
         short_description: "De-identified claims and prescription records for research.",
         categories: &["healthcare-life-sciences-data"],
-        fulfillment: "DATA_EXCHANGE",
+        fulfillment: &["DATA_EXCHANGE"],
     },
     BreadthRow {
         slug: "cirrus-secrets-broker",
         name: "Cirrus Secrets Broker",
         short_description: "Short-lived credential brokering for cluster workloads.",
         categories: &["security"],
-        fulfillment: "HELM",
+        fulfillment: &["HELM"],
     },
     BreadthRow {
         slug: "delta-speech-studio",
         name: "Delta Speech Studio",
         short_description: "Speech transcription and diarisation for contact centres.",
         categories: &["speech-recognition"],
-        fulfillment: "SAGEMAKER_ALGORITHM",
+        fulfillment: &["SAGEMAKER_ALGORITHM"],
     },
     BreadthRow {
         slug: "equinox-grid-forecast",
         name: "Equinox Grid Forecast",
         short_description: "Load and generation forecasting for energy networks.",
         categories: &["energy"],
-        fulfillment: "API",
+        fulfillment: &["API"],
     },
     BreadthRow {
         slug: "aurora-build-cache",
         name: "Aurora Build Cache",
         short_description: "Distributed build caching for large monorepos.",
         categories: &["application-development"],
-        fulfillment: "EKS_ADD_ON",
+        fulfillment: &["EKS_ADD_ON"],
     },
     BreadthRow {
         slug: "borealis-climate-grid",
         name: "Borealis Climate Grid",
         short_description: "Gridded climate observations and reanalysis series.",
         categories: &["environmental-data"],
-        fulfillment: "DATA_EXCHANGE",
+        fulfillment: &["DATA_EXCHANGE"],
     },
     BreadthRow {
         slug: "cirrus-migration-studio",
         name: "Cirrus Migration Studio",
         short_description: "Assessment and replatforming services for legacy estates.",
         categories: &["migration"],
-        fulfillment: "PROFESSIONAL_SERVICES",
+        fulfillment: &["PROFESSIONAL_SERVICES"],
     },
     BreadthRow {
         slug: "delta-forms-reader",
         name: "Delta Forms Reader",
         short_description: "Document understanding for structured and semi-structured forms.",
         categories: &["natural-language-processing"],
-        fulfillment: "SAGEMAKER_MODEL",
+        fulfillment: &["SAGEMAKER_MODEL"],
     },
     BreadthRow {
         slug: "equinox-retail-planner",
         name: "Equinox Retail Planner",
         short_description: "Assortment and replenishment planning for retailers.",
         categories: &["retail"],
-        fulfillment: "SAAS",
+        fulfillment: &["SAAS"],
     },
     BreadthRow {
         slug: "aurora-golden-images",
         name: "Aurora Golden Images",
         short_description: "Image pipeline components for compliant base images.",
         categories: &["infrastructure-as-code"],
-        fulfillment: "EC2_IMAGE_BUILDER_COMPONENT",
+        fulfillment: &["EC2_IMAGE_BUILDER_COMPONENT"],
     },
     BreadthRow {
         slug: "borealis-spectrum-usage",
         name: "Borealis Spectrum Usage",
         short_description: "Mobile network coverage and spectrum usage records.",
         categories: &["telecommunications-data"],
-        fulfillment: "DATA_EXCHANGE",
+        fulfillment: &["DATA_EXCHANGE"],
     },
     BreadthRow {
         slug: "cirrus-observability",
         name: "Cirrus Observability Stack",
         short_description: "Metrics, traces and log correlation for microservices.",
         categories: &["monitoring"],
-        fulfillment: "HELM",
+        fulfillment: &["HELM"],
     },
     BreadthRow {
         slug: "delta-crm-sync",
         name: "Delta CRM Sync",
         short_description: "Two-way synchronisation between CRM and billing systems.",
         categories: &["crm"],
-        fulfillment: "SAAS",
+        fulfillment: &["SAAS"],
     },
     BreadthRow {
         slug: "equinox-hpc-solver",
         name: "Equinox HPC Solver",
         short_description: "Finite element solver for structural simulation.",
         categories: &["high-performance-computing"],
-        fulfillment: "AMAZON_MACHINE_IMAGE",
+        fulfillment: &["AMAZON_MACHINE_IMAGE"],
     },
     BreadthRow {
         slug: "aurora-training-labs",
         name: "Aurora Training Labs",
         short_description: "Instructor-led enablement for platform engineering teams.",
         categories: &["training"],
-        fulfillment: "PROFESSIONAL_SERVICES",
+        fulfillment: &["PROFESSIONAL_SERVICES"],
     },
     BreadthRow {
         slug: "borealis-data-prep",
@@ -3544,14 +3573,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         // Both sibling leaves of Data Analytics, so the listing carries the taxonomy's
         // deepest path twice over: four categories across three levels.
         categories: &["data-integration", "data-preparation"],
-        fulfillment: "SAAS",
+        fulfillment: &["SAAS"],
     },
     BreadthRow {
         slug: "cirrus-query-lens",
         name: "Cirrus Query Lens",
         short_description: "Interactive dashboards over warehouse and lakehouse tables.",
         categories: &["data-visualization"],
-        fulfillment: "CONTAINER",
+        fulfillment: &["CONTAINER"],
     },
 ];
 
@@ -3626,11 +3655,16 @@ fn fulfillment_option_for_type(
     available_from: i64,
 ) -> FulfillmentOptionRecord {
     match option_type {
+        // A derived row's record carries a registration URL and no launch URL, so it claims
+        // no quick-launch deployment: `quickLaunch` ("Specifies whether the SaaS product
+        // supports quick-launch deployment") is an attribute of the product, claimed only
+        // where the record states it, and `launchUrl` is the URL such a launch sends the
+        // buyer to.
         "SAAS" => saas_option(
             id,
             &format!("https://example.com/{slug}/register"),
-            &format!("https://example.com/{slug}/launch"),
-            "ENABLED",
+            None,
+            "DISABLED",
             &format!("Subscribe, then open the {name} console."),
             available_from,
         ),
@@ -3764,10 +3798,9 @@ pub(crate) struct CatalogRow<'a> {
     /// The taxonomy categories the listing is classified under; each one's ancestors come
     /// with it through [`classified_under`].
     pub categories: &'a [&'a str],
-    /// The `FulfillmentOptionType` its single product is fulfilled through FIRST; the
-    /// product is offered through that type's whole delivery family
-    /// ([`fulfilled_through`]).
-    pub fulfillment: &'a str,
+    /// The `FulfillmentOptionType`s its single product is fulfilled through: the options
+    /// the record offers, the first being the one its prose names.
+    pub fulfillment: &'a [&'a str],
     /// The seller it is published by, as `(sellerProfileId, displayName)`.
     pub seller: (&'a str, &'a str),
     /// Its pricing model, as `(PricingModelType, displayName)`.
@@ -3797,11 +3830,17 @@ fn seed_rows(
         let listing_id = format!("l-{sequence:04}-{slug}");
         let product_id = format!("p-{sequence:04}-{slug}");
         let offer_id = format!("o-{sequence:04}-{slug}");
-        // Every fulfillment option type this row's product is offered through — its
-        // primary one and the rest of that type's delivery family ([`fulfilled_through`]) —
-        // each with an id of its own, so `ListFulfillmentOptions` pages over several
-        // options of one product the way the modelled one-to-many relation allows.
-        let option_types = fulfilled_through(row.fulfillment);
+        // The fulfillment option types this row's product is offered through — the ones
+        // the record itself names — each with an id of its own, so `ListFulfillmentOptions`
+        // pages over several options of one product wherever the record offers several, the
+        // way the modelled one-to-many relation allows.
+        let option_types = row.fulfillment;
+        // The route the record's prose names: the first option it offers. A row that names
+        // none would seed a product nothing can be fulfilled through, so it fails here
+        // rather than storing a blank record.
+        let primary = *option_types
+            .first()
+            .expect("a catalog row names the route its product is fulfilled through");
 
         let (seller_profile_id, seller_name) = row.seller;
         let publisher = seller(seller_profile_id, seller_name);
@@ -3817,7 +3856,7 @@ fn seed_rows(
             .iter()
             .next_back()
             .map_or_else(String::new, |leaf| taxonomy_category(leaf).display_name);
-        let fulfillment_name = fulfillment_option_display_name(row.fulfillment);
+        let fulfillment_name = fulfillment_option_display_name(primary);
         let long_description = format!(
             "{} {} is listed under {category_name} and fulfilled as {fulfillment_name}.",
             row.short_description, row.name

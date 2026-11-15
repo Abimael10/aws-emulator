@@ -382,7 +382,7 @@ fn facet_values(
 /// with the same `CATEGORY` filter.
 fn facet_value_parent(facet_type: &str, value: &str) -> Option<String> {
     match facet_type {
-        "CATEGORY" => crate::state::category_parent(value).map(str::to_string),
+        "CATEGORY" => crate::state::category_parent(value),
         _ => None,
     }
 }
