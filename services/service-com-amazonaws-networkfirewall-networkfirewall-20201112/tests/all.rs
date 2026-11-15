@@ -27,6 +27,8 @@ mod firewall_protection_settings;
 mod flow_operations;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/last_mapping_refusal_scope.rs"]
+mod last_mapping_refusal_scope;
 #[path = "all/logging_configuration.rs"]
 mod logging_configuration;
 #[path = "all/request_validation_errors.rs"]

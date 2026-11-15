@@ -7310,3 +7310,7 @@ mod zz_glue_job_source_permission_probe;
 //! this cross-service target rather than to one service crate, is stated in that suite's
 //! own module doc, where it is read beside the test it explains.
 // (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is what points each
+//! which compiles no suite of this target. An inner doc comment is legal only BEFORE the
+//! first item, so this header is the only place one may stand: past it one is `E0753` and
+//! compiles nothing, so a note below must be an ordinary comment — better still, add a
+//! declaration rather than a note about one.
