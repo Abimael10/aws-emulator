@@ -149,6 +149,8 @@ mod kinesis_streaming_destinations;
 mod kms_key_state_refusals;
 #[path = "all/legacy_conditional_operator_refusals.rs"]
 mod legacy_conditional_operator_refusals;
+#[path = "all/legacy_parameter_argument_rules.rs"]
+mod legacy_parameter_argument_rules;
 #[path = "all/limit_reached_page_stop_keys.rs"]
 mod limit_reached_page_stop_keys;
 #[path = "all/management_event_recording.rs"]

@@ -25,6 +25,10 @@ use crate::state::{
 /// The member a `FilterExpression` arrives in, which is what its refusals name.
 const FILTER_EXPRESSION: &str = "FilterExpression";
 
+/// How that member is SPELLED in the refusal of a filter that mentions a key attribute,
+/// which is the one sentence this service states its name with a space in it.
+const FILTER_EXPRESSION_PHRASE: &str = "Filter Expression";
+
 /// The filter one read applies to the attributes each row it evaluated SAW.
 #[derive(Debug)]
 pub enum ReadFilter<'a> {
@@ -37,6 +41,9 @@ pub enum ReadFilter<'a> {
     Expression(ParsedCondition),
     /// The legacy filter map, its entries combined by `ConditionalOperator`.
     Legacy {
+        /// The member that map arrived in (`ScanFilter`, `QueryFilter`), which is what a
+        /// refusal about this filter names ([`ReadFilter::stated_member`]).
+        member: &'a str,
         conditions: &'a HashMap<String, Condition>,
         conditional_operator: Option<&'a str>,
     },
@@ -52,7 +59,7 @@ impl<'a> ReadFilter<'a> {
     /// (`QueryFilter` for a query, `ScanFilter` for a scan), which is what the refusals
     /// of a request that used it name.
     pub fn resolve(
-        legacy_member: &'static str,
+        legacy_member: &'a str,
         expression: Option<&str>,
         legacy: Option<&'a HashMap<String, Condition>>,
         conditional_operator: Option<&'a str>,
@@ -92,6 +99,7 @@ impl<'a> ReadFilter<'a> {
                 )?;
                 check_legacy_conditions(conditions, conditional_operator)?;
                 Ok(Self::Legacy {
+                    member: legacy_member,
                     conditions,
                     conditional_operator,
                 })
@@ -118,7 +126,25 @@ impl<'a> ReadFilter<'a> {
             Self::Legacy {
                 conditions,
                 conditional_operator,
+                ..
             } => legacy_conditions_match(conditions, *conditional_operator, seen),
+        }
+    }
+
+    /// The member this read states its filter THROUGH, as a refusal about the filter names
+    /// it: the legacy map by its own member name, and the expression member as the one
+    /// sentence about it spells that name.
+    ///
+    /// A refusal names the member the REQUEST carried — the rule every other refusal about
+    /// this filter follows, `resolve` above being handed that member for exactly that
+    /// reason — so a request that filtered the legacy way is never told about an expression
+    /// member it did not send. A read that states no filter has no member to name and no
+    /// attributes to be refused over either, so it answers the expression member's name
+    /// like any read that stated no legacy map.
+    pub fn stated_member(&self) -> &str {
+        match self {
+            Self::Unfiltered | Self::Expression(_) => FILTER_EXPRESSION_PHRASE,
+            Self::Legacy { member, .. } => member,
         }
     }
 

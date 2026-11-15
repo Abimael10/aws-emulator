@@ -567,18 +567,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let condition = KeyCondition::resolve(table, schema, comparisons).map_err(lift)?;
         // "A FilterExpression does not allow key attributes. You cannot define a
         // filter expression based on a partition key or a sort key": which attributes
-        // the expression reads comes from the parsed tree, judged against EVERY key
-        // schema the read is addressed through — the table's own, and the index's when
-        // the request named one. An index query reads items of the table, so the
-        // table's key attributes are primary key attributes there too.
+        // the filter reads comes from the filter this request stated — in either
+        // generation of the member that states it — judged against EVERY key schema the
+        // read is addressed through: the table's own, and the index's when the request
+        // named one. An index query reads items of the table, so the table's key
+        // attributes are primary key attributes there too.
+        //
+        // The sentence names the member the REQUEST filtered through
+        // ([`crate::state::ReadFilter::stated_member`]), so a request that stated its
+        // filter the legacy way is told about the map it sent rather than about an
+        // expression member it never sent.
         let filter_attributes: ::std::collections::BTreeSet<String> = filter.attributes();
         if let Some(key) = filter_attributes
             .iter()
             .find(|attribute| table.is_table_key(attribute) || condition.is_key(attribute))
         {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Filter Expression can only contain non-primary key attributes: \
-                 Primary key attribute: {key}"
+                "{} can only contain non-primary key attributes: Primary key attribute: {key}",
+                filter.stated_member()
             )));
         }
         // "If you query or scan a global secondary index, you can only request

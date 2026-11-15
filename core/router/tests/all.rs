@@ -2537,3 +2537,18 @@ mod bedrock_agent_ingestion_populates_its_aoss_index;
 // explains. `all/all_rs_carries_no_inner_doc_comment.rs`,
 // `all/every_suite_file_is_declared.rs` pin the rules above for this file and for every
 // service crate's `tests/all.rs`.
+// One `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file, sorted by name, and
+// no other line: two branches landing at once then insert two lines in two places and have
+// no prose to duplicate, re-word or mistype. Put a new suite at `tests/all/<name>.rs` and
+// insert its pair below, in order; what that suite covers, and why it drives the assembled
+// router rather than one service crate, belongs in its own module doc, and a note about
+// THIS file belongs in `all/appended_notes.rs`, declared below like any other suite.
+// EVERY comment here is an ordinary `//` one, this header included: an inner doc comment is
+// legal only before the first item, so one appended past the declarations is `E0753` and
+// compiles no suite of this target — and with none in the file, no merge of two landings can
+// leave one there. A suite no `mod` names compiles nowhere and its tests never run, a suite
+// left at the top level of `tests/` fails the build, and a second `mod` for one name is
+// `E0428`. `tests/all.rs` is a test-target CRATE ROOT, where a bare `mod` resolves to a
+// declaration into `tests/all/`. The `all_rs_*` suites,
+// `all/declaration_roots_are_canonical_and_complete.rs` pin all of it, for this file and for
+// every service crate's `tests/all.rs`, so check there rather than leaving a note here.
