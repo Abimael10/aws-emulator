@@ -188,12 +188,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        // Resolved before the mutable borrow below, so the refusal can state that the ARN
+        // names a custom routing listener — a resource the Custom Routing APIs serve —
+        // rather than nothing at all.
+        let crossing = store.custom_routing_listener_crossing(&input.listener_arn);
         let Some(record) = store.listeners.get_mut(&input.listener_arn) else {
             return Err(UpdateListenerErrorModeled::ListenerNotFoundException(
                 ListenerNotFoundException {
-                    message: Some(crate::state::listener_not_found_message(
-                        &input.listener_arn,
-                    )),
+                    message: Some(crossing.unwrap_or_else(|| {
+                        crate::state::listener_not_found_message(&input.listener_arn)
+                    })),
                 },
             )
             .into());

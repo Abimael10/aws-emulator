@@ -2,7 +2,8 @@
 
 //! @op DescribeListener
 //! Reads one listener back out of [`crate::state`] and reports exactly what was
-//! persisted. An ARN the store does not hold is `ListenerNotFoundException`.
+//! persisted. An ARN the store does not hold is `ListenerNotFoundException`, worded as
+//! the family-scoped lookup in [`crate::state`] states it.
 //!
 //! ## Shape of an operation
 //!
@@ -146,11 +147,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let Some(record) = store.listeners.get(&input.listener_arn) else {
+            // A custom routing listener's ARN names a resource that exists and is served
+            // by the Custom Routing APIs, so it is refused as a family crossing rather
+            // than as an absent resource.
             return Err(DescribeListenerErrorModeled::ListenerNotFoundException(
                 ListenerNotFoundException {
-                    message: Some(crate::state::listener_not_found_message(
-                        &input.listener_arn,
-                    )),
+                    message: Some(
+                        store
+                            .custom_routing_listener_crossing(&input.listener_arn)
+                            .unwrap_or_else(|| {
+                                crate::state::listener_not_found_message(&input.listener_arn)
+                            }),
+                    ),
                 },
             )
             .into());

@@ -15,6 +15,8 @@
 mod accelerator_attributes;
 #[path = "all/accelerator_lifecycle.rs"]
 mod accelerator_lifecycle;
+#[path = "all/cross_family_resolution.rs"]
+mod cross_family_resolution;
 #[path = "all/custom_routing_accelerators.rs"]
 mod custom_routing_accelerators;
 #[path = "all/custom_routing_listeners.rs"]

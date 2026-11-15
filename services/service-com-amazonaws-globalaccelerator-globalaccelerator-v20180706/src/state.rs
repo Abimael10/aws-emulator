@@ -660,6 +660,44 @@ impl ComAmazonawsGlobalacceleratorGlobalacceleratorV20180706State {
             })
     }
 
+    /// The cross-family refusal a STANDARD accelerator lookup of `accelerator_arn` owes,
+    /// or `None` when the ARN names no accelerator of the custom routing family either
+    /// — in which case the calling operation states its own absent-resource wording.
+    ///
+    /// The one place a family-scoped accelerator lookup asks "does the other family hold
+    /// this ARN?", so every standard operation that resolves an `AcceleratorArn` — a
+    /// read, an update, a delete, a list of children, a create's parent check — tells a
+    /// caller that used the wrong API family the same thing.
+    pub fn custom_routing_accelerator_crossing(&self, accelerator_arn: &str) -> Option<String> {
+        self.custom_routing_accelerators
+            .contains_key(accelerator_arn)
+            .then(|| custom_routing_api_required_message(accelerator_arn))
+    }
+
+    /// The cross-family refusal a CUSTOM ROUTING accelerator lookup of `accelerator_arn`
+    /// owes — [`Self::custom_routing_accelerator_crossing`] in the other direction.
+    pub fn standard_accelerator_crossing(&self, accelerator_arn: &str) -> Option<String> {
+        self.accelerators
+            .contains_key(accelerator_arn)
+            .then(|| standard_resource_not_supported_message(accelerator_arn))
+    }
+
+    /// The cross-family refusal a STANDARD listener lookup of `listener_arn` owes — the
+    /// rule [`Self::custom_routing_accelerator_crossing`] states, one level down.
+    pub fn custom_routing_listener_crossing(&self, listener_arn: &str) -> Option<String> {
+        self.custom_routing_listeners
+            .contains_key(listener_arn)
+            .then(|| custom_routing_api_required_message(listener_arn))
+    }
+
+    /// The cross-family refusal a CUSTOM ROUTING listener lookup of `listener_arn` owes —
+    /// [`Self::custom_routing_listener_crossing`] in the other direction.
+    pub fn standard_listener_crossing(&self, listener_arn: &str) -> Option<String> {
+        self.listeners
+            .contains_key(listener_arn)
+            .then(|| standard_resource_not_supported_message(listener_arn))
+    }
+
     /// Drop every idempotency record whose resource is gone.
     ///
     /// This is the release path for [`Self::idempotency`]: a record is only useful
@@ -1155,6 +1193,36 @@ pub fn create_parent_accelerator_not_found_message() -> String {
 /// rule as [`accelerator_not_found_message`], one level down.
 pub fn listener_not_found_message(listener_arn: &str) -> String {
     format!("Listener {listener_arn} not found.")
+}
+
+/// The message a STANDARD operation refuses an ARN with that names a resource of the
+/// CUSTOM ROUTING family.
+///
+/// Standard and custom routing resources are distinct resource types served by distinct
+/// operations — the model gives each kind its own output shape (`Accelerator` vs
+/// `CustomRoutingAccelerator`, `Listener` vs `CustomRoutingListener`) and its own
+/// create, read, update, delete and list — so an ARN that names a custom routing
+/// resource names a resource that EXISTS and is reached through another API family, not
+/// an unknown one: the refusal says which family serves it and names the ARN the request
+/// carried, so the caller can reissue the call. Recorded wire behaviour; the model states
+/// no wording. The sentence is the FAMILY's, not one resource kind's, so it is stated for
+/// a custom routing accelerator and a custom routing listener alike.
+pub fn custom_routing_api_required_message(arn: &str) -> String {
+    format!(
+        "Custom Routing resources must use the Custom Routing APIs; got custom routing \
+         resource: {arn}"
+    )
+}
+
+/// The message a CUSTOM ROUTING operation refuses an ARN with that names a resource of
+/// the STANDARD family — the same rule as [`custom_routing_api_required_message`] in the
+/// other direction, in the wording recorded for it, which names the standard family
+/// rather than the resource kind.
+pub fn standard_resource_not_supported_message(arn: &str) -> String {
+    format!(
+        "Only Custom Routing resources are supported by this custom routing API; got \
+         standard accelerator: {arn}"
+    )
 }
 
 /// The message for a refusal that names an endpoint group the store does not hold. The

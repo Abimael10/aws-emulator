@@ -3,8 +3,9 @@
 //! @op DescribeCustomRoutingListener
 //! Reports the custom routing listener [`crate::state`] holds under the `ListenerArn`
 //! the request names, exactly as it was persisted. An ARN the store holds no custom
-//! routing listener for — including one that names a STANDARD listener — is
-//! `ListenerNotFoundException`. Reads nothing else and writes nothing.
+//! routing listener for — including one that names a STANDARD listener, which is refused
+//! as the family crossing it is — is `ListenerNotFoundException`. Reads nothing else and
+//! writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -151,12 +152,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let Some(record) = store.custom_routing_listeners.get(&input.listener_arn) else {
+            // A standard listener's ARN names a resource that exists and is served by the
+            // standard APIs, so it is refused as a family crossing rather than as an
+            // absent resource.
             return Err(
                 DescribeCustomRoutingListenerErrorModeled::ListenerNotFoundException(
                     ListenerNotFoundException {
-                        message: Some(crate::state::listener_not_found_message(
-                            &input.listener_arn,
-                        )),
+                        message: Some(
+                            store
+                                .standard_listener_crossing(&input.listener_arn)
+                                .unwrap_or_else(|| {
+                                    crate::state::listener_not_found_message(&input.listener_arn)
+                                }),
+                        ),
                     },
                 )
                 .into(),

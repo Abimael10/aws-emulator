@@ -168,11 +168,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let Some(record) = store.listeners.get(&input.listener_arn) else {
+            // A custom routing listener's ARN names a resource the Custom Routing APIs
+            // serve, not an absent one.
             return Err(DeleteListenerErrorModeled::ListenerNotFoundException(
                 ListenerNotFoundException {
-                    message: Some(crate::state::listener_not_found_message(
-                        &input.listener_arn,
-                    )),
+                    message: Some(
+                        store
+                            .custom_routing_listener_crossing(&input.listener_arn)
+                            .unwrap_or_else(|| {
+                                crate::state::listener_not_found_message(&input.listener_arn)
+                            }),
+                    ),
                 },
             )
             .into());

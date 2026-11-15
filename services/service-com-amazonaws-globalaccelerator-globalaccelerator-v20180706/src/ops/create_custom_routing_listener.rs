@@ -189,15 +189,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // A custom routing listener hangs off a custom routing accelerator: a standard
-        // accelerator's ARN names no parent for this create.
+        // accelerator's ARN names a resource the standard APIs serve, not a parent for
+        // this create.
         if !store
             .custom_routing_accelerators
             .contains_key(&input.accelerator_arn)
         {
+            let message = store
+                .standard_accelerator_crossing(&input.accelerator_arn)
+                .unwrap_or_else(crate::state::create_parent_accelerator_not_found_message);
             return Err(
                 CreateCustomRoutingListenerErrorModeled::AcceleratorNotFoundException(
                     AcceleratorNotFoundException {
-                        message: Some(crate::state::create_parent_accelerator_not_found_message()),
+                        message: Some(message),
                     },
                 )
                 .into(),

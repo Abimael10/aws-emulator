@@ -169,14 +169,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         // The attributes belong to the accelerator, so an ARN the store does not hold
-        // is the accelerator that "doesn't exist" (`AcceleratorNotFoundException`).
+        // is the accelerator that "doesn't exist" (`AcceleratorNotFoundException`) —
+        // unless it names a custom routing accelerator, whose attributes the Custom
+        // Routing APIs update.
         if !store.accelerators.contains_key(&input.accelerator_arn) {
+            let message = store
+                .custom_routing_accelerator_crossing(&input.accelerator_arn)
+                .unwrap_or_else(|| {
+                    crate::state::accelerator_not_found_message(&input.accelerator_arn)
+                });
             return Err(
                 UpdateAcceleratorAttributesErrorModeled::AcceleratorNotFoundException(
                     AcceleratorNotFoundException {
-                        message: Some(crate::state::accelerator_not_found_message(
-                            &input.accelerator_arn,
-                        )),
+                        message: Some(message),
                     },
                 )
                 .into(),

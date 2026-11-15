@@ -157,11 +157,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let Some(parent) = store.accelerators.get(&input.accelerator_arn) else {
+            // A custom routing accelerator's ARN names a resource the Custom Routing APIs
+            // serve — its listeners are listed through them — not an absent one.
             return Err(ListListenersErrorModeled::AcceleratorNotFoundException(
                 AcceleratorNotFoundException {
-                    message: Some(crate::state::accelerator_not_found_message(
-                        &input.accelerator_arn,
-                    )),
+                    message: Some(
+                        store
+                            .custom_routing_accelerator_crossing(&input.accelerator_arn)
+                            .unwrap_or_else(|| {
+                                crate::state::accelerator_not_found_message(&input.accelerator_arn)
+                            }),
+                    ),
                 },
             )
             .into());

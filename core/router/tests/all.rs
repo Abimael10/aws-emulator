@@ -1827,3 +1827,18 @@ mod zz_probe_whole_emulator;
 // `mod` is what points it into `tests/all/`. A suite no `mod` here names compiles nowhere and
 // its tests never run, and a suite declared twice is `E0428` — each fails EVERY suite of this
 // target. `all/all_rs_carries_no_inner_doc_comment.rs`,
+// name, and no other line — so two branches landing at once insert two lines in two places
+// and have no prose to duplicate, re-word or mistype. A file no pair names is compiled
+// nowhere and its tests never run; a suite left at the top level of `tests/` fails the build;
+// a second pair for one name is `E0428`; and a doc comment of this module, written past the
+// first item, is `E0753`. Each of the last two fails EVERY suite of this target, which is why
+// every comment in this file is an ordinary one, this header included: with none of the other
+// form anywhere in the file, no appended, re-typed or merged copy of a line of it can be one.
+// An inner attribute, like a module doc comment, is legal only before the first item, so the
+// one below stands here rather than in the list.
+// `mod` is what points the declaration into `tests/all/`.
+// belongs in that suite's own module header, where it is read beside the test it explains;
+// `all/appended_notes.rs` keeps the notes earlier landings had appended here. The sibling
+// suites `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/every_suite_file_is_declared.rs` check the rules above — for this file and for every
+// service crate's `tests/all.rs` — so check there rather than leaving a note here.

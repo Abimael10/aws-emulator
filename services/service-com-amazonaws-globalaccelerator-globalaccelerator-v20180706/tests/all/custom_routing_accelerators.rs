@@ -467,8 +467,8 @@ async fn the_ip_address_type_of_a_custom_routing_accelerator_must_be_ipv4() {
 }
 
 /// RULE: the two kinds of accelerator are distinct resources — each is reported only by
-/// the operations of its own kind, and an ARN of the other kind is as absent as one that
-/// was never created.
+/// the operations of its own kind, an ARN of the other kind is refused as a resource this
+/// API family does not serve, and an ARN that names nothing is absent.
 #[tokio::test]
 async fn each_accelerator_kind_is_reported_only_by_its_own_operations() {
     let router = emulator();
@@ -494,34 +494,58 @@ async fn each_accelerator_kind_is_reported_only_by_its_own_operations() {
         custom.push(arn_of(&accelerator));
     }
 
-    // Every cross-kind read is a row, plus an ARN that names nothing at all.
+    // Every cross-kind read is a row, plus an ARN that names nothing at all. The
+    // API-separation wording is pinned over the whole class by
+    // [`super::cross_family_resolution`].
     let unknown = format!("{}-gone", standard[0]);
-    let cases: Vec<(&str, &str, &str)> = vec![
-        ("custom via DescribeAccelerator", "DescribeAccelerator", &custom[0]),
-        ("custom via DescribeAccelerator, second", "DescribeAccelerator", &custom[1]),
+    let crossed_into_custom = |arn: &str| {
+        format!(
+            "Custom Routing resources must use the Custom Routing APIs; got custom routing \
+             resource: {arn}"
+        )
+    };
+    let cases: Vec<(&str, &str, &str, String)> = vec![
+        (
+            "custom via DescribeAccelerator",
+            "DescribeAccelerator",
+            &custom[0],
+            crossed_into_custom(&custom[0]),
+        ),
+        (
+            "custom via DescribeAccelerator, second",
+            "DescribeAccelerator",
+            &custom[1],
+            crossed_into_custom(&custom[1]),
+        ),
         (
             "standard via DescribeCustomRoutingAccelerator",
             "DescribeCustomRoutingAccelerator",
             &standard[0],
+            format!(
+                "Only Custom Routing resources are supported by this custom routing API; got \
+                 standard accelerator: {}",
+                standard[0]
+            ),
         ),
         (
             "unknown via DescribeCustomRoutingAccelerator",
             "DescribeCustomRoutingAccelerator",
             &unknown,
+            format!("Accelerator {unknown} not found."),
         ),
     ];
-    for (case, operation, arn) in cases {
+    for (case, operation, arn, expected) in cases {
         let (status, body) = call(&router, operation, json!({ "AcceleratorArn": arn })).await;
         // The status this service answers a missing resource with is pinned, for every
         // operation that can answer one, by [`super::not_found_error_status`].
         assert_eq!(
             (status, error_code(&body).as_str()),
             (400, "AcceleratorNotFoundException"),
-            "case {case}: expected the ARN to be absent, got {status} {body}"
+            "case {case}: expected this API family not to serve the ARN, got {status} {body}"
         );
         assert_eq!(
             error_message(&body),
-            format!("Accelerator {arn} not found."),
+            expected,
             "case {case}: expected the refusal to name the ARN the request carried, got {body}"
         );
     }

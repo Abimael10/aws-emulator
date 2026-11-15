@@ -192,9 +192,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         if !store.accelerators.contains_key(&input.accelerator_arn) {
+            // A custom routing accelerator's ARN names a resource the Custom Routing APIs
+            // serve, so the crossing is stated instead of the create path's
+            // absent-parent sentence.
+            let message = store
+                .custom_routing_accelerator_crossing(&input.accelerator_arn)
+                .unwrap_or_else(crate::state::create_parent_accelerator_not_found_message);
             return Err(CreateListenerErrorModeled::AcceleratorNotFoundException(
                 AcceleratorNotFoundException {
-                    message: Some(crate::state::create_parent_accelerator_not_found_message()),
+                    message: Some(message),
                 },
             )
             .into());

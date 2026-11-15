@@ -198,11 +198,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // without a second borrow of the store, and the lock is held across both, so no
         // other request can observe a half-applied update.
         let Some(mut record) = store.accelerators.get(&input.accelerator_arn).cloned() else {
+            // A custom routing accelerator's ARN names a resource the Custom Routing APIs
+            // serve, not an absent one.
             return Err(UpdateAcceleratorErrorModeled::AcceleratorNotFoundException(
                 AcceleratorNotFoundException {
-                    message: Some(crate::state::accelerator_not_found_message(
-                        &input.accelerator_arn,
-                    )),
+                    message: Some(
+                        store
+                            .custom_routing_accelerator_crossing(&input.accelerator_arn)
+                            .unwrap_or_else(|| {
+                                crate::state::accelerator_not_found_message(&input.accelerator_arn)
+                            }),
+                    ),
                 },
             )
             .into());

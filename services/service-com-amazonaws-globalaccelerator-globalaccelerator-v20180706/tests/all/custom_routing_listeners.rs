@@ -401,7 +401,7 @@ async fn an_idempotency_token_replays_only_its_own_create() {
 
 /// RULE: the two kinds of listener are distinct resources — each hangs off an accelerator
 /// of its own kind and is reported only by the operations of its own kind, and a
-/// reference of the other kind is as absent as one that was never created.
+/// reference of the other kind is refused as a resource this API family does not serve.
 #[tokio::test]
 async fn each_listener_kind_is_reached_only_through_its_own_operations() {
     let router = emulator();
@@ -435,25 +435,36 @@ async fn each_listener_kind_is_reached_only_through_its_own_operations() {
 
     // Every cross-kind read is a row, plus an ARN that names nothing at all. The status
     // this service answers a missing resource with is pinned, for every operation that
-    // can answer one, by [`super::not_found_error_status`].
-    let cases: Vec<(&str, &str, &str)> = vec![
+    // can answer one, by [`super::not_found_error_status`]; the wording of a CROSSING —
+    // an ARN that names a real listener of the other family — is the API-separation
+    // sentence, pinned over the whole class by [`super::cross_family_resolution`].
+    let cases: Vec<(&str, &str, &str, String)> = vec![
         (
             "custom via DescribeListener",
             "DescribeListener",
             &custom_listener,
+            format!(
+                "Custom Routing resources must use the Custom Routing APIs; got custom \
+                 routing resource: {custom_listener}"
+            ),
         ),
         (
             "standard via DescribeCustomRoutingListener",
             "DescribeCustomRoutingListener",
             &standard_listener,
+            format!(
+                "Only Custom Routing resources are supported by this custom routing API; \
+                 got standard accelerator: {standard_listener}"
+            ),
         ),
         (
             "unminted via DescribeCustomRoutingListener",
             "DescribeCustomRoutingListener",
             &unminted,
+            format!("Listener {unminted} not found."),
         ),
     ];
-    for (case, operation, listener_arn) in cases {
+    for (case, operation, listener_arn, expected) in cases {
         let (status, body) = call(
             &router,
             operation,
@@ -463,11 +474,11 @@ async fn each_listener_kind_is_reached_only_through_its_own_operations() {
         assert_eq!(
             (status, error_code(&body).as_str()),
             (400, "ListenerNotFoundException"),
-            "case {case}: expected the ARN to be absent, got {status} {body}"
+            "case {case}: expected this API family not to serve the ARN, got {status} {body}"
         );
         assert_eq!(
             error_message(&body),
-            format!("Listener {listener_arn} not found."),
+            expected,
             "case {case}: expected the refusal to name the ARN the request carried, got {body}"
         );
     }
@@ -491,8 +502,10 @@ async fn each_listener_kind_is_reached_only_through_its_own_operations() {
          got {read_standard}"
     );
 
-    // A create's parent must be an accelerator of its own kind, whichever way round.
-    let cross_parent: Vec<(&str, &str, Value)> = vec![
+    // A create's parent must be an accelerator of its own kind, whichever way round. A
+    // parent ARN that names an accelerator of the OTHER family is refused as the family
+    // crossing it is, naming the ARN the request carried.
+    let cross_parent: Vec<(&str, &str, Value, String)> = vec![
         (
             "custom listener on a standard accelerator",
             "CreateCustomRoutingListener",
@@ -501,6 +514,10 @@ async fn each_listener_kind_is_reached_only_through_its_own_operations() {
                 "PortRanges": [{ "FromPort": 80, "ToPort": 80 }],
                 "IdempotencyToken": "cross-custom",
             }),
+            format!(
+                "Only Custom Routing resources are supported by this custom routing API; \
+                 got standard accelerator: {standard_parent}"
+            ),
         ),
         (
             "standard listener on a custom routing accelerator",
@@ -511,19 +528,23 @@ async fn each_listener_kind_is_reached_only_through_its_own_operations() {
                 "Protocol": "TCP",
                 "IdempotencyToken": "cross-standard",
             }),
+            format!(
+                "Custom Routing resources must use the Custom Routing APIs; got custom \
+                 routing resource: {custom_parent}"
+            ),
         ),
     ];
-    for (case, operation, body) in cross_parent {
+    for (case, operation, body, expected) in cross_parent {
         let (status, parsed) = call(&router, operation, body).await;
         assert_eq!(
             (status, error_code(&parsed).as_str()),
             (400, "AcceleratorNotFoundException"),
-            "case {case}: expected the parent to be absent, got {status} {parsed}"
+            "case {case}: expected the parent not to be served by this API, got {status} {parsed}"
         );
         assert_eq!(
             error_message(&parsed),
-            "Could not find accelerator.",
-            "case {case}: expected the create path's wording, got {parsed}"
+            expected,
+            "case {case}: expected the API-separation wording, got {parsed}"
         );
     }
 }
