@@ -62,6 +62,12 @@ const ENDPOINT_PREFIX: &str = "agent-registry-control";
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The codec every modelled body of this service is read with and written with,
+    /// built ONCE here because [`Service::override_protocol`] hands back a borrow of
+    /// `&self` and must never build a protocol per request. It is the model's own
+    /// `restJson1` with the timestamp form this model declares; see the
+    /// [`ServerProtocol`] impl below.
+    body_codec: service_common::date_time_json::DateTimeRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -71,19 +77,28 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            body_codec: service_common::date_time_json::DateTimeRestJson::new(),
         }
     }
 }
 
 /// The protocol this service answers modelled requests in: the model's own `restJson1`,
-/// with the one framing correction `service-common`'s no-content module states — an answer
-/// at HTTP 204 carries no body, where the serializer renders the empty JSON object for an
-/// output structure that declares no member.
+/// with the two corrections `service-common` states for every service of this class.
 ///
-/// Implemented on the service itself because the model-derived protocol it delegates to is
-/// owned by the generated entry and reached by reference (`self.entry.protocol()`), and
-/// [`Service::override_protocol`] hands back a borrow of `&self` — so there is one protocol
-/// instance, the generated one, and no second routing table to drift from the model.
+/// * A timestamp goes onto the wire in the form its target timestamp shape declares. Every
+///   timestamp member of this model targets `DateTimestamp`, which carries
+///   `@timestampFormat("date-time")`, so each one is an RFC 3339 date-time STRING and not
+///   the epoch-seconds number `restJson1` defaults to — `service_common::date_time_json`
+///   holds that rule, and why a generated member schema cannot carry the format itself.
+/// * An answer at HTTP 204 carries no body, where the serializer renders the empty JSON
+///   object for an output structure that declares no member.
+///
+/// Implemented on the service itself because [`Service::override_protocol`] hands back a
+/// borrow of `&self`: the two corrections wrap one codec held in a field and built once at
+/// construction, so no protocol is built per request. ROUTING stays the generated entry's —
+/// `protocol_id` and `routing_key` are read off the model's own protocol, whose table is the
+/// model's — so the corrected codec drives only the modelled body sequence and no second
+/// routing table can drift from the model.
 impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
     type Request = WireRequest;
     type Response = WireResponse;
@@ -101,9 +116,11 @@ impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
         request: &'a WireRequest,
         input_schema: &Schema,
     ) -> Result<Box<dyn aws_smithy_schema::serde::ShapeDeserializer + 'a>, ProtocolError> {
-        self.entry
-            .protocol()
-            .deserialize_input(request, input_schema)
+        // Read through the same codec the answer is written with, so a timestamp a request
+        // carries is parsed in the form this model declares for it. No input member of this
+        // model is a timestamp today, so this is the model's own parse; the seam is uniform
+        // rather than corrected on one side only.
+        self.body_codec.deserialize_input(request, input_schema)
     }
 
     fn serialize_output(
@@ -113,7 +130,7 @@ impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
         operation_name: &str,
         success_status: u16,
     ) -> Result<WireResponse, ProtocolError> {
-        let response = self.entry.protocol().serialize_output(
+        let response = self.body_codec.serialize_output(
             output,
             output_schema,
             operation_name,
@@ -132,8 +149,7 @@ impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
         http_status: u16,
     ) -> Result<WireResponse, ProtocolError> {
         let response = self
-            .entry
-            .protocol()
+            .body_codec
             .serialize_error(error, error_schema, error_code, http_status)?;
         // Every modelled failure of this service carries its error envelope at a 4xx or
         // 5xx, so nothing here is emptied; the same call is made on both paths rather than
@@ -148,7 +164,7 @@ impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
         event: &dyn aws_smithy_schema::serde::SerializableStruct,
         event_schema: &Schema,
     ) -> Result<WireResponse, ProtocolError> {
-        self.entry.protocol().serialize_event_stream_message(
+        self.body_codec.serialize_event_stream_message(
             event_type,
             is_exception,
             event,
@@ -176,11 +192,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
-        // Every response a modelled operation of this service produces is serialized by the
-        // protocol returned here: the model's own, with the one framing correction below —
-        // an answer at a no-content status carries no body. `TagResource` and
-        // `UntagResource` both declare `http { code: 204 }` over an output structure with
-        // no members, which the serializer would otherwise render as the empty JSON object.
+        // Every modelled request this service reads, and every answer it produces, goes
+        // through the protocol returned here: the model's own, with the two corrections the
+        // `ServerProtocol` impl above states — every timestamp in the `date-time` form this
+        // model's one timestamp shape declares, and no body on an answer at a no-content
+        // status. (`TagResource` and `UntagResource` both declare `http { code: 204 }` over
+        // an output structure with no members, which the serializer would otherwise render
+        // as the empty JSON object.)
         Some(self)
     }
 

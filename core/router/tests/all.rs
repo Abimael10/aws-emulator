@@ -1941,3 +1941,18 @@ mod cloudtrail_iam_credential_write_audit;
 // The lint allowed below is for the suite files this root compiles: a wrapped paragraph in a
 // module header is a note rather than a build failure. An inner attribute, like an inner doc
 // comment, is legal only before the first item, so it stands here rather than in the list.
+//! Put a new suite at `tests/all/<name>.rs` and insert its `#[path = "all/<name>.rs"]` /
+//! `mod <name>;` pair into the sorted list below. This file holds this header and those
+//! pairs, and no other line — so two branches landing at once insert two lines in two
+//! places and have no prose to duplicate, re-word or mistype.
+//! THIS HEADER IS THE ONLY PLACE A `//!` LINE MAY STAND IN THIS FILE: an inner doc comment
+//! is legal only before the first item, so one written past the first declaration is
+//! `E0753` and compiles no suite of this target. A suite declared twice is `E0428`, and a
+//! suite file no `mod` names is compiled nowhere.
+//! `all/all_rs_is_a_canonical_declaration_list.rs`,
+//! service crate's `tests/all.rs`, so check there rather than leaving a note below.
+//! The `#[path]` attribute is what points each declaration into `tests/all/`: this file is
+//! a test-target CRATE ROOT, where a bare `mod` would resolve to a sibling of it, which the
+//! layout check refuses. What a suite covers, and why it drives the assembled router rather
+//! than one service crate, belongs in that suite's own module doc; a note about this file
+//! itself belongs in `all/appended_notes.rs`.
