@@ -125,14 +125,20 @@ fn identity_policies() -> Vec<DocumentCase> {
 
 /// The characters RFC 3986 leaves unencoded: "unreserved characters" are the ASCII letters
 /// and digits plus `-`, `.`, `_` and `~`.
-fn is_unreserved(character: char) -> bool {
+///
+/// The ONE definition of that set for this crate's tests, shared with the sibling suite about
+/// the instance-profile listings (`tests/all/instance_profile_listing_document_encoding.rs`).
+pub(crate) fn is_unreserved(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_' | '~')
 }
 
 /// Assert that `reported` is a percent-ENCODED document: every character of it is either
 /// unreserved or part of a `%XX` escape, so nothing a policy document is punctuated with
 /// (`{`, `"`, `:`, `,`, `[`, `]`, `*`, `/`, a space, a tab) reaches the caller as itself.
-fn assert_percent_encoded(case: &str, reported: &str) {
+///
+/// The hexadecimal digits are UPPER-case, which is the form the recorded AWS responses carry
+/// (`%7B`, `%22`, `%3A`). Shared with the sibling suite named on [`is_unreserved`].
+pub(crate) fn assert_percent_encoded(case: &str, reported: &str) {
     let mut characters = reported.chars();
     while let Some(character) = characters.next() {
         if is_unreserved(character) {
@@ -145,9 +151,12 @@ fn assert_percent_encoded(case: &str, reported: &str) {
         );
         let escape: String = characters.by_ref().take(2).collect();
         assert!(
-            escape.len() == 2 && escape.chars().all(|digit| digit.is_ascii_hexdigit()),
-            "case {case:?}: expected two hexadecimal digits after a '%', got {escape:?} in \
-             {reported:?}"
+            escape.len() == 2
+                && escape
+                    .chars()
+                    .all(|digit| digit.is_ascii_digit() || matches!(digit, 'A'..='F')),
+            "case {case:?}: expected two upper-case hexadecimal digits after a '%', got \
+             {escape:?} in {reported:?}"
         );
     }
 }

@@ -1930,3 +1930,5 @@ mod cognito_user_pool_replica_over_a_multi_region_key;
 // `all/appended_header_notes.rs` and `all/appended_prose.rs`, declared below like any
 // other suite.
 // An inner attribute, like a module doc comment, is legal only before the first item, so
+// An inner attribute is legal only before the first item of the file, which is why this one
+// stands here rather than among the declarations below.
