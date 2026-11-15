@@ -1348,8 +1348,6 @@ mod zz_probe_whole_emulator;
 // twice is `E0428`. The `all/all_rs_*` suites, `all/every_suite_file_is_declared.rs` and
 // into `tests/all/`. Some of the files below are shared harnesses or probes rather than
 // suites; every one of them is declared, because a file no declaration names is compiled
-#[path = "all/cloudformation_provisions_appsync_event_and_merged_apis.rs"]
-mod cloudformation_provisions_appsync_event_and_merged_apis;
 // `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs`,
 // `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs`, for this file and
 // for every service crate's own `tests/all.rs`. What a suite covers belongs in that suite's own
@@ -1377,8 +1375,6 @@ mod cloudformation_provisions_appsync_event_and_merged_apis;
 // `all/all_rs_declares_each_suite_once.rs`,
 // `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` pin all of that, for
 // this file and for every service crate's own `tests/all.rs`.
-#[path = "all/s3_notification_granted_function_writes_back_into_the_bucket.rs"]
-mod s3_notification_granted_function_writes_back_into_the_bucket;
 // Single integration-test target for the router: the canonical declaration list of its
 // cross-service suites, and nothing else. One `#[path = "all/<name>.rs"]` / `mod <name>;` pair
 // per file under `tests/all/`, sorted by name, and no other line — put a new suite at
@@ -1388,8 +1384,6 @@ mod s3_notification_granted_function_writes_back_into_the_bucket;
 // suite covers belongs in that suite's own module header, and a note about this file in
 // `all/appended_notes.rs`, declared below like any other suite. The `all_rs_*`,
 // `declaration_roots_*` and `every_suite_file_is_declared` suites pin all of it.
-#[path = "all/cloudformation_asg_launch_fault_diagnosis.rs"]
-mod cloudformation_asg_launch_fault_diagnosis;
 // cross-service suite under `tests/all/`, and nothing else. Put a new suite at
 // `tests/all/<name>.rs` and insert ONE `#[path = "all/<name>.rs"]` / `mod <name>;` pair into
 // the list below, in the one place its name sorts to; what that suite covers, and why it
@@ -1408,8 +1402,6 @@ mod cloudformation_asg_launch_fault_diagnosis;
 // The lint allowed below is for the suite files this root compiles: a module header that
 // wraps a paragraph without the indentation `clippy::doc_lazy_continuation` asks of a doc
 // list item is a note rather than a build failure.
-#[path = "all/apigateway_cognito_authorizer_spares_the_proxy_lambda.rs"]
-mod apigateway_cognito_authorizer_spares_the_proxy_lambda;
 // and why it drives the assembled router rather than one service crate, belongs in the
 // suite's own module header, where it is read beside the test it explains.
 // Three rules bind this file, and each of them fails EVERY suite of this target rather than
@@ -1424,8 +1416,6 @@ mod apigateway_cognito_authorizer_spares_the_proxy_lambda;
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod <name>;` would resolve to a
 // SIBLING of this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]`
 // above each declaration is what points it into `tests/all/`.
-#[path = "all/sts_session_context_keys.rs"]
-mod sts_session_context_keys;
 // The lint allowed here is for the suite files this root compiles: a wrapped paragraph in a
 // module header is a note rather than a build failure. An inner attribute is legal only
 // BEFORE the first item, so it stands here, ahead of the declaration list, rather than among

@@ -799,6 +799,11 @@ mod access_association_domain_resolution;
 // path it addressed, for the principal its credential speaks for.
 #[path = "all/control_plane_authorization.rs"]
 mod control_plane_authorization;
+// Appended for the reason the note above gives: WHEN the account's CloudWatch Logs role gates
+// a stage's execution logging — each configuration call judged against the account as it
+// stands then, and only the direction that turns logging ON.
+#[path = "all/stage_logging_role_current_setting.rs"]
+mod stage_logging_role_current_setting;
 // Appended for the reason the note above gives: how this service refuses the PAYLOAD of the
 // three operations whose payload it reads itself or leaves to the required-member check — a
 // request that carries none at all, and a definition document that does not say which format

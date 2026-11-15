@@ -40,13 +40,14 @@ const STAGE: &str = "prod";
 /// cleared again — a scope no earlier step of the row has configured.
 const OTHER_STAGE: &str = "staging";
 
-/// The JSON Pointer of the account member that carries the CloudWatch Logs role.
-const CLOUDWATCH_ROLE_PATH: &str = "/cloudwatchRoleArn";
+/// The JSON Pointer of the account member that carries the CloudWatch Logs role. Shared with
+/// the sibling `stage_logging_role_current_setting` suite, which patches the same member.
+pub(crate) const CLOUDWATCH_ROLE_PATH: &str = "/cloudwatchRoleArn";
 
 /// The message API Gateway refuses a stage configuration that turns execution logging on
 /// without the account's CloudWatch Logs role with: entirely fixed text for this error
 /// class, naming neither the stage, the method scope nor the setting the patch carried.
-const ROLE_REQUIRED: &str =
+pub(crate) const ROLE_REQUIRED: &str =
     "CloudWatch Logs role ARN must be set in account settings to enable logging";
 
 /// One row: the case name, the `patchOperations` it sends, and the `methodSettings` entries
@@ -59,12 +60,12 @@ type GatedRow = (
 );
 
 /// One `replace` of `path` with `value`.
-fn replace(path: &str, value: &str) -> Value {
+pub(crate) fn replace(path: &str, value: &str) -> Value {
     json!({ "op": "replace", "path": path, "value": value })
 }
 
 /// `UpdateStage` for `stage_name` of `api` with `operations`.
-async fn update_stage(
+pub(crate) async fn update_stage(
     gateway: &Gateway,
     api: &str,
     stage_name: &str,
@@ -100,7 +101,7 @@ async fn deployed_api(gateway: &Gateway, name: &str) -> String {
 
 /// Assert `answer` is the refusal of this error class: the modelled status and code, and
 /// the fixed sentence of [`ROLE_REQUIRED`].
-fn assert_role_required(answer: &Answer, case: &str) {
+pub(crate) fn assert_role_required(answer: &Answer, case: &str) {
     assert_failure(answer, 400, "BadRequestException", case);
     assert_eq!(
         answer.body["message"].as_str(),
@@ -111,7 +112,7 @@ fn assert_role_required(answer: &Answer, case: &str) {
 }
 
 /// The account's role as `GetAccount` reports it.
-async fn reported_role(gateway: &Gateway) -> Value {
+pub(crate) async fn reported_role(gateway: &Gateway) -> Value {
     get_account(gateway).await[CLOUDWATCH_ROLE_PATH
         .strip_prefix('/')
         .expect("the pointer names a member")]
