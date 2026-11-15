@@ -1408,10 +1408,6 @@ mod zz_probe_whole_emulator;
 // what points the declaration into `tests/all/`.
 // The `all/all_rs_*` suites, `all/every_suite_file_is_declared.rs`,
 // one this target needs stands in the header above rather than in the list below.
-#[path = "all/eks_nodegroup_nodes_join_the_cluster_api.rs"]
-mod eks_nodegroup_nodes_join_the_cluster_api;
-#[path = "all/apigateway_custom_domain_dns_alias.rs"]
-mod apigateway_custom_domain_dns_alias;
 // one this target needs stands HERE, ahead of the declaration list.
 // suite file, sorted by name, and NO other line: no prose between the pairs, no blank line,
 // and nothing at all after the last pair. Put a new suite at `tests/all/<name>.rs` and insert
@@ -1435,8 +1431,6 @@ mod apigateway_custom_domain_dns_alias;
 // no declaration names is compiled nowhere.
 // build failure. An inner attribute, like an inner doc comment, is legal only before the first
 // item, so it stands here rather than in the list.
-#[path = "all/cloudformation_provisions_bedrock_flows.rs"]
-mod cloudformation_provisions_bedrock_flows;
 // cross-service suite under `tests/all/`, and nothing else. Past this header the file holds
 // one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`, sorted by
 // name, and no other line — no prose between the pairs, no blank line, and nothing after the
@@ -1509,3 +1503,8 @@ mod bedrock_evaluation_job_saves_its_results_in_s3;
 // `all/declaration_roots_end_with_their_last_declaration.rs`,
 // service crate's `tests/all.rs`, so check there rather than leaving a note here, and
 // `all/appended_prose.rs` keep what the notes earlier landings had appended here said.
+// Single integration-test target for the router: one `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair per file under `tests/all/`, sorted by name, and no other line.
+// `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`
+// pin that shape; `all/appended_prose.rs` keeps what landings had appended here.
+// Single integration-test target for the router: the declaration list, and nothing else.

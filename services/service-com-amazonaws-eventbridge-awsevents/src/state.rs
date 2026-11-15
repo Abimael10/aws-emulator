@@ -4162,6 +4162,12 @@ pub fn target_arn_violation(target: &Target) -> Option<String> {
     .flatten()
     .find(|value| !is_arn(value))
     .map(invalid_arn_violation)
+    // An ARN of the right FORM still has to name a resource a rule can invoke:
+    // for a service EventBridge addresses one kind of resource of, an ARN naming
+    // another kind of it points at nothing invocable
+    // ([`request_validation::uninvocable_target_arn`]), and is refused in the
+    // same words as text that is no ARN at all.
+    .or_else(|| request_validation::uninvocable_target_arn(&target.arn))
 }
 
 /// What a refusal states for an ARN-valued member holding text that is not an
@@ -4844,6 +4850,11 @@ pub mod retry_bounds;
 /// service a referenced resource has to belong to, and the members another
 /// member makes required — each stated once, for every operation that writes it.
 pub mod request_validation;
+
+/// Whose ACCOUNT the resources a rule's targets name may belong to — the one
+/// cross-account destination EventBridge delivers to, and the refusal every other
+/// foreign resource earns.
+pub mod target_account;
 
 /// Whether the caller may HAND this service the IAM role a request names — the
 /// `iam:PassRole` pass every operation that takes a role ARN makes.

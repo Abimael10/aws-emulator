@@ -123,6 +123,12 @@ async fn given_bus_and_rule(router: &MultiServiceRouter, name: &str, rule: &str)
 /// BUS is gone: the resource is resolved first, so the caller is told the one
 /// thing no change to its body can fix. The same body against the bus that still
 /// exists is refused for the body, which is what makes the order observable.
+///
+/// The one member judged BEFORE the bus is resolved is a rule's `EventPattern`,
+/// which EventBridge reads first so a pattern the language does not admit is
+/// reported as such whatever else the request names — the precedence
+/// `tests/all/target_configuration_refusals.rs` owns, and the one `CreateArchive`
+/// and `UpdateArchive` already followed.
 #[tokio::test]
 async fn a_missing_bus_or_rule_is_reported_before_the_body_is_judged() {
     let bus = "orders";
@@ -133,11 +139,6 @@ async fn a_missing_bus_or_rule_is_reported_before_the_body_is_judged() {
             "a rule with neither an EventPattern nor a ScheduleExpression",
             "PutRule",
             json!({ "Name": rule, "EventBusName": bus }),
-        ),
-        (
-            "a rule whose EventPattern is not a pattern",
-            "PutRule",
-            json!({ "Name": rule, "EventBusName": bus, "EventPattern": "not-json" }),
         ),
         (
             "a rule whose ScheduleExpression is neither a rate nor a cron expression",

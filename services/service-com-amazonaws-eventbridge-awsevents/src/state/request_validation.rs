@@ -17,6 +17,8 @@
 //! the service states only that a parameter is not valid, the refusal is that
 //! subject clause alone ([`super::parameter_not_valid`]).
 
+use crate::ops::types::{AwsVpcConfiguration, EcsParameters};
+
 use super::{
     invalid_arn_violation, parameter_not_valid, schedule, DeadLetterConfig, Tag, Target,
     ARN_NAMESPACE, DEFAULT_EVENT_BUS_NAME,
@@ -150,10 +152,12 @@ pub fn reserved_tag_key_violation(tags: &[Tag]) -> Option<String> {
 ///
 /// The per-target requirements that follow from the target's own TYPE and from
 /// the members it carries, in the order a caller has to resolve them: the role
-/// EventBridge needs to invoke the target at all, the parameters the target's
-/// own kind of resource can only be delivered to with, the service its
-/// dead-letter destination has to belong to, and the JSON paths it reshapes its
-/// input with. Each is a property of ONE target, so the request is refused whole
+/// EventBridge needs to invoke the target at all, the parameter BLOCK the
+/// target's own kind of resource can only be delivered to with, what that block
+/// itself states (an ECS task's definition, count, launch type and network
+/// configuration — [`ecs_parameters_violation`]), the service its dead-letter
+/// destination has to belong to, and the JSON paths it reshapes its input with.
+/// Each is a property of ONE target, so the request is refused whole
 /// before any of its targets is stored — a rule carrying a target EventBridge
 /// could never invoke would report back a healthy rule that delivers nothing.
 ///
@@ -163,6 +167,7 @@ pub fn reserved_tag_key_violation(tags: &[Tag]) -> Option<String> {
 pub fn target_violation(target: &Target) -> Option<String> {
     target_role_violation(target)
         .or_else(|| target_parameters_violation(target))
+        .or_else(|| ecs_parameters_violation(target))
         .or_else(|| {
             target
                 .dead_letter_config
@@ -170,6 +175,342 @@ pub fn target_violation(target: &Target) -> Option<String> {
                 .and_then(dead_letter_arn_violation)
         })
         .or_else(|| target_input_path_violation(target))
+}
+
+/// The services EventBridge invokes exactly ONE kind of resource of, and the
+/// resource type a target of such a service has to name.
+///
+/// `Target$Arn` is "the Amazon Resource Name (ARN) of the target", and for a
+/// service of this class that is the resource EventBridge makes the call ON rather
+/// than the work it asks for: an Amazon ECS target names the CLUSTER a task runs on
+/// and carries the task itself in its parameter block ("contains the Amazon ECS
+/// task definition and task count to be used, if the event target is an Amazon ECS
+/// task", `Target$EcsParameters`). So an ARN of that service naming any other
+/// resource of it addresses nothing a rule could invoke, and the member is modelled
+/// a plain 1..1600 string with no pattern, so the boundary validator passes it and
+/// the class is read here.
+///
+/// It holds the ONE service whose single target class is established — Amazon ECS,
+/// where the parameter block's own documentation says what the ARN names. A service
+/// EventBridge addresses several kinds of resource of (Systems Manager, whose
+/// targets are both a Run Command document and an Automation definition) must not be
+/// entered at all, since naming one type would refuse a target AWS accepts, and
+/// neither must one whose ARNs carry no resource type (an Amazon SQS queue's ARN is
+/// its name); an entry is added for another service when ITS single target class is
+/// established the same way.
+const SINGLE_TARGET_RESOURCE_TYPES: [(&str, &str); 1] = [(ECS_ARN_NAMESPACE, ECS_CLUSTER_RESOURCE)];
+
+/// Why a target's `Arn` names no resource of its service that a rule could invoke,
+/// or `None` when it names one — or names a service whose targets this rule does
+/// not narrow.
+///
+/// What is wrong with such a value is the resource it names, so it is refused as
+/// the ARN it is not: the same sentence every ARN-valued member of this service
+/// that holds no usable ARN is refused with ([`super::invalid_arn_violation`]).
+pub fn uninvocable_target_arn(arn: &str) -> Option<String> {
+    let parsed = ::service_common::arn::parse(arn)?;
+    SINGLE_TARGET_RESOURCE_TYPES
+        .iter()
+        .any(|(vendor, resource_type)| {
+            parsed.vendor == *vendor && parsed.resource_type() != *resource_type
+        })
+        .then(|| invalid_arn_violation(arn))
+}
+
+/// Why the ECS parameters a target carries describe no task EventBridge could
+/// start, or `None` when they describe one — or when the target carries none.
+///
+/// The block's own members, judged after the block's PRESENCE
+/// ([`missing_parameter_block`]): how many tasks a firing may start, the members
+/// the launch type requires or rules out, and the sizes of the collections the
+/// task's network configuration carries. Every one of them is a requirement the
+/// model does not express, so the request is refused here rather than stored as a
+/// target whose every firing would fail.
+///
+/// The block describes work on an ECS CLUSTER, so it is judged for a target that
+/// NAMES one: its members are read against that cluster (the Region the task
+/// definition has to share with it), which a target of another class does not have.
+fn ecs_parameters_violation(target: &Target) -> Option<String> {
+    let parameters = target.ecs_parameters.as_ref()?;
+    ::service_common::arn::parse_of(&target.arn, ECS_ARN_NAMESPACE)
+        .filter(|cluster| cluster.resource_type() == ECS_CLUSTER_RESOURCE)?;
+    task_definition_violation(target, parameters)
+        .or_else(|| task_definition_region_violation(target, parameters))
+        .or_else(|| task_count_violation(target, parameters))
+        .or_else(|| launch_type_parameters_violation(target, parameters))
+        .or_else(|| vpc_collection_violation(parameters))
+}
+
+/// What the service states when the task a target names lives in another Region
+/// than the cluster it would run on: the two ARNs, cluster first, as the request
+/// gave them.
+fn region_mismatch(cluster_arn: &str, task_definition_arn: &str) -> String {
+    format!("Region of {cluster_arn} does not match region of {task_definition_arn}")
+}
+
+/// Why the task a target names could not run on the cluster the target addresses,
+/// or `None` when the two are in one Region.
+///
+/// A task definition is a REGIONAL resource of Amazon ECS and a cluster runs the
+/// tasks of its own Region, so a pair naming two Regions describes a task
+/// EventBridge could never start — the cluster's own `RunTask` resolves the
+/// definition in the cluster's Region. Both Regions are read through the one ARN
+/// parse (`service_common::arn`), and the refusal states the pair the caller
+/// submitted.
+fn task_definition_region_violation(
+    target: &Target,
+    parameters: &EcsParameters,
+) -> Option<String> {
+    let cluster = ::service_common::arn::parse(&target.arn)?;
+    let task_definition = ::service_common::arn::parse(&parameters.task_definition_arn)?;
+    (cluster.region != task_definition.region)
+        .then(|| region_mismatch(&target.arn, &parameters.task_definition_arn))
+}
+
+/// The ECS resource a task definition is, and the `EcsParameters` member naming
+/// the one a firing runs.
+const ECS_TASK_DEFINITION_RESOURCE: &str = "task-definition";
+const TASK_DEFINITION_MEMBER: &str = "TaskDefinitionArn";
+
+/// Why the task a target's ECS parameters name is not one EventBridge could run,
+/// or `None` when they name one.
+///
+/// "The ARN of the task definition to use if the event target is an Amazon ECS
+/// task" (`EcsParameters$TaskDefinitionArn`, `@required`): the member holds the ARN
+/// of an Amazon ECS TASK DEFINITION and nothing else — not the `family:revision`
+/// reference the Amazon ECS API itself also takes, and no resource of another
+/// service or of another kind — and it is modelled a plain 1..1600 string with no
+/// pattern, so the boundary validator passes any text and the form is read here.
+/// A reference EventBridge could not resolve to a task definition is a target whose
+/// every firing would fail, so it is refused where the target is written.
+fn task_definition_violation(target: &Target, parameters: &EcsParameters) -> Option<String> {
+    let names_a_task_definition =
+        ::service_common::arn::parse_of(&parameters.task_definition_arn, ECS_ARN_NAMESPACE)
+            .is_some_and(|arn| arn.resource_type() == ECS_TASK_DEFINITION_RESOURCE);
+    (!names_a_task_definition)
+        .then(|| invalid_target_parameters(TASK_DEFINITION_MEMBER, &target.id))
+}
+
+/// The most tasks one firing of a target may start.
+///
+/// `EcsParameters$TaskCount` is "the number of tasks to create based on
+/// `TaskDefinition`" and is modelled `@range(min: 1)` alone, so the boundary
+/// validator passes any figure above zero; the ceiling is the one the ECS call a
+/// firing makes states — "the number of instantiations of the specified task to
+/// place on your cluster. You can specify up to 10 tasks for each call"
+/// (Amazon ECS `RunTask$count`) — so a target asking for more names a firing ECS
+/// itself would refuse.
+const MAX_ECS_TASK_COUNT: i32 = 10;
+
+/// The `EcsParameters` member carrying how many tasks a firing starts.
+const TASK_COUNT_MEMBER: &str = "TaskCount";
+
+/// What the service states for a target parameter whose VALUE it will not take:
+/// the member, and the `Id` of the target carrying it. The value itself is not
+/// echoed — what is wrong with it is the member's own range, which the caller
+/// already has.
+fn invalid_target_parameters(member: &str, target_id: &str) -> String {
+    format!("Parameter(s) {member} not valid for target: {target_id}.")
+}
+
+/// Why the task count a target asks for is not one a firing may start, or `None`
+/// when it is within [`MAX_ECS_TASK_COUNT`] or the block names none.
+///
+/// The modelled minimum is left to the boundary validator, which refuses a figure
+/// below it with the constraint clause every modelled bound is refused with; only
+/// the ceiling the model does not carry is charged here.
+fn task_count_violation(target: &Target, parameters: &EcsParameters) -> Option<String> {
+    let count = parameters.task_count?;
+    (count > MAX_ECS_TASK_COUNT)
+        .then(|| invalid_target_parameters(TASK_COUNT_MEMBER, &target.id))
+}
+
+/// The launch type whose network mode EventBridge can only start a task in with a
+/// network configuration of its own, and the only one the Fargate-specific members
+/// of a parameter block state anything for.
+///
+/// `EcsParameters$NetworkConfiguration` is "required if `LaunchType` is `FARGATE`
+/// because the `awsvpc` mode is required for Fargate tasks": a task started under
+/// it has to be given the subnets and security groups it joins, so there is
+/// nothing for EventBridge to start without them.
+const AWSVPC_ONLY_LAUNCH_TYPE: &str = "FARGATE";
+
+/// The `EcsParameters` member carrying the VPC configuration a task joins.
+const NETWORK_CONFIGURATION_MEMBER: &str = "NetworkConfiguration";
+
+/// One `EcsParameters` member that states something only for a task of
+/// [`AWSVPC_ONLY_LAUNCH_TYPE`]: the member the refusal names, and whether a
+/// submitted block carries it.
+struct LaunchTypeOnlyMember {
+    member: &'static str,
+    carried: fn(&EcsParameters) -> bool,
+}
+
+/// The `EcsParameters` members that state something only for a task of
+/// [`AWSVPC_ONLY_LAUNCH_TYPE`], and so are not supported under any other launch
+/// type.
+///
+/// Read off each member's own documentation
+/// (`smithy_query(query="shape",shape="EcsParameters")`): a member documented as
+/// used only under one launch type describes a task of no other kind, so a request
+/// naming it beside another launch type asks for two different things.
+const LAUNCH_TYPE_ONLY_MEMBERS: [LaunchTypeOnlyMember; 2] = [
+    // "Specifies the platform version for the task. […] This structure is used
+    // only if LaunchType is FARGATE" (`EcsParameters$PlatformVersion`).
+    LaunchTypeOnlyMember {
+        member: "PlatformVersion",
+        carried: |parameters| parameters.platform_version.is_some(),
+    },
+    // "Specifies whether the task's elastic network interface receives a public IP
+    // address. You can specify ENABLED only when LaunchType in EcsParameters is
+    // set to FARGATE" (`AwsVpcConfiguration$AssignPublicIp`) — a member of the VPC
+    // configuration rather than of the block itself, and the only value it states
+    // for one launch type alone is [`PUBLIC_IP_ASSIGNED`].
+    LaunchTypeOnlyMember {
+        member: "AssignPublicIp",
+        carried: assigns_a_public_ip,
+    },
+];
+
+/// The `AssignPublicIp` value that states a task of [`AWSVPC_ONLY_LAUNCH_TYPE`]
+/// alone; the other value of that enum asks for the behaviour every launch type
+/// has.
+const PUBLIC_IP_ASSIGNED: &str = "ENABLED";
+
+/// Whether `parameters` ask for the task's network interface to receive a public
+/// IP address.
+fn assigns_a_public_ip(parameters: &EcsParameters) -> bool {
+    parameters
+        .network_configuration
+        .as_ref()
+        .and_then(|configuration| configuration.awsvpc_configuration.as_ref())
+        .and_then(|configuration| configuration.assign_public_ip.as_deref())
+        == Some(PUBLIC_IP_ASSIGNED)
+}
+
+/// What the service states for a parameter another parameter's VALUE makes
+/// required: the member that was not specified, the `Id` of the target it was
+/// required for, and the launch type that required it.
+fn missing_launch_type_parameter(member: &str, target_id: &str, launch_type: &str) -> String {
+    format!(
+        "Parameter {member} must be specified for target {target_id} when launch type is \
+         {launch_type}"
+    )
+}
+
+/// What the service states for a parameter that states nothing for the launch type
+/// the request named: the member, the `Id` of the target carrying it, and the
+/// launch type it is not supported under.
+fn unsupported_launch_type_parameter(member: &str, target_id: &str, launch_type: &str) -> String {
+    format!(
+        "Parameter {member} for target {target_id} is not supported when launch type is \
+         {launch_type}"
+    )
+}
+
+/// Why a target's ECS parameters and the LAUNCH TYPE they name do not describe one
+/// task, or `None` when they do.
+///
+/// Which members a parameter block has to carry, and which it may carry at all, is
+/// decided by the launch type the block names — a requirement no model can express,
+/// since each member is optional on its own — so it is refused where the target is
+/// written: a task EventBridge could never start is not a target it stores. Both
+/// halves of the rule are read off the launch type the REQUEST named, so a block
+/// naming none asks for the cluster's own default and is judged on neither.
+fn launch_type_parameters_violation(
+    target: &Target,
+    parameters: &EcsParameters,
+) -> Option<String> {
+    let launch_type = parameters.launch_type.as_deref()?;
+    if launch_type == AWSVPC_ONLY_LAUNCH_TYPE {
+        return parameters.network_configuration.is_none().then(|| {
+            missing_launch_type_parameter(NETWORK_CONFIGURATION_MEMBER, &target.id, launch_type)
+        });
+    }
+    LAUNCH_TYPE_ONLY_MEMBERS
+        .iter()
+        .find(|only| (only.carried)(parameters))
+        .map(|only| unsupported_launch_type_parameter(only.member, &target.id, launch_type))
+}
+
+/// One collection of the VPC configuration an ECS task joins, and the SIZE its own
+/// documentation states it may carry.
+struct BoundedCollection {
+    /// The member the refusal names.
+    member: &'static str,
+    /// The fewest elements it may carry.
+    fewest: usize,
+    /// The most elements it may carry.
+    most: usize,
+    /// How many elements a submitted configuration carries for it — the absent
+    /// optional member carrying none.
+    count: fn(&AwsVpcConfiguration) -> usize,
+}
+
+/// The collections of a task's VPC configuration whose size this service charges.
+///
+/// Neither list carries a modelled `@length` (`StringList` is a bare list of
+/// `String`, `smithy_query(query="shape",shape="AwsVpcConfiguration,StringList")`),
+/// so the boundary validator passes any number of elements and the documented
+/// bound is charged where the target is written. The minimum follows the member's
+/// own modelling: `Subnets` is `@required`, so a task joins at least one subnet,
+/// while `SecurityGroups` is optional — "if you do not specify a security group,
+/// the default security group for the VPC is used".
+const BOUNDED_VPC_COLLECTIONS: [BoundedCollection; 2] = [
+    // "These subnets must all be in the same VPC. You can specify as many as 16
+    // subnets" (`AwsVpcConfiguration$Subnets`).
+    BoundedCollection {
+        member: "Subnets",
+        fewest: 1,
+        most: 16,
+        count: |configuration| configuration.subnets.len(),
+    },
+    // "These security groups must all be in the same VPC. You can specify as many
+    // as five security groups" (`AwsVpcConfiguration$SecurityGroups`).
+    BoundedCollection {
+        member: "SecurityGroups",
+        fewest: 0,
+        most: 5,
+        count: |configuration| {
+            configuration
+                .security_groups
+                .as_ref()
+                .map_or(0, Vec::len)
+        },
+    },
+];
+
+/// What the service states for a collection member carrying a number of elements
+/// outside the size it admits: the member, and the size it has to be within.
+fn collection_size_violation(bound: &BoundedCollection) -> String {
+    super::parameter_violation(
+        bound.member,
+        &format!(
+            "size must be in between {} and {}.",
+            bound.fewest, bound.most
+        ),
+    )
+}
+
+/// Why the VPC configuration a target's ECS parameters carry names more (or fewer)
+/// of something than a task may join, or `None` when every collection it carries
+/// is within the size its documentation states.
+///
+/// The collections are judged in the order [`BOUNDED_VPC_COLLECTIONS`] lists them,
+/// so a configuration getting two of them wrong names the same member every time.
+fn vpc_collection_violation(parameters: &EcsParameters) -> Option<String> {
+    let configuration = parameters
+        .network_configuration
+        .as_ref()?
+        .awsvpc_configuration
+        .as_ref()?;
+    BOUNDED_VPC_COLLECTIONS
+        .iter()
+        .find(|bound| {
+            let count = (bound.count)(configuration);
+            count < bound.fewest || count > bound.most
+        })
+        .map(collection_size_violation)
 }
 
 /// The suffix the name of an Amazon SQS FIFO queue carries — a queue whose name
@@ -193,12 +534,27 @@ fn missing_target_parameters(member: &str, target_id: &str) -> String {
 /// Why a target names none of the parameters its own kind of resource can only be
 /// delivered to with, or `None` when it names them or needs none.
 ///
+/// Two readings of one rule — a target EventBridge could never invoke as
+/// configured is refused when the target is CONFIGURED rather than stored and
+/// found undeliverable at every firing: the parameter BLOCK a target of a given
+/// resource class is invoked through ([`missing_parameter_block`]), and the one
+/// member inside a block that a class needs beside the block itself (a FIFO
+/// queue's message group, [`fifo_queue_group_violation`]).
+fn target_parameters_violation(target: &Target) -> Option<String> {
+    fifo_queue_group_violation(target).or_else(|| {
+        missing_parameter_block(target)
+            .map(|member| missing_target_parameters(member, &target.id))
+    })
+}
+
+/// Why an Amazon SQS FIFO queue target names no message group, or `None` when it
+/// names one or is no FIFO queue.
+///
 /// `Target$SqsParameters` "contains the message group ID to use when the target is
 /// an Amazon SQS fair or FIFO queue", and a message sent to a FIFO queue without
 /// one is a send that queue refuses (Amazon SQS `SendMessage$MessageGroupId`): a
 /// FIFO queue target carrying no message group is a target EventBridge could never
-/// deliver to, so the request is refused when the target is CONFIGURED rather than
-/// stored and found undeliverable at every firing.
+/// deliver to.
 ///
 /// A FIFO queue is one whose NAME carries [`FIFO_QUEUE_SUFFIX`], which is the
 /// resource field of its ARN — read through the one ARN parse
@@ -207,7 +563,7 @@ fn missing_target_parameters(member: &str, target_id: &str) -> String {
 /// `@length(min: 0)`, so a group id of no characters is a value the caller
 /// specified, while a `SqsParameters` carrying no `MessageGroupId` at all
 /// specifies none.
-fn target_parameters_violation(target: &Target) -> Option<String> {
+fn fifo_queue_group_violation(target: &Target) -> Option<String> {
     let fifo_queue = ::service_common::arn::parse_of(&target.arn, SQS_ARN_NAMESPACE)
         .is_some_and(|queue| queue.resource.ends_with(FIFO_QUEUE_SUFFIX));
     let names_a_group = target
@@ -216,6 +572,96 @@ fn target_parameters_violation(target: &Target) -> Option<String> {
         .is_some_and(|parameters| parameters.message_group_id.is_some());
     (fifo_queue && !names_a_group)
         .then(|| missing_target_parameters(SQS_PARAMETERS_MEMBER, &target.id))
+}
+
+/// One target class EventBridge invokes only THROUGH a parameter block of the
+/// `Target` structure: what the ARN names, and the member carrying the block.
+struct ParameterisedTarget {
+    /// The service namespace of the target's ARN.
+    vendor: &'static str,
+    /// The resource TYPE within that namespace a target of this class is addressed
+    /// by — the resource EventBridge invokes the work ON, which is never the work
+    /// itself (an ECS target names a cluster, the task it runs is in the block).
+    resource_type: &'static str,
+    /// The `Target` member carrying the block, as the refusal names it.
+    member: &'static str,
+    /// Whether the target CARRIES that block.
+    carried: fn(&Target) -> bool,
+}
+
+/// The ARN namespace of Amazon ECS, and the resource a target of it names: the
+/// cluster a task runs on.
+const ECS_ARN_NAMESPACE: &str = "ecs";
+const ECS_CLUSTER_RESOURCE: &str = "cluster";
+
+/// The target classes EventBridge can only invoke through their own parameter
+/// block, read off the `Target` members that document each class
+/// (`smithy_query(query="shape",shape="Target")`, and each block's own shape for
+/// the members it marks `@required`).
+///
+/// A block whose own members are `@required` states what the invocation needs to
+/// happen at all — the ECS task definition to run, the Batch job definition to
+/// submit, the database to run a statement against, the instances to send a
+/// command to — so a target of such a class carrying NO block names none of them,
+/// and no delivery to it could ever be made. The block is what the refusal names,
+/// because that is the member the caller did not specify.
+const PARAMETERISED_TARGETS: [ParameterisedTarget; 4] = [
+    // "Contains the Amazon ECS task definition and task count to be used, if the
+    // event target is an Amazon ECS task" (`Target$EcsParameters`), whose
+    // `TaskDefinitionArn` is `@required`. An ECS target is addressed by the
+    // CLUSTER the task runs on.
+    ParameterisedTarget {
+        vendor: ECS_ARN_NAMESPACE,
+        resource_type: ECS_CLUSTER_RESOURCE,
+        member: "EcsParameters",
+        carried: |target| target.ecs_parameters.is_some(),
+    },
+    // "If the event target is an Batch job, this contains the job definition, job
+    // name, and other parameters" (`Target$BatchParameters`), whose
+    // `JobDefinition` and `JobName` are both `@required`. A Batch target is
+    // addressed by the job QUEUE the job is submitted to.
+    ParameterisedTarget {
+        vendor: "batch",
+        resource_type: "job-queue",
+        member: "BatchParameters",
+        carried: |target| target.batch_parameters.is_some(),
+    },
+    // "These are custom parameters to be used when the target is a Amazon Redshift
+    // cluster to invoke the Amazon Redshift Data API ExecuteStatement"
+    // (`Target$RedshiftDataParameters`), whose `Database` is `@required`.
+    ParameterisedTarget {
+        vendor: "redshift",
+        resource_type: "cluster",
+        member: "RedshiftDataParameters",
+        carried: |target| target.redshift_data_parameters.is_some(),
+    },
+    // "Parameters used when you are using the rule to invoke Amazon EC2 Run
+    // Command" (`Target$RunCommandParameters`), whose `RunCommandTargets` is
+    // `@required`: it "contains the criteria (either InstanceIds or a tag) used to
+    // specify which EC2 instances are to be sent the command". Such a target is
+    // addressed by the Systems Manager DOCUMENT the command runs.
+    ParameterisedTarget {
+        vendor: "ssm",
+        resource_type: "document",
+        member: "RunCommandParameters",
+        carried: |target| target.run_command_parameters.is_some(),
+    },
+];
+
+/// The `Target` member of the parameter block `target`'s own resource class is
+/// invoked through and the target does not carry, or `None` when it carries it or
+/// names a class that needs none.
+///
+/// The class is read off the target's ARN through the one ARN parse
+/// (`service_common::arn`), so the service namespace and the resource type decide
+/// it and nothing is inferred from a name.
+fn missing_parameter_block(target: &Target) -> Option<&'static str> {
+    let arn = ::service_common::arn::parse(&target.arn)?;
+    PARAMETERISED_TARGETS
+        .iter()
+        .find(|class| arn.vendor == class.vendor && arn.resource_type() == class.resource_type)
+        .filter(|class| !(class.carried)(target))
+        .map(|class| class.member)
 }
 
 /// Why a target names no role for an invocation EventBridge makes AS one, or

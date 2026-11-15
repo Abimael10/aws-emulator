@@ -251,7 +251,16 @@ where
                     req,
                 );
             }
-            self.operation.run(svc, req, ctx).await
+            // The answer is the operation's own, with the one member this
+            // service's wire renames moved ([`WIRE_RENAMED_ERROR_SHAPES`]): every
+            // other response, success or failure, is returned byte for byte.
+            let answered = self.operation.run(svc, req, ctx).await;
+            ::service_common::error_detail_member::with_renamed_detail_member(
+                answered,
+                &WIRE_RENAMED_ERROR_SHAPES,
+                MODELLED_DETAIL_MEMBER,
+                WIRE_DETAIL_MEMBER,
+            )
         })
     }
 
@@ -261,6 +270,23 @@ where
         self.operation.auth_schemes()
     }
 }
+
+/// The error shapes whose detail text this service's WIRE reports under a
+/// different member from the one its model declares, and the two member names.
+///
+/// `AccessDeniedException` declares `message`
+/// (`smithy_query(query="shape",shape="AccessDeniedException")`), and this
+/// service's recorded answers carry that error's sentence under `Message` — the
+/// member AWS's own authorization refusals use — while every other error of this
+/// service reports it under `message`. A client reading an access refusal's
+/// sentence must find it where the service puts it, so the ONE renaming of a
+/// detail member (`service_common::error_detail_member`) moves it.
+const WIRE_RENAMED_ERROR_SHAPES: [&str; 1] = ["AccessDeniedException"];
+
+/// The member the framework's renderers and this service's handlers write a
+/// refusal's sentence into, and the member the shapes above report it in.
+const MODELLED_DETAIL_MEMBER: &str = "message";
+const WIRE_DETAIL_MEMBER: &str = "Message";
 
 /// The first URI path segment EVERY request to this service carries: the ROOT path.
 ///

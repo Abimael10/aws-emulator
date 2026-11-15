@@ -70,8 +70,9 @@ enum Target {
     /// EventBridge here — so the assume-role step is reached and the call that
     /// would have followed it is not.
     DeliveryStream,
-    /// An Amazon ECS task definition: another target AWS invokes under that
-    /// role, with no invocation here either.
+    /// An Amazon ECS task: another target AWS invokes under that role, named by
+    /// the CLUSTER it runs on with the task definition in the target's own
+    /// parameter block, and with no invocation here either.
     EcsTask,
     /// A Step Functions state machine: a target AWS invokes under that role and
     /// this emulator does invoke.
@@ -187,7 +188,7 @@ async fn given_target(emulator: &Emulator, target: Target) -> (String, Option<St
             None,
         ),
         Target::EcsTask => (
-            format!("arn:aws:ecs:{REGION}:{account}:task-definition/orders:1"),
+            format!("arn:aws:ecs:{REGION}:{account}:cluster/orders"),
             None,
         ),
         Target::StateMachine => (
@@ -199,6 +200,16 @@ async fn given_target(emulator: &Emulator, target: Target) -> (String, Option<St
             (arn, Some(url))
         }
     }
+}
+
+/// The task definition an ECS target's parameter block names: a definition of the
+/// same account and Region as the cluster above, which is the pair a rule's ECS
+/// target is written with.
+fn task_definition_arn() -> String {
+    format!(
+        "arn:aws:ecs:{REGION}:{}:task-definition/orders:1",
+        engine::emulator_account_id()
+    )
 }
 
 /// How many executions the state machine `arn` holds — a state-machine target
@@ -228,17 +239,18 @@ async fn a_role_this_service_cannot_assume_dead_letters_the_event_whatever_the_t
             "arn:aws:events:{REGION}:{}:rule/{RULE_NAME}",
             engine::emulator_account_id()
         );
-        given_rule(
-            &emulator,
-            RULE_NAME,
-            json!([{
-                "Id": TARGET_ID,
-                "Arn": target_arn,
-                "RoleArn": role_arn,
-                "DeadLetterConfig": { "Arn": dead_letter_arn },
-            }]),
-        )
-        .await;
+        let mut target = json!({
+            "Id": TARGET_ID,
+            "Arn": target_arn,
+            "RoleArn": role_arn,
+            "DeadLetterConfig": { "Arn": dead_letter_arn },
+        });
+        if row.target == Target::EcsTask {
+            // An ECS target names the cluster and carries the task it runs in its
+            // parameter block, so both are written for it.
+            target["EcsParameters"] = json!({ "TaskDefinitionArn": task_definition_arn() });
+        }
+        given_rule(&emulator, RULE_NAME, json!([target])).await;
 
         publish(&emulator).await;
 

@@ -42,6 +42,13 @@ const PAST_STACK_SPAN: Duration = Duration::from_millis(900);
 /// The account id every ARN this emulator mints carries.
 const ACCOUNT_ID: &str = "000000000000";
 
+/// How long a wait for a stack's own clock-owed transition may take before the test fails
+/// rather than hangs: far above the span itself, so a loaded host cannot decide the outcome.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a wait sleeps between two looks at the stack.
+const SETTLE_INTERVAL: Duration = Duration::from_millis(20);
+
 /// The emulator with the three services this suite exercises, mounted on ONE engine exactly
 /// as `core/router/src/lib.rs` mounts them. Request authentication is off, as in every other
 /// suite here; the in-process callback CloudFormation makes signs its request either way
@@ -100,6 +107,40 @@ async fn cloudformation(
     let status = response.status().as_u16();
     let payload = String::from_utf8_lossy(response.body()).to_string();
     (status, payload)
+}
+
+/// The status `stack_name` rests in once CloudFormation has left `*_IN_PROGRESS`, read by
+/// LOOKING again until that holds or [`SETTLE_DEADLINE`] passes.
+///
+/// The wait is for the CONDITION rather than for a span, so a slower or busier host only takes
+/// more looks; the deadline is a safety net so a wait nothing will satisfy ends in a failure
+/// rather than a hang, and nothing here asserts how long anything took.
+async fn settled_stack_status(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    stack_name: &str,
+) -> String {
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (status, described) =
+            cloudformation(router, region, "DescribeStacks", &[("StackName", stack_name)]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from DescribeStacks, got {status} with body \
+             {described}"
+        );
+        let reached = opt_element(&described, "StackStatus").unwrap_or_default();
+        if !reached.ends_with("_IN_PROGRESS") {
+            return reached;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "case {case:?}: {stack_name} was still {reached:?} after {SETTLE_DEADLINE:?}, so \
+             nothing settled it: {described}"
+        );
+        tokio::time::sleep(SETTLE_INTERVAL).await;
+    }
 }
 
 /// Call one awsJson1_1 operation of a service addressed by its signing name and
@@ -363,12 +404,18 @@ const ROWS: &[Row] = &[
                                 {
                                     "Id": "First",
                                     "Arn": target_cluster_arn("us-east-1"),
-                                    "InputPath": "$.detail"
+                                    "InputPath": "$.detail",
+                                    "EcsParameters": {
+                                        "TaskDefinitionArn": task_definition_arn("us-east-1")
+                                    }
                                 },
                                 {
                                     "Id": "Second",
                                     "Arn": target_cluster_arn("us-east-1"),
-                                    "RetryPolicy": { "MaximumRetryAttempts": 2 }
+                                    "RetryPolicy": { "MaximumRetryAttempts": 2 },
+                                    "EcsParameters": {
+                                        "TaskDefinitionArn": task_definition_arn("us-east-1")
+                                    }
                                 }
                             ]
                         }
@@ -952,7 +999,10 @@ async fn an_update_applies_the_changed_declaration_in_place() {
             .map(|id| {
                 json!({
                     "Id": id,
-                    "Arn": target_cluster_arn(region)
+                    "Arn": target_cluster_arn(region),
+                    // An Amazon ECS target names the cluster and carries the task it runs
+                    // in its parameter block, so a declaration of one names both.
+                    "EcsParameters": { "TaskDefinitionArn": task_definition_arn(region) }
                 })
             })
             .collect();
@@ -992,7 +1042,14 @@ async fn an_update_applies_the_changed_declaration_in_place() {
         status, 200,
         "case {case:?}: expected HTTP 200 from CreateStack, got {status} with body {body}"
     );
-    tokio::time::sleep(PAST_STACK_SPAN).await;
+    // The stack's own clock-owed transition is waited for by LOOKING again until it has
+    // left `*_IN_PROGRESS`, which is what the update below needs of it.
+    let created_status = settled_stack_status(&router, region, case, stack_name).await;
+    assert_eq!(
+        created_status, "CREATE_COMPLETE",
+        "case {case:?}: expected the create to settle before the update, got \
+         {created_status:?}"
+    );
 
     let updated = template(&["Keep"], "rate(10 minutes)", "29");
     let (status, body) = cloudformation(
@@ -1006,14 +1063,10 @@ async fn an_update_applies_the_changed_declaration_in_place() {
         status, 200,
         "case {case:?}: expected HTTP 200 from UpdateStack, got {status} with body {body}"
     );
-    tokio::time::sleep(PAST_STACK_SPAN).await;
-
-    let (_, described) =
-        cloudformation(&router, region, "DescribeStacks", &[("StackName", stack_name)]).await;
+    let updated_status = settled_stack_status(&router, region, case, stack_name).await;
     assert_eq!(
-        opt_element(&described, "StackStatus").as_deref(),
-        Some("UPDATE_COMPLETE"),
-        "case {case:?}: expected the update to complete, got {described}"
+        updated_status, "UPDATE_COMPLETE",
+        "case {case:?}: expected the update to complete, got {updated_status:?}"
     );
 
     let (status, rule) = events(

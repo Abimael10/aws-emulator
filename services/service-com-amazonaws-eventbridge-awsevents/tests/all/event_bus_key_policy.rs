@@ -366,7 +366,7 @@ async fn a_bus_is_configured_on_a_key_only_where_its_policy_admits_this_service(
                 );
                 let expected = denied_message(&key);
                 assert_eq!(
-                    answered["message"],
+                    answered["Message"],
                     json!(expected),
                     "case {case:?}: expected the message {expected:?}, got {answered}"
                 );

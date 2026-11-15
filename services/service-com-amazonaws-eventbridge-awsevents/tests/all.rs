@@ -203,6 +203,8 @@ mod state_roundtrip;
 mod submitted_value_refusals;
 #[path = "all/target_arn_scoped_authorization.rs"]
 mod target_arn_scoped_authorization;
+#[path = "all/target_configuration_refusals.rs"]
+mod target_configuration_refusals;
 #[path = "all/target_delivery.rs"]
 mod target_delivery;
 #[path = "all/target_dispatch.rs"]

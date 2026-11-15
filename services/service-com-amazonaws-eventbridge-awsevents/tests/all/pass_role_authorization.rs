@@ -362,7 +362,7 @@ async fn every_operation_that_hands_this_service_a_role_needs_pass_role_on_it() 
             "case {case:?}: expected AccessDeniedException, got {refused}"
         );
         assert_eq!(
-            refused["message"],
+            refused["Message"],
             json!(no_grant_message(&passed)),
             "case {case:?}: expected the refusal to name the action and the role, got {refused}"
         );
@@ -561,7 +561,7 @@ async fn a_pass_role_statement_is_decided_against_the_role_and_the_service() {
                     Refusal::ExplicitDeny => explicit_deny_message(&passed),
                 };
                 assert_eq!(
-                    answered["message"],
+                    answered["Message"],
                     json!(expected),
                     "case {case:?}: expected the message {expected:?}, got {answered}"
                 );

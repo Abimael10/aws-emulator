@@ -252,20 +252,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A rule is bound to an event bus, so a bus that does not exist is a
-        // missing resource — never a bus this call brings into being. The bus is
-        // resolved BEFORE the request's own members are judged: a caller naming a
-        // bus that is gone has to read that it is gone, not a verdict on its
-        // request body, because the two call for different remedies.
-        if store.bus(&region, &bus_name).is_none() {
-            return Err(PutRuleErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::no_such_event_bus(&bus_name)),
-                },
-            )
-            .into());
-        }
-
         // "A rule must contain at least an EventPattern or ScheduleExpression"
         // (this operation's own documentation). The model cannot express a
         // requirement spanning two optional members, so it is refused here.
@@ -273,12 +259,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let schedule_expression = input
             .schedule_expression
             .filter(|text| !text.trim().is_empty());
-        if event_pattern.is_none() && schedule_expression.is_none() {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "Parameter(s) EventPattern or ScheduleExpression must be specified.",
-            ));
-        }
 
+        // The PATTERN is read before any resource the request names is resolved,
+        // so a pattern the language does not admit is reported as the invalid
+        // pattern it is whatever else the request names — the precedence every
+        // operation of this service that carries a pattern follows
+        // (`crate::ops::create_archive`, `crate::ops::update_archive`). A client
+        // that catches `InvalidEventPatternException` to report a bad pattern to
+        // its user must not be told instead that a resource is missing.
         if let Some(pattern) = event_pattern.as_deref() {
             // The pattern's SIZE is charged before it is read: the bound is on
             // the text the request carried, so a pattern past it is refused
@@ -304,6 +292,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+        }
+
+        // A rule is bound to an event bus, so a bus that does not exist is a
+        // missing resource — never a bus this call brings into being.
+        if store.bus(&region, &bus_name).is_none() {
+            return Err(PutRuleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::no_such_event_bus(&bus_name)),
+                },
+            )
+            .into());
+        }
+
+        if event_pattern.is_none() && schedule_expression.is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Parameter(s) EventPattern or ScheduleExpression must be specified.",
+            ));
         }
 
         if let Some(expression) = schedule_expression.as_deref() {
