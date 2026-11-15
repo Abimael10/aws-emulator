@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutTableBucketEncryption
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutTableBucketEncryption`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutTableBucketEncryption::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -140,6 +131,25 @@ impl From<PutTableBucketEncryptionErrorModeled> for PutTableBucketEncryptionErro
     }
 }
 
+/// `NotFoundException` (HTTP 404) — the refusal this operation models for a
+/// table bucket the store does not hold, worded with the one sentence this
+/// service states that class with.
+fn bucket_not_found() -> PutTableBucketEncryptionError {
+    PutTableBucketEncryptionErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::BUCKET_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// `BadRequestException` (HTTP 400) — the client-input error this operation
+/// models for a configuration this service cannot encrypt a table bucket under.
+fn bad_request(message: String) -> PutTableBucketEncryptionError {
+    PutTableBucketEncryptionErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `PutTableBucketEncryption` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -176,18 +186,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutTableBucketEncryption` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutTableBucketEncryptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutTableBucketEncryption"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutTableBucketEncryptionErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The configuration is settled BEFORE the store is reached, so a request
+        // this service has no encryption for leaves the bucket's own
+        // configuration exactly as it was: the algorithm must be one the model
+        // declares, and it carries a KMS key exactly when that algorithm takes
+        // one. The same reading the creates store a configuration through, so a
+        // put and a create cannot disagree about what is storable.
+        let encryption = crate::state::stored_encryption(
+            &input.encryption_configuration.sse_algorithm,
+            input.encryption_configuration.kms_key_arn.clone(),
+        )
+        .map_err(bad_request)?;
+
+        let mut store = state.lock();
+
+        // The configuration belongs to a table bucket, so a put against an ARN
+        // the store holds no bucket for is the modeled not-found.
+        let bucket = store
+            .table_buckets
+            .get_mut(&input.table_bucket_arn)
+            .ok_or_else(bucket_not_found)?;
+
+        // The operation is `@idempotent`: a put of the configuration the bucket
+        // already carries leaves the record exactly as it was. Storing `Some`
+        // also records that this bucket now has an EXPLICIT configuration,
+        // which is what distinguishes it from one protected by the service
+        // default alone.
+        let outcome = match &bucket.encryption {
+            Some(current) if *current == encryption => "unchanged",
+            Some(_) => "replaced",
+            None => "configured",
+        };
+        bucket.encryption = Some(encryption.clone());
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+
+        // The access record for a state-changing operation: who, what and the
+        // outcome. Metadata only — the algorithm the bucket is now encrypted
+        // under, and whether that algorithm carries a key, never the key
+        // itself.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            resource = %input.table_bucket_arn,
+            sse_algorithm = encryption.sse_algorithm.as_wire(),
+            carries_kms_key = encryption.kms_key_arn.is_some(),
+            outcome,
+            "table bucket encryption set",
+        );
+
+        Ok(PutTableBucketEncryptionOutput)
     }
 }

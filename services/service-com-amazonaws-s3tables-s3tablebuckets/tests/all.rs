@@ -55,6 +55,8 @@ mod resource_tagging;
 mod state_roundtrip;
 #[path = "all/table_bucket_encryption.rs"]
 mod table_bucket_encryption;
+#[path = "all/table_bucket_encryption_put.rs"]
+mod table_bucket_encryption_put;
 #[path = "all/table_bucket_lifecycle.rs"]
 mod table_bucket_lifecycle;
 #[path = "all/table_bucket_maintenance_configuration.rs"]

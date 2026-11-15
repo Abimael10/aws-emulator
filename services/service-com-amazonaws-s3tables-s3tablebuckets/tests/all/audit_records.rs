@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The audit record the state-changing replication, metrics, record-expiration and
-//! rename operations emit.
+//! The audit record the state-changing replication, metrics, encryption,
+//! record-expiration and rename operations emit.
 //!
 //! The rule under test: a call that changes stored state leaves exactly ONE
 //! structured record on the service's audit target, naming the operation, the
@@ -662,5 +662,83 @@ async fn a_record_expiration_write_accounts_for_the_table_it_changed() {
             body = refused.body
         );
         capture.assert_silent("PutTableRecordExpirationConfiguration", case);
+    }
+}
+
+#[tokio::test]
+async fn each_encryption_put_accounts_for_the_bucket_it_changed() {
+    let emulator = Emulator::new();
+    let region = "us-east-1";
+    let arn = emulator
+        .create_table_bucket(region, &json!({ "name": "audited-encryption-bucket" }))
+        .await
+        .text("arn");
+    let aes = json!({ "sseAlgorithm": "AES256" });
+    let kms = json!({
+        "sseAlgorithm": "aws:kms",
+        "kmsKeyArn": "arn:aws:kms:us-east-1:000000000000:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+    });
+
+    // (case, the configuration put, the outcome the record must carry): the
+    // first put configures the bucket, the second replaces that configuration,
+    // and a put of what the bucket already carries leaves the record as it was.
+    for (case, configuration, outcome) in [
+        ("the first put", &aes, "configured"),
+        ("the replacing put", &kms, "replaced"),
+        ("the repeated put", &kms, "unchanged"),
+    ] {
+        let (capture, _guard) = capture_events();
+        let put = emulator
+            .put_table_bucket_encryption(region, &arn, configuration)
+            .await;
+        assert_eq!(
+            put.status, 200,
+            "case {case:?}: the put must succeed, got {status} {body}",
+            status = put.status,
+            body = put.body
+        );
+        assert_record(&capture, "PutTableBucketEncryption", &arn, outcome, case);
+    }
+
+    // A read changes nothing, so it accounts for nothing.
+    {
+        let (capture, _guard) = capture_events();
+        let read = emulator.get_table_bucket_encryption(region, &arn).await;
+        assert_eq!(
+            read.status, 200,
+            "case \"the read\": the read must succeed, got {status} {body}",
+            status = read.status,
+            body = read.body
+        );
+        capture.assert_silent("GetTableBucketEncryption", "the read");
+    }
+
+    // A refused put changes nothing either, so neither the not-found nor the
+    // unstorable configuration accounts for anything.
+    for (case, target, configuration, expected_status) in [
+        (
+            "a bucket the store does not hold",
+            expected_bucket_arn(region, "audited-encryption-absent"),
+            &aes,
+            404,
+        ),
+        (
+            "KMS-managed keys with no key",
+            arn.clone(),
+            &json!({ "sseAlgorithm": "aws:kms" }),
+            400,
+        ),
+    ] {
+        let (capture, _guard) = capture_events();
+        let refused = emulator
+            .put_table_bucket_encryption(region, &target, configuration)
+            .await;
+        assert_eq!(
+            refused.status, expected_status,
+            "case {case:?}: expected {expected_status}, got {status} {body}",
+            status = refused.status,
+            body = refused.body
+        );
+        capture.assert_silent("PutTableBucketEncryption", case);
     }
 }

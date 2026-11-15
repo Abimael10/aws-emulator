@@ -139,7 +139,10 @@ fn cases() -> Vec<Case> {
 }
 
 /// The reported `encryptionConfiguration`, as `(sseAlgorithm, kmsKeyArn)`.
-fn reported(body: &Value, case: &str) -> (String, Option<String>) {
+///
+/// The one reading of that member every encryption suite of this crate asserts
+/// through, so two suites cannot disagree about how it is read.
+pub fn reported(body: &Value, case: &str) -> (String, Option<String>) {
     let configuration = body
         .get("encryptionConfiguration")
         .unwrap_or_else(|| panic!("case {case:?}: the response carries no encryptionConfiguration: {body}"));

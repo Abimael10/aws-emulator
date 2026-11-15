@@ -223,6 +223,23 @@ impl Emulator {
         .await
     }
 
+    /// `PutTableBucketEncryption`: the bucket's ARN is the one path label and
+    /// the configuration travels as the body's `encryptionConfiguration`.
+    pub async fn put_table_bucket_encryption(
+        &self,
+        region: &str,
+        arn: &str,
+        configuration: &Value,
+    ) -> Reply {
+        self.call(
+            "PUT",
+            &format!("/buckets/{}/encryption", encode(arn)),
+            region,
+            Some(&serde_json::json!({ "encryptionConfiguration": configuration })),
+        )
+        .await
+    }
+
     /// `GetTableEncryption`: the bucket's ARN, the namespace and the table's
     /// name are path labels.
     pub async fn get_table_encryption(

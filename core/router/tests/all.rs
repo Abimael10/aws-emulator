@@ -4765,3 +4765,7 @@ mod appended_notes;
 //! one place to insert and nothing to keep consistent. A suite no `mod` names compiles
 //! nowhere and its tests never run; a suite left at the top level of `tests/` fails the
 //! build; and a suite declared twice is `E0428`, which fails every suite in this target.
+//! declaration — not a note about one, and not a copy of this paragraph.
+//! each declaration into `tests/all/`. Why a suite belongs to this cross-service target
+//! rather than to one service crate is stated in that suite file's own module doc, which is
+//! the one place it cannot drift from the suite it describes.
