@@ -35,9 +35,10 @@
 //!   ([`super::python`]). A session over memory BUFFERS is not negotiated either: there is no
 //!   peer at the other end of a buffer.
 //!
-//! Nothing here is the containment, and nothing here invents a session: a call that cannot
-//! be served says so, and a value a caller reads back is one this module computed or was
-//! given.
+//! Nothing here is the containment — WHICH destination a connection can reach is
+//! [`super::guest_socket`]'s — and nothing here invents a session: a call that cannot be
+//! served says so, and a value a caller reads back is one this module computed, was given, or
+//! read off a session the runtime negotiated.
 
 use super::package::PackageModule;
 

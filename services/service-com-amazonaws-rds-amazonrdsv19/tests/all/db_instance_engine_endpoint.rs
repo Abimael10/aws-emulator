@@ -676,9 +676,28 @@ pub(crate) async fn mysql_login(
     let sequence = if transport == Transport::Tls { 2 } else { 1 };
     mysql_write(&mut conn, sequence, &response).await;
 
-    let (_, verdict) = mysql_read(&mut conn).await;
+    let (sequence, verdict) = mysql_read(&mut conn).await;
+    // An `AuthSwitchRequest`: the server asks this client to authenticate with another
+    // plugin instead. The cleartext plugin sends the credential as it stands, NUL-terminated
+    // — which is how an IAM authentication token is presented, the server having nothing to
+    // check a challenge-response proof of one against.
+    let (_, verdict) = match verdict[0] {
+        0xfe => {
+            let (plugin, _) = read_cstring(&verdict, 1);
+            assert_eq!(
+                plugin, "mysql_clear_password",
+                "the only plugin this client authenticates with on a switch is the cleartext \
+                 one, got {plugin:?}"
+            );
+            let mut answered = password.as_bytes().to_vec();
+            answered.push(0);
+            mysql_write(&mut conn, sequence.wrapping_add(1), &answered).await;
+            mysql_read(&mut conn).await
+        }
+        _ => (sequence, verdict),
+    };
     match verdict[0] {
-        0x00 | 0xfe => Ok(MySqlSession {
+        0x00 => Ok(MySqlSession {
             conn,
             server_version,
         }),

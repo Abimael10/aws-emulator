@@ -81,7 +81,7 @@ _DAEMON_FORMAT = "json"
 # ENETUNREACH, as a host with no route to the address answers.
 _ENETUNREACH = 101
 _NO_ROUTE = (
-    "a Lambda function in this emulator opens no connection: the only address its "
+    "a Lambda function in this emulator reaches no host: the only address its "
     "datagrams reach is the X-Ray daemon named by AWS_XRAY_DAEMON_ADDRESS"
 )
 

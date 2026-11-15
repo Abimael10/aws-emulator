@@ -362,13 +362,13 @@ impl SessionContext {
         database: Option<&str>,
     ) -> IamLogin {
         let could_be = facts.iam_database_authentication_enabled
-            && facts.wire == EngineWire::Postgres
             && facts
                 .master_username
                 .as_ref()
                 .is_none_or(|master| master != user);
         IamLogin {
             enabled: could_be,
+            wire: facts.wire,
             database: could_be.then(|| resolved_database(facts, database)).flatten(),
             engine: Arc::clone(&self.database),
         }
@@ -832,7 +832,9 @@ pub fn admit(
 /// Both halves of IAM database authentication have to hold, which is why this carries both:
 /// the resource must have it turned on (`EnableIAMDatabaseAuthentication`), and the database
 /// user must be one enabled for it inside the engine — on PostgreSQL, a member of `rds_iam`
-/// ([`super::pg_grants::user_authenticates_with_a_token`]).
+/// ([`super::pg_grants::user_authenticates_with_a_token`]); on MySQL, an account whose
+/// authentication plugin is the IAM one
+/// ([`super::mysql_accounts::authenticates_with_a_token`]).
 ///
 /// The decision WRITES NOTHING, and is taken in an order that keeps it that way: the
 /// token's own claims are read first ([`super::iam_auth_token`] reads text and the clock and
@@ -844,8 +846,12 @@ pub fn admit(
 #[derive(Clone)]
 pub struct IamLogin {
     /// Whether the resource serves IAM database authentication and this login could be one
-    /// at all: the PostgreSQL wire, and a user other than the master.
+    /// at all: a user other than the master.
     enabled: bool,
+    /// The wire the endpoint speaks, which is what decides WHERE the engine records that a
+    /// database user authenticates with a token: a role membership on the PostgreSQL wire,
+    /// an account's authentication plugin on the MySQL one.
+    wire: EngineWire,
     /// The database whose role catalog the user is resolved against: the one the login
     /// named, resolved against the databases the resource has. `None` for a login naming a
     /// database the resource does not have, which is refused for that.
@@ -866,6 +872,19 @@ impl std::fmt::Debug for IamLogin {
 }
 
 impl IamLogin {
+    /// Whether this login is one that presents an AUTHENTICATION TOKEN at all: the resource
+    /// serves IAM database authentication, and the engine records this database user as one
+    /// enabled for it.
+    ///
+    /// A READ, and nothing else ([`Self::engine_admits`]). It is what a wire whose handshake
+    /// has to ASK for the credential in the token's own form reads before it asks — the MySQL
+    /// handshake, which offers a password plugin and switches to the cleartext one for an
+    /// account whose plugin is the IAM one.
+    #[must_use]
+    pub fn expects_a_token(&self, user: &str) -> bool {
+        self.enabled && self.database.is_some() && self.engine_admits(user)
+    }
+
     /// Whether `token` authenticates `user` on this endpoint, as of now.
     ///
     /// `false` unless every half holds, so neither a token on a resource that does not serve
@@ -876,9 +895,9 @@ impl IamLogin {
         if !self.enabled {
             return false;
         }
-        let Some(database) = &self.database else {
+        if self.database.is_none() {
             return false;
-        };
+        }
         let target = super::iam_auth_token::TokenTarget {
             host: &facts.endpoint_host,
             port: facts.endpoint_port,
@@ -901,9 +920,30 @@ impl IamLogin {
             );
             return false;
         }
-        // Only then the engine, and only as a READ: whether this database user is one
-        // enabled for token authentication.
-        super::pg_grants::user_authenticates_with_a_token(&self.engine, database, user)
+        // Only then the engine, and only as a READ.
+        self.engine_admits(user)
+    }
+
+    /// The ENGINE's own half: whether this database user is one enabled for token
+    /// authentication, where the wire this endpoint speaks records that — membership of
+    /// `rds_iam` in the database the login resolved to on the PostgreSQL wire
+    /// ([`super::pg_grants::user_authenticates_with_a_token`]), the account's authentication
+    /// plugin on the MySQL one ([`super::mysql_accounts::authenticates_with_a_token`]), whose
+    /// accounts belong to the server rather than to one database.
+    fn engine_admits(&self, user: &str) -> bool {
+        match self.wire {
+            EngineWire::Postgres => match &self.database {
+                Some(database) => super::pg_grants::user_authenticates_with_a_token(
+                    &self.engine,
+                    database,
+                    user,
+                ),
+                None => false,
+            },
+            EngineWire::MySql => {
+                super::mysql_accounts::authenticates_with_a_token(&self.engine, user)
+            }
+        }
     }
 }
 
@@ -1346,6 +1386,15 @@ pub fn run_statement(
         // `GRANT` and `REVOKE` change WHICH ROLE MAY DO WHAT, which is likewise the
         // server's own catalog rather than a row in one of the instance's tables.
         if let Some(answer) = super::pg_grants::grant_statement(database, facts, &words, &tokens)? {
+            return Ok(answer);
+        }
+    } else {
+        // The ACCOUNT statements of a MySQL server — the accounts, their authentication
+        // plugins and the privileges granted to them — which this server likewise keeps in
+        // its own catalog and answers in MySQL's words.
+        if let Some(answer) =
+            super::mysql_accounts::account_statement(database, facts, &words, &tokens)?
+        {
             return Ok(answer);
         }
     }
@@ -1847,7 +1896,7 @@ fn server_command(
         }
         (EngineWire::Postgres, "SHOW", _) => Ok(Some(postgres_show(facts, tokens)?)),
         (EngineWire::Postgres, "SET", _) => Ok(Some(postgres_set(facts, tokens)?)),
-        (EngineWire::MySql, "SHOW", _) => mysql_show(facts, words, tokens).map(Some),
+        (EngineWire::MySql, "SHOW", _) => mysql_show(database, facts, words, tokens).map(Some),
         // Setting a GLOBAL system variable is a server-wide change, which the RDS master
         // user does not hold the privilege for; a parameter group is how it is changed.
         (EngineWire::MySql, "SET", "GLOBAL") | (EngineWire::MySql, "SET", "PERSIST") => {
@@ -2012,6 +2061,7 @@ fn mysql_set(facts: &SessionFacts, tokens: &[Token]) -> Result<StatementAnswer, 
 
 /// The `SHOW` forms a MySQL client sends.
 fn mysql_show(
+    database: &InstanceDatabase,
     facts: &SessionFacts,
     words: &[String],
     tokens: &[Token],
@@ -2048,9 +2098,13 @@ fn mysql_show(
         )),
         // `SHOW GRANTS [FOR <account>]` — "lists the privileges … granted to an account".
         // The account is the session's own where the statement names none, and the
-        // privileges are the ones the account HAS, which this server knows for exactly one
-        // account: the master user Amazon RDS created with the instance.
-        "GRANTS" => Ok(StatementAnswer::new("SHOW", mysql_grants(facts, tokens)?)),
+        // privileges are the ones the account HAS: the ones a `GRANT` of this server recorded
+        // for it ([`super::mysql_accounts`]), or — for the master user Amazon RDS created with
+        // the instance, which no statement granted anything to — the ones RDS grants it.
+        "GRANTS" => Ok(StatementAnswer::new(
+            "SHOW",
+            mysql_grants(database, facts, tokens)?,
+        )),
         // `SHOW TABLES`, `SHOW COLUMNS`, `SHOW CREATE TABLE` and the rest read the
         // schema, which is the ENGINE's to report; the engine has no `SHOW`, so the
         // honest answer is that this server does not serve the command rather than a
@@ -2081,35 +2135,31 @@ const MYSQL_MASTER_PRIVILEGES: &str = "SELECT, INSERT, UPDATE, DELETE, CREATE, D
 /// `SHOW GRANTS [FOR <account>]`: one row per `GRANT` statement, in the single column MySQL
 /// names after the account.
 ///
-/// An account this server has no grants for — any account but the instance's master user —
-/// gets the refusal MySQL answers for one, which is what a client branches on; the master
-/// user's own grants are [`MYSQL_MASTER_PRIVILEGES`] on every schema, held with the grant
-/// option, as RDS grants them.
-fn mysql_grants(facts: &SessionFacts, tokens: &[Token]) -> Result<ResultSet, EngineError> {
-    let named: Vec<String> = tokens
-        .iter()
-        .skip_while(|token| !matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case("FOR")))
-        .filter_map(|token| match token {
-            Token::SingleQuotedString(value) | Token::DoubleQuotedString(value) => {
-                Some(value.clone())
-            }
-            Token::Word(word) if word.quote_style == Some('`') => Some(word.value.clone()),
-            _ => None,
-        })
-        .collect();
-    let (user, host) = match named.as_slice() {
-        [] => (facts.user.clone(), MYSQL_MASTER_HOST_PATTERN.to_string()),
-        [user] => (user.clone(), MYSQL_MASTER_HOST_PATTERN.to_string()),
-        [user, host, ..] => (user.clone(), host.clone()),
-    };
-    // Only the instance's master user is an account this server holds grants for: an
-    // account nothing granted anything to is MySQL's own "no such grant" refusal, which is
-    // what a client branches on, rather than a privilege list nothing stands behind.
+/// The grants of an account this server HOLDS are the ones its own catalog recorded for it
+/// ([`super::mysql_accounts::grants_of`]). The master user Amazon RDS created with the
+/// instance is in no catalog — no statement created it — and its grants are
+/// [`MYSQL_MASTER_PRIVILEGES`] on every schema, held with the grant option, as RDS grants
+/// them. Any other account is one nothing created and nothing granted anything to, which is
+/// MySQL's own "no such grant" refusal rather than a privilege list nothing stands behind.
+fn mysql_grants(
+    database: &InstanceDatabase,
+    facts: &SessionFacts,
+    tokens: &[Token],
+) -> Result<ResultSet, EngineError> {
+    let account = super::mysql_accounts::named_account(facts, tokens);
+    if let Some(rows) = super::mysql_accounts::grants_of(database, facts, &account)? {
+        return Ok(rows);
+    }
+    let (user, host) = (account.user, account.host);
     if user != facts.user || host != MYSQL_MASTER_HOST_PATTERN {
+        // `ER_NONEXISTING_GRANT`, which is the condition's own error number rather than the
+        // one an undefined object takes in general: what a client branches on here is that
+        // this ACCOUNT has no grants, not that a table is missing.
         return Err(EngineError::new(
             EngineErrorKind::UndefinedObject,
             format!("There is no such grant defined for user '{user}' on host '{host}'"),
-        ));
+        )
+        .with_mysql_error(1141, "42000"));
     }
     Ok(ResultSet::of_rows(
         vec![ColumnInfo {

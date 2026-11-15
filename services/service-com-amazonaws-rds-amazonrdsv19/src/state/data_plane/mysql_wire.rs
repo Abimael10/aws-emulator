@@ -86,6 +86,15 @@ const COLLATION_BINARY: u16 = 63;
 /// The authentication plugin the greeting names.
 const AUTH_PLUGIN: &str = "mysql_native_password";
 
+/// The plugin the server switches the handshake to for an account that authenticates with a
+/// credential the server has to read as TEXT rather than as a proof over the nonce: MySQL's
+/// own cleartext plugin, which is what an authentication token is presented through.
+const CLEARTEXT_AUTH_PLUGIN: &str = "mysql_clear_password";
+
+/// The first byte of an `AuthSwitchRequest`, which the protocol gives the value an EOF packet
+/// has — the packet is told apart by the handshake phase it arrives in.
+const AUTH_SWITCH_REQUEST: u8 = 0xFE;
+
 /// How long the nonce in the greeting is.
 const NONCE_BYTES: usize = 20;
 
@@ -195,20 +204,51 @@ async fn serve_session(
         let (number, state, message) = refusal_sentence(&refusal, &facts, &login.user, tls.is_some());
         return write_error(&mut conn, sequence.wrapping_add(1), number, state, &message).await;
     }
+    // IAM database authentication on a MySQL engine is an AUTHENTICATION PLUGIN on the
+    // account (`IDENTIFIED WITH AWSAuthenticationPlugin`): such an account holds no password
+    // for the native plugin the greeting offered, and what it authenticates with is an
+    // authentication token the client sends in the CLEAR. So the server switches the
+    // handshake to the cleartext plugin for exactly those accounts, which is what asks the
+    // client's own plugin for the token — and only inside a TLS session, because the token is
+    // a credential and an unencrypted connection is not one to ask for it on (Amazon RDS User
+    // Guide, IAM database authentication: a connection using an authentication token is an
+    // SSL/TLS connection). A login as any other account proves the native password it
+    // already presented.
+    let iam = context.iam_login(&facts, &login.user, login.database.as_deref());
+    let token = match tls.is_some() && iam.expects_a_token(&login.user) {
+        true => {
+            write_packet(
+                &mut conn,
+                sequence.wrapping_add(1),
+                &auth_switch_packet(CLEARTEXT_AUTH_PLUGIN),
+            )
+            .await?;
+            let (next, answered) = read_packet(&mut conn).await?.ok_or_else(closed)?;
+            sequence = next;
+            // The cleartext plugin sends the credential NUL-terminated, as the protocol's
+            // own string<NUL> framing has it.
+            let answered = match answered.iter().position(|byte| *byte == 0) {
+                Some(end) => &answered[..end],
+                None => &answered[..],
+            };
+            Some(String::from_utf8_lossy(answered).to_string())
+        }
+        false => None,
+    };
+    let proof = match &token {
+        Some(token) => PasswordProof::Cleartext(token),
+        None => PasswordProof::MysqlNative {
+            nonce: &nonce,
+            response: &login.auth_response,
+        },
+    };
     let database = match wire_session::admit(
         &facts,
         &login.user,
         login.database.as_deref(),
         tls.is_some(),
-        &PasswordProof::MysqlNative {
-            nonce: &nonce,
-            response: &login.auth_response,
-        },
-        // IAM database authentication on a MySQL instance is an AUTHENTICATION PLUGIN on
-        // the account (`IDENTIFIED WITH AWSAuthenticationPlugin`), which this wire's
-        // handshake does not negotiate and this endpoint's MySQL half keeps no account
-        // table for: no login here presents an authentication token, so none is read.
-        None,
+        &proof,
+        Some(&iam),
     ) {
         Ok(database) => database,
         Err(refusal) => {
@@ -450,6 +490,17 @@ fn greeting_packet(server_version: &str, connection_id: u32, nonce: &[u8]) -> Ve
     packet.extend_from_slice(nonce.get(8..).unwrap_or_default());
     packet.push(0);
     packet.extend_from_slice(AUTH_PLUGIN.as_bytes());
+    packet.push(0);
+    packet
+}
+
+/// The `AuthSwitchRequest` that tells the client which plugin to authenticate with instead:
+/// the marker, the plugin's name, and the plugin data it is to use — none for the cleartext
+/// plugin, which sends the credential as it stands rather than a proof over a challenge.
+fn auth_switch_packet(plugin: &str) -> Vec<u8> {
+    let mut packet = vec![AUTH_SWITCH_REQUEST];
+    packet.extend_from_slice(plugin.as_bytes());
+    packet.push(0);
     packet.push(0);
     packet
 }

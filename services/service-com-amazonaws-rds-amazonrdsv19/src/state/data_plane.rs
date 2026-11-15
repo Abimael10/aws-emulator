@@ -40,6 +40,9 @@
 //!   transaction;
 //! * [`pg_grants`] — the role memberships and object privileges a PostgreSQL client grants
 //!   and revokes, and the catalogs they live in;
+//! * [`mysql_accounts`] — the accounts a MySQL client creates, the authentication plugin each
+//!   of them authenticates with and the privileges granted to them, and the catalog they live
+//!   in;
 //! * [`mysql_s3_load`] — `LOAD DATA FROM S3`, the Amazon S3 import the MySQL engines serve
 //!   under the IAM role their parameter group names;
 //! * [`iam_auth_token`] — the authentication token an IAM-authenticated login presents in
@@ -66,6 +69,7 @@ pub mod constraint_names;
 pub mod dialect;
 pub mod iam_auth_token;
 pub mod lock_plan;
+pub mod mysql_accounts;
 pub mod mysql_s3_load;
 pub mod mysql_wire;
 pub mod pg_copy;

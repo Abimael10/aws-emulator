@@ -548,7 +548,7 @@ async fn a_postgresql_endpoint_serves_object_privilege_grants() {
 /// The SIGNATURE is the client's: this suite holds no signing credential, so the value is
 /// of the shape a SigV4 signature has (the hex of a SHA-256) over the request the token
 /// states, which is what the endpoint reads it as.
-fn auth_token(host: &str, port: u16, user: &str, region: &str, signed_at: SystemTime, expires: u64) -> String {
+pub(crate) fn auth_token(host: &str, port: u16, user: &str, region: &str, signed_at: SystemTime, expires: u64) -> String {
     let seconds = signed_at
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("the signing instant is after the epoch")
