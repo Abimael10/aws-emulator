@@ -1348,11 +1348,6 @@ mod zz_opensearch_fgac_probe;
 mod zz_probe;
 #[path = "all/zz_probe_whole_emulator.rs"]
 mod zz_probe_whole_emulator;
-// Single integration-test target for the router: one `#[path = "all/<name>.rs"]` /
-// `mod <name>;` pair per file under `tests/all/`, sorted by name, and no other line.
-// `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`
-// pin that shape; `all/appended_prose.rs` keeps what landings had appended here.
-// Single integration-test target for the router: the declaration list, and nothing else.
 // and NOTHING after the last pair. Put a new suite at `tests/all/<name>.rs` and insert its
 // pair in the one place its name sorts to, so two branches landing at once insert two lines
 // in two places and have no prose to duplicate, re-word or mistype — which is what had gone

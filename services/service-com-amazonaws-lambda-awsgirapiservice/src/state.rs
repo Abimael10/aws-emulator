@@ -3717,6 +3717,22 @@ pub fn function_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("function:{name}"))
 }
 
+/// One spelling of a function ARN AT a version: the unqualified ARN itself for the
+/// unpublished version, and the `:<version>`-suffixed one for any other qualifier, exactly
+/// as the model's `NameSpacedFunctionArn` pattern allows.
+///
+/// Shared by the record that HOLDS a function ([`FunctionRecord::versioned_arn`]) and by the
+/// resolution that found none ([`resolve_function`]), so the resource a refusal names is
+/// spelled the same way whether or not the function exists.
+#[must_use]
+pub fn qualified_arn(function_arn: &str, version: &str) -> String {
+    if version == VERSION_LATEST {
+        function_arn.to_string()
+    } else {
+        format!("{function_arn}:{version}")
+    }
+}
+
 /// The ARN resource type a code-signing configuration carries, from the model's
 /// `CodeSigningConfigArn` pattern (`…:code-signing-config:csc-[a-z0-9]{17}`). The ARN is
 /// minted from it and the tagging surface reads it back by it, so the two cannot drift.
@@ -4733,10 +4749,17 @@ pub fn resolve_function<'a>(
         return Err(ResolveFailure::NotFound(message));
     }
 
+    // The resource one of these requests addresses is a function AT a version, so a pair
+    // that resolves to nothing names the ARN it RESOLVED: the function the name addresses,
+    // qualified by the version the pair named — in the name or in the `Qualifier` parameter —
+    // and left unqualified where it named none, which is how this service spells the
+    // unpublished version wherever it reports one ([`qualified_arn`]). A request naming a
+    // version of a function this store does not hold is therefore refused with the same
+    // resource a request naming a version the function does not hold is.
     let Some(record) = store.functions.get_mut(&reference.name) else {
         return Err(ResolveFailure::NotFound(format!(
             "Function not found: {}",
-            function_arn(region, &reference.name)
+            qualified_arn(&function_arn(region, &reference.name), &version)
         )));
     };
     record.materialize(now);

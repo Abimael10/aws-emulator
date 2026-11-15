@@ -385,13 +385,12 @@ impl FunctionRecord {
     /// The ARN of `version` of this function: the unqualified ARN for `$LATEST`, and
     /// the `:<version>`-suffixed one for a published version, exactly as the model's
     /// `NameSpacedFunctionArn` pattern allows.
+    ///
+    /// The spelling itself is [`super::qualified_arn`], which a refusal naming a function
+    /// this store holds NO record of shares, so the two cannot drift.
     #[must_use]
     pub fn versioned_arn(&self, version: &str) -> String {
-        if version == VERSION_LATEST {
-            self.arn.clone()
-        } else {
-            format!("{}:{}", self.arn, version)
-        }
+        super::qualified_arn(&self.arn, version)
     }
 
     /// The model's `State` reported for the configuration of `version`, which is this
