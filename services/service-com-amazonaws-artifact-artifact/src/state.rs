@@ -112,6 +112,11 @@ pub use inquiry_answers::*;
 mod resource_arn;
 pub use resource_arn::is_resource_arn;
 
+/// The accessibility-conformance class of the published report catalog: the rows AWS
+/// publishes one of per evaluated product, which [`seed_catalog`] materialises beside
+/// [`SEED`].
+mod accessibility_reports;
+
 /// The region a report ARN names when the request carries no SigV4 credential scope to
 /// read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -3287,19 +3292,21 @@ const PRODUCT_NAME: &str = "AWS";
 /// into being — it is the published catalog itself, the same for every account, keyed by
 /// the `ReportId` AWS assigned each report. A client's whole report flow starts by
 /// listing it and then naming one of these ids (or one of these series) to
-/// `GetReportMetadata`, `GetTermForReport` and `GetReport`, which is why the first four
+/// `GetReportMetadata`, `GetTermForReport` and `GetReport`, which is why the first three
 /// rows carry the ids and names AWS publishes for them, as the issue's recording of a
-/// live `ListReports` shows them: `report-073F0fUCdVVNKJrF`, `report-0c1IXmudeXuTlHJJ`,
-/// `report-5eevElBv6MyRmQsD` and `report-7g5j2DTVeNXWx7St`.
+/// live `ListReports` shows them: `report-073F0fUCdVVNKJrF`, `report-0c1IXmudeXuTlHJJ`
+/// and `report-5eevElBv6MyRmQsD`.
 ///
-/// Every row after those four carries a report AWS really publishes in Artifact (the SOC
+/// Every row after those three carries a report AWS really publishes in Artifact (the SOC
 /// reports, the ISO certificates, the PCI DSS attestation, the FedRAMP, IRAP and C5
 /// packages and the CSA questionnaire) under an id this catalog assigns, because the
-/// recording names an id only for the four above: those ids satisfy `ReportId`'s pattern
-/// and are this emulator's, not a claim that AWS issued them. They are here so the
-/// catalog is the published SET a client browses and PAGES — a set of a handful of rows
-/// is one no realistic page bound ever cuts — not to reach AWS's full catalog size, which
-/// no recording in this corpus discloses.
+/// recording names an id only for the three above: those ids satisfy `ReportId`'s pattern
+/// and are this emulator's, not a claim that AWS issued them.
+///
+/// This is one row per compliance PROGRAMME. The accessibility-conformance reports, which
+/// AWS publishes one of per evaluated PRODUCT, are the catalog's other class and are
+/// seeded in [`accessibility_reports`]; [`seed_catalog`] materialises both, so the catalog
+/// `ListReports` enumerates is the whole published inventory this emulator holds.
 ///
 /// Every row's `description` is the PUBLISHED description of its document — the prose a
 /// publisher writes about a compliance document, which is what the member carries — and
@@ -3309,7 +3316,8 @@ const PRODUCT_NAME: &str = "AWS";
 /// quotes it); the rest are this emulator's own, written in that same register, because
 /// the corpus discloses no other published description and no rule derives one.
 ///
-/// The rows span what the report surface generalises over: ten series, two categories,
+/// The rows span what the report surface generalises over: nine compliance-programme
+/// series (the accessibility-conformance series beside them makes ten), two categories,
 /// both `AcceptanceType` values, one, two, three and seven published versions, and
 /// reporting periods on the calendar-annual, the November-annual and the semiannual
 /// windows AWS publishes on.
@@ -3465,28 +3473,6 @@ const SEED: &[SeedReport] = &[
                 sequence_number: 7,
             },
         ],
-    },
-    SeedReport {
-        id: "report-7g5j2DTVeNXWx7St",
-        name: "Annual Compliance Report",
-        description: "The AWS annual compliance report consolidates the independent audits \
-                      AWS completed during the reporting period with the certifications \
-                      and attestations that were in force at the end of it. It states the \
-                      services and AWS Regions in scope and the standard each one was \
-                      assessed against. Customer teams use it as the single annual summary \
-                      of the AWS compliance program.",
-        series: "ACR",
-        category: "Certifications and Attestations",
-        acceptance_type: "EXPLICIT",
-        document_object: "AWS-Annual-Compliance-Report.pdf",
-        term_object: "AWS-Annual-Compliance-Report-Term.txt",
-        versions: &[SeedVersion {
-            version: 1,
-            period_start: T2024JAN,
-            period_end: T2025JAN,
-            published_at: T2025JAN,
-            sequence_number: 1,
-        }],
     },
     SeedReport {
         id: "report-9pQ2mT8xLbV4sZ1c",
@@ -3811,10 +3797,15 @@ fn at(seconds: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
 }
 
-/// Build the catalog from [`SEED`]. Deterministic: the same records, in the same order,
-/// every time the state is constructed.
+/// Build the catalog from every class the published inventory holds: the one row per
+/// compliance programme in [`SEED`] and the one row per evaluated product in
+/// [`accessibility_reports::ACCESSIBILITY_SEED`]. A report belongs to the catalog whatever
+/// class seeds it, so every one of them is materialised here and `ListReports` enumerates
+/// the union. Deterministic: the same records, keyed by `ReportId`, every time the state
+/// is constructed.
 fn seed_catalog() -> BTreeMap<String, Report> {
     SEED.iter()
+        .chain(accessibility_reports::ACCESSIBILITY_SEED.iter())
         .map(|seed| {
             let report = Report {
                 term: Document::new(seed.term_object, term_document(seed).into_bytes()),

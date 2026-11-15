@@ -11,9 +11,9 @@
 //! from the one stored record.
 //!
 //! The rows below span the whole catalog, which differs along what the rule generalises
-//! over: ten report series, two categories, both `AcceptanceType` values, and reports
-//! publishing one, two, three and seven versions. The FIRST row's text is the published
-//! description the corpus records for that report (quoted in
+//! over: the report series it publishes, two categories, both `AcceptanceType` values, and
+//! reports publishing one, two, three and seven versions. The FIRST row's text is the
+//! published description the corpus records for that report (quoted in
 //! `issues/things-that-now-work/20261029T192742Z-artifact-read-plane-serves-an-incomplete-report-catalog.md`);
 //! the rest are the catalog's own, which this suite spells out independently of
 //! `src/state.rs` so a row reseeded with a label fails here rather than redefining what
@@ -48,6 +48,19 @@ const PUBLISHED: &[(&str, &str)] = &[
          reviewed and updated regularly with the latest information.",
     ),
     (
+        "report-0QjvdIs6Bsw4uPxb",
+        "The Accessibility Conformance Report for Amazon Connect records how the \
+         product's user interfaces meet the accessibility criteria of Section 508 of the \
+         US Rehabilitation Act, EN 301 549 and the Web Content Accessibility Guidelines, \
+         reported in the Voluntary Product Accessibility Template that the Information \
+         Technology Industry Council publishes. The evaluation covers the agent workspace, \
+         the contact control panel and the administration website. Each criterion is \
+         reported as supported, partially supported or not applicable, with the remarks \
+         the evaluator recorded for it. Customer teams use it to assess the product \
+         against their own accessibility obligations before they roll it out to their \
+         users.",
+    ),
+    (
         "report-0c1IXmudeXuTlHJJ",
         "The ISO/IEC 27001:2022 certificate records the certification of the AWS \
          information security management system by an accredited independent registrar. It \
@@ -66,11 +79,16 @@ const PUBLISHED: &[(&str, &str)] = &[
     ),
     (
         "report-7g5j2DTVeNXWx7St",
-        "The AWS annual compliance report consolidates the independent audits AWS \
-         completed during the reporting period with the certifications and attestations \
-         that were in force at the end of it. It states the services and AWS Regions in \
-         scope and the standard each one was assessed against. Customer teams use it as the \
-         single annual summary of the AWS compliance program.",
+        "The Accessibility Conformance Report for the AWS Management Console records how \
+         the console's user interfaces meet the accessibility criteria of Section 508 of \
+         the US Rehabilitation Act, EN 301 549 and the Web Content Accessibility \
+         Guidelines, reported in the Voluntary Product Accessibility Template that the \
+         Information Technology Industry Council publishes. The evaluation covers the \
+         console's navigation, the service consoles reached from it and the documentation \
+         it links to. Each criterion is reported as supported, partially supported or not \
+         applicable, with the remarks the evaluator recorded for it. Customer teams use it \
+         to assess the console against their own accessibility obligations before they \
+         roll it out to their users.",
     ),
     (
         "report-9pQ2mT8xLbV4sZ1c",
@@ -174,6 +192,81 @@ const PUBLISHED: &[(&str, &str)] = &[
          question of the Cloud Controls Matrix. It covers the services and AWS Regions \
          named in the questionnaire for the period stated on it. Customer teams use it to \
          compare the AWS control environment with the CSA control framework.",
+    ),
+    (
+        "report-M2hXsL5bQw9TnF4j",
+        "The Accessibility Conformance Report for Amazon WorkSpaces records how the \
+         product's user interfaces meet the accessibility criteria of Section 508 of the \
+         US Rehabilitation Act, EN 301 549 and the Web Content Accessibility Guidelines, \
+         reported in the Voluntary Product Accessibility Template that the Information \
+         Technology Industry Council publishes. The evaluation covers the desktop clients, \
+         the web access client and the administration website. Each criterion is reported \
+         as supported, partially supported or not applicable, with the remarks the \
+         evaluator recorded for it. Customer teams use it to assess the product against \
+         their own accessibility obligations before they roll it out to their users.",
+    ),
+    (
+        "report-N7kDvR3mYt8ZpB6c",
+        "The Accessibility Conformance Report for Amazon QuickSight records how the \
+         product's user interfaces meet the accessibility criteria of Section 508 of the \
+         US Rehabilitation Act, EN 301 549 and the Web Content Accessibility Guidelines, \
+         reported in the Voluntary Product Accessibility Template that the Information \
+         Technology Industry Council publishes. The evaluation covers dashboard authoring, \
+         the reader experience and the embedded analytics surfaces. Each criterion is \
+         reported as supported, partially supported or not applicable, with the remarks \
+         the evaluator recorded for it. Customer teams use it to assess the product \
+         against their own accessibility obligations before they roll it out to their \
+         users.",
+    ),
+    (
+        "report-P5qZmJ8hXc2VtL9d",
+        "The Accessibility Conformance Report for the Amazon Chime SDK records how the \
+         product's user interfaces meet the accessibility criteria of Section 508 of the \
+         US Rehabilitation Act, EN 301 549 and the Web Content Accessibility Guidelines, \
+         reported in the Voluntary Product Accessibility Template that the Information \
+         Technology Industry Council publishes. The evaluation covers the meeting client, \
+         the messaging surfaces and the call controls. Each criterion is reported as \
+         supported, partially supported or not applicable, with the remarks the evaluator \
+         recorded for it. Customer teams use it to assess the product against their own \
+         accessibility obligations before they roll it out to their users.",
+    ),
+    (
+        "report-Q8tBnW4fKz6RmS3h",
+        "The Accessibility Conformance Report for AWS CloudShell records how the product's \
+         user interfaces meet the accessibility criteria of Section 508 of the US \
+         Rehabilitation Act, EN 301 549 and the Web Content Accessibility Guidelines, \
+         reported in the Voluntary Product Accessibility Template that the Information \
+         Technology Industry Council publishes. The evaluation covers the terminal \
+         surface, its keyboard interaction and the file transfer controls. Each criterion \
+         is reported as supported, partially supported or not applicable, with the remarks \
+         the evaluator recorded for it. Customer teams use it to assess the product \
+         against their own accessibility obligations before they roll it out to their \
+         users.",
+    ),
+    (
+        "report-R3vYkT9pLd5XnQ7b",
+        "The Accessibility Conformance Report for Amazon SageMaker Studio records how the \
+         product's user interfaces meet the accessibility criteria of Section 508 of the \
+         US Rehabilitation Act, EN 301 549 and the Web Content Accessibility Guidelines, \
+         reported in the Voluntary Product Accessibility Template that the Information \
+         Technology Industry Council publishes. The evaluation covers the notebook \
+         workspace, the experiment views and the model registry. Each criterion is \
+         reported as supported, partially supported or not applicable, with the remarks \
+         the evaluator recorded for it. Customer teams use it to assess the product \
+         against their own accessibility obligations before they roll it out to their \
+         users.",
+    ),
+    (
+        "report-S6mFqH2xVb8JtZ4n",
+        "The Accessibility Conformance Report for Amazon Lex records how the product's \
+         user interfaces meet the accessibility criteria of Section 508 of the US \
+         Rehabilitation Act, EN 301 549 and the Web Content Accessibility Guidelines, \
+         reported in the Voluntary Product Accessibility Template that the Information \
+         Technology Industry Council publishes. The evaluation covers the bot authoring \
+         surface, the test window and the conversation logs. Each criterion is reported as \
+         supported, partially supported or not applicable, with the remarks the evaluator \
+         recorded for it. Customer teams use it to assess the product against their own \
+         accessibility obligations before they roll it out to their users.",
     ),
 ];
 

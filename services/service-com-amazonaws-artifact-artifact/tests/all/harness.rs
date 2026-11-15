@@ -110,11 +110,17 @@ pub fn a_report_requiring_acceptance() -> &'static Expected {
 /// AWS Artifact has no `CreateReport`: the catalog is service-owned, so these rows are
 /// the published report set. They are spelled out here, independently of the seed in
 /// `src/state.rs`, so a changed or fabricated catalog fails these suites rather than
-/// quietly redefining what they assert. The first four ids and names are AWS's, as the
-/// issue's recording of a live `ListReports` shows them; every row after them is a report
-/// AWS publishes in Artifact under an id this emulator assigns (see `SEED`'s doc comment).
+/// quietly redefining what they assert. The ids and names AWS publishes are the ones a
+/// recording of a live `ListReports` shows (`report-073F0fUCdVVNKJrF`,
+/// `report-0c1IXmudeXuTlHJJ`, `report-5eevElBv6MyRmQsD`, and `report-7g5j2DTVeNXWx7St`
+/// and `report-0QjvdIs6Bsw4uPxb` of the accessibility-conformance class); every other row
+/// is a report AWS publishes in Artifact under an id this emulator assigns (see `SEED` and
+/// `accessibility_reports` in `src/state.rs`).
+///
 /// The rows differ along everything the rules generalise over: report series, category,
-/// `AcceptanceType`, and how many versions a report has (one, two, three and seven).
+/// `AcceptanceType`, and how many versions a report has (one, two, three and seven). The
+/// catalog holds both of the classes AWS publishes: one row per compliance programme, and
+/// one row per product evaluated for accessibility conformance (the `ACR` series).
 pub const CATALOG: &[Expected] = &[
     Expected {
         id: "report-073F0fUCdVVNKJrF",
@@ -123,6 +129,14 @@ pub const CATALOG: &[Expected] = &[
         category: "Alignment Documents",
         acceptance_type: "PASSTHROUGH",
         versions: &[1, 2, 3],
+    },
+    Expected {
+        id: "report-0QjvdIs6Bsw4uPxb",
+        name: "Accessibility Conformance Report VPAT - Amazon Connect",
+        series: "ACR",
+        category: "Certifications and Attestations",
+        acceptance_type: "PASSTHROUGH",
+        versions: &[1, 2],
     },
     Expected {
         id: "report-0c1IXmudeXuTlHJJ",
@@ -142,10 +156,10 @@ pub const CATALOG: &[Expected] = &[
     },
     Expected {
         id: "report-7g5j2DTVeNXWx7St",
-        name: "Annual Compliance Report",
+        name: "Accessibility Conformance Report VPAT - AWS Management Console",
         series: "ACR",
         category: "Certifications and Attestations",
-        acceptance_type: "EXPLICIT",
+        acceptance_type: "PASSTHROUGH",
         versions: &[1],
     },
     Expected {
@@ -241,6 +255,54 @@ pub const CATALOG: &[Expected] = &[
         name: "Cloud Security Alliance CAIQ",
         series: "CSA",
         category: "Alignment Documents",
+        acceptance_type: "PASSTHROUGH",
+        versions: &[1],
+    },
+    Expected {
+        id: "report-M2hXsL5bQw9TnF4j",
+        name: "Accessibility Conformance Report VPAT - Amazon WorkSpaces",
+        series: "ACR",
+        category: "Certifications and Attestations",
+        acceptance_type: "PASSTHROUGH",
+        versions: &[1, 2],
+    },
+    Expected {
+        id: "report-N7kDvR3mYt8ZpB6c",
+        name: "Accessibility Conformance Report VPAT - Amazon QuickSight",
+        series: "ACR",
+        category: "Certifications and Attestations",
+        acceptance_type: "PASSTHROUGH",
+        versions: &[1],
+    },
+    Expected {
+        id: "report-P5qZmJ8hXc2VtL9d",
+        name: "Accessibility Conformance Report VPAT - Amazon Chime SDK",
+        series: "ACR",
+        category: "Certifications and Attestations",
+        acceptance_type: "PASSTHROUGH",
+        versions: &[1, 2, 3],
+    },
+    Expected {
+        id: "report-Q8tBnW4fKz6RmS3h",
+        name: "Accessibility Conformance Report VPAT - AWS CloudShell",
+        series: "ACR",
+        category: "Certifications and Attestations",
+        acceptance_type: "PASSTHROUGH",
+        versions: &[1],
+    },
+    Expected {
+        id: "report-R3vYkT9pLd5XnQ7b",
+        name: "Accessibility Conformance Report VPAT - Amazon SageMaker Studio",
+        series: "ACR",
+        category: "Certifications and Attestations",
+        acceptance_type: "PASSTHROUGH",
+        versions: &[1, 2],
+    },
+    Expected {
+        id: "report-S6mFqH2xVb8JtZ4n",
+        name: "Accessibility Conformance Report VPAT - Amazon Lex",
+        series: "ACR",
+        category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
         versions: &[1],
     },

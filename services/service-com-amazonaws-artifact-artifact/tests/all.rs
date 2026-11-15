@@ -77,6 +77,8 @@ mod pagination_token_opacity;
 mod question_level_feedback_revision;
 #[path = "all/report_acceptance_type.rs"]
 mod report_acceptance_type;
+#[path = "all/report_catalog_membership.rs"]
+mod report_catalog_membership;
 #[path = "all/report_download_receipt_rule.rs"]
 mod report_download_receipt_rule;
 #[path = "all/report_projection.rs"]
