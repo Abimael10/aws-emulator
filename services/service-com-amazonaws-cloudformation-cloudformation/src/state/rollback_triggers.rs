@@ -25,8 +25,19 @@
 //!
 //! ## When the triggers are read
 //!
-//! The read happens while the operation is IN FLIGHT, from the operations that report a
-//! stack's progress ([`super::provisioning::advance_stabilisations`] drives it, before those
+//! They are read TWICE over the operation they monitor, because the alarm can already be in
+//! that state when the operation begins and can enter it while the operation runs.
+//!
+//! The first read is the operation's own, before it deploys anything
+//! ([`firing_trigger_refusal`], called by `CreateStack`, `UpdateStack` and
+//! `ExecuteChangeSet` off the store lock): monitoring covers "the stack operation" itself, so
+//! an operation whose alarm is ALREADY in that state is rolled back with NO resource change
+//! carried out at all — nothing is asked of any service that owns one of the stack's
+//! resources, which is the refusal channel every rollback CloudFormation itself reaches
+//! before asking anybody goes through ([`super::provisioning::reconcile`]'s `refused`).
+//!
+//! The second read happens while the operation is IN FLIGHT, from the operations that report
+//! a stack's progress ([`super::provisioning::advance_stabilisations`] drives it, before those
 //! handlers take the store lock) — the same place the waits on the owning services are read,
 //! and for the same reason: a call to another service cannot be made from under this store's
 //! lock, and the failure it uncovers was owed at the instant the alarm entered that state
@@ -300,6 +311,42 @@ async fn alarms_in_alarm(
         }
     }
     fired
+}
+
+/// The refusal the rollback triggers of `configuration` ALREADY force on the operation about
+/// to be carried out, or `None` where none of their alarms is in [`ALARM_STATE`].
+///
+/// "If any of the alarms you specify goes to ALARM state DURING THE STACK OPERATION or this
+/// monitoring period, CloudFormation rolls back the entire stack operation": the operation
+/// itself is monitored, so an alarm that is in that state when the operation begins rolls the
+/// operation back before it changes anything — the stack's resources are not touched, which
+/// is exactly what the deployment-refusal channel of
+/// [`super::provisioning::reconcile`] does with the reason this answers
+/// ([`trigger_failure_summary`]). The rollback, and the failed state a caller that asked for
+/// it is left in instead, are then the ones that refusal already performs: no second reading
+/// of what a failed operation of this service does.
+///
+/// Called by the operations a `RollbackConfiguration` is supplied on, with no store lock held
+/// — each trigger is a read of CloudWatch's own `DescribeAlarms`, and the number of them one
+/// call makes is bounded by the model ([`super::MAX_ROLLBACK_TRIGGERS`]). A configuration
+/// naming no trigger reads nothing at all.
+///
+/// `region` is the Region the operation's own calls are made in, which a trigger ARN carrying
+/// no Region field is read in.
+pub async fn firing_trigger_refusal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    configuration: Option<&super::StoredRollbackConfiguration>,
+) -> Option<String> {
+    let triggers = configuration.map(|configuration| configuration.triggers.as_slice())?;
+    if triggers.is_empty() {
+        return None;
+    }
+    let fired = alarms_in_alarm(ctx, region, triggers).await;
+    if fired.is_empty() {
+        return None;
+    }
+    Some(trigger_failure_summary(fired.iter().map(String::as_str)))
 }
 
 /// Read the rollback triggers of this Region's in-flight stack operations, and roll back

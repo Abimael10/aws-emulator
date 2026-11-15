@@ -257,6 +257,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         } else {
                             Vec::new()
                         },
+                        // ...and the ROLLBACK TRIGGERS this execution would be monitored
+                        // by, read in the same breath: the alarms they name are read below,
+                        // with the lock released, because that read reaches CloudWatch.
+                        change_set.rollback_configuration.clone(),
                     )
                 })
         };
@@ -267,7 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reconciles against — which is what makes the execution re-apply the declared
         // configuration to a resource whose template did not change at all.
         let drifted = match &planned {
-            Some((_, _, _, deployed)) if !deployed.is_empty() => {
+            Some((_, _, _, deployed, _)) if !deployed.is_empty() => {
                 crate::state::drift::drifted(ctx, &request_region, deployed).await
             }
             _ => Vec::new(),
@@ -275,8 +279,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `None` for a request that addresses no change set this Region holds, which the
         // block below refuses with the modelled `ChangeSetNotFoundException`: there is
         // nothing to resolve for a plan that does not exist.
+        // The rollback an alarm the change set's `RollbackConfiguration` names ALREADY
+        // forces: "if any of the alarms you specify goes to ALARM state during the stack
+        // operation", the operation this call starts is rolled back having changed nothing,
+        // so the alarms are read before the deployment below rather than only while it is in
+        // flight ([`crate::state::rollback_triggers`]).
+        let firing_triggers = match &planned {
+            Some((_, _, _, _, configuration)) => {
+                crate::state::rollback_triggers::firing_trigger_refusal(
+                    ctx,
+                    &request_region,
+                    configuration.as_ref(),
+                )
+                .await
+            }
+            None => None,
+        };
         let resolved_parameters = match planned {
-            Some((change_set_id, template_body, parameters, _)) => {
+            Some((change_set_id, template_body, parameters, _, _)) => {
                 // The values in force for that plan: the ones it carries, plus the
                 // template's own `Default` for a declared parameter it states none for —
                 // the same resolution a create or an update makes before it deploys, and
@@ -730,8 +750,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Region publishes has no value to import, so CloudFormation refuses the
             // deployment before anything is asked of the services that own the resources —
             // the execution then fails naming the export and is rolled back below.
-            let refused_deployment =
-                withdraws_an_export_in_use.or_else(|| stack.unresolved_cross_stack_failure());
+            //
+            // ...and so is a rollback its triggers already force, read before this block was
+            // entered: the execution takes its failed status and is rolled back having
+            // deployed nothing, exactly as every refusal CloudFormation itself reaches is.
+            let refused_deployment = withdraws_an_export_in_use
+                .or_else(|| stack.unresolved_cross_stack_failure())
+                .or(firing_triggers);
             let region = stack.region.clone();
             let declared = stack.current_resources().to_vec();
             // A resource the plan ADOPTS already exists in the service that owns it, and

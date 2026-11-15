@@ -439,6 +439,8 @@ mod resource_signals;
 mod route53_resource_declarations;
 #[path = "all/rollback_trigger_bounds.rs"]
 mod rollback_trigger_bounds;
+#[path = "all/rollback_trigger_monitoring.rs"]
+mod rollback_trigger_monitoring;
 #[path = "all/rollback_trigger_types.rs"]
 mod rollback_trigger_types;
 #[path = "all/rolled_back_create_stays_describable.rs"]

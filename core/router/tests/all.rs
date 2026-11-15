@@ -6881,3 +6881,14 @@ mod all_rs_is_a_canonical_declaration_list;
 //! `E0753` and compiles no suite of this target, so add a declaration below, never a
 //! note about one — the notes earlier landings appended live in
 //! `all/appended_notes.rs`. `all/all_rs_declares_each_suite_once.rs` and
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, keeping the list sorted. A suite no
+//! `mod` declares compiles nowhere and its tests never run, and a suite left at the top
+//! level of `tests/` fails the build.
+//! This file is ONE crate root, so it holds a single module namespace and a single header:
+//! * declare each suite EXACTLY ONCE — a second `mod` for the same name is `E0428`;
+//! * these lines are the ONLY place an inner doc comment (`//!`) may stand — past the first
+//!   item one is `E0753`.
+//! Either mistake fails every suite in this target, so add a DECLARATION below, never a note
+//! about one — not even as an ordinary comment: the notes concurrent landings had appended
+//! here live in `all/appended_notes.rs`, and the rules they repeat are these lines.
+//! file (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is what points

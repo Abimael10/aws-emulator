@@ -898,7 +898,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // re-derived from the reason text below: a refusal reached before it stands instead.
         let refused_by_validation =
             refused_before_validation.is_none() && failed_validation.is_some();
-        let refused_deployment = refused_before_validation.or(failed_validation);
+        // The ROLLBACK TRIGGERS this create is monitored by, read before anything is
+        // provisioned: an alarm already in `ALARM` when the operation begins rolls the whole
+        // operation back, so nothing is asked of any owning service and no resource of this
+        // stack is created at all ([`crate::state::rollback_triggers`]). The read reaches
+        // CloudWatch, so it happens HERE, with no store lock held, beside the other questions
+        // this create puts to other services — and not at all for a deployment already
+        // refused above, whose one diagnostic is that refusal.
+        let firing_triggers = if refused_before_validation.is_some()
+            || failed_validation.is_some()
+        {
+            None
+        } else {
+            crate::state::rollback_triggers::firing_trigger_refusal(
+                ctx,
+                &region,
+                stack.rollback_configuration.as_ref(),
+            )
+            .await
+        };
+        let refused_deployment = refused_before_validation
+            .or(failed_validation)
+            .or(firing_triggers);
 
         // The store lock is taken for the write and RELEASED at the end of this block:
         // the calls that create the stack's resources run after it, and each of those

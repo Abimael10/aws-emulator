@@ -5,16 +5,21 @@
 //!
 //! RULE under test: **a create or an update whose `RollbackConfiguration` names rollback
 //! triggers is rolled back when one of the CloudWatch alarms those triggers name is in
-//! `ALARM` while the operation is in flight — "if any of the alarms you specify goes to ALARM
-//! state during the stack operation or this monitoring period, CloudFormation rolls back the
-//! entire stack operation" — so the stack reaches its rolled-back terminal status
-//! (`ROLLBACK_COMPLETE` for a create, `UPDATE_ROLLBACK_COMPLETE` for an update) carrying the
-//! alarms that were in that state, by NAME, as its `StackStatusReason` and in the stack event
-//! the rollback is recorded in, and the configuration the operation had already applied in the
-//! owning service is put back; a trigger whose alarm is in any other
-//! state rolls nothing back and the operation completes, and a caller that asked for the
-//! failed state to be kept (`DisableRollback`) gets `UPDATE_FAILED` with the change left
-//! where it was.**
+//! `ALARM` — "if any of the alarms you specify goes to ALARM state during the stack operation
+//! or this monitoring period, CloudFormation rolls back the entire stack operation" — so the
+//! stack reaches its rolled-back terminal status (`ROLLBACK_COMPLETE` for a create,
+//! `UPDATE_ROLLBACK_COMPLETE` for an update) carrying the alarms that were in that state, by
+//! NAME, as its `StackStatusReason` and in the stack event the rollback is recorded in, and
+//! the owning service is left holding the configuration in force rather than the one the
+//! aborted operation declared; a trigger whose alarm is in any other state rolls nothing back
+//! and the operation completes.**
+//!
+//! The STACK OPERATION itself is monitored, so an alarm that is in that state when the
+//! operation BEGINS — which is every firing row below, each one settling its alarm before the
+//! call is made — aborts it before any resource change is carried out: nothing is asked of the
+//! service that owns the stack's resources, so there is nothing applied to put back and
+//! nothing applied to keep. That is why a caller that asked for the failed state to be kept
+//! (`DisableRollback`) gets `UPDATE_FAILED` over the property the stack already had.
 //!
 //! Only a cross-service suite can pin it: what decides the rollback is an alarm's `StateValue`
 //! in CLOUDWATCH's own records, read by CloudFormation in-process, and what says the rollback
@@ -407,6 +412,31 @@ async fn stack_topic_arn(router: &MultiServiceRouter, case: &str, stack: &str) -
         .clone()
 }
 
+/// The topic the stack reports for its `Topic` resource, by the physical resource id — which
+/// is the topic's ARN — or `None` where the stack reports no such resource, which is what an
+/// operation that deployed nothing leaves behind.
+async fn reported_topic_arn(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+) -> Option<String> {
+    let body = cfn_ok(
+        router,
+        case,
+        "DescribeStackResources",
+        &[member("StackName", stack)],
+    )
+    .await;
+    physical_ids_of(&body).get("Topic").cloned()
+}
+
+/// The ARN Amazon SNS keys a topic of this name by in the Region and account every call of
+/// this suite is signed for — the handle `GetTopicAttributes` takes for a topic the stack
+/// declared but no operation created, which the stack therefore reports no id for.
+fn topic_arn_of(topic: &str) -> String {
+    format!("arn:aws:sns:{REGION}:000000000000:{topic}")
+}
+
 /// Which operation deploys the revision a row's rollback triggers monitor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Deploy {
@@ -535,8 +565,10 @@ async fn an_alarm_in_alarm_rolls_the_update_it_monitors_back() {
             expected_display_name: BEFORE,
         },
         // "DisableRollback: Preserve the state of previously provisioned resources when an
-        // operation fails": the triggered failure is kept exactly as it failed, so the
-        // revision the update applied stands.
+        // operation fails": the triggered failure is kept exactly as it failed — the stack
+        // RESTS in `UPDATE_FAILED` rather than rolling back — and what that failure had
+        // provisioned is nothing at all, since the alarm was already in `ALARM` when the
+        // update began, so the property the stack already had is what stands.
         Row {
             case: "DisableRollback keeps the triggered failure as it failed",
             stack: "rbt-update-kept",
@@ -545,7 +577,7 @@ async fn an_alarm_in_alarm_rolls_the_update_it_monitors_back() {
             deploy: Deploy::UpdateStack,
             disable_rollback: true,
             expected_status: "UPDATE_FAILED",
-            expected_display_name: AFTER,
+            expected_display_name: BEFORE,
         },
     ];
 
@@ -900,9 +932,10 @@ async fn the_triggered_rollback_event_names_the_alarms_that_were_in_alarm() {
     }
 }
 
-/// A CREATE is monitored by the same triggers, and the rollback of a create removes what it
-/// had made: the topic the create had created is gone from SNS, while a create whose trigger
-/// is not firing completes and keeps it.
+/// A CREATE is monitored by the same triggers: a create whose trigger is already in `ALARM`
+/// when it begins is rolled back having made nothing — the stack reports no resource and SNS
+/// holds no topic of the name the template declared — while a create whose trigger is not
+/// firing completes and SNS holds the topic it made.
 #[tokio::test]
 async fn an_alarm_in_alarm_rolls_the_create_it_monitors_back() {
     // (case, the stack, the trigger, the terminal status, whether SNS still holds the topic)
@@ -959,15 +992,32 @@ async fn an_alarm_in_alarm_rolls_the_create_it_monitors_back() {
             );
         }
 
-        // The resource record survives the rollback, at the status the rollback left it in,
-        // and it is what says which topic the create had made.
-        let topic_arn = stack_topic_arn(&router, case, stack).await;
-        let held = topic_attributes(&router, &topic_arn).await;
-        assert_eq!(
-            held.is_some(),
-            *topic_kept,
-            "case {case:?}: expected SNS to {} the topic {topic_arn}, got {held:?}",
-            if *topic_kept { "hold" } else { "have removed" }
-        );
+        // What the create left in the owning service. A create its trigger aborted asked
+        // nothing of SNS at all, so the stack reports no `Topic` resource and SNS holds no
+        // topic of the declared name; a create that completed reports the topic it made, by
+        // the physical id that is its ARN, and SNS holds that topic.
+        let reported = reported_topic_arn(&router, case, stack).await;
+        if *topic_kept {
+            let topic_arn = reported.unwrap_or_else(|| {
+                panic!("case {case:?}: the completed create must report the topic it made")
+            });
+            let held = topic_attributes(&router, &topic_arn).await;
+            assert!(
+                held.is_some(),
+                "case {case:?}: expected SNS to hold the topic {topic_arn}, got {held:?}"
+            );
+        } else {
+            assert_eq!(
+                reported, None,
+                "case {case:?}: expected the aborted create to report no Topic resource, got \
+                 {reported:?}"
+            );
+            let declared = topic_arn_of(&topic);
+            let held = topic_attributes(&router, &declared).await;
+            assert!(
+                held.is_none(),
+                "case {case:?}: expected SNS to hold no topic {declared}, got {held:?}"
+            );
+        }
     }
 }

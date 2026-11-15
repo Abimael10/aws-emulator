@@ -1100,6 +1100,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into_iter()
                 .next()
         };
+        // The ROLLBACK TRIGGERS this update is monitored by, read before anything is
+        // deployed: an alarm already in `ALARM` when the operation begins rolls the whole
+        // operation back, so nothing is asked of any service that owns one of the stack's
+        // resources and none of them is changed at all
+        // ([`crate::state::rollback_triggers`]). The read reaches CloudWatch, so it happens
+        // HERE, with no store lock held, beside the existence check just above — and not at
+        // all for a deployment already refused, whose one diagnostic is that refusal.
+        let firing_triggers = if transform_failure.is_some() || name_conflict.is_some() {
+            None
+        } else {
+            crate::state::rollback_triggers::firing_trigger_refusal(
+                ctx,
+                &request_region,
+                rollback_configuration.as_ref(),
+            )
+            .await
+        };
 
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that create or delete the stack's resources run after it, and each of
@@ -1357,7 +1374,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 && failed_validation.is_some();
             let refused_deployment = withdraws_an_export_in_use
                 .or(unresolved_cross_stack)
-                .or(failed_validation);
+                .or(failed_validation)
+                // ...and the rollback an alarm already in `ALARM` forces, read before this
+                // block was entered: it rolls the operation back having changed nothing.
+                .or(firing_triggers);
             (
                 stack.stack_id.clone(),
                 stack.region.clone(),
