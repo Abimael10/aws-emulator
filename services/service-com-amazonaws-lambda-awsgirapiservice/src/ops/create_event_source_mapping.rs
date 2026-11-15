@@ -16,7 +16,25 @@
 //! with the modelled `InvalidParameterValueException` rather than stored as a mapping of
 //! a source nothing could poll — stating the ARN format the source service the value names
 //! is polled through where it names one at all, and otherwise that the source ARN sent is
-//! unsupported (see [`unrecognized_event_source`]).
+//! unsupported (see [`crate::state::unrecognized_event_source`]).
+//!
+//! A source that IS one of those resources has to exist, too: an Amazon MQ broker is
+//! consumed by connecting to the endpoints of the named broker, so a value naming a broker
+//! the service that owns brokers does not hold is refused with the modelled
+//! `ResourceNotFoundException` — the absence of the resource the request named, settled
+//! before the conflict below (see [`crate::state::absent_event_source_message`]).
+//!
+//! What the mapping may POLL that source in is held to the source as well: `BatchSize`'s own
+//! related setting — "When you set BatchSize to a value greater than 10, you must set
+//! MaximumBatchingWindowInSeconds to at least 1" — binds the one source whose default
+//! batching window is zero seconds, so a mapping on a queue asking for a larger batch
+//! without a window is refused with that same modelled 400; and a FIFO queue, whose messages
+//! are handed to one consumer in order, has no batching window at all, so asking to gather
+//! one is refused with its own sentence (see
+//! [`crate::state::queue_batch_window_refusal`]). And `FilterCriteria` have to be able to
+//! decide something: text that is not a filter pattern is refused with that same modelled
+//! 400 rather than stored as criteria no record could be matched against (see
+//! [`crate::state::filter_criteria_refusal`]).
 //!
 //! The two settings the model leaves optional because only SOME of those sources need them
 //! — the position a stream is read from, and the instant a position stated as a timestamp
@@ -461,21 +479,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Each entry of that enumeration is a resource of ONE vendor namespace and ONE
         // resource type, in the account doing the mapping, so an ARN naming anything else
-        // names nothing this mapping could poll however well formed it is.
+        // names nothing this mapping could poll however well formed it is. Which value
+        // names an event source at all is the one reading every operation that takes an
+        // `EventSourceArn` shares (see [`crate::state::event_source_arn_refusal`]).
         if let Some(event_source) = event_source_arn.as_deref() {
+            if let Some(message) = crate::state::event_source_arn_refusal(event_source, &region) {
+                return Err(invalid_parameter(message));
+            }
             let Some(parsed) = ::service_common::arn::parse(event_source) else {
                 return Err(invalid_parameter(format!(
                     "Value '{event_source}' at 'eventSourceArn' failed to satisfy constraint: \
                      Member must be the Amazon Resource Name of an event source"
                 )));
             };
-            if !crate::state::names_event_source(&parsed) {
-                return Err(invalid_parameter(unrecognized_event_source(
-                    parsed.vendor,
-                    event_source,
-                    &region,
-                )));
-            }
             if !crate::state::event_source_is_mappable_by_this_account(&parsed) {
                 return Err(invalid_parameter(format!(
                     "The event source '{event_source}' belongs to account '{}' rather than to \
@@ -520,6 +536,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::unsupported_mapping_destination(input.destination_config.as_ref())
         {
             return Err(invalid_parameter(message));
+        }
+
+        // `FilterCriteria` "determine whether Lambda should process an event", and each
+        // `Filter$Pattern` inside them is "a filter pattern": text that is not one decides
+        // nothing, so a mapping stored with it would consume its source through criteria no
+        // record could ever be matched against. It is refused here instead (see
+        // [`crate::state::filter_criteria_refusal`]).
+        if let Some(message) = crate::state::filter_criteria_refusal(input.filter_criteria.as_ref())
+        {
+            return Err(invalid_parameter(message.to_string()));
+        }
+
+        // `BatchSize`'s own related setting, and the one source whose batching window the
+        // request may not state at all: a batch past ten takes a window to gather it in, and
+        // a FIFO queue takes no window (see
+        // [`crate::state::queue_batch_window_refusal`]). Both halves are the values in force
+        // AFTER this call — what the request stated, or the default for this source —
+        // because that pair is what the mapping would poll with.
+        if let Some(message) = crate::state::queue_batch_window_refusal(
+            event_source_arn.as_deref(),
+            input
+                .batch_size
+                .unwrap_or_else(|| crate::state::default_batch_size(vendor)),
+            input
+                .maximum_batching_window_in_seconds
+                .or_else(|| crate::state::default_batching_window_seconds(vendor)),
+        ) {
+            return Err(invalid_parameter(message.to_string()));
         }
 
         // `StartingPosition` is "Required for Amazon Kinesis and Amazon DynamoDB Stream
@@ -676,6 +720,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(message));
         }
 
+        // The event source itself has to EXIST: an Amazon MQ broker is consumed by
+        // connecting to the endpoints of the named broker, so a mapping onto a broker that
+        // does not exist could never be reached (see
+        // [`crate::state::absent_event_source_message`]). That is the ABSENCE of the
+        // resource the request named, so it is the modelled not-found rather than the
+        // conflict below, and it is settled BEFORE that conflict: a caller whose source does
+        // not exist has to create it, not delete another mapping.
+        if let Some(message) = event_source_arn
+            .as_deref()
+            .and_then(|event_source| {
+                crate::state::absent_event_source_message(&*self.engine, event_source)
+            })
+        {
+            return Err(
+                CreateEventSourceMappingErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // "The resource already exists, or another operation is in progress": the records
         // a mapping reads are polled for one function by at most one mapping, so a second
         // create that would read the SAME records for the same function conflicts rather
@@ -754,7 +822,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             function_arn,
             function_name,
             function_qualifier,
-            event_source_arn,
+            event_source_arn: event_source_arn.clone(),
             enabled,
             batch_size: input
                 .batch_size
@@ -769,7 +837,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .or_else(|| shard_source.then_some(crate::state::DEFAULT_PARALLELIZATION_FACTOR)),
             starting_position: input.starting_position.clone(),
             starting_position_timestamp: input.starting_position_timestamp,
-            filter_criteria: input.filter_criteria.clone(),
+            // `FilterCriteria` carrying no filter at all are no criteria: there is nothing
+            // for them to determine, and they are the same value a later update DELETES a
+            // mapping's criteria with (see [`crate::state::criteria_carry_no_filter`]), so a
+            // mapping asked for with them is stored with none and reports the member not at
+            // all.
+            filter_criteria: input
+                .filter_criteria
+                .clone()
+                .filter(|stated| !crate::state::criteria_carry_no_filter(stated)),
             kms_key_arn: input.kms_key_arn.clone(),
             metrics_config: input.metrics_config.clone(),
             logging_config: input.logging_config.clone(),
@@ -826,7 +902,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // created already `Disabled` (see
             // [`crate::state::created_event_source_mapping_state`]).
             state: crate::state::created_event_source_mapping_state(enabled).to_string(),
-            state_transition_reason: crate::state::EVENT_SOURCE_MAPPING_USER_INITIATED.to_string(),
+            state_transition_reason: crate::state::event_source_mapping_transition_reason(
+                event_source_arn.as_deref(),
+            )
+            .to_string(),
             settled_due: now + crate::state::EVENT_SOURCE_MAPPING_SETTLE_DELAY,
             // Nobody has deleted this mapping, so no removal is owed.
             removal_due: None,
@@ -893,13 +972,6 @@ const DOCUMENT_DB_EVENT_SOURCE_CONFIG_MEMBER: &str = "DocumentDBEventSourceConfi
 /// See [`DOCUMENT_DB_EVENT_SOURCE_CONFIG_MEMBER`].
 const DATABASE_NAME_MEMBER: &str = "DatabaseName";
 
-/// The account field of an ARN FORMAT: the twelve-digit example id an ARN written as a
-/// SHAPE carries, beside the placeholder names of its resource half, in every format AWS
-/// spells out. It is the account half of an example rather than an account anything lives
-/// in — which is why it is stated here instead of the account whose resources this emulator
-/// holds ([`::engine::emulator_account_id`], the id every ARN this service MINTS carries).
-const EXAMPLE_ACCOUNT_ID: &str = "123456789012";
-
 /// How this operation refuses a request that left out a member it requires for the event
 /// source or the starting position that request names.
 ///
@@ -933,65 +1005,6 @@ fn absent_required_nested_member(structure: &str, member: &str) -> String {
         "{}.",
         ::aws_smithy_schema_server::missing_member_message(&path)
     )
-}
-
-/// How a request whose `EventSourceArn` names nothing an event source mapping can poll is
-/// refused.
-///
-/// Both refusals open with the same sentence — the source was not recognized — and then
-/// state the ONE thing that distinguishes the two cases, which is what tooling matches on.
-///
-/// An ARN whose VENDOR is one of the source services that member enumerates DOES name a
-/// service a mapping polls, so what the value got wrong is the SHAPE of the resource: the
-/// refusal states the ARN format that service's pollable resource is addressed by
-/// ([`expected_event_source_resource`]), because the missing or extra segment is the only
-/// thing that tells the caller what to send instead. An ARN of any other vendor names no
-/// source service at all, so there is no format to expect and nothing about the resource
-/// half to state: the refusal says the source ARN itself is unsupported and quotes it, which
-/// is the only variable part of that sentence.
-///
-/// What that format states is the SHAPE of the ARN rather than any one resource: the
-/// resource half is written with the placeholder names the format uses
-/// ([`expected_event_source_resource`]) and the account half with the example account id
-/// ([`EXAMPLE_ACCOUNT_ID`]), because neither names a resource of anybody's. The ONE field of
-/// it that is the caller's own is the Region, which the resources of a mapping's event source
-/// live in, so the example is written for the Region this request was made in.
-fn unrecognized_event_source(vendor: &str, event_source: &str, region: &str) -> String {
-    match expected_event_source_resource(vendor) {
-        Some(resource) => format!(
-            "Unrecognized event source. Expected arn of format \
-             arn:aws:{vendor}:{region}:{EXAMPLE_ACCOUNT_ID}:{resource}"
-        ),
-        None => format!("Unrecognized event source. Unsupported source arn : {event_source}"),
-    }
-}
-
-/// The RESOURCE field of the ARN that addresses the resource one source service is polled
-/// through, for each vendor namespace `EventSourceArn` enumerates — and `None` for a vendor
-/// that enumeration does not name.
-///
-/// One row per entry of that member's list, each written as that service writes the ARN of
-/// the resource the entry names: "Amazon Kinesis – The ARN of the data stream or a stream
-/// consumer", "Amazon DynamoDB Streams – The ARN of the stream" (the stream OF a table,
-/// hence the table's own resource field plus the stream segment), "Amazon Simple Queue
-/// Service – The ARN of the queue" (whose resource field is the queue's name), "Amazon
-/// Managed Streaming for Apache Kafka – The ARN of the cluster" (the VPC connection the
-/// same entry documents is its cross-account form rather than the shape a same-account
-/// mapping names), "Amazon MQ – The ARN of the broker" and "Amazon DocumentDB – The ARN of
-/// the DocumentDB change stream", which is an Amazon RDS cluster.
-///
-/// The placeholder names are the ones the format states for a shape rather than values of
-/// any resource, so the sentence reads the same whatever the caller sent.
-fn expected_event_source_resource(vendor: &str) -> Option<&'static str> {
-    Some(match vendor {
-        crate::state::EVENT_SOURCE_VENDOR_KINESIS => "stream/StreamName",
-        crate::state::EVENT_SOURCE_VENDOR_DYNAMODB => "table/TableName/stream/StreamId",
-        crate::state::EVENT_SOURCE_VENDOR_QUEUE => "QueueName",
-        crate::state::EVENT_SOURCE_VENDOR_KAFKA => "cluster/ClusterName/ClusterId",
-        crate::state::EVENT_SOURCE_VENDOR_MQ => "broker:BrokerName:BrokerId",
-        crate::state::EVENT_SOURCE_VENDOR_DOCUMENT_DB => "cluster:ClusterName",
-        _ => return None,
-    })
 }
 
 /// The modelled 400 this operation refuses a request it cannot satisfy with.

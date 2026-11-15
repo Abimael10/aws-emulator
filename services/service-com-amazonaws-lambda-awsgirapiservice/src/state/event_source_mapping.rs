@@ -64,8 +64,35 @@ pub fn created_event_source_mapping_state(enabled: bool) -> &'static str {
 
 /// `StateTransitionReason`: "Indicates whether a user or Lambda made the last change to
 /// the event source mapping." A mapping this store holds only ever changes because a
-/// caller asked it to, which Lambda reports as `USER_INITIATED`.
+/// caller asked it to, and Lambda words that differently for the two kinds of poller it
+/// stands up: a mapping on a QUEUE reports this, and one on a shard source
+/// [`EVENT_SOURCE_MAPPING_USER_ACTION`] (see
+/// [`event_source_mapping_transition_reason`]).
 pub const EVENT_SOURCE_MAPPING_USER_INITIATED: &str = "USER_INITIATED";
+
+/// See [`EVENT_SOURCE_MAPPING_USER_INITIATED`]: how the same change is worded for a mapping
+/// on one of the two SHARD sources — an Amazon Kinesis data stream or an Amazon DynamoDB
+/// table's stream — which is how the service worded it when that was observed.
+pub const EVENT_SOURCE_MAPPING_USER_ACTION: &str = "User action";
+
+/// What `StateTransitionReason` reports for a change the CALLER asked for on a mapping of
+/// the event source `event_source_arn` names.
+///
+/// One reading for every call that makes such a change — the create, the update and the
+/// delete — so no two of them word the same change differently.
+#[must_use]
+pub fn event_source_mapping_transition_reason(event_source_arn: Option<&str>) -> &'static str {
+    if is_shard_source(event_source_arn.and_then(event_source_vendor)) {
+        EVENT_SOURCE_MAPPING_USER_ACTION
+    } else {
+        EVENT_SOURCE_MAPPING_USER_INITIATED
+    }
+}
+
+/// `LastProcessingResult` for a mapping on a shard source whose poller has not attempted a
+/// batch yet: "the result of the event source mapping's last processing attempt" is that no
+/// record has been processed, which is a reading of the mapping rather than an unknown.
+pub const LAST_PROCESSING_RESULT_NO_RECORDS: &str = "No records processed";
 
 /// The `ResourceInUseException` sentence `DeleteEventSourceMapping` refuses a mapping that
 /// is not available to be deleted with.
@@ -415,10 +442,28 @@ pub fn names_event_source(arn: &::service_common::arn::Arn<'_>) -> bool {
             resource_type,
             EVENT_SOURCE_RESOURCE_CLUSTER | EVENT_SOURCE_RESOURCE_VPC_CONNECTION
         ),
-        EVENT_SOURCE_VENDOR_MQ => resource_type == EVENT_SOURCE_RESOURCE_BROKER,
+        // A broker is addressed by its NAME and the id Amazon MQ minted for it
+        // (`broker:<name>:<id>`), so a resource field that stops at the name names no one
+        // broker — which is why the refusal of such a value states that whole format.
+        EVENT_SOURCE_VENDOR_MQ => {
+            resource_type == EVENT_SOURCE_RESOURCE_BROKER && names_one_broker(arn.resource)
+        }
         EVENT_SOURCE_VENDOR_DOCUMENT_DB => resource_type == EVENT_SOURCE_RESOURCE_CLUSTER,
         _ => false,
     }
+}
+
+/// Whether the resource field `resource` of an Amazon MQ ARN names ONE broker: the three
+/// segments `broker:<name>:<id>` the format of a broker's ARN has, each carrying something.
+///
+/// A value that stops at the broker's name, or carries an empty segment, names no broker: the
+/// id beside the name is the one Amazon MQ minted for that broker, and it is part of how a
+/// broker is addressed.
+fn names_one_broker(resource: &str) -> bool {
+    let mut segments = resource.split(':').skip(1);
+    let named = segments.next().is_some_and(|name| !name.is_empty());
+    let identified = segments.next().is_some_and(|id| !id.is_empty());
+    named && identified && segments.next().is_none()
 }
 
 /// Whether the event source `arn` names belongs to the account whose resources this
@@ -670,7 +715,7 @@ impl EventSourceMappingRecord {
     /// Nothing sleeps for it.
     pub fn begin_update(&mut self, now: SystemTime) {
         self.state = EVENT_SOURCE_MAPPING_STATE_UPDATING.to_string();
-        self.state_transition_reason = EVENT_SOURCE_MAPPING_USER_INITIATED.to_string();
+        self.state_transition_reason = self.caller_transition_reason().to_string();
         // "The date that the event source mapping was last updated or that its state
         // changed": both happened now.
         self.last_modified = now;
@@ -688,7 +733,7 @@ impl EventSourceMappingRecord {
     /// Nothing sleeps for it.
     pub fn begin_delete(&mut self, now: SystemTime) {
         self.state = EVENT_SOURCE_MAPPING_STATE_DELETING.to_string();
-        self.state_transition_reason = EVENT_SOURCE_MAPPING_USER_INITIATED.to_string();
+        self.state_transition_reason = self.caller_transition_reason().to_string();
         // "The date that the event source mapping was last updated or that its state
         // changed": the move into `Deleting` is a state change, and it happened now.
         self.last_modified = now;
@@ -700,6 +745,29 @@ impl EventSourceMappingRecord {
     #[must_use]
     pub fn is_deleting(&self) -> bool {
         self.removal_due.is_some()
+    }
+
+    /// How a change this mapping's CALLER asked for is worded, which depends on the event
+    /// source it polls ([`event_source_mapping_transition_reason`]).
+    fn caller_transition_reason(&self) -> &'static str {
+        event_source_mapping_transition_reason(self.event_source_arn.as_deref())
+    }
+
+    /// Whether this mapping polls one of the two SHARD sources, whose poller is the one
+    /// Lambda reports a processing result and a user's change differently for.
+    fn polls_shards(&self) -> bool {
+        is_shard_source(self.event_source_arn.as_deref().and_then(event_source_vendor))
+    }
+
+    /// Whether this mapping polls one of the four STREAM sources — the ones
+    /// `DestinationConfig` is documented for: "(Kinesis, DynamoDB Streams, Amazon MSK, and
+    /// self-managed Apache Kafka) A configuration object that specifies the destination of
+    /// an event after Lambda processes it."
+    fn polls_a_stream(&self) -> bool {
+        is_stream_source(
+            self.event_source_arn.as_deref().and_then(event_source_vendor),
+            self.self_managed_event_source.is_some(),
+        )
     }
 
     /// Whether a change this mapping already accepted is still being applied — the
@@ -752,11 +820,26 @@ impl EventSourceMappingRecord {
             scaling_config: self.scaling_config.clone(),
             last_modified: Some(::aws_smithy_types::DateTime::from(self.last_modified)),
             // "The result of the event source mapping's last processing attempt": what
-            // the mapping's poller recorded, and nothing at all until it has made one.
-            last_processing_result: self.last_processing_result.clone(),
+            // the mapping's poller recorded — and, until it has attempted a batch, that no
+            // record has been processed, which is what the shard pollers report for a
+            // mapping that has polled nothing yet
+            // ([`LAST_PROCESSING_RESULT_NO_RECORDS`]).
+            last_processing_result: self.last_processing_result.clone().or_else(|| {
+                self.polls_shards()
+                    .then(|| LAST_PROCESSING_RESULT_NO_RECORDS.to_string())
+            }),
             state: Some(self.state.clone()),
             state_transition_reason: Some(self.state_transition_reason.clone()),
-            destination_config: self.destination_config.clone(),
+            // "(Kinesis, DynamoDB Streams, Amazon MSK, and self-managed Apache Kafka) A
+            // configuration object that specifies the destination of an event after Lambda
+            // processes it": a mapping on one of those sources HAS that configuration — with
+            // no destination in it until one is stated — and no other source has one at all.
+            destination_config: self.destination_config.clone().or_else(|| {
+                self.polls_a_stream().then_some(DestinationConfig {
+                    on_failure: Some(crate::ops::types::OnFailure { destination: None }),
+                    on_success: None,
+                })
+            }),
             topics: self.topics.clone(),
             queues: self.queues.clone(),
             source_access_configurations: self.source_access_configurations.clone(),

@@ -49,8 +49,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mappings::{
-    create_function, create_mapping, create_request, get_mapping, list_mappings, router_on,
-    unsupported_source_refusal, DYNAMODB_SOURCE, KINESIS_SOURCE, MSK_SOURCE, QUEUE_SOURCE,
+    create_function, create_mapping, create_request, get_mapping, given_broker, list_mappings,
+    router_on, unsupported_source_refusal, DYNAMODB_SOURCE, KINESIS_SOURCE, MQ_BROKER_NAME,
+    MSK_SOURCE, QUEUE_SOURCE,
 };
 
 /// The modelled error a request no mapping can satisfy is refused with
@@ -183,7 +184,9 @@ fn shape_rows() -> Vec<ShapeRow> {
             case: "an mq configuration rather than a broker",
             event_source: "arn:aws:mq:us-east-1:000000000000:configuration:order-config:c-1111",
             extras: json!({ "Queues": ["order-jobs"] }),
-            stated: Stated::ExpectedFormat("mq", "broker:BrokerName:BrokerId"),
+            // The resource half is written with the placeholder names the recorded format
+            // uses, which for a broker are lowerCamel.
+            stated: Stated::ExpectedFormat("mq", "broker:brokerName:brokerId"),
         },
         ShapeRow {
             case: "a database instance rather than a documentdb cluster",
@@ -420,6 +423,9 @@ fn member_rows() -> Vec<MemberRow> {
 #[tokio::test]
 async fn a_member_required_for_the_named_source_is_refused_as_a_validation_error_when_absent() {
     let router = emulator();
+    // The broker the Amazon MQ row names: a mapping onto a broker is accepted only against
+    // one Amazon MQ itself holds.
+    given_broker(&router, MQ_BROKER_NAME).await;
     for (index, row) in member_rows().iter().enumerate() {
         let case = row.case;
         let function = format!("esm-member-{index}");

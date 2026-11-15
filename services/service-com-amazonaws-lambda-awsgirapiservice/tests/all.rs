@@ -167,6 +167,8 @@ mod event_source_mapping_paused_state_and_response_types;
 mod event_source_mapping_processing_visibility;
 #[path = "all/event_source_mapping_queue_visibility.rs"]
 mod event_source_mapping_queue_visibility;
+#[path = "all/event_source_mapping_request_rules.rs"]
+mod event_source_mapping_request_rules;
 #[path = "all/event_source_mapping_role_access.rs"]
 mod event_source_mapping_role_access;
 #[path = "all/event_source_mapping_scaling_concurrency.rs"]

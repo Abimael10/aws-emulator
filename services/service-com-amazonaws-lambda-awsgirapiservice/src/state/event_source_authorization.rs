@@ -119,7 +119,25 @@ enum Refusal {
         /// How that sentence names the service.
         service: &'static str,
     },
+    /// An Amazon MQ BROKER, whose endpoints Lambda reads off the broker itself before it can
+    /// connect at all: one sentence naming the source and the describe a reader of it needs,
+    /// worded as the shard sources' is — but naming the source by the REQUEST MEMBER that
+    /// carried it rather than by the value, and listing its one action in the singular, which
+    /// is how the service worded this error class when it was observed.
+    Broker {
+        /// What that sentence calls the source.
+        noun: &'static str,
+        /// How it names the source: the member of the request that named it.
+        named: &'static str,
+        /// What closes the sentence after the noun it ends on.
+        tail: &'static str,
+    },
 }
+
+/// The member of the request that named the event source, in the lowerCamel spelling the
+/// wire uses for it — which is what one of these sentences names the source by, instead of
+/// the value that member carried.
+const EVENT_SOURCE_ARN_MEMBER: &str = "eventSourceArn";
 
 /// ONE action the refusal of an event source's reads names.
 struct Read {
@@ -264,7 +282,11 @@ const EVENT_SOURCE_ACCESS: &[EventSourceAccess] = &[
         vendor: super::EVENT_SOURCE_VENDOR_MQ,
         namespace: super::EVENT_SOURCE_VENDOR_MQ,
         actions: &[polls("DescribeBroker")],
-        refusal: Refusal::Call { service: "MQ" },
+        refusal: Refusal::Broker {
+            noun: "broker",
+            named: EVENT_SOURCE_ARN_MEMBER,
+            tail: " in IAM.",
+        },
     },
 ];
 
@@ -328,6 +350,11 @@ impl EventSourceAccess {
                 actions = self.action_list()
             ),
             Refusal::Call { service } => function_role_refusal_message(withheld, service),
+            Refusal::Broker { noun, named, tail } => format!(
+                "Cannot access {noun} {named}. Please ensure the role can perform the \
+                 {actions} action on your {noun}{tail}",
+                actions = self.action_list()
+            ),
         }
     }
 
@@ -679,7 +706,7 @@ mod tests {
     #[test]
     fn the_refusal_is_worded_as_the_source_words_that_error_class() {
         // (the event source, the sentence AWS answers for it)
-        let rows: [(&str, &str); 2] = [
+        let rows: [(&str, &str); 3] = [
             (
                 "arn:aws:kinesis:us-east-1:000000000000:stream/order-events",
                 "Cannot access stream arn:aws:kinesis:us-east-1:000000000000:stream/order-events. \
@@ -692,6 +719,13 @@ mod tests {
                 "Cannot access stream arn:aws:dynamodb:us-east-1:000000000000:table/orders/stream/\
                  2026-10-23T11:46:49.000. Please ensure the role can perform the GetRecords, \
                  GetShardIterator, DescribeStream, and ListStreams Actions on your stream in IAM.",
+            ),
+            (
+                // A broker's sentence names the source by the request MEMBER that carried it
+                // and lists its one action in the singular.
+                "arn:aws:mq:us-east-1:000000000000:broker:order-broker:b-1111",
+                "Cannot access broker eventSourceArn. Please ensure the role can perform the \
+                 DescribeBroker action on your broker in IAM.",
             ),
         ];
         for (event_source, expected) in rows {

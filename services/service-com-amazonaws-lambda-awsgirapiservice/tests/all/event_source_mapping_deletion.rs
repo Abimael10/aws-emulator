@@ -36,8 +36,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mappings::{
     call, create_function, create_mapping, create_request, get_mapping, list_mappings, router_on,
-    Answer, DYNAMODB_SOURCE, KINESIS_SOURCE, MAPPINGS_URI, MSK_SOURCE, QUEUE_SOURCE,
-    STATE_CREATING, USER_INITIATED, UUID_LEN,
+    shard_source_readings, Answer, DYNAMODB_SOURCE, KINESIS_SOURCE, MAPPINGS_URI, MSK_SOURCE,
+    QUEUE_SOURCE, STATE_CREATING, UUID_LEN,
 };
 
 /// The `State` a mapping a delete was accepted for carries, from
@@ -227,7 +227,7 @@ async fn a_deleted_mapping_reports_deleting_until_the_clock_removes_it() {
                 Some(STATE_DELETING.to_string()),
                 Some(uuid.clone()),
                 Some(arn.clone()),
-                Some(USER_INITIATED.to_string()),
+                Some(shard_source_readings(case.event_source).0.to_string()),
             ),
             "case {label:?}: the delete must answer the stored mapping as {STATE_DELETING}, \
              got {} {}",

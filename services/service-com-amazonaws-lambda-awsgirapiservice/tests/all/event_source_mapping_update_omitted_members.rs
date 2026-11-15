@@ -38,7 +38,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mappings::{
     call, create_function, create_mapping, create_request, get_mapping, list_mappings, router_on,
-    Answer, DYNAMODB_SOURCE, KINESIS_SOURCE, MAPPINGS_URI, QUEUE_SOURCE, USER_INITIATED,
+    shard_source_readings, Answer, DYNAMODB_SOURCE, KINESIS_SOURCE, MAPPINGS_URI, QUEUE_SOURCE,
 };
 
 /// The `State` a mapping an update was accepted for carries, and the two it settles into,
@@ -133,7 +133,15 @@ fn rows() -> Vec<Row> {
             name: "one integer member, at the published BatchSize maximum",
             function: "esm-omitted-batch",
             event_source: QUEUE_SOURCE,
-            create_extras: json!({ "BatchSize": 5, "ScalingConfig": { "MaximumConcurrency": 2 } }),
+            // The batching window `BatchSize`'s own related setting asks for past ten is
+            // stated at the CREATE, so the update below moves the batch alone: "When you set
+            // BatchSize to a value greater than 10, you must set
+            // MaximumBatchingWindowInSeconds to at least 1."
+            create_extras: json!({
+                "BatchSize": 5,
+                "MaximumBatchingWindowInSeconds": 1,
+                "ScalingConfig": { "MaximumConcurrency": 2 },
+            }),
             update: json!({ "BatchSize": 10_000 }),
             changed: vec![("BatchSize", json!(10_000))],
             settles_into: STATE_ENABLED,
@@ -315,7 +323,7 @@ async fn an_update_moves_the_members_it_states_and_leaves_every_other_one_alone(
             (answer.string("State"), answer.string("StateTransitionReason")),
             (
                 Some(STATE_UPDATING.to_string()),
-                Some(USER_INITIATED.to_string())
+                Some(shard_source_readings(Some(row.event_source)).0.to_string())
             ),
             "case {label:?}: the update must answer the mapping as {STATE_UPDATING}, asked for \
              by a caller, got {}",

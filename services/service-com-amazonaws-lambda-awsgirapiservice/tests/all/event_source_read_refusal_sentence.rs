@@ -36,8 +36,8 @@ use crate::event_source_mapping_role_access::{
     router_with_iam, QUEUE_READS,
 };
 use crate::event_source_mappings::{
-    create_mapping, create_queue, create_request, get_mapping, list_mappings, queue_held,
-    router_on, send_message, MSK_SOURCE, QUEUE_SOURCE,
+    create_mapping, create_queue, create_request, get_mapping, given_broker, list_mappings,
+    queue_held, router_on, send_message, MQ_BROKER_NAME, MSK_SOURCE, QUEUE_SOURCE,
 };
 
 /// Another queue of the same account, for the row whose grant names the wrong resource.
@@ -91,12 +91,22 @@ impl Source {
 }
 
 /// One row: the source a mapping would poll, the statements of the role's one inline policy,
-/// and the `(call, service)` the refusal has to name — `None` for a row that must be served.
+/// and the WHOLE sentence the refusal has to carry — `None` for a row that must be served.
 struct Row {
     case: &'static str,
     source: Source,
     statements: Value,
-    withheld: Option<(&'static str, &'static str)>,
+    withheld: Option<String>,
+}
+
+/// The sentence a role that may not DESCRIBE the broker a mapping would poll is refused with:
+/// worded like the shard sources', naming the source by the request member that carried it
+/// and its one action in the singular.
+fn broker_refusal() -> String {
+    format!(
+        "Cannot access broker eventSourceArn. Please ensure the role can perform the {MQ_READ} \
+         action on your broker in IAM."
+    )
 }
 
 /// The catalog: for each source service, which of its reads the role is granted, how the
@@ -109,13 +119,13 @@ fn rows() -> Vec<Row> {
             case: "a queue, with no queue call granted at all",
             source: Source::Queue,
             statements: json!([logs_only()]),
-            withheld: Some((QUEUE_READS[0], "SQS")),
+            withheld: Some(call_refusal(QUEUE_READS[0], "SQS")),
         },
         Row {
             case: "a queue, with only the receive granted",
             source: Source::Queue,
             statements: json!([logs_only(), allow("sqs", &[QUEUE_READS[0]], QUEUE_SOURCE)]),
-            withheld: Some((QUEUE_READS[1], "SQS")),
+            withheld: Some(call_refusal(QUEUE_READS[1], "SQS")),
         },
         Row {
             case: "a queue, with the receive and the delete granted",
@@ -124,7 +134,7 @@ fn rows() -> Vec<Row> {
                 logs_only(),
                 allow("sqs", &[QUEUE_READS[0], QUEUE_READS[1]], QUEUE_SOURCE)
             ]),
-            withheld: Some((QUEUE_READS[2], "SQS")),
+            withheld: Some(call_refusal(QUEUE_READS[2], "SQS")),
         },
         Row {
             // IAM's deny precedence: an explicit `Deny` wins over the grant beside it, and
@@ -139,7 +149,7 @@ fn rows() -> Vec<Row> {
                     "Resource": QUEUE_SOURCE,
                 },
             ]),
-            withheld: Some((QUEUE_READS[1], "SQS")),
+            withheld: Some(call_refusal(QUEUE_READS[1], "SQS")),
         },
         Row {
             // The grant has to name the source the mapping polls: another queue's ARN says
@@ -147,7 +157,7 @@ fn rows() -> Vec<Row> {
             case: "a queue, with every call granted on another queue",
             source: Source::Queue,
             statements: json!([allow("sqs", &QUEUE_READS, OTHER_QUEUE_SOURCE)]),
-            withheld: Some((QUEUE_READS[0], "SQS")),
+            withheld: Some(call_refusal(QUEUE_READS[0], "SQS")),
         },
         Row {
             case: "a queue, with every call granted on it",
@@ -159,7 +169,7 @@ fn rows() -> Vec<Row> {
             case: "an msk cluster, with no cluster call granted at all",
             source: Source::Cluster,
             statements: json!([logs_only()]),
-            withheld: Some((MSK_READ, "MSK")),
+            withheld: Some(call_refusal(MSK_READ, "MSK")),
         },
         Row {
             case: "an msk cluster, with the cluster describe granted on it",
@@ -171,7 +181,7 @@ fn rows() -> Vec<Row> {
             case: "an mq broker, with no broker call granted at all",
             source: Source::Broker,
             statements: json!([logs_only()]),
-            withheld: Some((MQ_READ, "MQ")),
+            withheld: Some(broker_refusal()),
         },
         Row {
             case: "an mq broker, with the broker describe granted on it",
@@ -199,6 +209,10 @@ async fn a_withheld_source_read_is_refused_with_awss_fixed_sentence() {
     for (index, row) in rows().iter().enumerate() {
         let case = row.case;
         let router = router_with_iam();
+        // The broker the Amazon MQ rows name: a mapping onto a broker is accepted only
+        // against one Amazon MQ itself holds, so the row that IS granted the read reaches
+        // the 202 it asserts.
+        given_broker(&router, MQ_BROKER_NAME).await;
         let role = given_role(
             &router,
             case,
@@ -216,7 +230,7 @@ async fn a_withheld_source_read_is_refused_with_awss_fixed_sentence() {
         )
         .await;
 
-        let Some((call, service)) = row.withheld else {
+        let Some(expected) = row.withheld.clone() else {
             assert_eq!(
                 answer.status,
                 202,
@@ -238,7 +252,6 @@ async fn a_withheld_source_read_is_refused_with_awss_fixed_sentence() {
             continue;
         };
 
-        let expected = call_refusal(call, service);
         assert_refused(case, &answer, &expected);
         let message = answer
             .string("message")

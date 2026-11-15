@@ -42,7 +42,7 @@ use crate::event_source_mapping_role_access::{
 };
 use crate::event_source_mappings::{
     call, call_sqs, create_mapping, create_queue, get_mapping, processing_result_within_budget,
-    queue_message_counts, router_on, DrivenPolling,
+    queue_message_counts, reports_no_attempt, router_on, DrivenPolling,
 };
 // The stream fixture and the Kinesis calls are the ones the shard-source suites already
 // publish, so every suite over that surface drives the same wire.
@@ -436,7 +436,7 @@ async fn a_queue_mapping_polls_only_while_its_execution_role_may_read_the_queue(
             reading.text()
         );
         assert!(
-            reading.json().get("LastProcessingResult").is_none(),
+            reports_no_attempt(&reading),
             "case {case:?}: no batch was polled, so there is no processing attempt to \
              report, got {}",
             reading.text()
@@ -566,7 +566,7 @@ async fn a_stream_mapping_reads_only_while_its_execution_role_may_read_the_strea
         while Instant::now() < watch_until {
             let reading = get_mapping(&router, &uuid).await;
             assert!(
-                reading.json().get("LastProcessingResult").is_none(),
+                reports_no_attempt(&reading),
                 "case {case:?}: a read the role may not make is one the pass does not make, \
                  so no batch is read and no attempt at one is reported, got {}",
                 reading.text()

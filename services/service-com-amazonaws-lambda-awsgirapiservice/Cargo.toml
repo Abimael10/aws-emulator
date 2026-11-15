@@ -31,6 +31,11 @@ tracing = { workspace = true }
 # which lives in the Amazon SQS emulator's queue store: it is reached through the shared
 # engine, which needs the owning service's state TYPE.
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# An event source mapping on an Amazon MQ broker is accepted only against a broker that
+# EXISTS, and brokers live in the Amazon MQ emulator's own store
+# (`state::event_source_request`): it is reached through the shared engine, which needs the
+# owning service's state TYPE.
+service-com-amazonaws-mq-mq = { workspace = true }
 # A mapping is also accepted against what the invoked function's EXECUTION ROLE may read on
 # the event source (`state::event_source_authorization`): the role's policies live in the
 # IAM emulator's store, reached through that same shared engine. The same store holds the

@@ -90,8 +90,36 @@ pub(crate) fn created_state_for(extras: &Value) -> &'static str {
     }
 }
 
-/// `StateTransitionReason` for a change a caller asked for.
+/// `StateTransitionReason` for a change a caller asked for, as a mapping on a QUEUE (and on
+/// every source whose poller is not a shard reader) reports it.
 pub(crate) const USER_INITIATED: &str = "USER_INITIATED";
+
+/// The same change, as a mapping on one of the two SHARD sources reports it.
+pub(crate) const USER_ACTION: &str = "User action";
+
+/// `LastProcessingResult` of a mapping on a shard source whose poller has attempted no batch
+/// yet: "the result of the event source mapping's last processing attempt" is that no record
+/// has been processed.
+pub(crate) const NO_RECORDS_PROCESSED: &str = "No records processed";
+
+/// What a mapping of `event_source` reports as the `StateTransitionReason` of a change its
+/// caller asked for, and as its `LastProcessingResult` before its poller has attempted a
+/// batch — `None` for a result no mapping of that source reports at all.
+///
+/// Stated here from the event source the REQUEST named, independently of the store's own
+/// resolution of the same rule, so that these assertions check the emulator rather than
+/// restate it: keep the two apart rather than collapsing this into the production helper.
+pub(crate) fn shard_source_readings(event_source: Option<&str>) -> (&'static str, Option<&'static str>) {
+    let shard_source = event_source.is_some_and(|arn| {
+        arn.starts_with("arn:aws:kinesis:")
+            || (arn.starts_with("arn:aws:dynamodb:") && arn.contains("/stream/"))
+    });
+    if shard_source {
+        (USER_ACTION, Some(NO_RECORDS_PROCESSED))
+    } else {
+        (USER_INITIATED, None)
+    }
+}
 
 /// The bounds the model puts on `EventSourceMappingArn` (`@length(min: 85, max: 120)`),
 /// from `smithy_query(query="shape", shape="EventSourceMappingArn")`.
@@ -139,6 +167,10 @@ pub(crate) const MSK_SOURCE: &str =
     "arn:aws:kafka:us-east-1:000000000000:cluster/order-events/11111111-2222-3333-4444-555555555555-1";
 /// An Amazon MQ broker, "Amazon MQ – The ARN of the broker".
 const MQ_SOURCE: &str = "arn:aws:mq:us-east-1:000000000000:broker:order-broker:b-1111";
+/// The broker [`MQ_SOURCE`] names, which the suites that map it create through Amazon MQ's
+/// own API ([`given_broker`]): a mapping onto a broker is accepted only against a broker
+/// that service holds.
+pub(crate) const MQ_BROKER_NAME: &str = "order-broker";
 /// An Amazon DocumentDB change stream, "Amazon DocumentDB – The ARN of the DocumentDB
 /// change stream", whose ARNs are in the `rds` namespace.
 const DOCDB_SOURCE: &str = "arn:aws:rds:us-east-1:000000000000:cluster:order-docdb";
@@ -233,11 +265,60 @@ impl Answer {
 
 /// One service mounted on its own engine, reached the way the production router reaches
 /// it.
+///
+/// Amazon MQ is mounted beside it because a mapping onto a BROKER is accepted only against
+/// a broker that exists, and brokers live in that service's own store: the suites that map a
+/// broker create it there first ([`given_broker`]), so a mapping is wired to a source a
+/// client can really read back.
 pub(crate) fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(engine)));
+    router.register_service(
+        service_com_amazonaws_mq_mq::EmulatedService::new(Arc::clone(engine)),
+    );
     router
+}
+
+/// Create the Amazon MQ broker `name` through THAT service's own `CreateBroker`, so the
+/// broker a mapping's `EventSourceArn` names is one Amazon MQ itself reports.
+///
+/// The body carries the members that operation requires plus the one administrative user a
+/// broker is created with, exactly as the Amazon MQ suites write it.
+pub(crate) async fn given_broker(router: &MultiServiceRouter, name: &str) {
+    let body = json!({
+        "brokerName": name,
+        "engineType": "ACTIVEMQ",
+        "deploymentMode": "SINGLE_INSTANCE",
+        "hostInstanceType": "mq.t3.micro",
+        "publiclyAccessible": false,
+        "users": [{ "username": "admin", "password": "SuperSecret123" }],
+    });
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("http://mq.us-east-1.amazonaws.com/v1/brokers")
+        .header("host", "mq.us-east-1.amazonaws.com")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=emulator-test-key/20260101/{REGION}/mq/aws4_request, \
+                 SignedHeaders=host, Signature=not-verified"
+            ),
+        )
+        .header("content-type", "application/json")
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(&body).expect("the broker request body must serialize"),
+        ))
+        .expect("the broker request must build");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = response.into_body();
+    assert_eq!(
+        status,
+        200,
+        "CreateBroker for {name:?} must answer 200, got {status} {}",
+        String::from_utf8_lossy(&body)
+    );
 }
 
 /// Dispatch one JSON request, signed with the credential this harness publishes — a key no
@@ -553,7 +634,13 @@ pub(crate) async fn processing_result_within_budget(
     let deadline = Instant::now() + CLOCK_BUDGET;
     loop {
         let reading = get_mapping(router, uuid).await;
-        if let Some(result) = reading.string("LastProcessingResult") {
+        // The reading a mapping on a shard source carries before its poller's first attempt
+        // is the ABSENCE of an attempt, not the result of one, so it is not what this waits
+        // for ([`reports_no_attempt`]).
+        if let Some(result) = reading
+            .string("LastProcessingResult")
+            .filter(|result| result != NO_RECORDS_PROCESSED)
+        {
             return Some(result);
         }
         assert_eq!(
@@ -567,6 +654,16 @@ pub(crate) async fn processing_result_within_budget(
         }
         tokio::time::sleep(LOOK_AGAIN).await;
     }
+}
+
+/// Whether `reading` reports NO processing attempt at all: a mapping whose poller has
+/// attempted nothing reports either no `LastProcessingResult` (a queue's does not) or the
+/// no-records reading a shard source's carries until its first attempt
+/// ([`NO_RECORDS_PROCESSED`]).
+pub(crate) fn reports_no_attempt(reading: &Answer) -> bool {
+    reading
+        .string("LastProcessingResult")
+        .is_none_or(|result| result == NO_RECORDS_PROCESSED)
 }
 
 /// `SendMessage` of `body` to the queue `url` addresses, carrying `group` as its
@@ -1186,6 +1283,9 @@ async fn a_created_event_source_mapping_is_persisted_and_reported() {
     let router = router_on(&engine);
     let function = "esm-reported-fn";
     create_function(&router, function).await;
+    // The broker the Amazon MQ row maps: a mapping is accepted only onto a broker that
+    // service itself holds, so it is created through its own API first.
+    given_broker(&router, MQ_BROKER_NAME).await;
 
     let mut uuids: BTreeSet<String> = BTreeSet::new();
 
@@ -1236,6 +1336,10 @@ async fn a_created_event_source_mapping_is_persisted_and_reported() {
         // asked for with polling paused has no poller to stand up, so it is created
         // already in the terminal state its setting asks for.
         let created_state = created_state_for(&case.request_extras);
+        // Which of the two sentences the change is worded with, and whether the mapping
+        // reports a processing result before its poller has attempted anything, is the
+        // source's own.
+        let (reason, unattempted) = shard_source_readings(case.event_source);
         assert_eq!(
             (
                 created.string("FunctionArn"),
@@ -1245,7 +1349,7 @@ async fn a_created_event_source_mapping_is_persisted_and_reported() {
             (
                 Some(function_arn(function)),
                 Some(created_state.to_string()),
-                Some(USER_INITIATED.to_string())
+                Some(reason.to_string())
             ),
             "case {label:?}: a created mapping names the function it resolved and starts \
              {created_state}, got {}",
@@ -1256,10 +1360,11 @@ async fn a_created_event_source_mapping_is_persisted_and_reported() {
             "case {label:?}: a created mapping reports when it was last modified, got {}",
             created.text()
         );
-        assert!(
-            created.json().get("LastProcessingResult").is_none(),
-            "case {label:?}: no poller has processed anything, so no last processing result \
-             is reported, got {}",
+        assert_eq!(
+            created.string("LastProcessingResult").as_deref(),
+            unattempted,
+            "case {label:?}: no poller has processed anything, so the mapping reports \
+             {unattempted:?}, got {}",
             created.text()
         );
         assert_members(label, "the create", &created.json(), &case.expected);
@@ -1287,7 +1392,7 @@ async fn a_created_event_source_mapping_is_persisted_and_reported() {
                 Some(uuid.clone()),
                 Some(arn.clone()),
                 Some(function_arn(function)),
-                Some(USER_INITIATED.to_string())
+                Some(reason.to_string())
             ),
             "case {label:?}: the get reports the same identity the create minted, got {}",
             fetched.text()
@@ -1915,6 +2020,9 @@ async fn only_an_arn_naming_an_event_source_of_this_account_is_mapped() {
     let router = router_on(&engine);
     let function = "esm-source-catalog-fn";
     create_function(&router, function).await;
+    // The broker the Amazon MQ row of the catalogue names, created through Amazon MQ's own
+    // API: a mapping onto a broker is accepted only against a broker that service holds.
+    given_broker(&router, "catalog-broker").await;
 
     let cases = event_source_cases();
     for case in &cases {
@@ -2136,12 +2244,14 @@ async fn a_request_no_event_source_mapping_can_satisfy_is_refused() {
             code: "ResourceNotFoundException",
         },
         RefusalCase {
-            name: "list-the-mappings-of-an-unknown-function",
+            name: "list-by-an-arn-that-names-no-event-source",
             method: "GET",
-            uri: format!("{MAPPINGS_URI}?FunctionName=esm-absent-fn"),
+            uri: format!(
+                "{MAPPINGS_URI}?EventSourceArn=arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/orders"
+            ),
             body: Value::Null,
-            status: 404,
-            code: "ResourceNotFoundException",
+            status: 400,
+            code: "InvalidParameterValueException",
         },
     ];
 

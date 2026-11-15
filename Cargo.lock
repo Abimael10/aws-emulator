@@ -15781,6 +15781,7 @@ dependencies = [
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-kinesis-kinesis-20131202",
  "service-com-amazonaws-kms-trentservice",
+ "service-com-amazonaws-mq-mq",
  "service-com-amazonaws-opensearch-amazonopensearchservice",
  "service-com-amazonaws-opensearchserverless-opensearchserverless",
  "service-com-amazonaws-pipes-pipes",

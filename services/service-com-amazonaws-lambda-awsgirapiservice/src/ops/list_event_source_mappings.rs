@@ -5,6 +5,15 @@
 //! marker always continues from where the previous page ended, narrowed to one event
 //! source or one function when the request names one.
 //!
+//! Both narrowings are FILTERS over the stored mappings rather than lookups of the resource
+//! they name: a `FunctionName` naming no function this store holds matches no mapping, so
+//! the answer is an empty `EventSourceMappings` list and not a refusal. What the two values
+//! are still held to is what they have to BE — a `FunctionName` in one of the documented
+//! name forms, and an `EventSourceArn` that names an event source at all, which is the same
+//! reading the call that wires a mapping to a source makes of it (see
+//! [`crate::state::event_source_arn_refusal`]) — because a value that names no event source
+//! is not a filter that happens to match nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -191,50 +200,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_all(now);
 
-        // "The name or ARN of the Lambda function": the filter names one function, so it
-        // resolves exactly the way every other operation on this service resolves a
-        // `FunctionName`, and a value naming no stored function is answered with the
-        // modelled not-found rather than an empty page.
+        // "The name or ARN of the Lambda function": the filter NARROWS the mappings this
+        // store holds to the ones of the function it names, so it is a predicate rather than
+        // a resource lookup. The value is still read exactly the way every other operation on
+        // this service reads a `FunctionName` — so one in none of the documented forms is the
+        // parameter violation it is — but a well-formed value naming no stored function, or
+        // no such version of one, matches no mapping: the answer is an empty list rather than
+        // a not-found, because the listing reports mappings and nothing about the function
+        // was asked for.
         let function_filter = match input.function_name.as_deref() {
             Some(function_name) => {
-                let (record, version) = match crate::state::resolve_function(
-                    &mut store,
-                    function_name,
-                    None,
-                    &region,
-                    now,
-                ) {
-                    Ok(resolved) => resolved,
+                match crate::state::resolve_function(&mut store, function_name, None, &region, now)
+                {
+                    Ok((record, version)) => {
+                        let name = record.config.name.clone();
+                        // An unqualified reference names the function, so it matches every
+                        // mapping of it; `$LATEST` is the function itself rather than one
+                        // version or alias of it.
+                        let qualifier =
+                            (version != crate::state::VERSION_LATEST).then(|| version.clone());
+                        Some(FunctionFilter::Of(name, qualifier))
+                    }
                     Err(crate::state::ResolveFailure::Malformed(message)) => {
                         return Err(invalid_parameter(message))
                     }
-                    Err(crate::state::ResolveFailure::NotFound(message)) => {
-                        return Err(
-                            ListEventSourceMappingsErrorModeled::ResourceNotFoundException(
-                                ResourceNotFoundException {
-                                    r#type: None,
-                                    message: Some(message),
-                                },
-                            )
-                            .into(),
-                        )
+                    Err(crate::state::ResolveFailure::NotFound(_)) => {
+                        Some(FunctionFilter::MatchesNothing)
                     }
-                };
-                let name = record.config.name.clone();
-                // An unqualified reference names the function, so it matches every
-                // mapping of it; `$LATEST` is the function itself rather than one version
-                // or alias of it.
-                let qualifier =
-                    (version != crate::state::VERSION_LATEST).then(|| version.clone());
-                Some((name, qualifier))
+                }
             }
             None => None,
         };
 
         // "Specify an EventSourceArn to show only event source mappings for a single
         // event source": the filter is the event source itself, so it matches the ARN the
-        // mapping was created against.
+        // mapping was created against — and a value that names no event source at all is
+        // refused here exactly as the call that WIRES a mapping to a source refuses it (see
+        // [`crate::state::event_source_arn_refusal`]), rather than answered as a filter that
+        // happens to match nothing.
         let event_source_filter = input.event_source_arn.as_deref();
+        if let Some(message) = event_source_filter
+            .filter(|arn| !arn.is_empty())
+            .and_then(|arn| crate::state::event_source_arn_refusal(arn, &region))
+        {
+            return Err(invalid_parameter(message));
+        }
 
         let entries: Vec<&crate::state::EventSourceMappingRecord> = store
             .event_source_mappings
@@ -244,8 +254,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .is_none_or(|arn| mapping.event_source_arn.as_deref() == Some(arn))
             })
             .filter(|mapping| {
-                function_filter.as_ref().is_none_or(|(name, qualifier)| {
-                    mapping.is_of_function(name, qualifier.as_deref())
+                function_filter.as_ref().is_none_or(|filter| match filter {
+                    FunctionFilter::Of(name, qualifier) => {
+                        mapping.is_of_function(name, qualifier.as_deref())
+                    }
+                    FunctionFilter::MatchesNothing => false,
                 })
             })
             .collect();
@@ -294,4 +307,17 @@ fn invalid_parameter(message: String) -> ListEventSourceMappingsError {
         },
     )
     .into()
+}
+
+/// Which mappings a `FunctionName` filter admits.
+///
+/// A well-formed value that names no function this store holds is NOT an error of the
+/// listing — nothing about the function was asked for — so it is a filter that admits
+/// nothing, kept apart from the absent filter, which admits every mapping.
+enum FunctionFilter {
+    /// The mappings of the function `name` names, narrowed to one version or alias when the
+    /// value qualified it.
+    Of(String, Option<String>),
+    /// A value naming no function of this Region: no mapping is of it.
+    MatchesNothing,
 }

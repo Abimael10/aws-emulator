@@ -42,7 +42,7 @@ use crate::event_source_mapping_role_access::{
 };
 use crate::event_source_mappings::{
     call_sqs, create_queue, get_mapping, processing_result_within_budget, queue_message_counts,
-    send_message,
+    reports_no_attempt, send_message,
 };
 use crate::event_source_poll_authorization::{
     driven_emulator_with_queues, emulator_with_streams, given_enabled_mapping, wait_until_active,
@@ -375,7 +375,7 @@ async fn a_queue_mapping_polls_only_while_the_queue_s_own_policy_lets_the_poller
             reading.text()
         );
         assert!(
-            reading.json().get("LastProcessingResult").is_none(),
+            reports_no_attempt(&reading),
             "case {case:?}: no batch was polled, so there is no processing attempt to report, \
              got {}",
             reading.text()
@@ -445,7 +445,7 @@ async fn a_stream_mapping_reads_only_while_the_stream_s_own_policy_lets_the_poll
         while Instant::now() < watch_until {
             let reading = get_mapping(&router, &uuid).await;
             assert!(
-                reading.json().get("LastProcessingResult").is_none(),
+                reports_no_attempt(&reading),
                 "case {case:?}: a read the stream's own policy denies is one the pass does \
                  not make, so no batch is read and no attempt at one is reported, got {}",
                 reading.text()

@@ -250,6 +250,7 @@ pub use sqs_poller::{
 /// beside them, and is re-exported here for the same reason as [`capacity_provider`]: the
 /// mapping record carrying those criteria stays in this module.
 pub mod event_source_filter;
+pub use event_source_filter::criteria_carry_no_filter;
 
 /// Which records of a batch the function it was handed to reported it did not process — the
 /// ONE reading of a partial batch response, which both pollers above decide what to consume
@@ -3006,25 +3007,41 @@ pub mod async_completion_delivery;
 pub use async_completion_delivery::{deliver_completion, Completion, Ending};
 pub use event_source_mapping::{
     created_event_source_mapping_state, default_batch_size, default_batching_window_seconds,
-    event_source_is_mappable_by_this_account, event_source_mapping_arn, event_source_vendor,
-    is_kafka_source, is_shard_source, is_stream_source, metrics_config_refusal,
-    mint_event_source_mapping_uuid, names_event_source, queue_visibility_refusal,
-    queue_visibility_timeout_seconds, supports_at_timestamp, DEFAULT_BATCHING_WINDOW_SECONDS,
+    event_source_is_mappable_by_this_account, event_source_mapping_arn,
+    event_source_mapping_transition_reason, event_source_vendor, is_kafka_source, is_shard_source,
+    is_stream_source, metrics_config_refusal, mint_event_source_mapping_uuid, names_event_source,
+    queue_visibility_refusal, queue_visibility_timeout_seconds, supports_at_timestamp,
+    DEFAULT_BATCHING_WINDOW_SECONDS,
     DEFAULT_BATCH_SIZE_QUEUE, DEFAULT_BATCH_SIZE_STREAM, DEFAULT_PARALLELIZATION_FACTOR,
     DYNAMODB_STREAM_SEGMENT, EVENT_SOURCE_MAPPING_DELETE_DELAY,
     EVENT_SOURCE_MAPPING_DELETE_IN_USE_MESSAGE, EVENT_SOURCE_MAPPING_SETTLE_DELAY,
     EVENT_SOURCE_MAPPING_STATE_CREATING, EVENT_SOURCE_MAPPING_STATE_DELETING,
     EVENT_SOURCE_MAPPING_STATE_DISABLED, EVENT_SOURCE_MAPPING_STATE_ENABLED,
-    EVENT_SOURCE_MAPPING_STATE_UPDATING, EVENT_SOURCE_MAPPING_USER_INITIATED,
+    EVENT_SOURCE_MAPPING_STATE_UPDATING, EVENT_SOURCE_MAPPING_USER_ACTION,
+    EVENT_SOURCE_MAPPING_USER_INITIATED,
     EVENT_SOURCE_RESOURCE_BROKER, EVENT_SOURCE_RESOURCE_CLUSTER, EVENT_SOURCE_RESOURCE_STREAM,
     EVENT_SOURCE_RESOURCE_TABLE, EVENT_SOURCE_RESOURCE_VPC_CONNECTION,
     EVENT_SOURCE_VENDOR_DOCUMENT_DB, EVENT_SOURCE_VENDOR_DYNAMODB, EVENT_SOURCE_VENDOR_KAFKA,
     EVENT_SOURCE_VENDOR_KINESIS, EVENT_SOURCE_VENDOR_MQ, EVENT_SOURCE_VENDOR_QUEUE,
-    INFINITE_RETENTION, LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED, LAST_PROCESSING_RESULT_OK,
+    INFINITE_RETENTION, LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED,
+    LAST_PROCESSING_RESULT_NO_RECORDS, LAST_PROCESSING_RESULT_OK,
     MAX_EVENT_SOURCE_MAPPINGS, MAX_EVENT_SOURCE_MAPPING_PAGE_SIZE,
     STARTING_POSITION_AT_TIMESTAMP, STARTING_POSITION_LATEST, STARTING_POSITION_TRIM_HORIZON,
 };
 pub use event_source_mapping::{EventSourceMappingRecord, ShardCursor, ShardSource};
+
+/// What a request ABOUT a mapping has to state — the event source its `EventSourceArn`
+/// names, the batch a queue may be read in, and whether its `FilterCriteria` can decide
+/// anything — lives in [`event_source_request`], because the create, the update and the
+/// listing each state some of it and no two of them may read a member differently. Every
+/// item is re-exported here, so a handler names them as `crate::state::…`.
+pub mod event_source_request;
+pub use event_source_request::{
+    absent_event_source_message, event_source_arn_refusal, filter_criteria_refusal,
+    names_fifo_queue, queue_batch_window_refusal, unrecognized_event_source,
+    ABSENT_BROKER_MESSAGE, FIFO_BATCHING_WINDOW_MESSAGE, INVALID_FILTER_PATTERN_MESSAGE,
+    MAX_QUEUE_BATCH_SIZE_WITHOUT_WINDOW, QUEUE_BATCH_WINDOW_MESSAGE,
+};
 
 /// WHICH destinations such a mapping may hand a record of a failed batch to lives in
 /// [`event_source_mapping_destination`], beside the slice above, and is re-exported here for

@@ -111,6 +111,21 @@ pub fn patterns_of(criteria: Option<&crate::ops::types::FilterCriteria>) -> Vec<
         .unwrap_or_default()
 }
 
+/// Whether `criteria` carry no filter at all — the value that DELETES a mapping's criteria:
+/// "To delete the filter criteria, specify an empty FilterCriteria object"
+/// (`UpdateEventSourceMapping$FilterCriteria`).
+///
+/// `FilterCriteria` is "an object that defines the filter criteria that determine whether
+/// Lambda should process an event", and what determines that is the patterns its `Filters`
+/// carry: criteria carrying none determine nothing, whether the list is absent, empty, or
+/// made only of filters carrying no pattern. So the two calls that STATE criteria read such a
+/// value as no criteria rather than storing a structure that decides nothing, and every
+/// reader of the mapping then reports the member not at all.
+#[must_use]
+pub fn criteria_carry_no_filter(criteria: &crate::ops::types::FilterCriteria) -> bool {
+    patterns_of(Some(criteria)).is_empty()
+}
+
 /// All of `filters` parsed, or `None` when any of them is not a pattern this emulator can
 /// match: a filter that was only partly read would admit or reject on criteria the mapping
 /// does not carry (see [`Filters::AdmitEverything`]).

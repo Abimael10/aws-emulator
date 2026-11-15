@@ -32,7 +32,7 @@ use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mappings::{
-    call, create_function, create_mapping, list_mappings, router_on, Answer,
+    call, create_function, create_mapping, given_broker, list_mappings, router_on, Answer,
     MAPPINGS_URI, MSK_SOURCE, QUEUE_SOURCE,
 };
 
@@ -43,6 +43,8 @@ const ACCOUNT: &str = "000000000000";
 
 /// An Amazon MQ broker, "Amazon MQ – The ARN of the broker".
 const MQ_SOURCE: &str = "arn:aws:mq:us-east-1:000000000000:broker:duplicate-broker:b-2222";
+/// The broker [`MQ_SOURCE`] names, created through Amazon MQ's own API by the suite.
+const DUPLICATE_BROKER_NAME: &str = "duplicate-broker";
 
 /// Bootstrap servers of a self-managed Apache Kafka cluster, each satisfying the
 /// `Endpoint` pattern the model puts on an `EndpointLists` member
@@ -359,6 +361,9 @@ fn duplicate_cases() -> Vec<DuplicateCase> {
 async fn a_second_mapping_of_the_same_records_for_one_function_conflicts() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
+    // The broker the Amazon MQ rows map: a mapping onto a broker is accepted only against
+    // one Amazon MQ itself holds, so the conflict these rows assert is reached at all.
+    given_broker(&router, DUPLICATE_BROKER_NAME).await;
 
     for case in duplicate_cases() {
         let DuplicateCase {

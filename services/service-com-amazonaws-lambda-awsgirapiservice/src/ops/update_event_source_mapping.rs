@@ -39,6 +39,15 @@
 //! since that is the identity it is written under (see
 //! [`crate::state::unwritable_mapping_destination`]).
 //!
+//! So are the two settings a request about WHAT the mapping polls states: `FilterCriteria`
+//! carrying text that is not a filter pattern decide nothing, so they are refused with that
+//! same modelled 400 and the criteria the mapping already carries stand (see
+//! [`crate::state::filter_criteria_refusal`]); and `BatchSize`'s own related setting — "When
+//! you set BatchSize to a value greater than 10, you must set
+//! MaximumBatchingWindowInSeconds to at least 1" — is decided against the values in force
+//! after this update, so a mapping on a queue is never left with a batch it has no window to
+//! gather (see [`crate::state::queue_batch_window_refusal`]).
+//!
 //! The operation answers 202 Accepted, so the change is NOT in effect when the call
 //! returns: the mapping moves into `Updating` — one of the states
 //! `EventSourceMappingConfiguration$State` enumerates — and the move to the state its
@@ -460,6 +469,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(message));
         }
 
+        // And `FilterCriteria` this update states are held to exactly what the create's are:
+        // each `Filter$Pattern` is "a filter pattern", so text that is not one decides
+        // nothing and is refused rather than stored over criteria that did (see
+        // [`crate::state::filter_criteria_refusal`]) — which is also what keeps a later,
+        // valid update of the same mapping possible.
+        if let Some(message) = crate::state::filter_criteria_refusal(input.filter_criteria.as_ref())
+        {
+            return Err(invalid_parameter(message.to_string()));
+        }
+
+        // And the pair `BatchSize`'s own related setting binds is held to the same rule a
+        // create is, against the values in force AFTER this update: what this request states
+        // for each half, and the stored value for the half it leaves alone (see
+        // [`crate::state::queue_batch_window_refusal`]).
+        if let Some(message) = store
+            .event_source_mappings
+            .get(&input.uuid)
+            .and_then(|record| {
+                crate::state::queue_batch_window_refusal(
+                    mapped_source.as_deref(),
+                    input.batch_size.unwrap_or(record.batch_size),
+                    input
+                        .maximum_batching_window_in_seconds
+                        .or(record.maximum_batching_window_in_seconds),
+                )
+            })
+        {
+            return Err(invalid_parameter(message.to_string()));
+        }
+
         // Only a queue carries a visibility timeout, so only a queue source is one of those
         // comparisons.
         let queue_source = mapped_source.clone().filter(|arn| {
@@ -586,8 +625,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(batch_size) = input.batch_size {
             record.batch_size = batch_size;
         }
-        if input.filter_criteria.is_some() {
-            record.filter_criteria = input.filter_criteria.clone();
+        // `FilterCriteria` the request states replace the stored criteria — and criteria
+        // that carry no filter at all are what DELETES them ("To delete the filter criteria,
+        // specify an empty FilterCriteria object"), so the mapping is left with no criteria
+        // rather than with an empty structure, and every reader of it reports the member not
+        // at all.
+        if let Some(criteria) = input.filter_criteria.clone() {
+            record.filter_criteria =
+                Some(criteria).filter(|stated| !crate::state::criteria_carry_no_filter(stated));
         }
         if input.kms_key_arn.is_some() {
             record.kms_key_arn = input.kms_key_arn.clone();

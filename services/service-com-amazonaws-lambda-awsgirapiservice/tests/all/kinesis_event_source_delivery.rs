@@ -38,8 +38,9 @@ use service_com_amazonaws_lambda_awsgirapiservice::state::metrics::{
     FUNCTION_NAME_DIMENSION, ITERATOR_AGE_METRIC, ITERATOR_AGE_UNIT, METRIC_NAMESPACE,
 };
 use service_com_amazonaws_lambda_awsgirapiservice::state::{
-    LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED, LAST_PROCESSING_RESULT_OK,
-    STARTING_POSITION_AT_TIMESTAMP, STARTING_POSITION_LATEST, STARTING_POSITION_TRIM_HORIZON,
+    LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED, LAST_PROCESSING_RESULT_NO_RECORDS,
+    LAST_PROCESSING_RESULT_OK, STARTING_POSITION_AT_TIMESTAMP, STARTING_POSITION_LATEST,
+    STARTING_POSITION_TRIM_HORIZON,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -409,7 +410,12 @@ pub(crate) async fn get_mapping(router: &MultiServiceRouter, case: &str, uuid: &
     read
 }
 
-/// Wait until the mapping reports a `LastProcessingResult`, answering what it reported.
+/// Wait until the mapping reports the result of a processing ATTEMPT, answering what it
+/// reported.
+///
+/// The reading a mapping on a shard source carries before its poller's first attempt
+/// ([`NO_RECORDS_PROCESSED`]) is the absence of an attempt rather than the result of one, so
+/// it is not what this waits for.
 async fn wait_for_processing_result(
     router: &MultiServiceRouter,
     case: &str,
@@ -418,7 +424,10 @@ async fn wait_for_processing_result(
     let deadline = Instant::now() + BUDGET;
     loop {
         let read = get_mapping(router, case, uuid).await;
-        let result = read["LastProcessingResult"].as_str().map(str::to_string);
+        let result = read["LastProcessingResult"]
+            .as_str()
+            .filter(|result| *result != LAST_PROCESSING_RESULT_NO_RECORDS)
+            .map(str::to_string);
         if result.is_some() || Instant::now() >= deadline {
             return result;
         }
@@ -530,8 +539,9 @@ async fn a_paused_mapping_accumulates_a_backlog_that_meters_its_age_when_it_resu
             let read = get_mapping(&router, case, &uuid).await;
             assert_eq!(
                 read["LastProcessingResult"],
-                Value::Null,
-                "case {case:?}: a paused mapping must make no processing attempt, got {read}"
+                json!(LAST_PROCESSING_RESULT_NO_RECORDS),
+                "case {case:?}: a paused mapping must make no processing attempt, so it still \
+                 reports that no record has been processed, got {read}"
             );
             let (status, updated) = lambda(
                 &router,
