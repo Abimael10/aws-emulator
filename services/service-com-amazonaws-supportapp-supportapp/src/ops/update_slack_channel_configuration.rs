@@ -221,40 +221,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `channelRoleArn` came off the request boundary with the whole member (see
-        // [`crate::state::channel_role_account_refusal`]), so the one rule of it that is a
-        // caller-input rule — the declared length bound on what this API can carry — is
-        // applied here, in the envelope the boundary states that class in, and before the
-        // pass-role attempt below for that reason.
-        if let Some(message) = input
+        // [`crate::state::channel_role_arn_refusal`]), so the member's rules are applied
+        // here, to the value this request CARRIES: an update naming none leaves the stored
+        // role alone, and the record this update would rewrite is left exactly as it stands
+        // when a value is refused. WHICH refusal a value draws, and in which order the two
+        // rules are judged, is that shared rule's — this handler only lifts the answer it
+        // gives into this operation's own error enum.
+        if let Some(refusal) = input
             .channel_role_arn
             .as_deref()
-            .and_then(crate::state::channel_role_arn_length_refusal)
+            .and_then(crate::state::channel_role_arn_refusal)
         {
-            return Err(UpdateSlackChannelConfigurationErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(message),
-                },
-            )
+            return Err(match refusal {
+                crate::state::ChannelRoleArnRefusal::Validation(message) => {
+                    UpdateSlackChannelConfigurationErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(message),
+                        },
+                    )
+                }
+                crate::state::ChannelRoleArnRefusal::AccessDenied(message) => {
+                    UpdateSlackChannelConfigurationErrorModeled::AccessDeniedException(
+                        AccessDeniedException {
+                            message: Some(message),
+                        },
+                    )
+                }
+            }
             .into());
-        }
-
-        // Which role this request asks the service to use is settled next — a fact about the
-        // REQUEST, not about the stored configuration: the value has to name a role this
-        // account can pass, and the record this update would rewrite is left exactly as it
-        // stands when it does not.
-        if let Some(message) = input
-            .channel_role_arn
-            .as_deref()
-            .and_then(crate::state::channel_role_account_refusal)
-        {
-            return Err(
-                UpdateSlackChannelConfigurationErrorModeled::AccessDeniedException(
-                    AccessDeniedException {
-                        message: Some(message),
-                    },
-                )
-                .into(),
-            );
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

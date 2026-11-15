@@ -5,7 +5,8 @@
 //! Besides the state struct itself this module holds the few rules the Support App
 //! handlers share — the stored-record-to-modelled-shape conversion, the listing
 //! pagination rule, the documented `notifyOnCaseSeverity` consistency rule, the account
-//! a caller-supplied `channelRoleArn` must name, whether a Slack workspace is registered
+//! a caller-supplied `channelRoleArn` must name together with which refusal that member
+//! draws and in which order its rules are judged, whether a Slack workspace is registered
 //! to the account, the Slack workspaces the Support Center
 //! console has authorized, the organization membership an
 //! Organizations-scoped call needs, and the wording of the failures
@@ -479,8 +480,12 @@ pub fn workspace_quota_exceeded_message(operation: &str) -> String {
     )
 }
 
-/// Why the `channelRoleArn` a write carried cannot be used, as the message the
-/// refusal carries, or `None` when the value names a role this account can pass.
+/// Why the `channelRoleArn` a write carried names no role this account can pass, as the
+/// message the refusal carries, or `None` when it does.
+///
+/// Private, and reached only through [`channel_role_arn_refusal`]: WHICH of this member's
+/// refusals applies, and in which order they are judged, is that function's rule, not a
+/// handler's.
 ///
 /// The member documents the role as one "that you want to use to perform operations on
 /// Amazon Web Services"
@@ -502,7 +507,7 @@ pub fn workspace_quota_exceeded_message(operation: &str) -> String {
 /// is, is a role this service cannot pass. EVERY operation that takes the member answers
 /// this refusal rather than persisting the value, before the account's store is
 /// consulted, so nothing is written when it holds.
-pub fn channel_role_account_refusal(role_arn: &str) -> Option<String> {
+fn channel_role_account_refusal(role_arn: &str) -> Option<String> {
     let own_account_role = format!("arn:aws:iam::{}:role/", ::engine::emulator_account_id());
     let names_a_role_of_this_account = role_arn
         .strip_prefix(&own_account_role)
@@ -554,6 +559,9 @@ const CHANNEL_ROLE_ARN_PATH: &str = "channelRoleArn";
 
 /// Why the `channelRoleArn` a write carried is too long to hold, or `None` when it fits.
 ///
+/// Private for the same reason as [`channel_role_account_refusal`]: a handler asks
+/// [`channel_role_arn_refusal`] what this member's answer is.
+///
 /// The member's declared `@length` maximum is a bound on what the API can carry — the
 /// same member reports the stored value back on `UpdateSlackChannelConfiguration` and
 /// `ListSlackChannelConfigurations` — and it is the one rule of this member the request
@@ -574,7 +582,7 @@ const CHANNEL_ROLE_ARN_PATH: &str = "channelRoleArn";
 /// cannot express. The value is echoed through the tree's shared
 /// [`::service_common::validation::quoted_echo`], so a handler-worded clause quotes a value
 /// under the same ceiling as one the walk restored and no message is sized by the request.
-pub fn channel_role_arn_length_refusal(role_arn: &str) -> Option<String> {
+fn channel_role_arn_length_refusal(role_arn: &str) -> Option<String> {
     if role_arn.chars().count() <= MAX_CHANNEL_ROLE_ARN_LEN {
         return None;
     }
@@ -587,6 +595,48 @@ pub fn channel_role_arn_length_refusal(role_arn: &str) -> Option<String> {
         sensitive: false,
     };
     ::aws_smithy_schema_server::constraints::envelope(::std::slice::from_ref(&violation))
+}
+
+/// Which refusal a `channelRoleArn` draws, as the modelled error class it is answered in
+/// plus the message that class carries.
+///
+/// The two classes are not interchangeable — a client branches on which one it got — so the
+/// class belongs to the rule that decided the refusal rather than to the handler that
+/// writes the response: see [`channel_role_arn_refusal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelRoleArnRefusal {
+    /// The value is outside what this API can carry: the modelled `ValidationException`
+    /// (HTTP 400), from the member's declared `@length` maximum
+    /// ([`MAX_CHANNEL_ROLE_ARN_LEN`]).
+    Validation(String),
+    /// The value names no role this service may pass for the account: the modelled
+    /// `AccessDeniedException` (HTTP 403), worded as
+    /// [`CROSS_ACCOUNT_PASS_ROLE_MESSAGE`].
+    AccessDenied(String),
+}
+
+/// Why the `channelRoleArn` a write carried cannot be used — which modelled error class
+/// answers it and with which message — or `None` when the value names a role this account
+/// can pass.
+///
+/// This is the single entry point every operation that takes the member goes through, so
+/// the ORDER of the member's two rules, and the class each refusal travels in, is stated
+/// once here instead of once per writing handler: the declared `@length` maximum
+/// ([`MAX_CHANNEL_ROLE_ARN_LEN`]) is a caller-input mistake and is settled FIRST, and only
+/// a value this API can carry reaches the pass-role attempt that judges which role it
+/// names. A handler's whole part is lifting the answer into
+/// its own operation error enum, which is the one thing it cannot share; neither
+/// operation can reorder or drop a step, so the two cannot answer different classes for
+/// the same value.
+///
+/// Nothing is read or written for a value this refuses: both rules are facts about the
+/// REQUEST, so every operation that takes the member answers them before reaching the
+/// account's store.
+pub fn channel_role_arn_refusal(role_arn: &str) -> Option<ChannelRoleArnRefusal> {
+    if let Some(message) = channel_role_arn_length_refusal(role_arn) {
+        return Some(ChannelRoleArnRefusal::Validation(message));
+    }
+    channel_role_account_refusal(role_arn).map(ChannelRoleArnRefusal::AccessDenied)
 }
 
 /// The three notification flags as ONE clause of the documented

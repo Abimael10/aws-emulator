@@ -23,6 +23,8 @@ mod channel_role_account;
 mod channel_role_name_pattern;
 #[path = "all/channel_role_pass_role_form.rs"]
 mod channel_role_pass_role_form;
+#[path = "all/channel_role_refusal_order.rs"]
+mod channel_role_refusal_order;
 #[path = "all/console_authorized_workspace.rs"]
 mod console_authorized_workspace;
 #[path = "all/delete_slack_workspace_configuration.rs"]

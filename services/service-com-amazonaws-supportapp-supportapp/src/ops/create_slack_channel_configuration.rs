@@ -11,7 +11,8 @@
 //! value is taken into the pass-role step rather than refused for its form at the request
 //! boundary (`skip_validation` on the input in `src/ops/types/`): a value that does not name
 //! a role of the calling account is the modelled `AccessDeniedException` (403), whatever
-//! form it has — see [`crate::state::channel_role_account_refusal`].
+//! form it has — see [`crate::state::channel_role_arn_refusal`], which owns both of the
+//! member's rules and the order between them.
 //!
 //! A channel configuration lives inside a Slack workspace that is registered to the
 //! account, so the request's `teamId` must be in the account's workspace registry
@@ -203,35 +204,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `channelRoleArn` came off the request boundary with the whole member (see
-        // [`crate::state::channel_role_account_refusal`]), so the one rule of it that is a
-        // caller-input rule — the declared length bound on what this API can carry — is
-        // applied here, in the envelope the boundary states that class in, and before the
-        // pass-role attempt below for that reason.
-        if let Some(message) =
-            crate::state::channel_role_arn_length_refusal(&input.channel_role_arn)
-        {
-            return Err(CreateSlackChannelConfigurationErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(message),
-                },
-            )
+        // [`crate::state::channel_role_arn_refusal`]), so the member's rules are applied
+        // here, before the store is reached: no configuration is recorded for a value this
+        // API cannot carry or a role this account cannot pass. WHICH refusal a value draws,
+        // and in which order the two rules are judged, is that shared rule's — this handler
+        // only lifts the answer it gives into this operation's own error enum.
+        if let Some(refusal) = crate::state::channel_role_arn_refusal(&input.channel_role_arn) {
+            return Err(match refusal {
+                crate::state::ChannelRoleArnRefusal::Validation(message) => {
+                    CreateSlackChannelConfigurationErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(message),
+                        },
+                    )
+                }
+                crate::state::ChannelRoleArnRefusal::AccessDenied(message) => {
+                    CreateSlackChannelConfigurationErrorModeled::AccessDeniedException(
+                        AccessDeniedException {
+                            message: Some(message),
+                        },
+                    )
+                }
+            }
             .into());
-        }
-
-        // Which role this request asks the service to use is settled next, before the store
-        // is reached: the value has to name a role this account can pass, and no
-        // configuration is recorded for one it cannot.
-        if let Some(message) =
-            crate::state::channel_role_account_refusal(&input.channel_role_arn)
-        {
-            return Err(
-                CreateSlackChannelConfigurationErrorModeled::AccessDeniedException(
-                    AccessDeniedException {
-                        message: Some(message),
-                    },
-                )
-                .into(),
-            );
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
