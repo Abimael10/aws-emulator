@@ -15,7 +15,9 @@
 //! The newest element is the item as a read of the item itself reports it, a frozen
 //! element keeps what it held, the request's billing-period filter selects the
 //! generations in effect anywhere in that span — its `StartBillingPeriod` inclusive and
-//! its `EndBillingPeriod` exclusive, as the model documents them — `MaxResults`/
+//! its `EndBillingPeriod` exclusive, as the model documents them, and asked of EACH
+//! stretch a generation applies in, so a generation carved into two stretches by a
+//! bounded delete is not selected by the periods of the hole between them — `MaxResults`/
 //! `NextToken` page the sequence, and an `Arn` that names no stored item — or a filter
 //! range whose exclusive end is at or before its inclusive start, which covers no
 //! billing period — is refused 400 `ValidationException`.
@@ -27,7 +29,9 @@
 //! month),
 //! which attribute a write changes, where a filter's span falls relative to a
 //! generation's (before, at the start, inside, across, at its exclusive end, after, open
-//! at either end, empty), the
+//! at either end, empty) and relative to the stretches of a generation that applies in
+//! more than one (inside a stretch, inside the hole between them, across the hole, the
+//! hull of both), how many stretches and generations a history has, the
 //! page size (each published bound of `MaxCustomLineItemResults` and one past each), and
 //! the form the `Arn` takes (full ARN / bare resource id).
 
@@ -1416,5 +1420,282 @@ async fn a_filter_range_covering_no_billing_period_is_refused() {
             "case {case:?}: expected a range covering a billing period to be served with HTTP \
              200, got {status} with {body}"
         );
+    }
+}
+
+/// A `ListCustomLineItemVersions` request carrying only the billing-period range filter
+/// `(start, end)`, either bound absent and so open.
+fn filtered_by(start: Option<&str>, end: Option<&str>) -> Value {
+    let mut range = Map::new();
+    if let Some(start) = start {
+        range.insert("StartBillingPeriod".to_string(), json!(start));
+    }
+    if let Some(end) = end {
+        range.insert("EndBillingPeriod".to_string(), json!(end));
+    }
+    json!({ "Filters": { "BillingPeriodRange": Value::Object(range) } })
+}
+
+/// One row of the bisected-generation filter table: the case, the filter's
+/// `StartBillingPeriod` and `EndBillingPeriod` (either absent and so open), and whether
+/// the item's generation is expected among the selected versions.
+type StretchRow = (&'static str, Option<String>, Option<String>, bool);
+
+/// An item whose ONE generation applies over TWO stretches of billing periods, with a
+/// hole between them: `[period(-1), period(0))` and `[period(2), period(6))`.
+///
+/// Created over the single stretch `[period(-1), period(6))`, then deleted over
+/// `[period(0), period(2))` — a bounded `DeleteCustomLineItem` whose range falls inside
+/// the stretch the item applies over deletes the item only there, so it splits that
+/// stretch in two.
+async fn bisected(case: &str) -> (Emulator, String) {
+    let (emulator, _, item) = fixture(
+        json!({ "BillingPeriodRange": period_range(&period(-1), Some(&period(6))) }),
+    )
+    .await;
+    emulator
+        .delete_ok(
+            case,
+            &item,
+            json!({ "BillingPeriodRange": period_range(&period(0), Some(&period(2))) }),
+        )
+        .await;
+    (emulator, item)
+}
+
+/// THE RULE on the filter over a generation that applies in SEVERAL stretches of billing
+/// periods: the filter names the billing periods a version "is applied" in, so the
+/// generation is selected when at least one period of that range is a period the
+/// generation really applies in — asked of each stretch on its own, never of the outer
+/// bounds across the hole between them.
+///
+/// The rows span where the filter's span falls relative to the stretches and the hole:
+/// wholly inside the hole (the whole hole, one period of it, its first period), inside
+/// either stretch (the first, the start and the last period of the second), across the
+/// hole from either side, the hull of both stretches, open at either end, before the item
+/// existed, after it ended, and a month spelled without its leading zero.
+#[tokio::test]
+async fn the_filter_asks_each_stretch_a_generation_applies_in() {
+    let rows: Vec<StretchRow> = vec![
+        (
+            "the whole hole between the two stretches",
+            Some(period(0)),
+            Some(period(2)),
+            false,
+        ),
+        (
+            "one period inside the hole",
+            Some(period(1)),
+            Some(period(2)),
+            false,
+        ),
+        (
+            "the first period of the hole",
+            Some(period(0)),
+            Some(period(1)),
+            false,
+        ),
+        (
+            "the hole, months spelled without their leading zeroes",
+            Some(one_digit_month(&period(0))),
+            Some(one_digit_month(&period(2))),
+            false,
+        ),
+        (
+            "the only period of the first stretch",
+            Some(period(-1)),
+            Some(period(0)),
+            true,
+        ),
+        (
+            "the first period of the second stretch",
+            Some(period(2)),
+            Some(period(3)),
+            true,
+        ),
+        (
+            "the last period of the second stretch",
+            Some(period(5)),
+            Some(period(6)),
+            true,
+        ),
+        (
+            "the period the second stretch ends at",
+            Some(period(6)),
+            Some(period(7)),
+            false,
+        ),
+        (
+            "across the hole from the first stretch",
+            Some(period(-1)),
+            Some(period(1)),
+            true,
+        ),
+        (
+            "from inside the hole into the second stretch",
+            Some(period(1)),
+            Some(period(3)),
+            true,
+        ),
+        (
+            "the hull of both stretches",
+            Some(period(-1)),
+            Some(period(6)),
+            true,
+        ),
+        (
+            "open at its end, starting inside the hole",
+            Some(period(0)),
+            None,
+            true,
+        ),
+        (
+            "open at its start, ending inside the hole",
+            None,
+            Some(period(1)),
+            true,
+        ),
+        (
+            "open at its end, starting after the item ended",
+            Some(period(6)),
+            None,
+            false,
+        ),
+        (
+            "open at its start, ending before the item existed",
+            None,
+            Some(period(-1)),
+            false,
+        ),
+        (
+            "a span of a year before the item existed",
+            Some(period(-13)),
+            Some(period(-1)),
+            false,
+        ),
+    ];
+
+    for (case, start, end, expected) in rows {
+        let (emulator, item) = bisected(case).await;
+        let reported = emulator
+            .versions_ok(case, &item, filtered_by(start.as_deref(), end.as_deref()))
+            .await;
+        assert_eq!(
+            reported.len(),
+            usize::from(expected),
+            "case {case:?}: expected {} selected version(s) for the filter [{start:?}, \
+             {end:?}), got {:?}",
+            usize::from(expected),
+            spans(&reported)
+        );
+        // A selected generation is still REPORTED by the outer bounds of the stretches it
+        // applies in, because one element carries one start and one end billing period.
+        if expected {
+            let (reported_start, reported_end) = spans(&reported)[0].clone();
+            assert!(
+                same_period(reported_start.as_deref(), Some(&period(-1)))
+                    && same_period(reported_end.as_deref(), Some(&period(6))),
+                "case {case:?}: expected the generation reported from {:?} to {:?}, got \
+                 {reported_start:?} to {reported_end:?}",
+                period(-1),
+                period(6)
+            );
+        }
+    }
+}
+
+/// THE RULE the two period-scoped reads of one item share: for a single billing period,
+/// the version filter selects a version exactly when a read scoped to that period reports
+/// the item — and at most one, because the generations hold disjoint stretches of periods.
+///
+/// The fixtures span the shapes a history can have: one open-ended stretch, one bounded
+/// stretch, a single generation carved in two by a bounded delete, and two generations
+/// with the hole that delete left across both of them.
+#[tokio::test]
+async fn a_one_period_filter_agrees_with_the_period_scoped_item_read() {
+    // (case, how the fixture is built)
+    for case in [
+        "one open-ended stretch",
+        "one bounded stretch",
+        "one generation bisected by a bounded delete",
+        "two generations with a hole across both",
+    ] {
+        let (emulator, item) = match case {
+            "one open-ended stretch" => {
+                let (emulator, _, item) =
+                    fixture(json!({ "BillingPeriodRange": period_range(&period(-1), None) }))
+                        .await;
+                (emulator, item)
+            }
+            "one bounded stretch" => {
+                let (emulator, _, item) = fixture(
+                    json!({ "BillingPeriodRange": period_range(&period(-1), Some(&period(3))) }),
+                )
+                .await;
+                (emulator, item)
+            }
+            "one generation bisected by a bounded delete" => bisected(case).await,
+            _ => {
+                let (emulator, _, item) = fixture(
+                    json!({ "BillingPeriodRange": period_range(&period(-1), Some(&period(6))) }),
+                )
+                .await;
+                // A write applied from the current billing period opens a second
+                // generation there and freezes the first at that period; the bounded
+                // delete then takes the same periods out of BOTH of them.
+                emulator
+                    .update_ok(
+                        case,
+                        &item,
+                        json!({
+                            "Description": "the second generation",
+                            "BillingPeriodRange": period_range(&period(0), Some(&period(6))),
+                        }),
+                    )
+                    .await;
+                emulator
+                    .delete_ok(
+                        case,
+                        &item,
+                        json!({
+                            "BillingPeriodRange": period_range(&period(0), Some(&period(2))),
+                        }),
+                    )
+                    .await;
+                (emulator, item)
+            }
+        };
+
+        for months in -2..=7 {
+            let billing_period = period(months);
+            let probe = format!("{case}, the billing period {billing_period}");
+            let reported_by_item_read = emulator
+                .item(&probe, &item, &billing_period)
+                .await
+                .is_some();
+            let selected = emulator
+                .versions_ok(
+                    &probe,
+                    &item,
+                    filtered_by(
+                        Some(&billing_period),
+                        Some(&next_period(&billing_period)),
+                    ),
+                )
+                .await;
+            assert_eq!(
+                !selected.is_empty(),
+                reported_by_item_read,
+                "case {probe:?}: expected the filter to select a version exactly when the \
+                 item read reports the item ({reported_by_item_read}), got {:?}",
+                spans(&selected)
+            );
+            assert!(
+                selected.len() <= 1,
+                "case {probe:?}: expected at most one version in effect in one billing \
+                 period, got {:?}",
+                spans(&selected)
+            );
+        }
     }
 }

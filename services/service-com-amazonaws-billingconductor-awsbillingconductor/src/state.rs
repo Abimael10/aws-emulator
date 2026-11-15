@@ -368,6 +368,20 @@ impl BillingPeriodSpan {
         )
     }
 
+    /// Does this span cover at least one billing period `other` covers — [`Self::covers`]
+    /// asked of a whole span of periods rather than of one?
+    ///
+    /// The crate's one half-open overlap decision ([`half_open_ranges_overlap`]) on the
+    /// billing-period axis: an absent bound is open, as it is everywhere here, and the
+    /// bounds are compared as the months they name ([`billing_period_key`]), so the two
+    /// spellings of one month answer alike.
+    pub fn shares_period_with(&self, other: &Self) -> bool {
+        half_open_ranges_overlap(
+            (self.start_key(), self.end_key()),
+            (other.start_key(), other.end_key()),
+        )
+    }
+
     /// This span's inclusive start as a comparable month count; `None` when it is open.
     fn start_key(&self) -> Option<i64> {
         self.inclusive_start.as_deref().and_then(billing_period_key)
@@ -389,11 +403,9 @@ impl BillingPeriodSpan {
     pub fn minus(&self, removed: &Self) -> Vec<Self> {
         let (start, end) = (self.start_key(), self.end_key());
         let (removed_start, removed_end) = (removed.start_key(), removed.end_key());
-        // Two half-open spans share a billing period only when each one starts before
-        // the other ends.
-        if !billing_period_precedes(start, removed_end)
-            || !billing_period_precedes(removed_start, end)
-        {
+        // A removal that shares no billing period with this span takes nothing from it
+        // ([`Self::shares_period_with`]).
+        if !self.shares_period_with(removed) {
             return vec![self.clone()];
         }
         let mut left = Vec::new();
@@ -2580,6 +2592,20 @@ impl CustomLineItemVersion {
     /// [`billing_period_range_covers`].
     pub fn covers(&self, billing_period: &str) -> bool {
         self.spans.iter().any(|span| span.covers(billing_period))
+    }
+
+    /// Does this generation apply in at least one billing period `periods` names?
+    ///
+    /// Each stretch the generation applies in is asked on its own
+    /// ([`BillingPeriodSpan::shares_period_with`]), never the hull across them: the
+    /// stretches of ONE generation can have a hole between them — a bounded delete
+    /// inside a stretch splits it in two ([`remove_billing_periods`]) — and the
+    /// generation applies in no billing period of that hole, exactly as
+    /// [`Self::covers`] answers of each period of it.
+    pub fn applies_in_any_period_of(&self, periods: &BillingPeriodSpan) -> bool {
+        self.spans
+            .iter()
+            .any(|span| span.shares_period_with(periods))
     }
 
     /// Does this generation apply in at least one billing period — is it a VERSION of

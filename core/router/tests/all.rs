@@ -1244,3 +1244,13 @@ mod zz_probe_whole_emulator;
 //! WHY a suite lives in this target rather than in a service crate's own — it drives more
 //! than one service over the assembled router — is stated in that suite's OWN module doc,
 //! which is where it stays current; this file is the declaration list and nothing else.
+//! A suite that is not declared here compiles nowhere and its tests never run, and a
+//! ONCE: this is one crate root, so a second `mod` for the same name is `E0428` and fails
+//! every suite in this target. An inner doc comment (`//!`) is legal only BEFORE the first
+//! item, so these header lines are the only place one may stand — past the first item one
+//! is `E0753` and compiles no suite of this target, so a note further down this file must
+//! be an ordinary `//` comment. `all/all_rs_declares_each_suite_once.rs` and
+//! for this file and for every service crate's `tests/all.rs`, so check there rather than
+//! leaving a note here.
+//! (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what points each
+//! declaration into `tests/all/`.

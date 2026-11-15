@@ -152,36 +152,26 @@ fn end_billing_period(
 /// model documents its bounds: its start billing period is INCLUSIVE and its end
 /// billing period EXCLUSIVE, the same half-open span a write's
 /// `CustomLineItemBillingPeriodRange` names, with an absent bound open. A generation is
-/// selected when its own half-open span shares at least one billing period with that
-/// span, which is the crate's one half-open overlap decision
-/// ([`crate::state::half_open_ranges_overlap`]) on the billing-period axis. Every
-/// generation reaching this filter applies in some billing period, because a
-/// generation that applies in none is a version of the item nowhere and is not reported
-/// at all ([`crate::state::CustomLineItemRecord::versions`]).
+/// selected when it applies in at least one billing period of that span, asked of EACH
+/// stretch the generation applies in ([`CustomLineItemVersion::applies_in_any_period_of`])
+/// rather than of the outer bounds across them: a generation carved into two stretches by
+/// a bounded delete applies in no period of the hole between them, so a filter naming only
+/// periods of that hole selects it no more than a period-scoped read of the item reports it
+/// there ([`crate::state::CustomLineItemRecord::effective_in`]). Every generation reaching
+/// this filter applies in some billing period, because a generation that applies in none is
+/// a version of the item nowhere and is not reported at all
+/// ([`crate::state::CustomLineItemRecord::versions`]).
 fn in_filter(
-    start_billing_period: &str,
-    end_billing_period: Option<&str>,
+    version: &CustomLineItemVersion,
     filter: Option<&ListCustomLineItemVersionsBillingPeriodRangeFilter>,
 ) -> bool {
     let Some(filter) = filter else {
         return true;
     };
-    crate::state::half_open_ranges_overlap(
-        (
-            crate::state::billing_period_key(start_billing_period),
-            end_billing_period.and_then(crate::state::billing_period_key),
-        ),
-        (
-            filter
-                .start_billing_period
-                .as_deref()
-                .and_then(crate::state::billing_period_key),
-            filter
-                .end_billing_period
-                .as_deref()
-                .and_then(crate::state::billing_period_key),
-        ),
-    )
+    version.applies_in_any_period_of(&crate::state::BillingPeriodSpan::new(
+        filter.start_billing_period.clone(),
+        filter.end_billing_period.clone(),
+    ))
 }
 
 /// One generation of the item, as this operation reports a version.
@@ -332,10 +322,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let versions = item.versions();
         let mut selected: Vec<(String, CustomLineItemVersionListElement)> = Vec::new();
         for (index, version) in versions.iter().enumerate() {
-            let end = end_billing_period(version, versions.get(index + 1));
-            if !in_filter(&version.start_billing_period(), end.as_deref(), filter) {
+            if !in_filter(version, filter) {
                 continue;
             }
+            let end = end_billing_period(version, versions.get(index + 1));
             // The pagination key is the generation's position in that order, written
             // fixed-width so it orders as a string the way it orders as a number.
             selected.push((format!("{index:010}"), element(item, version, end)));
