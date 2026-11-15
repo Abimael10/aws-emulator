@@ -63,9 +63,10 @@ const GET_APP: &str = "GetApp";
 const UPDATE_APP: &str = "UpdateApp";
 const DELETE_APP: &str = "DeleteApp";
 
-/// The error code AWS Amplify answers for an app it does not hold (`NotFoundException`, the
-/// modelled 404 of its read, its update and its delete).
-const AMPLIFY_NOT_FOUND: &str = "NotFoundException";
+/// The error code AWS Amplify answers for an entity it does not hold (`NotFoundException`, the
+/// modelled 404 of the read, the update and the delete of an app and of a branch alike), which
+/// is why the branch's arm reads it from here ([`super::amplify_branches`]).
+pub(super) const AMPLIFY_NOT_FOUND: &str = "NotFoundException";
 
 /// The member every one of those operations answers the app record in.
 const APP_MEMBER: &str = "app";
@@ -108,13 +109,14 @@ const AMPLIFY_APP_MAPPED_PROPERTIES: &[&str] = &[
 const AMPLIFY_APP_RENAMED_PROPERTIES: &[(&str, &str)] = &[("IAMServiceRole", "iamServiceRoleArn")];
 
 /// The properties stated as a LIST of `{Name, Value}` pairs that the owning API takes as a
-/// MAP: the app's own environment variables, and the ones an auto-created branch inherits.
-const ENVIRONMENT_VARIABLES_PROPERTY: &str = "EnvironmentVariables";
-const ENVIRONMENT_VARIABLES_MEMBER: &str = "environmentVariables";
+/// MAP: the app's own environment variables, the ones an auto-created branch inherits, and the
+/// ones a declared branch states the same way ([`super::amplify_branches`]).
+pub(super) const ENVIRONMENT_VARIABLES_PROPERTY: &str = "EnvironmentVariables";
+pub(super) const ENVIRONMENT_VARIABLES_MEMBER: &str = "environmentVariables";
 
 /// The property that states basic authorization apart from the credentials member it becomes,
 /// with the two halves it states them in, and the members it maps onto.
-const BASIC_AUTH_CONFIG_PROPERTY: &str = "BasicAuthConfig";
+pub(super) const BASIC_AUTH_CONFIG_PROPERTY: &str = "BasicAuthConfig";
 const BASIC_AUTH_ENABLE_PROPERTY: &str = "EnableBasicAuth";
 const BASIC_AUTH_USERNAME_PROPERTY: &str = "Username";
 const BASIC_AUTH_PASSWORD_PROPERTY: &str = "Password";
@@ -410,7 +412,7 @@ fn declared_app_members(declared: &Value) -> Result<Map<String, Value>, Refusal>
 
 /// One `{Name, Value}` pair list as the MAP the owning API takes it as: a pair stating neither
 /// as a scalar names no variable and contributes nothing.
-fn name_value_map(declared: &Value) -> Map<String, Value> {
+pub(super) fn name_value_map(declared: &Value) -> Map<String, Value> {
     let Some(pairs) = declared.as_array() else {
         return Map::new();
     };
@@ -430,7 +432,7 @@ fn name_value_map(declared: &Value) -> Map<String, Value> {
 ///
 /// The codec is `aws_smithy_types::base64` — the standard-alphabet one the wire serializers of
 /// this workspace already use, so nothing here hand-rolls an encoding.
-fn basic_auth_members(declared: &Value) -> Vec<(String, Value)> {
+pub(super) fn basic_auth_members(declared: &Value) -> Vec<(String, Value)> {
     let mut members = Vec::new();
     if let Some(enabled) = declared.get(BASIC_AUTH_ENABLE_PROPERTY) {
         members.push((ENABLE_BASIC_AUTH_MEMBER.to_string(), enabled.clone()));

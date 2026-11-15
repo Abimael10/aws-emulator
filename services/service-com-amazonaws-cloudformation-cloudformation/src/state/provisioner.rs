@@ -474,7 +474,7 @@ use super::template::{
     ACMPCA_CERTIFICATE, ACMPCA_CERTIFICATE_AUTHORITY, ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION,
     ACMPCA_PERMISSION,
     ACM_ACME_ENDPOINT, ACM_CERTIFICATE, AMPLIFYUIBUILDER_COMPONENT, AMPLIFYUIBUILDER_FORM,
-    AMPLIFYUIBUILDER_THEME, AMPLIFY_APP, AOSS_COLLECTION,
+    AMPLIFYUIBUILDER_THEME, AMPLIFY_APP, AMPLIFY_BRANCH, AOSS_COLLECTION,
     AOSS_SECURITY_POLICY, APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME, APIGATEWAYV2_API,
     APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_AUTHORIZER, APIGATEWAYV2_DEPLOYMENT,
     APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
@@ -1047,6 +1047,13 @@ pub(super) enum Provisioner {
     /// MINTS the `appId` and the `appArn` the type publishes, so both are read off that
     /// create's own answer and the ARN is the identity a `Ref` resolves to.
     AmplifyApp,
+    /// `AWS::Amplify::Branch`: the branch of such an app AWS Amplify's own `CreateBranch`
+    /// makes under the name the template states, `UpdateBranch` changes and `DeleteBranch`
+    /// removes — the unit that service hosts, which every `GetBranch`, `ListBranches` and
+    /// deployment call addresses. That service builds the `branchArn` the type publishes around
+    /// the `appId` it minted for the app, so it is read off that create's own answer and is the
+    /// identity a `Ref` resolves to.
+    AmplifyBranch,
     /// `AWS::MWAA::Environment`: the Apache Airflow environment Amazon Managed Workflows for
     /// Apache Airflow's `CreateEnvironment` creates under the name the template states,
     /// `UpdateEnvironment` reconfigures and `DeleteEnvironment` removes. The name IS the
@@ -1274,6 +1281,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         AMPLIFYUIBUILDER_FORM => Some(Provisioner::AmplifyUiBuilderForm),
         AMPLIFYUIBUILDER_THEME => Some(Provisioner::AmplifyUiBuilderTheme),
         AMPLIFY_APP => Some(Provisioner::AmplifyApp),
+        AMPLIFY_BRANCH => Some(Provisioner::AmplifyBranch),
         MWAA_ENVIRONMENT => Some(Provisioner::MwaaEnvironment),
         XRAY_SAMPLING_RULE => Some(Provisioner::XraySamplingRule),
         XRAY_GROUP => Some(Provisioner::XrayGroup),
@@ -1914,6 +1922,13 @@ impl Provisioner {
             // as the `TagMap` of its own `tags` member, so an app a stack creates carries the
             // tags CloudFormation gives it beside the ones the declaration asks for.
             Self::AmplifyApp => create_amplify_app(ctx, region, resource, propagated).await,
+            // `AWS::Amplify::Branch` publishes `Tags` as a LIST of pairs too, which
+            // `CreateBranch` takes as the `TagMap` of its own `tags` member, so a branch a stack
+            // creates carries the tags CloudFormation gives it beside the ones the declaration
+            // asks for.
+            Self::AmplifyBranch => {
+                create_amplify_branch(ctx, region, resource, propagated).await
+            }
             Self::XraySamplingRule => {
                 create_sampling_rule(ctx, region, resource, propagated).await
             }
@@ -2957,6 +2972,11 @@ impl Provisioner {
             // minted for it, the app's name included, so a changed declaration is applied to
             // that app rather than replacing it.
             Self::AmplifyApp => update_amplify_app(ctx, region, resource, declared).await,
+            // `UpdateBranch` takes the branch's whole declared configuration by the app and the
+            // name it was created under, so a changed declaration is applied to that branch
+            // rather than replacing it. (A re-declared app or name replaces the resource
+            // instead: both are [`super::template::replacing_properties`] of this type.)
+            Self::AmplifyBranch => update_amplify_branch(ctx, region, resource, declared).await,
             // What a MemoryDB group's own service can change reaches it: a parameter group's
             // declared values, and a subnet group's description and subnets
             // ([`memorydb_groups::update_memorydb_group`]).
@@ -3617,6 +3637,9 @@ impl Provisioner {
             // The delete addresses the app by the id AWS Amplify minted for it, which is the
             // id inside the ARN that is this resource's physical id.
             Self::AmplifyApp => delete_amplify_app(ctx, region, resource).await,
+            // The delete addresses the branch by the name it was created under, inside the app
+            // the ARN that is this resource's physical id carries.
+            Self::AmplifyBranch => delete_amplify_branch(ctx, region, resource).await,
             // The delete addresses the environment by the name Amazon MWAA keyed it by,
             // which is this resource's physical id.
             Self::MwaaEnvironment => {
@@ -4164,6 +4187,9 @@ impl Provisioner {
             }
             // AWS Amplify's own read of the app, by the id it minted for it.
             Self::AmplifyApp => describe_amplify_app(ctx, region, resource).await,
+            // AWS Amplify's own read of the branch, by the name it was created under inside the
+            // app it belongs to.
+            Self::AmplifyBranch => describe_amplify_branch(ctx, region, resource).await,
             // Amazon MWAA's own read of the environment, by the name it was created under.
             Self::MwaaEnvironment => {
                 describe_mwaa_environment(ctx, region, physical_resource_id).await
@@ -4243,6 +4269,7 @@ pub(crate) mod sagemaker_resources;
 mod braket_spending_limits;
 mod amplify_ui_builder;
 mod amplify_apps;
+mod amplify_branches;
 mod mwaa_environments;
 /// The Amazon Connect Customer Profiles DOMAIN arms: the customer-data domain an
 /// `AWS::CustomerProfiles::Domain` declares, created in the service that owns it so a client's
@@ -4324,6 +4351,7 @@ use sagemaker_resources::*;
 use braket_spending_limits::*;
 use amplify_ui_builder::*;
 use amplify_apps::*;
+use amplify_branches::*;
 use mwaa_environments::*;
 use customer_profiles_domains::*;
 use glue_table_optimizers::*;

@@ -1617,3 +1617,23 @@ mod zz_probe_whole_emulator;
 // crate's `tests/all.rs`, so check there rather than leaving a note here;
 // `all/appended_header_notes.rs`, `all/appended_notes.rs`, `all/appended_notes_tail.rs` and
 // `all/appended_prose.rs` keep what the notes landings had appended to this file.
+// Single integration-test target for the router: the declaration list of every
+// This file holds this header and then one `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair per file under `tests/all/`, sorted by name, with no other line
+// — so two branches landing at once insert two lines in two places and have no prose
+// to duplicate, re-word or mistype. Put a new suite at `tests/all/<name>.rs` and
+// insert its pair into the sorted list below.
+// EVERY comment in this file is an ordinary `//` one, this header included, and the
+// inner attribute below stands ahead of the first declaration: an inner attribute or
+// an inner doc comment is legal only before the first item, so one written past the
+// declarations compiles no suite of this target, and with none in the file past this
+// header no merge of two landings can leave one there. A second pair for one name is
+// `E0428`, and a suite file no pair names compiles nowhere; this file is a test-target
+// CRATE ROOT, where a bare `mod` would resolve to a sibling of it under `tests/`,
+// which the layout check refuses, so the `#[path]` above each `mod` is what points the
+// declaration into `tests/all/`. `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/every_suite_file_is_declared.rs` pin all of that, so a note about any of it
+// belongs there rather than here.
+// What a suite covers, and why it drives the assembled router rather than one service
+// crate, belongs in that suite's own module header, where it is read beside the test
+// it explains; the notes earlier landings had appended to this file live in

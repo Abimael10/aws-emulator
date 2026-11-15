@@ -83,7 +83,8 @@ use super::provisioner::ssm_maintenance_windows::SSM_MAINTENANCE_WINDOW_TARGET;
 use super::template::{
     DeclaredResource, Template, ACMPCA_CERTIFICATE, ACMPCA_CERTIFICATE_AUTHORITY,
     ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION, ACMPCA_PERMISSION, AMPLIFYUIBUILDER_COMPONENT,
-    AMPLIFYUIBUILDER_FORM, AMPLIFYUIBUILDER_THEME, AMPLIFY_APP, APIGATEWAY_ACCOUNT,
+    AMPLIFYUIBUILDER_FORM, AMPLIFYUIBUILDER_THEME, AMPLIFY_APP, AMPLIFY_BRANCH,
+    APIGATEWAY_ACCOUNT,
     APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME, BRAKET_SPENDING_LIMIT,
     CUSTOMER_PROFILES_DOMAIN, GLUE_TABLE_OPTIMIZER, MWAA_ENVIRONMENT,
 };
@@ -175,7 +176,7 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::AmazonMQ::ConfigurationAssociation",
     // AWS Amplify
     AMPLIFY_APP,
-    "AWS::Amplify::Branch",
+    AMPLIFY_BRANCH,
     "AWS::Amplify::Domain",
     // Amplify UI Builder. The three UI entities of an Amplify app environment are each
     // created in that service (`super::provisioner`), which is also where the middle segment

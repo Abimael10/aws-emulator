@@ -83,6 +83,9 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // environment and the id its own resource shape names, which step 1 above answers from
         // [`super::template::composite_identity_properties`].)
         AMPLIFY_APP => "Arn",
+        // An AWS Amplify BRANCH, identified by the ARN that service built around the app's own
+        // ("Ref returns the ARN of the branch"), which is the type's primary identifier.
+        AMPLIFY_BRANCH => "Arn",
         // The CloudFront types, each identified by the id that service assigns.
         CLOUDFRONT_DISTRIBUTION
         | CLOUDFRONT_ORIGIN_ACCESS_CONTROL

@@ -13,6 +13,8 @@
 mod account_limits;
 #[path = "all/agentcore_stack_outputs.rs"]
 mod agentcore_stack_outputs;
+#[path = "all/amplify_branch_provisioning.rs"]
+mod amplify_branch_provisioning;
 #[path = "all/appconfig_estate_provisioning.rs"]
 mod appconfig_estate_provisioning;
 #[path = "all/appconfig_refused_create_exception.rs"]

@@ -103,6 +103,24 @@ pub const AMPLIFY_APP: &str = "AWS::Amplify::App";
 pub(super) const AMPLIFY_APP_ATTRIBUTES: &[&str] =
     &["AppId", "AppName", "Arn", "DefaultDomain"];
 
+/// The `AWS::<cloudFormationName>::<Resource>` type of an AWS Amplify BRANCH: the branch of an
+/// [`AMPLIFY_APP`] that service's own `CreateBranch` makes, and the unit Amplify hosts — every
+/// `GetBranch`, `ListBranches`, `UpdateBranch` and deployment call addresses one.
+///
+/// "Ref returns the ARN of the branch" — the type's primary identifier — and `Fn::GetAtt` reads
+/// [`AMPLIFY_BRANCH_ATTRIBUTES`]. That ARN is built around the `appId` AWS Amplify minted for
+/// the app the branch belongs to, so it cannot be recomputed from the template: that is what
+/// [`identity_is_service_assigned`] names this type for. The branch's NAME is the declaration's
+/// own `BranchName`, and every call of that service on a branch addresses it BY that name, so a
+/// re-declared name asks for a different branch.
+pub const AMPLIFY_BRANCH: &str = "AWS::Amplify::Branch";
+
+/// Every `Fn::GetAtt` attribute an [`AMPLIFY_BRANCH`] publishes, in the sorted order a
+/// resource's own attribute map holds them in: the ARN AWS Amplify built for the branch, which
+/// stands in ([`service_assigned_document`]) until that service has reported it, and the
+/// branch's own name, which the declaration states.
+pub(super) const AMPLIFY_BRANCH_ATTRIBUTES: &[&str] = &["Arn", "BranchName"];
+
 /// The `AWS::<cloudFormationName>::<Resource>` types of the three user-interface entities of
 /// an Amplify app environment: the component, the form and the theme Amplify UI
 /// Builder's own `CreateComponent`, `CreateForm` and `CreateTheme` make. The middle segment is
@@ -184,6 +202,11 @@ pub(crate) fn amplifyuibuilder_identity_parts(identity: &str) -> Option<(&str, &
 /// The attribute of [`AMPLIFY_APP_ATTRIBUTES`] that carries the app's ARN, which is the
 /// identity a `Ref` to one resolves to.
 pub(super) const APP_ARN_STAND_IN_ATTRIBUTE: &str = "Arn";
+
+/// The attribute of [`AMPLIFY_BRANCH_ATTRIBUTES`] that carries the branch's ARN, which is the
+/// identity a `Ref` to one resolves to, beside the one that carries its name.
+pub(super) const BRANCH_ARN_STAND_IN_ATTRIBUTE: &str = "Arn";
+pub(super) const BRANCH_NAME_STAND_IN_ATTRIBUTE: &str = "BranchName";
 
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Managed Workflows for
 /// Apache Airflow ENVIRONMENT: the Apache Airflow deployment that service's own

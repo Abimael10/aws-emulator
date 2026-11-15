@@ -242,6 +242,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         AMPLIFYUIBUILDER_COMPONENT | AMPLIFYUIBUILDER_THEME => AMPLIFYUIBUILDER_TIMED_ATTRIBUTES,
         AMPLIFYUIBUILDER_FORM => AMPLIFYUIBUILDER_ATTRIBUTES,
         AMPLIFY_APP => AMPLIFY_APP_ATTRIBUTES,
+        AMPLIFY_BRANCH => AMPLIFY_BRANCH_ATTRIBUTES,
         MWAA_ENVIRONMENT => MWAA_ENVIRONMENT_ATTRIBUTES,
         CUSTOMER_PROFILES_DOMAIN => CUSTOMER_PROFILES_DOMAIN_ATTRIBUTES,
         "AWS::BedrockAgentCore::Memory" => &["MemoryArn", "MemoryId"],
@@ -623,6 +624,12 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // an app, and on everything hanging off one, takes. A name CloudFormation decides
         // satisfies neither, so the identity in force is the one that service answered.
         || resource_type == AMPLIFY_APP
+        // An AWS Amplify BRANCH is one more: `CreateBranch` takes the app as its URI label and
+        // the branch's NAME in its payload, and answers the `branchArn` that service built —
+        // the app's own ARN, around the `appId` it minted, with the branch's name appended —
+        // which is what that type's `Ref` returns. No naming rule can compute an ARN carrying a
+        // minted id, so the identity in force is the one that service answered.
+        || resource_type == AMPLIFY_BRANCH
         // An Amazon EC2 VPC, a subnet of one and a security group of one are three more:
         // `CreateVpc`, `CreateSubnet` and `CreateSecurityGroup` take no identifier at all —
         // EC2 assigns each resource an id of its own published form — and "Ref returns the

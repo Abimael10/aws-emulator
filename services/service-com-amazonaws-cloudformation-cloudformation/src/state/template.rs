@@ -2757,6 +2757,12 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         AMPLIFYUIBUILDER_COMPONENT | AMPLIFYUIBUILDER_FORM | AMPLIFYUIBUILDER_THEME => {
             &["AppId", "EnvironmentName"]
         }
+        // An AWS Amplify BRANCH belongs to the app its `AppId` names: that id is the first URI
+        // label of every call on a branch — the create included — and that service publishes no
+        // call that moves a branch to another app, so a declaration restating it asks for a
+        // different branch. (Its NAME is in the same position through [`name_is_create_only`]:
+        // `UpdateBranch` addresses a branch BY its name and takes no new one.)
+        AMPLIFY_BRANCH => &["AppId"],
         // An environment's encryption key and who manages its VPC endpoints are fixed when
         // Amazon MWAA makes it: both are members of `CreateEnvironment` and of no member of
         // `UpdateEnvironment`, so a declaration restating either asks for a different
@@ -3120,6 +3126,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     APIGATEWAY_USAGE_PLAN,
     APIGATEWAY_USAGE_PLAN_KEY,
     AMPLIFY_APP,
+    AMPLIFY_BRANCH,
     AMPLIFYUIBUILDER_COMPONENT,
     AMPLIFYUIBUILDER_FORM,
     AMPLIFYUIBUILDER_THEME,

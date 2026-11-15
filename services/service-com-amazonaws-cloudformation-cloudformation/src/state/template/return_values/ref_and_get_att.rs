@@ -1479,6 +1479,18 @@ pub(crate) fn return_values(
                 attributes,
             )
         }
+        // AWS Amplify's own control plane: the BRANCH an `AWS::Amplify::Branch` declares. "Ref
+        // returns the ARN of the branch"; `Fn::GetAtt` reads [`AMPLIFY_BRANCH_ATTRIBUTES`]. That
+        // ARN is built around the `appId` AWS Amplify minted for the app the branch belongs to,
+        // so it is a STAND-IN here, which `super::provisioning` re-points at what the create
+        // really answered ([`super::provisioner::Provisioner::AmplifyBranch`]). The branch's
+        // NAME is the declaration's own, which is this resource's physical name.
+        AMPLIFY_BRANCH => {
+            let arn = service_assigned_document(name, BRANCH_ARN_STAND_IN_ATTRIBUTE);
+            attributes.insert(BRANCH_ARN_STAND_IN_ATTRIBUTE.to_string(), arn.clone());
+            attributes.insert(BRANCH_NAME_STAND_IN_ATTRIBUTE.to_string(), name.to_string());
+            (arn, attributes)
+        }
         // Amplify UI Builder's own control plane: the component, the form or the theme an
         // `AWS::AmplifyUIBuilder::{Component,Form,Theme}` declares. The type's primary
         // identifier is the TRIPLE its own resource shape is identified by — the app, the

@@ -268,6 +268,13 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             Arc::clone(&engine),
         ),
     );
+    // AWS Amplify, for the `AWS::Amplify::App` and the `AWS::Amplify::Branch` of one a stack
+    // really creates there, so a suite that deploys an Amplify hosting topology reads the app
+    // and its branches back through that service's own wire, by the id and the ARN the stack
+    // publishes.
+    router.register_service(
+        service_com_amazonaws_amplify_amplify::EmulatedService::new(Arc::clone(&engine)),
+    );
     // Amazon EKS, for the `AWS::EKS::Cluster` a stack really creates there and for the
     // `AWS::EKS::Addon` and `AWS::EKS::Nodegroup` it installs ON that cluster, so a suite that
     // deploys one reads the add-on and the node group back through that service's own wire, by

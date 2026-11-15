@@ -11135,6 +11135,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "service-com-amazonaws-amplify-amplify",
  "service-com-amazonaws-apigateway-backplanecontrolservice",
  "service-com-amazonaws-apigatewayv2-apigatewayv2",
  "service-com-amazonaws-appconfig-amazonappconfig",

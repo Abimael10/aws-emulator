@@ -241,6 +241,11 @@ service-com-amazonaws-memorydb-amazonmemorydb = { workspace = true }
 # stack fails — and the domain the stack published is read back, and driven, through that
 # service's own wire.
 service-com-amazonaws-customerprofiles-customerprofiles-20200815 = { workspace = true }
+# AWS Amplify, for the `AWS::Amplify::App` and `AWS::Amplify::Branch` a stack really creates
+# there (`state::provisioner::amplify_apps`, `::amplify_branches`): a suite that deploys one
+# must have its owning service mounted beside CloudFormation, or the create is refused and the
+# stack fails — and the branch the stack published is read back through that service's own wire.
+service-com-amazonaws-amplify-amplify = { workspace = true }
 # Amazon EKS, for the `AWS::EKS::Cluster` a stack really creates there and the
 # `AWS::EKS::Addon` and `AWS::EKS::Nodegroup` it installs on that cluster
 # (`state::provisioner::eks_cluster_workloads`): a suite that deploys one must have its
