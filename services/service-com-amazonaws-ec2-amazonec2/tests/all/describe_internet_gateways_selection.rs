@@ -465,13 +465,13 @@ async fn a_page_size_outside_the_published_range_is_refused() {
         );
     }
 
-    // One step past either published bound is refused with HTTP 400. Below the smallest page
-    // the operation pages with, EC2 answers its own code for a page size it will not page
-    // with; above the largest, the refusal is the constraint clause for the member, the same
-    // code and sentence every other paged describe of this crate answers there.
+    // One step past either published bound is refused with HTTP 400 and EC2's own code for a
+    // page size it will not page with, naming the member, the value and the bound that value
+    // missed — the same code and sentence every other paged describe of this crate answers
+    // there.
     for (size, code, bound) in [
         (MIN_PAGE_SIZE - 1, "InvalidMaxResults", MIN_PAGE_SIZE),
-        (MAX_PAGE_SIZE + 1, "ValidationError", MAX_PAGE_SIZE),
+        (MAX_PAGE_SIZE + 1, "InvalidMaxResults", MAX_PAGE_SIZE),
     ] {
         let case = format!("the page size {size}, one step past a published bound");
         let (status, body) = call(

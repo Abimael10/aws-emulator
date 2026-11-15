@@ -1106,15 +1106,14 @@ async fn max_results_is_accepted_at_its_bounds_and_refused_past_them() {
         );
         if expected_status == 400 {
             // Which code the BOUNDARY answers is one rule for the whole service, keyed on
-            // what the value is: a POSITIVE page size below the smallest the operation
-            // serves carries EC2's own `InvalidMaxResults`, a value that is no page size at
-            // all — this operation's `@range` starting at 1, that is what a page size below
-            // it is — carries EC2's `InvalidParameter`, and one above the largest keeps the
-            // boundary validator's generic code.
+            // what the value is: a POSITIVE page size the operation will not page with
+            // carries EC2's own `InvalidMaxResults` on either side of the published range,
+            // and a value that is no page size at all — this operation's `@range` starting at
+            // 1, that is what a page size below it is — carries EC2's `InvalidParameter`.
             let expected_code = if max_results < 1 {
                 "InvalidParameter"
             } else {
-                "ValidationError"
+                "InvalidMaxResults"
             };
             assert_eq!(
                 error_code(&body),
@@ -1168,14 +1167,11 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
 // ---------------------------------------------------------------------------
 
 /// The error code the BOUNDARY answers for a `@required` member the request left out, as
-/// every operation of this service answers it today. Which of EC2's own codes a boundary
-/// refusal carries, and how it is worded, is one rule for the whole service and is recorded
-/// as its own issue
-/// (`issues/.../20261023T102725Z-ec2-answers-parameter-rejections-with-generic-validationerror-and.md`),
-/// so this row pins what the boundary answers rather than restating that rule for one
-/// operation. A value outside the `CallerRole` catalog is different: EC2's own words for THAT
-/// refusal are recorded, so the rows below state them.
-const BOUNDARY_MISSING_MEMBER_CODE: &str = "MalformedInput";
+/// every operation of this service answers it: EC2's own `MissingParameter`, naming the
+/// parameter the request has to add ([`crate::service::parameter_refusals`] states that rule
+/// once for the whole service). A value outside the `CallerRole` catalog is a different
+/// refusal: EC2's own words for THAT one are recorded, so the rows below state them.
+const BOUNDARY_MISSING_MEMBER_CODE: &str = "MissingParameter";
 
 /// One row of the `Role` refusal table: the case's name, the form fields it sends, and the
 /// error code and message it must be refused with (`None` for a refusal this suite pins the
@@ -1286,7 +1282,7 @@ async fn a_role_outside_the_modelled_catalog_is_refused() {
             assert!(
                 message
                     .as_deref()
-                    .is_some_and(|text| text.contains("role")),
+                    .is_some_and(|text| text.contains("Role")),
                 "case {case:?}: the refusal must name the parameter to fix, got {message:?}"
             );
         }

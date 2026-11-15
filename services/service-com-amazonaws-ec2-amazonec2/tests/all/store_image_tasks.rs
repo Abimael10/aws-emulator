@@ -764,19 +764,19 @@ async fn the_create_refuses_a_bad_request() {
         ),
         (
             // Both members are `clientOptional` `@required`: a request that OMITS one is
-            // refused at the boundary, before the handler runs, with the query protocol's own
-            // code, while one that SENDS it empty reaches the handler and is EC2's
-            // `MissingParameter` — the parameter was given no value.
+            // refused at the boundary, before the handler runs, and one that SENDS it empty
+            // reaches the handler — both answered EC2's `MissingParameter`, the parameter
+            // being the one the request did not supply.
             "no bucket named",
             vec![p("ImageId", image_id.as_str())],
             400,
-            "MalformedInput",
+            "MissingParameter",
         ),
         (
             "no AMI named",
             vec![p("Bucket", "ami-archive")],
             400,
-            "MalformedInput",
+            "MissingParameter",
         ),
         (
             "an empty bucket name",

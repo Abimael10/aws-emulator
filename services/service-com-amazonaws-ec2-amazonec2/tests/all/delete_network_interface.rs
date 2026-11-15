@@ -395,8 +395,8 @@ async fn an_id_that_names_no_interface_of_the_account_deletes_nothing() {
     );
     assert_eq!(
         error_code(&body),
-        "MalformedInput",
-        "a request with no NetworkInterfaceId is refused by the boundary validator, \
+        "MissingParameter",
+        "a request with no NetworkInterfaceId is refused for the parameter it left out, \
          got {body}"
     );
     assert!(

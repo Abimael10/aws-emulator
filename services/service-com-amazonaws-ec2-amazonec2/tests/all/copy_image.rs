@@ -987,10 +987,9 @@ async fn a_snapshot_tag_specification_tags_the_copys_snapshots() {
 type RefusalRow = (&'static str, Params, u16, &'static str);
 
 /// The code the request walk answers a REQUIRED member the request did not carry at all,
-/// before any handler runs: the three required members of this request are modelled
-/// `clientOptional`, so a value the request carries EMPTY reaches the handler instead and is
-/// answered `MissingParameter` there.
-const ABSENT_REQUIRED_MEMBER_CODE: &str = "MalformedInput";
+/// before any handler runs: EC2's own `MissingParameter`, the same code the handler answers
+/// for one of the three `clientOptional` required members that reaches it EMPTY.
+const ABSENT_REQUIRED_MEMBER_CODE: &str = "MissingParameter";
 
 /// The refusals that do not depend on a stored source, each a distinct input along what the
 /// rule generalises over.

@@ -502,11 +502,12 @@ async fn a_create_that_cannot_be_served_is_refused_and_stores_nothing() {
         ),
         (
             // `LaunchTemplateData` is `required` in the model, so the request walk refuses a
-            // request that carries none of it BEFORE this handler runs: the status and the
-            // boundary's own code are what the operation promises for it.
+            // request that carries none of it BEFORE this handler runs: the status and EC2's
+            // own code for a parameter the request left out are what the operation promises
+            // for it.
             "no launch template data at all",
             vec![p("LaunchTemplateId", &launch_template_id)],
-            "MalformedInput",
+            "MissingParameter",
         ),
         (
             "an ImageId naming a Systems Manager parameter no image publishes",

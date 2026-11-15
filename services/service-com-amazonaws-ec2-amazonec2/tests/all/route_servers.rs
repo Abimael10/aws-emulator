@@ -1242,17 +1242,13 @@ async fn max_results_is_accepted_at_each_published_bound_and_refused_past_it() {
              got {status} with body {body}"
         );
         match page {
-            // The modelled `@range` is enforced by the boundary validator; a page size BELOW
-            // the smallest the operation serves carries EC2's own `InvalidMaxResults`, while
-            // one above the largest keeps the validator's generic code. Either way the
+            // The modelled `@range` is enforced by the boundary validator; a page size the
+            // operation will not page with carries EC2's own `InvalidMaxResults` on either
+            // side of the published range. Either way the
             // refusal names the member it rejected, and neither is the handler's own
             // parameter refusal.
             None => {
-                let expected_code = if max_results < 5 {
-                    "InvalidMaxResults"
-                } else {
-                    "ValidationError"
-                };
+                let expected_code = "InvalidMaxResults";
                 assert_eq!(
                     error_code(&body),
                     expected_code,

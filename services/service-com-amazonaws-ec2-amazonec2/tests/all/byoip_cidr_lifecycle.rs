@@ -66,8 +66,9 @@ const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 const MISSING_PARAMETER: &str = "MissingParameter";
 
 /// The code the BOUNDARY answers for a `@required` member the request left out, before any
-/// handler of this service runs.
-const BOUNDARY_MISSING_MEMBER: &str = "MalformedInput";
+/// handler of this service runs: EC2's own `MissingParameter`, the same code a handler that
+/// resolves an absent member itself answers.
+const BOUNDARY_MISSING_MEMBER: &str = "MissingParameter";
 
 /// EC2's error code for a `DryRun` request that would have been served.
 const DRY_RUN_OPERATION: &str = "DryRunOperation";

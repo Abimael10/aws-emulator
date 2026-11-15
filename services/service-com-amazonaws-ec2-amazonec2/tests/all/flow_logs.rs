@@ -1772,9 +1772,10 @@ async fn a_repeated_client_token_answers_the_flow_logs_it_already_minted() {
 const DOCUMENTED_MAX_FLOW_LOG_IDS: usize = 1000;
 
 /// The code this service answers a request that leaves a `@required` member out with: the
-/// request never reaches the handler, because the boundary validator refuses it first — the
-/// answer every operation of this crate gives for a member the request does not carry.
-const BOUNDARY_MISSING_MEMBER: &str = "MalformedInput";
+/// request never reaches the handler, because the boundary validator refuses it first — with
+/// EC2's own `MissingParameter`, the answer every operation of this crate gives for a member
+/// the request does not carry.
+const BOUNDARY_MISSING_MEMBER: &str = "MissingParameter";
 
 /// `count` DISTINCT well-formed flow log ids this account holds no flow log for.
 ///
@@ -1908,7 +1909,7 @@ async fn the_flow_log_id_list_is_held_to_its_documented_bounds() {
                 let message = delete_refused(&router, case, &named, code).await;
                 match code {
                     BOUNDARY_MISSING_MEMBER => assert!(
-                        message.contains("flowLogIds"),
+                        message.contains("FlowLogIds"),
                         "case {case:?}: expected a message naming the member left out, got \
                          {message:?}"
                     ),

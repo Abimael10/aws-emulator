@@ -507,12 +507,11 @@ async fn a_request_that_names_no_path_is_refused() {
         "no NetworkInsightsPathId: expected HTTP 400, got {status} with body {body}"
     );
     // The member is `@required`, so the BOUNDARY validator refuses the request before this
-    // operation's handler runs — with the framework's own `MalformedInput`, not with a code
-    // the handler chose.
+    // operation's handler runs — with EC2's own code for a parameter the request left out.
     assert_eq!(
         error_code(&body),
-        "MalformedInput",
-        "no NetworkInsightsPathId: expected the boundary validator's MalformedInput, got {body}"
+        "MissingParameter",
+        "no NetworkInsightsPathId: expected EC2's MissingParameter, got {body}"
     );
     assert_eq!(
         stored_paths(&engine),

@@ -684,8 +684,9 @@ async fn the_create_refuses_a_transport_attachment_it_cannot_build_on() {
 }
 
 /// The code the request-boundary validator refuses a member the model requires and the
-/// request leaves out with, before any handler of this service runs.
-const BOUNDARY_MISSING_MEMBER: &str = "MalformedInput";
+/// request leaves out with, before any handler of this service runs: EC2's own
+/// `MissingParameter`, naming that member.
+const BOUNDARY_MISSING_MEMBER: &str = "MissingParameter";
 
 /// The code that same validator refuses a value outside a modelled enum with.
 const BOUNDARY_ENUM_VIOLATION: &str = "ValidationError";

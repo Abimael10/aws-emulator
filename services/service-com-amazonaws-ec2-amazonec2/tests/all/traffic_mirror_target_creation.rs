@@ -57,11 +57,6 @@ use super::wire::{child_text, document, is_long_id, set_items};
 /// selects the envelope.
 const REGION: &str = "us-west-2";
 
-/// The error code the BOUNDARY validator answers for a value outside a modelled constraint —
-/// a `MaxResults` outside `TrafficMirroringMaxResults`'s `range 5..1000` is refused before
-/// any handler runs, so it carries the boundary's code rather than one this crate chose.
-const BOUNDARY_CONSTRAINT_CODE: &str = "ValidationError";
-
 /// A `(key, value)` request parameter.
 fn p(key: &str, value: impl Into<String>) -> (String, String) {
     (key.to_string(), value.into())
@@ -1321,10 +1316,9 @@ async fn the_report_pages_over_every_target() {
     }
 
     // The published bounds of `TrafficMirroringMaxResults` (`range 5..1000`): one below the
-    // minimum is this service's own `InvalidMaxResults` — a positive page size it will not
-    // page with — and one above the maximum keeps the boundary validator's own code, both
-    // refused before this handler runs.
-    for (size, code) in [("4", "InvalidMaxResults"), ("1001", BOUNDARY_CONSTRAINT_CODE)] {
+    // minimum and one above the maximum are each this service's own `InvalidMaxResults` — a
+    // page size it will not page with — both refused before this handler runs.
+    for (size, code) in [("4", "InvalidMaxResults"), ("1001", "InvalidMaxResults")] {
         let (status, body) = describe(&router, &[p("MaxResults", size)]).await;
         assert_eq!(
             status, 400,

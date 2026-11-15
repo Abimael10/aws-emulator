@@ -564,8 +564,8 @@ async fn an_instance_id_this_account_cannot_resolve_is_refused() {
 ///
 /// `InstanceIds` is `@required` but `clientOptional`, so where the refusal of a request that
 /// names NO instance comes from is worth pinning rather than assuming: over ec2Query the
-/// boundary validator refuses it against the model's own `@required` marking, in the
-/// service-wide refusal envelope (`MalformedInput`), so the handler's own empty-list guard
+/// boundary validator refuses it against the model's own `@required` marking, in EC2's own
+/// `MissingParameter` naming that parameter, so the handler's own empty-list guard
 /// is a safety net behind it and never the wire answer. The batch size is the handler's
 /// own, the model publishing no length for the list, so the other rows are the ceiling at
 /// the maximum and one past it.
@@ -588,7 +588,7 @@ async fn a_request_outside_the_operations_parameters_is_refused() {
             // never a reboot queued for anybody.
             "no instance named at all",
             Vec::new(),
-            "MalformedInput",
+            "MissingParameter",
         ),
         (
             "one id past the batch ceiling",

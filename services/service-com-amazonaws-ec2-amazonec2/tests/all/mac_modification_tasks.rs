@@ -1281,7 +1281,7 @@ async fn a_page_size_outside_the_published_range_is_refused() {
     // value that is no page size at all — zero or negative — is EC2's `InvalidParameter`
     // naming the member, the value and the bound, a POSITIVE page size below the smallest the
     // operation serves would be its `InvalidMaxResults` (this range starting at 1, there is
-    // no such value here), and one above the largest keeps the boundary validator's own code.
+    // no such value here), and one above the largest is that same `InvalidMaxResults`.
     //
     // (what the page size is, the value, the expected status, the expected code)
     let rows: Vec<(&str, i64, u16, &str)> = vec![
@@ -1299,7 +1299,7 @@ async fn a_page_size_outside_the_published_range_is_refused() {
             "one above the published maximum",
             PUBLISHED_MAX_PAGE + 1,
             400,
-            "ValidationError",
+            "InvalidMaxResults",
         ),
     ];
     for (case, page_size, expected_status, code) in rows {

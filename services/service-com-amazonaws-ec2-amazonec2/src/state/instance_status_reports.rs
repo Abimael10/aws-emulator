@@ -25,6 +25,32 @@ use std::time::SystemTime;
 
 use super::{ComAmazonawsEc2Amazonec2State, MAX_STORED_RECORDS_PER_STORE};
 
+/// Is `allowed` the `ReportInstanceReasonCodes` catalog — the value set the model declares for
+/// the reasons a caller files feedback under
+/// (`crate::ops::types::REPORT_INSTANCE_REASON_CODES_VALUES`)?
+///
+/// Keyed to the TYPE's value set, the way every catalog-keyed refusal of this crate is
+/// ([`super::is_modelled_catalog`] records that rule), so every member of this model that names
+/// a reported reason is refused an unpublished one in the same words.
+pub fn is_report_instance_reason_codes_catalog(allowed: &[String]) -> bool {
+    super::is_modelled_catalog(
+        allowed,
+        crate::ops::types::REPORT_INSTANCE_REASON_CODES_VALUES,
+    )
+}
+
+/// How EC2 states a reason code the catalog does not hold: HTTP 400 `InvalidParameterValue`
+/// with the submitted value — "invalid reason code `<value>`".
+///
+/// EC2 does not state a modelled refusal as the generic validation clause; it says which
+/// reason it could not read, and the only part built from the request is the value echoed back
+/// (already elided by the constraint walk, so echoing it cannot amplify a request into an
+/// arbitrarily long response). The catalog is NOT stated back: a caller reads the reasons from
+/// the API reference.
+pub fn report_instance_reason_code_refusal_message(value: &str) -> String {
+    format!("invalid reason code {value}")
+}
+
 /// One status report a caller submitted about one instance.
 ///
 /// Not a modelled shape: `ReportInstanceStatus` answers `Unit` and no operation reports a

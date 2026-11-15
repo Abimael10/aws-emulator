@@ -931,7 +931,7 @@ async fn a_page_size_outside_the_published_range_is_refused() {
         ("one below the published minimum", 4, 400, "InvalidMaxResults"),
         ("the published minimum", 5, 200, ""),
         ("the published maximum", 1000, 200, ""),
-        ("one above the published maximum", 1001, 400, "ValidationError"),
+        ("one above the published maximum", 1001, 400, "InvalidMaxResults"),
     ] {
         let (status, body) =
             describe(&fixture.router, &[param("MaxResults", &page_size.to_string())]).await;

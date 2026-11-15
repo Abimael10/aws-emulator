@@ -169,10 +169,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             CONVERSION_TASK_STATE_ACTIVE, CONVERSION_TASK_STATE_CANCELLING,
-            MAX_IMPORT_TASK_CANCEL_REASON_CHARS, conversion_task_id_is_well_formed,
+            MAX_IMPORT_TASK_CANCEL_REASON_CHARS, MAX_STORED_BYTES,
+            conversion_task_id_is_well_formed,
             dry_run_operation, incorrect_state_of, invalid_conversion_task_id_format,
             invalid_conversion_task_id_not_found, invalid_parameter_value, missing_parameter,
-            require_service_state,
+            require_service_state, resource_limit_exceeded,
         };
 
         // A conversion task carries no Region member of its own (it has no ARN and the zone
@@ -245,11 +246,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(dry_run_operation());
         }
 
-        store.start_conversion_task_cancellation(
+        // The reason is stored on the task and on every volume of an instance import, so the
+        // write is refused when those copies would take the store past the bytes it holds of
+        // caller-supplied data — the byte budget every other write of this crate is bounded
+        // by, a record count being no bound on the text a record carries.
+        if !store.start_conversion_task_cancellation(
             conversion_task_id,
             now,
             input.reason_message.as_deref(),
-        );
+        ) {
+            return Err(resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store the reason this cancellation \
+                 carries",
+                held = store.stored_bytes(),
+            )));
+        }
         // Read the state back OUT of the store, so a success means the state a later report
         // of this task will carry rather than what this handler meant to write.
         let state_now = store.conversion_task_state(conversion_task_id);

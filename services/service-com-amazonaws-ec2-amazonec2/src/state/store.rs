@@ -658,21 +658,27 @@ pub const INVALID_MAX_RESULTS: &str = "InvalidMaxResults";
 ///
 /// * a POSITIVE page size smaller than the smallest page the operation serves is a page
 ///   size the operation will not page with, which EC2 answers [`INVALID_MAX_RESULTS`] for,
-///   in the sentence [`max_results_below_minimum_message`] words — `maxResults=4` against a
+///   in the sentence [`page_size_outside_range_message`] words — `maxResults=4` against a
 ///   published minimum of 5;
 /// * a value that is no page size at all — zero or negative, so it asks for a page of none —
 ///   is a parameter the service cannot use, which EC2 answers [`INVALID_PARAMETER`] for, in
 ///   the sentence [`value_below_required_minimum_message`] words.
 ///
 /// One function for both, so the code and the wording of a refusal cannot disagree. `path`
-/// is the member the constraint walk reports and `value` the value the caller sent.
-/// Anything that is not an integer at all never reaches here: the walk refuses it before it
-/// has a bound to compare against.
-pub fn max_results_refusal(path: &str, value: &str, minimum: &str) -> (&'static str, String) {
+/// is the member the constraint walk reports, `value` the value the caller sent and
+/// `input_shape` the input being read, which chooses the two words EC2 varies per operation
+/// in that sentence ([`RECORDED_PAGE_SIZE_WORDINGS`]). Anything that is not an integer at all
+/// never reaches here: the walk refuses it before it has a bound to compare against.
+pub fn max_results_refusal(
+    input_shape: Option<&str>,
+    path: &str,
+    value: &str,
+    minimum: &str,
+) -> (&'static str, String) {
     match value.trim().parse::<i64>() {
         Ok(page_size) if page_size > 0 => (
             INVALID_MAX_RESULTS,
-            max_results_below_minimum_message(value, minimum),
+            page_size_outside_range_message(input_shape, value, minimum, PageSizeBound::Smallest),
         ),
         _ => (
             INVALID_PARAMETER,
@@ -719,6 +725,54 @@ pub fn value_below_required_minimum_message(member: &str, value: &str, minimum: 
 /// place that reads a violation path and the one that words the refusal cannot drift apart.
 pub const MAX_RESULTS_MEMBER_PATH: &str = "maxResults";
 
+/// The path prefix the boundary's constraint walk reports a violation of one ELEMENT of a
+/// member that names the instance types a REPORT covers under: the member's own name in
+/// lowerCamel, followed by the step into the list
+/// (`aws_smithy_schema_server::constraints::path` spells an element `<position>.member`, so the
+/// whole path reads `instanceTypes.1.member`).
+///
+/// The trailing separator is what tells that member from the single `instanceType` a create
+/// carries: the first asks the catalog ABOUT types, the second is the value a resource is
+/// placed with, and EC2 refuses the two differently
+/// ([`nonexistent_instance_types_message`] against [`instance_type_refusal_message`]).
+pub const INSTANCE_TYPES_ELEMENT_PATH_PREFIX: &str = "instanceTypes.";
+
+/// The input shapes whose operation reports ON the instance-type catalog itself, so a name
+/// that member carries which the catalog does not hold is a type that DOES NOT EXIST.
+///
+/// `DescribeInstanceTypes` "describes the specified instance types" — its subject IS the
+/// catalog, and every type it names is looked up in it, so EC2 answers which of the supplied
+/// types do not exist ([`nonexistent_instance_types_message`]). A member that names types to
+/// NARROW a report of something else — `DescribeSpotPriceHistory`'s `InstanceTypes` selects
+/// price records, and every member that names the type a resource is PLACED as — carries the
+/// type as a parameter VALUE, and a value outside the catalog is EC2's
+/// [`INVALID_PARAMETER_VALUE`] for that parameter ([`instance_type_refusal_message`]), which
+/// that operation's own suite pins.
+pub const INSTANCE_TYPE_CATALOG_LOOKUP_INPUT_SHAPES: &[&str] = &["DescribeInstanceTypesRequest"];
+
+/// Is `allowed` — the value set the boundary's constraint walk reports a refused enum value
+/// against — the modelled `catalog`?
+///
+/// The walk reports a refused enum value as the VALUE SET it failed rather than as the shape
+/// that declared it, so the catalog IS how the parameter's type is recognised: a refusal is
+/// keyed to the type's own value set and never to the operation that happened to carry it,
+/// which is what lets every member of that type be refused in the same words
+/// ([`is_caller_role_catalog`] records the rule in full).
+///
+/// Compared as a SET: codegen writes a catalog constant sorted, while the walk reports it in
+/// the model's own declaration order, so two orders of one value set must still match. The one
+/// comparison every catalog-keyed refusal that reads a value set AS A SET makes
+/// ([`is_instance_type_catalog`] answers through it), so those cannot recognise a catalog
+/// differently; the catalogs whose declaration order IS their constant's order are compared
+/// member by member where they are defined.
+pub fn is_modelled_catalog(allowed: &[String], catalog: &[&str]) -> bool {
+    let declared: ::std::collections::BTreeSet<&str> = catalog.iter().copied().collect();
+    allowed.len() == declared.len()
+        && allowed
+            .iter()
+            .all(|held| declared.contains(held.as_str()))
+}
+
 /// How EC2 states a `MaxResults` below the smallest page an operation serves: the value the
 /// request sent and the bound it has to reach, in the sentence EC2 words every refused
 /// `maxResults` with — "Value ( `<value>` ) for parameter maxResults is invalid. Expecting a
@@ -729,7 +783,7 @@ pub const MAX_RESULTS_MEMBER_PATH: &str = "maxResults";
 /// arbitrarily long response) and the minimum off the member's own `@range`, so an operation
 /// whose published minimum differs is refused with its own bound rather than a copied number.
 pub fn max_results_below_minimum_message(value: &str, minimum: &str) -> String {
-    max_results_below_bound(value, minimum, "than or equal to")
+    max_results_below_bound(value, minimum, DEFAULT_PAGE_SIZE_WORDING.1)
 }
 
 /// How EC2 states the SAME refusal for the operations it was recorded wording without the
@@ -746,12 +800,15 @@ pub fn max_results_below_bound_message(value: &str, minimum: &str) -> String {
     max_results_below_bound(value, minimum, "than")
 }
 
-/// The one template both sentences above are built from, so the part they SHARE cannot drift
-/// between them: only the comparison clause differs.
-fn max_results_below_bound(value: &str, bound: &str, comparison: &str) -> String {
-    format!(
-        "Value ( {value} ) for parameter maxResults is invalid. Expecting a value greater \
-         {comparison} {bound}."
+/// Both sentences above, through the one template every page-size sentence of this service is
+/// built from ([`page_size_message`]), so none of them can drift from the others.
+fn max_results_below_bound(value: &str, bound: &str, clause: &str) -> String {
+    page_size_message(
+        DEFAULT_PAGE_SIZE_WORDING.0,
+        clause,
+        value,
+        bound,
+        PageSizeBound::Smallest,
     )
 }
 

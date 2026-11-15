@@ -1174,10 +1174,10 @@ async fn the_describe_pages_in_a_stable_order() {
             case: "a page size above the modelled maximum",
             params: vec![param("MaxResults", "1001")],
             status: 400,
-            // Above the modelled `IpamMaxResults` range the boundary validator refuses the
-            // member itself, before this operation's handler runs; only the MINIMUM carries
-            // EC2's own `InvalidMaxResults` wording (`crate::service`'s refusal override).
-            code: "ValidationError",
+            // Either side of the modelled `IpamMaxResults` range carries EC2's own
+            // `InvalidMaxResults` wording (`crate::service`'s refusal override), the
+            // boundary validator refusing the member before this operation's handler runs.
+            code: INVALID_MAX_RESULTS,
         },
         RefusalCase {
             case: "a target id of no target, in a form this service does not mint",

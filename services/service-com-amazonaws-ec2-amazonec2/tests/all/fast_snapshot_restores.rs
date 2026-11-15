@@ -497,13 +497,13 @@ async fn an_unreadable_request_is_refused_with_the_ec2_code_for_it() {
     let cases: Vec<(&str, Vec<Param>, u16, &str)> = vec![
         (
             // `SourceSnapshotIds` is `@required`, so the MODEL boundary refuses a request
-            // that names none before the handler runs; the handler's own
-            // `MissingParameter` is what an empty list would get, which ec2Query cannot
-            // express (an empty list is an omitted member).
+            // that names none before the handler runs, with the same EC2
+            // `MissingParameter` the handler answers for an empty list — which ec2Query
+            // cannot express (an empty list is an omitted member).
             "no snapshot named",
             vec![param("AvailabilityZone.1", &zone_name(0))],
             400,
-            "MalformedInput",
+            ec2::state::MISSING_PARAMETER,
         ),
         (
             "neither zone form named",

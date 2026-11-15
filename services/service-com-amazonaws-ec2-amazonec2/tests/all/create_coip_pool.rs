@@ -324,13 +324,13 @@ fn not_found_message(id: &str) -> String {
 fn refusals(route_table_id: &str) -> Vec<Refusal> {
     let mut rows = vec![
         // A member the request omits ENTIRELY is refused while the request is still being
-        // deserialized, before this operation's handler runs — with the framework's own
-        // `MalformedInput` and its own sentence, not with the handler's `MissingParameter`, as
-        // every other operation of this service answers it.
+        // deserialized, before this operation's handler runs — with EC2's own
+        // `MissingParameter`, the same code the handler answers for one that reaches it
+        // empty, as every other operation of this service answers it.
         Refusal {
             case: "no LocalGatewayRouteTableId at all".to_string(),
             params: Vec::new(),
-            code: "MalformedInput",
+            code: "MissingParameter",
             message: None,
         },
         // A member the request DOES carry, empty, reaches the handler: `LocalGatewayRouteTableId`

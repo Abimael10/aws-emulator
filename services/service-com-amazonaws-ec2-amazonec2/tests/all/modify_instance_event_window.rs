@@ -507,11 +507,12 @@ fn refusals() -> Vec<RefusalRow> {
         ),
         (
             // `ModifyInstanceEventWindowRequest$InstanceEventWindowId` is `@required`, so
-            // the boundary refuses a request that names no window before the handler runs.
+            // the boundary refuses a request that names no window before the handler runs,
+            // with EC2's own code for a parameter the request left out.
             "no event window id at all",
             Names::NoWindow,
             vec![p("Name", "renamed")],
-            "MalformedInput",
+            "MissingParameter",
         ),
         (
             "both a cron expression and a time range",

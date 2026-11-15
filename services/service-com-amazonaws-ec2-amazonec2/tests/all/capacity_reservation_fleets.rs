@@ -1119,7 +1119,8 @@ async fn a_create_that_cannot_be_served_is_refused_and_stores_nothing() {
         ),
         (
             // `$InstancePlatform` targets the modelled
-            // `CapacityReservationInstancePlatform` enum, refused at the same boundary.
+            // `CapacityReservationInstancePlatform` enum, refused at the same boundary with
+            // EC2's own code and sentence for a platform outside that catalog.
             "an operating system outside the modelled catalog",
             [
                 vec![param("TotalTargetCapacity", "4")],
@@ -1130,7 +1131,7 @@ async fn a_create_that_cannot_be_served_is_refused_and_stores_nothing() {
                 ]),
             ]
             .concat(),
-            "ValidationError",
+            "InvalidParameterValue",
         ),
         (
             "both the zone and its id",

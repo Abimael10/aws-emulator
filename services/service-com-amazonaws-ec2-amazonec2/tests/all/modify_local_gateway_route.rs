@@ -708,8 +708,8 @@ async fn a_route_table_id_outside_the_issued_form_is_malformed_and_an_unknown_on
     // A request that carries the route table id as an EMPTY value names no table whose route
     // to modify: the id is modelled `clientOptional`, so an empty one reaches the handler and
     // is refused with EC2's `MissingParameter`. One that leaves the parameter out ALTOGETHER
-    // is a null the boundary validator refuses before the handler, with the framework's own
-    // `MalformedInput`.
+    // is a null the boundary validator refuses before the handler, with that same
+    // `MissingParameter`.
     for (case, params, expected_code) in [
         (
             "an empty LocalGatewayRouteTableId",
@@ -723,7 +723,7 @@ async fn a_route_table_id_outside_the_issued_form_is_malformed_and_an_unknown_on
                 params.push(fixtures.target_param(row.modified_to));
                 params
             },
-            "MalformedInput",
+            "MissingParameter",
         ),
     ] {
         let (status, body) = modify(&router, &params).await;

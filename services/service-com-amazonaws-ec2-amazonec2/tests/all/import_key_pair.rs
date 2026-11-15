@@ -667,7 +667,7 @@ fn refusal_table() -> Vec<RefusalCase> {
         (
             "no public key material at all",
             vec![param("KeyName", "no-material")],
-            "MalformedInput",
+            "MissingParameter",
             400,
         ),
         (

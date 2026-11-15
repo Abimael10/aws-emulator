@@ -444,11 +444,10 @@ struct Refusal {
 ///
 /// The `<Code>` each row expects is the code this service already answers for that layer,
 /// asserted so a row cannot pass by being refused for another reason: `InvalidMaxResults` is
-/// EC2's own for a page below an operation's published minimum, while a value outside a
-/// modelled constraint the service has no recorded EC2 wording for keeps the request walk's
-/// own code. Which code EC2 words those with is a different issue
-/// (`issues/.../20261023T102725Z-ec2-answers-parameter-rejections-with-generic-validationerror-and.md`);
-/// this suite is about the envelope every one of them is announced in.
+/// EC2's own for a page size an operation will not page with, `MissingParameter` its own for a
+/// parameter the request left out, while a value outside a modelled constraint the service has
+/// no recorded EC2 wording for keeps the request walk's own code.
+/// This suite is about the envelope every one of them is announced in.
 fn refusals(vpc_id: &str) -> Vec<Refusal> {
     vec![
         Refusal {
@@ -470,14 +469,14 @@ fn refusals(vpc_id: &str) -> Vec<Refusal> {
             action: "DescribeStaleSecurityGroups",
             params: vec![param("VpcId", vpc_id), param("MaxResults", "256")],
             status: 400,
-            code: "ValidationError",
+            code: "InvalidMaxResults",
         },
         Refusal {
             case: "a request that leaves out a member the model requires",
             action: "DeleteVpc",
             params: Vec::new(),
             status: 400,
-            code: "MalformedInput",
+            code: "MissingParameter",
         },
         Refusal {
             case: "a value outside a modelled enum catalog",

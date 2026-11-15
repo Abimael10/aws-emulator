@@ -1193,9 +1193,9 @@ async fn a_dry_run_that_would_have_been_refused_gets_that_reason() {
             "a page size past the published bound",
             vec![param("MaxResults", "101")],
             // `NetworkInsightsMaxResults` is a modelled `range 1..100`, so the BOUNDARY
-            // validator refuses this before the handler runs — with its own
-            // `ValidationError`, not with a code the handler chose.
-            "ValidationError",
+            // validator refuses this before the handler runs — with EC2's own code for a
+            // page size the operation will not page with.
+            "InvalidMaxResults",
         ),
         (
             "a token this service did not issue",

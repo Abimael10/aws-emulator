@@ -56,9 +56,9 @@ const DRY_RUN_STATUS: u16 = 412;
 const REFUSAL_STATUS: u16 = 400;
 
 /// The code the request boundary refuses an absent `@required` member with, before any
-/// handler of this service runs — the service-wide refusal envelope, not a code a handler
-/// chooses.
-const BOUNDARY_MISSING_MEMBER: &str = "MalformedInput";
+/// handler of this service runs — EC2's own `MissingParameter`, the service-wide answer for a
+/// parameter the request left out.
+const BOUNDARY_MISSING_MEMBER: &str = "MissingParameter";
 
 /// A well-formed EC2 id suffix — 17 lowercase hex digits — that nothing in this store mints,
 /// so an id built from it is well formed and names no resource.

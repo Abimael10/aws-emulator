@@ -831,8 +831,9 @@ async fn an_unservable_request_is_refused_and_stores_nothing() {
             params: |_| vec![p("TargetCapacitySpecification.TotalTargetCapacity", "1")],
             status: 400,
             // The member is modelled `@required`, so the boundary validator refuses a
-            // request that carries none before the handler runs.
-            code: "MalformedInput",
+            // request that carries none before the handler runs, with EC2's own code for a
+            // parameter the request left out.
+            code: "MissingParameter",
         },
         Refusal {
             case: "a launch template id the service never minted",

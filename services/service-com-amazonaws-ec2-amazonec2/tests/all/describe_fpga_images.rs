@@ -1127,15 +1127,15 @@ async fn max_results_is_served_at_its_bounds_and_refused_outside_them() {
     }
 
     // The modelled `@range` is enforced by the boundary validator in front of the handler: a
-    // page size BELOW the smallest the operation serves carries EC2's own `InvalidMaxResults`,
-    // while one above the largest keeps the validator's generic code.
+    // page size the operation will not page with carries EC2's own `InvalidMaxResults` on
+    // either side of the published range.
     let outside: Vec<(&str, i64, &str)> = vec![
         ("one below the published minimum", MIN_MAX_RESULTS - 1, "InvalidMaxResults"),
         // A value that is no page size at all — zero or negative — is not a page size the
         // operation declines to serve but a parameter it cannot use, which carries EC2's own
         // `InvalidParameter` instead.
         ("a page of none", 0, "InvalidParameter"),
-        ("one above the published maximum", MAX_MAX_RESULTS + 1, "ValidationError"),
+        ("one above the published maximum", MAX_MAX_RESULTS + 1, "InvalidMaxResults"),
     ];
     for (case, page_size, expected_code) in outside {
         let (status, body) = describe(&router, &[p("MaxResults", page_size.to_string())]).await;

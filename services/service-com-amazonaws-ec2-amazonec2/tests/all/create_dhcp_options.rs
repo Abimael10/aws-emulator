@@ -443,14 +443,14 @@ async fn create_dhcp_options_refuses_what_the_options_do_not_admit() {
 
     let cases: Vec<RefusalCase> = vec![
         // A required member the request omits entirely is refused by the service's own
-        // request boundary, with `MalformedInput` rather than the handler's
-        // `MissingParameter` — the same answer every other operation of this service gives
-        // for an absent required member.
+        // request boundary, with the SAME `MissingParameter` the handler answers for a
+        // member it resolves as absent itself — the answer every other operation of this
+        // service gives for an absent required member.
         (
             "no DhcpConfigurations at all",
             Vec::new(),
             400,
-            "MalformedInput",
+            "MissingParameter",
         ),
         (
             "an option with no value",

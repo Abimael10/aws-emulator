@@ -767,11 +767,11 @@ async fn a_request_outside_the_documented_contract_is_refused_and_stores_nothing
         (
             // `ResourceTypes` is a modelled `@required` member
             // (`smithy_query(query="operation",operation="CreateImageUsageReport")`), so a
-            // request that names none is refused by the boundary validator — with its own
-            // code for a required member the request omitted — before this handler runs.
+            // request that names none is refused by the boundary validator — with EC2's own
+            // code for a parameter the request left out — before this handler runs.
             "no resource type at all".to_string(),
             create_params(&images.own, &[], &[], &[]),
-            "MalformedInput",
+            "MissingParameter",
         ),
         (
             "a resource type outside the documented catalog".to_string(),
@@ -1038,7 +1038,7 @@ async fn a_dry_run_create_stores_nothing() {
             "a request naming no resource type",
             create_params(&images.own, &[], &[], &[]),
             400,
-            "MalformedInput",
+            "MissingParameter",
         ),
     ];
 

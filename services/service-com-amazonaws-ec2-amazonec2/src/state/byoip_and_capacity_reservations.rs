@@ -223,13 +223,18 @@ impl ComAmazonawsEc2Amazonec2State {
     }
 
     /// Store a conversion task, and answer the `ConversionTaskId` it was given — or `None`
-    /// when the store already holds [`MAX_STORED_CONVERSION_TASKS`] of them, in which case
+    /// when the store already holds [`MAX_STORED_CONVERSION_TASKS`] of them, or when the
+    /// record's caller-chosen bytes would take the store past its byte budget, in which case
     /// NOTHING is stored and no bytes are charged.
     ///
     /// The ceiling is enforced here as well as asked about through
     /// [`Self::has_conversion_task_capacity`], for the reason
-    /// [`Self::insert_import_snapshot_task`] enforces its own: the count is the only thing
-    /// bounding this store's growth.
+    /// [`Self::insert_import_snapshot_task`] enforces its own: the count is one of the two
+    /// things bounding this store's growth. The other is the BYTE budget, which binds this
+    /// path the way it binds [`Self::insert_byoip_cidr`]: what a task charges is dominated by
+    /// caller-chosen text (the descriptions, the checksum, the manifest URL and one element
+    /// per imported volume), so without this gate resident memory would be a function of the
+    /// request body rather than of the budget.
     ///
     /// The id is minted here rather than taken from the caller, so a task never shares an id
     /// with another resource of this store, and its prefix comes from the detail the spec
@@ -260,7 +265,11 @@ impl ComAmazonawsEc2Amazonec2State {
             status_message: None,
             tags: Some(spec.tags),
         };
-        self.add_stored_bytes(conversion_task_payload_bytes(&task));
+        let charge = conversion_task_payload_bytes(&task);
+        if self.would_exceed_stored_bytes_after_refund(charge, 0) {
+            return None;
+        }
+        self.add_stored_bytes(charge);
         self.conversion_tasks
             .insert(conversion_task_id.clone(), task);
         Some(conversion_task_id)
@@ -278,7 +287,8 @@ impl ComAmazonawsEc2Amazonec2State {
     }
 
     /// Start the cancellation of the conversion task `conversion_task_id`, answering whether
-    /// this account holds one under that id — it does nothing at all when it does not.
+    /// this account holds one under that id — it does nothing at all when it does not, and
+    /// nothing at all when the reason's bytes would take the store past its byte budget.
     ///
     /// The task moves to [`CONVERSION_TASK_STATE_CANCELLING`] now and the clock owes it
     /// [`CONVERSION_TASK_STATE_CANCELLED`] one [`TRANSITION_DELAY`] later
@@ -292,6 +302,11 @@ impl ComAmazonawsEc2Amazonec2State {
     /// refund, because [`conversion_task_payload_bytes`] charges a writer for the one it
     /// stored.
     ///
+    /// The reason is stored ONCE PER VOLUME beside the task's own copy, so the charge counts
+    /// every copy and the write is refused when the budget cannot take them: that volume count
+    /// comes from the request that created the task, so a charge counting one copy would let a
+    /// cancel grow resident memory by a multiple of what it was charged for.
+    ///
     /// Each volume of an instance import stops where the task did: its
     /// `ImportInstanceVolumeDetailItem$Status` is "the status of the import of this
     /// particular disk image", which is this import, the same way a disk of an import image
@@ -303,6 +318,22 @@ impl ComAmazonawsEc2Amazonec2State {
         reason: Option<&str>,
     ) -> bool {
         let message = reason.map(str::to_string);
+        // The copies the write would store: the task's own `StatusMessage` and one per
+        // volume of an instance import, counted before anything is written.
+        let copies = match self.conversion_tasks.get(conversion_task_id) {
+            None => return false,
+            Some(task) => {
+                1 + task
+                    .import_instance
+                    .iter()
+                    .flat_map(|detail| detail.volumes.iter().flatten())
+                    .count()
+            }
+        };
+        let charge = message.as_ref().map_or(0, |text| text.len() * copies);
+        if self.would_exceed_stored_bytes_after_refund(charge, 0) {
+            return false;
+        }
         let Some(task) = self.conversion_tasks.get_mut(conversion_task_id) else {
             return false;
         };
@@ -316,7 +347,7 @@ impl ComAmazonawsEc2Amazonec2State {
             item.status = Some(CONVERSION_TASK_STATE_CANCELLING.to_string());
             item.status_message = message.clone();
         }
-        self.add_stored_bytes(message.map_or(0, |text| text.len()));
+        self.add_stored_bytes(charge);
         self.conversion_task_cancelled_at
             .insert(conversion_task_id.to_string(), now + TRANSITION_DELAY);
         true
@@ -2139,6 +2170,37 @@ pub const CAPACITY_RESERVATION_STATE_DELAYED: &str = "delayed";
 /// "Valid range: 1 - 1000" (`CreateCapacityReservationRequest$InstanceCount`). The model
 /// puts no `@range` on the member, so this is the only place the published one is kept.
 pub const CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE: ::std::ops::RangeInclusive<i32> = 1..=1000;
+
+/// Is `allowed` the `CapacityReservationInstancePlatform` catalog — the value set the model
+/// declares for the platform a reservation holds capacity for
+/// (`crate::ops::types::CAPACITY_RESERVATION_INSTANCE_PLATFORM_VALUES`)?
+///
+/// Keyed to the TYPE's value set, the way every catalog-keyed refusal of this crate is
+/// ([`super::is_modelled_catalog`] records that rule), so every member of this model that names
+/// the platform a reservation is for — a create's own and a Capacity Reservation Fleet's
+/// instance type specification — is refused an unpublished one in the same words.
+pub fn is_capacity_reservation_instance_platform_catalog(allowed: &[String]) -> bool {
+    super::is_modelled_catalog(
+        allowed,
+        crate::ops::types::CAPACITY_RESERVATION_INSTANCE_PLATFORM_VALUES,
+    )
+}
+
+/// How EC2 states an `InstancePlatform` the catalog does not hold: HTTP 400
+/// `InvalidParameterValue` with the submitted value and the account the call was made in —
+/// "Invalid instance platform: `<value>` , accountId: `<account>`".
+///
+/// EC2 does not state a modelled refusal as the generic validation clause; it states what it
+/// could not read and for whom. The two variable parts are the value echoed back (already
+/// elided by the constraint walk, so echoing it cannot amplify a request into an arbitrarily
+/// long response) and the one account this emulator serves
+/// ([`::engine::emulator_account_id`]), which is read rather than written into the sentence.
+pub fn capacity_reservation_instance_platform_refusal_message(value: &str) -> String {
+    format!(
+        "Invalid instance platform: {value} , accountId: {account}",
+        account = ::engine::emulator_account_id(),
+    )
+}
 
 /// The tenancy a Capacity Reservation gets when the request names none: "`default` - The
 /// Capacity Reservation is created on hardware that is shared with other Amazon Web

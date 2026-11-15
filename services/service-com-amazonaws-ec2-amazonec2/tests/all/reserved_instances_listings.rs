@@ -1021,10 +1021,11 @@ async fn a_price_schedule_the_service_cannot_take_is_refused() {
             // `PriceSchedules` is `@required`, so a request that carries no schedule at all
             // is refused by the BOUNDARY validator before this operation runs: the model
             // itself enforces that the member is there, and this operation enforces what the
-            // schedules in it have to say.
-            "MalformedInput",
-            "1 validation error detected: Value null at 'priceSchedules' failed to satisfy \
-             constraint: Member must not be null"
+            // schedules in it have to say. EC2's code for a parameter the request left out
+            // names that parameter.
+            MISSING_PARAMETER,
+            "The request must include the PriceSchedules parameter. Add the required parameter \
+             and retry the request."
                 .to_string(),
         ),
         (

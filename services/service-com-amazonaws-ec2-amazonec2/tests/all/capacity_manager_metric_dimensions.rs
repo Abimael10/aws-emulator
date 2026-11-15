@@ -929,13 +929,12 @@ async fn requests_outside_a_documented_rule_are_refused() {
     let table: Vec<RefusalRow> = vec![
         (
             // An absent `@required` member is refused by the framework's own constraint
-            // walk, before any handler runs: which code EC2 answers for each framework
-            // refusal, and how it words it, is one rule for the whole service and has an
-            // issue of its own, so this pins what the service answers today rather than
-            // restating that rule here.
+            // walk, before any handler runs, with EC2's own code for a parameter the request
+            // left out — one rule for the whole service
+            // (`crate::service::parameter_refusals`).
             "no dimension to group by",
             query(&[], &[RESERVATION_METRIC], &now),
-            "MalformedInput",
+            "MissingParameter",
             400,
         ),
         (
@@ -952,7 +951,7 @@ async fn requests_outside_a_documented_rule_are_refused() {
             // `GroupBy` above.
             "no metric at all",
             query(&["instance-type"], &[], &now),
-            "MalformedInput",
+            "MissingParameter",
             400,
         ),
         (

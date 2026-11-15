@@ -557,9 +557,12 @@ async fn a_request_the_create_cannot_serve_is_refused_and_stores_nothing() {
 /// A member the MODEL constrains is refused before the handler runs, against the model's own
 /// requirement: a `@required` member the request omits, and a value outside a modelled enum.
 ///
-/// The sentence is the shared boundary validator's for that requirement class, so this row is
-/// about WHICH requirement each member carries rather than about wording this operation
-/// chooses: the catalogs are `Schedule` and `OutputFormat`
+/// Each row is about WHICH requirement the member carries and the code and sentence EC2
+/// answers it with: a `@required` member the request left out is EC2's `MissingParameter`
+/// naming that member, a `Schedule` outside its catalog keeps the boundary validator's clause
+/// (this service has no recorded EC2 wording for that parameter type), and an `OutputFormat`
+/// outside its own is EC2's `InvalidParameterValue` naming the value and the formats it
+/// accepts. The catalogs are `Schedule` and `OutputFormat`
 /// (`smithy_query(query="shape",shape="Schedule,OutputFormat")`), and the three required
 /// members are `S3BucketName`, `Schedule` and `OutputFormat`
 /// (`smithy_query(query="operation",operation="CreateCapacityManagerDataExport")`).
@@ -567,8 +570,8 @@ async fn a_request_the_create_cannot_serve_is_refused_and_stores_nothing() {
 async fn a_modelled_requirement_is_refused_before_the_create_runs() {
     let required = |member: &str| -> String {
         format!(
-            "1 validation error detected: Value null at '{member}' failed to satisfy \
-             constraint: Member must not be null"
+            "The request must include the {member} parameter. Add the required parameter and \
+             retry the request."
         )
     };
     let off_catalog = |value: &str, member: &str, catalog: &[&str]| -> String {
@@ -587,8 +590,8 @@ async fn a_modelled_requirement_is_refused_before_the_create_runs() {
                 param("Schedule", HOURLY),
                 param("OutputFormat", OUTPUT_FORMATS[0]),
             ],
-            "MalformedInput",
-            required("s3BucketName"),
+            "MissingParameter",
+            required("S3BucketName"),
         ),
         (
             "no schedule at all",
@@ -596,14 +599,14 @@ async fn a_modelled_requirement_is_refused_before_the_create_runs() {
                 param("S3BucketName", BUCKET),
                 param("OutputFormat", OUTPUT_FORMATS[0]),
             ],
-            "MalformedInput",
-            required("schedule"),
+            "MissingParameter",
+            required("Schedule"),
         ),
         (
             "no output format at all",
             vec![param("S3BucketName", BUCKET), param("Schedule", HOURLY)],
-            "MalformedInput",
-            required("outputFormat"),
+            "MissingParameter",
+            required("OutputFormat"),
         ),
         (
             "a schedule outside the modelled catalog",
@@ -614,8 +617,9 @@ async fn a_modelled_requirement_is_refused_before_the_create_runs() {
         (
             "an output format outside the modelled catalog",
             create_params(BUCKET, HOURLY, "json", &[]),
-            "ValidationError",
-            off_catalog("json", "outputFormat", &OUTPUT_FORMATS),
+            "InvalidParameterValue",
+            "The value 'json' for OutputFormat isn't valid. Valid values: CSV or Parquet."
+                .to_string(),
         ),
     ];
 

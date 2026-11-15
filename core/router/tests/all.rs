@@ -7263,3 +7263,22 @@ mod events_lambda_target_permission_granted_after_the_rule;
 //! covers, and why it belongs to this cross-service target rather than to one service
 //! crate, is stated in that suite's own module doc, where it is read beside the test.
 //! belongs there rather than here.
+//! Put a new suite at `tests/all/<name>.rs` and declare it below: one `#[path]` / `mod`
+//! pair per suite and NOTHING else, so a landing has one place to insert and nothing to
+//! keep consistent. A suite that is not declared here compiles nowhere and its tests never
+//! run, and a suite left at the top level of `tests/` is a test target of its own, which
+//! fails the build. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to
+//! a SIBLING of this file (`tests/boot_serve.rs`), which the layout check refuses: the
+//! `#[path]` above each `mod` is what points the declaration into `tests/all/`.
+//! name is `E0428` and fails every suite in this target. THIS HEADER IS THE ONLY PLACE AN
+//! INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE: past the first item one is `E0753` and
+//! compiles no suite of this target. So what goes below is a DECLARATION — never a note
+//! about one, and never a copy of this header.
+//! this file and for every service crate's `tests/all.rs`, which is where a note about
+//! either rule belongs.
+//! WHAT a suite covers, and WHY it lives in this cross-service target rather than in one
+//! service crate's own, is stated in that suite's own module doc, where it is read beside
+//! the test it explains and stays correct when the suite moves. This file is the list and
+//! nothing else: the notes about the file itself that successive landings appended into its
+//! tail — copies of this header re-typed with `//!`, and bookkeeping about declarations that
+//! are no longer duplicated — are gone rather than re-typed.

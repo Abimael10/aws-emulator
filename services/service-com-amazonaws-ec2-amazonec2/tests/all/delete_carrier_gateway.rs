@@ -502,12 +502,12 @@ async fn a_request_that_names_no_gateway_is_refused() {
         "no CarrierGatewayId: expected HTTP 400, got {status} with body {body}"
     );
     // The member is `@required`, so the BOUNDARY validator refuses the request before this
-    // operation's handler runs — with the framework's own `MalformedInput`, not with a code
-    // the handler chose.
+    // operation's handler runs — with EC2's own `MissingParameter`, naming the parameter the
+    // request has to add.
     assert_eq!(
         error_code(&body),
-        "MalformedInput",
-        "no CarrierGatewayId: expected the boundary validator's MalformedInput, got {body}"
+        "MissingParameter",
+        "no CarrierGatewayId: expected EC2's MissingParameter, got {body}"
     );
     assert_eq!(
         stored_gateways(&engine),

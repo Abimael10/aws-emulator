@@ -425,6 +425,11 @@ mod disassociate_subnet_cidr_block;
 // position, and nothing repeated back by a class whose sentence interpolates nothing.
 #[path = "all/per_resource_refusal_wording.rs"]
 mod per_resource_refusal_wording;
+// The code and the sentence this service answers a request the MODEL's own rules refuse: a
+// parameter the request left out, a value outside a declared catalog, a page size outside a
+// declared range, and the enum value it reads without regard to case.
+#[path = "all/parameter_refusal_codes.rs"]
+mod parameter_refusal_codes;
 // What `ModifyTransitGateway` applies to a stored transit gateway, what it leaves alone,
 // what it refuses, and the `modifying` -> `available` move the clock owes the gateway.
 #[path = "all/modify_transit_gateway.rs"]

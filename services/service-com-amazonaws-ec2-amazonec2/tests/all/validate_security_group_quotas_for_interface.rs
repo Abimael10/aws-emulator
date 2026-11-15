@@ -287,8 +287,8 @@ async fn the_answer_is_decided_by_the_caller_not_by_the_groups_named() {
 
 /// A request that names no security group never reaches the operation at all: the member is
 /// required (`ValidateSecurityGroupQuotasForInterfaceRequest$SecurityGroupIds`), so the
-/// boundary refuses it as a malformed request — which is a different claim from either answer
-/// above, and also stores nothing.
+/// boundary refuses it for the parameter it left out — which is a different claim from either
+/// answer above, and also stores nothing.
 #[tokio::test]
 async fn a_request_naming_no_security_group_is_refused_at_the_boundary() {
     let (router, engine) = emulator();
@@ -300,7 +300,7 @@ async fn a_request_naming_no_security_group_is_refused_at_the_boundary() {
         "a request naming no security group: expected HTTP 400, got {status} with body {body}"
     );
     assert!(
-        error_message(&body).contains("securityGroupIds"),
+        error_message(&body).contains("SecurityGroupIds"),
         "a request naming no security group: expected the refusal to name the member it \
          requires, got {body}"
     );

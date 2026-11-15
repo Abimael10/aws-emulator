@@ -684,7 +684,7 @@ async fn a_request_naming_no_host_is_refused() {
         "no host id: expected HTTP 400, got {status} with body {body}"
     );
     assert!(
-        unescaped(&element(&body, "Message").unwrap_or_default()).contains("hostIds"),
+        unescaped(&element(&body, "Message").unwrap_or_default()).contains("HostIds"),
         "no host id: the refusal must name the required member, got {body}"
     );
     let (state, _) = described(&router, &allocated[0])

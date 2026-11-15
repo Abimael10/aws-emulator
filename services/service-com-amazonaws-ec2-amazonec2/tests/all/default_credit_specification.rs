@@ -566,14 +566,14 @@ async fn a_bad_request_is_refused_with_the_error_code_for_it() {
             "GetDefaultCreditSpecification",
             Vec::new(),
             400,
-            "MalformedInput",
+            "MissingParameter",
         ),
         (
             "a modify that names no credit option at all",
             "ModifyDefaultCreditSpecification",
             vec![param("InstanceFamily", FAMILY)],
             400,
-            "MalformedInput",
+            "MissingParameter",
         ),
         (
             "a dry run of a get that would have succeeded",

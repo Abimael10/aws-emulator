@@ -610,10 +610,10 @@ async fn an_unresolvable_request_is_refused_and_a_dry_run_reports_it() {
             region: REGION,
             extra: vec![p("MaxResults", "1001")],
             status: 400,
-            // Above the modelled `IpamMaxResults` range the boundary validator refuses the
-            // member itself, before this operation's handler runs; only the MINIMUM carries
-            // EC2's own `InvalidMaxResults` wording (`crate::service`'s refusal override).
-            code: "ValidationError",
+            // Either side of the modelled `IpamMaxResults` range carries EC2's own
+            // `InvalidMaxResults` wording (`crate::service`'s refusal override), the
+            // boundary validator refusing the member before this operation's handler runs.
+            code: INVALID_MAX_RESULTS,
         },
         Refusal {
             case: "a token this service did not issue",

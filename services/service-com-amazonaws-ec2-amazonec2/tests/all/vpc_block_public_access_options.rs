@@ -469,9 +469,9 @@ async fn a_mode_outside_the_modelled_catalog_is_refused_and_writes_nothing() {
             vec![param("InternetGatewayBlockMode", "")],
             "ValidationError",
         ),
-        // The required member absent altogether is a malformed request rather than a bad
-        // value, so the boundary says so.
-        ("no mode at all", vec![], "MalformedInput"),
+        // The required member absent altogether is a parameter the request left out rather
+        // than a bad value, so the boundary answers EC2's `MissingParameter` naming it.
+        ("no mode at all", vec![], "MissingParameter"),
     ];
 
     for (case, params, expected_code) in cases {

@@ -823,7 +823,7 @@ async fn a_required_parameter_the_request_left_out_is_refused() {
 
     // Rows: each required member given empty (the handler's refusal — a VLAN of zero is the
     // integer form of "not given", 0 being no VLAN at all), then each left out entirely (the
-    // boundary validator's).
+    // boundary validator's, which answers EC2's same `MissingParameter`).
     let mut cases: Vec<MissingParameterCase> = Vec::new();
     for field in [
         "LocalGatewayVirtualInterfaceGroupId",
@@ -832,10 +832,10 @@ async fn a_required_parameter_the_request_left_out_is_refused() {
         "PeerAddress",
     ] {
         cases.push((field, with(&groups[0], field, ""), "MissingParameter"));
-        cases.push((field, without(&groups[0], field), "MalformedInput"));
+        cases.push((field, without(&groups[0], field), "MissingParameter"));
     }
     cases.push(("Vlan", with(&groups[0], "Vlan", "0"), "MissingParameter"));
-    cases.push(("Vlan", without(&groups[0], "Vlan"), "MalformedInput"));
+    cases.push(("Vlan", without(&groups[0], "Vlan"), "MissingParameter"));
 
     for (case, params, expected_code) in cases {
         for dry_run in [false, true] {

@@ -328,8 +328,8 @@ async fn a_host_the_account_does_not_hold_is_refused() {
     );
     assert_eq!(
         error_code(&body),
-        "MalformedInput",
-        "no host at all: expected the boundary validator's refusal, got {body}"
+        "MissingParameter",
+        "no host at all: expected EC2's MissingParameter for the member left out, got {body}"
     );
 }
 

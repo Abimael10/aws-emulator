@@ -46,6 +46,136 @@ pub fn max_results_below_published_minimum<E>(
     ))
 }
 
+/// How EC2 states a parameter the request left out: `The request must include the <Member>
+/// parameter. Add the required parameter and retry the request.`
+///
+/// The one sentence EC2's `MissingParameter` carries, whichever member is absent and whichever
+/// operation was called: the member is named as the MODEL declares it and the rest is fixed
+/// text, so nothing of one run's request is written into the template. Answered both by a
+/// handler that resolves an absent member itself ([`missing_required_parameter`]) and by the
+/// refusal override for the `@required` members the boundary resolves
+/// (`crate::service::parameter_refusals`), so the two cannot word it differently.
+pub fn missing_required_parameter_message(member: &str) -> String {
+    format!(
+        "The request must include the {member} parameter. Add the required parameter and retry \
+         the request."
+    )
+}
+
+/// The code and the words EC2 refuses a page size OUTSIDE the range an operation publishes
+/// with, for the operations whose own refusal its callers recorded:
+/// `(input shape, error code, parameter spelling, comparison clause)`.
+///
+/// One refusal class, several recorded answers. `DescribeSubnets` names the member as the model
+/// declares it and admits the bound itself ("smaller than or equal to 1000"), while
+/// `DescribeSecurityGroups` names it in lowerCamel and excludes it ("smaller than 1000"); both
+/// answer [`INVALID_PARAMETER_VALUE`], where the paged describes whose refusal was recorded
+/// elsewhere answer EC2's own [`INVALID_MAX_RESULTS`]. WHICH an operation answers is a fact of
+/// that operation recorded by its caller and not of the bound, exactly as the two sentences for
+/// a page size below the minimum differ ([`max_results_below_bound_message`]) — so it is keyed
+/// to the INPUT SHAPE being read, the one key that names a member of one operation.
+///
+/// An operation NOT named here keeps the code and the sentence every other paged operation
+/// answers: [`INVALID_MAX_RESULTS`] with [`DEFAULT_PAGE_SIZE_WORDING`] for a page size it will
+/// not page with, either side of its published range.
+pub const RECORDED_PAGE_SIZE_WORDINGS: &[(&str, &str, &str, &str)] = &[
+    (
+        "DescribeSecurityGroupsRequest",
+        INVALID_PARAMETER_VALUE,
+        "maxResults",
+        "than",
+    ),
+    (
+        "DescribeSubnetsRequest",
+        INVALID_PARAMETER_VALUE,
+        "MaxResults",
+        "than or equal to",
+    ),
+];
+
+/// The `(parameter spelling, comparison clause)` a paged operation whose own wording is not
+/// recorded answers: the member in the lowerCamel the rest of this service's `maxResults`
+/// sentences name it in ([`max_results_below_bound_message`]), and the bound admitted — the
+/// value a request may still ask for, which is what a `@range` bound means.
+pub const DEFAULT_PAGE_SIZE_WORDING: (&str, &str) = ("maxResults", "than or equal to");
+
+/// Which bound of the page-size range an operation publishes a value fell outside.
+///
+/// EC2 words both in one sentence and varies one word between them, so the two are one value
+/// here rather than two sentences that could drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageSizeBound {
+    /// Below the smallest page the operation serves: the sentence asks for a value GREATER
+    /// than the bound.
+    Smallest,
+    /// Above the largest page it serves: the sentence asks for a value SMALLER than it.
+    Largest,
+}
+
+impl PageSizeBound {
+    /// The word EC2's sentence compares the value with.
+    fn comparison(self) -> &'static str {
+        match self {
+            Self::Smallest => "greater",
+            Self::Largest => "smaller",
+        }
+    }
+}
+
+/// Whether EC2's own refusal of a page size outside `input_shape`'s published range is
+/// recorded, and the code it answers it with — `None` for every operation that answers the
+/// code and the sentence every other paged operation does.
+pub fn recorded_page_size_code(input_shape: Option<&str>) -> Option<&'static str> {
+    RECORDED_PAGE_SIZE_WORDINGS
+        .iter()
+        .find(|(shape, _, _, _)| Some(*shape) == input_shape)
+        .map(|(_, code, _, _)| *code)
+}
+
+/// How EC2 states a page size outside the range an operation publishes: the value the request
+/// sent, in spaced parentheses, the parameter that carried it and the bound it has to stay
+/// inside — "Value ( `<value>` ) for parameter `<parameter>` is invalid. Expecting a value
+/// smaller than or equal to `<bound>`."
+///
+/// `input_shape` is the input being read, which chooses the wording
+/// ([`RECORDED_PAGE_SIZE_WORDINGS`]); `None` — a refusal given before any input shape was
+/// read — takes the default. Every variable part comes from the request and the model: the
+/// value as the caller sent it (already elided by the constraint walk, so echoing it cannot
+/// amplify a request into an arbitrarily long response) and the bound off the member's own
+/// `@range`, so an operation whose published range differs is refused with its own bound
+/// rather than a copied number.
+pub fn page_size_outside_range_message(
+    input_shape: Option<&str>,
+    value: &str,
+    bound: &str,
+    outside: PageSizeBound,
+) -> String {
+    let (parameter, clause) = RECORDED_PAGE_SIZE_WORDINGS
+        .iter()
+        .find(|(shape, _, _, _)| Some(*shape) == input_shape)
+        .map_or(DEFAULT_PAGE_SIZE_WORDING, |(_, _, parameter, clause)| {
+            (parameter, clause)
+        });
+    page_size_message(parameter, clause, value, bound, outside)
+}
+
+/// The ONE template every page-size sentence of this service is built from, so no two of them
+/// can drift apart: only the parameter's spelling, the comparison clause and which bound was
+/// missed vary.
+pub fn page_size_message(
+    parameter: &str,
+    clause: &str,
+    value: &str,
+    bound: &str,
+    outside: PageSizeBound,
+) -> String {
+    format!(
+        "Value ( {value} ) for parameter {parameter} is invalid. Expecting a value {comparison} \
+         {clause} {bound}.",
+        comparison = outside.comparison(),
+    )
+}
+
 /// How EC2 refuses a page size outside the range an operation publishes: the two bounds of
 /// that range and nothing of the request.
 ///

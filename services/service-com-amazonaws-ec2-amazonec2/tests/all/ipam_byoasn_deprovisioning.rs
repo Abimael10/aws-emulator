@@ -111,8 +111,9 @@ const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 const MISSING_PARAMETER: &str = "MissingParameter";
 
 /// The code the boundary validator refuses a request missing a modelled `@required` member
-/// with, before any handler logic runs.
-const MALFORMED_INPUT: &str = "MalformedInput";
+/// with, before any handler logic runs: EC2's own `MissingParameter`, the same code the
+/// handler answers for one that reached it empty.
+const BOUNDARY_MISSING_MEMBER: &str = "MissingParameter";
 
 /// EC2's code for a `DryRun` request that would otherwise have been served, and the status
 /// this emulator answers it with.
@@ -599,7 +600,7 @@ async fn an_unreadable_member_is_refused_before_anything_is_resolved() {
             vec![p("IpamId", ""), p("Asn", asn)],
             MISSING_PARAMETER,
         ),
-        ("no IpamId parameter at all", vec![p("Asn", asn)], MALFORMED_INPUT),
+        ("no IpamId parameter at all", vec![p("Asn", asn)], BOUNDARY_MISSING_MEMBER),
         (
             "an IpamId that is not an id at all",
             vec![p("IpamId", "not-an-ipam"), p("Asn", asn)],
@@ -628,7 +629,7 @@ async fn an_unreadable_member_is_refused_before_anything_is_resolved() {
         (
             "no Asn parameter at all",
             vec![p("IpamId", "ipam-00000000000000001")],
-            MALFORMED_INPUT,
+            BOUNDARY_MISSING_MEMBER,
         ),
         (
             "an Asn that is not a number",

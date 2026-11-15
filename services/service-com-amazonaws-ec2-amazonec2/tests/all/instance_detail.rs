@@ -1072,12 +1072,13 @@ async fn monitoring_refuses_what_it_cannot_act_on_and_changes_nothing() {
         },
         RefusalRow {
             // `InstanceIds` is `@required`, so the boundary validator refuses a request
-            // that omits the list before the handler runs.
+            // that omits the list before the handler runs, with EC2's own code for a
+            // parameter the request left out.
             case: "no instance at all",
             action: "MonitorInstances",
             params: Vec::new(),
             status: 400,
-            code: "MalformedInput",
+            code: "MissingParameter",
         },
         RefusalRow {
             case: "a terminated instance",
@@ -1115,7 +1116,7 @@ async fn monitoring_refuses_what_it_cannot_act_on_and_changes_nothing() {
             action: "UnmonitorInstances",
             params: Vec::new(),
             status: 400,
-            code: "MalformedInput",
+            code: "MissingParameter",
         },
     ];
 

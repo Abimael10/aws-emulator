@@ -85,9 +85,9 @@ const MISSING_PARAMETER: &str = "MissingParameter";
 
 /// The code the request walk answers when a member the model marks required is absent
 /// altogether: the framework's own validation refuses the request before the handler reads
-/// it, so `allocationId` missing is this rather than the handler's own refusal for a list
-/// that is present and empty.
-const MALFORMED_INPUT: &str = "MalformedInput";
+/// it, with EC2's own code for a parameter the request left out — the same code the handler
+/// answers for a list that is present and empty.
+const BOUNDARY_MISSING_MEMBER: &str = "MissingParameter";
 
 /// EC2's error code for an allocation id the account holds no address for.
 const INVALID_ALLOCATION_ID_NOT_FOUND: &str = "InvalidAllocationID.NotFound";
@@ -1248,8 +1248,8 @@ async fn a_call_naming_no_allocation_is_refused() {
     );
     assert_eq!(
         error_code(&body),
-        MALFORMED_INPUT,
-        "expected {MALFORMED_INPUT} for a call naming no allocation, got body {body}"
+        BOUNDARY_MISSING_MEMBER,
+        "expected {BOUNDARY_MISSING_MEMBER} for a call naming no allocation, got body {body}"
     );
     assert_eq!(
         stored_addresses(&engine, &seeded.nat_gateway_id).len(),

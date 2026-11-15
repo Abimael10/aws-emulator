@@ -77,9 +77,9 @@ const INVALID_PARAMETER_COMBINATION: &str = "InvalidParameterCombination";
 const MISSING_PARAMETER: &str = "MissingParameter";
 
 /// The code the request BOUNDARY answers for a `@required` member the request did not carry,
-/// before any handler runs — the framework's own, as every other operation of this service
-/// answers it.
-const BOUNDARY_MISSING_MEMBER: &str = "MalformedInput";
+/// before any handler runs: EC2's own `MissingParameter`, as every other operation of this
+/// service answers it.
+const BOUNDARY_MISSING_MEMBER: &str = "MissingParameter";
 
 /// The EC2 code for an action the resource's current state does not admit.
 const INCORRECT_STATE: &str = "IncorrectState";

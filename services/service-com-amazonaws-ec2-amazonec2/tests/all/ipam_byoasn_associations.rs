@@ -97,8 +97,9 @@ const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 const MISSING_PARAMETER: &str = "MissingParameter";
 
 /// The code the boundary validator refuses a request missing a modelled `@required` member
-/// with, before any handler logic runs.
-const MALFORMED_INPUT: &str = "MalformedInput";
+/// with, before any handler logic runs: EC2's own `MissingParameter`, the same code the
+/// handler answers for one that reached it empty.
+const BOUNDARY_MISSING_MEMBER: &str = "MissingParameter";
 
 /// EC2's code for a `DryRun` request that would otherwise have been served, and the status
 /// this emulator answers it with (`Precondition Failed`, the status EC2's own dry-run
@@ -737,7 +738,7 @@ async fn a_request_whose_asn_or_cidr_is_not_one_is_refused_before_any_lookup() {
         (
             "no Asn parameter at all",
             vec![p("Cidr", "192.0.2.0/24")],
-            MALFORMED_INPUT,
+            BOUNDARY_MISSING_MEMBER,
         ),
         (
             "a Cidr that is not an address range",
@@ -767,7 +768,7 @@ async fn a_request_whose_asn_or_cidr_is_not_one_is_refused_before_any_lookup() {
         (
             "no Cidr parameter at all",
             vec![p("Asn", "64496")],
-            MALFORMED_INPUT,
+            BOUNDARY_MISSING_MEMBER,
         ),
         (
             // Both members are read before anything is resolved, in the order the operation

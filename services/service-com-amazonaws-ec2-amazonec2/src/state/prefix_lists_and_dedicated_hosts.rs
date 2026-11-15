@@ -1180,14 +1180,10 @@ pub fn instance_family_of(instance_type: &str) -> &str {
 ///
 /// Compared as a SET rather than member by member in order: this catalog is the largest in the
 /// model, and [`offered_instance_types`] reports it sorted while the walk reports it in the
-/// model's own declaration order — two orders of one value set.
+/// model's own declaration order — two orders of one value set. The comparison itself is the
+/// one every set-compared catalog of this crate makes ([`is_modelled_catalog`]).
 pub fn is_instance_type_catalog(allowed: &[String]) -> bool {
-    let catalog: ::std::collections::BTreeSet<&str> =
-        offered_instance_types().iter().copied().collect();
-    allowed.len() == catalog.len()
-        && allowed
-            .iter()
-            .all(|held| catalog.contains(held.as_str()))
+    is_modelled_catalog(allowed, offered_instance_types())
 }
 
 /// How EC2 states an instance type the catalog does not hold: HTTP 400
@@ -1197,6 +1193,35 @@ pub fn is_instance_type_catalog(allowed: &[String]) -> bool {
 /// value echoed back.
 pub fn instance_type_refusal_message(value: &str) -> String {
     format!("Invalid value '{}' for InstanceType.", echoed_resource_id(value))
+}
+
+/// EC2's error code for a request that names an instance type the catalog does not hold where
+/// the member asks the catalog ABOUT types rather than placing a resource on one —
+/// "InvalidInstanceType" (EC2 API error codes).
+///
+/// A describe that names types reports which of them do not exist
+/// ([`nonexistent_instance_types_message`]); a create that names the type a resource is placed
+/// as is refused [`INVALID_PARAMETER_VALUE`] with [`instance_type_refusal_message`], because
+/// there the type is the value of a parameter rather than the subject of the lookup.
+pub const INVALID_INSTANCE_TYPE: &str = "InvalidInstanceType";
+
+/// How EC2 states the instance types a request asked the catalog about that the catalog does
+/// not hold: "The following supplied instance types do not exist: [`<type>`, `<type>`]".
+///
+/// EVERY type the request named that the catalog does not hold, in the order the request named
+/// them, because the refusal answers one LOOKUP of a list rather than one bad value: a caller
+/// cataloguing capability by probing types learns which of its names are unknown from one
+/// call. Each value is echoed as the request sent it through [`echoed_resource_id`], so naming
+/// them cannot amplify a request into an arbitrarily long response.
+pub fn nonexistent_instance_types_message(values: &[String]) -> String {
+    let named: Vec<String> = values
+        .iter()
+        .map(|value| echoed_resource_id(value))
+        .collect();
+    format!(
+        "The following supplied instance types do not exist: [{}]",
+        named.join(", ")
+    )
 }
 
 /// Whether the model declares `instance_type` at all: it is a value of the `InstanceType`

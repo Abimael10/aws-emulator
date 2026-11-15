@@ -642,12 +642,12 @@ async fn a_bad_deregister_is_refused_with_the_ec2_error_code_for_it() {
         ),
         (
             // `InstanceTagAttribute` is a modelled `@required` member, so the boundary
-            // validator refuses a request without it BEFORE the handler runs — with its
-            // own `MalformedInput`, not with the handler's `MissingParameter`.
+            // validator refuses a request without it BEFORE the handler runs — with the
+            // SAME `MissingParameter` the handler answers for a parameter left out.
             "no attribute at all",
             Vec::new(),
             400,
-            "MalformedInput",
+            ec2::state::MISSING_PARAMETER,
         ),
         (
             "a key with no characters",
@@ -866,13 +866,13 @@ async fn a_bad_request_is_refused_with_the_ec2_error_code_for_it() {
         ),
         (
             // `InstanceTagAttribute` is a modelled `@required` member, so the boundary
-            // validator refuses a request without it BEFORE the handler runs — with its
-            // own `MalformedInput`, not with the handler's `MissingParameter`.
+            // validator refuses a request without it BEFORE the handler runs — with the
+            // SAME `MissingParameter` the handler answers for a parameter left out.
             "no attribute at all",
             REGISTER,
             Vec::new(),
             400,
-            "MalformedInput",
+            ec2::state::MISSING_PARAMETER,
         ),
         (
             "a key with no characters",

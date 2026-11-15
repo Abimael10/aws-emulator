@@ -749,12 +749,18 @@ async fn a_request_naming_no_group_is_refused() {
     let world = world(&engine);
     seed_row(&engine, &world, 0, &rows()[0]);
 
-    // Rows: no `GroupId` field at all, and one carrying an empty value at no list position —
-    // "the IDs of the security groups in your account" (`$GroupId`, required) names a group
-    // in neither, so the required member is absent either way and the refusal names it.
-    for (case, params) in [
-        ("no GroupId field", Vec::new()),
-        ("a GroupId field at no position", vec![param("GroupId", "")]),
+    // Rows: no `GroupId` field at all — refused at the boundary, which names the member as
+    // the MODEL declares it — and one carrying an empty value at no list position, which
+    // reaches the handler and is named as the WIRE spells it. "The IDs of the security groups
+    // in your account" (`$GroupId`, required) names a group in neither, so the required member
+    // is absent either way and each refusal names it in its own spelling.
+    for (case, params, named) in [
+        ("no GroupId field", Vec::new(), "GroupId"),
+        (
+            "a GroupId field at no position",
+            vec![param("GroupId", "")],
+            "groupId",
+        ),
     ] {
         let (status, body) = describe(&router, &params).await;
         assert_eq!(
@@ -762,8 +768,8 @@ async fn a_request_naming_no_group_is_refused() {
             "case {case:?}: expected HTTP 400, got {status} with body {body}"
         );
         assert!(
-            ec2_query::error_message(&body).contains("groupId"),
-            "case {case:?}: expected the refusal to name the groupId member, got {body}"
+            ec2_query::error_message(&body).contains(named),
+            "case {case:?}: expected the refusal to name {named}, got {body}"
         );
         assert!(
             references(case, &body).is_empty(),

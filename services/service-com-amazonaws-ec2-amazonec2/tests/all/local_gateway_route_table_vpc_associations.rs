@@ -489,8 +489,8 @@ type MissingParameterCase = (&'static str, Vec<(String, String)>, &'static str);
 /// `MissingParameter` naming it — the two ids are modelled `clientOptional`, so an empty one
 /// reaches the handler rather than the boundary validator — and that refusal is answered
 /// whether or not the request only asks about permission. A parameter left out ALTOGETHER is
-/// a null the boundary validator refuses before the handler, with the framework's own
-/// `MalformedInput`, as every other operation of this service answers it.
+/// a null the boundary validator refuses before the handler, with that same
+/// `MissingParameter`, as every other operation of this service answers it.
 #[tokio::test]
 async fn a_required_parameter_the_request_left_out_is_refused() {
     let (router, engine) = super::ec2_query::emulator();
@@ -511,14 +511,14 @@ async fn a_required_parameter_the_request_left_out_is_refused() {
         (
             "no LocalGatewayRouteTableId",
             vec![param("VpcId", &vpc_id)],
-            "MalformedInput",
+            "MissingParameter",
         ),
         (
             "no VpcId",
             vec![param("LocalGatewayRouteTableId", &route_table_id)],
-            "MalformedInput",
+            "MissingParameter",
         ),
-        ("neither id", Vec::new(), "MalformedInput"),
+        ("neither id", Vec::new(), "MissingParameter"),
     ];
     for (case, params, expected_code) in cases {
         for dry_run in [false, true] {

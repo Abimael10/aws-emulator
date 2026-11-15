@@ -634,11 +634,11 @@ async fn a_call_naming_no_request_is_refused() {
     );
     assert_eq!(
         error_code(&body),
-        "MalformedInput",
+        "MissingParameter",
         "case {case:?}: expected the refusal of a request missing a required member, got {body}"
     );
     assert!(
-        error_message(&body).contains("spotInstanceRequestIds"),
+        error_message(&body).contains("SpotInstanceRequestIds"),
         "case {case:?}: the refusal must name the member it is about, got {body}"
     );
     let request = described_one(case, &router, &own_id).await;

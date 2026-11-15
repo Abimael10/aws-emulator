@@ -54,10 +54,10 @@ const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 /// `InvalidParameterCombination`, the code EC2 answers members that cannot hold together.
 const INVALID_PARAMETER_COMBINATION: &str = "InvalidParameterCombination";
 
-/// `MalformedInput`, the code the request boundary answers a `@required` member the request did
-/// not carry at all — `Filters` for a search of the routes, which is a list, so a request
+/// `MissingParameter`, the code the request boundary answers a `@required` member the request
+/// did not carry at all — `Filters` for a search of the routes, which is a list, so a request
 /// naming no filter carries no field of it and the member arrives null.
-const MALFORMED_INPUT: &str = "MalformedInput";
+const BOUNDARY_MISSING_MEMBER: &str = "MissingParameter";
 
 /// `RouteAlreadyExists`, the code EC2 answers a destination the route table already holds a
 /// route for.
@@ -991,7 +991,7 @@ async fn a_request_at_fault_is_refused_with_its_own_code() {
             action: "SearchTransitGatewayRoutes",
             request: |route_table_id, _| vec![param("TransitGatewayRouteTableId", route_table_id)],
             status: 400,
-            code: MALFORMED_INPUT,
+            code: BOUNDARY_MISSING_MEMBER,
         },
         RefusalCase {
             name: "a search whose route table id is empty",

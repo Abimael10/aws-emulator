@@ -432,7 +432,7 @@ async fn a_modify_that_names_no_catalog_member_is_refused() {
             case: "a modify naming no visibility at all",
             params: Vec::new(),
             status: 400,
-            code: "MalformedInput",
+            code: "MissingParameter",
         },
         Refusal {
             case: "a modify naming the empty string",

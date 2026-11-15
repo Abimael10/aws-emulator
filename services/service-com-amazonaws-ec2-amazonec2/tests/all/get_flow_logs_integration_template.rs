@@ -898,15 +898,15 @@ async fn every_refusal_answers_its_own_code_and_writes_nothing() {
         },
         RefusalCase {
             // `IntegrateServices` is `@required`, so a request that carries no integration
-            // at all is refused by the boundary validator before the handler runs — which is
-            // the modelled constraint answering, not this operation.
+            // at all is refused by the boundary validator before the handler runs — with
+            // EC2's own code for a parameter the request left out, naming that parameter.
             name: "a request naming no service integration",
             params: vec![
                 param("FlowLogId", &flow_log_id),
                 param("ConfigDeliveryS3DestinationArn", CONFIG_BUCKET_ARN),
             ],
-            expected_code: "MalformedInput",
-            expected_message: "integrateServices".to_string(),
+            expected_code: "MissingParameter",
+            expected_message: "IntegrateServices".to_string(),
         },
     ];
 

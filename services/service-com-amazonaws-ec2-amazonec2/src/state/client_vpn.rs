@@ -240,19 +240,20 @@ pub const CLIENT_VPN_ATTRIBUTE_STATUS_APPLIED: &str = "applied";
 
 /// Refuse a client CIDR range of a size Client VPN does not serve: HTTP 400
 /// `InvalidParameterValue`, in the sentence `ClientCidrBlock` documents its rule with —
-/// "Client CIDR range must have a size of at least /22 and must not be greater than /12" —
+/// "Client CIDR range must have a size of at least /22 and must not be greater than /12." —
 /// with the two prefix lengths taken from [`CLIENT_VPN_CLIENT_CIDR_PREFIX_LENGTHS`] rather
 /// than written into the sentence twice.
 ///
 /// A bare sentence carrying no part of the request, as the refusals of this surface read
 /// ([`client_vpn_certificate_not_found`] is the one a recorded response pins): what was wrong
-/// with the value is the SIZE the rule names, which the sentence states.
+/// with the value is the SIZE the rule names, which the sentence states — to the closing full
+/// stop the member's own documentation ends it with.
 pub fn client_vpn_client_cidr_size_refusal<E>() -> Scaffolded<E> {
     // The SMALLEST range the rule admits is the one with the LONGEST prefix (the range's end),
     // and the largest is the one with the shortest (its start).
     invalid_parameter_value(format!(
         "Client CIDR range must have a size of at least /{longest_prefix} and must not be \
-         greater than /{shortest_prefix}",
+         greater than /{shortest_prefix}.",
         longest_prefix = CLIENT_VPN_CLIENT_CIDR_PREFIX_LENGTHS.end(),
         shortest_prefix = CLIENT_VPN_CLIENT_CIDR_PREFIX_LENGTHS.start(),
     ))
@@ -275,12 +276,12 @@ pub fn client_vpn_certificate_not_found<E>() -> Scaffolded<E> {
 ///
 /// The member is named as the MODEL spells it, which is how the sentence a recorded refusal of
 /// this operation pins names it, and the sentence carries nothing else of the request: what was
-/// wrong is that the parameter was not there.
+/// wrong is that the parameter was not there. The sentence itself is the service-wide one
+/// ([`missing_required_parameter_message`]), which the refusal the BOUNDARY gives for an absent
+/// `@required` member answers too, so a caller reads one wording whichever side of dispatch
+/// resolved the absence.
 pub fn missing_required_parameter<E>(member: &str) -> Scaffolded<E> {
-    missing_parameter(format!(
-        "The request must include the {member} parameter. Add the required parameter and retry \
-         the request."
-    ))
+    missing_parameter(missing_required_parameter_message(member))
 }
 
 /// The DNS name clients reach the Client VPN endpoint `endpoint_id` at, in `region`.

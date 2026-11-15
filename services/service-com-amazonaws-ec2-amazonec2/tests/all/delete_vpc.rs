@@ -314,8 +314,8 @@ async fn an_id_that_names_no_vpc_deletes_nothing() {
     }
 
     // A request that omits the member entirely never reaches the operation: `VpcId` is
-    // required, so the boundary validator refuses it first — with the boundary's own code
-    // for a member the request left out.
+    // required, so the boundary validator refuses it first — with EC2's own code for a
+    // parameter the request left out.
     let (status, body) = delete_vpc(&router, &[]).await;
     assert_eq!(
         status, 400,
@@ -323,8 +323,8 @@ async fn an_id_that_names_no_vpc_deletes_nothing() {
     );
     assert_eq!(
         error_code(&body),
-        "MalformedInput",
-        "a request with no VpcId is refused by the boundary validator, got {body}"
+        "MissingParameter",
+        "a request with no VpcId is refused for the parameter it left out, got {body}"
     );
     assert_eq!(
         described_vpc_ids("no vpcId at all", &router).await,

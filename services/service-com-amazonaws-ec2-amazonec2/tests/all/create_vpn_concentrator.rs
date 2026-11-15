@@ -82,9 +82,9 @@ fn concentrator_type() -> &'static str {
 
 /// The code the REQUEST BOUNDARY answers a `@required` member the request left out
 /// entirely, before this operation's handler runs — as every other operation of this service
-/// answers it. A member the request sent EMPTY does reach the handler, and is answered with
-/// EC2's own `MissingParameter` below.
-const BOUNDARY_MISSING_MEMBER: &str = "MalformedInput";
+/// answers it: EC2's own `MissingParameter`, which is also what the handler answers for a
+/// member the request sent EMPTY (in its own sentence, below).
+const BOUNDARY_MISSING_MEMBER: &str = "MissingParameter";
 
 /// The code the REQUEST BOUNDARY answers a value outside what a member's modelled enum
 /// publishes, before this operation's handler runs — as every other operation of this service
@@ -755,8 +755,8 @@ fn refusal_cases() -> Vec<RefusalCase> {
             concentrator_type: None,
             transit_gateway_id: Some("tgw-0123456789abcdef0"),
             code: BOUNDARY_MISSING_MEMBER,
-            message: "1 validation error detected: Value null at 'type' failed to satisfy \
-                      constraint: Member must not be null",
+            message: "The request must include the Type parameter. Add the required parameter \
+                      and retry the request.",
         },
         RefusalCase {
             case: "an empty type",

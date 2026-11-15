@@ -979,7 +979,7 @@ async fn a_request_naming_no_host_is_refused() {
         "case {case:?}: expected HTTP 400, got {status} with body {body}"
     );
     assert!(
-        unescaped(&element(&body, "Message").unwrap_or_default()).contains("hostIds"),
+        unescaped(&element(&body, "Message").unwrap_or_default()).contains("HostIds"),
         "case {case:?}: the refusal must name the required member, got {body}"
     );
 

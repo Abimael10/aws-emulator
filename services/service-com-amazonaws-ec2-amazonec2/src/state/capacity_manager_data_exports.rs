@@ -46,6 +46,40 @@ use super::{
 /// (`crate::ops::types::RESOURCE_TYPE_VALUES`), which is the resource this operation makes.
 pub const CAPACITY_MANAGER_DATA_EXPORT_TAGGABLE_RESOURCE: &str = "capacity-manager-data-export";
 
+/// Is `allowed` the `OutputFormat` catalog — the value set the model declares for the format a
+/// data export writes its files in (`crate::ops::types::OUTPUT_FORMAT_VALUES`)?
+///
+/// Keyed to the TYPE's value set, the way every catalog-keyed refusal of this crate is
+/// ([`super::is_modelled_catalog`] records that rule), so every member of this model that names
+/// an export's output format is refused an unpublished one in the same words.
+pub fn is_output_format_catalog(allowed: &[String]) -> bool {
+    super::is_modelled_catalog(allowed, crate::ops::types::OUTPUT_FORMAT_VALUES)
+}
+
+/// The spellings EC2 OFFERS a caller in the sentence below.
+///
+/// RECORDED: EC2 offers the two formats as `CSV` and `Parquet` where the model declares them
+/// `csv` and `parquet`, so the sentence states them the way the service states them rather than
+/// the way the model spells them. Each one names the catalog member it offers, differing from
+/// it only in ASCII case.
+const OUTPUT_FORMAT_OFFERED_SPELLINGS: &[&str] = &["CSV", "Parquet"];
+
+/// How EC2 states an `OutputFormat` the catalog does not hold: HTTP 400
+/// `InvalidParameterValue` with the submitted value, the parameter that refused it and the
+/// formats it accepts — "The value '`<value>`' for OutputFormat isn't valid. Valid values: CSV
+/// or Parquet."
+///
+/// EC2 does not state a modelled refusal as the generic validation clause; it names the
+/// parameter and what to send instead, and the only part built from the request is the value
+/// echoed back (already elided by the constraint walk, so echoing it cannot amplify a request
+/// into an arbitrarily long response).
+pub fn output_format_refusal_message(value: &str) -> String {
+    format!(
+        "The value '{value}' for OutputFormat isn't valid. Valid values: {}.",
+        super::either_of(OUTPUT_FORMAT_OFFERED_SPELLINGS)
+    )
+}
+
 /// How many data export configurations this store holds before a create is refused.
 ///
 /// CHOSEN: AWS publishes no quota for this resource, and a store that grows without bound is

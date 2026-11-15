@@ -204,11 +204,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The ID of the instance" (`InstanceId`): the task exports THAT instance, so an id
         // this account holds no instance for has nothing to export. This operation reads such
         // a value as a parameter it cannot accept rather than as a resource that is missing,
-        // which is what it is recorded answering.
+        // which is what it is recorded answering — in the sentence EC2 words for an instance
+        // id that resolves to nothing: it states that the id provided does not exist and what
+        // the caller is to do about it, the only part built from the request being the id
+        // echoed back.
         if !store.instances.contains_key(&input.instance_id) {
             return Err(invalid_parameter(format!(
-                "Invalid value '{instance_id}' for parameter instanceId",
-                instance_id = input.instance_id,
+                "The instance ID provided ({instance_id}) does not exist. Please make sure the \
+                 ID is correct.",
+                instance_id = state::echoed_resource_id(&input.instance_id),
             )));
         }
 

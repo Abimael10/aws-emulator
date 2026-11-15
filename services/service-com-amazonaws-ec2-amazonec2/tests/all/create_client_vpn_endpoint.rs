@@ -538,9 +538,9 @@ async fn each_authentication_kind_is_stored_as_it_was_given() {
 
 /// The message AWS words the published size rule with
 /// (`CreateClientVpnEndpointRequest$ClientCidrBlock`: "Client CIDR range must have a size of at
-/// least /22 and must not be greater than /12"), spelled here independently of the handler.
+/// least /22 and must not be greater than /12."), spelled here independently of the handler.
 const CIDR_SIZE_MESSAGE: &str =
-    "Client CIDR range must have a size of at least /22 and must not be greater than /12";
+    "Client CIDR range must have a size of at least /22 and must not be greater than /12.";
 
 /// Both published bounds are accepted, and one past each is refused with AWS's own sentence.
 #[tokio::test]

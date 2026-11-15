@@ -653,7 +653,7 @@ async fn the_batch_size_is_bounded_by_the_modelled_length() {
             MAX_IDS_PER_REQUEST + 1,
             "ValidationError",
         ),
-        ("no ids", 0, "MalformedInput"),
+        ("no ids", 0, "MissingParameter"),
     ] {
         let ids: Vec<String> = (0..count).map(unknown_id).collect();
         let named: Vec<&str> = ids.iter().map(String::as_str).collect();

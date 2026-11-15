@@ -550,7 +550,7 @@ async fn an_enable_that_names_no_accepted_mode_is_refused() {
             case: "an enable naming no state at all",
             params: Vec::new(),
             status: 400,
-            code: "MalformedInput",
+            code: "MissingParameter",
         },
         Refusal {
             case: "an enable naming the empty string",

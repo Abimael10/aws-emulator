@@ -483,12 +483,13 @@ async fn delete_tags_refuses_an_unresolvable_id_or_an_unactionable_key() {
         ),
         (
             // `Resources` is `@required`, so the boundary validator refuses a request
-            // carrying none of it before the handler is reached at all.
+            // carrying none of it before the handler is reached at all, with EC2's own code
+            // for a parameter the request left out.
             "no resource named at all",
             tag_fields(&[("env", None)]),
             Some(""),
             400,
-            "MalformedInput",
+            "MissingParameter",
         ),
         (
             "a DryRun that would have succeeded",

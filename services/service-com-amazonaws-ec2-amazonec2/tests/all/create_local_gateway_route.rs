@@ -636,8 +636,8 @@ async fn a_route_table_id_outside_the_issued_form_is_malformed_and_an_unknown_on
     // A request that carries the route table id as an EMPTY value names no table to create
     // a route in: the id is modelled `clientOptional`, so an empty one reaches the handler
     // and is refused with EC2's `MissingParameter`. One that leaves the parameter out
-    // ALTOGETHER is a null the boundary validator refuses before the handler, with the
-    // framework's own `MalformedInput`, as every other operation of this service answers it.
+    // ALTOGETHER is a null the boundary validator refuses before the handler, with that same
+    // `MissingParameter`, as every other operation of this service answers it.
     for (case, params, expected_code) in [
         (
             "an empty LocalGatewayRouteTableId",
@@ -647,7 +647,7 @@ async fn a_route_table_id_outside_the_issued_form_is_malformed_and_an_unknown_on
         (
             "no LocalGatewayRouteTableId",
             vec![row.destination.param(), fixtures.target_param(row.target)],
-            "MalformedInput",
+            "MissingParameter",
         ),
     ] {
         let (status, body) = create(&router, &params).await;

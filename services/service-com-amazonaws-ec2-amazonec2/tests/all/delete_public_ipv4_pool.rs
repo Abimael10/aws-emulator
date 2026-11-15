@@ -71,9 +71,9 @@ const READ_NOT_FOUND: &str = "InvalidPublicIpv4PoolID.NotFound";
 const MISSING_PARAMETER: &str = "MissingParameter";
 
 /// The code the request walk answers a REQUIRED member the request left out entirely with,
-/// before any handler of this service runs — a different failure from a member that arrived
-/// present but empty, which is the handler's own `MissingParameter`.
-const MALFORMED_INPUT: &str = "MalformedInput";
+/// before any handler of this service runs: EC2's own `MissingParameter` — the same code the
+/// handler answers for a member that arrived present but empty, in its own sentence.
+const BOUNDARY_MISSING_MEMBER: &str = "MissingParameter";
 
 /// EC2's error code for a delete the resource's own dependencies forbid.
 const DEPENDENCY_VIOLATION: &str = "DependencyViolation";
@@ -472,7 +472,7 @@ async fn delete_public_ipv4_pool_refuses_what_it_cannot_serve() {
             400,
             NOT_FOUND,
         ),
-        ("no PoolId at all", Vec::new(), 400, MALFORMED_INPUT),
+        ("no PoolId at all", Vec::new(), 400, BOUNDARY_MISSING_MEMBER),
         (
             "an empty PoolId",
             vec![p("PoolId", "")],

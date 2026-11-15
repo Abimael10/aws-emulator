@@ -110,6 +110,12 @@ pub mod request_parameters;
 /// it rather than of any one operation.
 pub mod management_events;
 
+/// How this front door words the refusals the FRAMEWORK gives for the rules the MODEL declares
+/// — an absent `@required` member, a value outside a declared catalog or `@range` — in EC2's
+/// own vocabulary: the choice [`Service::override_refusal`] makes, and the input shape it is
+/// made against.
+pub mod parameter_refusals;
+
 /// The `com-amazonaws-ec2-amazonec2` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -183,27 +189,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             // `@pattern` or enum catalog. EC2 declares no error SHAPES at all
             // (`smithy_query(query="operation", …)` reports `errors: []` for every
             // operation), so what it answers is a CODE, and this service states that code
-            // only where EC2's own words for the refusal are known: a value outside a
-            // modelled catalog this service has recorded wording for is EC2's
-            // `InvalidParameterValue` with the sentence EC2 words for that parameter TYPE,
-            // and a page size below the smallest its `@range` publishes is EC2's
-            // `InvalidMaxResults`, and a page size that is no page size at all — zero or
-            // negative — is EC2's `InvalidParameter` ([`ec2_value_refusal`]).
+            // only where EC2's own words for the refusal are known: an absent `@required`
+            // member is EC2's `MissingParameter` naming the member the request left out, a
+            // value outside a modelled catalog this service has recorded wording for is
+            // EC2's `InvalidParameterValue` with the sentence EC2 words for that parameter
+            // TYPE, a page size below the smallest its `@range` publishes is EC2's
+            // `InvalidMaxResults`, one above the largest is EC2's `InvalidParameterValue`,
+            // and a page size that is no page size at all — zero or negative — is EC2's
+            // `InvalidParameter` ([`parameter_refusals`]).
             //
             // Every other framework refusal answers `None`, which keeps the framework's own
             // code and its request-built clause in AWS's validation envelope
             // ([`aws_smithy_schema_server::envelope`]) rather than inventing a second
-            // dialect for a parameter whose EC2 wording this service does not know. Which
-            // code EC2 answers for each of those, and how it words them, is one rule for the
-            // whole service and is recorded as its own issue
-            // (`issues/.../20261023T102725Z-ec2-answers-parameter-rejections-with-generic-validationerror-and.md`),
-            // to be stated here once when that issue is fixed. The refusals this service's
-            // HANDLERS give for the rules the model cannot express are a different path and
-            // already carry EC2's own codes (`crate::state`).
+            // dialect for a parameter whose EC2 wording this service does not know. The
+            // refusals this service's HANDLERS give for the rules the model cannot express
+            // are a different path and already carry EC2's own codes (`crate::state`).
             Refusal::Invalid(violations) => {
                 // EC2 reports ONE parameter at a time, so a request that also failed other
-                // constraints is still refused with this parameter's own sentence.
-                violations.iter().find_map(ec2_value_refusal)
+                // constraints is still refused with this parameter's own sentence
+                // ([`parameter_refusals::ec2_refusal`]).
+                parameter_refusals::ec2_refusal(violations)
             }
             // Authentication is the framework's answer to give, not this service's, and a
             // refusal carrying no violation has nothing for this service to name.
@@ -558,6 +563,11 @@ impl ServerProtocol for Ec2QueryEnvelope {
         // body is rewritten here, in the one place this service reads a request, so the
         // reading is the same for every operation; a request that carries no such value is
         // handed to the framework's own reader untouched ([`enum_cased_body`]).
+        //
+        // This is also where the input shape being read is recorded, for the one refusal EC2
+        // words per operation rather than per value ([`parameter_refusals`]): the one place
+        // this service reads a request is the one place that knows which input it is.
+        parameter_refusals::reading_input(input_schema.shape_id().shape_name());
         if let Some(rewritten) = request
             .body()
             .bytes()
@@ -694,36 +704,42 @@ fn enum_cased_body(body: &[u8], input_schema: &Schema) -> Option<Vec<u8>> {
     changed.then_some(rewritten.into_bytes())
 }
 
-/// The modelled MEMBER NAME a request key names, or `None` when the key names no member of
-/// `input_schema` — including a member of a NESTED structure, whose name the input shape's
-/// own members do not carry.
+/// The MEMBER NAME a request key names, or `None` when the key names no member of
+/// `input_schema` at all.
 ///
 /// A key is the member's own name with its first letter capitalised
 /// (`MacSystemIntegrityProtectionStatus`), or its `@xmlName`, with an index for an element of
-/// a list (`ReasonCode.1`) — the key conventions the framework's query reader resolves. The
-/// name is matched without regard to case, so a client's spelling of the KEY cannot decide
-/// whether the VALUE is read, and the name answered is the MODEL's, which is what
-/// [`crate::state::declared_enum_spelling`] is keyed by.
+/// a list (`ReasonCode.1`), and a nested structure's member after a separator
+/// (`ExportToS3.DiskImageFormat`) — the key conventions the framework's query reader resolves.
+/// The name is matched without regard to case, so a client's spelling of the KEY cannot decide
+/// whether the VALUE is read.
 ///
-/// A member schema carries its own id and kind rather than the shape it targets, so nothing
-/// here can descend into a nested structure's members: such a key is answered `None` and its
-/// value is left exactly as it was sent.
-fn member_at<'schema>(input_schema: &'schema Schema, key: &str) -> Option<&'schema str> {
+/// For a key naming a member of the input shape ITSELF the name answered is the MODEL's, which
+/// is what [`crate::state::declared_enum_spelling`] is keyed by — a member whose `@xmlName`
+/// differs from its name is reached under either. For a member of a NESTED structure it is the
+/// INNERMOST segment as the request spelled it: a member schema carries its own id and kind
+/// rather than the shape it targets, so the nested shape's own members are not reachable from
+/// here, and the table matches that name without regard to case for the same reason.
+fn member_at<'a>(input_schema: &'a Schema, key: &'a str) -> Option<&'a str> {
     let mut segments = key.split('.');
     let name = segments.next()?;
+    let member = input_schema
+        .members()
+        .iter()
+        .find(|member| member_is_named(member, name))?;
+    let mut nested: Option<&str> = None;
     for segment in segments {
         // The index of a list element, and the wrapper segment a wrapped list writes: both
-        // position a value WITHIN the member the first segment named.
+        // position a value WITHIN the member named so far rather than naming another one.
         if segment == "member" || segment.bytes().all(|byte| byte.is_ascii_digit()) {
             continue;
         }
-        return None;
+        nested = Some(segment);
     }
-    input_schema
-        .members()
-        .iter()
-        .find(|member| member_is_named(member, name))
-        .and_then(|member| member.member_name())
+    match nested {
+        Some(nested) => Some(nested),
+        None => member.member_name(),
+    }
 }
 
 /// Does the request key segment `name` name `member` — its `@xmlName` or its member name,
@@ -802,6 +818,10 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for FinishedEnvelope<Eng> {
             // [`management_events`]): cleared before the slot is used, so one call's
             // outcome can never be recorded on another call's response.
             management_events::forget_any_unanswered();
+            // And whatever input shape it may hold belongs to no call this run serves
+            // either ([`parameter_refusals`]): cleared before the walk that fills it, so one
+            // call's refusal can never be worded from another call's input.
+            parameter_refusals::forget_input_being_read();
             let mut response = self.served(svc, req, ctx).await;
             stamp_envelope(&mut response);
             // The AUDIT leg, after the response the caller gets has been finished and
@@ -1025,126 +1045,3 @@ fn injected_fault_response<Eng: Send + Sync + 'static>(
         ::aws_smithy_types::body::SdkBody::from(body),
     ))
 }
-
-/// EC2's own code and sentence for a value this service knows how EC2 refuses, or `None`
-/// when the refusal has no recorded EC2 wording.
-///
-/// EC2 words a refused value per parameter TYPE rather than as a validation clause —
-/// "`<value>` is not a valid value for RoleType. Specify either odcr-owner or
-/// unused-reservation-billing-owner." for a value outside the `CallerRole` catalog. The
-/// wording lives with the type it belongs to ([`crate::state::caller_role_refusal_message`]),
-/// keyed on the value set the constraint walk reports, so every operation that carries that
-/// member is refused in the same words and nothing here keys on an operation or a request's
-/// shape. A type whose EC2 wording this service has not recorded answers `None` and keeps
-/// the framework's own clause.
-///
-/// A value outside the burstable `UnlimitedSupportedInstanceFamily` catalog is the second
-/// catalog this service has EC2's wording for: EC2 answers its own `InvalidInstanceFamily`
-/// with the sentence it words for that parameter type
-/// ([`crate::state::instance_family_refusal_message`]), keyed on that catalog the same way.
-///
-/// A `Mode` outside the per-VPC `VpcEncryptionControlMode` catalog is the third: EC2 answers
-/// its own `InvalidParameterValue` with the sentence
-/// [`crate::ops::create_vpc_encryption_control::vpc_encryption_controls::vpc_encryption_control_mode_refusal_message`]
-/// words, which is also what that operation's own backstop answers with.
-///
-/// A value outside the `InstanceType` catalog is the fourth, and the one every member of this
-/// model that names the type an instance is PLACED as carries: EC2 answers its own
-/// `InvalidParameterValue` naming the value and the member that refused it
-/// ([`crate::state::instance_type_refusal_message`]), keyed on that catalog the same way — so
-/// a launch, a Spot Instance request, a Spot Fleet pool and a launch template's own data are
-/// each refused an unpublished type identically.
-///
-/// A `MaxResults` below the smallest page the operation publishes is the other refusal this
-/// service states: EC2 answers its own code and sentence for it, naming the value and the
-/// bound ([`crate::state::max_results_refusal`]). It is keyed on the member the constraint
-/// walk reports, on the bound it failed and on the value it carried — a positive page size
-/// the operation will not page with is `InvalidMaxResults`, a value that is no page size at
-/// all is `InvalidParameter` — so every paged operation of this service answers one code and
-/// one wording for each of the two, the minimum coming from the violation rather than from a
-/// number written here.
-fn ec2_value_refusal(violation: &aws_smithy_schema_server::Violation) -> Option<Refused> {
-    use aws_smithy_schema_server::ViolationKind;
-
-    match &violation.kind {
-        ViolationKind::EnumValue(allowed) if crate::state::is_caller_role_catalog(allowed) => {
-            // Already elided to the framework's `MAX_ECHOED_VALUE`, so echoing it cannot
-            // amplify a request into an arbitrarily long response.
-            Some(Refused {
-                code: crate::state::INVALID_PARAMETER_VALUE.to_string(),
-                message: crate::state::caller_role_refusal_message(
-                    violation.value.as_deref().unwrap_or_default(),
-                ),
-            })
-        }
-        ViolationKind::EnumValue(allowed)
-            if crate::state::is_unlimited_supported_instance_family_catalog(allowed) =>
-        {
-            // A family outside the burstable catalog is EC2's own `InvalidInstanceFamily`
-            // rather than a validation clause, in the sentence EC2 words for that parameter
-            // type ([`crate::state::instance_family_refusal_message`], which the handlers
-            // that resolve a family answer with too). The value it names is already elided
-            // to the framework's `MAX_ECHOED_VALUE`, so echoing it cannot amplify a request
-            // into an arbitrarily long response.
-            Some(Refused {
-                code: crate::state::INVALID_INSTANCE_FAMILY.to_string(),
-                message: crate::state::instance_family_refusal_message(
-                    violation.value.as_deref().unwrap_or_default(),
-                ),
-            })
-        }
-        ViolationKind::EnumValue(allowed)
-            if crate::ops::create_vpc_encryption_control::vpc_encryption_controls::
-                is_vpc_encryption_control_mode_catalog(allowed) =>
-        {
-            // A `Mode` outside the per-VPC `VpcEncryptionControlMode` catalog is EC2's own
-            // `InvalidParameterValue` rather than a validation clause, in the sentence EC2
-            // words for that parameter (the one `ModifyVpcEncryptionControl`'s own backstop
-            // answers with, so the two cannot disagree). That sentence states the catalog and
-            // echoes no part of the request at all.
-            Some(Refused {
-                code: crate::state::INVALID_PARAMETER_VALUE.to_string(),
-                message:
-                    crate::ops::create_vpc_encryption_control::vpc_encryption_controls::
-                        vpc_encryption_control_mode_refusal_message(),
-            })
-        }
-        ViolationKind::EnumValue(allowed)
-            if crate::state::is_instance_type_catalog(allowed) =>
-        {
-            // An instance type outside the catalog the model publishes is EC2's own
-            // `InvalidParameterValue` rather than a validation clause, in the sentence EC2
-            // words for that parameter type ([`crate::state::instance_type_refusal_message`]).
-            // Keyed on the catalog, so every member of this model that names the type an
-            // instance is placed as — a launch's own, a Spot Instance request's and a Spot
-            // Fleet pool's launch specification, a launch template's data — is refused in the
-            // same words. The value it names is already elided to the framework's
-            // `MAX_ECHOED_VALUE`, so echoing it cannot amplify a request into an arbitrarily
-            // long response — and the catalog itself is NOT stated back, which is what makes
-            // this sentence EC2's rather than the framework's clause.
-            Some(Refused {
-                code: crate::state::INVALID_PARAMETER_VALUE.to_string(),
-                message: crate::state::instance_type_refusal_message(
-                    violation.value.as_deref().unwrap_or_default(),
-                ),
-            })
-        }
-        ViolationKind::MinValue(minimum)
-            if violation.path == crate::state::MAX_RESULTS_MEMBER_PATH =>
-        {
-            let value = violation.value.as_deref().unwrap_or_default();
-            // Which code and which sentence depend on what the value IS — a page size the
-            // operation will not page with, or no page size at all — never on the operation
-            // that carries it ([`crate::state::max_results_refusal`], which answers both so
-            // they cannot disagree).
-            let (code, message) =
-                crate::state::max_results_refusal(&violation.path, value, minimum);
-            Some(Refused {
-                code: code.to_string(),
-                message,
-            })
-        }
-        _ => None,
-    }
-}
-

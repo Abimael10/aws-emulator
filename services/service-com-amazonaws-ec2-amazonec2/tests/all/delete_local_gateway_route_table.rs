@@ -681,8 +681,8 @@ async fn a_delete_it_cannot_carry_out_is_refused_and_changes_nothing() {
     }
     // The id is `@required` but modelled `clientOptional`, so an EMPTY member reaches the
     // handler, which refuses it as a parameter the request did not carry; a member left out
-    // ALTOGETHER is a null the boundary validator refuses before the handler, with the
-    // framework's own `MalformedInput`, as every other operation of this service answers it.
+    // ALTOGETHER is a null the boundary validator refuses before the handler, with that same
+    // `MissingParameter`, as every other operation of this service answers it.
     rows.push((
         "an empty LocalGatewayRouteTableId".to_string(),
         table_param(""),
@@ -694,9 +694,9 @@ async fn a_delete_it_cannot_carry_out_is_refused_and_changes_nothing() {
         "no LocalGatewayRouteTableId at all".to_string(),
         Vec::new(),
         400,
-        "MalformedInput",
-        "1 validation error detected: Value null at 'localGatewayRouteTableId' failed to \
-         satisfy constraint: Member must not be null"
+        MISSING_PARAMETER,
+        "The request must include the LocalGatewayRouteTableId parameter. Add the required \
+         parameter and retry the request."
             .to_string(),
     ));
     // A table an association still holds: taking it away would leave the association pointing

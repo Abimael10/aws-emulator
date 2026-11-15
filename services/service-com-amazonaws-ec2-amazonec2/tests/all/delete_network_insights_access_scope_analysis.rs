@@ -631,13 +631,11 @@ async fn a_request_that_names_no_analysis_is_refused() {
          {body}"
     );
     // The member is `@required`, so the BOUNDARY validator refuses the request before this
-    // operation's handler runs — with the framework's own `MalformedInput`, not with a code
-    // the handler chose.
+    // operation's handler runs — with EC2's own code for a parameter the request left out.
     assert_eq!(
         error_code(&body),
-        "MalformedInput",
-        "no NetworkInsightsAccessScopeAnalysisId: expected the boundary validator's \
-         MalformedInput, got {body}"
+        "MissingParameter",
+        "no NetworkInsightsAccessScopeAnalysisId: expected EC2's MissingParameter, got {body}"
     );
     let remaining = held_ids(&engine);
     assert_eq!(

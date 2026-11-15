@@ -465,12 +465,11 @@ async fn a_member_the_operation_needs_and_the_request_omits_is_refused() {
         ),
         // `VpcEndpointIds` is `@required`, so the boundary validator is what refuses a
         // request that carries none — before this operation's handler is reached at all, and
-        // with the boundary's own code rather than the one a handler answers for a parameter
-        // the request left out.
+        // with the SAME code a handler answers for a parameter the request left out.
         (
             "AcceptVpcEndpointConnections",
             vec![member("ServiceId", &service)],
-            "MalformedInput",
+            ec2::state::MISSING_PARAMETER,
         ),
     ];
 

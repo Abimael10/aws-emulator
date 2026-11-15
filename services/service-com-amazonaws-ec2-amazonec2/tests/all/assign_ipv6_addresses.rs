@@ -758,8 +758,9 @@ async fn an_assignment_it_cannot_make_is_refused_and_records_nothing() {
     );
     assert_eq!(
         error_code(&body),
-        "MalformedInput",
-        "a request with no NetworkInterfaceId is refused by the boundary validator, got {body}"
+        "MissingParameter",
+        "a request with no NetworkInterfaceId is refused for the parameter it left out, got \
+         {body}"
     );
 }
 

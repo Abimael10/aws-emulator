@@ -1767,6 +1767,14 @@ pub fn require_mac_instance<'store, E>(
 /// the protocol was read as the member it spells, where holding it to the declared spelling
 /// refuses the create at the boundary before the handler runs.
 ///
+/// `CreateInstanceExportTaskRequest`'s `DiskImageFormat` is in it for the same reason: the
+/// recorded traffic has EC2 SERVING a `CreateInstanceExportTask` whose `ExportToS3Task`
+/// requests the `vmdk` format against the declared `[VMDK, RAW, VHD]`, and answering the
+/// request for the INSTANCE it names — so the format was read as the member it spells. The
+/// member is one of a NESTED structure, and the row names the INPUT shape being read as every
+/// other row does: a nested member is reached by the name the request spells it with, which is
+/// what [`crate::service::member_at`] answers for one.
+///
 /// Each row names the INPUT SHAPE as well as the member, because a bare member name does not
 /// identify one member of this model: `Protocol` is also a member of
 /// `CreateNetworkAclEntryRequest`, `ReplaceNetworkAclEntryRequest` (free-text `String`s, where
@@ -1789,6 +1797,11 @@ pub const CASE_INSENSITIVE_MEMBERS: &[(&str, &str, &[&str])] = &[
         "CreateApplicationStatusCheckRequest",
         "Protocol",
         crate::ops::types::NETWORK_PROTOCOL_ENUM_VALUES,
+    ),
+    (
+        "CreateInstanceExportTaskRequest",
+        "DiskImageFormat",
+        crate::ops::types::DISK_IMAGE_FORMAT_VALUES,
     ),
 ];
 
