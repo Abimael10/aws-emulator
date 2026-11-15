@@ -226,7 +226,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so what they accept is the same.
         if let Some(why) =
             crate::state::share_arn_rejection("resourceShareArn", &input.resource_share_arn)
-                .or_else(|| crate::state::resource_arn_rejection("resourceArns", &resource_arns))
+                .or_else(|| {
+                    crate::state::shareable_resource_arn_rejection("resourceArns", &resource_arns)
+                })
         {
             return Err(
                 DisassociateResourceShareErrorModeled::MalformedArnException(

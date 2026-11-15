@@ -54,10 +54,14 @@ const REGIONAL_RESOURCE: &str = LOCAL_RESOURCE;
 /// A second regional one.
 const REGIONAL_RESOURCE_TWO: &str = LOCAL_RESOURCE_TWO;
 /// A resource of a global service: its ARN names no Region, so it "can be accessed
-/// from any Amazon Web Services Region" — `GLOBAL`.
-const GLOBAL_RESOURCE: &str = "arn:aws:route53:::hostedzone/Z11111111111111111111";
-/// A second global one, of another global service.
-const GLOBAL_RESOURCE_TWO: &str = "arn:aws:cloudfront::000000000000:distribution/E22222222222";
+/// from any Amazon Web Services Region" — `GLOBAL`. A global resource type this
+/// service can share (`RESOURCE_TYPES`, the catalog `ListResourceTypes` reports),
+/// since a resource type it cannot share is refused whatever its Region scope.
+const GLOBAL_RESOURCE: &str =
+    "arn:aws:networkmanager::000000000000:global-network/global-network-01231231231231231";
+/// A second global one, of another shareable global resource type.
+const GLOBAL_RESOURCE_TWO: &str =
+    "arn:aws:networkmanager::000000000000:core-network/core-network-0123456789abcdef0";
 
 // ---------------------------------------------------------------------------
 // Who gets invited
@@ -484,15 +488,15 @@ async fn a_pending_invitation_reports_the_resources_of_its_share() {
         ResourcesCase {
             case: "one global resource, whose ARN names no Region",
             resources: vec![GLOBAL_RESOURCE],
-            expected: vec![(GLOBAL_RESOURCE, "route53:hostedzone", "GLOBAL")],
+            expected: vec![(GLOBAL_RESOURCE, "networkmanager:global-network", "GLOBAL")],
         },
         ResourcesCase {
             case: "global and regional resources together",
             resources: vec![GLOBAL_RESOURCE_TWO, REGIONAL_RESOURCE, GLOBAL_RESOURCE],
             expected: vec![
-                (GLOBAL_RESOURCE_TWO, "cloudfront:distribution", "GLOBAL"),
+                (GLOBAL_RESOURCE_TWO, "networkmanager:core-network", "GLOBAL"),
                 (REGIONAL_RESOURCE, "ec2:subnet", "REGIONAL"),
-                (GLOBAL_RESOURCE, "route53:hostedzone", "GLOBAL"),
+                (GLOBAL_RESOURCE, "networkmanager:global-network", "GLOBAL"),
             ],
         },
     ];

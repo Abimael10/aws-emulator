@@ -2093,6 +2093,62 @@ pub fn resource_arn_rejection(member: &str, arns: &[String]) -> Option<String> {
         .map(|arn| not_an_arn_message(member, arn))
 }
 
+/// The message RAM refuses a value that is not a shareable resource's ARN with.
+///
+/// The refusal is about the KIND of resource the ARN names, not about any resource the
+/// store holds, so the text names nothing from the request: no ARN, id, account or
+/// Region.
+pub const NON_SHAREABLE_RESOURCE_TYPE_MESSAGE: &str =
+    "You cannot share the selected resource type.";
+
+/// Whether `arn` names a resource of a type this service can share.
+///
+/// The types it can share are [`RESOURCE_TYPES`], the catalog `ListResourceTypes`
+/// reports, each spelled `<service-code>:<resource-code>`. A resource's own ARN carries
+/// the service code in its service field, and the resource code as one of the segments
+/// of its resource field: a field that leads with the code (`subnet/subnet-1111`), one
+/// that nests it under another resource (`outpost/op-1/bucket/example`) and one that is
+/// the code alone (`catalog`) all name it. The two spellings are compared the way
+/// [`resource_type_matches`] compares them, because the owning service spells the code
+/// in an ARN the way it spells it there (`prefix-list`) rather than the way RAM
+/// publishes the type (`ec2:PrefixList`).
+pub fn is_shareable_resource_arn(arn: &str) -> bool {
+    let Some(service) = arn_service(arn) else {
+        return false;
+    };
+    let Some(resource) = arn.splitn(6, ':').nth(5) else {
+        return false;
+    };
+    resource
+        .split(['/', ':'])
+        .filter(|segment| !segment.is_empty())
+        .any(|segment| {
+            let candidate = format!("{service}:{segment}");
+            RESOURCE_TYPES
+                .iter()
+                .any(|entry| resource_type_matches(entry.resource_type, &candidate))
+        })
+}
+
+/// Why an entry of `resourceArns` is not usable as the ARN of a shareable resource, or
+/// `None` when every entry is one.
+///
+/// Classification by KIND, which is what every member that takes the ARN of a resource
+/// to share — or of one whose sharing this service reports — needs before it reaches the
+/// store: a value that is no ARN at all is refused with [`not_an_arn_message`], and an
+/// ARN of a resource type this service cannot share with
+/// [`NON_SHAREABLE_RESOURCE_TYPE_MESSAGE`]. Both are the `MalformedArnException` case,
+/// as distinct from the state question — does any share of this account hold the
+/// resource? — that the operations answer with `ResourceArnNotFoundException` or
+/// `UnknownResourceException` only once an entry has passed this check.
+pub fn shareable_resource_arn_rejection(member: &str, arns: &[String]) -> Option<String> {
+    resource_arn_rejection(member, arns).or_else(|| {
+        arns.iter()
+            .any(|arn| !is_shareable_resource_arn(arn))
+            .then(|| NON_SHAREABLE_RESOURCE_TYPE_MESSAGE.to_string())
+    })
+}
+
 /// Why a value this service expected to be an ARN cannot be read as one, as the
 /// message of the `MalformedArnException` that refuses it: one template for every
 /// member that takes an ARN, naming the member and the value it refused.

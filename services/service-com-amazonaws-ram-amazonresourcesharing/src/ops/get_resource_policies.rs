@@ -212,7 +212,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if let Some(why) = crate::state::resource_arn_rejection("resourceArns", &resources) {
+        // Each entry is classified by KIND before the store is read at all: a value
+        // that is not an ARN, and an ARN of a resource type this service cannot share,
+        // are both refusals about the ARN itself — only an entry that could name a
+        // shared resource reaches the lookup that asks whether one does.
+        if let Some(why) = crate::state::shareable_resource_arn_rejection("resourceArns", &resources)
+        {
             return Err(GetResourcePoliciesErrorModeled::MalformedArnException(
                 MalformedArnException { message: why },
             )

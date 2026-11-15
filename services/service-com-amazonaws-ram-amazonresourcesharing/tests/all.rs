@@ -39,5 +39,7 @@ mod share_permission_attachment;
 mod share_permissions;
 #[path = "all/share_tags_and_configuration.rs"]
 mod share_tags_and_configuration;
+#[path = "all/shareable_resource_arn_classification.rs"]
+mod shareable_resource_arn_classification;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

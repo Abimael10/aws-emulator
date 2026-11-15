@@ -247,8 +247,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if let Some(why) = crate::state::resource_arn_rejection("resourceArns", &resource_arns)
-            .or_else(|| crate::state::resource_arn_rejection("permissionArns", &permission_arns))
+        if let Some(why) =
+            crate::state::shareable_resource_arn_rejection("resourceArns", &resource_arns)
+                .or_else(|| crate::state::resource_arn_rejection("permissionArns", &permission_arns))
         {
             return Err(CreateResourceShareErrorModeled::MalformedArnException(
                 MalformedArnException { message: why },

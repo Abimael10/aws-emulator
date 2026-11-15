@@ -53,8 +53,9 @@ const CODEBUILD_PROJECT: &str = "arn:aws:codebuild:us-west-2:000000000000:projec
 /// (`RESOURCE_TYPES`) that the AWS managed catalog publishes no permission for.
 const COIP_POOL: &str = "arn:aws:ec2:us-west-2:000000000000:coip-pool/ipv4pool-coip-0a1b2c3d";
 /// An ARN whose resource field carries no separator, so it names no resource type at
-/// all (`Resource$type`).
-const TYPELESS_RESOURCE: &str = "arn:aws:s3:::shared-bucket";
+/// all (`Resource$type`) — a Glue data catalog, one of the resource types this service
+/// can share (`RESOURCE_TYPES`).
+const TYPELESS_RESOURCE: &str = "arn:aws:glue:us-west-2:000000000000:catalog";
 
 async fn list_permissions(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
     call(router, "POST", "/listresourcesharepermissions", Some(body)).await
