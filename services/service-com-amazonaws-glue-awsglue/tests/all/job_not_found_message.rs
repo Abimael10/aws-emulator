@@ -24,7 +24,10 @@
 //! `GetJobRun` is the one job operation that does NOT report this sentence: it addresses a
 //! RUN by the (job name, run id) pair, so an absent job is its RUN miss, which
 //! [`a_run_read_of_an_absent_job_is_the_run_miss`] pins here and
-//! [`crate::job_run_miss_message`] pins for a job that exists.
+//! [`crate::job_run_miss_message`] pins for a job that exists. The bookmark surface
+//! (`GetJobBookmark`, `ResetJobBookmark`) is outside this rule for the same reason: it
+//! addresses a job's CONTINUATION point rather than the definition, so a name holding no
+//! job is its continuation miss, pinned in [`crate::job_bookmarks`].
 //!
 //! The expected sentence is written out here as a literal rather than read from the
 //! service's own constant, so this suite pins the wording instead of restating it.

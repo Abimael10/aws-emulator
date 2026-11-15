@@ -10,14 +10,17 @@
 //! `OperationNotSupportedException` naming that type, before anything is looked up — so
 //! the answer is the same whether or not the account holds such a resource. The kind it
 //! does resolve, `SESSION`, is looked up, and an id no session of the account has is
-//! refused with `EntityNotFoundException` naming it rather than handed a URL.
+//! refused with `EntityNotFoundException` carrying this operation's fixed, generic miss
+//! text — which discloses neither the id nor the kind — rather than handed a URL.
 //!
 //! The rows below differ along what the rule generalises over: the resource type asked for
 //! (every value of the modelled enum), whether a resource of that name exists, the form of
 //! the `ResourceId`, and whether the call carries a `RequestOrigin`.
 
 use serde_json::json;
-use service_com_amazonaws_glue_awsglue::state::messages::dashboard_url_not_supported;
+use service_com_amazonaws_glue_awsglue::state::messages::{
+    dashboard_url_not_supported, DASHBOARD_URL_RESOURCE_NOT_FOUND,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::job_runs::job_body;
@@ -26,6 +29,17 @@ use crate::wire::{call, emulator, error_code, error_message, ok};
 /// Every value of the modelled `GlueResourceType` enum, which `ResourceType` is one of.
 /// Source: `smithy_query shape=GlueResourceType`.
 const RESOURCE_TYPES: [&str; 2] = ["JOB", "SESSION"];
+
+/// The miss of this operation as Glue words it, written out here as a literal rather than
+/// read from the service's own constant, so this suite pins the WORDING instead of
+/// restating it: the whole sentence is fixed, with no trailing full stop.
+#[test]
+fn the_resource_miss_is_worded_as_glue_words_it() {
+    assert_eq!(
+        DASHBOARD_URL_RESOURCE_NOT_FOUND, "Entity not found",
+        "unexpected GetDashboardUrl entity-miss wording"
+    );
+}
 
 /// The one resource type this operation resolves rather than refusing outright.
 const SESSION: &str = "SESSION";
@@ -101,7 +115,8 @@ async fn a_resource_type_with_no_dashboard_is_refused_as_unsupported() {
 }
 
 /// A `SESSION` id no session of the account has is refused with `EntityNotFoundException`
-/// naming it — never answered with a URL for a session nothing created.
+/// carrying the operation's fixed miss text — never answered with a URL for a session
+/// nothing created, and never echoing the id back.
 ///
 /// The rows differ along the form of the id and whether a `RequestOrigin` is named.
 #[tokio::test]
@@ -126,9 +141,14 @@ async fn an_unknown_session_is_refused_as_not_found() {
             "case {case}: expected EntityNotFoundException, got {} in {body}",
             error_code(&body)
         );
+        assert_eq!(
+            error_message(&body),
+            DASHBOARD_URL_RESOURCE_NOT_FOUND,
+            "case {case}: the miss must be the operation's fixed sentence, got {body}"
+        );
         assert!(
-            error_message(&body).contains(resource_id),
-            "case {case}: the refusal must name the session the request addressed, got {body}"
+            !error_message(&body).contains(resource_id),
+            "case {case}: the refusal must not echo the id the request addressed, got {body}"
         );
         assert!(
             body["Url"].is_null(),

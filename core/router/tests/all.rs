@@ -2073,3 +2073,15 @@ mod s3_sourced_table_derived_key_schema;
 // anywhere, no merge of two landings can leave one past the first item.
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING
 // (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what points each
+// Below this block the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
+// suite file under `tests/all/`, sorted by name, and no other line — no prose between the
+// pairs, no blank line, no second declaration of a name. Two branches landing at once then
+// insert two lines in two places and have nothing to duplicate, re-word or mistype.
+// the declarations fails every suite of this target. With none anywhere, no merge of two
+// landings can leave one past the first item.
+// A suite no `mod` here names is compiled nowhere and its tests never run, and a second `mod`
+// for one name compiles neither copy.
+// Put a new suite at `tests/all/<name>.rs` and insert its pair in sorted position. What a
+// suite covers, and why it drives the assembled router rather than one service crate, belongs
+// in that suite's own module header; `all/appended_notes.rs` keeps the notes this file had
+// collected.

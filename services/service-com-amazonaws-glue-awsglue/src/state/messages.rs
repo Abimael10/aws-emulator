@@ -394,7 +394,9 @@ pub fn predicate_logical_required(conditions: usize) -> String {
 /// Any operation whose `JobName`/`Name` names no job definition of the Region it is
 /// served in — a read or a write that addresses a job (`GetJob`, `UpdateJob`,
 /// `GetJobRun`, `GetJobRuns`, `BatchStopJobRun`), and the job an action of a trigger
-/// would run.
+/// would run. NOT the bookmark surface, which addresses a job's CONTINUATION point
+/// rather than its definition and reports its own miss for every name that resolves
+/// none ([`job_continuation_not_found`]).
 ///
 /// Recorded constant: the job-definition miss is FIXED text, trailing period
 /// included, and has no variable part — the refusal names neither the requested job,
@@ -480,16 +482,16 @@ pub fn s3_target_not_found(path: &str) -> String {
 /// reports the job itself as missing ([`JOB_NOT_FOUND`]).
 pub const JOB_RUN_NOT_FOUND: &str = "Job run not found for the given job name and runId.";
 
-/// A bookmark operation (`GetJobBookmark`, `ResetJobBookmark`) addressing a job that
-/// has no bookmark: one no run of it has written yet, or one whose run the request's
-/// `RunId` names no run of.
+/// A bookmark operation (`GetJobBookmark`, `ResetJobBookmark`) that resolves no bookmark:
+/// a job no run of has written one yet, a job whose run the request's `RunId` names no run
+/// of, and a `JobName` this Region holds no job definition under at all — the surface
+/// addresses a CONTINUATION point rather than the job, so all three are the one miss.
 ///
-/// NOT recorded: what is pinned is the behaviour — 400 with the operation's modelled
-/// `EntityNotFoundException` — and a sentence following the per-resource template of
-/// [`database_not_found`], built from the job the request addressed, which with the
-/// account and Region is the whole address of a bookmark.
-pub fn job_bookmark_not_found(job_name: &str) -> String {
-    format!("Job bookmark for job {job_name} not found.")
+/// RECORDED template: the fixed text `Continuation for job ` and ` not found` — no trailing
+/// period — around its one variable part, the `JobName` the request sent, taken exactly as
+/// sent.
+pub fn job_continuation_not_found(job_name: &str) -> String {
+    format!("Continuation for job {job_name} not found")
 }
 
 /// `GetDashboardUrl` for a `ResourceType` the operation does not serve a dashboard
@@ -498,6 +500,18 @@ pub fn job_bookmark_not_found(job_name: &str) -> String {
 pub fn dashboard_url_not_supported(resource_type: &str) -> String {
     format!("GetDashboardUrl operation is not supported for {resource_type}")
 }
+
+/// `GetDashboardUrl` for a `ResourceId` that names no resource of the `ResourceType` the
+/// request asked a dashboard for.
+///
+/// RECORDED constant, and the whole message: the sentence is the fixed, generic one this
+/// operation answers a miss with — it names neither the id the request addressed nor the
+/// kind of resource it was looked for as, and carries no trailing period.
+///
+/// It reads the same as the WORKFLOW surface's own miss ([`WORKFLOW_NOT_FOUND`]) and is a
+/// separate constant all the same: the two surfaces are recorded independently, so either
+/// may be re-worded without the other.
+pub const DASHBOARD_URL_RESOURCE_NOT_FOUND: &str = "Entity not found";
 
 /// A session lookup addressed by `Id` for an id this account holds no session under —
 /// `GetSession`'s miss, and the miss of every operation that resolves a session the same
@@ -1575,15 +1589,14 @@ pub fn data_quality_ruleset_already_exists(name: &str) -> String {
 pub const PARTITION_VALUES_REQUIRED: &str = "PartitionInput must specify Values.";
 
 /// A partition create whose value count is not the addressed table's partition-key
-/// count. NOT recorded: what is pinned is the behaviour — `InvalidInputException`,
-/// per item for a batch create — and the sentence carries the two counts the request
-/// and the table disagree on, so a client can see which it got wrong.
-pub fn partition_values_do_not_match_keys(keys: usize, values: usize) -> String {
-    format!(
-        "Partition values must name one value per partition key of the table; the table \
-             has {keys} partition keys and the input carried {values} values"
-    )
-}
+/// count, in EITHER direction (fewer values than keys, or more).
+///
+/// RECORDED constant, and the whole message: the sentence is fixed and has no variable
+/// part at all — it names neither the table, nor the values, nor the two counts that
+/// disagree, so one arity refusal reads the same as every other and a client matching the
+/// text recognises the condition whatever was sent.
+pub const PARTITION_KEYS_DO_NOT_MATCH_VALUES: &str =
+    "The number of partition keys do not match the number of partition values";
 
 /// A partition create for a value list the addressed table already holds a partition
 /// for. NOT recorded: inferred from the recorded `CreateDatabase` duplicate, like

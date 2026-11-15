@@ -245,14 +245,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let message = Some(refusal.message());
                 Err(match refusal {
                     crate::state::PartitionCreateRefusal::ValuesRequired
-                    | crate::state::PartitionCreateRefusal::ValuesDoNotMatchPartitionKeys {
-                        ..
-                    } => CreatePartitionErrorModeled::InvalidInputException(
-                        InvalidInputException {
-                            message,
-                            from_federation_source: None,
-                        },
-                    ),
+                    | crate::state::PartitionCreateRefusal::ValuesDoNotMatchPartitionKeys => {
+                        CreatePartitionErrorModeled::InvalidInputException(
+                            InvalidInputException {
+                                message,
+                                from_federation_source: None,
+                            },
+                        )
+                    }
                     crate::state::PartitionCreateRefusal::AlreadyExists => {
                         CreatePartitionErrorModeled::AlreadyExistsException(
                             AlreadyExistsException { message },

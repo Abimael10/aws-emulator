@@ -19,7 +19,7 @@
 //! A value list whose length is not the table's partition-key count addresses no slice of
 //! that table, so it is a miss like any other key this table holds no partition for. The
 //! write path words that condition as its own refusal
-//! ([`crate::state::messages::partition_values_do_not_match_keys`]) because a create has to
+//! ([`crate::state::messages::PARTITION_KEYS_DO_NOT_MATCH_VALUES`]) because a create has to
 //! say what it would not store; a read of such a list has no partition to report either
 //! way, and the single-partition read answers it as the same miss
 //! ([`crate::state::messages::PARTITION_NOT_FOUND`]), so the two reads agree.

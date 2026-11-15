@@ -24,6 +24,7 @@
 //! and casing of a partition value, and the way one create can fail.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_glue_awsglue::state::messages::PARTITION_KEYS_DO_NOT_MATCH_VALUES;
 use service_com_amazonaws_glue_awsglue::state::MAX_PARTITIONS_PER_TABLE;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -363,10 +364,7 @@ async fn a_create_the_catalog_cannot_serve_is_refused_and_stores_nothing() {
             seeded: None,
             input: json!({ "Values": ["2026-01-01"] }),
             expected_code: "InvalidInputException",
-            expected_message: "Partition values must name one value per partition key of the \
-                               table; the table has 2 partition keys and the input carried 1 \
-                               values"
-                .to_string(),
+            expected_message: PARTITION_KEYS_DO_NOT_MATCH_VALUES.to_string(),
             missing: vec![vec!["2026-01-01"]],
         },
         RefusalCase {
@@ -375,10 +373,7 @@ async fn a_create_the_catalog_cannot_serve_is_refused_and_stores_nothing() {
             seeded: None,
             input: json!({ "Values": ["2026-01-01", "us-east-1"] }),
             expected_code: "InvalidInputException",
-            expected_message: "Partition values must name one value per partition key of the \
-                               table; the table has 1 partition keys and the input carried 2 \
-                               values"
-                .to_string(),
+            expected_message: PARTITION_KEYS_DO_NOT_MATCH_VALUES.to_string(),
             missing: vec![vec!["2026-01-01", "us-east-1"], vec!["2026-01-01"]],
         },
         RefusalCase {
@@ -396,10 +391,7 @@ async fn a_create_the_catalog_cannot_serve_is_refused_and_stores_nothing() {
             seeded: None,
             input: json!({ "Values": ["2026-01-01"] }),
             expected_code: "InvalidInputException",
-            expected_message: "Partition values must name one value per partition key of the \
-                               table; the table has 0 partition keys and the input carried 1 \
-                               values"
-                .to_string(),
+            expected_message: PARTITION_KEYS_DO_NOT_MATCH_VALUES.to_string(),
             missing: vec![vec!["2026-01-01"]],
         },
     ];

@@ -15,10 +15,12 @@
 //!   resource KIND, not about the resource.
 //! * `SESSION` is looked up in the Region the request is served in
 //!   ([`crate::state::ComAmazonawsGlueAwsglueState::sessions`]): a session this endpoint
-//!   holds is answered with the dashboard URL of THAT session, and an `ResourceId` no
-//!   session of this endpoint has is the modelled `EntityNotFoundException` naming it.
-//!   Handing out a URL for a session nothing created would be worse: the URL would address
-//!   a dashboard of a resource that is not there.
+//!   holds is answered with the dashboard URL of THAT session, and a `ResourceId` no
+//!   session of this endpoint has is the modelled `EntityNotFoundException` with this
+//!   operation's fixed, generic miss text, which discloses neither the id nor the kind
+//!   ([`crate::state::messages::DASHBOARD_URL_RESOURCE_NOT_FOUND`]). Handing out a URL for
+//!   a session nothing created would be worse: the URL would address a dashboard of a
+//!   resource that is not there.
 //!
 //! `RequestOrigin` ("the origin of the request") does not change which kind is served, so
 //! it changes nothing here.
@@ -202,9 +204,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if !held {
                     return Err(GetDashboardUrlErrorModeled::EntityNotFoundException(
                         EntityNotFoundException {
-                            message: Some(crate::state::messages::session_not_found(
-                                &input.resource_id,
-                            )),
+                            // The miss of this operation is the one fixed sentence,
+                            // whatever was addressed: the requested id is not echoed back.
+                            message: Some(
+                                crate::state::messages::DASHBOARD_URL_RESOURCE_NOT_FOUND
+                                    .to_string(),
+                            ),
                             from_federation_source: None,
                         },
                     )

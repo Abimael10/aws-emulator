@@ -14,7 +14,9 @@
 //! the same job. `RunId` ("the unique run identifier associated with this job run")
 //! addresses the run whose bookmark is reset, so a value naming no run of the job is that
 //! miss too — the bookmark of a run the job never had is not the bookmark of its latest
-//! one.
+//! one — and so is a `JobName` this Region holds no job definition under: this surface
+//! addresses a CONTINUATION point rather than the job, so every input that resolves no
+//! bookmark is the one miss ([`crate::state::messages::job_continuation_not_found`]).
 //!
 //! The job itself is addressed by `JobName` within the Region the request is served in,
 //! exactly as every other job operation addresses one
@@ -163,27 +165,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // A job and its bookmark are addressed together, so the job is resolved first and
-        // its own miss reported for a name the Region holds no definition under.
-        let Some(job) = store.job_mut(&region, &input.job_name) else {
+        // Every input that resolves no bookmark is the SAME miss: a `JobName` this Region
+        // holds no definition under resolves no continuation either, so it is not reported
+        // as the job's own miss. A `RunId` the job holds no run for addresses a bookmark
+        // that does not exist, and nothing is reset.
+        let bookmark = store.job_mut(&region, &input.job_name).and_then(|job| {
+            let addresses_a_run = input
+                .run_id
+                .as_ref()
+                .is_none_or(|run_id| job.run(run_id).is_some());
+            job.bookmark.as_mut().filter(|_| addresses_a_run)
+        });
+        let Some(bookmark) = bookmark else {
             return Err(ResetJobBookmarkErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::JOB_NOT_FOUND.to_string()),
-                    from_federation_source: None,
-                },
-            )
-            .into());
-        };
-        // The run the reset is about, when the request named one: a `RunId` the job holds
-        // no run for addresses a bookmark that does not exist, and nothing is reset.
-        let addresses_a_run = input
-            .run_id
-            .as_ref()
-            .is_none_or(|run_id| job.run(run_id).is_some());
-        let Some(bookmark) = job.bookmark.as_mut().filter(|_| addresses_a_run) else {
-            return Err(ResetJobBookmarkErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::job_bookmark_not_found(
+                    message: Some(crate::state::messages::job_continuation_not_found(
                         &input.job_name,
                     )),
                     from_federation_source: None,

@@ -9,20 +9,46 @@
 //! The rule under test: a bookmark is "a point that a job can resume processing", which a
 //! RUN establishes — so a job definition nothing has run yet has no bookmark and both
 //! operations answer it with `EntityNotFoundException`, and a `RunId` naming no run of the
-//! job is that same miss. Once a run has written it, the read reports it, each further run
-//! advances it, and a reset clears the position the next run would have resumed from while
-//! leaving the entry readable. The read never writes it: only a run and a reset do.
+//! job, as well as a `JobName` the Region holds no job under, are that same miss: the
+//! surface addresses a CONTINUATION point rather than the job, so every input that resolves
+//! no bookmark is refused with the one message, naming the `JobName` the request sent. Once
+//! a run has written it, the read reports it, each further run advances it, and a reset
+//! clears the position the next run would have resumed from while leaving the entry
+//! readable. The read never writes it: only a run and a reset do.
 //!
 //! The rows below differ along what the rule generalises over: whether the job exists, how
 //! many runs it has taken, whether a `RunId` is named and whether that id is one of the
 //! job's runs.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_glue_awsglue::state::messages::{job_bookmark_not_found, JOB_NOT_FOUND};
+use service_com_amazonaws_glue_awsglue::state::messages::job_continuation_not_found;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::job_runs::{job_body, start_run};
 use crate::wire::{call, emulator, error_code, error_message, ok};
+
+/// The continuation miss as Glue words it, written out here as a literal rather than read
+/// from the service's own helper, so this suite pins the WORDING instead of restating it:
+/// the fixed text around the one variable part, the `JobName` the request sent, with no
+/// trailing full stop.
+#[test]
+fn the_continuation_miss_is_worded_as_glue_words_it() {
+    // The rows differ along the JobName the message is built from — the shape the recorded
+    // fixture used, a single character, a mixed-case name, and one carrying punctuation —
+    // since the name is the template's only variable part.
+    for name in [
+        "sim2real-behav-job-0af56235612c",
+        "x",
+        "NightlyETL",
+        "team.data_lake-2026/raw",
+    ] {
+        assert_eq!(
+            job_continuation_not_found(name),
+            format!("Continuation for job {name} not found"),
+            "case {name:?}: unexpected continuation-miss wording"
+        );
+    }
+}
 
 /// Read the bookmark of `job`, answering the HTTP status and body. `run_id` addresses one
 /// run's bookmark when the row names one.
@@ -100,9 +126,9 @@ async fn a_job_that_has_never_run_has_no_bookmark() {
             );
             assert_eq!(
                 error_message(&body),
-                job_bookmark_not_found(job),
-                "case {case}: {operation} must name the job whose bookmark is missing, got \
-                 {body}"
+                job_continuation_not_found(job),
+                "case {case}: {operation} must report the continuation miss of the job the \
+                 request named, got {body}"
             );
             assert!(
                 body["JobBookmarkEntry"].is_null(),
@@ -112,34 +138,63 @@ async fn a_job_that_has_never_run_has_no_bookmark() {
     }
 }
 
-/// A job name the Region holds no definition under is the JOB's own miss, not the
-/// bookmark's: the job is resolved before its bookmark.
+/// A `JobName` the Region holds no definition under resolves no continuation either, so it
+/// is the SAME miss as a job that has never run — the bookmark surface addresses the
+/// continuation point, not the job definition.
+///
+/// The rows differ along the form of the unknown name and whether a `RunId` is named.
 #[tokio::test]
-async fn a_job_that_does_not_exist_is_the_jobs_own_miss() {
+async fn a_job_that_does_not_exist_is_the_same_continuation_miss() {
     let router = emulator();
+    // The job this Region DOES hold, so a row below cannot pass by the store being empty.
+    ok(&router, "CreateJob", &job_body("held_job", json!({}))).await;
 
-    for (operation, (status, body)) in [
-        ("GetJobBookmark", get_bookmark(&router, "no_such_job", None).await),
+    // (case, the job name asked about, the RunId the row names)
+    let cases: [(&str, &str, Option<&str>); 3] = [
+        ("a name nothing created", "no_such_job", None),
+        ("a name in another form", "no.such-job_2", None),
         (
-            "ResetJobBookmark",
-            reset_bookmark(&router, "no_such_job", None).await,
+            "an unknown name with a run id",
+            "no_such_job",
+            Some("jr_0000000000000000"),
         ),
-    ] {
-        assert_eq!(
-            status, 400,
-            "{operation} on an unknown job must be refused, got {status} with {body}"
-        );
-        assert!(
-            error_code(&body).ends_with("EntityNotFoundException"),
-            "{operation}: expected EntityNotFoundException, got {} in {body}",
-            error_code(&body)
-        );
-        assert_eq!(
-            error_message(&body),
-            JOB_NOT_FOUND,
-            "{operation} must report the job's own miss, got {body}"
-        );
+    ];
+
+    for (case, job, run_id) in cases {
+        for (operation, (status, body)) in [
+            ("GetJobBookmark", get_bookmark(&router, job, run_id).await),
+            (
+                "ResetJobBookmark",
+                reset_bookmark(&router, job, run_id).await,
+            ),
+        ] {
+            assert_eq!(
+                status, 400,
+                "case {case}: {operation} on an unknown job must be refused, got {status} \
+                 with {body}"
+            );
+            assert!(
+                error_code(&body).ends_with("EntityNotFoundException"),
+                "case {case}: {operation}: expected EntityNotFoundException, got {} in {body}",
+                error_code(&body)
+            );
+            assert_eq!(
+                error_message(&body),
+                job_continuation_not_found(job),
+                "case {case}: {operation} must report the continuation miss naming the \
+                 JobName the request sent, got {body}"
+            );
+        }
     }
+
+    // The job the Region does hold has no bookmark either, and it is refused with its own
+    // name: the message is a template over `JobName`, not one fixed sentence.
+    let (_, body) = get_bookmark(&router, "held_job", None).await;
+    assert_eq!(
+        error_message(&body),
+        job_continuation_not_found("held_job"),
+        "the miss must name the job the request asked about, got {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -340,6 +395,12 @@ async fn a_run_id_the_job_does_not_hold_is_a_miss() {
                 "case {case}: expected EntityNotFoundException from {operation}, got {} in \
                  {body}",
                 error_code(&body)
+            );
+            assert_eq!(
+                error_message(&body),
+                job_continuation_not_found("etl_job"),
+                "case {case}: {operation} must report the continuation miss of the job the \
+                 request named, got {body}"
             );
         }
     }

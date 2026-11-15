@@ -22,16 +22,32 @@
 //! one item can fail.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_glue_awsglue::state::messages::PARTITION_NOT_FOUND;
+use service_com_amazonaws_glue_awsglue::state::messages::{
+    PARTITION_KEYS_DO_NOT_MATCH_VALUES, PARTITION_NOT_FOUND,
+};
 use service_com_amazonaws_glue_awsglue::state::MAX_PARTITIONS_PER_TABLE;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::error_messages::assert_refusal;
-use crate::wire::{assert_echoed, call, emulator, error_code, ok, ACCOUNT_ID, ERROR_DETAIL_TAG};
+use crate::wire::{
+    assert_echoed, call, emulator, error_code, error_message, ok, ACCOUNT_ID, ERROR_DETAIL_TAG,
+};
 
 /// The largest `PartitionInputList` one batch may carry: `PartitionInputList`, length
 /// 0..100, from `smithy_query` on `BatchCreatePartition`.
 const MAX_PARTITIONS_PER_BATCH: usize = 100;
+
+/// The arity refusal as Glue words it, written out here as a literal rather than read from
+/// the service's own constant, so this suite pins the WORDING instead of restating it: the
+/// whole sentence is fixed, with no counts and no trailing full stop.
+#[test]
+fn the_arity_refusal_is_worded_as_glue_words_it() {
+    assert_eq!(
+        PARTITION_KEYS_DO_NOT_MATCH_VALUES,
+        "The number of partition keys do not match the number of partition values",
+        "unexpected partition-arity refusal wording"
+    );
+}
 
 /// Create `database` holding `table`, partitioned by `keys` (one `Column` per key).
 pub(crate) async fn seed_table(
@@ -514,7 +530,9 @@ struct ArityCase {
 /// partition key of its table, so such an item describes a slice of no table and the
 /// request is malformed rather than partly servable. The response carries no `Errors` list
 /// at all, and nothing is created — not even the items of the same batch that were
-/// well-formed.
+/// well-formed. The refusal's message is the one FIXED sentence for the condition: it
+/// varies with nothing the request or the table carries, so every row below is answered
+/// with the same text.
 ///
 /// The rows differ along how the count is wrong (fewer values than keys, more values than
 /// keys, no `Values` member at all, a value for a table that defines no partition keys),
@@ -598,6 +616,12 @@ async fn an_arity_mismatch_refuses_the_whole_request() {
         assert!(
             body["Errors"].is_null(),
             "case {case}: a request-level refusal carries no Errors list, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            PARTITION_KEYS_DO_NOT_MATCH_VALUES,
+            "case {case}: the arity refusal must be the fixed sentence for the condition, \
+             whatever the counts; got {body}"
         );
 
         for values in &row.created_nothing {

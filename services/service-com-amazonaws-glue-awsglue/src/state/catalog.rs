@@ -928,13 +928,9 @@ pub enum PartitionCreateRefusal {
     /// The values do not line up with the table's partition keys: a partition is one
     /// value per key of the table it belongs to, passed "in the same order as the
     /// partition keys" (`PartitionInput$Values`), so a list of another length cannot
-    /// name a slice of this table.
-    ValuesDoNotMatchPartitionKeys {
-        /// How many partition keys the addressed table defines.
-        keys: usize,
-        /// How many values the input carried.
-        values: usize,
-    },
+    /// name a slice of this table. Carries neither count, because the refusal discloses
+    /// neither ([`messages::PARTITION_KEYS_DO_NOT_MATCH_VALUES`]).
+    ValuesDoNotMatchPartitionKeys,
     /// The table already holds a partition with those values.
     AlreadyExists,
     /// The store cannot hold another partition ([`MAX_PARTITIONS_PER_TABLE`],
@@ -951,9 +947,7 @@ impl PartitionCreateRefusal {
     /// raises.
     pub fn error_code(&self) -> &'static str {
         match self {
-            Self::ValuesRequired | Self::ValuesDoNotMatchPartitionKeys { .. } => {
-                "InvalidInputException"
-            }
+            Self::ValuesRequired | Self::ValuesDoNotMatchPartitionKeys => "InvalidInputException",
             Self::AlreadyExists => "AlreadyExistsException",
             Self::LimitExceeded { .. } => "ResourceNumberLimitExceededException",
         }
@@ -964,8 +958,8 @@ impl PartitionCreateRefusal {
     pub fn message(&self) -> String {
         match self {
             Self::ValuesRequired => messages::PARTITION_VALUES_REQUIRED.to_string(),
-            Self::ValuesDoNotMatchPartitionKeys { keys, values } => {
-                messages::partition_values_do_not_match_keys(*keys, *values)
+            Self::ValuesDoNotMatchPartitionKeys => {
+                messages::PARTITION_KEYS_DO_NOT_MATCH_VALUES.to_string()
             }
             Self::AlreadyExists => messages::PARTITION_ALREADY_EXISTS.to_string(),
             Self::LimitExceeded { limit } => {
@@ -1325,12 +1319,8 @@ impl TableEntry {
         if values.is_empty() {
             return Err(PartitionCreateRefusal::ValuesRequired);
         }
-        let keys = self.partition_key_count();
-        if values.len() != keys {
-            return Err(PartitionCreateRefusal::ValuesDoNotMatchPartitionKeys {
-                keys,
-                values: values.len(),
-            });
+        if values.len() != self.partition_key_count() {
+            return Err(PartitionCreateRefusal::ValuesDoNotMatchPartitionKeys);
         }
         if self.partitions.contains_key(&values) {
             return Err(PartitionCreateRefusal::AlreadyExists);

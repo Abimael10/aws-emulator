@@ -235,18 +235,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // malformed REQUEST rather than one item the service could not create: the whole
         // batch is refused with `InvalidInputException` BEFORE any item is applied, so a
         // batch carrying one such item creates nothing and reports no `Errors` list at
-        // all. The counts the request and the table disagree on travel with the refusal,
-        // in the same sentence a single-partition create is refused with.
+        // all. The refusal is the same fixed sentence a single-partition create is refused
+        // with, in either direction of the mismatch: it discloses neither count.
         let keys = table.partition_key_count();
-        if let Some(values) = input.partition_input_list.iter().find_map(|requested| {
-            let values = requested.values.as_ref().map_or(0, Vec::len);
-            (values != keys).then_some(values)
-        }) {
+        if input
+            .partition_input_list
+            .iter()
+            .any(|requested| requested.values.as_ref().map_or(0, Vec::len) != keys)
+        {
             return Err(BatchCreatePartitionErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(crate::state::messages::partition_values_do_not_match_keys(
-                        keys, values,
-                    )),
+                    message: Some(
+                        crate::state::messages::PARTITION_KEYS_DO_NOT_MATCH_VALUES.to_string(),
+                    ),
                     from_federation_source: None,
                 },
             )
