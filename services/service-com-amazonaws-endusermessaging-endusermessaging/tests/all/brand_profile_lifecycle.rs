@@ -11,6 +11,8 @@
 //! * a created profile is persisted, and `GetBrandProfile` / `ListBrandProfiles`
 //!   report exactly what was stored — for every name the modelled `BrandProfileName`
 //!   accepts, with or without `deletionProtectionEnabled` and `tags`;
+//! * the `attributesCreated` a create reports is the number of attributes the new
+//!   profile's own list holds (the template it was seeded with);
 //! * a `BrandProfileIdOrArn` resolves a profile by its bare id or by its full ARN;
 //! * the ARN is `arn:aws:end-user-messaging:<region>:<account>:brand-profile/<id>`
 //!   for whatever region the request is signed for;
@@ -174,6 +176,15 @@ impl Emulator {
         self.call("GET", &format!("/v1/brand-profiles{query}"), None)
             .await
     }
+
+    async fn list_attributes(&self, id_or_arn: &str) -> Reply {
+        self.call(
+            "GET",
+            &format!("/v1/brand-profiles/{id_or_arn}/attributes"),
+            None,
+        )
+        .await
+    }
 }
 
 /// The names in this table are the classes `BrandProfileName`'s modelled
@@ -221,11 +232,29 @@ async fn a_created_profile_is_persisted_and_read_back_whole() {
                 "case {case}: a created profile is ACTIVE, got {:?}",
                 created.body
             );
+            // The create seeds the default attribute template, so the count it
+            // reports is positive and is what the profile's attribute list holds.
+            let seeded = created.number("attributesCreated");
+            assert!(
+                seeded > 0.0,
+                "case {case}: a created profile is seeded with a default attribute \
+                 template, so attributesCreated is positive, got {seeded:?}"
+            );
+            let attributes = em.list_attributes(&id).await;
+            let listed = attributes
+                .member("brandProfileAttributes")
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case}: brandProfileAttributes is not a list, got {:?}",
+                        attributes.body
+                    )
+                })
+                .len();
             assert_eq!(
-                created.number("attributesCreated"),
-                0.0,
-                "case {case}: a fresh profile has no default attributes, got {:?}",
-                created.body
+                listed as f64, seeded,
+                "case {case}: attributesCreated must equal the number of attributes the \
+                 list reports, got {seeded:?} vs {listed}"
             );
             assert_eq!(
                 created.member("deletionProtectionEnabled"),

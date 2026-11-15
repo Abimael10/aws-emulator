@@ -162,7 +162,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // item the page that produced it returned.
         let resume_after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(decode_next_token(token).ok_or_else(|| {
+            Some(token) => Some(
+                crate::state::decode_page_token(TOKEN_MARKER, token).ok_or_else(|| {
                 ListBrandProfilesErrorModeled::ValidationException(ValidationException {
                     message: format!("nextToken {token} is not a pagination token this service issued."),
                     field_list: Some(vec![ValidationExceptionField {
@@ -171,7 +172,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .to_string(),
                     }]),
                 })
-            })?),
+                })?,
+            ),
         };
 
         // `maxResults` is modelled `range 1..100`, so the boundary validator has
@@ -212,7 +214,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A token is emitted only when something is actually left to return.
         let next_token = match brand_profiles.last() {
             Some(last) if remaining.next().is_some() => {
-                Some(encode_next_token(&last.brand_profile_id))
+                Some(crate::state::encode_page_token(
+                    TOKEN_MARKER,
+                    &last.brand_profile_id,
+                ))
             }
             _ => None,
         };
@@ -230,22 +235,8 @@ const MAX_PAGE_SIZE: usize = 100;
 
 /// The marker every token this operation issues carries, so a token the service did
 /// not issue is recognisable rather than being read as some other resume point.
-/// Without it any hex-decodable string would be accepted as a continuation.
+/// Without it any hex-decodable string would be accepted as a continuation. The
+/// token itself is built and read by [`crate::state::encode_page_token`] /
+/// [`crate::state::decode_page_token`], which every paginated operation of this
+/// service shares.
 const TOKEN_MARKER: &str = "ListBrandProfiles/1/";
-
-/// An opaque continuation token for the last item of a page.
-///
-/// Hex keeps the token within `NextToken`'s `^.+$` pattern and 1..2048 length
-/// whatever an id contains, and makes it opaque to a client while staying
-/// decodable by the next call.
-fn encode_next_token(last_returned_id: &str) -> String {
-    hex::encode(format!("{TOKEN_MARKER}{last_returned_id}"))
-}
-
-/// The id a token issued by [`encode_next_token`] resumes after, or `None` for any
-/// value this operation never issued.
-fn decode_next_token(token: &str) -> Option<String> {
-    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    let resume_after = decoded.strip_prefix(TOKEN_MARKER)?;
-    (!resume_after.is_empty()).then(|| resume_after.to_string())
-}

@@ -9,6 +9,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod verifications;
 pub use verifications::*;
 
+/// The attributes a brand profile holds, and the default template a created
+/// profile is seeded with.
+mod brand_profile_attributes;
+pub use brand_profile_attributes::*;
+
 /// The service's own ARN namespace / sigv4 signing name, as the Smithy model's
 /// `aws.api#service` trait declares it (`arnNamespace`/`endpointPrefix`
 /// `end-user-messaging`).
@@ -26,23 +31,6 @@ const BRAND_PROFILE_RESOURCE: &str = "brand-profile";
 /// ARN, as `NotifyCodeConfigurationIdOrArn` documents it.
 const NOTIFY_CODE_CONFIGURATION_RESOURCE: &str = "notify-code-configuration";
 
-/// One brand-profile attribute, keyed in [`BrandProfile::attributes`] by its
-/// name (`BrandProfileAttributeName` is unique within a profile).
-///
-/// The attribute operations are still scaffolded, so nothing writes this yet;
-/// the map it lives in is what `attributesCreated` counts.
-#[derive(Debug, Clone)]
-pub struct BrandProfileAttribute {
-    /// `attributeName` — unique within the owning brand profile.
-    pub name: String,
-    /// `attributeType`, one of [`crate::ops::types::BRAND_PROFILE_ATTRIBUTE_TYPE_VALUES`].
-    pub attribute_type: String,
-    /// `attributeValue` for a `TEXT` attribute; `None` for uploaded media.
-    pub value: Option<String>,
-    pub created_at: SystemTime,
-    pub updated_at: SystemTime,
-}
-
 /// A persisted brand profile: everything the brand-profile operations report.
 #[derive(Debug, Clone)]
 pub struct BrandProfile {
@@ -59,8 +47,16 @@ pub struct BrandProfile {
     pub updated_at: SystemTime,
     /// `tags` as supplied at create time; the tagging operations are scaffolded.
     pub tags: Vec<(String, String)>,
-    /// The profile's attributes, empty for a freshly created profile.
+    /// The profile's attributes, keyed by `attributeName`: the default template of
+    /// [`default_brand_profile_attributes`] as created, plus whatever the attribute
+    /// operations have since written. A `BTreeMap` so
+    /// `ListBrandProfileAttributes` pages in a stable, resumable order.
     pub attributes: BTreeMap<String, BrandProfileAttribute>,
+    /// How many default attributes were seeded into this profile when it was
+    /// created, which is what `attributesCreated` reports. A property of the
+    /// create, so it is recorded on the record rather than recomputed from a map
+    /// that later attribute calls change.
+    pub default_attributes_created: usize,
 }
 
 /// A persisted notify code configuration: the reusable passcode policy the
@@ -440,6 +436,28 @@ pub fn notify_code_configuration_view(
         created_at: timestamp(record.created_at),
         updated_at: timestamp(record.updated_at),
     }
+}
+
+/// An opaque pagination continuation token for a page that ended at
+/// `last_returned_key`.
+///
+/// `marker` names the issuing operation and token version, so a token one paginated
+/// operation issued is never read as a resume point by another and any value the
+/// service did not issue is recognisable; hex keeps the token inside `NextToken`'s
+/// `^.+$` pattern and `@length(1..2048)` whatever the key contains, and makes it
+/// opaque to a client while staying decodable by the next call. Every paginated
+/// operation of this service pages through here, so one token format is defined
+/// once.
+pub fn encode_page_token(marker: &str, last_returned_key: &str) -> String {
+    ::hex::encode(format!("{marker}{last_returned_key}"))
+}
+
+/// The key a token issued by [`encode_page_token`] under `marker` resumes strictly
+/// after, or `None` for any value that operation never issued.
+pub fn decode_page_token(marker: &str, token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let resume_after = decoded.strip_prefix(marker)?;
+    (!resume_after.is_empty()).then(|| resume_after.to_string())
 }
 
 fn nanos_since_epoch() -> u128 {

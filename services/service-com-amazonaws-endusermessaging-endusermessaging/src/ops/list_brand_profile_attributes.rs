@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBrandProfileAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBrandProfileAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBrandProfileAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages the attributes of a stored brand profile, read back off the
+//! persisted record.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +152,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBrandProfileAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBrandProfileAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBrandProfileAttributes"))
+        // `@readonly`: paging a list never changes what a later caller sees.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListBrandProfileAttributesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::NO_STORE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // No token starts at the beginning; a token resumes strictly after the last
+        // attribute the page that produced it returned.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(TOKEN_MARKER, token).ok_or_else(|| {
+                    ListBrandProfileAttributesErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "nextToken {token} is not a pagination token this service issued."
+                            ),
+                            field_list: Some(vec![ValidationExceptionField {
+                                path: "nextToken".to_string(),
+                                message: "The token is not one a previous \
+                                          ListBrandProfileAttributes response returned."
+                                    .to_string(),
+                            }]),
+                        },
+                    )
+                })?,
+            ),
+        };
+
+        // `maxResults` is modelled `range 1..100`, so the boundary validator has
+        // already refused anything outside it; an absent one pages at the maximum the
+        // output list itself allows.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        let store = state.lock();
+        // The attributes belong to one profile, so an identifier that names no stored
+        // profile is the operation's own `ResourceNotFoundException` rather than an
+        // empty page.
+        let Some(profile) = store
+            .resolve_brand_profile_id(&input.brand_profile_id)
+            .and_then(|id| store.brand_profiles.get(id))
+        else {
+            return Err(
+                ListBrandProfileAttributesErrorModeled::ResourceNotFoundException(
+                    crate::state::brand_profile_not_found(&input.brand_profile_id),
+                )
+                .into(),
+            );
+        };
+
+        // A range query, not a scan: resuming costs O(log n) + O(page) rather than
+        // walking every stored attribute on each page.
+        let start = match resume_after.as_deref() {
+            Some(after) => ::std::ops::Bound::Excluded(after),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut remaining = profile
+            .attributes
+            .range::<str, _>((start, ::std::ops::Bound::Unbounded))
+            .map(|(_, attribute)| attribute);
+
+        let brand_profile_attributes: Vec<BrandProfileAttributeSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::brand_profile_attribute_summary)
+            .collect();
+
+        // A token is emitted only when something is actually left to return.
+        let next_token = match brand_profile_attributes.last() {
+            Some(last) if remaining.next().is_some() => {
+                Some(crate::state::encode_page_token(
+                    TOKEN_MARKER,
+                    &last.attribute_name,
+                ))
+            }
+            _ => None,
+        };
+
+        Ok(ListBrandProfileAttributesOutput {
+            brand_profile_attributes,
+            next_token,
+        })
     }
 }
+
+/// The largest page this operation returns: the modelled `@length` ceiling of the
+/// `brandProfileAttributes` output list, which is also `maxResults`' modelled
+/// maximum.
+const MAX_PAGE_SIZE: usize = 100;
+
+/// The marker every token this operation issues carries, so a token the service did
+/// not issue is recognisable rather than being read as some other resume point.
+/// Without it any hex-decodable string would be accepted as a continuation. The
+/// token itself is built and read by [`crate::state::encode_page_token`] /
+/// [`crate::state::decode_page_token`], which every paginated operation of this
+/// service shares.
+const TOKEN_MARKER: &str = "ListBrandProfileAttributes/1/";

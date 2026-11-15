@@ -1304,3 +1304,19 @@ mod cloudtrail_iam_credential_write_audit;
 // is declared below like any other suite.
 // `all/every_suite_file_is_declared.rs` check these rules, for this root and for every
 // service crate's `tests/all.rs`, so check there rather than leaving a note here.
+// Single integration-test target for the router: the canonical declaration list.
+// This file is the license line, this header, and then one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file under `tests/all/`,
+// sorted by name, and NO other line. Put a new suite at `tests/all/<name>.rs` and insert
+// its pair in the one place its name sorts to; what a suite covers, and why it belongs to
+// this cross-service target rather than to one service crate's own, is stated in that
+// suite's own module doc, and a note about THIS file belongs in `all/appended_notes.rs`,
+// which is declared below like any other module and holds comments alone.
+// A suite no `mod` names compiles nowhere and its tests never run; a suite left at the top
+// level of `tests/` fails the build; a suite declared twice is `E0428`; and an inner doc
+// comment (`//!`) is legal only before the first item, so one written past the declarations
+// is `E0753`. Each of those fails EVERY suite of this target, which is why
+// `all/every_suite_file_is_declared.rs` pin the shape above.
+// deliberate: with no `//!` anywhere, no merge of two landings can leave a doc comment past
+// the first item.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING

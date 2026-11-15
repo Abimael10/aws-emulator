@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBrandProfile
-//! IMPLEMENTED: mints a brand profile, persists it, and reports every output member
-//! read back off the persisted record.
+//! IMPLEMENTED: mints a brand profile, seeds its default attribute template,
+//! persists it, and reports every output member read back off the persisted record.
 //!
 //! ## Shape of an operation
 //!
@@ -216,6 +216,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let id = store.mint_brand_profile_id();
         let now = ::std::time::SystemTime::now();
+        // Creating a profile seeds the service's default attribute template into it,
+        // which is what `attributesCreated` counts and what
+        // `ListBrandProfileAttributes` pages back for a profile nobody has written an
+        // attribute to yet.
+        let attributes = crate::state::default_brand_profile_attributes(now);
         let profile = crate::state::BrandProfile {
             arn: crate::state::brand_profile_arn(&region, &id),
             id: id.clone(),
@@ -232,8 +237,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into_iter()
                 .map(|tag| (tag.key, tag.value))
                 .collect(),
-            // This call creates no default attributes; `attributesCreated` counts this map.
-            attributes: ::std::collections::BTreeMap::new(),
+            default_attributes_created: attributes.len(),
+            attributes,
         };
         if let Some(token) = input.client_token {
             store.record_create_token(token, &id);
@@ -254,6 +259,6 @@ fn output_for(profile: &crate::state::BrandProfile) -> CreateBrandProfileOutput 
         deletion_protection_enabled: profile.deletion_protection_enabled,
         created_at: crate::state::timestamp(profile.created_at),
         updated_at: crate::state::timestamp(profile.updated_at),
-        attributes_created: i32::try_from(profile.attributes.len()).unwrap_or(i32::MAX),
+        attributes_created: i32::try_from(profile.default_attributes_created).unwrap_or(i32::MAX),
     }
 }
