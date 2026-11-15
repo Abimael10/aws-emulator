@@ -17,7 +17,9 @@
 //! > answered about ONE resolved version, so it reports that version's id in
 //! > `x-amz-version-id` exactly as a served read of the same address does: the key's
 //! > current version when the request addressed no version, the addressed version when it
-//! > did, and no such header at all for an object of a bucket that mints no version ids.
+//! > did, the `null` version id for a version a bucket carrying a versioning status minted
+//! > no id for, and no such header at all for an object of a bucket that has no version
+//! > ids.
 //!
 //! Its sources: `GetObjectOutput$VersionId` and `HeadObjectOutput$VersionId` are bound to
 //! the `x-amz-version-id` header (`smithy_query(query="operation",operation="GetObject")`),
@@ -35,6 +37,8 @@
 //! the same address reports.
 
 use std::time::SystemTime;
+
+use service_com_amazonaws_s3_amazons3::state::NULL_VERSION_ID;
 
 use super::bucket_lifecycle::{router, Answer};
 use super::object_and_tagging_roundtrip::{bucket, expected_etag, get_object, put_object, text};
@@ -96,7 +100,10 @@ async fn a_not_modified_read_names_the_version_it_evaluated() {
     );
 
     // A bucket that mints NONE, and one whose versioning was SUSPENDED before the write:
-    // neither object carries a version id, so neither answer names one.
+    // neither write reports a version id. The suspended bucket CARRIES a versioning status,
+    // so the object it stored is the `null` version a read names it by ("all objects added
+    // to the bucket receive the version ID null"), while the bucket whose versioning state
+    // was never set has no version ids at all.
     bucket(&router, "revalidate-plain").await;
     let plain = put_object(&router, "revalidate-plain", "held.bin", OLDER_BODY, &[]).await;
     bucket(&router, "revalidate-suspended").await;
@@ -124,6 +131,7 @@ async fn a_not_modified_read_names_the_version_it_evaluated() {
 
     let older_etag = expected_etag(OLDER_BODY);
     let newer_etag = expected_etag(NEWER_BODY);
+    let null_version = NULL_VERSION_ID.to_string();
     let at_this_read = http_date(SystemTime::now());
     let row = |case: &'static str,
                bucket: &'static str,
@@ -230,7 +238,7 @@ async fn a_not_modified_read_names_the_version_it_evaluated() {
             String::new(),
             vec![("if-none-match", "*".to_string())],
             &older_etag,
-            None,
+            Some(&null_version),
         ),
     ];
 

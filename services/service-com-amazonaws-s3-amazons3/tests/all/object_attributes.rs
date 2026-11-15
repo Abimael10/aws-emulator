@@ -48,7 +48,10 @@ fn expected_etag_value(body: &[u8]) -> String {
 }
 
 /// `GET /<bucket>/<key>?attributes<query>` — `GetObjectAttributes`, asking for `attributes`.
-async fn get_object_attributes(
+///
+/// `pub(crate)`: the suite that pins which version a read of an object reports drives this
+/// read through it rather than spelling the call a second way.
+pub(crate) async fn get_object_attributes(
     router: &MultiServiceRouter,
     bucket: &str,
     key: &str,

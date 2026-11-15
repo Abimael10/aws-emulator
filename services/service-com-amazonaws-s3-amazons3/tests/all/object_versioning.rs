@@ -39,7 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use service_com_amazonaws_s3_amazons3::state::MAX_VERSION_ID_CHARS;
+use service_com_amazonaws_s3_amazons3::state::{MAX_VERSION_ID_CHARS, NULL_VERSION_ID};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{router, send, send_bytes, Answer};
@@ -551,7 +551,12 @@ async fn a_bucket_whose_versioning_is_not_enabled_mints_no_version_id() {
         );
 
         // And the object it stored is the `null` version: a read naming no version and a
-        // read naming `null` answer the same bytes, and neither reports an id.
+        // read naming `null` answer the same bytes, and both name the version they served by
+        // the id it carries. A bucket CARRYING a versioning status has a version id for
+        // every version it holds — "all objects added to the bucket receive the version ID
+        // null" — so a read of that version reports `null`; a bucket whose versioning state
+        // was never set has no version ids at all, so a read of its object reports none.
+        let expected_id = (!statuses.is_empty()).then(|| NULL_VERSION_ID.to_string());
         for (label, query) in [("no versionId", ""), ("versionId=null", "?versionId=null")] {
             let read = get_object(&router, name, "object.txt", query, &[]).await;
             assert_eq!(
@@ -568,8 +573,9 @@ async fn a_bucket_whose_versioning_is_not_enabled_mints_no_version_id() {
             );
             assert_eq!(
                 read.header(VERSION_ID_HEADER),
-                None,
-                "case {case:?} with {label}: the null version carries no id, got {:?}",
+                expected_id,
+                "case {case:?} with {label}: the version read is reported as \
+                 {expected_id:?}, got {:?}",
                 read.header(VERSION_ID_HEADER)
             );
         }

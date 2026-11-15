@@ -1300,3 +1300,22 @@ mod zz_probe_whole_emulator;
 // Four suites of this target pin the shape above rather than restating it here:
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
 // `all/all_rs_is_a_canonical_declaration_list.rs`.
+// `tests/all/<name>.rs` and insert its pair where its name sorts to: two branches landing at
+// once then insert two lines in two places and have no prose to duplicate, re-word or
+// mistype. What a suite covers, and why it drives the assembled router rather than one
+// service crate, belongs in that suite's own module header, where it is read beside the test
+// it explains; a note about THIS file belongs in `all/appended_notes.rs`.
+// EVERY comment in this file is an ordinary `//` one, this header included: an inner doc
+// comment is legal only before the first item, so one left past the declarations is `E0753`
+// and compiles no suite of this target. With none anywhere in the file, no merge of two
+// landings can put one there.
+// This file is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of it
+// under `tests/`, which the layout check refuses: the `#[path]` above each `mod` is what
+// points the declaration into `tests/all/`. A suite file no `mod` names is compiled nowhere
+// and its tests never run, and a second `mod` for one name is `E0428` — either fails every
+// suite of this target. `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/declaration_roots_are_canonical_and_complete.rs` and
+// `all/every_suite_file_is_declared.rs` check these rules, for this file and for every
+// service crate's `tests/all.rs`, so check there rather than leaving a note here. Some of
+// the files below are shared harnesses or probes rather than suites; all are declared,
+// because a file no declaration names is compiled nowhere.

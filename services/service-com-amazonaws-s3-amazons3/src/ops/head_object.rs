@@ -582,6 +582,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
 
+        // WHICH VERSION this HEAD resolved, as the bucket names it
+        // ([`crate::state::Bucket::reported_version_id`]): the id the store minted for it, or
+        // the `null` version id every other version of a bucket carrying a versioning status
+        // is addressed by. Read through the one rule `GetObject` reports its own version by,
+        // so a GET and a HEAD of one version cannot disagree about the id it carries — on the
+        // answer below and on the 304 for a caller that already holds it.
+        let reported_version_id = store
+            .bucket(&input.bucket)
+            .and_then(|bucket| bucket.reported_version_id(object.version_id.as_deref()));
+
         // WHICH SPAN of the object this HEAD describes: "a HEAD request has the same options
         // as a GET operation on an object" (`HeadObject`'s own documentation), so a
         // `PartNumber` or a `Range` is answered with the same span, the same `Content-Range`
@@ -659,7 +669,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::not_modified(
                 &object.etag,
                 object.last_modified,
-                object.version_id.as_deref(),
+                reported_version_id.as_deref(),
             ));
         }
 
@@ -749,11 +759,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // one with it. "If any": an object with no tags reports no count at all
             // rather than a zero.
             tag_count: object.tag_count(),
-            // "Version ID of the object" (`HeadObjectOutput$VersionId`), reported for a
-            // version the store minted an id for — a write into a bucket whose versioning
-            // status is `Enabled`. A `null` version carries no id of its own, so none is
-            // reported for it.
-            version_id: object.version_id.clone(),
+            // "Version ID of the object" (`HeadObjectOutput$VersionId`) — the id of the
+            // version this HEAD resolved, which in a bucket carrying a versioning status is
+            // the minted one or the `null` version id, and nothing at all for an object of a
+            // bucket that has no version ids (see the note above the span).
+            version_id: reported_version_id,
             // The encryption configuration the object was STORED under (`PutObject`
             // records it), so a HEAD of an SSE/SSE-KMS object reports the same
             // `x-amz-server-side-encryption` headers the write answered with.

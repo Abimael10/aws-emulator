@@ -579,6 +579,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
 
+        // WHICH VERSION this read resolved, as the bucket names it
+        // ([`crate::state::Bucket::reported_version_id`]): the id the store minted for it, or
+        // the `null` version id every other version of a bucket carrying a versioning status
+        // is addressed by. Taken here, off the bucket this read resolved against and while
+        // its guard is still held, because every answer below names the same version — the
+        // served one, and the 304 for a caller that already holds it.
+        let reported_version_id = bucket.reported_version_id(object.version_id.as_deref());
+
         // WHICH BYTES this read asks for, resolved FIRST of everything this read is judged by.
         //
         // A `partNumber` "effectively performs a 'ranged' GET request for the part specified"
@@ -675,7 +683,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::not_modified(
                 &object.etag,
                 object.last_modified,
-                object.version_id.as_deref(),
+                reported_version_id.as_deref(),
             ));
         }
 
@@ -854,11 +862,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // one with it. "If any": an object with no tags reports no count at all
             // rather than a zero.
             tag_count: object.tag_count(),
-            // "Version ID of the object" (`GetObjectOutput$VersionId`), reported for a
-            // version the store minted an id for — a write into a bucket whose versioning
-            // status is `Enabled`. A `null` version carries no id of its own, so none is
-            // reported for it.
-            version_id: object.version_id.clone(),
+            // "Version ID of the object" (`GetObjectOutput$VersionId`) — the id of the
+            // version this read resolved, which in a bucket carrying a versioning status is
+            // the minted one or the `null` version id, and nothing at all for an object of a
+            // bucket that has no version ids (see the note above the span).
+            version_id: reported_version_id,
             // The encryption configuration the object was STORED under (`PutObject`
             // records it), so a read of an SSE/SSE-KMS object answers the same
             // `x-amz-server-side-encryption` headers the write did.

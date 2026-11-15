@@ -2100,6 +2100,36 @@ impl Bucket {
         }
     }
 
+    /// The version id a READ of one of this bucket's versions REPORTS, for a version the
+    /// store minted the id `minted` for — and `None` for an object of a bucket that has no
+    /// version ids at all.
+    ///
+    /// A bucket that CARRIES a versioning status has a version id for every version it
+    /// holds. `Enabled` mints a unique one ("All objects added to the bucket receive a
+    /// unique version ID"); every other version it holds is the `null` version
+    /// ([`NULL_VERSION_ID`]) — the write made while the status was `Suspended` ("All objects
+    /// added to the bucket receive the version ID null") and the object stored before the
+    /// status was ever set ("Objects stored in your bucket before you set the versioning
+    /// state have a version ID of null", both from `PutBucketVersioning`'s own
+    /// documentation). That id is one a reader reports and a request names
+    /// ([`Self::stored_version`] resolves it), so such a version is reported as the `null`
+    /// version rather than as a version with no id.
+    ///
+    /// A bucket whose versioning state has never been set is the one case with no version
+    /// ids: "if the versioning state has never been set on a bucket, it has no versioning
+    /// state" (same documentation), so a read of its object reports no version id at all.
+    ///
+    /// ONE place, so no two readers of one version can disagree about the id it carries.
+    pub fn reported_version_id(&self, minted: Option<&str>) -> Option<String> {
+        match minted {
+            Some(version_id) => Some(version_id.to_string()),
+            None => self
+                .versioning
+                .is_some()
+                .then(|| NULL_VERSION_ID.to_string()),
+        }
+    }
+
     /// Every version of `key` the bucket holds, NEWEST FIRST: the current one followed by
     /// the noncurrent ones, delete markers among them.
     ///

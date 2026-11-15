@@ -539,9 +539,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetObjectAttributesOutput {
             // Bound HEADERS rather than fields of the document, so they are reported for
-            // every answer: when the object was written, and the id of the version read.
+            // every answer: when the object was written, and the id of the version read —
+            // the minted id, or the `null` version id every other version of a bucket
+            // carrying a versioning status is addressed by, through the one rule `GetObject`
+            // reports its own version by ([`crate::state::Bucket::reported_version_id`]).
             last_modified: Some(::aws_smithy_types::DateTime::from(object.last_modified)),
-            version_id: object.version_id.clone(),
+            version_id: bucket.reported_version_id(object.version_id.as_deref()),
             // The tag is a FIELD of this response document rather than the `ETag` header,
             // so it carries the tag's own value — the digest without the quoted-string
             // quotes that header syntax requires ([`crate::state::etag_value`]).
