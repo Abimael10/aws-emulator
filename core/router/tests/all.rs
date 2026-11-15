@@ -1599,3 +1599,18 @@ mod cloudtrail_iam_credential_write_audit;
 // belongs in that suite's own module header; `all/appended_notes.rs` keeps the notes landings
 // had appended here. `all/all_rs_declares_each_suite_once.rs`,
 // `all/every_suite_file_is_declared.rs` check these rules rather than restating them.
+// item, so one that lands past the declarations — which is what concurrent landings
+// appending to this file kept producing — is `E0753` and compiles no suite of this target.
+// With no inner doc comment anywhere in the file, no merge of two landings can put one past
+// the first item. An inner ATTRIBUTE (`#!` followed by `[..]`) is the same story: past the
+// first item it is a hard error, so this file carries none of those either.
+// Past this header the file is declaration pairs and NOTHING else — no note, no blank line,
+// and nothing after the last pair — sorted by suite name: one `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair per file under `tests/all/`, so two branches landing at once insert two
+// lines in two places and have no prose to duplicate, re-word or mistype. Declare each suite
+// exactly ONCE: this is one crate root, so a second `mod` for the same name is `E0428` and
+// `mod` would resolve to a SIBLING (`tests/<name>.rs`), which the layout check refuses; the
+// `#[path]` is what points each declaration into `tests/all/`.
+// service crate's own, is stated in that suite's own module header, where it is read beside
+// the test it explains and cannot collide with a concurrent landing. Four suites check the
+// rules above rather than restating them: `all/all_rs_declares_each_suite_once.rs`,

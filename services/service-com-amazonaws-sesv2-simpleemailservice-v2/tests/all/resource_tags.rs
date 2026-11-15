@@ -20,9 +20,12 @@
 //! that same resource, keyed by tag key — a key the resource does not carry yet is
 //! appended and a key it does carry takes the request's value, since each key is unique
 //! on a resource and carries one value — and it refuses, storing nothing, a tag no
-//! caller may define (a key or value outside the documented length or character set, or
-//! one carrying the reserved prefix) or a request that would leave the resource carrying
-//! more than the documented maximum of tags.
+//! caller may define or a request that would leave the resource carrying more than the
+//! documented maximum of tags. A refused tag is refused by the LAYER its fault belongs
+//! to: a key or value outside the length the shapes state breaks a bound of the shapes
+//! themselves, so it earns the shape-validation refusal that states no message, while a
+//! tag the shapes accept and the service will not store (one outside the character set,
+//! one carrying the reserved prefix) earns the operation's own modelled input error.
 //!
 //! The accepted table below spans what the rule generalises over: the KIND of resource
 //! the ARN names (contact list, email identity by address and by domain, configuration
@@ -47,14 +50,14 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::contact_lists::query_escaped;
 
 /// The canonical account id every emulated ARN carries.
-const ACCOUNT_ID: &str = "000000000000";
+pub(crate) const ACCOUNT_ID: &str = "000000000000";
 
 /// An account id that is not this emulator's.
 const OTHER_ACCOUNT_ID: &str = "999999999999";
 
 /// The Region every call in this suite is signed for, so the Region an ARN it resolves
 /// has to carry.
-const HOME: &str = "us-east-1";
+pub(crate) const HOME: &str = "us-east-1";
 
 /// A Region these calls are not signed for.
 const AWAY: &str = "eu-west-1";
@@ -95,16 +98,15 @@ const MAX_TAG_VALUE_CHARS: usize =
 const TAG_CHARSET_REFUSAL: &str = "Tags can only contain letters, numbers, spaces, and \
                                    the following special characters: _ . : / = + - @";
 
-/// The sentence the surface answers a tag key outside its documented length.
-const TAG_KEY_LENGTH_REFUSAL: &str = "A tag key must be between 1 and 128 characters long.";
+/// The sentence the surface answers a tagging call whose tags it will not apply — fixed
+/// text, with nothing of the request in it. Spelled out here rather than read from the
+/// crate, so a change to the handler's wording fails these rows.
+pub(crate) const TAG_WRITE_FAILED: &str = "Failed to tag resource";
 
-/// The sentence the surface answers a tag value longer than its documented maximum.
-const TAG_VALUE_LENGTH_REFUSAL: &str = "A tag value must be no more than 256 characters long.";
-
-/// The sentence the surface answers a tag key or value carrying the prefix the model's
-/// `Tag` documentation reserves for Amazon Web Services.
-const RESERVED_TAG_PREFIX_REFUSAL: &str =
-    "The aws: prefix is reserved and cannot be used in a tag key or value.";
+/// The error class a tag breaking a LENGTH bound the shapes state earns: the refusal comes
+/// from the layer that validates a request against its shapes, not from the operation's own
+/// rules, and carries no message.
+pub(crate) const SHAPE_BOUND_ERROR: &str = "ValidationException";
 
 /// The sentence the surface answers a request that would leave one resource carrying
 /// `total` tags, more than it may hold.
@@ -114,10 +116,10 @@ fn too_many_tags(total: usize) -> String {
 
 /// One answered request: the status, the error shape when there was one, and the parsed
 /// body.
-struct Reply {
-    status: u16,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     error_type: Option<String>,
-    body: Value,
+    pub(crate) body: Value,
 }
 
 impl Reply {
@@ -125,7 +127,7 @@ impl Reply {
     ///
     /// restJson1 resolves the error shape from `x-amzn-errortype`; the JSON body's
     /// `__type` carries the same name, so either is read.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         let raw = self
             .error_type
             .as_deref()
@@ -136,7 +138,7 @@ impl Reply {
     }
 
     /// The message the error carried, for an assertion that wants to show it.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         self.body
             .get("message")
             .or_else(|| self.body.get("Message"))
@@ -155,7 +157,7 @@ impl Reply {
     }
 
     /// The `Tags` the response reported, as key/value pairs in the order reported.
-    fn tags(&self, member: &str) -> Vec<(String, String)> {
+    pub(crate) fn tags(&self, member: &str) -> Vec<(String, String)> {
         self.body
             .get(member)
             .and_then(Value::as_array)
@@ -185,12 +187,12 @@ impl Reply {
 }
 
 /// The emulated service behind its router.
-struct Ses {
+pub(crate) struct Ses {
     router: MultiServiceRouter,
 }
 
 impl Ses {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These cases exercise handler behaviour, not SigV4.
@@ -199,7 +201,7 @@ impl Ses {
         Self { router }
     }
 
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
         let payload = match &body {
             Some(value) => bytes::Bytes::from(serde_json::to_vec(value).expect("serialize body")),
             None => bytes::Bytes::new(),
@@ -241,7 +243,7 @@ impl Ses {
 
     /// `ListTagsForResource` for `resource_arn`, which the operation binds to
     /// `@httpQuery`.
-    async fn list_tags(&self, resource_arn: &str) -> Reply {
+    pub(crate) async fn list_tags(&self, resource_arn: &str) -> Reply {
         self.call(
             "GET",
             &format!("/v2/email/tags?ResourceArn={}", query_escaped(resource_arn)),
@@ -257,7 +259,7 @@ impl Ses {
 
     /// `TagResource` for `resource_arn` with `tags`, which the operation carries in its
     /// POST body.
-    async fn tag_resource(&self, resource_arn: &str, tags: &[(String, String)]) -> Reply {
+    pub(crate) async fn tag_resource(&self, resource_arn: &str, tags: &[(String, String)]) -> Reply {
         let tags: Vec<Value> = tags
             .iter()
             .map(|(key, value)| json!({"Key": key, "Value": value}))
@@ -326,7 +328,7 @@ impl Ses {
 
 /// `arn:aws:ses:<region>:<account>:<type>/<id>`, the form SES writes a resource of its
 /// own in.
-fn arn(region: &str, account: &str, resource_type: &str, resource_id: &str) -> String {
+pub(crate) fn arn(region: &str, account: &str, resource_type: &str, resource_id: &str) -> String {
     format!("arn:aws:ses:{region}:{account}:{resource_type}/{resource_id}")
 }
 
@@ -378,7 +380,7 @@ impl TagCase {
 }
 
 /// A tag pair, as a row states one.
-fn tag(key: &str, value: &str) -> (String, String) {
+pub(crate) fn tag(key: &str, value: &str) -> (String, String) {
     (key.to_string(), value.to_string())
 }
 
@@ -1151,24 +1153,24 @@ async fn tag_resource_refuses_an_arn_it_cannot_resolve_and_a_tag_no_caller_may_d
             resource_arn: held_arn.clone(),
             tags: vec![tag("", "prod")],
             status: 400,
-            error_code: "BadRequestException",
-            message: TAG_KEY_LENGTH_REFUSAL.to_string(),
+            error_code: SHAPE_BOUND_ERROR,
+            message: String::new(),
         },
         WriteRefusalCase {
             case: "a tag key one character past its documented maximum",
             resource_arn: held_arn.clone(),
             tags: vec![tag(&"k".repeat(MAX_TAG_KEY_CHARS + 1), "prod")],
             status: 400,
-            error_code: "BadRequestException",
-            message: TAG_KEY_LENGTH_REFUSAL.to_string(),
+            error_code: SHAPE_BOUND_ERROR,
+            message: String::new(),
         },
         WriteRefusalCase {
             case: "a tag value one character past its documented maximum",
             resource_arn: held_arn.clone(),
             tags: vec![tag("env", &"v".repeat(MAX_TAG_VALUE_CHARS + 1))],
             status: 400,
-            error_code: "BadRequestException",
-            message: TAG_VALUE_LENGTH_REFUSAL.to_string(),
+            error_code: SHAPE_BOUND_ERROR,
+            message: String::new(),
         },
         WriteRefusalCase {
             case: "a tag value carrying a symbol outside the set the surface accepts",
@@ -1200,7 +1202,7 @@ async fn tag_resource_refuses_an_arn_it_cannot_resolve_and_a_tag_no_caller_may_d
             tags: vec![tag("aws:created-by", "me")],
             status: 400,
             error_code: "BadRequestException",
-            message: RESERVED_TAG_PREFIX_REFUSAL.to_string(),
+            message: TAG_WRITE_FAILED.to_string(),
         },
         WriteRefusalCase {
             case: "a tag value carrying the prefix reserved for Amazon Web Services",
@@ -1208,7 +1210,7 @@ async fn tag_resource_refuses_an_arn_it_cannot_resolve_and_a_tag_no_caller_may_d
             tags: vec![tag("creator", "aws:ses")],
             status: 400,
             error_code: "BadRequestException",
-            message: RESERVED_TAG_PREFIX_REFUSAL.to_string(),
+            message: TAG_WRITE_FAILED.to_string(),
         },
         WriteRefusalCase {
             case: "one more tag than the resource may carry, once merged",

@@ -427,8 +427,8 @@ pub const RESERVED_TAG_PREFIX: &str = "aws:";
 ///
 /// The model's `Tag` documentation lists "Unicode letters, digits, white space, or one
 /// of the following symbols: _ . : / = + -", and the service's own refusal for a tag
-/// outside the set ([`tag_refusal`]) names those seven and `@` as well, so `@` is in
-/// the set the surface accepts. Written in the order that sentence names them.
+/// outside the set ([`tag_restriction_refusal`]) names those seven and `@` as well, so
+/// `@` is in the set the surface accepts. Written in the order that sentence names them.
 pub const TAG_SYMBOLS: &str = "_.:/=+-@";
 
 /// Whether `text` is in the character set a tag key or a tag value may be written in.
@@ -443,40 +443,48 @@ pub fn tag_text_is_in_charset(text: &str) -> bool {
         .all(|c| c.is_alphanumeric() || c.is_whitespace() || TAG_SYMBOLS.contains(c))
 }
 
-/// How this service words `BadRequestException` for a tag whose key or value is one no
-/// caller may define, or `None` when the pair satisfies every restriction the model's
-/// `Tag` documentation states for a tag a caller defines.
+/// The sentence this surface answers a tagging call whose tags it will not apply.
 ///
-/// Stated once, so every operation that accepts a `TagList` can read those
-/// restrictions the same way rather than disagree about which tags it will store: the
-/// key's documented length ([`MIN_TAG_KEY_CHARS`]..=[`MAX_TAG_KEY_CHARS`] characters),
-/// the value's ([`MAX_TAG_VALUE_CHARS`]), the character set both are written in
-/// ([`tag_text_is_in_charset`]) and the [`RESERVED_TAG_PREFIX`] neither may carry. The
-/// sentences are fixed text: each refusal is about the FORM of what the request
-/// carried, and the bounds and the symbol set are named from the constants above. The
-/// character-set sentence is the one this surface answers a tag outside the set with,
-/// listing the symbols separated by spaces.
-pub fn tag_refusal(key: &str, value: &str) -> Option<String> {
+/// FIXED text, with nothing of the request in it: the refusal states that the resource was
+/// not tagged, and echoes neither the key, nor the value, nor the ARN — a caller learns
+/// which restriction it broke from the documentation of `Tag`, not from the sentence, and
+/// nothing of what it submitted is reflected back to it.
+pub const TAG_WRITE_FAILED: &str = "Failed to tag resource";
+
+/// Whether the tag `key`/`value` breaks a LENGTH bound the model's `Tag` documentation
+/// states for the shapes a tag is built from: the key's
+/// ([`MIN_TAG_KEY_CHARS`]..=[`MAX_TAG_KEY_CHARS`] characters) or the value's
+/// ([`MAX_TAG_VALUE_CHARS`]).
+///
+/// Such a bound is a constraint on the SHAPE a member targets, so a request carrying a
+/// value outside it is refused where a request is validated against the shapes it is built
+/// from — before any rule of the operation's own runs, and with no sentence of this
+/// service's in it. Kept apart from [`tag_restriction_refusal`] for exactly that reason:
+/// the two layers refuse two different conditions, so they must not collapse into one
+/// error class or one message.
+pub fn tag_breaks_shape_bound(key: &str, value: &str) -> bool {
     let key_chars = key.chars().count();
-    if !(MIN_TAG_KEY_CHARS..=MAX_TAG_KEY_CHARS).contains(&key_chars) {
-        return Some(format!(
-            "A tag key must be between {MIN_TAG_KEY_CHARS} and {MAX_TAG_KEY_CHARS} \
-             characters long."
-        ));
-    }
-    if value.chars().count() > MAX_TAG_VALUE_CHARS {
-        return Some(format!(
-            "A tag value must be no more than {MAX_TAG_VALUE_CHARS} characters long."
-        ));
-    }
+    !(MIN_TAG_KEY_CHARS..=MAX_TAG_KEY_CHARS).contains(&key_chars)
+        || value.chars().count() > MAX_TAG_VALUE_CHARS
+}
+
+/// How this service words `BadRequestException` for a tag the SERVICE itself will not
+/// store, or `None` when the pair breaks none of those restrictions.
+///
+/// Stated once, so every operation that accepts a `TagList` can read those restrictions
+/// the same way rather than disagree about which tags it will store: the character set a
+/// key and a value are written in ([`tag_text_is_in_charset`]) and the
+/// [`RESERVED_TAG_PREFIX`] neither may carry. The sentences are fixed text, with nothing
+/// of the request interpolated into either: the character-set one names the set the
+/// surface accepts, and a tag carrying the reserved prefix is refused with the sentence
+/// this surface answers a tagging call it will not apply ([`TAG_WRITE_FAILED`]), which
+/// states no key, value or ARN at all.
+pub fn tag_restriction_refusal(key: &str, value: &str) -> Option<String> {
     if !tag_text_is_in_charset(key) || !tag_text_is_in_charset(value) {
         return Some(tag_charset_refusal());
     }
     if key.starts_with(RESERVED_TAG_PREFIX) || value.starts_with(RESERVED_TAG_PREFIX) {
-        return Some(format!(
-            "The {RESERVED_TAG_PREFIX} prefix is reserved and cannot be used in a tag \
-             key or value."
-        ));
+        return Some(TAG_WRITE_FAILED.to_string());
     }
     None
 }
@@ -1315,6 +1323,12 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     /// the table enumerates deterministically whatever order the jobs were created
     /// in; the order a listing reports them in is
     /// [`ExportJobRecord::listing_key`]'s.
+    ///
+    /// Bounded by [`MAX_EXPORT_JOBS`], which `CreateExportJob` enforces on the one
+    /// path that inserts here, and the file a completed run retains is bounded in
+    /// turn by [`export_file::MAX_EXPORT_FILE_RECORDS`] rows read under
+    /// [`export_file::MAX_EXPORT_FILE_VISITS`] visits — so neither the table nor one
+    /// record grows with what a caller asks for.
     pub export_jobs: BTreeMap<String, ExportJobRecord>,
     /// Import jobs, keyed by the `JobId` minted for them — the only name an import job
     /// has, and the one every import-job operation addresses it by. Ordered, so the

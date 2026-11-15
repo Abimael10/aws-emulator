@@ -155,6 +155,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let resource_arn = input.resource_arn;
+        // The tags the request carries, in the order it supplied them.
+        let requested: Vec<(String, String)> = input
+            .tags
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        // TWO layers refuse a tag, and this is the OUTER one: the lengths the model's
+        // `Tag` documentation states for a key and a value are bounds on the SHAPES a
+        // request is built from, so a request carrying one outside them is refused where a
+        // request is validated against its shapes — before the ARN is resolved, before any
+        // rule of this operation runs, and carrying no sentence of this service's, because
+        // that layer states none. The restrictions the SERVICE enforces on a tag the shapes
+        // do accept are the inner layer below, and answer the operation's own modelled
+        // input error instead.
+        if requested
+            .iter()
+            .any(|(key, value)| crate::state::tag_breaks_shape_bound(key, value))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(String::new()));
+        }
+
         // A value that is no resource ARN of this service, or one naming no resource
         // within it, addresses nothing this API can tag, so it is refused on the input —
         // before any lookup and before any write — with the `BadRequestException` the
@@ -165,15 +187,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(crate::state::UNSUPPORTED_RESOURCE_ARN));
         }
 
-        // `TagKey` and `TagValue` carry no bounds in the model, so the restrictions the
-        // model's `Tag` documentation states on a tag a caller defines are refused here,
-        // on the input: a request carrying one tag it may not define stores NONE of the
-        // tags it carries.
-        let requested: Vec<(String, String)> = input
-            .tags
-            .into_iter()
-            .map(|tag| (tag.key, tag.value))
-            .collect();
         // "A resource can have as many as 50 tags": a request carrying more tags than
         // that is one no resource could end up satisfying, whatever it already carries,
         // so it is refused BEFORE anything walks the list — which is what bounds every
@@ -182,8 +195,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if requested.len() > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(bad_request(crate::state::too_many_tags(requested.len())));
         }
+        // The inner layer: a tag the shapes accept but this service will not store — one
+        // outside the character set, or one carrying the prefix reserved for Amazon Web
+        // Services. The WHOLE batch is read before anything is written, so a request
+        // carrying one tag it may not define stores NONE of the tags it carries.
         for (key, value) in &requested {
-            if let Some(message) = crate::state::tag_refusal(key, value) {
+            if let Some(message) = crate::state::tag_restriction_refusal(key, value) {
                 return Err(bad_request(message));
             }
         }

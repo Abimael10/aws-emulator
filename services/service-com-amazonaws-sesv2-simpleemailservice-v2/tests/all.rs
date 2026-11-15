@@ -199,6 +199,8 @@ mod suppressed_destination_deletion;
 mod suppressed_destinations;
 #[path = "all/suppression_list_scope_refusal.rs"]
 mod suppression_list_scope_refusal;
+#[path = "all/tag_refusal_layers.rs"]
+mod tag_refusal_layers;
 #[path = "all/template_policy_and_tag_reads.rs"]
 mod template_policy_and_tag_reads;
 #[path = "all/tenant_deletion.rs"]
