@@ -1151,6 +1151,22 @@ impl Object {
             .then(|| i32::try_from(self.parts.len()).unwrap_or(i32::MAX))
     }
 
+    /// How many parts the object IS made of: the parts a multipart upload assembled it from,
+    /// and ONE for an object a single write stored whole.
+    ///
+    /// What the `<ActualPartCount>` of a refused part-scoped read states — the count a
+    /// part number was judged against, which is what a client clamps its next read to. It is
+    /// not [`Self::parts_count`]: that member is reported only for an object "uploaded as a
+    /// multipart upload" (`GetObjectOutput$PartsCount`), where a part-scoped read of a
+    /// whole-object write is answered with the object's single part all the same
+    /// ([`Self::part_span`]), so the count the refusal states is never zero.
+    pub fn part_count(&self) -> i32 {
+        match self.parts.is_empty() {
+            true => 1,
+            false => i32::try_from(self.parts.len()).unwrap_or(i32::MAX),
+        }
+    }
+
     /// The span of this object's bytes that `part_number` names, or `None` when the object
     /// has no such part.
     ///

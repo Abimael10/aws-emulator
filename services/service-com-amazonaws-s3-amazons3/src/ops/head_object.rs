@@ -358,6 +358,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // WHICH span of the object this HEAD asks for has to be a span a read can ask for,
+        // judged over the request's own parameters and BEFORE anything about the object is
+        // resolved, through the one rule `GetObject` is judged by: a `partNumber` that is not
+        // an integer inside the published range addresses no part of any object, and a `Range`
+        // beside a `partNumber` asks for two spans at once — "a HEAD request has the same
+        // options as a GET operation on an object" (`HeadObject`'s own documentation), so the
+        // two cannot disagree about which request S3 serves at all.
+        if let Some(value) = crate::service::wire::rejected_part_number(
+            ctx.parts(),
+            super::types::HEAD_OBJECT_INPUT_SCHEMA,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_part_number_argument(
+                &value,
+            ));
+        }
+        if crate::service::wire::selects_both_range_and_part_number(
+            ctx.parts(),
+            super::types::HEAD_OBJECT_INPUT_SCHEMA,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                crate::state::RANGE_AND_PART_NUMBER_MESSAGE,
+            ));
+        }
+
+        // The RESPONSE HEADERS this read is asked to override have to be ones it can override,
+        // by the same rule and from the same source — the model's own override members
+        // ([`crate::service::wire::unoverridable_response_header`]).
+        if let Some((parameter, value)) = crate::service::wire::unoverridable_response_header(
+            ctx.parts(),
+            super::types::HEAD_OBJECT_INPUT_SCHEMA,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_argument(
+                &parameter,
+                Some(&value),
+                crate::state::unoverridable_response_header_message(&parameter),
+            ));
+        }
+
         // The ENCRYPTION HEADERS a WRITE names the configuration of the object it stores in
         // are not this operation's input: this read REPORTS that configuration in headers of
         // the same names, so one that CARRIES them is refused for the header, through the one
@@ -555,10 +595,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (Some(part_number), _) => match object.part_span(part_number) {
                 Some(span) => Some(span),
                 None => {
-                    return Err(crate::scaffolded::Scaffolded::unmodeled(
-                        crate::state::INVALID_PART_NUMBER_CODE,
-                        crate::state::INVALID_PART_NUMBER_STATUS,
-                        crate::state::INVALID_PART_NUMBER_MESSAGE,
+                    return Err(crate::scaffolded::Scaffolded::invalid_part_number(
+                        part_number,
+                        object.part_count(),
                     ))
                 }
             },

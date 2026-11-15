@@ -247,16 +247,6 @@ async fn a_read_that_names_a_span_answers_that_span() {
             span: Some((first_part, total - 1)),
         },
         Served {
-            // Both at once: the part number IS the range it asks for ("effectively performs
-            // a 'ranged' GET request for the part specified",
-            // `GetObjectRequest$PartNumber`), so it decides the span and the `Range` beside
-            // it cannot name a second one the answer also is.
-            case: "a part number beside a byte range",
-            range: Some("bytes=0-9"),
-            part_number: Some(2),
-            span: Some((first_part, total - 1)),
-        },
-        Served {
             case: "a closed range inside the first part",
             range: Some("bytes=0-9"),
             part_number: None,

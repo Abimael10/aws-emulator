@@ -359,6 +359,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //   customer-provided one is read with, matched below against the digest that object
         //   records ([`crate::state::sse_customer`]).
 
+        // WHICH span of the object this read asks for has to be a span a read can ask for,
+        // judged over the request's own parameters and BEFORE anything about the object is
+        // resolved — a request-validation fault is not a span that cannot be served:
+        //
+        // * a `partNumber` that is not an integer inside the published range addresses no
+        //   part of any object ([`crate::state::part_number_addresses_a_part`]), which S3
+        //   refuses naming the parameter and the value as sent;
+        // * a `Range` beside a `partNumber` asks for two spans at once, which no one answer
+        //   can be ([`crate::state::RANGE_AND_PART_NUMBER_MESSAGE`]).
+        if let Some(value) = crate::service::wire::rejected_part_number(
+            ctx.parts(),
+            super::types::GET_OBJECT_INPUT_SCHEMA,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_part_number_argument(
+                &value,
+            ));
+        }
+        if crate::service::wire::selects_both_range_and_part_number(
+            ctx.parts(),
+            super::types::GET_OBJECT_INPUT_SCHEMA,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                crate::state::RANGE_AND_PART_NUMBER_MESSAGE,
+            ));
+        }
+
+        // The RESPONSE HEADERS this read is asked to override have to be ones it can override:
+        // the model binds one member per overridable header, so a `response-`-prefixed
+        // parameter it binds no member for names no overridable header at all — which S3
+        // refuses rather than serving the object with the override dropped
+        // ([`crate::service::wire::unoverridable_response_header`] holds the rule, read off
+        // the model's own members).
+        if let Some((parameter, value)) = crate::service::wire::unoverridable_response_header(
+            ctx.parts(),
+            super::types::GET_OBJECT_INPUT_SCHEMA,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_argument(
+                &parameter,
+                Some(&value),
+                crate::state::unoverridable_response_header_message(&parameter),
+            ));
+        }
+
         // The ENCRYPTION HEADERS a WRITE names the configuration of the object it stores in
         // are not this operation's input at all: a read REPORTS the configuration the object
         // was stored under in headers of the same names, so one that CARRIES them asks this
@@ -544,13 +589,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // range at all.
         //
         // `partNumber` is judged first: a number the object has no part for is
-        // `InvalidPartNumber` (416), and a `Range` asking for bytes outside the object is
-        // `InvalidRange` (416) — the two refusals HTTP has for a span that cannot be served.
-        //
-        // A request naming BOTH is answered with the part: "effectively performs a 'ranged'
-        // GET request for the part specified" (`GetObjectRequest$PartNumber`) — the part
-        // number IS the range it asks for, so it decides the span and the `Range` beside it
-        // names a second one the answer cannot also be.
+        // `InvalidPartNumber` (416), naming the number and the count it was judged against,
+        // and a `Range` asking for bytes outside the object is `InvalidRange` (416) — the two
+        // refusals HTTP has for a span that cannot be served. A request naming BOTH named no
+        // one span and was refused above, before any of this.
         //
         // The SPAN is resolved against the version the address resolved to and BEFORE
         // everything else this read is judged by — the key it presents, the conditions it
@@ -563,10 +605,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (Some(part_number), _) => match object.part_span(part_number) {
                 Some(span) => Some(span),
                 None => {
-                    return Err(crate::scaffolded::Scaffolded::unmodeled(
-                        crate::state::INVALID_PART_NUMBER_CODE,
-                        crate::state::INVALID_PART_NUMBER_STATUS,
-                        crate::state::INVALID_PART_NUMBER_MESSAGE,
+                    return Err(crate::scaffolded::Scaffolded::invalid_part_number(
+                        part_number,
+                        object.part_count(),
                     ))
                 }
             },

@@ -127,6 +127,27 @@ pub const VERSION_ID_ARGUMENT: &str = "versionId";
 /// shaped like a version id ([`version_id_is_well_formed`]).
 pub const INVALID_VERSION_ID_MESSAGE: &str = "Invalid version id specified";
 
+/// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for a `versionId` the request
+/// stated with NO text at all.
+///
+/// A parameter stated empty is a different fault from one stated wrong: it names no version
+/// because it names nothing, which S3 says in a sentence of its own rather than in the one
+/// for a token that is not a version id ([`INVALID_VERSION_ID_MESSAGE`]). Fixed text, with
+/// nothing of the request in it — the empty value travels in the envelope's
+/// `<ArgumentValue>`. Chosen through [`invalid_version_id_message`], so every operation that
+/// takes a `versionId` tells the two apart the same way.
+pub const EMPTY_VERSION_ID_MESSAGE: &str = "Version id cannot be the empty string";
+
+/// The sentence S3 refuses `version_id` with: the one for a parameter stated EMPTY
+/// ([`EMPTY_VERSION_ID_MESSAGE`]) and otherwise the one for a token that is not a version id
+/// ([`INVALID_VERSION_ID_MESSAGE`]).
+pub fn invalid_version_id_message(version_id: &str) -> &'static str {
+    match version_id.is_empty() {
+        true => EMPTY_VERSION_ID_MESSAGE,
+        false => INVALID_VERSION_ID_MESSAGE,
+    }
+}
+
 /// The request field a refused `x-amz-copy-source` is reported against — the header every
 /// operation that takes a copy source binds it from
 /// (`smithy_query(query="operation",operation="CopyObject,UploadPartCopy")` reports
@@ -995,6 +1016,71 @@ pub const INVALID_ARGUMENT_STATUS: u16 = 400;
 /// two ways.
 pub fn invalid_part_number_message() -> String {
     format!("Part number must be an integer between {MIN_PART_NUMBER} and {MAX_PART_NUMBER}, inclusive")
+}
+
+/// The request field a refused `partNumber` is reported against — the query parameter the
+/// object reads bind it from (`smithy_query(query="operation",operation="GetObject")` reports
+/// `PartNumber: {httpQuery: "partNumber"}`), which is how S3's `InvalidArgument` document
+/// names the argument it rejected.
+pub const PART_NUMBER_ARGUMENT: &str = "partNumber";
+
+/// Whether `value` — the text a request stated `partNumber` with — addresses a part at all.
+///
+/// A part number is "a positive integer between 1 and 10,000"
+/// (`UploadPartRequest$PartNumber`), so text that is no integer and an integer outside
+/// [`MIN_PART_NUMBER`]..=[`MAX_PART_NUMBER`] are the SAME fault: neither names a part of any
+/// object, and S3 refuses both with the one sentence that range publishes
+/// ([`invalid_part_number_message`]). The TEXT is judged rather than a bound number, so the
+/// two cannot be told apart by how far the codec got with the value.
+pub fn part_number_addresses_a_part(value: &str) -> bool {
+    value
+        .parse::<i32>()
+        .is_ok_and(|number| (MIN_PART_NUMBER..=MAX_PART_NUMBER).contains(&number))
+}
+
+/// Whether the codec must not be handed the `partNumber` text a request carried: text that is
+/// no integer of the member's own type at all, which the codec can only report as a parse
+/// failure in a sentence about Rust types where S3 states the rule the value broke. An
+/// integer binds and is judged against the published range by the operation, through the one
+/// reading above.
+pub fn withholds_part_number(value: &str) -> bool {
+    value.parse::<i32>().is_err()
+}
+
+/// The `<Message>` S3 sends with [`INVALID_REQUEST_CODE`] for a read that selects a span of
+/// the object BOTH ways at once — a `Range` header beside a `partNumber` query parameter.
+///
+/// Each selects a span of its own ("downloads the specified byte range of an object",
+/// `GetObjectRequest$Range`; "effectively performs a 'ranged' GET request for the part
+/// specified", `$PartNumber`), so a request stating both asks for two spans and names no one
+/// answer. Fixed text naming the two parameters, with nothing of the request in it.
+pub const RANGE_AND_PART_NUMBER_MESSAGE: &str =
+    "Cannot specify both Range header and partNumber query parameter";
+
+/// The prefix the query parameters that OVERRIDE a response header are published under:
+/// every such member of an object read binds a `response-`-prefixed parameter
+/// (`smithy_query(query="operation",operation="GetObject")` reports `response-cache-control`,
+/// `response-content-disposition`, `response-content-encoding`, `response-content-language`,
+/// `response-content-type` and `response-expires`).
+///
+/// What makes a parameter one of that SET is therefore the model itself, not a list written
+/// here: a read refuses a `response-`-prefixed parameter it binds no member for
+/// ([`unoverridable_response_header_message`]), so the set cannot drift from the members the
+/// read actually honours.
+pub const RESPONSE_HEADER_OVERRIDE_PREFIX: &str = "response-";
+
+/// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for a read asking to override a
+/// response header that is not one of the overridable ones
+/// ([`RESPONSE_HEADER_OVERRIDE_PREFIX`]).
+///
+/// The sentence NAMES the parameter the request carried — the only variable part — and then
+/// states the rule and where the set is published; a misspelled override would otherwise be
+/// ignored and the caller served a response it did not ask for.
+pub fn unoverridable_response_header_message(parameter: &str) -> String {
+    format!(
+        "{parameter} is not in the set of overridable response headers. Please refer to the \
+         S3 API documentation for a complete list of overridable response headers."
+    )
 }
 
 /// The code S3 answers an annotation NAME that breaks the naming rules with — a name that

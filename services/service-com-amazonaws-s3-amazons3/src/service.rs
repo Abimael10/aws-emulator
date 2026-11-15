@@ -687,6 +687,19 @@ fn published_refusal(violation: &Violation) -> Option<Refused> {
             crate::state::INVALID_ARGUMENT_CODE,
             "Unknown metadata directive.".to_string(),
         ),
+        // The `partNumber` a part-scoped call addresses a part by: "a positive integer
+        // between 1 and 10,000" (`UploadPartRequest$PartNumber`), so text that is no integer
+        // at all addresses no part — which S3 reports against the published RANGE, in the
+        // sentence that range publishes, rather than as a value the codec could not read.
+        // Such text is withheld from the codec
+        // (`wire::QUERY_PARAMETERS_JUDGED_BY_THE_HANDLER`), which leaves the operations that
+        // REQUIRE the parameter with none; the reads, whose member is optional, answer it
+        // themselves and name the value as sent beside the sentence
+        // (`crate::scaffolded::Scaffolded::invalid_part_number_argument`).
+        "partNumber" => (
+            crate::state::INVALID_ARGUMENT_CODE,
+            crate::state::invalid_part_number_message(),
+        ),
         // The `encoding-type` every listing binds: the value names the encoding S3 is to
         // write the response's key-name elements in, so a value outside the one the model
         // declares names no encoding method at all — which S3 reports against the METHOD

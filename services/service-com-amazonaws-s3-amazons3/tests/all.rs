@@ -331,6 +331,8 @@ mod object_plane_byte_budget;
 mod object_read_authorization;
 #[path = "all/object_read_request_headers.rs"]
 mod object_read_request_headers;
+#[path = "all/object_read_request_parameters.rs"]
+mod object_read_request_parameters;
 #[path = "all/object_read_policy_union.rs"]
 mod object_read_policy_union;
 #[path = "all/object_replication.rs"]

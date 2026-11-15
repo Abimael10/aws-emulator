@@ -1759,6 +1759,99 @@ pub(crate) fn rejected_bucket_region(
     (!crate::state::names_an_aws_region(&value)).then_some(value)
 }
 
+/// The request header a read binds the byte range it asks for from
+/// (`smithy_query(query="operation",operation="GetObject")` reports
+/// `Range: {httpHeader: "Range"}`), which is the other way one selects a span of the object
+/// — see [`selects_both_range_and_part_number`].
+const RANGE_HEADER: &str = "Range";
+
+/// The `partNumber` value `parts` carried that addresses no part of any object, as the
+/// request spelled it — or `None` for a request addressing one, carrying none, and for an
+/// operation that binds no such parameter.
+///
+/// The judgement is made over the request's own QUERY TEXT, for the reason the page bounds
+/// above are: S3's refusal of such a value names the parameter and echoes the value as sent in
+/// members only a handler's envelope can carry, and a value that is no integer the codec
+/// cannot word at all — its sentence is about Rust types — so that text is withheld from the
+/// codec ([`without_withheld_parameters`]) and both faults are answered through the one
+/// reading of them ([`crate::state::part_number_addresses_a_part`]).
+pub(crate) fn rejected_part_number(
+    parts: &::http::request::Parts,
+    input_schema: &Schema,
+) -> Option<String> {
+    let value = bound_query_value(
+        parts.uri.query().unwrap_or_default(),
+        input_schema,
+        crate::state::PART_NUMBER_ARGUMENT,
+    )?;
+    (!crate::state::part_number_addresses_a_part(&value)).then_some(value)
+}
+
+/// Whether `parts` selects a span of the object BOTH ways at once — a `Range` header beside a
+/// `partNumber` query parameter — for an operation whose input binds both.
+///
+/// The `partNumber` is read from the query TEXT rather than from the bound member, so a
+/// request stating it in a value the codec was not handed is still a request that stated it.
+pub(crate) fn selects_both_range_and_part_number(
+    parts: &::http::request::Parts,
+    input_schema: &Schema,
+) -> bool {
+    let states_part_number = bound_query_value(
+        parts.uri.query().unwrap_or_default(),
+        input_schema,
+        crate::state::PART_NUMBER_ARGUMENT,
+    )
+    .is_some();
+    states_part_number
+        && header_member(input_schema, RANGE_HEADER).is_some()
+        && parts.headers.contains_key(RANGE_HEADER)
+}
+
+/// The `response-`-prefixed query parameter `parts` carried that overrides no response header
+/// — the parameter name as the request spelled it — or `None` for a request whose overrides
+/// are all in the set.
+///
+/// WHICH overrides are in the set is the MODEL's answer: the operation's input binds one
+/// member per overridable response header, each under its own `response-`-prefixed query
+/// parameter, so a parameter under that prefix the input binds no member for names no
+/// overridable header. Read here, over the request's own query, because the codec ignores a
+/// parameter no member binds — the read would be served with the override silently dropped —
+/// and because the refusal names the parameter in its sentence and in its envelope.
+///
+/// An operation that binds no such member at all (one with no overrides to ask for) is left
+/// alone: the prefix means nothing on it.
+pub(crate) fn unoverridable_response_header(
+    parts: &::http::request::Parts,
+    input_schema: &Schema,
+) -> Option<(String, String)> {
+    let query = parts.uri.query().unwrap_or_default();
+    if !binds_a_response_header_override(input_schema) {
+        return None;
+    }
+    query.split('&').find_map(|parameter| {
+        let (name, value) = match parameter.split_once('=') {
+            Some((name, value)) => (name, super::sigv4::percent_decoded(value)),
+            None => (parameter, String::new()),
+        };
+        let name = super::sigv4::percent_decoded(name);
+        let overrides_a_header = name.starts_with(crate::state::RESPONSE_HEADER_OVERRIDE_PREFIX);
+        (overrides_a_header && query_member(input_schema, &name).is_none())
+            .then_some((name, value))
+    })
+}
+
+/// Whether `input_schema` binds any OVERRIDE of a response header at all — see
+/// [`unoverridable_response_header`].
+fn binds_a_response_header_override(input_schema: &Schema) -> bool {
+    input_schema.members().iter().any(|member| {
+        member.http_query().is_some_and(|query| {
+            query
+                .value()
+                .starts_with(crate::state::RESPONSE_HEADER_OVERRIDE_PREFIX)
+        })
+    })
+}
+
 /// The `encoding-type` text `parts` carried, or `None` for a listing that carried none and
 /// for one that carried it with no value, which asks for no encoding
 /// ([`crate::state::withholds_empty_listing_value`]).
@@ -1823,18 +1916,24 @@ type WithholdsValue = fn(&str) -> bool;
 /// itself: a page bound S3 refuses in an envelope with members of its own — the
 /// `<ArgumentName>` / `<ArgumentValue>` pair naming the parameter and the value as sent,
 /// which only a handler can answer, where the codec can only report a parse failure in a
-/// sentence about Rust types; a narrowing parameter stated with NO value, which states
-/// nothing at all ([`crate::state::withholds_empty_listing_value`]); and a response override
+/// sentence about Rust types; the PART NUMBER a read addresses a part by, refused in that same
+/// envelope and against the published range ([`rejected_part_number`]); a narrowing parameter
+/// stated with NO value, which states nothing at all
+/// ([`crate::state::withholds_empty_listing_value`]); and a response override
 /// S3 ECHOES as the text it arrived as, which the codec would refuse the whole read for.
 ///
 /// So the value is kept from the codec, exactly as the two headers an operation judges are
 /// ([`HEADERS_JUDGED_BY_THE_HANDLER`]), and the operation reads it from the request's own
 /// query ([`rejected_max_buckets`], [`rejected_max_keys`], [`response_expires_as_sent`]).
 /// Each rule is still enforced, in that one place.
-const QUERY_PARAMETERS_JUDGED_BY_THE_HANDLER: [(&str, WithholdsValue); 5] = [
+const QUERY_PARAMETERS_JUDGED_BY_THE_HANDLER: [(&str, WithholdsValue); 6] = [
     (
         crate::state::MAX_BUCKETS_ARGUMENT,
         crate::state::withholds_max_buckets,
+    ),
+    (
+        crate::state::PART_NUMBER_ARGUMENT,
+        crate::state::withholds_part_number,
     ),
     (
         crate::state::MAX_KEYS_ARGUMENT,

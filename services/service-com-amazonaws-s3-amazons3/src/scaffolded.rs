@@ -880,6 +880,35 @@ static ACTUAL_OBJECT_SIZE: Schema = Schema::new_member(
 )
 .with_xml_name("ActualObjectSize");
 
+/// The `<PartNumberRequested>` of an S3 error document: the part number the read asked for,
+/// where the object has no part of that number.
+static PART_NUMBER_REQUESTED: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#UnsatisfiablePartNumber$partNumberRequested",
+        "smithy.framework",
+        "partNumberRequested",
+    ),
+    ShapeType::Integer,
+    "partNumberRequested",
+    24,
+)
+.with_xml_name("PartNumberRequested");
+
+/// The `<ActualPartCount>` of an S3 error document: how many parts the object actually has —
+/// written after [`PART_NUMBER_REQUESTED`], which is what makes the pair actionable, since
+/// the sentence of that class states neither number.
+static ACTUAL_PART_COUNT: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#UnsatisfiablePartNumber$actualPartCount",
+        "smithy.framework",
+        "actualPartCount",
+    ),
+    ShapeType::Integer,
+    "actualPartCount",
+    25,
+)
+.with_xml_name("ActualPartCount");
+
 /// The `<Condition>` of an S3 error document: the conditional HEADER of the request that did
 /// not hold.
 static UNMET_CONDITION: Schema = Schema::new_member(
@@ -1148,6 +1177,15 @@ pub enum ErrorDetail {
         /// The size of the representation it was judged against, in bytes.
         actual_object_size: i64,
     },
+    /// A part number the object holds no part under, named by the `<PartNumberRequested>` /
+    /// `<ActualPartCount>` pair: the number the read asked for and how many parts the object
+    /// actually has, which is what a client clamps its next part-scoped read to.
+    PartNumber {
+        /// The part number the read asked for.
+        requested: i32,
+        /// How many parts the object it was judged against is made of.
+        actual_part_count: i32,
+    },
     /// A precondition that did not hold, named by `<Condition>`: the conditional HEADER of
     /// the request that failed.
     Condition(String),
@@ -1274,6 +1312,13 @@ impl ErrorDetail {
                 s.write_string(&RANGE_REQUESTED, requested)?;
                 s.write_long(&ACTUAL_OBJECT_SIZE, *actual_object_size)
             }
+            Self::PartNumber {
+                requested,
+                actual_part_count,
+            } => {
+                s.write_integer(&PART_NUMBER_REQUESTED, *requested)?;
+                s.write_integer(&ACTUAL_PART_COUNT, *actual_part_count)
+            }
             Self::Condition(condition) => s.write_string(&UNMET_CONDITION, condition),
             Self::LocationConstraint(location) => s.write_string(&LOCATION_CONSTRAINT, location),
             Self::Size {
@@ -1329,6 +1374,10 @@ impl ErrorDetail {
                 requested,
                 actual_object_size,
             } => format!("{requested} of {actual_object_size} bytes"),
+            Self::PartNumber {
+                requested,
+                actual_part_count,
+            } => format!("part {requested} of {actual_part_count}"),
             Self::Size {
                 size,
                 max_size_allowed,
@@ -1577,6 +1626,48 @@ impl<E> Scaffolded<E> {
         })
     }
 
+    /// The refusal S3 answers a read whose `partNumber` names no part of the object with:
+    /// [`crate::state::INVALID_PART_NUMBER_CODE`] at
+    /// [`crate::state::INVALID_PART_NUMBER_STATUS`], the fixed sentence that code publishes,
+    /// and the `<PartNumberRequested>` / `<ActualPartCount>` pair — the number asked for and
+    /// how many parts the object has, which is what a client clamps its next read to.
+    ///
+    /// Not the refusal of a number outside the published RANGE: that value addresses no part
+    /// of any object and is a bad argument ([`Self::invalid_part_number_argument`]), where
+    /// this is a well-formed number the object simply has no part under.
+    ///
+    /// The ONE place that pair is attached, so every part-scoped read in this service refuses
+    /// the same way.
+    pub fn invalid_part_number(requested: i32, actual_part_count: i32) -> Self {
+        Self::unmodeled(
+            crate::state::INVALID_PART_NUMBER_CODE,
+            crate::state::INVALID_PART_NUMBER_STATUS,
+            crate::state::INVALID_PART_NUMBER_MESSAGE,
+        )
+        .naming(ErrorDetail::PartNumber {
+            requested,
+            actual_part_count,
+        })
+    }
+
+    /// The refusal S3 answers a `partNumber` that addresses no part of ANY object with — text
+    /// that is no integer, and an integer outside the published range
+    /// ([`crate::state::part_number_addresses_a_part`] is the one reading of it): the
+    /// `InvalidArgument` above carrying the fixed sentence that range publishes
+    /// ([`crate::state::invalid_part_number_message`]), naming the `partNumber` parameter and
+    /// echoing the value as the request spelled it.
+    ///
+    /// One place, so a value that names no part is refused identically wherever it arrives —
+    /// and before the span of any object is resolved, which is what keeps a request
+    /// validation fault from being answered as a range that cannot be served.
+    pub fn invalid_part_number_argument(value: &str) -> Self {
+        Self::invalid_argument(
+            crate::state::PART_NUMBER_ARGUMENT,
+            Some(value),
+            crate::state::invalid_part_number_message(),
+        )
+    }
+
     /// The refusal S3 answers a method used against a kind of resource that does not allow it
     /// with: `MethodNotAllowed` at [`crate::state::METHOD_NOT_ALLOWED_STATUS`], the fixed
     /// sentence that code publishes, and the `<Method>` / `<ResourceType>` pair — the method
@@ -1720,15 +1811,16 @@ impl<E> Scaffolded<E> {
 
     /// The refusal every operation that takes a `versionId` answers one that is not shaped
     /// like a version id with ([`crate::state::version_id_is_well_formed`] decides it): the
-    /// `InvalidArgument` above, naming the `versionId` parameter and echoing the token it
-    /// rejected.
+    /// `InvalidArgument` above, naming the `versionId` parameter, echoing the token it
+    /// rejected and carrying the sentence that FAULT publishes — the parameter stated with no
+    /// text at all has its own ([`crate::state::invalid_version_id_message`]).
     ///
     /// One place, so a malformed id is refused identically wherever it arrives.
     pub fn invalid_version_id(version_id: &str) -> Self {
         Self::invalid_argument(
             crate::state::VERSION_ID_ARGUMENT,
             Some(version_id),
-            crate::state::INVALID_VERSION_ID_MESSAGE,
+            crate::state::invalid_version_id_message(version_id),
         )
     }
 
