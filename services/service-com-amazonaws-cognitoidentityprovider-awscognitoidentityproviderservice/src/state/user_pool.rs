@@ -5,6 +5,26 @@
 
 use super::*;
 
+/// One alphabet per character class a password policy can require — uppercase,
+/// lowercase, a digit and a symbol (`PasswordPolicyType.RequireUppercase` /
+/// `RequireLowercase` / `RequireNumbers` / `RequireSymbols`, this service's model) —
+/// so a password drawing one character from each satisfies every combination of
+/// those requirements ([`UserPool::generated_temporary_password`]).
+///
+/// The symbols are drawn from the printable, non-alphanumeric characters a policy
+/// counts as symbols; none of them is whitespace, which `PasswordType` forbids.
+const PASSWORD_CLASS_ALPHABETS: [&[u8]; 4] = [
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    b"abcdefghijklmnopqrstuvwxyz",
+    b"0123456789",
+    b"!#$%&*+-=?@^_~",
+];
+
+/// The longest password there is: `PasswordType` is `len 0..256` (this service's model), so
+/// a generated one is never built longer than that however long a stored policy asks for
+/// ([`UserPool::generated_temporary_password`]).
+const MAX_PASSWORD_LENGTH: usize = 256;
+
 /// One stored user pool, with the app clients and users it owns.
 #[derive(Debug, Clone)]
 pub struct UserPool {
@@ -987,6 +1007,37 @@ impl UserPool {
         // Saturating, so no stored policy value can ask for a number of seconds
         // the arithmetic cannot represent.
         Duration::from_secs(u64::try_from(days).unwrap_or(0).saturating_mul(24 * 60 * 60))
+    }
+
+    /// A temporary password this pool issues ITSELF, for an invitation whose request
+    /// submitted none: "if you don't specify a value, Amazon Cognito generates one for
+    /// you" (`AdminCreateUser.TemporaryPassword`).
+    ///
+    /// What it generates satisfies the policy a SUBMITTED temporary password is held to
+    /// ([`Self::check_password`]) — one character of each class a policy can require,
+    /// then alphanumeric filler up to the length it requires — so the credential the
+    /// invitation carries is one its holder can actually sign in with, and it carries no
+    /// whitespace, which `PasswordType` (`^[\S]+$`) forbids.
+    ///
+    /// The length is CLAMPED to what a password may be: `PasswordType` is `len 0..256`, so
+    /// no stored policy can ask this to build a longer one.
+    #[must_use]
+    pub fn generated_temporary_password(&self) -> String {
+        let required_length = usize::try_from(
+            self.password_policy()
+                .minimum_length
+                .unwrap_or(DEFAULT_PASSWORD_MIN_LENGTH),
+        )
+        .unwrap_or(0)
+        .min(MAX_PASSWORD_LENGTH);
+        let mut password = String::new();
+        for alphabet in PASSWORD_CLASS_ALPHABETS {
+            password.push_str(&random_from_alphabet(alphabet, 1));
+        }
+        password.push_str(&random_alphanumeric_token(
+            required_length.saturating_sub(password.chars().count()),
+        ));
+        password
     }
 
     /// Whether this pool's schema declares the attribute `name` — a standard

@@ -60,16 +60,31 @@ pub(super) fn random_token(len: usize) -> String {
     token
 }
 
-/// `len` random characters of [`ALPHANUMERIC_ALPHABET`], drawn from the same
-/// randomness [`random_token`] draws on: each byte of a v4 UUID, read as the hex
-/// pair it is rendered as, picks one character of the alphabet. A byte past the
-/// last whole multiple of the alphabet is DROPPED rather than folded, so no
-/// character is drawn more often than another.
+/// `len` random characters of [`ALPHANUMERIC_ALPHABET`]
+/// ([`random_from_alphabet`]).
 pub(super) fn random_alphanumeric_token(len: usize) -> String {
-    let alphabet = ALPHANUMERIC_ALPHABET.len();
+    random_from_alphabet(ALPHANUMERIC_ALPHABET, len)
+}
+
+/// `len` random characters of `alphabet`, drawn from the same randomness
+/// [`random_token`] draws on: each byte of a v4 UUID, read as the hex pair it is
+/// rendered as, picks one character of the alphabet. A byte past the last whole
+/// multiple of the alphabet is DROPPED rather than folded, so no character is
+/// drawn more often than another.
+///
+/// An EMPTY alphabet draws nothing: there is no character to pick.
+pub(super) fn random_from_alphabet(alphabet: &[u8], len: usize) -> String {
+    let alphabet_size = alphabet.len();
+    if alphabet_size == 0 {
+        return String::new();
+    }
     // The byte values that leave the draw uniform: the ones below the last whole
-    // multiple of the alphabet's size.
-    let drawable = 256 - 256 % alphabet;
+    // multiple of the alphabet's size. An alphabet no byte value can index past
+    // leaves every byte drawable.
+    let drawable = match 256_usize.checked_rem(alphabet_size) {
+        Some(remainder) if alphabet_size < 256 => 256 - remainder,
+        _ => 256,
+    };
     let mut token = String::with_capacity(len);
     while token.len() < len {
         let hex = random_token(len.saturating_sub(token.len()).saturating_mul(4));
@@ -80,7 +95,7 @@ pub(super) fn random_alphanumeric_token(len: usize) -> String {
                 .map(usize::from)
                 .filter(|drawn| *drawn < drawable);
             if let Some(drawn) = drawn {
-                token.push(char::from(ALPHANUMERIC_ALPHABET[drawn % alphabet]));
+                token.push(char::from(alphabet[drawn % alphabet_size]));
             }
         }
     }

@@ -17,6 +17,8 @@ mod add_custom_attributes;
 mod add_user_pool_client_secret;
 #[path = "all/admin_confirm_sign_up.rs"]
 mod admin_confirm_sign_up;
+#[path = "all/admin_create_user_invitation.rs"]
+mod admin_create_user_invitation;
 #[path = "all/admin_delete_user_attributes.rs"]
 mod admin_delete_user_attributes;
 #[path = "all/admin_get_user_auth_factors.rs"]

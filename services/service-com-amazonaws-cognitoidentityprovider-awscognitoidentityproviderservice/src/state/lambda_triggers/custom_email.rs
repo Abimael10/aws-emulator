@@ -60,6 +60,12 @@ const NO_WRAPPED_KEY_ERROR: &str = "The configured KMS key wrapped no key for th
 pub enum CustomEmailSource {
     /// A sign-up's confirmation code, sent by `SignUp`.
     SignUp,
+    /// The temporary password of the invitation an administrative create sends, by
+    /// `AdminCreateUser` — the credential "the user must enter ... in the sign-in page,
+    /// along with a new password to be used in all future sign-ins"
+    /// (`AdminCreateUser.TemporaryPassword`), which is one of the "temporary passwords sent
+    /// to `CustomEmailSender`" the pool's key wraps (`LambdaConfigType$KMSKeyID`).
+    AdminCreateUser,
     /// A sign-up confirmation code sent again, by `ResendConfirmationCode`.
     ResendCode,
     /// A password-reset code, sent by `ForgotPassword` and by `AdminResetUserPassword`.
@@ -78,6 +84,7 @@ impl CustomEmailSource {
     pub fn trigger_source(self) -> &'static str {
         match self {
             Self::SignUp => "CustomEmailSender_SignUp",
+            Self::AdminCreateUser => "CustomEmailSender_AdminCreateUser",
             Self::ResendCode => "CustomEmailSender_ResendCode",
             Self::ForgotPassword => "CustomEmailSender_ForgotPassword",
             Self::UpdateUserAttribute => "CustomEmailSender_UpdateUserAttribute",
@@ -344,6 +351,7 @@ mod tests {
     fn every_trigger_source_names_the_custom_email_sender_and_its_stage() {
         let cases = [
             (CustomEmailSource::SignUp, "SignUp"),
+            (CustomEmailSource::AdminCreateUser, "AdminCreateUser"),
             (CustomEmailSource::ResendCode, "ResendCode"),
             (CustomEmailSource::ForgotPassword, "ForgotPassword"),
             (CustomEmailSource::UpdateUserAttribute, "UpdateUserAttribute"),

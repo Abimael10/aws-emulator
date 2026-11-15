@@ -9,6 +9,10 @@
 //! of the account's values the pool takes as verified — and a function that failed creates
 //! nobody ([`crate::state::lambda_triggers::pre_sign_up`]).
 //!
+//! A pool carrying a `LambdaConfig.CustomEmailSender` has the INVITATION this create sends
+//! handed to that function instead of mailed, carrying the temporary password it invites its
+//! recipient to sign in with ([`crate::state::lambda_triggers::custom_email`]).
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -278,7 +282,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the pool's pre-sign-up function is invoked: nothing else of this service can be
         // served while a function is being waited for.
         let creating = match self.plan(&input, caller)? {
-            Planned::Resent(answer) => return Ok(answer),
+            Planned::Resent { answer, invitation } => {
+                // A resend "resend[s] the invitation message to a user that already exists"
+                // (`AdminCreateUser.MessageAction`), so the message it sends again is
+                // delivered the same way the first one was.
+                self.deliver_invitation(&input, ctx, caller, invitation.as_ref())
+                    .await?;
+                return Ok(answer);
+            }
             Planned::Create(creating) => creating,
         };
 
@@ -295,15 +306,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await
         .map_err(trigger_failed)?;
-        self.store(*creating, &decision)
+        let invitation = creating.invitation.clone();
+        let created = self.store(*creating, &decision)?;
+
+        // The account exists now, so the invitation that carries its temporary password is
+        // delivered. On a pool that routes its email to a custom sender that means handing
+        // the password to the configured function rather than mailing it; a create that
+        // sends no invitation at all hands over nothing.
+        self.deliver_invitation(&input, ctx, caller, invitation.as_ref())
+            .await?;
+        Ok(created)
     }
 }
+
+/// The invitation message one create or resend sends: the user it is addressed to, and the
+/// temporary password it carries.
+///
+/// No `Debug`: the password it holds is a credential, and a type that carries one stays out
+/// of every formatter.
+#[derive(Clone)]
+struct Invitation {
+    /// The STORED username of the user invited, however the request named it.
+    username: String,
+    /// The temporary password the message carries, which is what its recipient signs in
+    /// with once.
+    temporary_password: String,
+}
+
+/// The user attribute whose stored value an invitation sent by email is addressed to, which
+/// is the medium a pool's custom email sender is the channel of
+/// ([`crate::state::DELIVERY_MEDIUM_ATTRIBUTES`] maps the two to each other).
+const EMAIL_ATTRIBUTE: &str = "email";
+
+/// The `MessageActionType` value that sends no message at all: "set to SUPPRESS to suppress
+/// sending the message" (`AdminCreateUser.MessageAction`).
+const SUPPRESS_MESSAGE: &str = "SUPPRESS";
 
 /// What the request resolved to under the lock: the invitation a `RESEND` sent again, which is
 /// already answered, or the account a create would store.
 enum Planned {
-    /// A `RESEND`, answered from the user whose invitation it reset.
-    Resent(AdminCreateUserOutput),
+    /// A `RESEND`, answered from the user whose invitation it reset, with the invitation it
+    /// sends again.
+    Resent {
+        /// The answer the resend owes, rendered from the user it reset.
+        answer: AdminCreateUserOutput,
+        /// The invitation it sends again, or `None` where it sends none.
+        invitation: Option<Invitation>,
+    },
     /// A create, which the pool's pre-sign-up function evaluates before it is stored.
     Create(Box<Creating>),
 }
@@ -319,6 +368,9 @@ struct Creating {
     user: crate::state::User,
     /// The pool's pre-sign-up invocation, or `None` for a pool that configures none.
     dispatch: Option<crate::state::lambda_triggers::Dispatch>,
+    /// The invitation this create sends once the account is stored, or `None` where it
+    /// sends none.
+    invitation: Option<Invitation>,
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<Eng> {
@@ -356,6 +408,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
         {
             return Err(invalid_password(message));
         }
+        // "Set to SUPPRESS to suppress sending the message"
+        // (`AdminCreateUser.MessageAction`), and "specify EMAIL if email will be used to
+        // send the welcome message. Specify SMS if the phone number will be used. The
+        // default value is SMS" (`AdminCreateUser.DesiredDeliveryMediums`) — so the
+        // invitation travels by email exactly where the request asked for that medium and
+        // asked for a message at all. A pool whose `LambdaConfig` routes its email to a
+        // custom sender delivers it by handing the temporary password it carries to that
+        // function, "this trigger rout[ing] all email notifications from a user pool to a
+        // Lambda function" (`LambdaConfigType$CustomEmailSender`), which is the one channel
+        // this emulator carries a message over.
+        let invited_by_email = input
+            .desired_delivery_mediums
+            .as_deref()
+            .is_some_and(|mediums| {
+                mediums.iter().any(|medium| {
+                    crate::state::medium_destination_attribute(medium) == Some(EMAIL_ATTRIBUTE)
+                })
+            });
+        let delivers_invitation = invited_by_email
+            && input.message_action.as_deref() != Some(SUPPRESS_MESSAGE)
+            && pool
+                .lambda_config
+                .custom_email_sender
+                .as_ref()
+                .is_some_and(|configured| !configured.lambda_arn.is_empty());
+        // The credential the invitation carries: the one the request submitted, or — "if you
+        // don't specify a value, Amazon Cognito generates one for you"
+        // (`AdminCreateUser.TemporaryPassword`) — one the pool mints itself
+        // ([`crate::state::UserPool::generated_temporary_password`]). It is minted only
+        // where the invitation that carries it is delivered: a password nothing can read
+        // would be a credential that does not exist.
+        let temporary_password = match input
+            .temporary_password
+            .clone()
+            .filter(|submitted| !submitted.is_empty())
+        {
+            Some(submitted) => Some(submitted),
+            None => delivers_invitation.then(|| pool.generated_temporary_password()),
+        };
         // Every attribute written has to be one the pool's schema declares.
         let requested_attributes = input.user_attributes.clone().unwrap_or_default();
         let requested_names: Vec<String> = requested_attributes
@@ -491,16 +582,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
             if existing.status != RESENDABLE_STATUS {
                 return Err(resend_not_possible(&input.username));
             }
-            if let Some(temporary_password) = input.temporary_password.clone() {
+            if let Some(temporary_password) = temporary_password.clone() {
                 existing.password = Some(temporary_password);
                 existing.password_permanent = false;
                 existing.password_set_at = Some(now);
             }
             existing.user_last_modified_date = now;
+            let username = existing.username.clone();
             let stored = existing.to_user_type();
-            return Ok(Planned::Resent(AdminCreateUserOutput {
-                user: Some(stored),
-            }));
+            return Ok(Planned::Resent {
+                answer: AdminCreateUserOutput {
+                    user: Some(stored),
+                },
+                invitation: temporary_password
+                    .filter(|_| delivers_invitation)
+                    .map(|temporary_password| Invitation {
+                        username,
+                        temporary_password,
+                    }),
+            });
         }
         if resend {
             // There is no invitation to resend to a user that does not exist.
@@ -572,15 +672,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
             // confirmation.
             pending_attributes: ::std::collections::BTreeMap::new(),
             // A temporary password Amazon Cognito would have messaged to the user
-            // is not minted here: this emulator delivers no mail or SMS, so a
-            // password nothing can read would be a credential that does not exist.
-            // The status below is the same either way.
-            password: input.temporary_password.clone(),
+            // is minted only where the invitation that carries it is delivered
+            // (above): a password nothing can read would be a credential that
+            // does not exist. The status below is the same either way.
+            password: temporary_password.clone(),
             password_permanent: false,
             // A user this call just created has had no password before the one
             // it is created with, so it owes its history nothing.
             password_history: Vec::new(),
-            password_set_at: input.temporary_password.as_ref().map(|_| now),
+            password_set_at: temporary_password.as_ref().map(|_| now),
             // An administrator-created user must change the password it signs in with.
             status: crate::state::UserStatus::ForceChangePassword,
             enabled: true,
@@ -629,9 +729,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
         Ok(Planned::Create(Box::new(Creating {
             user_pool_id: input.user_pool_id.clone(),
             key,
+            invitation: temporary_password
+                .filter(|_| delivers_invitation)
+                .map(|temporary_password| Invitation {
+                    username: user.username.clone(),
+                    temporary_password,
+                }),
             user,
             dispatch,
         })))
+    }
+
+    /// Deliver `invitation`, which on a pool that routes its email to a custom sender means
+    /// handing the temporary password it carries to the configured function.
+    ///
+    /// Called with this service's lock RELEASED, and with the account the invitation is for
+    /// already stored: the message reports the user as the create or resend left it, and
+    /// nothing else of this service waits on the function being invoked. A request that
+    /// sends no invitation, and a pool that configures no custom email sender, hand over
+    /// nothing.
+    async fn deliver_invitation(
+        &self,
+        input: &AdminCreateUserInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        caller: crate::state::lambda_triggers::Caller<'_>,
+        invitation: Option<&Invitation>,
+    ) -> Result<(), AdminCreateUserError> {
+        let Some(invitation) = invitation else {
+            return Ok(());
+        };
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        crate::state::lambda_triggers::custom_email::fire_custom_email_sender(
+            ctx,
+            &state,
+            &input.user_pool_id,
+            &invitation.username,
+            crate::state::lambda_triggers::custom_email::CustomEmailSource::AdminCreateUser,
+            caller,
+            input.client_metadata.as_ref(),
+            &invitation.temporary_password,
+        )
+        .await
+        .map_err(trigger_failed)
     }
 
     /// Store the account `creating` decided, as the pool's pre-sign-up function left it, and
@@ -679,11 +820,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
     }
 }
 
-/// What the pool's pre-sign-up trigger's failure is for THIS operation: the modelled error
+/// What a trigger of this operation's failure is for THIS operation: the modelled error
 /// each outcome amounts to, carrying the message the dispatch built.
 ///
-/// The trigger evaluates an account that does not exist yet, so nothing is created for a
-/// failure of it: a function Lambda cannot invoke at all is "an unexpected exception with
+/// The pre-sign-up trigger evaluates an account that does not exist yet, so nothing is
+/// created for a failure of it; the custom email sender is handed an invitation for an
+/// account already stored, so what a failure of it changes is only what this call ANSWERS.
+/// Either way a function Lambda cannot invoke at all is "an unexpected exception with
 /// Lambda", and one that ran and reported an error is "a user validation exception with the
 /// Lambda service" (this service's model) — which is how a function blocks a create.
 fn trigger_failed(failure: crate::state::lambda_triggers::Failure) -> AdminCreateUserError {
