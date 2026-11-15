@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConnectInstanceConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConnectInstanceConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! REPORTS the Campaigns configuration of an Amazon Connect instance, read out of the
+//! onboarding record `StartInstanceOnboardingJob` wrote: the instance, the encryption
+//! config that call persisted and the account's Campaigns service-linked role. An
+//! instance whose onboarding job has not finished — never onboarded, or still
+//! `IN_PROGRESS` — has no configuration, which is the modelled
+//! `ResourceNotFoundException` (HTTP 404) naming the configuration and the instance the
+//! request asked about.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConnectInstanceConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure report: the job's status is read off the stored due instant, so this neither
+//! starts a job nor finishes one and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +145,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConnectInstanceConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConnectInstanceConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConnectInstanceConfig"))
+        // A pure report: it writes nothing, so it leaves no audit record either — the
+        // record this service writes is of a CHANGE to an instance.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetConnectInstanceConfigError::from(
+                GetConnectInstanceConfigErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the instance onboarding store is unavailable".to_string(),
+                        x_amz_error_type: None,
+                    },
+                ),
+            )
+        })?;
+
+        // Onboarding is what configures an instance for Campaigns, so the configuration
+        // is projected from the onboarding record and only once that job has finished:
+        // an instance nobody onboarded and one whose job is still in progress both have
+        // no configuration to report. The status is read off the stored due instant, so
+        // this read moves nothing and two callers reading at the same moment agree.
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        let Some(stored) = store.onboarded_instance(&input.connect_instance_id, now) else {
+            return Err(
+                GetConnectInstanceConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::instance_config_absent_message(
+                            &input.connect_instance_id,
+                        ),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Answered from the stored record, so the configuration a caller reads cannot
+        // differ from the one the onboarding call persisted.
+        Ok(GetConnectInstanceConfigOutput {
+            connect_instance_config: Some(stored.to_config()),
+        })
     }
 }

@@ -25,6 +25,8 @@ mod common;
 mod dial_request_batch;
 #[path = "all/input_constraint_refusals.rs"]
 mod input_constraint_refusals;
+#[path = "all/instance_config.rs"]
+mod instance_config;
 #[path = "all/instance_onboarding.rs"]
 mod instance_onboarding;
 #[path = "all/onboarding_job_deletion.rs"]

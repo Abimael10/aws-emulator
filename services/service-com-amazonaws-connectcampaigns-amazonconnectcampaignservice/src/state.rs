@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    AnswerMachineDetectionConfig, DialerConfig, EncryptionConfig, InstanceOnboardingJobStatus,
-    OutboundCallConfig,
+    AnswerMachineDetectionConfig, DialerConfig, EncryptionConfig, InstanceConfig,
+    InstanceOnboardingJobStatus, OutboundCallConfig,
 };
 
 /// This service's sigv4 signing name and ARN namespace (see `OPERATIONS.md`), used
@@ -403,6 +403,24 @@ impl ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState {
         self.instance_onboarding.get(connect_instance_id)
     }
 
+    /// The onboarding record of an instance whose job has FINISHED onboarding it at
+    /// `now`, or `None` when the instance has no configuration: no call has onboarded
+    /// it, or its job has not reached [`ONBOARDING_STATUS_SUCCEEDED`] yet.
+    ///
+    /// Onboarding is what configures an instance for Campaigns, so a configuration
+    /// exists exactly while a finished job's record does. The one place that is
+    /// decided, over the SAME record [`Self::instance_onboarding`] reports the job of,
+    /// so the job's status and whether the instance has a configuration cannot
+    /// disagree.
+    pub fn onboarded_instance(
+        &self,
+        connect_instance_id: &str,
+        now: SystemTime,
+    ) -> Option<&StoredInstanceOnboarding> {
+        self.instance_onboarding(connect_instance_id)
+            .filter(|record| record.status_at(now) == ONBOARDING_STATUS_SUCCEEDED)
+    }
+
     /// Replace the stored name of one campaign and report what that did. `None` when no
     /// campaign is stored under that id, in which case nothing is written.
     ///
@@ -785,6 +803,39 @@ impl StoredInstanceOnboarding {
             failure_code: self.failure_code.clone(),
         }
     }
+
+    /// This record as the modelled `InstanceConfig` the operations that address an
+    /// instance's Campaigns configuration report: the instance, the encryption config
+    /// this record persisted, and the account's Campaigns service-linked role (see
+    /// [`service_linked_role_arn`]).
+    ///
+    /// A configuration exists only once the instance's onboarding job has finished, so
+    /// a caller resolves the record through
+    /// [`ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState::onboarded_instance`]
+    /// rather than projecting whatever record it holds.
+    pub fn to_config(&self) -> InstanceConfig {
+        InstanceConfig {
+            connect_instance_id: self.connect_instance_id.clone(),
+            service_linked_role_arn: service_linked_role_arn(),
+            encryption_config: self.encryption_config.clone(),
+        }
+    }
+}
+
+/// The service-linked role every onboarded instance's configuration names.
+///
+/// `InstanceConfig$serviceLinkedRoleArn` is required, and AWS fills it with the
+/// Campaigns service-linked role of the caller's own account — one role per account,
+/// not per instance — so it is built from the emulator's canonical account rather than
+/// from anything in the request. IAM files a service-linked role under the reserved
+/// `role/aws-service-role/<service principal>/` path, and IAM is global, hence the
+/// empty region segment.
+pub fn service_linked_role_arn() -> String {
+    ::engine::emulator_arn(
+        "iam",
+        "",
+        "role/aws-service-role/connect-campaigns.amazonaws.com/AWSServiceRoleForAmazonConnectCampaigns",
+    )
 }
 
 /// Why a requested onboarding job was not started, as
@@ -855,6 +906,22 @@ pub fn onboarding_record_absent_message(connect_instance_id: &str) -> String {
         "Instance onboarding record does not exist for aws account id {} and instance id {connect_instance_id}",
         ::emulator_server::emulator_account_id()
     )
+}
+
+/// What this service answers when the resource a request addresses IS an Amazon Connect
+/// instance's Campaigns configuration and the instance has none: no call has onboarded
+/// it, or its onboarding job has not finished.
+///
+/// The CONFIGURATION is the resource that is missing here, not the instance and not the
+/// onboarding job — so the sentence names the configuration and the instance the request
+/// asked about, in the same shape as [`connect_instance_not_found_message`], which is
+/// how this service words a resource its request addresses by id. The one text the
+/// operations whose own resource IS that configuration share, so they cannot disagree
+/// about a request they both refuse; the operations whose own resource is the onboarding
+/// RECORD answer [`onboarding_record_absent_message`] instead, because each operation
+/// names the resource it was asked for.
+pub fn instance_config_absent_message(connect_instance_id: &str) -> String {
+    format!("ConnectInstanceConfig not found {connect_instance_id}.")
 }
 
 /// The region a request was signed for, which is the region of every ARN the
