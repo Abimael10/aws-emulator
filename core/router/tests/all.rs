@@ -1487,3 +1487,21 @@ mod lambda_in_function_assumed_role_session;
 //! there rather than leaving a note here.
 //! (`tests/<name>.rs`), which the layout check refuses: the `#[path = "all/<name>.rs"]`
 //! is what points each declaration into `tests/all/`.
+//! Single integration-test target for the router: the canonical declaration list.
+//! This file holds this header and then ONE `#[path = "all/<name>.rs"]` / `mod <name>;` pair
+//! per suite under `tests/all/`, sorted by name, and no other line — the shape
+//! `all/all_rs_is_a_canonical_declaration_list.rs` pins. Three rules make it that:
+//! * a suite this file does not declare compiles nowhere and its tests never run, and a
+//!   suite left at the top level of `tests/` fails the build;
+//! * each suite is declared exactly ONCE — this is one crate root, so a second `mod` for one
+//!   name is `E0428` and compiles neither copy
+//!   (`all/all_rs_declares_each_suite_once.rs`);
+//! * an inner doc comment (`//!`) is legal only BEFORE the first item, so THESE lines are the
+//!   only place one may stand; past the first item it is `E0753` and compiles no suite of
+//!   this target (`all/all_rs_inner_doc_comments_precede_the_first_item.rs`).
+//! So add a DECLARATION below, in its sorted place, and nothing else: what a suite covers
+//! belongs in that suite's own module doc, and a note about this file belongs in
+//! `all/appended_notes.rs`.
+// The `#[path]` attribute is what points each module into `tests/all/`: this file is a
+// test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of it, which the layout
+// check refuses.

@@ -63,6 +63,8 @@ mod owed_delivery_survives_update;
 mod page_token_refusal;
 #[path = "all/page_token_spelling.rs"]
 mod page_token_spelling;
+#[path = "all/polled_delivery_success.rs"]
+mod polled_delivery_success;
 #[path = "all/property_gated_columns.rs"]
 mod property_gated_columns;
 #[path = "all/query_alias_scope.rs"]

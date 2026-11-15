@@ -843,14 +843,31 @@ fn pending_window_start() -> i64 {
     window_start(now, finest) + finest
 }
 
+/// How far back from [`pending_window_start`] a case's receipts are placed for its
+/// AGGREGATED phase: a day, plus one whole window of the period under test.
+///
+/// The window a receipt falls in has to have CLOSED for its aggregation to be due, and the
+/// pending window start is the next FINEST window boundary — which is up to one finest
+/// window AFTER the clock, and can be the first instant of the next hour or of the next day.
+/// A day back from it is therefore not necessarily inside an earlier window of a COARSER
+/// period: read in the last finest window of a day, a receipt a day before that boundary
+/// still sits in the day the clock is in, whose window has not closed, and the aggregation
+/// it owes is correctly not due. One more whole window of the period under test puts the
+/// receipt in a window that is over whatever phase of the clock the case runs at, which is
+/// what the aggregated phase is about — and the pending phase, which reads the clock the same
+/// way, is unaffected.
+fn aged_by(period: &str) -> i64 {
+    DAY + period_seconds(period)
+}
+
 /// One pending-aggregation row: where the group's posted profiles are received, relative
 /// to the window whose aggregation is not due yet, and how the request is parameterised.
 #[derive(Debug)]
 struct PendingCase {
     label: &'static str,
     /// One offset in seconds per posted profile, from [`pending_window_start`] for the
-    /// pending phase and from a day earlier for the aggregated phase. Non-negative, so
-    /// every pending receipt sits in a window that has not closed.
+    /// pending phase and from [`aged_by`] before that for the aggregated phase.
+    /// Non-negative, so every pending receipt sits in a window that has not closed.
     offsets: Vec<i64>,
     /// A modelled `AggregationPeriod` value (`AGGREGATION_PERIOD_VALUES`).
     period: &'static str,
@@ -983,17 +1000,13 @@ fn pending_cases() -> Vec<PendingCase> {
 /// window owes has fallen due, the same request reports its start.
 #[tokio::test]
 async fn a_window_is_reported_only_once_the_aggregation_it_owes_is_due() {
-    /// A day in seconds back from the pending window: far enough that every window those
-    /// receipts fall in has closed, so their aggregations are due.
-    const AGED: i64 = DAY;
-
     let harness = Harness::new();
 
     for (index, case) in pending_cases().iter().enumerate() {
         let name = format!("times-pending-{index}");
         let label = case.label;
-        // One base instant per case, so the two phases place the same profiles a day
-        // apart even if the clock crosses a window boundary mid-case.
+        // One base instant per case, so the two phases place the same profiles the same
+        // span apart even if the clock crosses a window boundary mid-case.
         let base = pending_window_start();
         let (pending_receipts, pending_range, pending_query) = case.request(base);
 
@@ -1037,9 +1050,9 @@ async fn a_window_is_reported_only_once_the_aggregation_it_owes_is_due() {
             );
         }
 
-        // The same profiles, received a day earlier: every window they fall in has closed
-        // and been aggregated, so the same request now reports one start per window.
-        let (due_receipts, due_range, due_query) = case.request(base - AGED);
+        // The same profiles, received [`aged_by`] earlier: every window they fall in has
+        // closed and been aggregated, so the same request now reports one start per window.
+        let (due_receipts, due_range, due_query) = case.request(base - aged_by(case.period));
         place_receipts(&harness, &name, &due_receipts);
         let (expected, expect_next) = case.expected(&due_receipts, due_range);
         assert!(

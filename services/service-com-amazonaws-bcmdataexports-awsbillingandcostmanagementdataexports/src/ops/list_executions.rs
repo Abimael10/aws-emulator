@@ -29,11 +29,13 @@
 //!
 //! NOTE on what this emulator holds: an execution is the record of a data-plane DELIVERY
 //! — a query run against the billing data and a file written to the caller's S3 bucket —
-//! and this emulator performs no such delivery, so the delivery it records ends in the
-//! service's own modelled failure state rather than reporting a `DELIVERY_SUCCESS` for a
-//! file nothing wrote (see `crate::state::StoredExecution`). An export whose first
-//! delivery is not due yet pages empty, which is what AWS answers for an export that has
-//! not run yet. `GetExecution` reads one execution out of the same store.
+//! which this emulator PERFORMS against the Amazon S3 service on the same engine, so every
+//! reference reported here carries the outcome of the write that really happened: the
+//! modelled `DELIVERY_SUCCESS` once the file is in the destination bucket, and the modelled
+//! failure state with the reason a delivery that wrote nothing failed for (see
+//! `crate::state::delivery`). An export whose first delivery is not due yet pages empty,
+//! which is what AWS answers for an export that has not run yet. `GetExecution` reads one
+//! execution out of the same store.
 //!
 //! ## Shape of an operation
 //!

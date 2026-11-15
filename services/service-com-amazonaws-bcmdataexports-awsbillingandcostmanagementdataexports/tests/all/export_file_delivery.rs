@@ -65,8 +65,12 @@ const OUTPUT_TYPE: &str = "CUSTOM";
 const REPORT_PART: &str = "00001";
 
 /// One row of the table.
-struct Row {
-    label: &'static str,
+///
+/// `pub(crate)` with [`rows`] and [`create_request`] so the suite that waits for the same
+/// deliveries on the service's OWN clock (`tests/all/polled_delivery_success.rs`) asserts
+/// over this ONE table of accepted definitions instead of growing a second copy of it.
+pub(crate) struct Row {
+    pub(crate) label: &'static str,
     /// The `QueryStatement` the definition carries.
     statement: &'static str,
     /// The header the delivered file must carry, or `None` for a wildcard projection, whose
@@ -81,10 +85,10 @@ struct Row {
     /// The `Overwrite` disposition of the destination.
     overwrite: &'static str,
     /// The `S3Prefix` the export is delivered under.
-    prefix: &'static str,
+    pub(crate) prefix: &'static str,
 }
 
-fn rows() -> Vec<Row> {
+pub(crate) fn rows() -> Vec<Row> {
     vec![
         Row {
             label: "one column, gzipped CSV, overwritten",
@@ -171,7 +175,7 @@ fn rows() -> Vec<Row> {
 }
 
 /// The `CreateExport` request of one row, delivered to `bucket`.
-fn create_request(row: &Row, name: &str, bucket: &str) -> Value {
+pub(crate) fn create_request(row: &Row, name: &str, bucket: &str) -> Value {
     let (format, compression) = row.encoding;
     json!({
         "Export": {
