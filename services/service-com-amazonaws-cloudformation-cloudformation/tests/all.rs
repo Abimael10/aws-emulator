@@ -761,3 +761,5 @@ mod declared_bucket_policy_is_applied;
 mod private_macro_change_sets;
 #[path = "all/rest_api_redeployment.rs"]
 mod rest_api_redeployment;
+#[path = "all/replacement_update_retention.rs"]
+mod replacement_update_retention;
