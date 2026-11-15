@@ -13,7 +13,10 @@
 //! * a group or a user, which QuickSight's identity path serves, is named by its name
 //!   together with the account it belongs to, and a refusal the account's own
 //!   configuration causes is named by that account too — each of them closed by the
-//!   labelled fields [`identity_scope_fields`] renders.
+//!   labelled fields [`identity_scope_fields`] renders. Those fields are a locator
+//!   addressing what the call named, so a refusal that has nothing else to say — a
+//!   name the service holds no record of — is that locator alone, with no sentence
+//!   before it.
 //!
 //! A refusal about an allowance names the resource whose allowance ran out, and
 //! that resource is the parent the counted children hang on, not the child the
@@ -22,6 +25,8 @@
 //! The ARN is built from the serving region and the request's own path labels by
 //! the builders beside these in [`crate::state`], so the resource a message names
 //! is the resource the request addressed.
+
+use std::fmt::Write as _;
 
 use super::{data_set_arn, data_source_arn, folder_arn};
 
@@ -95,13 +100,20 @@ pub fn refresh_schedule_limit_message(
 }
 
 /// The labelled fields QuickSight's identity path closes a refusal with: the account
-/// the call addressed, then one field naming what inside that account the refusal is
-/// about, ending in a period and a space.
+/// the call addressed, then one field per part of the address naming what inside that
+/// account the refusal is about, ending in a period and a space.
 ///
 /// The sentence before them already ends in its own punctuation, so these fields follow
-/// it directly — the caller joins the two with no separator of its own.
-fn identity_scope_fields(aws_account_id: &str, label: &str, value: &str) -> String {
-    format!("AWS account id: {aws_account_id}, {label}: {value}. ")
+/// it directly — the caller joins the two with no separator of its own — and a refusal
+/// with no sentence of its own is these fields alone.
+fn identity_scope_fields(aws_account_id: &str, fields: &[(&str, &str)]) -> String {
+    let mut rendered = format!("AWS account id: {aws_account_id}");
+    for (label, value) in fields {
+        // Writing into a `String` cannot fail.
+        let _ = write!(rendered, ", {label}: {value}");
+    }
+    rendered.push_str(". ");
+    rendered
 }
 
 /// The conflict `CreateGroup` reports for a group name its namespace already holds.
@@ -112,7 +124,7 @@ fn identity_scope_fields(aws_account_id: &str, label: &str, value: &str) -> Stri
 pub fn group_exists_message(group_name: &str, aws_account_id: &str) -> String {
     format!(
         "Group {group_name} already exists. {}",
-        identity_scope_fields(aws_account_id, "groupName", group_name)
+        identity_scope_fields(aws_account_id, &[("groupName", group_name)])
     )
 }
 
@@ -134,7 +146,7 @@ pub fn identity_type_not_authorized_message(
     format!(
         "Account {aws_account_id} is not authorized to create {identity_type_name} \
          IdentityType user.{}",
-        identity_scope_fields(aws_account_id, "Namespace", namespace)
+        identity_scope_fields(aws_account_id, &[("Namespace", namespace)])
     )
 }
 
@@ -146,13 +158,45 @@ pub fn identity_type_not_authorized_message(
 pub fn user_exists_message(user_name: &str, aws_account_id: &str) -> String {
     format!(
         "User {user_name} already exists. {}",
-        identity_scope_fields(aws_account_id, "userName", user_name)
+        identity_scope_fields(aws_account_id, &[("userName", user_name)])
     )
 }
 
-/// The miss a user operation reports for a `UserName` the namespace holds no user
-/// under — the same text whether the call reads, updates or deletes, and the same
-/// template the group reads answer a group nobody holds with.
-pub fn user_not_found_message(user_name: &str, namespace: &str, aws_account_id: &str) -> String {
-    format!("User {user_name} not found in namespace {namespace} in account {aws_account_id}.")
+/// The labelled fields a refusal about a user closes with: the account, the namespace
+/// the user lives in and the name it is known by there.
+///
+/// Those three are exactly the path labels a user operation addresses its user with, so
+/// the fields locate the user the request named and nothing in them comes from stored
+/// state — a miss can report the address even when it holds no record of it.
+fn user_scope_fields(aws_account_id: &str, namespace: &str, user_name: &str) -> String {
+    identity_scope_fields(
+        aws_account_id,
+        &[("Namespace", namespace), ("Username", user_name)],
+    )
+}
+
+/// The miss a user operation reports for a `UserName` the namespace holds no record of
+/// at all: the locator alone, with no sentence before it.
+///
+/// Nothing is said to have stopped existing, because nothing is known to have existed:
+/// the only thing the service can report is the address the call asked about.
+pub fn user_not_found_message(aws_account_id: &str, namespace: &str, user_name: &str) -> String {
+    user_scope_fields(aws_account_id, namespace, user_name)
+}
+
+/// The miss a user operation reports for a `UserName` whose user this service deleted:
+/// the existence sentence about that user, then the locator directly after it.
+///
+/// A deletion is something the service knows happened, so the refusal states it — which
+/// is what tells a caller a user it once held is gone apart from a name that never named
+/// a user ([`user_not_found_message`]).
+pub fn deleted_user_not_found_message(
+    aws_account_id: &str,
+    namespace: &str,
+    user_name: &str,
+) -> String {
+    format!(
+        "User {user_name} does not exist.{}",
+        user_scope_fields(aws_account_id, namespace, user_name)
+    )
 }

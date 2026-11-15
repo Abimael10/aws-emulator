@@ -12,15 +12,19 @@
 
 mod authorization;
 mod connection_test;
+mod external_login;
 /// The impl block in this module adds the account's identity-store reading to the state
 /// struct, so it exports no name of its own and needs no re-export.
 mod identity_store;
 mod refusals;
+mod user_deletions;
 mod users;
 
 pub use authorization::*;
 pub use connection_test::*;
+pub use external_login::*;
 pub use refusals::*;
+pub use user_deletions::*;
 pub use users::*;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -96,6 +100,9 @@ pub struct ComAmazonawsQuicksightQuicksight20180401State {
     /// two namespaces of the same account can each hold a user of the same name, and
     /// neither is reached from the other.
     pub users: HashMap<(String, String, String), UserRecord>,
+    /// The addresses users this service deleted were held at, so a later read of one
+    /// reports a user that is gone rather than a name that never named one.
+    pub deleted_users: RememberedUserDeletions,
     /// The sign-up details `CreateAccountSubscription` stored, by `AwsAccountId`.
     ///
     /// An account with no entry here is still a QuickSight account — see

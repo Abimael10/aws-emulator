@@ -509,7 +509,7 @@ fn refuse_members_of_the_iam_identity_path(
         ("ExternalLoginId", input.external_login_id.as_deref()),
     ]
     .into_iter()
-    .find(|(_, value)| value.is_some_and(|value| !value.trim().is_empty()));
+    .find(|(_, value)| crate::state::named_member(*value).is_some());
 
     match named {
         Some((member, _)) => Err(invalid_parameter(
@@ -526,82 +526,35 @@ fn refuse_members_of_the_iam_identity_path(
 /// The URL of the external login provider the registered user federates through, or
 /// `None` when the request names no provider.
 ///
-/// The provider type fixes that URL for Amazon Cognito ("The provider URL is
-/// cognito-identity.amazonaws.com"), and a custom OpenID Connect provider carries its
-/// own in `CustomFederationProviderUrl` — a parameter "only needed when the external
-/// provider is custom", so naming it for any other provider is refused rather than
-/// quietly dropped.
-///
-/// A member is NAMED when it carries something other than whitespace, the same reading
-/// [`refuse_members_of_the_iam_identity_path`] makes, so one rule decides it everywhere.
+/// The reading is the one every handler that writes a user makes
+/// ([`crate::state::external_login_change`]), over the provider types a REGISTRATION
+/// admits: the two the operation's own documentation names. Clearing a saved external
+/// login belongs to the update of a user, so a registration — which has nothing saved
+/// yet — does not admit that type.
 fn external_login_provider_url(
     input: &RegisterUserInput,
     request_id: &str,
 ) -> Result<Option<String>, RegisterUserError> {
-    let custom_url = input
-        .custom_federation_provider_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|url| !url.is_empty());
-    let Some(provider_type) = input
-        .external_login_federation_provider_type
-        .as_deref()
-        .map(str::trim)
-        .filter(|provider_type| !provider_type.is_empty())
-    else {
-        if custom_url.is_some() {
-            return Err(invalid_parameter(
-                custom_federation_provider_url_message(),
-                request_id,
-            ));
-        }
-        return Ok(None);
-    };
-
-    match provider_type {
-        crate::state::EXTERNAL_LOGIN_PROVIDER_COGNITO => {
-            if custom_url.is_some() {
-                return Err(invalid_parameter(
-                    custom_federation_provider_url_message(),
-                    request_id,
-                ));
-            }
-            Ok(Some(
-                crate::state::COGNITO_FEDERATION_PROVIDER_URL.to_string(),
-            ))
-        }
-        crate::state::EXTERNAL_LOGIN_PROVIDER_CUSTOM_OIDC => match custom_url {
-            Some(url) => Ok(Some(url.to_string())),
-            None => Err(invalid_parameter(
-                format!(
-                    "CustomFederationProviderUrl is required when \
-                     ExternalLoginFederationProviderType is {}.",
-                    crate::state::EXTERNAL_LOGIN_PROVIDER_CUSTOM_OIDC
-                ),
-                request_id,
-            )),
-        },
-        other => Err(invalid_parameter(
-            format!(
-                "ExternalLoginFederationProviderType {other} is not supported. Supported \
-                 types are {} and {}.",
-                crate::state::EXTERNAL_LOGIN_PROVIDER_COGNITO,
-                crate::state::EXTERNAL_LOGIN_PROVIDER_CUSTOM_OIDC
-            ),
-            request_id,
-        )),
+    let change = crate::state::external_login_change(
+        input.external_login_federation_provider_type.as_deref(),
+        input.custom_federation_provider_url.as_deref(),
+        REGISTERED_EXTERNAL_LOGIN_PROVIDERS,
+    )
+    .map_err(|message| invalid_parameter(message, request_id))?;
+    match change {
+        crate::state::ExternalLoginChange::Provider { provider_url, .. } => Ok(Some(provider_url)),
+        _ => Ok(None),
     }
 }
 
-/// The refusal a `CustomFederationProviderUrl` named for anything but a custom OpenID
-/// Connect provider reads: that parameter belongs to that provider type alone.
-fn custom_federation_provider_url_message() -> String {
-    format!(
-        "CustomFederationProviderUrl is only used when ExternalLoginFederationProviderType \
-         is {}.",
-        crate::state::EXTERNAL_LOGIN_PROVIDER_CUSTOM_OIDC
-    )
-}
+/// The external login provider types a registration admits: the two `RegisterUser`'s own
+/// documentation names for `ExternalLoginFederationProviderType`.
+/// Source: `smithy_query(query="doc", shape="RegisterUserRequest",
+/// member="ExternalLoginFederationProviderType")`.
+const REGISTERED_EXTERNAL_LOGIN_PROVIDERS: &[&str] = &[
+    crate::state::EXTERNAL_LOGIN_PROVIDER_COGNITO,
+    crate::state::EXTERNAL_LOGIN_PROVIDER_CUSTOM_OIDC,
+];
 
 /// One modelled `InvalidParameterValueException`: the refusal a request whose parameters
 /// do not go together carries.

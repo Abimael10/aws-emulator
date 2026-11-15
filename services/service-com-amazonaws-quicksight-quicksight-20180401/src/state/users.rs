@@ -40,12 +40,24 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
     /// Removes the users `(aws_account_id, namespace)` holds, answering how many went:
     /// deleting a namespace deletes the users and groups associated with it, so they go
     /// with the namespace rather than outliving it.
+    ///
+    /// Each of them goes through the one removal
+    /// ([`ComAmazonawsQuicksightQuicksight20180401State::remove_user`]), so a user
+    /// deleted with its namespace is as deleted as one deleted by name: a later read of
+    /// it reports a user that is gone.
     pub fn remove_users_in(&mut self, aws_account_id: &str, namespace: &str) -> usize {
-        let before = self.users.len();
-        self.users.retain(|(account, user_namespace, _), _| {
-            account != aws_account_id || user_namespace != namespace
-        });
-        before - self.users.len()
+        let names: Vec<String> = self
+            .users
+            .keys()
+            .filter(|(account, user_namespace, _)| {
+                account == aws_account_id && user_namespace == namespace
+            })
+            .map(|(_, _, user_name)| user_name.clone())
+            .collect();
+        for user_name in &names {
+            self.remove_user(aws_account_id, namespace, user_name);
+        }
+        names.len()
     }
 }
 

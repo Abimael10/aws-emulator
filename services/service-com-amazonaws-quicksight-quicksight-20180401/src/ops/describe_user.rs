@@ -172,10 +172,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(DescribeUserErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::user_not_found_message(
-                        &input.user_name,
-                        &input.namespace,
+                    // What the identity path says about a user it holds no record of:
+                    // the address the call named, and — for a user this service deleted
+                    // — that it does not exist.
+                    message: Some(store.user_miss_message(
                         &input.aws_account_id,
+                        &input.namespace,
+                        &input.user_name,
                     )),
                     resource_type: Some(crate::state::EXCEPTION_RESOURCE_TYPE_USER.to_string()),
                     request_id: Some(request_id),

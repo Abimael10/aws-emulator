@@ -53,6 +53,10 @@ mod theme_lifecycle;
 mod topic_lifecycle;
 #[path = "all/user_lifecycle.rs"]
 mod user_lifecycle;
+#[path = "all/user_not_found_message.rs"]
+mod user_not_found_message;
+#[path = "all/user_update.rs"]
+mod user_update;
 #[path = "all/folder_lifecycle.rs"]
 mod folder_lifecycle;
 #[path = "all/group_lifecycle.rs"]

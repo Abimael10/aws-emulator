@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the user `RegisterUser` stored under `(AwsAccountId, Namespace, UserName)` —
+//! its email, its role, the custom permissions profile assigned to it and the external
+//! login it federates through — and reports the user the update stored.
 //!
 //! ## Shape of an operation
 //!
@@ -197,18 +192,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateUser"))
+        // Everything the update writes comes from the request; `ctx` carries nothing it
+        // needs.
+        let _ = ctx;
+        let request_id = crate::state::next_request_id();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateUserErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        // A role the service does not currently assign assigns nothing, so the update is
+        // refused rather than storing a role nobody can hold — the same roles a
+        // registration cannot assign.
+        if crate::state::UNAVAILABLE_USER_ROLES.contains(&input.role.as_str()) {
+            return Err(invalid_parameter(
+                format!("Role {} isn't currently available for use.", input.role),
+                &request_id,
+            ));
+        }
+        // The user is reached at the email address the update gives, so a value that is
+        // not an email address is not a value this parameter takes. The form is the
+        // tree's one reading of an address.
+        if !::service_common::email_address::is_email_address(&input.email) {
+            return Err(invalid_parameter(
+                format!("Email {} is not a valid email address.", input.email),
+                &request_id,
+            ));
+        }
+        // Removing every custom permission and naming a profile to apply ask for
+        // opposite things, so a request carrying both is refused rather than having one
+        // of them quietly dropped.
+        let custom_permissions_name =
+            crate::state::named_member(input.custom_permissions_name.as_deref());
+        if input.unapply_custom_permissions && custom_permissions_name.is_some() {
+            return Err(invalid_parameter(
+                "CustomPermissionsName is not used when UnapplyCustomPermissions is set."
+                    .to_string(),
+                &request_id,
+            ));
+        }
+        let external_login = crate::state::external_login_change(
+            input.external_login_federation_provider_type.as_deref(),
+            input.custom_federation_provider_url.as_deref(),
+            UPDATED_EXTERNAL_LOGIN_PROVIDERS,
+        )
+        .map_err(|message| invalid_parameter(message, &request_id))?;
+        let external_login_id = crate::state::named_member(input.external_login_id.as_deref())
+            .map(str::to_string);
+
+        let mut store = state.lock();
+        let key = (
+            input.aws_account_id.clone(),
+            input.namespace.clone(),
+            input.user_name.clone(),
+        );
+        let Some(record) = store.users.get_mut(&key) else {
+            return Err(UpdateUserErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // The same miss every user handler reports, rendered by the one
+                    // shared helper.
+                    message: Some(store.user_miss_message(
+                        &input.aws_account_id,
+                        &input.namespace,
+                        &input.user_name,
+                    )),
+                    resource_type: Some(crate::state::EXCEPTION_RESOURCE_TYPE_USER.to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        // The two required members are what the update always writes.
+        record.email = input.email;
+        record.role = input.role;
+        // Removing the custom permissions resets the user to the state it was in before a
+        // profile was applied; naming one applies it; naming neither leaves the profile
+        // the user already has.
+        if input.unapply_custom_permissions {
+            record.custom_permissions_name = None;
+        } else if let Some(name) = custom_permissions_name {
+            record.custom_permissions_name = Some(name.to_string());
+        }
+        match external_login {
+            // Clearing takes every external login value the user had with it, the
+            // identity id included: there is no provider left for an id to be held at.
+            crate::state::ExternalLoginChange::Cleared => {
+                record.external_login_federation_provider_type = None;
+                record.external_login_federation_provider_url = None;
+                record.external_login_id = None;
+            }
+            crate::state::ExternalLoginChange::Provider {
+                provider_type,
+                provider_url,
+            } => {
+                record.external_login_federation_provider_type = Some(provider_type);
+                record.external_login_federation_provider_url = Some(provider_url);
+                if let Some(id) = external_login_id {
+                    record.external_login_id = Some(id);
+                }
+            }
+            // An update that names no provider says nothing about the one the user
+            // federates through, so what was saved stays saved — only the identity id it
+            // names is written.
+            crate::state::ExternalLoginChange::Unnamed => {
+                if let Some(id) = external_login_id {
+                    record.external_login_id = Some(id);
+                }
+            }
+        }
+
+        // The response reports the user as stored, so a caller sees exactly what the
+        // next read will answer with.
+        Ok(UpdateUserOutput {
+            user: Some(record.to_user()),
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
+}
+
+/// The external login provider types an update admits: the two a registration names,
+/// plus the one that clears what was saved before — which only an update can do, because
+/// only a stored user has something saved to clear.
+/// Source: `smithy_query(query="doc", shape="UpdateUserRequest",
+/// member="ExternalLoginFederationProviderType")`.
+const UPDATED_EXTERNAL_LOGIN_PROVIDERS: &[&str] = &[
+    crate::state::EXTERNAL_LOGIN_PROVIDER_COGNITO,
+    crate::state::EXTERNAL_LOGIN_PROVIDER_CUSTOM_OIDC,
+    crate::state::EXTERNAL_LOGIN_PROVIDER_NONE,
+];
+
+/// One modelled `InvalidParameterValueException`: the refusal an update whose parameters
+/// do not go together carries.
+fn invalid_parameter(message: String, request_id: &str) -> UpdateUserError {
+    UpdateUserErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message),
+        request_id: Some(request_id.to_string()),
+    })
+    .into()
 }

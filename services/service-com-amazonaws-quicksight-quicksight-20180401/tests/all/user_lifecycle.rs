@@ -63,8 +63,11 @@ const IAM_AND_QUICKSIGHT: &str = "IAM_AND_QUICKSIGHT";
 
 /// `CreateAccountSubscription`: `POST /account/{AwsAccountId}` — how a case gives its
 /// account an identity store of its own.
+///
+/// `pub(crate)` because every suite that registers a user QuickSight manages itself
+/// needs the account signed up for one.
 /// Source: smithy_query(query="operation", operation="CreateAccountSubscription").
-async fn sign_up_for_quicksight_identities(harness: &Harness, account: &str) {
+pub(crate) async fn sign_up_for_quicksight_identities(harness: &Harness, account: &str) {
     let (status, body) = harness
         .call(
             "POST",
@@ -90,8 +93,11 @@ fn user_arn(account: &str, namespace: &str, user_name: &str) -> String {
 }
 
 /// `RegisterUser`: `POST /accounts/{AwsAccountId}/namespaces/{Namespace}/users`.
+///
+/// `pub(crate)` because every suite that needs a stored user registers it the way a
+/// client would.
 /// Source: smithy_query(query="operation", operation="RegisterUser").
-async fn register_user(
+pub(crate) async fn register_user(
     harness: &Harness,
     account: &str,
     namespace: &str,
@@ -108,8 +114,10 @@ async fn register_user(
 
 /// `DescribeUser`:
 /// `GET /accounts/{AwsAccountId}/namespaces/{Namespace}/users/{UserName}`.
+///
+/// `pub(crate)` because every suite that reads a user back addresses it the same way.
 /// Source: smithy_query(query="operation", operation="DescribeUser").
-async fn describe_user(
+pub(crate) async fn describe_user(
     harness: &Harness,
     account: &str,
     namespace: &str,
@@ -697,9 +705,10 @@ async fn user_identity_is_the_account_the_namespace_and_the_name() {
         assert_eq!(
             body["Message"],
             json!(format!(
-                "User {user_name} not found in namespace {namespace} in account {account}."
+                "AWS account id: {account}, Namespace: {namespace}, Username: \
+                 {user_name}. "
             )),
-            "case {case:?}: the refusal must name what was not found: {body}"
+            "case {case:?}: the refusal must locate what was not found: {body}"
         );
         assert_eq!(
             body["ResourceType"],
