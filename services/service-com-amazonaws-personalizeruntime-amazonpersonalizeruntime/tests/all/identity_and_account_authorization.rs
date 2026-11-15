@@ -25,6 +25,11 @@
 //! the statements a policy can carry (an allow of the exact action, a wildcard allow, an
 //! allow of another action of the same service, an allow scoped to another campaign, an
 //! explicit deny, no policy at all).
+//!
+//! The last case takes the ORDER of that rule on its own: it drives every request shape the
+//! handler could refuse on its own — a resource the registry does not hold, no inference
+//! target, two of them — from a principal the policies do not permit and from one they do,
+//! so the 403 and each of the handler's own 400s are pinned against the same request.
 
 use std::sync::Arc;
 
@@ -803,4 +808,276 @@ async fn an_inference_call_is_served_only_to_a_principal_iam_permits() {
         status, 200,
         "case \"the account's own credential\": expected HTTP 200, got {status} with {answered}"
     );
+}
+
+/// One request shape, and what each of the two callers of
+/// [`an_identity_refusal_precedes_every_lookup_and_every_request_check`] owes it.
+struct OrderRow {
+    /// How the row reads in an assertion message.
+    case: &'static str,
+    /// The operation the row calls, which names the action its refusal states.
+    operation: &'static str,
+    /// That operation's modelled route.
+    route: &'static str,
+    /// The request body, every ARN in it belonging to the account this emulator serves.
+    body: Value,
+    /// The resource the identity-based decision is taken against: the campaign or
+    /// recommender the request names, or the resource IAM writes for a request that
+    /// addresses none of the service's resources.
+    resource: String,
+    /// The status a caller whose policies PERMIT the action earns, having reached the
+    /// business logic.
+    permitted_status: u16,
+    /// The message that caller earns there, when the business logic refuses the request;
+    /// `None` when the row is served.
+    permitted_message: Option<String>,
+}
+
+/// The identity-based decision is taken BEFORE anything the request names is resolved and
+/// before the request's own members are read, so a principal the policies do not permit
+/// earns 403 `AccessDeniedException` whether or not the resource it named exists — while the
+/// identical request from a permitted caller reaches the business logic, where an
+/// unresolvable ARN, an ARN of the wrong resource type and a missing or contradictory
+/// inference target are all its own 400 `InvalidInputException`.
+///
+/// The rows span what the ordering rule generalises over: all three operations, a resource
+/// the registry holds and one it does not, both resource types the action is published for,
+/// a filter the registry does not hold beside a campaign it does, and the two request shapes
+/// that name no resource of this service at all — i.e. every refusal the handler could reach
+/// after the decision.
+#[tokio::test]
+async fn an_identity_refusal_precedes_every_lookup_and_every_request_check() {
+    let harness = Harness::new();
+    // Every resource lives in the account this emulator serves, so no row is refused for
+    // addressing another account: what a row varies is what the request names.
+    seeded(&harness, ACCOUNT);
+
+    let held_campaign = campaign_arn(ACCOUNT, CAMPAIGN_USER_NAME);
+    let held_ranking = campaign_arn(ACCOUNT, CAMPAIGN_RANKING_NAME);
+    let held_actions = campaign_arn(ACCOUNT, CAMPAIGN_ACTIONS_NAME);
+    let held_recommender = recommender_arn(ACCOUNT, RECOMMENDER_NAME);
+    let missing_campaign = campaign_arn(ACCOUNT, UNREGISTERED_NAME);
+    let missing_recommender = recommender_arn(ACCOUNT, UNREGISTERED_NAME);
+    let missing_filter = filter_arn(ACCOUNT, UNREGISTERED_NAME);
+    // The resource IAM writes in a denial about a request that addresses no resource of the
+    // service: the all-resources wildcard, spelled here rather than read from the crate, so
+    // the expectation is independent of the implementation's own constant.
+    let any_resource = "*".to_string();
+
+    let rows = vec![
+        OrderRow {
+            case: "GetRecommendations on a campaign the registry does not hold",
+            operation: "GetRecommendations",
+            route: RECOMMENDATIONS,
+            body: json!({ "campaignArn": missing_campaign, "userId": "user-1" }),
+            resource: missing_campaign.clone(),
+            permitted_status: UNRESOLVED_STATUS,
+            permitted_message: Some(format!(
+                "{missing_campaign} does not exist or is not active yet."
+            )),
+        },
+        OrderRow {
+            case: "GetPersonalizedRanking on a campaign the registry does not hold",
+            operation: "GetPersonalizedRanking",
+            route: PERSONALIZE_RANKING,
+            body: json!({
+                "campaignArn": missing_campaign,
+                "userId": "user-1",
+                "inputList": ["item-1", "item-2"],
+            }),
+            resource: missing_campaign.clone(),
+            permitted_status: UNRESOLVED_STATUS,
+            permitted_message: Some(format!(
+                "{missing_campaign} does not exist or is not active yet."
+            )),
+        },
+        OrderRow {
+            case: "GetActionRecommendations on a campaign the registry does not hold",
+            operation: "GetActionRecommendations",
+            route: ACTION_RECOMMENDATIONS,
+            body: json!({ "campaignArn": missing_campaign, "userId": "user-1", "numResults": 2 }),
+            resource: missing_campaign.clone(),
+            permitted_status: UNRESOLVED_STATUS,
+            permitted_message: Some(format!(
+                "{missing_campaign} does not exist or is not active yet."
+            )),
+        },
+        OrderRow {
+            case: "GetRecommendations on a recommender the registry does not hold",
+            operation: "GetRecommendations",
+            route: RECOMMENDATIONS,
+            body: json!({ "recommenderArn": missing_recommender, "userId": "user-1" }),
+            resource: missing_recommender.clone(),
+            permitted_status: UNRESOLVED_STATUS,
+            permitted_message: Some(format!(
+                "{missing_recommender} does not exist or is not active yet."
+            )),
+        },
+        OrderRow {
+            case: "GetRecommendations on a campaign the registry DOES hold",
+            operation: "GetRecommendations",
+            route: RECOMMENDATIONS,
+            body: json!({ "campaignArn": held_campaign, "userId": "user-1", "numResults": 3 }),
+            resource: held_campaign.clone(),
+            permitted_status: 200,
+            permitted_message: None,
+        },
+        OrderRow {
+            case: "GetPersonalizedRanking on a campaign the registry DOES hold",
+            operation: "GetPersonalizedRanking",
+            route: PERSONALIZE_RANKING,
+            body: json!({
+                "campaignArn": held_ranking,
+                "userId": "user-1",
+                "inputList": ["item-1"],
+            }),
+            resource: held_ranking.clone(),
+            permitted_status: 200,
+            permitted_message: None,
+        },
+        OrderRow {
+            case: "GetActionRecommendations on a campaign the registry DOES hold",
+            operation: "GetActionRecommendations",
+            route: ACTION_RECOMMENDATIONS,
+            body: json!({ "campaignArn": held_actions, "userId": "user-1" }),
+            resource: held_actions.clone(),
+            permitted_status: 200,
+            permitted_message: None,
+        },
+        OrderRow {
+            case: "GetRecommendations on a recommender the registry DOES hold",
+            operation: "GetRecommendations",
+            route: RECOMMENDATIONS,
+            body: json!({ "recommenderArn": held_recommender, "userId": "user-1" }),
+            resource: held_recommender.clone(),
+            permitted_status: 200,
+            permitted_message: None,
+        },
+        OrderRow {
+            case: "GetRecommendations naming a filter the registry does not hold",
+            operation: "GetRecommendations",
+            route: RECOMMENDATIONS,
+            body: json!({
+                "campaignArn": held_campaign,
+                "userId": "user-1",
+                "filterArn": missing_filter,
+            }),
+            // The action is performed on the campaign; a filter is a value it READS.
+            resource: held_campaign.clone(),
+            permitted_status: UNRESOLVED_STATUS,
+            permitted_message: Some(format!(
+                "{missing_filter} does not exist or is not active yet."
+            )),
+        },
+        OrderRow {
+            case: "GetRecommendations naming no inference target at all",
+            operation: "GetRecommendations",
+            route: RECOMMENDATIONS,
+            body: json!({ "userId": "user-1" }),
+            resource: any_resource.clone(),
+            permitted_status: UNRESOLVED_STATUS,
+            permitted_message: Some("campaignArn or recommenderArn required.".to_string()),
+        },
+        OrderRow {
+            case: "GetRecommendations naming both inference targets",
+            operation: "GetRecommendations",
+            route: RECOMMENDATIONS,
+            body: json!({
+                "campaignArn": held_campaign,
+                "recommenderArn": held_recommender,
+                "userId": "user-1",
+            }),
+            resource: held_campaign.clone(),
+            permitted_status: UNRESOLVED_STATUS,
+            permitted_message: Some(
+                "Cannot provide both a campaignArn and recommenderArn".to_string(),
+            ),
+        },
+    ];
+
+    // The caller the account grants one OTHER action of this same service and nothing else,
+    // so every row's action falls to IAM's default deny — the least-privilege role a
+    // negative-permission test signs with.
+    let restricted = harness
+        .assumed_role_key(
+            "describe-campaign-only",
+            Some(&policy("Allow", &["personalize:DescribeCampaign"], &["*"])),
+        )
+        .await;
+    let principal = harness.principal(&restricted).await;
+
+    for row in &rows {
+        let case = row.case;
+        let resource = &row.resource;
+
+        // The restricted caller: refused at the authorization layer, whatever the row names.
+        let issued_before = harness.issued();
+        let (status, answered) = harness.inference(&restricted, row.route, &row.body).await;
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (DENIED_STATUS, DENIED_CODE),
+            "case {case:?}: expected HTTP {DENIED_STATUS} {DENIED_CODE}, got {status} with \
+             {answered}"
+        );
+        let action = format!("personalize:{}", row.operation);
+        assert_eq!(
+            error_message(&answered),
+            format!(
+                "User: {principal} is not authorized to perform: {action} on resource: \
+                 {resource} because no identity-based policy allows the {action} action"
+            ),
+            "case {case:?}: expected IAM's identity-denial wording, got {answered}"
+        );
+        // The refusal tells the caller nothing about what the registry holds or what else is
+        // wrong with the request: the business logic was never reached.
+        if let Some(permitted_message) = &row.permitted_message {
+            assert_ne!(
+                &error_message(&answered),
+                permitted_message,
+                "case {case:?}: the refusal must not state what the business logic would"
+            );
+        }
+        assert_eq!(
+            harness.issued(),
+            issued_before,
+            "case {case:?}: a refused call must issue no recommendationId"
+        );
+
+        // The account's own published credential, which holds no IAM policies: permitted, so
+        // the identical request reaches the business logic and earns its answer instead.
+        let issued_before = harness.issued();
+        let (status, answered) = harness.inference(ACCOUNT_KEY, row.route, &row.body).await;
+        assert_eq!(
+            status, row.permitted_status,
+            "case {case:?} (permitted caller): expected HTTP {}, got {status} with {answered}",
+            row.permitted_status
+        );
+        if let Some(permitted_message) = &row.permitted_message {
+            assert_eq!(
+                error_code(&answered).as_str(),
+                UNRESOLVED_CODE,
+                "case {case:?} (permitted caller): expected {UNRESOLVED_CODE}, got {answered}"
+            );
+            assert_eq!(
+                &error_message(&answered),
+                permitted_message,
+                "case {case:?} (permitted caller): expected the business logic's sentence, got \
+                 {answered}"
+            );
+            assert_eq!(
+                harness.issued(),
+                issued_before,
+                "case {case:?} (permitted caller): a refused call issues no recommendationId"
+            );
+        } else {
+            // The positive control of each served row: the call the permitted caller made
+            // really was served, so this service minted a recommendation for it.
+            assert_eq!(
+                harness.issued(),
+                issued_before + 1,
+                "case {case:?} (permitted caller): a served call issues one recommendationId, \
+                 got {answered}"
+            );
+        }
+    }
 }

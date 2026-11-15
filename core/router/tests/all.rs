@@ -1261,3 +1261,9 @@ mod lambda_in_function_assumed_role_session;
 //! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of it
 //! (`tests/boot_serve.rs`), which the layout check refuses: the `#[path]` above each `mod`
 //! is what points the declaration into `tests/all/`.
+//! Single integration-test target for the router: one `#[path = "all/<name>.rs"]` / `mod`
+//! pair per suite, sorted by name, and no other line — the canonical declaration list
+//! `all/all_rs_is_a_canonical_declaration_list.rs`, `all/all_rs_declares_each_suite_once.rs`
+//! and `all/all_rs_inner_doc_comments_precede_the_first_item.rs` pin. What a suite covers,
+//! and why it drives the assembled router rather than one service crate, is in that suite's
+//! own module header.
