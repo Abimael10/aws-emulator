@@ -117,6 +117,8 @@ mod declared_alarm_is_readable_in_cloudwatch;
 mod declared_function_logs_on_first_invoke;
 #[path = "all/declared_notification_runs_its_function.rs"]
 mod declared_notification_runs_its_function;
+#[path = "all/declared_topic_policy_decides_the_alarm_action.rs"]
+mod declared_topic_policy_decides_the_alarm_action;
 // An EMPTY, moved-out suite: its rows now live in `all/delete_stack_export_in_use.rs`.
 // Declared because the layout check refuses an undeclared file under `tests/all/`, and this
 // fixer's tool set can write a file but not remove one; the next change to touch this

@@ -119,6 +119,10 @@ service-com-amazonaws-s3tables-s3tablebuckets = { workspace = true }
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-codepipeline-codepipeline-20150709 = { workspace = true }
 service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
+# Amazon SQS, for the `AWS::SQS::Queue` and `AWS::SQS::QueuePolicy` a stack really creates
+# there: the queue subscribed to a stack's topic is where a client reads the notification a
+# deployed alarm's action published, so the suite that pins that estate needs it mounted.
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 service-com-amazonaws-rds-amazonrdsv19 = { workspace = true }
 # AWS Systems Manager, for the `AWS::SSM::Parameter` a stack really creates there
 # (`state::provisioner`): a suite that deploys one must have its owning service mounted

@@ -42,3 +42,31 @@ Actual: the alarm notification envelope (a JSON body whose Message carries Alarm
 3. cloudwatch SetAlarmState(StateValue="ALARM") on the restricted stack's alarm, then on the control stack's alarm.
 4. Poll the control queue until the notification arrives (measures latency L), then poll the restricted stack's queue for max(60 s, L) and assert it stays empty.
 Observed: the restricted queue also receives the ALARM notification.
+
+## Resolution
+
+* Cause 1 is implemented and no longer reproduces: executing an SNS alarm action is authorized
+  against the documents in force on the destination topic before anything is published — the
+  topic's own access policy for the publish action by the `cloudwatch.amazonaws.com` service
+  principal, and, for a topic carrying `KmsMasterKeyId`, that key's policy
+  (`services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801/src/state/alarm_actions/sns_topic_authorization.rs`,
+  called from `settle_alarms` in `.../state/alarm_actions.rs`), and a document stating no such
+  grant withholds the publish, which is then recorded in the alarm's history as the
+  authorization failure it was. The policy an `AWS::SNS::TopicPolicy` declares reaches that
+  decision because the provider writes it through to the topic's `Policy` attribute
+  (`services/service-com-amazonaws-cloudformation-cloudformation/src/state/provisioner/application_services.rs`,
+  `put_topic_policy`).
+* What this change adds is the DEPLOYED-estate coverage of that rule in a target that runs:
+  `services/service-com-amazonaws-cloudformation-cloudformation/tests/all/declared_topic_policy_decides_the_alarm_action.rs`
+  deploys the stack shape this report describes — a queue, a topic, the sqs subscription, a
+  queue policy whose grant to SNS is scoped by `aws:SourceArn`, the alarm, and the declared
+  topic policy — and tables the grants the declared document can make, including this report's
+  own least-privilege statement (`{"AWS": "*"}` over `SNS:Subscribe`, `SNS:Receive` and
+  `SNS:GetTopicAttributes`) beside the same statement with `SNS:Publish` added.
+* The check itself still cannot pass, for the reason
+  `issues/things-that-now-work/20261029T182452Z-cloudwatch-sns-alarm-actions-cfn-alarms-are-never.md`
+  already recorded for this same trace id: its absence assertion is satisfied, so it holds its
+  whole emptiness window (`max(60 s, L)`) on top of deploying two stacks, which exceeds the
+  check's own 60 s wall-clock budget. The remaining replay failure is a timeout rather than
+  this report's `AssertionError`, and is filed separately as
+  `20261114T170523Z-cloudwatch-sns-a-cfn-deployed-alarm-s-sns.md`.

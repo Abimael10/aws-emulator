@@ -11062,6 +11062,7 @@ dependencies = [
  "service-com-amazonaws-secretsmanager-secretsmanager",
  "service-com-amazonaws-sfn-awsstepfunctions",
  "service-com-amazonaws-sns-amazonsimplenotificationservice",
+ "service-com-amazonaws-sqs-amazonsqs",
  "service-com-amazonaws-ssm-amazonssm",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",
