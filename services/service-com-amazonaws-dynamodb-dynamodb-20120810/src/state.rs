@@ -4601,6 +4601,12 @@ pub use imports::*;
 mod import_objects;
 pub use import_objects::*;
 
+/// The CloudWatch Logs side of an import: the log group its task reports what it could not
+/// import to, created where that service holds log groups. Re-exported below, so every
+/// caller still names them `crate::state::…`.
+mod import_log_groups;
+pub use import_log_groups::*;
+
 /// The objects one export writes into Amazon S3, and the write into that service's own
 /// store on this engine. Re-exported below, so every caller still names them
 /// `crate::state::…`.

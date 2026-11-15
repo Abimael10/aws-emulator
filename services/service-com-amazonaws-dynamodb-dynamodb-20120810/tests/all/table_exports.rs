@@ -11,7 +11,10 @@
 //!    for table '<name>'"), whatever else the request asks for, and a table whose
 //!    recovery was turned on and then off again is in exactly that state;
 //! 2. an `ExportTime` must lie inside the table's recovery window, and one outside it is
-//!    refused with `InvalidExportTimeException`; a request that names none exports the
+//!    refused with `InvalidExportTimeException` — an instant NO recovery window could
+//!    cover (one in the future, one from before the table existed, one further back than
+//!    the longest recovery period the service offers) is refused for the TIME whatever the
+//!    addressed table's recovery state is; a request that names none exports the
 //!    table as it stands at the instant of the request, so an item written a moment
 //!    before the call is in the snapshot;
 //! 3. an accepted export is RECORDED, and every member of the description is read from
@@ -208,6 +211,13 @@ async fn an_export_of_a_table_with_recovery_off_is_refused() {
     // window started, so it is in the same state as one that never had recovery at all.
     set_recovery(&router, "RecoveryTurnedOff", true).await;
     set_recovery(&router, "RecoveryTurnedOff", false).await;
+    // An instant the table HAS existed at, which a recovery window could therefore have
+    // covered: what is wrong with the request is the table's recovery, so the point in time
+    // it names must be one no other refusal speaks about
+    // (`an_export_time_no_window_could_cover_is_refused_for_the_time`).
+    let existed_at = ok(&router, "DescribeTable", json!({"TableName": "NoRecovery"})).await
+        ["Table"]["CreationDateTime"]
+        .clone();
 
     // Rows differ in the table addressed and in what else the request asks for: the
     // refusal is about the table's recovery, so no other member can turn it into a
@@ -234,9 +244,9 @@ async fn an_export_of_a_table_with_recovery_off_is_refused() {
             json!({"S3Prefix": "snapshots/nightly", "S3BucketOwner": engine::emulator_account_id()}),
         ),
         (
-            "an export naming a point in time",
+            "an export naming a point in time the table existed at",
             "NoRecovery",
-            json!({"ExportTime": 1_700_000_000}),
+            json!({"ExportTime": existed_at}),
         ),
         (
             "an export naming a client token",
@@ -274,6 +284,62 @@ async fn an_export_of_a_table_with_recovery_off_is_refused() {
             json!([]),
             "case {case:?}: a refused export records nothing, got {listed}"
         );
+    }
+}
+
+#[tokio::test]
+async fn an_export_time_no_recovery_window_could_cover_is_refused_for_the_time() {
+    let router = emulator_with_destination().await;
+    table_with_items(&router, "TimeRecoveryOff", 1).await;
+    table_with_items(&router, "TimeRecoveryOn", 1).await;
+    set_recovery(&router, "TimeRecoveryOn", true).await;
+
+    // Every instant below is measured from the table's own reported creation instant, so
+    // the rows are the same whatever the clock reads: no recovery window of any table can
+    // reach an instant in the future, one from before the table existed, or one further
+    // back than the longest recovery period the service offers
+    // (`PointInTimeRecoverySpecification$RecoveryPeriodInDays`, @range max 35).
+    let created = ok(&router, "DescribeTable", json!({"TableName": "TimeRecoveryOff"})).await
+        ["Table"]["CreationDateTime"]
+        .as_f64()
+        .expect("the table reports its creation instant");
+    let day = 24.0 * 60.0 * 60.0;
+    let instants: [(&str, f64); 4] = [
+        ("an instant an hour in the future", created + 60.0 * 60.0),
+        ("an instant a day in the future", created + day),
+        ("an instant from before the table existed", created - 60.0),
+        (
+            "an instant older than the longest recovery period",
+            created - 40.0 * day,
+        ),
+    ];
+
+    // Both tables answer the same way: what is wrong is the TIME, so the addressed table's
+    // recovery state does not decide the refusal.
+    for (case, export_time) in instants {
+        for table in ["TimeRecoveryOff", "TimeRecoveryOn"] {
+            let arn = state::table_arn(REGION, table);
+            let mut body = export_body(&arn);
+            body["ExportTime"] = json!(export_time);
+            let (status, answered) = call(&router, "ExportTableToPointInTime", body).await;
+            assert_eq!(
+                (status, error_code(&answered).as_str()),
+                (400, "InvalidExportTimeException"),
+                "case {case:?} against {table}: expected HTTP 400 InvalidExportTimeException, \
+                 got {status} with {answered}"
+            );
+            assert_eq!(
+                message(&answered),
+                "Export Time is invalid",
+                "case {case:?} against {table}: the refusal states the fixed sentence"
+            );
+            let listed = ok(&router, "ListExports", json!({"TableArn": arn})).await;
+            assert_eq!(
+                listed["ExportSummaries"],
+                json!([]),
+                "case {case:?} against {table}: a refused export records nothing, got {listed}"
+            );
+        }
     }
 }
 

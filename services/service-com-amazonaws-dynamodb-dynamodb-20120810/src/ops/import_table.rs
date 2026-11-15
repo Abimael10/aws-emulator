@@ -301,9 +301,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(|| crate::state::DEFAULT_INPUT_COMPRESSION_TYPE.to_string());
         // What this request ASKED FOR, in the one form two requests are compared in: a
         // replayed `ClientToken` answers the import it already started only if every
-        // other member is the one that import was started with.
+        // other member is the one that import was started with. The source is compared
+        // with its bucket owner RESOLVED, the way the compression is resolved to the value
+        // its member defaults to: a request naming the requester's own account and one
+        // naming no owner at all ask for the same import.
         let signature = crate::state::import_request_signature(
-            &input.s3_bucket_source,
+            &crate::state::resolved_bucket_source(&input.s3_bucket_source),
             &input.input_format,
             input.input_format_options.as_ref(),
             input.input_compression_type.as_deref(),
@@ -325,6 +328,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the instant in its ARN, the instant it reports and the instant a client can
         // send back are all the same one.
         let started_at = crate::state::at_timestamp_precision(now);
+
+        // The log group an import this call records reports its per-row errors in, made for
+        // it where CloudWatch Logs holds log groups ([`crate::state::import_log_group`]).
+        // Called only where an import IS recorded, so a request refused before anything is
+        // recorded makes no log group either.
+        let log_group = || crate::state::import_log_group(&*self.engine, &region, now);
 
         // Everything this call decides about the catalogue and the target name is decided
         // under the store's own guard, and the guard is released at the end of this
@@ -363,6 +372,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &name,
                     &compression,
                     started_at,
+                    log_group(),
                     TaskOutcome {
                         failure: Some(crate::state::ImportFailure {
                             code: crate::state::IMPORT_FAILURE_TABLE_ALREADY_EXISTS.to_string(),
@@ -541,6 +551,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &name,
                 &compression,
                 started_at,
+                log_group(),
                 TaskOutcome {
                     failure: Some(crate::state::ImportFailure {
                         code: crate::state::IMPORT_FAILURE_TABLE_ALREADY_EXISTS.to_string(),
@@ -578,15 +589,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &name,
             &compression,
             started_at,
+            log_group(),
             TaskOutcome {
                 table_id: Some(table.id.clone()),
                 processed_item_count: read.processed_item_count,
                 imported_item_count: keyed.imported_item_count,
                 error_count,
-                // A source that could not be read processed nothing, so there are no
-                // bytes to report for it. An import that READ its source processed its
-                // bytes whether every item it carried could be written or not.
-                processed_size_bytes: failure.is_none().then_some(read.processed_size_bytes),
+                // A source that could not be read processed nothing, so the figure it
+                // reports is 0. An import that READ its source processed its bytes whether
+                // every item it carried could be written or not.
+                processed_size_bytes: if failure.is_none() {
+                    read.processed_size_bytes
+                } else {
+                    0
+                },
                 // An import that could not write every item it read did not import the
                 // source it was given, so its task ends FAILED with the validation its
                 // items failed — the items that passed are in the table either way. A
@@ -724,7 +740,8 @@ struct TaskOutcome {
     processed_item_count: i64,
     imported_item_count: i64,
     error_count: i64,
-    processed_size_bytes: Option<i64>,
+    /// The bytes of source the task read, 0 for a task that read none.
+    processed_size_bytes: i64,
     /// Why the task did not finish, where it did not.
     failure: Option<crate::state::ImportFailure>,
 }
@@ -744,6 +761,7 @@ fn recorded_import(
     name: &str,
     compression: &str,
     started_at: ::std::time::SystemTime,
+    log_group: Option<String>,
     outcome: TaskOutcome,
 ) -> crate::state::Import {
     crate::state::Import {
@@ -755,10 +773,12 @@ fn recorded_import(
         } else {
             crate::state::IMPORT_STATUS_COMPLETED.to_string()
         },
-        s3_bucket_source: input.s3_bucket_source.clone(),
-        // No log group: this emulator writes no import error log, so there is none to
-        // report. The member is reported only where one was made.
-        cloud_watch_log_group_arn: None,
+        // The source as the import READS it, with the bucket owner the request left to
+        // the requester's own account resolved ([`crate::state::resolved_bucket_source`]).
+        s3_bucket_source: crate::state::resolved_bucket_source(&input.s3_bucket_source),
+        // The log group this import's errors are reported in, made for it where CloudWatch
+        // Logs holds log groups ([`crate::state::import_log_group`]).
+        cloud_watch_log_group_arn: log_group,
         input_format: input.input_format.clone(),
         started_at,
         // One span after it began, which is when the table it filled is ready too.

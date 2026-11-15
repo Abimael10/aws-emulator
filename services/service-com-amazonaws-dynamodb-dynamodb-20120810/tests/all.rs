@@ -103,6 +103,8 @@ mod global_secondary_indexes;
 mod global_tables;
 #[path = "all/import_item_validation_outcomes.rs"]
 mod import_item_validation_outcomes;
+#[path = "all/import_task_reporting.rs"]
+mod import_task_reporting;
 #[path = "all/index_and_projection_reads.rs"]
 mod index_and_projection_reads;
 #[path = "all/index_capacity_and_item_collections.rs"]
@@ -221,6 +223,8 @@ mod region_from_the_request_endpoint;
 mod regions_indexes_and_capacity;
 #[path = "all/replica_auto_scaling.rs"]
 mod replica_auto_scaling;
+#[path = "all/replica_auto_scaling_global_table_scope.rs"]
+mod replica_auto_scaling_global_table_scope;
 #[path = "all/resource_policy_arn_scope_refusals.rs"]
 mod resource_policy_arn_scope_refusals;
 #[path = "all/resource_policy_conditions_and_read_lag.rs"]
@@ -247,6 +251,8 @@ mod resume_token_schema_refusals;
 mod scan_filter_value_types_and_segments;
 #[path = "all/scan_indexes_and_projections.rs"]
 mod scan_indexes_and_projections;
+#[path = "all/scan_read_capacity.rs"]
+mod scan_read_capacity;
 #[path = "all/scan_segment_partitions.rs"]
 mod scan_segment_partitions;
 #[path = "all/schema_duplicates_and_capacity_floors.rs"]

@@ -536,6 +536,10 @@ fn select_items(
         .limit
         .map_or(usize::MAX, |limit| usize::try_from(limit).unwrap_or(0));
     let mut page_size: i64 = 0;
+    // What the rows the plan evaluated COST, where the plan is a scan: one read unit per
+    // 4 KB of EACH row, half a unit where the read is eventually consistent — the charge a
+    // `Scan` of the same rows carries ([`crate::ops::scan`]).
+    let mut page_units: f64 = 0.0;
     let mut evaluated = 0usize;
     let mut rows: Vec<(&crate::state::ItemKey, &crate::state::Item)> = Vec::new();
     for (key, item) in &candidates {
@@ -544,7 +548,10 @@ fn select_items(
         if evaluated >= limit || (evaluated > 0 && page_size >= MAX_PAGE_BYTES) {
             break;
         }
-        page_size = page_size.saturating_add(crate::state::item_size(item));
+        let size = crate::state::item_size(item);
+        page_size = page_size.saturating_add(size);
+        page_units +=
+            crate::state::read_capacity_units(size, input.consistent_read.unwrap_or(false));
         evaluated += 1;
         if let Some(condition) = condition.as_ref() {
             if !condition.evaluate(Some(*item)).map_err(lift)? {
@@ -593,8 +600,16 @@ fn select_items(
         ),
         _ => (None, None),
     };
-    let units =
-        crate::state::read_capacity_units(page_size, input.consistent_read.unwrap_or(false));
+    // What this statement is charged is what the plan it ran READ, charged as the native
+    // read that IS that plan: a plan that pins a partition key is a query (or, with the
+    // sort key pinned too, a single-item read), charged once over the bytes it read; a plan
+    // that walks the whole source is a scan, charged per row it evaluated. A plan that
+    // evaluated nothing spends the one unit a read takes at least.
+    let units = if partition.is_some() || evaluated == 0 {
+        crate::state::read_capacity_units(page_size, input.consistent_read.unwrap_or(false))
+    } else {
+        page_units
+    };
     // The read is ADMITTED against the read capacity the table is provisioned for, the
     // same as the item API's reads: a statement past that capacity is refused rather
     // than served.

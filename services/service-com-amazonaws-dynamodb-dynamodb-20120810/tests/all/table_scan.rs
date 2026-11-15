@@ -526,18 +526,19 @@ async fn consumed_capacity_is_reported_only_when_asked_for() {
     };
     seed(&router, &table).await;
 
-    // The page is far inside one 4 KB read unit, which an eventually consistent read
-    // takes half of: "one read capacity unit represents one strongly consistent read
-    // per second ... for an item up to 4 KB" and "two eventually consistent reads per
-    // second" (the Developer Guide's "Read/write capacity mode"). Each row: the
-    // `ReturnConsumedCapacity`, the `ConsistentRead`, and the units the response must
-    // report — `None` where it must report no `ConsumedCapacity` at all.
+    // Each item of the page is charged its own read unit: the page is far inside one 4 KB
+    // read unit PER ITEM, which an eventually consistent read takes half of — "one read
+    // capacity unit represents one strongly consistent read per second ... for an item up
+    // to 4 KB" and "two eventually consistent reads per second" (the Developer Guide's
+    // "Read/write capacity mode") — so this two-item page costs two of those units. Each
+    // row: the `ReturnConsumedCapacity`, the `ConsistentRead`, and the units the response
+    // must report — `None` where it must report no `ConsumedCapacity` at all.
     let cases: [(&str, Option<&str>, bool, Option<f64>); 5] = [
         ("no ReturnConsumedCapacity", None, false, None),
         ("NONE", Some("NONE"), false, None),
-        ("TOTAL, eventually consistent", Some("TOTAL"), false, Some(0.5)),
-        ("TOTAL, strongly consistent", Some("TOTAL"), true, Some(1.0)),
-        ("INDEXES, strongly consistent", Some("INDEXES"), true, Some(1.0)),
+        ("TOTAL, eventually consistent", Some("TOTAL"), false, Some(1.0)),
+        ("TOTAL, strongly consistent", Some("TOTAL"), true, Some(2.0)),
+        ("INDEXES, strongly consistent", Some("INDEXES"), true, Some(2.0)),
     ];
     for (case, requested, consistent, expected_units) in cases {
         let mut request = json!({"TableName": &table.name, "ConsistentRead": consistent});
@@ -567,7 +568,7 @@ async fn consumed_capacity_is_reported_only_when_asked_for() {
         if requested == Some("INDEXES") {
             assert_eq!(
                 scanned["ConsumedCapacity"]["Table"]["CapacityUnits"],
-                json!(1.0),
+                json!(2.0),
                 "case {case:?}: INDEXES breaks the table's own capacity out, got {scanned}"
             );
         }

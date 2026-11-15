@@ -1,32 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Endpoint discovery: what `DescribeEndpoints` reports, that it names the endpoint
-//! identity a client reads it for, and that what it names still reaches this process.
+//! Endpoint discovery: what `DescribeEndpoints` reports, and that what it names is the
+//! address this emulator is actually reached on.
 //!
 //! The rule these tests pin:
 //!
-//! > endpoint discovery reports exactly one endpoint, whose `Address` is the endpoint of the
-//! > REGION THE REQUEST ADDRESSES as this emulator serves it — this service's endpoint
-//! > prefix, then that region, then the loopback name and the port this process serves, with
-//! > no scheme and no path — with a positive cache TTL in minutes, whatever endpoint the
-//! > request arrived on; and the answer is stable across an immediate repeat call.
+//! > endpoint discovery reports exactly one endpoint, whose `Address` is THIS EMULATOR'S
+//! > OWN serving address — the host and port of the base URL this process is reached at,
+//! > with no scheme and no path — with a positive cache TTL in minutes; the address is a
+//! > property of the process, so neither the endpoint a request arrives on nor the region it
+//! > addresses moves it, and it is the same across an immediate repeat call.
 //!
 //! One form of arrival is one row of [`ARRIVALS`]; the rows differ along the FORM of the
 //! endpoint a client reaches this emulator through (the regional host, its FIPS sibling, the
 //! dual-stack endpoint as an HTTP/2 `:authority` with no `Host` header at all, the legacy
 //! global host, loopback with a port, a bare name on a port of the caller's choosing, no
 //! host at all, a `Host` that is not an address, a `Host` carrying a path) and along the
-//! REGION each addresses — regions of six different AWS partitions — because the arrival is
-//! what the reported address must NOT depend on and the region is the only thing it may.
-//! [`the_address_does_not_depend_on_the_arrival`] states that independence directly, by
-//! sending every arrival form for ONE region, and
-//! [`the_reported_address_reaches_this_process_and_no_public_host`] pins the other half: an
-//! address handed to a client is one that resolves to this machine, never a real AWS
-//! endpoint host.
+//! REGION each addresses — regions of six different AWS partitions — because neither may
+//! change the address reported back. [`the_announced_address_is_the_serving_address`] drives
+//! the other half: a set of serving addresses this emulator is published at, each of which
+//! the answer must name back, which is what makes the announced address one a client can
+//! actually dial.
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
+use smithy_server_runtime::{EndpointUrl, MultiServiceRouter};
 
 use crate::emulator::emulator;
 
@@ -45,8 +43,8 @@ struct Arrival {
 
 /// Every form of endpoint a client reaches this emulator through, each addressing a region
 /// of a different AWS partition (commercial, GovCloud, China and the four ISO partitions —
-/// the partitions of the AWS SDKs' endpoint metadata), none of which may change the form of
-/// the address reported back.
+/// the partitions of the AWS SDKs' endpoint metadata), none of which may change the address
+/// reported back.
 const ARRIVALS: &[Arrival] = &[
     Arrival {
         case: "the regional endpoint host of the region it is signed for",
@@ -104,21 +102,18 @@ const ARRIVALS: &[Arrival] = &[
     },
 ];
 
-/// The first label an endpoint host of this service carries: its `aws.api#service`
-/// `endpointPrefix` (`smithy_query(query="service_info")` — `endpointPrefix: "dynamodb"`).
-const ENDPOINT_PREFIX: &str = "dynamodb";
+/// The base URL this suite's emulator is published at, and the `Address` discovery must
+/// then announce: the authority of that URL, which is the host and port a client dials.
+const SERVING_BASE: &str = "https://127.0.0.1:34567";
+const SERVING_ADDRESS: &str = "127.0.0.1:34567";
 
-/// The last label of an address this emulator may report: the name reserved for the
-/// loopback interface.
-const LOOPBACK_ENDPOINT_NAME: &str = "localhost";
-
-/// The one `Address` a request addressing `region` must be answered with: the service, the
-/// region, the loopback name and the port this emulator serves.
-fn expected_address(region: &str) -> String {
-    format!(
-        "{ENDPOINT_PREFIX}.{region}.{LOOPBACK_ENDPOINT_NAME}:{}",
-        emulator_server::data_port_from_env()
-    )
+/// One emulator published at `base`, the way the data port publishes the URL it bound.
+fn emulator_served_at(base: &str) -> MultiServiceRouter {
+    let mut router = emulator();
+    router.set_url_base(EndpointUrl::parse(base).unwrap_or_else(|| {
+        panic!("{base:?} is a usable endpoint URL");
+    }));
+    router
 }
 
 /// Send one operation that arrives on `host`/`authority_uri` signed for `region`, and
@@ -158,8 +153,7 @@ async fn call_through(
 }
 
 /// The addresses a `DescribeEndpoints` body reports, in order, with every entry checked for
-/// shape: a host and a port and nothing else (no scheme, no path), on the loopback name and
-/// the port this process serves — never a host outside this machine — with a positive cache
+/// shape: a host and a port and nothing else (no scheme, no path), with a positive cache
 /// TTL in minutes.
 fn reported_addresses(case: &str, body: &Value) -> Vec<String> {
     let endpoints = body["Endpoints"]
@@ -168,10 +162,8 @@ fn reported_addresses(case: &str, body: &Value) -> Vec<String> {
     assert_eq!(
         endpoints.len(),
         1,
-        "case {case:?}: the region this request addresses has one endpoint to discover, got \
-         {body}"
+        "case {case:?}: this emulator serves one endpoint, so one is discovered, got {body}"
     );
-    let serving_port = emulator_server::data_port_from_env();
     endpoints
         .iter()
         .map(|endpoint| {
@@ -182,19 +174,6 @@ fn reported_addresses(case: &str, body: &Value) -> Vec<String> {
             assert!(
                 !address.contains("://") && !address.contains('/') && !address.is_empty(),
                 "case {case:?}: an Address is a host and a port, not a URL, got {address:?}"
-            );
-            let (host, port) = address
-                .rsplit_once(':')
-                .unwrap_or_else(|| panic!("case {case:?}: a host and a port, got {address:?}"));
-            assert_eq!(
-                port,
-                serving_port.to_string(),
-                "case {case:?}: the port this emulator serves, got {address:?}"
-            );
-            assert!(
-                host.ends_with(&format!(".{LOOPBACK_ENDPOINT_NAME}")),
-                "case {case:?}: an address a client is handed resolves to this machine, so it \
-                 ends in the loopback name, got {address:?}"
             );
             let ttl = endpoint["CachePeriodInMinutes"].as_i64().unwrap_or_else(|| {
                 panic!("case {case:?}: CachePeriodInMinutes is a long, got {body}")
@@ -220,8 +199,8 @@ fn probe_table(name: &str) -> Value {
 }
 
 #[tokio::test]
-async fn discovery_reports_the_endpoint_of_the_region_addressed() {
-    let router = emulator();
+async fn discovery_reports_this_emulators_serving_address() {
+    let router = emulator_served_at(SERVING_BASE);
 
     for arrival in ARRIVALS {
         // One table in this row's region, so the address the answer names can be shown to
@@ -256,21 +235,19 @@ async fn discovery_reports_the_endpoint_of_the_region_addressed() {
             "case {:?}: expected HTTP 200, got {status} with {body}",
             arrival.case
         );
-        let expected = expected_address(arrival.region);
         let addresses = reported_addresses(arrival.case, &body);
         assert_eq!(
             addresses,
-            vec![expected.clone()],
-            "case {:?}: the endpoint of {} as this emulator serves it, whatever endpoint the \
-             request arrived on, expected {expected:?}, got {addresses:?}",
-            arrival.case,
-            arrival.region
+            vec![SERVING_ADDRESS.to_string()],
+            "case {:?}: the address this emulator is served on, whatever endpoint the \
+             request arrived on and whatever region it addresses, expected \
+             {SERVING_ADDRESS:?}, got {addresses:?}",
+            arrival.case
         );
 
         for address in &addresses {
-            // The reported address names the service and the region in the labels this
-            // emulator's own routing reads them from, so a request sent to it reaches this
-            // service over the same region's store — which is also what shows discovery
+            // A request sent to the announced address reaches this service, over the store
+            // of the region the request addresses — which is also what shows discovery
             // changed nothing a later caller sees, the probe table still being the one and
             // only table of that region.
             let (status, listed) = call_through(
@@ -295,48 +272,39 @@ async fn discovery_reports_the_endpoint_of_the_region_addressed() {
 }
 
 #[tokio::test]
-async fn the_address_does_not_depend_on_the_arrival() {
-    let router = emulator();
-    // One region, every form of arrival: the reported address is a property of the region
-    // the request addresses, so none of these may move it.
-    let region = "eu-west-3";
-    let expected = expected_address(region);
-    let arrivals: [(&str, Option<&str>, Option<&str>); 7] = [
+async fn the_announced_address_is_the_serving_address() {
+    // Each row is an address this emulator is published at — a loopback address with a
+    // port, a port the OS could hand out, an IPv6 literal, a host name with a port and one
+    // without — and the `Address` discovery must then announce: the authority of that URL,
+    // whatever it is, because that is where this process answers.
+    let rows: [(&str, &str, &str); 5] = [
+        ("loopback on a fixed port", SERVING_BASE, SERVING_ADDRESS),
         (
-            "the regional host",
-            Some("dynamodb.eu-west-3.amazonaws.com"),
-            None,
+            "loopback on an ephemeral port",
+            "https://127.0.0.1:49512",
+            "127.0.0.1:49512",
         ),
         (
-            "the FIPS host",
-            Some("dynamodb-fips.eu-west-3.amazonaws.com"),
-            None,
+            "an IPv6 loopback literal",
+            "https://[::1]:9297",
+            "[::1]:9297",
         ),
         (
-            "another region's host",
-            Some("dynamodb.ap-south-1.amazonaws.com"),
-            None,
+            "a host name with a port",
+            "https://emulator.internal:8443",
+            "emulator.internal:8443",
         ),
-        ("loopback on a port", Some("127.0.0.1:45283"), None),
-        ("a bare name on a port", Some("emulator.internal:8080"), None),
-        ("no host at all", None, None),
         (
-            "an authority-form URI and no Host",
-            None,
-            Some("https://dynamodb.eu-west-3.api.aws/"),
+            "a host name on the default port",
+            "https://emulator.internal",
+            "emulator.internal",
         ),
     ];
 
-    for (case, host, authority_uri) in arrivals {
-        let (status, body) = call_through(
-            &router,
-            region,
-            host,
-            authority_uri,
-            "DescribeEndpoints",
-            &json!({}),
-        )
-        .await;
+    for (case, base, expected) in rows {
+        let router = emulator_served_at(base);
+        let (status, body) =
+            call_through(&router, "us-west-2", None, None, "DescribeEndpoints", &json!({})).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected HTTP 200, got {status} with {body}"
@@ -344,20 +312,20 @@ async fn the_address_does_not_depend_on_the_arrival() {
         let addresses = reported_addresses(case, &body);
         assert_eq!(
             addresses,
-            vec![expected.clone()],
-            "case {case:?}: the endpoint a request arrives on does not change the region's \
-             endpoint, expected {expected:?}, got {addresses:?}"
+            vec![expected.to_string()],
+            "case {case:?}: the announced address is the one this emulator is served at, \
+             expected {expected:?}, got {addresses:?}"
         );
     }
 }
 
 #[tokio::test]
-async fn the_reported_address_reaches_this_process_and_no_public_host() {
-    let router = emulator();
-    // Whatever region a request addresses, the address it is handed is one that resolves to
-    // THIS machine: the labels carry the endpoint's identity, but the host is never a real
-    // AWS endpoint, so a client that re-targets itself at a discovered endpoint cannot be
-    // sent off this emulator with the credentials it is holding.
+async fn the_announced_address_is_never_a_public_aws_endpoint() {
+    let router = emulator_served_at(SERVING_BASE);
+    // Whatever region a request addresses, and whatever endpoint host it arrives on, the
+    // address it is handed is this emulator's own: never a real AWS endpoint, so a client
+    // that re-targets itself at a discovered endpoint cannot be sent off this emulator with
+    // the credentials it is holding.
     //
     // The DNS suffixes ruled out here are those of the AWS partitions (the `dnsSuffix`
     // values of the AWS SDKs' endpoint metadata), one per partition.
@@ -393,7 +361,9 @@ async fn the_reported_address_reaches_this_process_and_no_public_host() {
             "case {region:?}: expected HTTP 200, got {status} with {body}"
         );
         for address in reported_addresses(region, &body) {
-            let host = address.rsplit_once(':').map_or(address.clone(), |(host, _)| host.to_string());
+            let host = address
+                .rsplit_once(':')
+                .map_or(address.clone(), |(host, _)| host.to_string());
             for suffix in partition_suffixes {
                 assert!(
                     !host.ends_with(suffix),
@@ -401,12 +371,10 @@ async fn the_reported_address_reaches_this_process_and_no_public_host() {
                      but {address:?} ends in {suffix:?}"
                 );
             }
-            assert!(
-                host.starts_with(&format!("{ENDPOINT_PREFIX}."))
-                    && host.contains(&format!(".{region}."))
-                    && host.ends_with(&format!(".{LOOPBACK_ENDPOINT_NAME}")),
-                "case {region:?}: the address names this service and this region on the \
-                 loopback name, got {address:?}"
+            assert_eq!(
+                address, SERVING_ADDRESS,
+                "case {region:?}: the address is this emulator's own serving address, got \
+                 {address:?}"
             );
         }
     }
@@ -414,7 +382,7 @@ async fn the_reported_address_reaches_this_process_and_no_public_host() {
 
 #[tokio::test]
 async fn discovery_is_stable_across_calls_through_one_endpoint() {
-    let router = emulator();
+    let router = emulator_served_at(SERVING_BASE);
     // Two calls through the same endpoint report the same endpoints: a client that caches
     // what it was handed for the TTL it was handed is not being handed a moving target.
     for arrival in ARRIVALS {
@@ -445,12 +413,12 @@ async fn discovery_is_stable_across_calls_through_one_endpoint() {
 }
 
 #[tokio::test]
-async fn a_request_that_names_no_region_is_told_the_default_region_endpoint() {
-    let router = emulator();
-    // A request whose credential scope names nothing region-shaped, on no endpoint host,
-    // addresses the region this emulator defaults to — and that region's endpoint is what
-    // discovery reports, never an empty list and never a bare socket.
-    let expected = expected_address("us-east-1");
+async fn a_request_that_names_no_region_is_told_the_same_address() {
+    let router = emulator_served_at(SERVING_BASE);
+    // A request whose credential scope names nothing region-shaped, on no endpoint host, is
+    // answered the serving address like every other request: the address this process
+    // answers at is no more a property of the region than of the arrival, and it is never
+    // an empty list.
     for scope in ["US_WEST_2", "not a region"] {
         let (status, body) =
             call_through(&router, scope, None, None, "DescribeEndpoints", &json!({})).await;
@@ -461,9 +429,9 @@ async fn a_request_that_names_no_region_is_told_the_default_region_endpoint() {
         let addresses = reported_addresses(scope, &body);
         assert_eq!(
             addresses,
-            vec![expected.clone()],
-            "case {scope:?}: a request that addresses no region is served the default \
-             region's endpoint, expected {expected:?}, got {addresses:?}"
+            vec![SERVING_ADDRESS.to_string()],
+            "case {scope:?}: a request that addresses no region is served this emulator's \
+             own address, expected {SERVING_ADDRESS:?}, got {addresses:?}"
         );
     }
 }

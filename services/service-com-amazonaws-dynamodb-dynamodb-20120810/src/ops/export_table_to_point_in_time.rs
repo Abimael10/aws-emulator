@@ -121,6 +121,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The longest point in time recovery window this service offers, in days: "the number of
+/// preceding days for which continuous backups are taken and maintained"
+/// (`PointInTimeRecoverySpecification$RecoveryPeriodInDays`, @range min 1 max 35 —
+/// `smithy_query(query="shape", shape="PointInTimeRecoverySpecification")`). No table's
+/// window reaches further back than this, whatever its settings say, which is what makes an
+/// instant older than it one no export could be taken at
+/// ([`export_time_beyond_any_window`]).
+const MAX_RECOVERY_PERIOD_IN_DAYS: u64 = 35;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -245,6 +254,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                     return Err(export_conflict());
                 }
+            }
+            // The `ExportTime` the request NAMES is held to the instants an export could be
+            // taken at at all, before the table's recovery settings are consulted: an
+            // instant in the future, one before the table existed, or one further back than
+            // the longest recovery window this service offers is outside EVERY point in
+            // time recovery window a table could have, so what is wrong with such a request
+            // is the time it asked for ([`export_time_beyond_any_window`]) rather than the
+            // table's recovery being off.
+            if export_time_beyond_any_window(input.export_time.as_ref(), table, now) {
+                return Err(invalid_export_time());
             }
             // "The table must have point in time recovery enabled, and you can export data
             // from any time within the point in time recovery window" (this operation's
@@ -511,6 +530,43 @@ fn export_point(
         return Err(invalid_export_time());
     }
     Ok(point)
+}
+
+/// Whether the `ExportTime` this request names lies outside EVERY point in time recovery
+/// window the addressed table could have, whatever its recovery settings say.
+///
+/// Three instants are outside every such window: one in the FUTURE (an export is "a
+/// snapshot of the table's state at this point in time" — `$ExportTime` — and the table has
+/// not been in a future state yet), one BEFORE THE TABLE EXISTED (there was no table to
+/// snapshot), and one further back than the longest recovery period the service offers
+/// ([`MAX_RECOVERY_PERIOD_IN_DAYS`], `PointInTimeRecoverySpecification$RecoveryPeriodInDays`
+/// @range max 35 — "the number of preceding days for which continuous backups are taken and
+/// maintained"), since no window reaches further than that. Each is a fault of the TIME the
+/// request asked for rather than of the table it addressed, which is why it is settled
+/// before the table's recovery is looked at.
+///
+/// A request naming NO `ExportTime` names no such instant: it exports the table as it
+/// stands ([`export_point`]).
+fn export_time_beyond_any_window(
+    requested: Option<&::aws_smithy_types::DateTime>,
+    table: &crate::state::Table,
+    now: ::std::time::SystemTime,
+) -> bool {
+    let Some(requested) = requested else {
+        return false;
+    };
+    let Ok(point) = ::std::time::SystemTime::try_from(*requested) else {
+        return true;
+    };
+    let point = crate::state::at_nearest_timestamp_precision(point);
+    let longest = ::std::time::Duration::from_secs(MAX_RECOVERY_PERIOD_IN_DAYS * 24 * 60 * 60);
+    // The table's creation instant AS IT IS REPORTED (`TableDescription$CreationDateTime`,
+    // at the millisecond precision a timestamp carries on the wire), so the earliest
+    // instant a client may name is exactly the one it read back for the table rather than
+    // the fraction of a millisecond above it.
+    let created = crate::state::at_timestamp_precision(table.creation_date_time);
+    let floor = now.checked_sub(longest).unwrap_or(now).max(created);
+    point > now || point < floor
 }
 
 /// The modelled refusal of an export from a table that has no point in time to export

@@ -410,6 +410,16 @@ impl Table {
     }
 }
 
+/// How a replica auto scaling request naming something that is NOT a global table is
+/// refused: the pair of operations is stated over the global table, so a name no
+/// replication group answers to names no resource they can address — "the operation tried
+/// to access a nonexistent table or index" (the `ResourceNotFoundException` doc), in the
+/// sentence DynamoDB states for a missing global table, built from the name the request
+/// asked for.
+pub fn global_table_not_found(name: &str) -> RequestError {
+    RequestError::NotFound(format!("Global table with name: '{name}' does not exist."))
+}
+
 /// How an auto scaling update that names no `IndexName` is refused: the entry addresses
 /// "the global secondary index" whose capacity is to be scaled, so an entry without the
 /// name addresses nothing.
@@ -422,14 +432,29 @@ fn index_name_required() -> RequestError {
 }
 
 impl ComAmazonawsDynamodbDynamodb20120810State {
+    /// The GLOBAL TABLE one replica auto scaling request addresses, or the refusal a name
+    /// that is not a global table's earns.
+    ///
+    /// Both replica auto scaling operations are stated over the global table — "describes
+    /// auto scaling settings across replicas of the global table at once" and "updates auto
+    /// scaling settings on your global tables" — so what they address is a REPLICATION
+    /// GROUP: a name this store holds no table for, and a table that replicates nowhere, are
+    /// the same miss, because neither is a global table ([`global_table_not_found`]).
+    fn auto_scaling_global_table(&self, region: &str, name: &str) -> Result<&Table, RequestError> {
+        let table = self
+            .table(region, name)
+            .map_err(|_| global_table_not_found(name))?;
+        if table.replicas.is_empty() {
+            return Err(global_table_not_found(name));
+        }
+        Ok(table)
+    }
+
     /// The Regions one table's auto scaling settings span: the Region of the addressed
     /// table, which is a replica of the group itself, and every Region its replication
     /// group records beside it ([`Table::replicas`]).
-    ///
-    /// A table that belongs to no group spans its own Region alone — the one regional
-    /// table whose capacities there are to scale.
     fn auto_scaling_regions(&self, region: &str, name: &str) -> Result<Vec<String>, RequestError> {
-        let table = self.table(region, name)?;
+        let table = self.auto_scaling_global_table(region, name)?;
         let mut regions = vec![region.to_string()];
         regions.extend(table.replicas.iter().map(|replica| replica.region.clone()));
         Ok(regions)
@@ -465,7 +490,7 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         name: &str,
         now: SystemTime,
     ) -> Result<TableAutoScalingDescription, RequestError> {
-        let table = self.table(region, name)?;
+        let table = self.auto_scaling_global_table(region, name)?;
         let replicas: Vec<ReplicaAutoScalingDescription> = self
             .auto_scaling_regions(region, name)?
             .iter()

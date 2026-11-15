@@ -588,16 +588,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(lift)?;
 
-        // Which PARTITION of the walked key space each row sits in, which is what the
-        // segments of a parallel scan are shared out by ([`Partitions`]).
-        let partitions = Partitions::of(&candidates, index.as_ref());
-        // Segment membership is decided from the row's partition in that total order,
-        // NOT from the position within one page, so a later page of the same segment
-        // sees the same share of what is scanned.
+        // Segment membership is decided from the row's own PARTITION KEY, not from where
+        // the row sits in this walk ([`Segmentation::owns`]), so a later page of the same
+        // segment sees the same share of what is scanned and a segment's share does not
+        // move when another item is written. Decided once per PARTITION: rows that share a
+        // partition key are contiguous in either walk — the table's items are ordered
+        // partition-first ([`crate::state::ItemKey`]) and an index's entries by the index
+        // key ([`crate::state::IndexItemKey`]) — so one pass over the walk places each
+        // partition once and reuses that answer for its run of rows.
+        let owned: Vec<bool> = {
+            let mut owned: Vec<bool> = Vec::with_capacity(candidates.len());
+            let mut placed: Option<(&[crate::state::AttributeValueKey], bool)> = None;
+            for (position, _) in &candidates {
+                let partition = position.partition(index.as_ref());
+                let owns = match placed {
+                    Some((previous, owns)) if previous == partition => owns,
+                    _ => segmentation.owns(partition),
+                };
+                owned.push(owns);
+                placed = Some((partition, owns));
+            }
+            owned
+        };
         let evaluated = candidates
             .iter()
             .enumerate()
-            .filter(|(position, _)| partitions.owned_by(*position, segmentation))
+            .filter(|(row, _)| owned.get(*row).copied().unwrap_or(false))
             .map(|(_, row)| row)
             // "Use this value to start a new operation, EXCLUDING this value in the
             // new request" (`Scan$LastEvaluatedKey`). A scan always walks forward.
@@ -616,6 +632,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_or(usize::MAX, |limit| usize::try_from(limit).unwrap_or(0));
         let mut page: Vec<crate::state::Read<'_>> = Vec::new();
         let mut page_size: i64 = 0;
+        // What the page COSTS: one read unit per 4 KB of EACH item it evaluated, half a
+        // unit per 4 KB where the read is eventually consistent — the charge a read of one
+        // item carries ([`crate::state::read_capacity_units`]), summed over the items this
+        // scan examined, exactly as a batched read of the same items is charged.
+        let mut page_units: f64 = 0.0;
         let mut truncated = false;
         for (_, item) in evaluated {
             let read = crate::state::Read::new(
@@ -636,6 +657,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 break;
             }
             page_size = page_size.saturating_add(size);
+            page_units += crate::state::read_capacity_units(size, consistent_read);
             page.push(read);
         }
 
@@ -667,7 +689,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not carry still narrows the scan.
         let items = crate::state::reported_items(&selection, &matched);
 
-        let units = crate::state::read_capacity_units(page_size, consistent_read);
+        // A scan that evaluated nothing still spends the one unit a read takes at least —
+        // the charge the walk itself carries — which is what a read of a key no item
+        // answers to is charged too.
+        let units = if page.is_empty() {
+            crate::state::read_capacity_units(0, consistent_read)
+        } else {
+            page_units
+        };
         let requested_capacity = input.return_consumed_capacity.as_deref();
         // Projected while the index this scan read is still borrowed from the table, so
         // what the response bills is decided before the table is reached for again.
@@ -775,11 +804,15 @@ const FILTER_ASK: usize = 1;
 /// "TotalSegments represents the total number of segments into which the Scan
 /// operation will be divided ... Segment identifies an individual segment to be
 /// scanned by an application worker" (`Scan$TotalSegments` / `Scan$Segment`). What is
-/// divided is the table's or index's KEY SPACE, so a segment is a block of PARTITIONS
-/// ([`Partitions`]): the segments together cover every item exactly once, no two of them
-/// cover the same item, and every item sharing a partition key is evaluated by one
-/// segment. A request that names neither member is the sequential scan: one segment,
-/// holding everything.
+/// divided is the table's or index's KEY SPACE, and a key space is laid out by the HASH of
+/// each partition key ("DynamoDB uses the partition key's value as input to an internal
+/// hash function", the Developer Guide's "Partitions and data distribution"), so a segment
+/// is a block of that hash space ([`Self::owns`]): the segments together cover every item
+/// exactly once, no two of them cover the same item, every item sharing a partition key is
+/// evaluated by one segment, and WHICH segment owns a partition follows from its key alone
+/// — not from how many items the table holds, in what order they were written, or which
+/// other partitions exist. A request that names neither member is the sequential scan: one
+/// segment, holding everything.
 #[derive(Debug, Clone, Copy)]
 struct Segmentation {
     segment: usize,
@@ -822,76 +855,49 @@ impl Segmentation {
         }
     }
 
-    /// Whether the partition at `partition` of the `partitions` the walk covers belongs
-    /// to this request's segment.
+    /// Whether the partition whose key values are `partition` belongs to this request's
+    /// segment.
     ///
-    /// The segments divide the key space into as many CONTIGUOUS blocks of partitions as
-    /// there are segments, so a request that names fewer partitions than segments leaves
-    /// the trailing segments with nothing to evaluate, and the blocks together cover
-    /// every partition exactly once.
-    fn owns(&self, partition: usize, partitions: usize) -> bool {
+    /// The segments divide the hash space the key space is laid out by into as many equal
+    /// blocks as there are segments, and a partition sits where the hash of its key puts
+    /// it ([`partition_hash`]) — so the blocks together cover every partition exactly
+    /// once, no partition falls in two of them, and a segment's share is decided by the
+    /// key alone. The sequential scan (one segment) owns the whole space, which is the
+    /// same answer the division gives and is answered without hashing anything.
+    fn owns(&self, partition: &[crate::state::AttributeValueKey]) -> bool {
         if self.total <= 1 {
             return true;
         }
-        if partitions == 0 {
-            return false;
-        }
-        partition.saturating_mul(self.total) / partitions == self.segment
+        let total = u128::try_from(self.total).unwrap_or(1);
+        let block = (u128::from(partition_hash(partition)) * total) >> u64::BITS;
+        usize::try_from(block).unwrap_or(0) == self.segment
     }
 }
 
-/// Which PARTITION of the walked key space each row of a scan's walk sits in.
+/// Where in the hash space one partition of the walked key space sits: the leading 64 bits
+/// of a digest of its key values, as a fraction of that space.
 ///
-/// A parallel scan divides the TABLE OR INDEX, not the row list: "DynamoDB divides the
-/// table or index into TotalSegments segments" and a page of one segment resumes from
-/// "the same segment whose previous Scan returned the corresponding value of
-/// LastEvaluatedKey" (`Scan$ExclusiveStartKey`) — a segment is therefore a block of the
-/// KEY SPACE, which keeps every row that shares a partition key in one segment and makes
-/// a segment's share a contiguous run of the walk. Built once per request from the walk
-/// this scan reads ([`crate::state::ReadPosition::partition`]), in that walk's order, so
-/// every page of a segment sees the same share.
-#[derive(Debug)]
-struct Partitions {
-    /// One entry per row of the walk, in walk order: which partition of the key space
-    /// that row falls in, numbered from 0 in walk order.
-    of_row: Vec<usize>,
-    /// How many distinct partitions the walk covers.
-    count: usize,
-}
+/// "DynamoDB uses the partition key's value as input to an internal hash function. The
+/// output value from the hash function determines the partition" (the Developer Guide's
+/// "Partitions and data distribution"), so the place a partition occupies is a function of
+/// its KEY and of nothing else — which is what makes a segment's share stable while the
+/// table is written to. The digest is taken over each key component's own text
+/// ([`crate::state::AttributeValueKey::key_text`]), length-prefixed so two components
+/// cannot run together into one value a different key would also produce; an index key
+/// may carry several components, and they are all part of the one partition they address.
+fn partition_hash(partition: &[crate::state::AttributeValueKey]) -> u64 {
+    use ::sha2::Digest;
 
-impl Partitions {
-    /// Number the partitions the walk covers. Rows sharing a partition key are
-    /// contiguous in either walk — the table's items are ordered partition-first
-    /// ([`crate::state::ItemKey`]) and an index's entries by the index key
-    /// ([`crate::state::IndexItemKey`]) — so one pass over the walk numbers them.
-    fn of(
-        candidates: &[(crate::state::ReadPosition<'_>, &crate::state::Item)],
-        index: Option<&crate::state::SecondaryIndex<'_>>,
-    ) -> Self {
-        let mut of_row: Vec<usize> = Vec::with_capacity(candidates.len());
-        let mut count = 0usize;
-        let mut previous: Option<&[crate::state::AttributeValueKey]> = None;
-        for (position, _) in candidates {
-            let partition = position.partition(index);
-            if previous.is_some_and(|previous| previous != partition) {
-                count = count.saturating_add(1);
-            }
-            of_row.push(count);
-            previous = Some(partition);
-        }
-        Self {
-            of_row,
-            count: if candidates.is_empty() {
-                0
-            } else {
-                count.saturating_add(1)
-            },
-        }
+    let mut digest = ::sha2::Sha256::new();
+    for component in partition {
+        let text = component.key_text();
+        digest.update(u64::try_from(text.len()).unwrap_or(u64::MAX).to_be_bytes());
+        digest.update(text.as_bytes());
     }
-
-    /// Whether the row at `position` in the walk falls in `segmentation`'s share of the
-    /// key space.
-    fn owned_by(&self, position: usize, segmentation: Segmentation) -> bool {
-        segmentation.owns(self.of_row.get(position).copied().unwrap_or(0), self.count)
-    }
+    let hashed = digest.finalize();
+    let leading: [u8; 8] = hashed
+        .get(..8)
+        .and_then(|bytes| bytes.try_into().ok())
+        .unwrap_or_default();
+    u64::from_be_bytes(leading)
 }

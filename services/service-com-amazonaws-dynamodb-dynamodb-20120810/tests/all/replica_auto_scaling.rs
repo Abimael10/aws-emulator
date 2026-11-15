@@ -463,12 +463,10 @@ async fn an_update_modifies_only_the_members_it_names() {
 async fn a_capacity_nothing_scales_is_reported_with_no_settings() {
     let router = emulator();
     let name = "Scaled.unconfigured";
-    create_table(&router, name).await;
-    settle().await;
+    create_global_table(&router, name).await;
 
-    // A table that belongs to no replication group is still a regional table of its own,
-    // so it reports exactly one replica: its own Region, with no capacity configured and
-    // its index listed.
+    // A group nothing has scaled reports every replica it holds with no capacity
+    // configured, each one's index listed and no settings on it either.
     let report = described(&router, name).await;
     let replica = replica_in(&report, REGION);
     assert_eq!(
@@ -485,14 +483,14 @@ async fn a_capacity_nothing_scales_is_reported_with_no_settings() {
         (
             json!(name),
             json!("ACTIVE"),
-            Some(1),
+            Some(2),
             json!("ACTIVE"),
             Value::Null,
             Value::Null,
             json!(INDEX),
             Value::Null,
         ),
-        "case a table nothing scales: every capacity is reported as configured by nothing, got \
+        "case a group nothing scales: every capacity is reported as configured by nothing, got \
          {report}"
     );
 

@@ -2,26 +2,21 @@
 
 //! @op DescribeEndpoints
 //!
-//! IMPLEMENTED: endpoint discovery, answered with the endpoint of the REGION THE REQUEST
-//! ADDRESSES — "the regional endpoint information" (the doc below) — as this emulator
-//! serves it. An address handed out here is what a client reads to learn which regional
-//! endpoint to address, and what it validates a discovered endpoint by, so it names both
-//! halves of that endpoint's identity in the labels AWS puts them in: the service, as its
-//! endpoint prefix, then the region the caller called. Neither is a property of the socket
-//! the request happened to arrive on, so both are derived from the region the request
-//! addresses rather than from the host or port it reached.
+//! IMPLEMENTED: endpoint discovery, answered with THIS EMULATOR'S OWN serving address —
+//! "the regional endpoint information" (the doc below) is the address a client re-targets
+//! itself at, and the only address that serves this API is the one this process is reached
+//! on. So the answer is the host and port of the emulator's own base URL
+//! ([`smithy_server_runtime::OperationContext::endpoint`]), with no scheme and no path,
+//! which is the form the modelled `Address` carries.
 //!
-//! The address ends in the loopback name and the port this process serves, so what is
-//! advertised stays an endpoint OF THIS EMULATOR: a client that re-targets itself at a
-//! discovered endpoint keeps talking to this server, instead of being sent — with the
-//! developer's credentials — to the real regional endpoint those labels would otherwise
-//! name. The emulator's own routing resolves a service and a region from exactly these
-//! labels ([`crate::state::request_region`]), so the advertised address also places a
-//! request the same way the one it was discovered through did.
-//!
-//! The endpoint VARIANT a request arrives on (a FIPS or dual-stack host) is deliberately not
-//! carried into the answer: this process serves ONE endpoint, and it is neither of those, so
-//! reporting a variant would describe an endpoint nothing here answers on.
+//! What is advertised is therefore an endpoint OF THIS EMULATOR: a client that honours the
+//! announced address keeps talking to this server, instead of being sent — with the
+//! developer's credentials — to the real regional endpoint, and instead of being sent to a
+//! host or port nothing listens on. The serving address is a property of the PROCESS rather
+//! than of the region addressed or of the socket the request arrived on, so neither moves
+//! it; the endpoint VARIANT a request arrives on (a FIPS or dual-stack host) is not carried
+//! into the answer either, because this process serves one endpoint and it is neither of
+//! those.
 //!
 //! ## Shape of an operation
 //!
@@ -74,33 +69,23 @@ use super::types::*;
 /// How long a client may cache a discovered endpoint, in minutes (`Endpoint`'s
 /// `CachePeriodInMinutes`: "Endpoint cache time to live (TTL) value.").
 ///
-/// CHOSEN, not documented: a region's service endpoint is a fixed name rather than
-/// something this service moves, so a 24-hour TTL keeps endpoint discovery to one call per
-/// client without ever handing out an address that goes stale.
+/// CHOSEN, not documented: this process serves one address for as long as it runs, so a
+/// 24-hour TTL keeps endpoint discovery to one call per client without ever handing out an
+/// address that goes stale.
 const ENDPOINT_CACHE_PERIOD_MINUTES: i64 = 24 * 60;
 
-/// The first label of every endpoint host this service is served on: its `aws.api#service`
-/// `endpointPrefix`, which is also the SigV4 signing name a request addresses it by
-/// (`smithy_query(query="service_info")` on this crate's model — `endpointPrefix:
-/// "dynamodb"`).
-const ENDPOINT_PREFIX: &str = "dynamodb";
-
-/// The last label of every address reported here: the name reserved for the loopback
-/// interface, so the whole address resolves to THIS machine and to no other host.
-const LOOPBACK_ENDPOINT_NAME: &str = "localhost";
-
-/// The endpoint of `region` as this emulator serves it, in the form the modelled `Address`
-/// carries (a host and a port, no scheme and no path): the service's endpoint prefix, then
-/// the region, then the loopback name and the port this process listens on.
+/// The address this emulator is reached on, in the form the modelled `Address` carries (a
+/// host and a port, no scheme and no path): the authority of the emulator's own base URL,
+/// read through the tree's one statement of that question
+/// ([`::service_common::data_plane_addressing::emulator_endpoint_authority`] — "what a
+/// DISCOVERY operation publishes for a plane the client then DIALS").
 ///
-/// The leading labels are the endpoint identity a discovery answer conveys, laid out as an
-/// AWS regional endpoint host lays them out; the trailing ones keep the address on this
-/// machine, which is the only place this service is actually served.
-fn regional_endpoint_address(region: &str) -> String {
-    format!(
-        "{ENDPOINT_PREFIX}.{region}.{LOOPBACK_ENDPOINT_NAME}:{}",
-        ::emulator_server::data_port_from_env()
-    )
+/// That base is the data port's published URL while this emulator is served, so the
+/// announced address is exactly the host and port a client already reached — the one
+/// address that serves this API — rather than a name assembled here, which is why nothing
+/// in it comes from the request.
+fn serving_address(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::service_common::data_plane_addressing::emulator_endpoint_authority(ctx)
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -170,17 +155,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `DescribeEndpointsRequest` has no members, and the answer is a property of the
-        // region this request addresses — not of the store — so no state is read or
+        // `DescribeEndpointsRequest` has no members, and the answer is the address this
+        // process is served on — not a property of the store — so no state is read or
         // written here.
         let _ = (&input, &self.engine);
-        // The region the request is signed for is the region it addresses (the same
-        // resolution every other operation here places a request in), and that region has
-        // exactly one service endpoint to discover, so exactly one is reported.
-        let region = crate::state::request_region(ctx.parts());
+        // This emulator serves one endpoint, so exactly one is reported, and its address
+        // is the one this emulator answers on.
         Ok(DescribeEndpointsOutput {
             endpoints: vec![Endpoint {
-                address: regional_endpoint_address(&region),
+                address: serving_address(ctx),
                 cache_period_in_minutes: ENDPOINT_CACHE_PERIOD_MINUTES,
             }],
         })

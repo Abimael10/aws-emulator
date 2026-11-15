@@ -82,6 +82,11 @@ service-com-amazonaws-kms-trentservice = { workspace = true }
 # `AWS/DynamoDB` `ConsumedReadCapacityUnits`/`ConsumedWriteCapacityUnits` back and what an
 # alarm on those metrics is evaluated against.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# CloudWatch Logs owns the log group a table import reports its per-row errors in: recording
+# an import creates `/aws-dynamodb/imports` in that service's own log-group store, which is
+# where `DescribeLogGroups` then reports it and what the `CloudWatchLogGroupArn` an import
+# reader answers with names (`state::import_log_groups`).
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # `query_error_envelope`: the tree's one statement of how a response names the request it
 # answers (`x-amzn-RequestId`), wired into this service's operation dispatch and its
 # framework-level error renderers (`service::EmulatedService`).

@@ -1306,3 +1306,19 @@ mod zz_probe_whole_emulator;
 // What a suite covers, and why it lives in THIS target rather than in a service crate's
 // own, belongs in that suite's own module header, where it is read beside the test it
 // explains; `all/appended_notes.rs` keeps the notes this file had collected.
+// `mod <name>;` pair below, into the sorted list — one pair per suite and no other line, so
+// two branches landing at once insert two lines in two places and have nothing to keep
+// consistent between them.
+// level of `tests/` fails the build; a suite declared twice is `E0428`; and an inner doc
+// comment (`//!`) past the first item is `E0753`. The last two fail EVERY suite of this
+// target, which is what the tail of this file kept producing, so EVERY comment here is an
+// ordinary one — this block included. With no inner doc comment anywhere in the file, no
+// merge of two landings can put one past the first item.
+// `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs` check those rules, for this file and for
+// every service crate's `tests/all.rs`, so a note about them belongs there;
+// `all/appended_notes.rs` keeps the notes earlier landings appended here. What a suite
+// covers, and why it belongs to this cross-service target rather than to one service
+// crate's own, is stated in that suite's OWN module doc, beside the test it explains.
+// (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` above each `mod` is
+// what points the declaration into `tests/all/`.

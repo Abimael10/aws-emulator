@@ -412,3 +412,158 @@ async fn the_segments_of_a_parallel_index_scan_are_whole_index_partitions() {
         }
     }
 }
+
+/// The tables the key-determined-partition rule is driven over: the same set of partition
+/// keys, seeded in a DIFFERENT order in each, so the only thing a segment's share can
+/// follow is the key itself.
+const SHUFFLED: [(&str, &str); 2] = [
+    ("seeded in ascending key order", "SegKeyedAscending"),
+    ("seeded in descending key order", "SegKeyedDescending"),
+];
+
+/// The partition keys those tables hold.
+const KEYED: [&str; 6] = ["web-001", "web-002", "web-003", "web-004", "web-005", "web-006"];
+
+/// The partition keys added to one of them AFTER its segments were observed, which no
+/// earlier key's segment may move.
+const KEYED_LATER: [&str; 3] = ["web-007", "web-008", "web-009"];
+
+/// Create `table` and seed one item under each of `keys`, in the order given.
+async fn seed_keys(router: &MultiServiceRouter, table: &str, keys: &[&str]) {
+    ok(
+        router,
+        "CreateTable",
+        json!({
+            "TableName": table,
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST",
+        }),
+    )
+    .await;
+    describe_when_active(router, table, table).await;
+    add_keys(router, table, keys).await;
+}
+
+/// Put one item under each of `keys`, in the order given.
+async fn add_keys(router: &MultiServiceRouter, table: &str, keys: &[&str]) {
+    for key in keys {
+        ok(
+            router,
+            "PutItem",
+            json!({"TableName": table, "Item": {"pk": {"S": key}}}),
+        )
+        .await;
+    }
+}
+
+/// Which segment of a `total`-way parallel scan of `table` each of its partition keys falls
+/// in, read by scanning every segment: a key the scan reports under exactly one segment.
+async fn segment_of_each_key(
+    router: &MultiServiceRouter,
+    case: &str,
+    table: &str,
+    total: usize,
+) -> BTreeMap<String, usize> {
+    let mut owner: BTreeMap<String, usize> = BTreeMap::new();
+    for segment in 0..total {
+        let page = ok(
+            router,
+            "Scan",
+            json!({"TableName": table, "Segment": segment, "TotalSegments": total}),
+        )
+        .await;
+        for item in page["Items"].as_array().cloned().unwrap_or_default() {
+            let key = item["pk"]["S"].as_str().unwrap_or("<no pk>").to_string();
+            assert!(
+                owner.insert(key.clone(), segment).is_none(),
+                "case {case}: {key:?} is evaluated by one segment, but segment {segment} \
+                 reported it again"
+            );
+        }
+    }
+    owner
+}
+
+#[tokio::test]
+async fn which_segment_owns_a_partition_follows_the_key_alone() {
+    let router = emulator();
+    // The same six partition keys in two tables, seeded in opposite orders: a segment's
+    // share is a block of the KEY SPACE, so the order the items were written in cannot
+    // change which segment evaluates a key.
+    let mut descending: Vec<&str> = KEYED.to_vec();
+    descending.reverse();
+    seed_keys(&router, SHUFFLED[0].1, &KEYED).await;
+    seed_keys(&router, SHUFFLED[1].1, &descending).await;
+
+    // Rows are the number of segments the scan divides the table into: fewer than the
+    // partitions, as many, and more.
+    for total in [2usize, 3, 4, 7] {
+        let ascending = segment_of_each_key(
+            &router,
+            &format!("{} over {total} segment(s)", SHUFFLED[0].0),
+            SHUFFLED[0].1,
+            total,
+        )
+        .await;
+        let reversed = segment_of_each_key(
+            &router,
+            &format!("{} over {total} segment(s)", SHUFFLED[1].0),
+            SHUFFLED[1].1,
+            total,
+        )
+        .await;
+        assert_eq!(
+            ascending, reversed,
+            "case over {total} segment(s): the same keys fall in the same segments whatever \
+             order they were written in, got {ascending:?} against {reversed:?}"
+        );
+        assert_eq!(
+            ascending.len(),
+            KEYED.len(),
+            "case over {total} segment(s): every key is evaluated by some segment, got \
+             {ascending:?}"
+        );
+
+        // And a key written LATER cannot move an earlier key's segment: the share follows
+        // the key, not the number of partitions the table happens to hold.
+        let before = segment_of_each_key(
+            &router,
+            &format!("before more keys, over {total} segment(s)"),
+            SHUFFLED[0].1,
+            total,
+        )
+        .await;
+        add_keys(&router, SHUFFLED[0].1, &KEYED_LATER).await;
+        let after = segment_of_each_key(
+            &router,
+            &format!("after more keys, over {total} segment(s)"),
+            SHUFFLED[0].1,
+            total,
+        )
+        .await;
+        for (key, segment) in &before {
+            assert_eq!(
+                after.get(key),
+                Some(segment),
+                "case over {total} segment(s): {key:?} stays in segment {segment} when other \
+                 keys are written, got {after:?}"
+            );
+        }
+        assert_eq!(
+            after.len(),
+            KEYED.len() + KEYED_LATER.len(),
+            "case over {total} segment(s): the new keys are evaluated too, got {after:?}"
+        );
+        // The table is left as the next row finds it, so each row's `before` is the same
+        // table shape.
+        for key in KEYED_LATER {
+            ok(
+                &router,
+                "DeleteItem",
+                json!({"TableName": SHUFFLED[0].1, "Key": {"pk": {"S": key}}}),
+            )
+            .await;
+        }
+    }
+}

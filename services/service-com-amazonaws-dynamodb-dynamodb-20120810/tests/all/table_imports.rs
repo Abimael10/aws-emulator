@@ -977,8 +977,8 @@ async fn a_source_the_object_store_holds_no_bucket_for_fails_the_task() {
     );
     assert_eq!(
         reported["ProcessedSizeBytes"],
-        Value::Null,
-        "a task that read nothing processed no bytes, got {reported}"
+        json!(0),
+        "a task that read nothing REPORTS the nothing it processed, got {reported}"
     );
     assert_eq!(
         counter(&reported, "ImportedItemCount"),

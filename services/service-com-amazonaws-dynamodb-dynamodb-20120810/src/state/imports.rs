@@ -177,8 +177,10 @@ pub struct ImportDetails {
     /// table" (`$ErrorCount`): the items the task read and could not write.
     pub error_count: i64,
     /// "The total size of data processed from the source file, in Bytes"
-    /// (`$ProcessedSizeBytes`), or `None` for a task that read nothing at all.
-    pub processed_size_bytes: Option<i64>,
+    /// (`$ProcessedSizeBytes`): the bytes of source the task read, which is 0 for a task
+    /// that read nothing at all — a figure every finished task reports, so a zero-byte
+    /// import is told apart from an import whose figure is not in yet.
+    pub processed_size_bytes: i64,
     /// Why this import's task could not read its source, where it could not: such an
     /// import reports `FAILED` and this reason once its span has elapsed, rather than a
     /// completion it did not achieve.
@@ -213,8 +215,10 @@ pub struct Import {
     /// "The S3 bucket that provides the source for the import"
     /// (`ImportTable$S3BucketSource`), as the request named it.
     pub s3_bucket_source: S3BucketSource,
-    /// The log group the import wrote its errors to, where one was made for it
-    /// (`ImportSummary$CloudWatchLogGroupArn`).
+    /// The log group this import's errors are reported in
+    /// (`ImportSummary$CloudWatchLogGroupArn`), as it was made for the import where
+    /// CloudWatch Logs holds log groups ([`import_log_group`]) — `None` only where this
+    /// engine holds no log-group store for one to be made in.
     pub cloud_watch_log_group_arn: Option<String>,
     /// "The format of the source data" (`ImportSummary$InputFormat`): one of the
     /// `InputFormat` values the model declares.
@@ -291,11 +295,11 @@ impl Import {
             table_creation_parameters: self.details.table_creation_parameters.clone(),
             start_time: Some(super::reported_date(self.started_at)),
             end_time: self.ended_at(now).map(super::reported_date),
-            processed_size_bytes: if finished {
+            processed_size_bytes: Some(if finished {
                 self.details.processed_size_bytes
             } else {
-                None
-            },
+                0
+            }),
             processed_item_count: if finished {
                 self.details.processed_item_count
             } else {
@@ -354,9 +358,11 @@ impl Import {
 /// One rendering of those members, so the comparison is member for member however deeply
 /// a member nests, and a request that changes any of them is the conflict the operation
 /// models ([`IMPORT_CONFLICT_MESSAGE`]) rather than a second import. The members are
-/// compared as the request STATED them, except the compression, which both sides resolve
-/// to the value the member defaults to: a request naming `NONE` and one naming nothing
-/// ask for the same import.
+/// compared as the request STATED them, except the two that RESOLVE: the compression,
+/// resolved to the value its member defaults to, and the source's bucket owner, resolved
+/// to the account the bucket is read from ([`resolved_bucket_source`]) — a request naming
+/// `NONE` and one naming no compression ask for the same import, and so do one naming the
+/// requester's own account and one naming no owner.
 pub fn import_request_signature(
     s3_bucket_source: &S3BucketSource,
     input_format: &str,
@@ -376,6 +382,27 @@ pub fn import_request_signature(
             table_creation_parameters,
         )
     )
+}
+
+/// The source one import reads, with its bucket OWNER resolved: "the account number of the
+/// S3 bucket that is being imported from. If the bucket is owned by the requester this is
+/// optional" (`S3BucketSource$S3BucketOwner`).
+///
+/// A request that names no owner is reading a bucket of its OWN account, so that is the
+/// account the source is read from and the one every import reader reports — the member is
+/// optional in the REQUEST, not absent from the resource. One resolution, applied where the
+/// import is recorded, so the ARN-addressed readers and the listing all report the same
+/// source.
+pub fn resolved_bucket_source(requested: &S3BucketSource) -> S3BucketSource {
+    S3BucketSource {
+        s3_bucket_owner: Some(
+            requested
+                .s3_bucket_owner
+                .clone()
+                .unwrap_or_else(|| ::engine::emulator_account_id().to_string()),
+        ),
+        ..requested.clone()
+    }
 }
 
 /// The `ImportNotFoundException` message an import-addressed operation answers an ARN it
