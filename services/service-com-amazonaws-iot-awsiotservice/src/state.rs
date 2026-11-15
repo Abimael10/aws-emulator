@@ -127,6 +127,12 @@
 //! single-audit operation. One record carries what the audit amounted to over the account's
 //! resources, check by check, so `DescribeAuditTask` after `StartOnDemandAuditTask` reports
 //! the audit that call performed (see [`audit_tasks`]).
+//!
+//! One collection in the store is NOT this account's: the AWS-MANAGED JOB TEMPLATE
+//! catalog, keyed by `templateName`. No operation creates, updates or deletes a managed
+//! template — `ListManagedJobTemplates` and `DescribeManagedJobTemplate` are the whole
+//! surface — so it is published data, seeded complete when the store is first touched
+//! and only ever read (see [`managed_job_templates`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
@@ -1034,6 +1040,16 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// A caller grows this store, so it is bounded: [`streams::MAX_STREAMS`] is the
     /// ceiling `CreateStream` refuses past.
     pub streams: BTreeMap<String, RegisteredStream>,
+    /// The AWS-MANAGED JOB TEMPLATE catalog: the published templates a job can be
+    /// created from, keyed by `templateName`.
+    ///
+    /// Unlike every collection above it, this one is not this account's: no operation
+    /// creates, updates or deletes a managed template, so the catalog is seeded
+    /// COMPLETE when the store is first touched and only ever read (see
+    /// [`managed_job_templates`]). It lives on the store rather than beside it so that
+    /// `ListManagedJobTemplates` and `DescribeManagedJobTemplate` read the one
+    /// collection, exactly as the registries above are read.
+    pub managed_job_templates: ManagedJobTemplateCatalog,
 }
 
 impl ComAmazonawsIotAwsiotserviceState {
@@ -3033,6 +3049,19 @@ pub use not_found::{
     missing_job_message, missing_thing_group_message, missing_thing_message,
     missing_thing_type_message, unrecognized_index_name_message,
     MISSING_THING_REGISTRATION_TASK_MESSAGE,
+};
+
+// What an AWS-MANAGED JOB TEMPLATE is — the published catalog `ListManagedJobTemplates`
+// pages over and `DescribeManagedJobTemplate` reads one entry of, which no operation of
+// this service writes — lives in `state/managed_job_templates.rs`, beside the store
+// accessor for the same reason the rules engine does. Its names are re-exported here so
+// a handler reaches them as `crate::state::<name>`.
+pub mod managed_job_templates;
+pub use managed_job_templates::{
+    invalid_managed_job_template_name_message, invalid_managed_job_template_version_message,
+    is_modeled_managed_job_template_name, is_modeled_managed_template_version,
+    managed_job_template_arn, ManagedJobTemplate, ManagedJobTemplateCatalog,
+    ManagedJobTemplateVersion,
 };
 
 // Whether a FLEET INDEXING QUERY STRING is one this service can read at all — the one

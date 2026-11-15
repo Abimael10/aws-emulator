@@ -6909,3 +6909,15 @@ mod all_rs_is_a_canonical_declaration_list;
 //! compiles no suite of this target, so a note added further down must be an ordinary `//`
 //! comment, and a note about one declaration belongs in the suite file rather than here.
 //! (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is what points each
+//! sorted: ONE `#[path]` / `mod` pair per suite and NOTHING ELSE, so a landing has one
+//! place to insert its line and nothing to keep consistent. What a suite covers, and why
+//! it lives in this cross-service target rather than in one service crate's own, belongs
+//! in that suite's own module header, where it is read beside the test it explains.
+//! A suite that is not declared here compiles nowhere and its tests never run (the
+//! crate's build script refuses that); a suite left at the top level of `tests/` fails
+//! the build; and a suite declared twice is `E0428`, which fails every suite in this
+//! target. These header lines are the ONLY place an inner doc comment (`//!`) may stand
+//! in this file: past the first item one is `E0753` and compiles no suite of this target,
+//! so append a declaration below, never a note about one.
+// (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each `mod` is
+// what points the declaration into `tests/all/`.

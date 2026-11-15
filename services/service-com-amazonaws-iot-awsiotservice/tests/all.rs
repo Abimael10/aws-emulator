@@ -69,6 +69,8 @@ mod job_execution_read;
 mod job_targeting;
 #[path = "all/logging_options.rs"]
 mod logging_options;
+#[path = "all/managed_job_templates.rs"]
+mod managed_job_templates;
 #[path = "all/not_found_wording.rs"]
 mod not_found_wording;
 #[path = "all/on_demand_audit_task.rs"]

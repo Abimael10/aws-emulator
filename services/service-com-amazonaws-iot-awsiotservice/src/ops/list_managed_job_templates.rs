@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListManagedJobTemplates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListManagedJobTemplates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListManagedJobTemplates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One page of the AWS-MANAGED JOB TEMPLATE catalog this service publishes
+//! (`crate::state::ManagedJobTemplateCatalog`), which no operation writes: every entry
+//! is one VERSION of one published template, projected from that catalog entry
+//! (`crate::state::ManagedJobTemplate::summary`), so what this lists and what
+//! `DescribeManagedJobTemplate` reports for the same pair is one value rather than two
+//! that could drift.
+//!
+//! `templateName` narrows the listing to the versions of the template it names; a
+//! `templateName` that names no template the catalog publishes is refused with the
+//! modelled `InvalidRequestException` rather than answered with an empty page.
+//! `maxResults` bounds the page and `nextToken` resumes the SAME listing. A read only:
+//! nothing here writes.
+
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +153,191 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListManagedJobTemplates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListManagedJobTemplatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListManagedJobTemplates"))
+        // The region the request is signed for scopes the `templateArn` of every entry
+        // this page carries: a managed template is published per region, so the ARN
+        // names the catalog of the region it is read from.
+        let region = crate::state::request_region(ctx.parts());
+
+        // What the request selects is resolved BEFORE the catalog is reached: a
+        // `nextToken` this listing never issued is refused whatever the catalog holds.
+        let scope = listing_scope(input.template_name.as_deref());
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_next_token(token, &scope)?),
+            None => None,
+        };
+        // `maxResults` is `range 1..250`, refused outside that before this handler runs,
+        // so a request that names it asks for at least one entry; one that names none
+        // asks for every entry that matches — the member documents no default page. The
+        // clamp is defensive rather than load-bearing: it keeps the page inside the
+        // modelled range without depending on a validation performed outside this
+        // module.
+        let page_size = input
+            .max_results
+            .map_or(usize::MAX, |max| max.clamp(1, MAX_PAGE_SIZE) as usize);
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListManagedJobTemplatesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A pure read of the published catalog: nothing here writes, so a later caller
+        // sees exactly what this one did.
+        let store = state.lock();
+        let catalog = &store.managed_job_templates;
+
+        // `templateName` is "An optional parameter for template name. If specified, only
+        // the versions of the managed job templates that have the specified template
+        // name will be returned" — so a name the catalog publishes no template under
+        // selects no versions at all. It is refused as the modelled
+        // `InvalidRequestException` (HTTP 400, "The request is not valid") and not as a
+        // miss of this account's: the catalog is AWS-published reference data, so naming
+        // a template it does not publish is a bad request rather than a resource this
+        // account does not have.
+        if let Some(template_name) = input.template_name.as_deref() {
+            if catalog.template(template_name).is_none() {
+                return Err(
+                    ListManagedJobTemplatesErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(
+                                crate::state::invalid_managed_job_template_name_message(
+                                    template_name,
+                                ),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // One entry per published (template, version) pair the request selects, in
+        // catalog order — by `templateName`, then by `templateVersion` — which is what
+        // makes a page boundary meaningful. One pair beyond the page is taken: its
+        // presence is what says the listing is truncated, and nothing more than that is
+        // read.
+        let mut page: Vec<(CatalogKey, ManagedJobTemplateSummary)> = catalog
+            .pairs()
+            .filter(|(template, _)| {
+                input
+                    .template_name
+                    .as_deref()
+                    .is_none_or(|wanted| template.template_name == wanted)
+            })
+            .map(|(template, version)| {
+                (
+                    (
+                        template.template_name.clone(),
+                        version.template_version.clone(),
+                    ),
+                    template.summary(&region, version),
+                )
+            })
+            .filter(|(key, _)| {
+                resume_after
+                    .as_ref()
+                    .is_none_or(|cursor| key > cursor)
+            })
+            .take(page_size.saturating_add(1))
+            .collect();
+        drop(store);
+
+        let truncated = page.len() > page_size;
+        page.truncate(page_size);
+
+        // `nextToken` is "The token to retrieve the next set of results", so it is
+        // issued only while entries remain.
+        let next_token = if truncated {
+            page.last().map(|(key, _)| encode_next_token(&scope, key))
+        } else {
+            None
+        };
+
+        Ok(ListManagedJobTemplatesOutput {
+            // `ManagedJobTemplatesSummaryList` carries no length constraint, so a
+            // selection nothing matches answers with an EMPTY list rather than an absent
+            // member: "nothing matches" is an answer, not a missing one.
+            managed_job_templates: Some(page.into_iter().map(|(_, summary)| summary).collect()),
+            next_token,
+        })
     }
+}
+
+/// The largest page `LaserMaxResults` admits (`range 1..250`), which is also the most
+/// entries one page of this listing may carry.
+const MAX_PAGE_SIZE: i32 = 250;
+
+/// The position of one entry in this listing's total order: the template's name, then
+/// the version of it this entry is about. The PAIR, because one entry is one version of
+/// one template, so the name alone would not be a position.
+type CatalogKey = (String, String);
+
+/// The character that separates a token's scope from the position it resumes after, and
+/// the two fields of that position. A control character, so it occurs in no
+/// `ManagedJobTemplateName` or `ManagedTemplateVersion` this catalog publishes and
+/// cannot be forged out of one.
+const TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// The LISTING a continuation token belongs to: its filter, which decides which entries
+/// it walks and therefore what "the next set of results" means. A token issued for one
+/// listing is refused by another.
+///
+/// `ManagedJobTemplateName` carries no modelled pattern, so the name is hex-encoded here
+/// and tagged, keeping an ABSENT filter distinct from a supplied one whatever the name
+/// contains.
+fn listing_scope(template_name: Option<&str>) -> String {
+    match template_name {
+        None => "n".to_string(),
+        Some(template_name) => format!("t{}", ::hex::encode(template_name)),
+    }
+}
+
+/// The opaque `nextToken` that resumes `scope`'s listing after the entry at `key`.
+///
+/// The position and not the template name alone, so a page resumes where the last one
+/// ended. Hex-encoded so the token is opaque to the caller whatever the filter contains.
+/// The encoding carries no integrity protection and claims none: a caller that reverses
+/// it can name any resume point of the listing it is already reading, which selects a
+/// page of that same listing and nothing else.
+fn encode_next_token(scope: &str, key: &CatalogKey) -> String {
+    let (template_name, template_version) = key;
+    ::hex::encode(format!(
+        "{scope}{TOKEN_SEPARATOR}{template_name}{TOKEN_SEPARATOR}{template_version}"
+    ))
+}
+
+/// The position a `nextToken` resumes after, or the modelled `InvalidRequestException`
+/// (HTTP 400, "The request is not valid") when the token is not one
+/// [`encode_next_token`] issued for THIS listing.
+///
+/// Every step is fallible on purpose: the token is caller-supplied, so nothing read out
+/// of it may panic the handler. A token issued for another filter is refused rather than
+/// silently resuming a different listing from the middle.
+fn decode_next_token(
+    token: &str,
+    scope: &str,
+) -> Result<CatalogKey, ListManagedJobTemplatesError> {
+    let invalid = || -> ListManagedJobTemplatesError {
+        ListManagedJobTemplatesErrorModeled::InvalidRequestException(InvalidRequestException {
+            message: Some("nextToken is not a continuation token of this listing".to_string()),
+        })
+        .into()
+    };
+    let bytes = ::hex::decode(token).map_err(|_| invalid())?;
+    let decoded = String::from_utf8(bytes).map_err(|_| invalid())?;
+    let (token_scope, position) = decoded.split_once(TOKEN_SEPARATOR).ok_or_else(invalid)?;
+    let (template_name, template_version) =
+        position.split_once(TOKEN_SEPARATOR).ok_or_else(invalid)?;
+    // A resume point outside the modelled shapes could name no entry of the catalog, so
+    // a token carrying one was not issued by this listing.
+    if token_scope != scope
+        || !crate::state::is_modeled_managed_job_template_name(template_name)
+        || !crate::state::is_modeled_managed_template_version(template_version)
+    {
+        return Err(invalid());
+    }
+    Ok((template_name.to_string(), template_version.to_string()))
 }
