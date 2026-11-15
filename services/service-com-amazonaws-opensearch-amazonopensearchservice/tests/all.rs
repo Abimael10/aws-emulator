@@ -151,6 +151,8 @@ mod domain_package_listing_cursor;
 mod domain_rest_bulk_and_index_apis;
 #[path = "all/domain_rest_data_plane.rs"]
 mod domain_rest_data_plane;
+#[path = "all/domain_rest_document_update.rs"]
+mod domain_rest_document_update;
 #[path = "all/domain_server_defaults.rs"]
 mod domain_server_defaults;
 #[path = "all/domain_vpc_placement.rs"]

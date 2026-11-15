@@ -116,6 +116,10 @@ pub const ACTION_DELETE_NOTIFICATION_CONFIG: &str =
 /// The action a write of one document asks for.
 pub const ACTION_INDEX_DOCUMENT: &str = "indices:data/write/index";
 
+/// The action a PARTIAL-DOCUMENT update asks for — the update API's own action, beside the
+/// write the merged document it produces is stored by.
+pub const ACTION_UPDATE_DOCUMENT: &str = "indices:data/write/update";
+
 /// The action a BULK write asks for — the one action the bulk API itself is registered
 /// under, beside the per-item action each of its items asks for.
 pub const ACTION_BULK: &str = "indices:data/write/bulk";

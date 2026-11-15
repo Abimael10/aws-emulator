@@ -25,7 +25,8 @@ use serde_json::{json, Map, Value};
 use crate::state::{fgac, ingest, Domain};
 
 use super::{
-    apply_pipeline, error, guarded, ok, wrong_method, write_conflict, Creates, Refusal, Request,
+    apply_pipeline, document_update, error, guarded, ok, wrong_method, write_conflict, Creates,
+    Refusal, Request,
 };
 
 /// The actions a bulk stream may name, each the name of the member its metadata is carried
@@ -46,13 +47,6 @@ const META_INDEX: &str = "_index";
 
 /// See [`META_INDEX`].
 const META_ID: &str = "_id";
-
-/// The member an `update` action carries the partial document to merge in.
-const DOC: &str = "doc";
-
-/// The member an `update` action asks for the partial document to be INDEXED with when the
-/// document does not exist yet.
-const DOC_AS_UPSERT: &str = "doc_as_upsert";
 
 /// The most actions ONE bulk request may carry.
 ///
@@ -371,6 +365,10 @@ fn index(
 
 /// An `update` item: the partial document the action carried MERGED onto the one the index
 /// holds, which is then stored through the same write path.
+///
+/// What the merge COMES TO is the one rule the update API states
+/// ([`document_update::updated`]), so an item of a stream and a request of its own change
+/// the stored document the same way.
 fn update(
     domain: &mut Domain,
     request: &Request<'_>,
@@ -380,52 +378,39 @@ fn update(
     now: SystemTime,
 ) -> Item {
     let body = action.source.clone().unwrap_or(Value::Null);
-    // "script or doc is missing": this surface updates a document with the partial
-    // document the action carries. A SCRIPTED update runs caller-supplied code, which this
-    // cluster does not run, so such an item is refused rather than reported as applied.
-    if body.get("script").is_some() {
-        return failure(
-            action,
-            index_name,
-            &Refusal::of_illegal_argument(
-                "scripted updates are not supported by this cluster; send [doc] with the fields \
-                 to change",
-            ),
-        );
-    }
-    let Some(doc) = body.get(DOC).filter(|doc| doc.is_object()) else {
-        return failure(
-            action,
-            index_name,
-            &Refusal::of_illegal_argument("Validation Failed: 1: script or doc is missing;"),
-        );
-    };
+    let holds_index = domain.indexes.contains_key(index_name);
     let held = domain
         .indexes
         .get(index_name)
         .and_then(|index| index.documents.get(&action.id))
-        .map(|document| document.source.clone());
-    let upserts = body.get(DOC_AS_UPSERT).and_then(Value::as_bool) == Some(true);
-    let source = match held {
-        // "The update API allows to update a document based on a script or a partial
-        // document": the fields the partial names are written over the document, and every
-        // other field of it stays.
-        Some(mut source) => {
-            merge(&mut source, doc);
-            source
+        .cloned();
+    let source = match document_update::updated(
+        index_name,
+        &action.id,
+        holds_index,
+        held.as_ref().map(|document| &document.source),
+        &body,
+    ) {
+        Ok(document_update::Updated::Stored(source)) => source,
+        // The merge changed nothing, so nothing is written and the item reports the
+        // revision the document is still at.
+        Ok(document_update::Updated::Unchanged) => {
+            return match &held {
+                Some(document) => Item {
+                    reported: with_status(
+                        document_update::noop_answer(index_name, &action.id, document),
+                        200,
+                    ),
+                    failed: false,
+                },
+                None => failure(
+                    action,
+                    index_name,
+                    &Refusal::of_document_missing(&action.id),
+                ),
+            }
         }
-        // "doc_as_upsert: instead of sending a partial doc plus an upsert doc, you can set
-        // this to true to use the contents of doc as the upsert value"; without it an
-        // update of a document the index does not hold is the engine's missing-document
-        // refusal.
-        None if upserts => doc.clone(),
-        None => {
-            return failure(
-                action,
-                index_name,
-                &Refusal::of_document_missing(&action.id),
-            )
-        }
+        Err(refusal) => return failure(action, index_name, &refusal),
     };
     index(
         domain,
@@ -437,6 +422,15 @@ fn update(
         pipeline,
         now,
     )
+}
+
+/// One item's answer with the STATUS that item reports beside it, which is what a bulk item
+/// carries and the single-request answer does not.
+fn with_status(mut reported: Value, status: u16) -> Value {
+    if let Some(members) = reported.as_object_mut() {
+        members.insert("status".to_string(), json!(status));
+    }
+    reported
 }
 
 /// A `delete` item: the document the action addresses removed from the index, which takes
@@ -500,72 +494,6 @@ fn revision(meta: &Value) -> Option<(u64, u64)> {
         meta.get("if_seq_no").and_then(Value::as_u64),
         meta.get("if_primary_term").and_then(Value::as_u64),
     )
-}
-
-/// Write the members of the partial document `doc` over `source`, descending into an
-/// object a member of both carries — which is how a partial update changes one field of a
-/// nested object without dropping the fields beside it.
-///
-/// Taken as the LEAVES the partial names and the path of each, so the walk never holds two
-/// borrows of the document it writes into, and iterative rather than recursive, so a deeply
-/// nested partial costs no stack. The document's own size is bounded by
-/// [`ingest::MAX_DOCUMENT_BYTES`], which bounds both the paths and the walk.
-fn merge(source: &mut Value, doc: &Value) {
-    for (path, value) in leaves(doc) {
-        write_at(source, &path, value);
-    }
-}
-
-/// The VALUES the partial document names, each with its path: a member that is not an
-/// object is one value, and an object is the way to the members under it.
-///
-/// An object naming no member changes nothing, so it names no value of its own — merging a
-/// partial that carries one leaves what the document holds there as it was.
-fn leaves(doc: &Value) -> Vec<(Vec<String>, Value)> {
-    let mut found: Vec<(Vec<String>, Value)> = Vec::new();
-    let mut pending: Vec<(Vec<String>, &Value)> = vec![(Vec::new(), doc)];
-    while let Some((path, node)) = pending.pop() {
-        match node {
-            Value::Object(members) if !members.is_empty() => {
-                for (member, child) in members {
-                    let mut under = path.clone();
-                    under.push(member.clone());
-                    pending.push((under, child));
-                }
-            }
-            // The root itself is not a member, so a partial that is not an object writes
-            // nothing.
-            value if !path.is_empty() => found.push((path, value.clone())),
-            _ => {}
-        }
-    }
-    found
-}
-
-/// Write `value` at `path` in `source`, making each node above it an object so a nested
-/// member is written without dropping the members beside it.
-fn write_at(source: &mut Value, path: &[String], value: Value) {
-    let Some((member, ancestors)) = path.split_last() else {
-        return;
-    };
-    let mut node = source;
-    for ancestor in ancestors {
-        if !node.is_object() {
-            *node = Value::Object(Map::new());
-        }
-        let Some(members) = node.as_object_mut() else {
-            return;
-        };
-        node = members
-            .entry(ancestor.clone())
-            .or_insert_with(|| Value::Object(Map::new()));
-    }
-    if !node.is_object() {
-        *node = Value::Object(Map::new());
-    }
-    if let Some(members) = node.as_object_mut() {
-        members.insert(member.clone(), value);
-    }
 }
 
 /// The refusal a line the stream's grammar does not admit earns, worded as the engine

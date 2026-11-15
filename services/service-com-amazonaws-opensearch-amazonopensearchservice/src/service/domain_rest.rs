@@ -85,8 +85,9 @@
 //! the cluster banner and health, the cluster's nodes and its own settings, the compact
 //! listings of its indexes and nodes ([`cat`]), an index's create/read/delete, its own
 //! settings read and updated ([`index_settings`]) and its mappings read and added to
-//! ([`index_mapping`]), the aliases that stand for it ([`aliases`]), a document write, read
-//! and delete — each numbered with the revision a conditional write is taken against — the
+//! ([`index_mapping`]), the aliases that stand for it ([`aliases`]), a document write, read,
+//! partial update ([`document_update`]) and delete — each numbered with the revision a
+//! conditional write is taken against — the
 //! newline-delimited stream of them the bulk API takes ([`bulk`]), a count and a search over
 //! a bounded query vocabulary ([`selector`]) whose `match` is evaluated over the terms the
 //! field's own analysis chain produces, the documents such a query selects removed
@@ -140,6 +141,11 @@ mod search;
 /// The BULK API: the newline-delimited action/source stream a client loads documents with,
 /// and the per-item answer each action earns.
 mod bulk;
+
+/// The PARTIAL-DOCUMENT UPDATE: the `doc` object a caller sends instead of the whole
+/// document, merged onto the one the index holds — the rule the update API and a bulk
+/// `update` action share.
+mod document_update;
 
 /// The ALIAS API: the alias actions a client points a virtual index name with.
 mod aliases;
@@ -1480,6 +1486,11 @@ fn serve_resolved(
         ),
         [index, "_create", id] if !reserved(index) => {
             document_request(domain, request, index, id, Creates::Only, now, files)
+        }
+        // The PARTIAL-DOCUMENT UPDATE of one document: the fields the request's `doc`
+        // names merged onto the document the index holds.
+        [index, "_update", id] if !reserved(index) => {
+            document_update::update_request(domain, request, index, id, now)
         }
         [index, "_count"] if !reserved(index) => match request.method {
             "GET" | "POST" => guarded(domain, request, fgac::ACTION_COUNT, |domain| {

@@ -1372,3 +1372,12 @@ mod cloudformation_provisions_appsync_event_and_merged_apis;
 // this file and for every service crate's own `tests/all.rs`.
 #[path = "all/s3_notification_granted_function_writes_back_into_the_bucket.rs"]
 mod s3_notification_granted_function_writes_back_into_the_bucket;
+// Single integration-test target for the router: the canonical declaration list of its
+// cross-service suites, and nothing else. One `#[path = "all/<name>.rs"]` / `mod <name>;` pair
+// per file under `tests/all/`, sorted by name, and no other line — put a new suite at
+// `tests/all/<name>.rs` and insert its pair where its name sorts. Every comment here is an
+// ordinary `//` one, this header included, so no appended or merged line can be an inner doc
+// comment past the first item; for the same reason the file carries no inner attribute. What a
+// suite covers belongs in that suite's own module header, and a note about this file in
+// `all/appended_notes.rs`, declared below like any other suite. The `all_rs_*`,
+// `declaration_roots_*` and `every_suite_file_is_declared` suites pin all of it.
