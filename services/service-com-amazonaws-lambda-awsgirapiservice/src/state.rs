@@ -442,6 +442,13 @@ pub mod durable_events;
 pub mod function_url;
 pub use function_url::{AddressedFunctionUrl, FunctionUrlTarget};
 
+/// The ADDRESS one function URL is published on, and the listener that answers there: a
+/// function URL's identity belongs in the HOST a client is handed, because a consumer of a
+/// published endpoint carries a host and supplies the path itself. A SUBMODULE for the same
+/// reason as [`function_url`], re-exported here so a handler names it as `crate::state::…`.
+pub mod function_url_endpoint;
+pub use function_url_endpoint::{open_function_url_endpoint, FunctionUrlEndpoint};
+
 /// The workspace's one reading of an authenticated pagination token, which this store's
 /// paginated reads mint their `NextMarker` with
 /// ([`function_url::function_url_marker`]): the secret lives on the store
@@ -1853,6 +1860,15 @@ pub fn named_qualifier(function_name: &str, qualifier: Option<&str>) -> Option<S
         .filter(|named| !named.is_empty())
 }
 
+/// How many PUBLISHED function URL addresses one store keeps open at once.
+///
+/// Each is a socket this process holds, and an address outlives the configuration published
+/// on it (see
+/// [`ComAmazonawsLambdaAwsgirapiserviceState::make_room_for_a_function_url_endpoint`]), so
+/// this is the ceiling on what a caller creating and deleting function URLs can hold open.
+/// An EMULATOR bound: AWS publishes a host per function URL and holds no socket for one.
+const MAX_PUBLISHED_FUNCTION_URL_ADDRESSES: usize = 256;
+
 /// One Lambda function URL: "a dedicated HTTP(S) endpoint that you can use to invoke
 /// your function", with the configuration the caller gave it.
 ///
@@ -1870,6 +1886,13 @@ pub struct FunctionUrlConfigRecord {
     /// `UpdateFunctionUrlConfig` and `ListFunctionUrlConfigs` cannot report the same
     /// function URL at two different addresses.
     pub url: String,
+    /// The `host:port` of the LISTENER this URL is published on
+    /// ([`function_url_endpoint`]), when one was opened for it: the authority of
+    /// [`Self::url`], held on its own so a request addressed at that authority alone — which
+    /// is how a consumer handed this endpoint addresses it, carrying a path of its own —
+    /// resolves to this URL. Absent for a URL published on the emulator's own shared
+    /// endpoint, whose authority names no function URL and must never be read as one.
+    pub endpoint_authority: Option<String>,
     /// The `FunctionUrlAuthType` the URL enforces (`AWS_IAM` or `NONE`), as supplied.
     pub auth_type: String,
     /// The CORS settings, exactly as configured; absent when the caller configured
@@ -3133,6 +3156,19 @@ pub struct ComAmazonawsLambdaAwsgirapiserviceState {
     /// tell a `Marker` it ISSUED from one a caller assembled; see
     /// [`function_url::function_url_marker`].
     pub page_token_key: PageTokenKey,
+    /// The listener each published function URL is served on, keyed by its url id
+    /// ([`function_url_endpoint`]). Held here because dropping the handle closes the port.
+    ///
+    /// An address OUTLIVES the configuration published on it, as a function URL's own host
+    /// does: AWS answers a request to a deleted function URL's address rather than nothing,
+    /// so the handle stays until the room it holds is needed
+    /// ([`Self::make_room_for_a_function_url_endpoint`]).
+    pub function_url_endpoints: BTreeMap<String, FunctionUrlEndpoint>,
+    /// How many published function URL addresses a create has RESERVED and not yet handed to
+    /// [`Self::function_url_endpoints`]: a socket is opened with no guard held, so this is
+    /// what makes the cap on those addresses bound the opens in flight as well as the ones
+    /// this store holds ([`Self::make_room_for_a_function_url_endpoint`]).
+    pub function_url_endpoint_reservations: usize,
 }
 
 /// One code-signing configuration.
@@ -3257,6 +3293,92 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
         for mapping in self.event_source_mappings.values_mut() {
             mapping.materialize(now);
         }
+    }
+
+    /// Whether this store ANSWERS at the authority `host` names: an address a function URL of
+    /// this store was published on ([`function_url_endpoint`]).
+    ///
+    /// An address stays this plane's while the handle is held, whether or not a configuration
+    /// still sits behind it: a function URL whose configuration was deleted is still an
+    /// address of this service, and what a caller reading it is told is this service's to say
+    /// — the refusal of a caller no configuration admits, which is the answer AWS gives at a
+    /// deleted function URL's own host.
+    #[must_use]
+    pub fn answers_at_published_authority(&self, host: &str) -> bool {
+        let authority = host.rsplit('@').next().unwrap_or(host);
+        self.function_url_endpoints
+            .values()
+            .any(|endpoint| endpoint.authority().eq_ignore_ascii_case(authority))
+    }
+
+    /// RESERVE room for one more published function URL address, and report whether there IS
+    /// room for one: the addresses of the configurations this store no longer holds are closed
+    /// once the addresses held reach [`MAX_PUBLISHED_FUNCTION_URL_ADDRESSES`], and `false`
+    /// says the cap is reached by LIVE addresses alone.
+    ///
+    /// Each address is an open socket, so what a caller can drive up is bounded here and not
+    /// by how many function URLs it creates: a deleted URL's address keeps answering until the
+    /// room it holds is needed, and a create past the cap opens no socket at all — that URL is
+    /// published on the emulator's own endpoint instead, which serves it by path
+    /// ([`function_url::announced_function_url`]). A configuration this store still holds is
+    /// never closed: that address is live.
+    ///
+    /// `true` COUNTS the address this caller is about to open
+    /// ([`Self::function_url_endpoint_reservations`]), because the socket is opened with no
+    /// guard held: without that, every create in flight at once would read the same room and
+    /// each open one, and the cap would bound nothing. The caller releases its reservation
+    /// under the guard it inserts the handle under ([`Self::took_a_function_url_endpoint`]),
+    /// so the count is the open sockets plus the opens in flight.
+    ///
+    /// Called from the create that would open one; nothing a read does reaches it.
+    pub fn make_room_for_a_function_url_endpoint(&mut self) -> bool {
+        if self.reserved_function_url_addresses() < MAX_PUBLISHED_FUNCTION_URL_ADDRESSES {
+            self.function_url_endpoint_reservations += 1;
+            return true;
+        }
+        let held: BTreeSet<String> = self
+            .functions
+            .values()
+            .flat_map(|function| function.url_configs.values())
+            .map(|config| config.url_id.clone())
+            .collect();
+        let retired: Vec<String> = self
+            .function_url_endpoints
+            .keys()
+            .filter(|url_id| !held.contains(*url_id))
+            .cloned()
+            .collect();
+        for url_id in retired {
+            if self.reserved_function_url_addresses() < MAX_PUBLISHED_FUNCTION_URL_ADDRESSES {
+                self.function_url_endpoint_reservations += 1;
+                return true;
+            }
+            self.function_url_endpoints.remove(&url_id);
+        }
+        let room = self.reserved_function_url_addresses() < MAX_PUBLISHED_FUNCTION_URL_ADDRESSES;
+        if room {
+            self.function_url_endpoint_reservations += 1;
+        }
+        room
+    }
+
+    /// The addresses this store accounts for: the sockets it holds open, plus the opens a
+    /// create has reserved and not yet handed over.
+    fn reserved_function_url_addresses(&self) -> usize {
+        self.function_url_endpoints
+            .len()
+            .saturating_add(self.function_url_endpoint_reservations)
+    }
+
+    /// Release the reservation [`Self::make_room_for_a_function_url_endpoint`] took, now that
+    /// the address it was taken for is accounted for — held on this store, or closed because
+    /// the create that opened it answered nothing.
+    ///
+    /// Called under the guard the handle is inserted under, so the count never falls below
+    /// what is open.
+    pub fn took_a_function_url_endpoint(&mut self) {
+        self.function_url_endpoint_reservations =
+            self.function_url_endpoint_reservations.saturating_sub(1);
     }
 
     /// Claim the ONE poller of the mapping `uuid` names, reporting whether this caller got

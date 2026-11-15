@@ -85,6 +85,17 @@
 // have no prose to duplicate, re-word or mistype.
 // What a suite covers, and why it drives the assembled router rather than one service crate,
 // belongs in that suite's OWN module header, where it is read beside the test it explains; a
+// note about THIS file belongs in `all/appended_notes.rs`. The suites
+// `all/all_rs_carries_no_inner_doc_comment.rs`, `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs` and
+// `all/declaration_roots_are_canonical_and_complete.rs` check all of the above, for this file
+// and for every service crate's `tests/all.rs`, so check there rather than leaving a note
+// here.
+// The header paragraphs above wrap without the indentation `clippy::doc_lazy_continuation`
+// asks of a doc list item; the lint is allowed here so a header line is a header line rather
+// than a build failure. An inner attribute, like an inner doc comment, is legal only before
+// the first item, so it stands here rather than in the list below.
 // note about THIS file belongs in `all/appended_notes.rs`, declared below like any other
 // suite.
 // EVERY comment in this file is an ordinary `//` one, this header included: an inner doc

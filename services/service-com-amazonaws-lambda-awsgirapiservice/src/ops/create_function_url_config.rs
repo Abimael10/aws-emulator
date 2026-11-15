@@ -210,7 +210,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        let url_id = crate::state::mint_function_url_id();
+        // The ADDRESS this function URL is published on: a listener of this emulator's own,
+        // so a function URL's identity lives in the HOST a client is handed — which is what a
+        // consumer of the endpoint carries (see `crate::state::function_url_endpoint`).
+        //
+        // The socket is opened with no guard held, so the room for it is RESERVED under one
+        // first and released under the guard the handle is handed over through: the cap then
+        // bounds the opens in flight as well as the addresses this store holds, which is what
+        // bounds the sockets a caller can drive this process into holding. Past that cap
+        // nothing is opened and the URL is published on the emulator's own endpoint, which
+        // serves it by path. A create this operation then refuses drops the handle, which
+        // closes the port.
+        let has_room = state.lock().make_room_for_a_function_url_endpoint();
+        let endpoint = if has_room {
+            crate::state::open_function_url_endpoint(
+                &*self.engine,
+                ctx.callback().clone(),
+                &url_id,
+                &region,
+            )
+            .await
+        } else {
+            None
+        };
         let mut store = state.lock();
+        if has_room {
+            // Accounted for from here on by the handle itself: every path below either hands
+            // it to this store or drops it, which closes the port.
+            store.took_a_function_url_endpoint();
+        }
         let (record, version) = crate::state::resolve_function(
             &mut store,
             &input.function_name,
@@ -255,7 +284,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let url_id = crate::state::mint_function_url_id();
         let created = crate::state::FunctionUrlConfigRecord {
             url_id: url_id.clone(),
             // Resolved once, from the request that created the URL: the endpoint announced
@@ -265,7 +293,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ctx,
                 &record.region,
                 &url_id,
+                endpoint.as_ref().map(crate::state::FunctionUrlEndpoint::authority),
             ),
+            // The authority of that address, when it is the URL's OWN listener: a request
+            // addressed there names this function URL and nothing else.
+            endpoint_authority: endpoint
+                .as_ref()
+                .map(|endpoint| endpoint.authority().to_string()),
             auth_type: input.auth_type.clone(),
             // Stored exactly as configured: a member the caller did not set is not
             // reported with a value this emulator made up.
@@ -293,6 +327,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             invoke_mode: created.invoke_mode.clone(),
         };
         record.url_configs.insert(version, created);
+        // The listener is held for as long as this store keeps room for it: an address a
+        // function URL was published on answers a caller that reads it even once the
+        // configuration behind it is gone, exactly as a function URL's own host does
+        // (`crate::state::function_url_endpoint`).
+        if let Some(endpoint) = endpoint {
+            store.function_url_endpoints.insert(url_id, endpoint);
+        }
 
         Ok(output)
     }

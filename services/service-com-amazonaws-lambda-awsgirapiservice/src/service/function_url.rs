@@ -144,14 +144,55 @@ const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
 /// The ADDRESS is read first, with no guard taken: a request that addresses no function URL
 /// at all — every control-plane call, and every other service's traffic, which this runs for
 /// on the way to `can_handle`'s answer — is answered before the store is touched.
+///
+/// Two readings, and which one decides is the whole question. The AUTHORITY the URL was
+/// PUBLISHED on ([`crate::state::function_url::published_function_url`]) was opened for ONE
+/// function URL and identifies it, so a path a consumer supplies there is a path WITHIN that
+/// URL — including one spelled like another URL's own addressing, which names nothing else at
+/// this address. The addressings that carry the url id in the path
+/// ([`crate::state::function_url::addressed_url`]) are how a client reaching the emulator's
+/// own endpoint names one, and they decide only when they name the URL this address serves:
+/// that is the announced value followed verbatim, whose marked prefix is the endpoint's base
+/// rather than a path within it. Both resolve only to a configuration this store HOLDS.
 pub(super) fn target_of<Eng: Send + Sync + 'static>(
     engine: &Eng,
     addressed: &crate::state::AddressedFunctionUrl<'_>,
 ) -> Option<crate::state::FunctionUrlTarget> {
-    let named = crate::state::function_url::addressed_url(addressed)?;
+    let addressed_url = crate::state::function_url::addressed_url(addressed);
     let state = crate::state::service_state(engine)?;
     let store = state.lock();
-    crate::state::function_url::held_function_url(&store, &named)
+    let published = crate::state::function_url::published_function_url(&store, addressed);
+    let named = addressed_url
+        .and_then(|named| crate::state::function_url::held_function_url(&store, &named));
+    match (published, named) {
+        (Some(published), Some(named)) if named.url_id == published.url_id => Some(named),
+        (Some(published), _) => Some(published),
+        (None, named) => named,
+    }
+}
+
+/// Whether `addressed` names an ADDRESS this service PUBLISHED a function URL on, whatever
+/// the store holds behind it ([`crate::state::ComAmazonawsLambdaAwsgirapiserviceState::
+/// answers_at_published_authority`]).
+///
+/// An address this service handed a caller stays this service's to answer: a function URL
+/// whose configuration was deleted is still an address of this service, and what a caller
+/// reading it is told is this service's to say rather than the router's "no service is
+/// registered for this".
+fn addresses_a_published_endpoint<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    addressed: &crate::state::AddressedFunctionUrl<'_>,
+) -> bool {
+    let Some(host) = addressed.host.as_deref() else {
+        return false;
+    };
+    // Every published address is a `host:port` nobody can read a service off, so a request to
+    // another service's endpoint host is never read as one.
+    if ::service_common::data_plane_addressing::service_named_by_host(host).is_some() {
+        return false;
+    }
+    crate::state::service_state(engine)
+        .is_some_and(|state| state.lock().answers_at_published_authority(host))
 }
 
 /// Which callers a mounted plane serves, which is what its declared auth schemes say.
@@ -240,15 +281,18 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
     pub fn claims(&self, parts: &smithy_server_runtime::http::request::Parts) -> bool {
         let addressed = crate::state::AddressedFunctionUrl::of_parts(parts);
         crate::state::function_url::named_endpoint(&addressed).is_some()
+            || addresses_a_published_endpoint(&*self.engine, &addressed)
             || target_of(&*self.engine, &addressed).is_some()
     }
 
     /// Whether the runtime-API request `req` addresses this plane at all — by an addressing
-    /// that names it and nothing else, or by naming a function URL this store HOLDS, which
-    /// is exactly the reading `claims` admitted the request by.
+    /// that names it and nothing else, by an ADDRESS this service published a function URL
+    /// on, or by naming a function URL this store HOLDS, which is exactly the reading
+    /// `claims` admitted the request by.
     pub fn addressed(&self, req: &RtRequest) -> bool {
         let addressed = crate::state::AddressedFunctionUrl::of_request(req);
         crate::state::function_url::named_endpoint(&addressed).is_some()
+            || addresses_a_published_endpoint(&*self.engine, &addressed)
             || target_of(&*self.engine, &addressed).is_some()
     }
 

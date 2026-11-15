@@ -7,23 +7,24 @@
 //!
 //! > The address this service announces for a function URL is one this emulator itself
 //! > answers on, so a client that follows `FunctionUrl` verbatim — "the HTTP URL endpoint
-//! > for your function" — reaches the function the URL is attached to. A client configured
-//! > with the emulator's own endpoint is announced that endpoint with the url id behind the
-//! > reserved data-plane path; a client that resolves AWS's own hosts is announced the
-//! > `<url-id>.lambda-url.<region>.on.aws` host that member documents, which this service
-//! > claims host-style. Whichever form it is, the value is resolved once at creation, so
-//! > `CreateFunctionUrlConfig`, `GetFunctionUrlConfig`, `ListFunctionUrlConfigs` and
-//! > `UpdateFunctionUrlConfig` all report the one announced address.
+//! > for your function" — reaches the function the URL is attached to. It is the URL's OWN
+//! > address: the `host:port` of the listener opened for it, carrying the url id behind the
+//! > reserved data-plane path, whatever endpoint the client that created it was configured
+//! > with — because a consumer handed that value addresses it by its AUTHORITY and supplies
+//! > a path of its own. The documented `<url-id>.lambda-url.<region>.on.aws` host is
+//! > announced only where this emulator can open no listener at all. Whichever form it is,
+//! > the value is resolved once at creation, so `CreateFunctionUrlConfig`,
+//! > `GetFunctionUrlConfig`, `ListFunctionUrlConfigs` and `UpdateFunctionUrlConfig` all
+//! > report the one announced address.
 //!
 //! The rows span what the rule generalises over: the endpoint the control-plane request was
 //! addressed at (an IPv4 loopback literal with a port, a loopback NAME with a port, a
-//! bracketed IPv6 literal, a bare IPv4 literal carrying no port, a full IPv6 literal, an
-//! address so long that the announced local form would pass the member's modelled length
-//! ceiling, and one of AWS's own service hosts), the Region the request is signed for, and
-//! the qualifier the URL is attached to (the function's unpublished version and an alias).
-//! Each row is checked against every one of the four reporters and the announced address is
-//! then FETCHED, at the URL's own root and at a path below it, against a function whose
-//! package RUNS — so an address that was announced but is served by nothing fails here.
+//! bracketed IPv6 literal, a bare IPv4 literal carrying no port, a full IPv6 literal, a
+//! longer one still, and one of AWS's own service hosts), the Region the request is signed
+//! for, and the qualifier the URL is attached to (the function's unpublished version and an
+//! alias). Each row is checked against every one of the four reporters and the announced
+//! address is then FETCHED, at the URL's own root and at a path below it, against a function
+//! whose package RUNS — so an address that was announced but is served by nothing fails here.
 
 use std::time::Duration;
 
@@ -63,19 +64,8 @@ const LOCAL_MARKER: &str = "/_aws/lambda-url";
 /// is an address nothing serves, so this is never a legitimate answer here.
 const UNKNOWN_SERVICE: &str = "UnknownService";
 
-/// Which address a row must be announced on.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Announced {
-    /// The emulator's own endpoint, with the url id behind the reserved data-plane path.
-    EmulatorEndpoint,
-    /// The `<url-id>.lambda-url.<region>.on.aws` host `FunctionUrlConfig$FunctionUrl`
-    /// documents.
-    FunctionUrlHost,
-}
-
 /// One row: the endpoint the control-plane calls are addressed at, the Region they are
-/// signed for, the qualifier the URL is attached to, and the address it must be announced
-/// on.
+/// signed for, and the qualifier the URL is attached to.
 struct Row {
     case: &'static str,
     /// The `Host` the control-plane request carries — the endpoint the client is configured
@@ -84,7 +74,6 @@ struct Row {
     region: &'static str,
     /// The alias the URL is attached to, or `None` for the function's unpublished version.
     qualifier: Option<&'static str>,
-    announced: Announced,
 }
 
 fn rows() -> Vec<Row> {
@@ -95,59 +84,49 @@ fn rows() -> Vec<Row> {
             host: "127.0.0.1:45923",
             region: "us-west-2",
             qualifier: None,
-            announced: Announced::EmulatorEndpoint,
         },
         Row {
             case: "the same endpoint named by its loopback NAME, on an alias",
             host: "localhost:9297",
             region: "eu-west-1",
             qualifier: Some("live"),
-            announced: Announced::EmulatorEndpoint,
         },
         Row {
             case: "the same endpoint named by a bracketed IPv6 literal",
             host: "[::1]:9297",
             region: "ap-southeast-2",
             qualifier: None,
-            announced: Announced::EmulatorEndpoint,
         },
         Row {
             case: "the same endpoint named by a bare IPv4 literal carrying no port",
             host: "127.0.0.1",
             region: "us-east-1",
             qualifier: None,
-            announced: Announced::EmulatorEndpoint,
         },
         Row {
-            case: "a longer address for the same endpoint, a full IPv6 literal with a port, \
-                   which the announced value still fits the modelled length with",
+            case: "a longer address for the same endpoint, a full IPv6 literal with a port",
             host: "[2001:db8::1]:39355",
             region: "ap-northeast-1",
             qualifier: None,
-            announced: Announced::EmulatorEndpoint,
         },
         Row {
-            case: "an address so long that announcing the URL behind the emulator's own \
-                   endpoint would pass the modelled FunctionUrl length: the documented \
-                   endpoint is announced instead of a value the model refuses",
+            case: "an address longer still, which the URL's own published address is \
+                   unaffected by",
             host: "[2001:db8:85a3:8d3:1319:8a2e:370:7348]:39355",
             region: "us-west-2",
             qualifier: None,
-            announced: Announced::FunctionUrlHost,
         },
         Row {
-            case: "a client that resolves AWS's own hosts: the documented function URL host",
+            case: "a client that resolves AWS's own hosts",
             host: "lambda.us-east-1.amazonaws.com",
             region: "us-east-1",
             qualifier: None,
-            announced: Announced::FunctionUrlHost,
         },
         Row {
             case: "a client that resolves AWS's own hosts, an alias in another Region",
             host: "lambda.eu-central-1.amazonaws.com",
             region: "eu-central-1",
             qualifier: Some("stable"),
-            announced: Announced::FunctionUrlHost,
         },
     ]
 }
@@ -331,8 +310,13 @@ fn announced_parts(announced: &str) -> (String, String) {
     }
 }
 
-/// Assert `announced` is an address this emulator answers on, in the form this row's client
-/// is announced, and answer the authority and the base path a client fetches it at.
+/// Assert `announced` is the address this emulator published for this function URL, and
+/// answer the authority and the base path a client fetches it at.
+///
+/// The URL's OWN address: a `host:port` on the interface this emulator is bound on — never
+/// a host under one of AWS's zones, which no client of this emulator resolves — carrying the
+/// url id behind the reserved data-plane path. A consumer handed this value addresses it by
+/// that authority, so the authority is what identifies the URL.
 fn assert_announced(row: &Row, reporter: &str, announced: &str) -> (String, String) {
     let case = row.case;
     assert!(
@@ -350,45 +334,28 @@ fn assert_announced(row: &Row, reporter: &str, announced: &str) -> (String, Stri
         base_path.ends_with('/'),
         "case {case:?}: {reporter} must announce the endpoint's own root, got {announced:?}"
     );
-    match row.announced {
-        Announced::EmulatorEndpoint => {
-            assert_eq!(
-                authority, row.host,
-                "case {case:?}: {reporter} must announce the endpoint the request reached, \
-                 got {announced:?}"
-            );
-            assert!(
-                !authority.ends_with("on.aws") && !authority.ends_with("amazonaws.com"),
-                "case {case:?}: {reporter} must not announce an AWS host no client of this \
-                 emulator resolves, got {announced:?}"
-            );
-            let url_id = base_path
-                .strip_prefix(&format!("{LOCAL_MARKER}/"))
-                .and_then(|rest| rest.strip_suffix('/'))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "case {case:?}: {reporter} must name the url id behind the reserved \
-                         data-plane path {LOCAL_MARKER}, got {announced:?}"
-                    )
-                });
-            assert_opaque_url_id(case, reporter, url_id, announced);
-        }
-        Announced::FunctionUrlHost => {
-            let suffix = format!(".lambda-url.{}.on.aws", row.region);
-            let url_id = authority.strip_suffix(&suffix).unwrap_or_else(|| {
-                panic!(
-                    "case {case:?}: {reporter} must announce the documented \
-                     <url-id>{suffix} host, got {announced:?}"
-                )
-            });
-            assert_opaque_url_id(case, reporter, url_id, announced);
-            assert_eq!(
-                base_path, "/",
-                "case {case:?}: the documented endpoint carries no path of its own, got \
-                 {announced:?}"
-            );
-        }
-    }
+    assert!(
+        !authority.ends_with("on.aws") && !authority.ends_with("amazonaws.com"),
+        "case {case:?}: {reporter} must not announce an AWS host no client of this \
+         emulator resolves, got {announced:?}"
+    );
+    assert!(
+        authority.rsplit_once(':').is_some_and(|(host, port)| {
+            !host.is_empty() && port.parse::<u16>().is_ok()
+        }),
+        "case {case:?}: {reporter} must announce the `host:port` a client dials this URL at, \
+         got {announced:?}"
+    );
+    let url_id = base_path
+        .strip_prefix(&format!("{LOCAL_MARKER}/"))
+        .and_then(|rest| rest.strip_suffix('/'))
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: {reporter} must name the url id behind the reserved \
+                 data-plane path {LOCAL_MARKER}, got {announced:?}"
+            )
+        });
+    assert_opaque_url_id(case, reporter, url_id, announced);
     (authority, base_path)
 }
 

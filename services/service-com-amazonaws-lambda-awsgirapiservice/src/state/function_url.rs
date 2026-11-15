@@ -149,10 +149,15 @@ pub fn function_url_endpoint_host(region: &str, url_id: &str) -> String {
 ///
 /// The member exists for a client to FETCH — "the HTTP URL endpoint for your function", "a
 /// dedicated HTTP(S) endpoint that you can use to invoke your function" — so the address
-/// announced has to be one this emulator itself answers on. Which address that is follows
-/// the addressings the module doc above states, in the same order the API Gateway V2 plane
-/// announces an api's endpoint in:
+/// announced has to be one this emulator itself answers on. `endpoint` is the `host:port` of
+/// the LISTENER opened for this URL ([`super::function_url_endpoint`]) when one could be
+/// opened, and that address is the one announced: it is the URL's OWN, so a consumer handed
+/// this endpoint resolves it from the authority alone and supplies its own path, exactly as
+/// it does for the documented host. Which address it is follows the addressings the module
+/// doc above states, in the same order the API Gateway V2 plane announces an api's endpoint
+/// in:
 ///
+/// * the URL's own listener, when this engine vends one;
 /// * a request that addressed the EMULATOR'S OWN endpoint
 ///   ([`::service_common::data_plane_addressing::reached_emulator_endpoint`]) comes from a
 ///   client that resolves nothing else, so the URL is announced on that same endpoint with
@@ -172,13 +177,14 @@ pub fn function_url_endpoint_host(region: &str, url_id: &str) -> String {
 ///   [`super::function_url()`] mints it — the form `FunctionUrlConfig$FunctionUrl`
 ///   documents, which this module claims host-style.
 ///
-/// Both forms stay inside the model's 40..100 `FunctionUrl` length constraint: the
-/// documented URL is 69 characters for a Region label of nine, and the announced local form
-/// is 58 characters plus the authority the request reached this emulator at. The authority
-/// comes off a caller-supplied `Host`, which a DNS name or a full IPv6 literal may make
-/// longer than that leaves room for, so an announced local form past
-/// [`FUNCTION_URL_MAX_LEN`] falls back to the documented one rather than answering a value
-/// the member's own constraint refuses.
+/// Every form stays inside the model's 40..100 `FunctionUrl` length constraint: the
+/// documented URL is 69 characters for a Region label of nine, and the local form is 58
+/// characters plus the authority it is served at — which is why the listener's own address
+/// carries that same marked path, rather than being announced bare and falling short of the
+/// member's own minimum. The authority comes off a caller-supplied `Host`, which a DNS name
+/// or a full IPv6 literal may make longer than that leaves room for, so an announced local
+/// form past [`FUNCTION_URL_MAX_LEN`] falls back to the documented one rather than answering
+/// a value the member's own constraint refuses.
 ///
 /// The scheme is `https` in every form rather than the one the endpoint base carries,
 /// because a function URL IS an HTTPS endpoint — `CreateFunctionUrlConfig` hands out "a
@@ -189,17 +195,22 @@ pub fn announced_function_url(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
     url_id: &str,
+    endpoint: Option<&str>,
 ) -> String {
     let addressed = AddressedFunctionUrl::of_parts(ctx.parts());
-    let served = ::service_common::data_plane_addressing::reached_emulator_endpoint(
-        "",
-        addressed.host.as_deref(),
-    )
-    .or_else(|| {
-        ::service_common::data_plane_addressing::served_endpoint_authority(
-            ctx.endpoint().as_str(),
-        )
-    });
+    let served = endpoint
+        .map(str::to_string)
+        .or_else(|| {
+            ::service_common::data_plane_addressing::reached_emulator_endpoint(
+                "",
+                addressed.host.as_deref(),
+            )
+        })
+        .or_else(|| {
+            ::service_common::data_plane_addressing::served_endpoint_authority(
+                ctx.endpoint().as_str(),
+            )
+        });
     match served {
         Some(authority) => {
             let announced = format!(
@@ -356,6 +367,42 @@ pub struct FunctionUrlTarget {
     pub endpoint_host: String,
 }
 
+/// The function URL PUBLISHED at the authority `addressed` names, or `None` when no
+/// configuration this store holds was published there.
+///
+/// This is the addressing a CONSUMER of a published endpoint uses: it was handed the URL and
+/// carries its AUTHORITY, supplying a request path of its own — a CloudFront
+/// `Origin$DomainName`, an integration's host, an operator's `curl`. The address it names is
+/// the listener opened for one function URL ([`super::function_url_endpoint`]), so the whole
+/// request path is the path within that URL.
+///
+/// Only an authority a configuration was PUBLISHED on resolves, read off the stored record's
+/// own `endpoint_authority`: the emulator's shared endpoint is nobody's function URL, so a
+/// URL announced there resolves by its path alone and this reading claims no request that
+/// arrives at the front door.
+#[must_use]
+pub fn published_function_url<'r>(
+    store: &ComAmazonawsLambdaAwsgirapiserviceState,
+    addressed: &'r AddressedFunctionUrl<'r>,
+) -> Option<FunctionUrlTarget> {
+    let host = addressed.host.as_deref()?;
+    let authority = host.rsplit('@').next().unwrap_or(host).to_ascii_lowercase();
+    store.functions.values().find_map(|function| {
+        function
+            .url_configs
+            .iter()
+            .find(|(_, config)| {
+                config
+                    .endpoint_authority
+                    .as_ref()
+                    .is_some_and(|published| published.eq_ignore_ascii_case(&authority))
+            })
+            .map(|(qualifier, config)| {
+                target_of_record(function, qualifier, config, addressed.path, None)
+            })
+    })
+}
+
 /// The stored function URL `addressed` names, or `None` when this store holds none under
 /// that id.
 ///
@@ -371,19 +418,41 @@ pub fn held_function_url(
             .url_configs
             .iter()
             .find(|(_, config)| config.url_id == addressed.url_id)
-            .map(|(qualifier, config)| FunctionUrlTarget {
-                url_id: config.url_id.clone(),
-                function_name: function.config.name.clone(),
-                qualifier: qualifier.clone(),
-                resource_arn: function.versioned_arn(qualifier),
-                auth_type: config.auth_type.clone(),
-                invoke_mode: config.served_invoke_mode(),
-                cors: config.cors.clone(),
-                request_path: normalized_path(addressed.request_path),
-                addressed_region: addressed.region.map(str::to_string),
-                endpoint_host: announced_host(&config.url, &function.region, &config.url_id),
+            .map(|(qualifier, config)| {
+                target_of_record(
+                    function,
+                    qualifier,
+                    config,
+                    addressed.request_path,
+                    addressed.region,
+                )
             })
     })
+}
+
+/// The target one stored configuration is, for a request that carried `request_path` and —
+/// for the addressings that carry one — named `region`. The ONE place a
+/// [`FunctionUrlTarget`] is built, so every addressing resolves the same facts about the same
+/// configuration.
+fn target_of_record(
+    function: &FunctionRecord,
+    qualifier: &str,
+    config: &FunctionUrlConfigRecord,
+    request_path: &str,
+    region: Option<&str>,
+) -> FunctionUrlTarget {
+    FunctionUrlTarget {
+        url_id: config.url_id.clone(),
+        function_name: function.config.name.clone(),
+        qualifier: qualifier.to_string(),
+        resource_arn: function.versioned_arn(qualifier),
+        auth_type: config.auth_type.clone(),
+        invoke_mode: config.served_invoke_mode(),
+        cors: config.cors.clone(),
+        request_path: normalized_path(request_path),
+        addressed_region: region.map(str::to_string),
+        endpoint_host: announced_host(&config.url, &function.region, &config.url_id),
+    }
 }
 
 /// The HOST of an announced function URL: the authority of the address the configuration

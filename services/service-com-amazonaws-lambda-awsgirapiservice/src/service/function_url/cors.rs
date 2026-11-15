@@ -51,6 +51,27 @@ const WILDCARD: &str = "*";
 /// The header a browser states the requesting origin in (RFC 6454 §7).
 const ORIGIN_HEADER: &str = "origin";
 
+/// The ORIGIN as this plane reads it: the header the browser stated, or — for a request
+/// forwarded from the address this function URL is published on — the reserved name that leg
+/// carries it under ([`crate::state::function_url_endpoint::CLIENT_ORIGIN_HEADER`]).
+///
+/// A browser-set header is not copied onto that leg, because the leg is this emulator calling
+/// itself and the emulator's own front door refuses a request carrying one as a cross-site
+/// browser request; the listener has already made that decision against this URL's own
+/// `Cors$AllowOrigins`. So the value the CORS answer is built from is read HERE, once, from
+/// either place a request can carry it.
+fn stated_origin(req: &RtRequest) -> Option<&str> {
+    let stated = |name: &str| {
+        req.headers()
+            .get(name)
+            .map(str::trim)
+            .filter(|origin| !origin.is_empty())
+    };
+    stated(ORIGIN_HEADER).or_else(|| {
+        stated(crate::state::function_url_endpoint::CLIENT_ORIGIN_HEADER)
+    })
+}
+
 /// The header a PREFLIGHT states the method it is asking about in (Fetch,
 /// "CORS-preflight request").
 const REQUEST_METHOD_HEADER: &str = "access-control-request-method";
@@ -114,7 +135,7 @@ pub(super) fn preflight_of(req: &RtRequest) -> Option<Preflight<'_>> {
     }
     let header = |name| req.headers().get(name).map(str::trim).filter(|value| !value.is_empty());
     Some(Preflight {
-        origin: header(ORIGIN_HEADER)?,
+        origin: stated_origin(req)?,
         method: header(REQUEST_METHOD_HEADER)?,
     })
 }
@@ -155,12 +176,7 @@ pub(super) fn answered_preflight(cors: &Cors, asked: &Preflight<'_>) -> RtRespon
 /// two answer the question a PREFLIGHT asks, while "the HTTP headers in your function
 /// response that you want to expose" is about the response this one decorates.
 pub(super) fn decoration(cors: &Cors, req: &RtRequest) -> Vec<(&'static str, String)> {
-    let Some(origin) = req
-        .headers()
-        .get(ORIGIN_HEADER)
-        .map(str::trim)
-        .filter(|origin| !origin.is_empty())
-    else {
+    let Some(origin) = stated_origin(req) else {
         return Vec::new();
     };
     let Some(admitted) = admitted(cors.allow_origins.as_deref(), origin) else {

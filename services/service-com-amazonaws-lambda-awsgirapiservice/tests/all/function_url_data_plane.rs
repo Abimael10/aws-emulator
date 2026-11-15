@@ -298,13 +298,28 @@ pub(crate) async fn given_configured_url(
         .and_then(|rest| rest.split('/').next())
         .expect("the minted URL carries a host")
         .to_string();
-    let url_id = host
-        .split('.')
-        .next()
-        .expect("the host carries the url id")
-        .to_string();
+    // The url id as the ANNOUNCED address carries it: in the path of the address a function
+    // URL is published at (`/_aws/lambda-url/<url-id>/`), and in the first label of the host
+    // for the documented form. One reading of the announced value, so a row addressing the
+    // endpoint by its id uses the id that address names.
+    let url_id = url
+        .split('/')
+        .skip_while(|segment| *segment != PLANE_LABEL)
+        .nth(1)
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            host.split('.')
+                .next()
+                .expect("the host carries the url id")
+                .to_string()
+        });
     Endpoint { host, url_id }
 }
+
+/// The path segment that names this plane inside an announced local address, as
+/// `crate::state::function_url` spells it.
+const PLANE_LABEL: &str = "lambda-url";
 
 /// The endpoint one function URL publishes.
 pub(crate) struct Endpoint {
@@ -758,7 +773,10 @@ async fn the_endpoint_is_reached_by_every_addressing_a_client_can_write() {
     let endpoint = given_url(&router, "url-addressing", None, "NONE").await;
 
     let local = format!("/_aws/lambda-url/{}/echo", endpoint.url_id);
-    let local_host = format!("/_aws/{}/echo", endpoint.host);
+    // The ENDPOINT-HOST spelling behind the marker, which carries the host
+    // `FunctionUrlConfig$FunctionUrl` documents for this url id — a name a client on this
+    // machine resolves nowhere, which is why it travels in the path.
+    let local_host = format!("/_aws/{}.lambda-url.us-east-1.on.aws/echo", endpoint.url_id);
     let path_style = format!("/{}/echo", endpoint.url_id);
     // (case, the host the request is sent to, the path it carries)
     let rows: &[(&str, &str, &str)] = &[

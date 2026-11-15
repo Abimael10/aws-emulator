@@ -33,7 +33,14 @@
 //!   served through the distribution while the same URL called directly with no credential is
 //!   refused by Lambda — the boundary that control exists for. That leg is driven on a router
 //!   that VERIFIES request signatures, which is how the emulator is started, so the signature
-//!   the edge computes is one the emulator's own verifier accepts.
+//!   the edge computes is one the emulator's own verifier accepts;
+//! * the origin is named by the function URL's own ADDRESS and nothing else: an
+//!   `Origin$DomainName` carries a host, and the viewer's path is appended to it, so a
+//!   distribution whose origin is the AUTHORITY of a published function URL reaches that
+//!   function — and the distribution's `Restrictions.GeoRestriction` then decides which
+//!   viewers are served from it at all, a viewer a `blacklist` names (or one a `whitelist`
+//!   leaves out) being refused by CloudFront itself with `403`,
+//!   `X-Cache: Error from cloudfront` and none of the origin's bytes.
 //!
 //! The rows differ along what each rule generalises over: every method a client can send (the
 //! two the behaviour lists, and five it does not), the scheme the viewer dialled, the
@@ -1112,6 +1119,89 @@ async fn direct_call(router: &MultiServiceRouter, host: &str, path: &str) -> (u1
     )
 }
 
+/// RULE, over the topology the issue was filed on: an `OriginAccessControl` of origin type
+/// `lambda` signs the edge's own fetch of a function URL origin that is named by the
+/// function URL's own ADDRESS — the authority a consumer of the published endpoint carries —
+/// so a viewer of the distribution is served the function's answer. Driven on an emulator
+/// SERVED at an endpoint, as a started one is, and one that VERIFIES every signature.
+#[tokio::test]
+async fn an_oac_signs_a_function_url_origin_named_by_its_published_authority() {
+    let topology = Topology::verifying();
+    // The emulator as a started one is: served at an endpoint, so every address it publishes
+    // is one a client of that process reads.
+    ::emulator_server::EmulatorService::serving_at(&topology.router, "https://127.0.0.1:9297");
+    let case = "an OAC-signed function URL origin on a served emulator";
+    let function = "cf-edge-oac-served";
+    let announced = topology
+        .function_url_host(
+            case,
+            function,
+            aws_sdk_lambda::types::FunctionUrlAuthType::AwsIam,
+        )
+        .await;
+    // What an `Origin$DomainName` carries: the authority of the published endpoint, with the
+    // viewer's own path appended to it by the edge.
+    let origin = announced.split('/').next().unwrap_or_default().to_string();
+    let control = topology
+        .origin_access_control(case, "edge-lambda-url-oac-served")
+        .await;
+    let (id, arn, domain) = topology
+        .created_distribution(
+            case,
+            &config_xml(
+                "edge-lambda-url-oac-served",
+                &origin,
+                &format!("<OriginAccessControlId>{control}</OriginAccessControlId>"),
+                "",
+                ALL_VIEWER_EXCEPT_HOST,
+            ),
+        )
+        .await;
+    // The grant that makes the signed fetch one Lambda admits FOR this distribution: the
+    // CloudFront service principal, scoped to the distribution that signs.
+    for action in ["lambda:InvokeFunctionUrl", "lambda:InvokeFunction"] {
+        topology
+            .lambda()
+            .add_permission()
+            .function_name(function)
+            .statement_id(action.replace(':', "-"))
+            .action(action)
+            .principal("cloudfront.amazonaws.com")
+            .source_arn(&arn)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("setup {case}: granting {action}: {error}"));
+    }
+    topology.awaited_deployment(case, &id).await;
+
+    // The viewer's own query travels to the origin, which is what says the request the
+    // function served is this one.
+    let through_the_edge = Answered::of(case, &domain, "GET", &format!("{OPEN_PATH}?nonce=abc")).await;
+    assert_eq!(
+        through_the_edge.status, 200,
+        "case {case:?}: expected the origin named by its published authority ({origin:?}, \
+         announced {announced:?}) to be served through the edge, got {} with {:?}",
+        through_the_edge.status, through_the_edge.raw
+    );
+    assert!(
+        through_the_edge.carries_the_origins_bytes(),
+        "case {case:?}: expected the origin's own bytes, got {:?}",
+        through_the_edge.body
+    );
+    let report = through_the_edge.report(case);
+    assert_eq!(
+        report["path"].as_str(),
+        Some(OPEN_PATH),
+        "case {case:?}: expected the origin to be told the viewer's own path, got {report}"
+    );
+    let names = header_names(&report);
+    assert!(
+        names.iter().any(|name| name == EDGE_REQUEST_ID_HEADER),
+        "case {case:?}: expected the origin to see {EDGE_REQUEST_ID_HEADER:?} on a request \
+         that arrived through the edge, got {names:?}"
+    );
+}
+
 /// An `OriginAccessControl` of origin type `lambda` over a function URL whose `AuthType` is
 /// `AWS_IAM`: "all origin requests" are signed, so the edge's own fetch is a credentialled
 /// caller Lambda admits and the viewer is served the function's answer — while the SAME
@@ -1212,4 +1302,263 @@ async fn an_origin_access_control_signs_a_function_url_origin_the_direct_caller_
         "case {case:?}: expected the origin's own bytes again, got {:?}",
         again.body
     );
+}
+
+// ---------------------------------------------------------------------------
+// The geographic restriction over an origin addressed by the function URL's AUTHORITY
+// ---------------------------------------------------------------------------
+
+/// The header a viewer states its country in, as CloudFront spells it: every viewer of this
+/// emulator dials a loopback address, which is in no country the databases `GeoRestriction`
+/// names, so the country this request is in is stated on the request itself.
+const VIEWER_COUNTRY_HEADER: &str = "cloudfront-viewer-country";
+
+/// One geo row: the `Restrictions` the distribution carries, the country the viewer states
+/// (`None` for a viewer that states none), and whether CloudFront refuses it.
+struct GeoRow {
+    case: &'static str,
+    restriction_type: &'static str,
+    locations: &'static [&'static str],
+    stated_country: Option<&'static str>,
+    refused: bool,
+}
+
+/// A `Restrictions` element of `restriction_type` over `locations`; `Quantity` is the number
+/// of locations it carries, which is what the control plane checks it against.
+fn restrictions(restriction_type: &str, locations: &[&str]) -> String {
+    let items: String = locations
+        .iter()
+        .map(|location| format!("<Location>{location}</Location>"))
+        .collect();
+    let items = if locations.is_empty() {
+        String::new()
+    } else {
+        format!("<Items>{items}</Items>")
+    };
+    format!(
+        "<Restrictions><GeoRestriction>\
+         <RestrictionType>{restriction_type}</RestrictionType>\
+         <Quantity>{}</Quantity>{items}\
+         </GeoRestriction></Restrictions>",
+        locations.len()
+    )
+}
+
+/// One VIEWER request to `domain`, carrying no credential and stating `country` the way
+/// CloudFront states it — a client of a distribution, addressing the domain the distribution
+/// published.
+async fn viewer(
+    router: &MultiServiceRouter,
+    domain: &str,
+    path: &str,
+    country: Option<&str>,
+) -> (u16, String, String) {
+    let mut builder = ::http::Request::builder()
+        .method("GET")
+        .uri(format!("https://{domain}{path}"))
+        .header("host", domain);
+    if let Some(country) = country {
+        builder = builder.header(VIEWER_COUNTRY_HEADER, country);
+    }
+    let request = builder
+        .body(::bytes::Bytes::new())
+        .expect("the viewer request is well formed");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let x_cache = response
+        .headers()
+        .get("x-cache")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = String::from_utf8_lossy(&response.into_body()).to_string();
+    (status, x_cache, body)
+}
+
+/// One `DistributionConfig` over the function URL `origin` carrying `restrictions`: the
+/// shape the geo rows drive, with the AWS-managed `CachingDisabled` cache policy, so every
+/// row's viewer request is an origin fetch rather than another row's cached answer.
+fn geo_config_xml(
+    caller_reference: &str,
+    origin: &str,
+    restrictions: &str,
+    origin_request_policy: &str,
+) -> String {
+    format!(
+        "<DistributionConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
+         <CallerReference>{caller_reference}</CallerReference>\
+         <Origins><Quantity>1</Quantity><Items><Origin>\
+         <Id>function-url</Id><DomainName>{origin}</DomainName>\
+         <CustomOriginConfig><HTTPPort>80</HTTPPort><HTTPSPort>443</HTTPSPort>\
+         <OriginProtocolPolicy>https-only</OriginProtocolPolicy>\
+         <OriginSslProtocols><Quantity>1</Quantity>\
+         <Items><SslProtocol>TLSv1.2</SslProtocol></Items></OriginSslProtocols>\
+         </CustomOriginConfig>\
+         </Origin></Items></Origins>\
+         <DefaultCacheBehavior><TargetOriginId>function-url</TargetOriginId>\
+         <ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy>\
+         <AllowedMethods><Quantity>2</Quantity>\
+         <Items><Method>GET</Method><Method>HEAD</Method></Items></AllowedMethods>\
+         <CachePolicyId>{CACHING_DISABLED}</CachePolicyId>\
+         <OriginRequestPolicyId>{origin_request_policy}</OriginRequestPolicyId>\
+         </DefaultCacheBehavior>\
+         <Comment>a geo-restricted function url behind a distribution</Comment>\
+         {restrictions}\
+         <Enabled>true</Enabled>\
+         </DistributionConfig>"
+    )
+}
+
+/// RULE: a function URL is published at an address that IDENTIFIES it, so a consumer handed
+/// that endpoint reaches the function by its AUTHORITY alone while supplying a path of its
+/// own — which is what an `Origin$DomainName` carries — and the distribution's
+/// `Restrictions.GeoRestriction` then decides, at the edge, which viewers are served from
+/// that origin at all.
+///
+/// Driven on an emulator SERVED at an endpoint, as a started one is, so the function URL is
+/// announced the way a client of a running emulator reads it; the origin is that announced
+/// URL's AUTHORITY and nothing else.
+///
+/// The rows differ along what the rule generalises over: the restriction type (`none`,
+/// `blacklist`, `whitelist`), how many locations it names, whether the viewer's country is
+/// one of them, the case the viewer states it in — a `Location` is a code rather than a
+/// spelling — and a viewer that states none at all.
+#[tokio::test]
+async fn the_geo_restriction_decides_a_function_url_origin_reached_by_its_authority() {
+    let topology = Topology::new();
+    // The emulator as a started one is: served at an endpoint, so every address it publishes
+    // is one a client of that process reads.
+    ::emulator_server::EmulatorService::serving_at(&topology.router, "https://127.0.0.1:9297");
+    let case = "a function URL origin addressed by its own authority";
+    let function = "cf-edge-geo-restriction";
+    let announced = topology.public_function_url_host(case, function).await;
+    // What a consumer of the published endpoint carries: its AUTHORITY. An
+    // `Origin$DomainName` is a host — it carries no path — and the viewer's own path is
+    // appended to it, so this is the whole of the endpoint the origin names.
+    let origin = announced
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        origin
+            .rsplit_once(':')
+            .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok()),
+        "setup {case:?}: expected the function URL to be published at a host:port an origin \
+         can name, got {announced:?}"
+    );
+
+    let rows: &[GeoRow] = &[
+        GeoRow {
+            case: "no restriction at all, which restricts nobody",
+            restriction_type: "none",
+            locations: &[],
+            stated_country: Some("US"),
+            refused: false,
+        },
+        GeoRow {
+            case: "a blocklisted country",
+            restriction_type: "blacklist",
+            locations: &["US"],
+            stated_country: Some("US"),
+            refused: true,
+        },
+        GeoRow {
+            case: "a blocklisted country stated in lower case",
+            restriction_type: "blacklist",
+            locations: &["US"],
+            stated_country: Some("us"),
+            refused: true,
+        },
+        GeoRow {
+            case: "the last of several blocklisted countries",
+            restriction_type: "blacklist",
+            locations: &["RU", "CN", "DE"],
+            stated_country: Some("DE"),
+            refused: true,
+        },
+        GeoRow {
+            case: "a country outside the blocklist",
+            restriction_type: "blacklist",
+            locations: &["RU", "CN"],
+            stated_country: Some("DE"),
+            refused: false,
+        },
+        GeoRow {
+            case: "the same country moved to the allowlist",
+            restriction_type: "whitelist",
+            locations: &["US"],
+            stated_country: Some("US"),
+            refused: false,
+        },
+        GeoRow {
+            case: "a country outside the allowlist",
+            restriction_type: "whitelist",
+            locations: &["US"],
+            stated_country: Some("RU"),
+            refused: true,
+        },
+        GeoRow {
+            case: "a viewer that states no country, under an allowlist naming another",
+            restriction_type: "whitelist",
+            locations: &["RU"],
+            stated_country: None,
+            refused: true,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let (id, _arn, domain) = topology
+            .created_distribution(
+                case,
+                &geo_config_xml(
+                    &format!("edge-lambda-url-geo-{index}"),
+                    &origin,
+                    &restrictions(row.restriction_type, row.locations),
+                    ALL_VIEWER_AND_CLOUDFRONT,
+                ),
+            )
+            .await;
+        topology.awaited_deployment(case, &id).await;
+        let (status, x_cache, body) =
+            viewer(&topology.router, &domain, OPEN_PATH, row.stated_country).await;
+        if row.refused {
+            assert_eq!(
+                (status, x_cache.as_str()),
+                (403, ERROR),
+                "case {case:?}: expected CloudFront's own 403 with X-Cache {ERROR:?}, got \
+                 {status} with {x_cache:?} and {body:?}"
+            );
+            assert!(
+                !body.contains(ORIGIN_MARKER),
+                "case {case:?}: a refused viewer must be served none of the origin's bytes, \
+                 got {body:?}"
+            );
+            continue;
+        }
+        assert_eq!(
+            (status, x_cache.as_str()),
+            (200, MISS),
+            "case {case:?}: expected the origin's answer through the edge with X-Cache \
+             {MISS:?}, got {status} with {x_cache:?} and {body:?}"
+        );
+        assert!(
+            body.contains(ORIGIN_MARKER),
+            "case {case:?}: expected the function's own bytes through the edge, got {body:?}"
+        );
+        let report: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let country = report["country"].as_str().unwrap_or_default();
+        assert_eq!(
+            country.len(),
+            2,
+            "case {case:?}: expected the origin to be told a two-letter country code, got \
+             {country:?} in {body:?}"
+        );
+        assert_eq!(
+            country,
+            country.to_ascii_uppercase(),
+            "case {case:?}: expected an uppercase country code at the origin, got {country:?}"
+        );
+    }
 }

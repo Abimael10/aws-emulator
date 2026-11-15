@@ -247,6 +247,13 @@ rand = "0.9"
 # Read with `deflate` alone — no other compression method is linked in — and never
 # extracted to a host path.
 zip = { version = "9", default-features = false, features = ["deflate"] }
+# Speaks HTTP/1.1 on the raw connection the core hands a FUNCTION URL's own listener, which
+# is what makes the published `FunctionUrl` an address a client dials by its host alone
+# (`src/state/function_url_endpoint.rs`). `hyper-util` carries the tokio IO and timer
+# adapters for it, `http-body-util` the bounded body reader and the one-shot body.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 # `InvokeWithResponseStream`'s `PayloadChunk` carries its blob as the FRAME's own payload
 # (`@eventPayload`), which the framework's event serializer does not express: that one
 # frame is written with the event-stream encoder itself.

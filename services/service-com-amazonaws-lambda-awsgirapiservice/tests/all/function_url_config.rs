@@ -221,9 +221,10 @@ async fn create_function(router: &MultiServiceRouter, name: &str) {
     create_function_publishing(router, name, false).await;
 }
 
-/// Assert the endpoint is a function URL of the documented form:
-/// `https://<url-id>.lambda-url.<region>.on.aws/`, with an opaque lowercase
-/// alphanumeric id, inside the modelled length bounds. Answers the id.
+/// Assert the endpoint is the ADDRESS this emulator published for the function URL —
+/// `https://<host:port>/_aws/lambda-url/<url-id>/`, the one a consumer handed the endpoint
+/// reaches it at — with an opaque lowercase alphanumeric id and inside the modelled length
+/// bounds. Answers the id.
 fn url_id_of(case: &str, url: &str) -> String {
     assert!(
         url.len() >= FUNCTION_URL_MIN_LEN && url.len() <= FUNCTION_URL_MAX_LEN,
@@ -231,13 +232,22 @@ fn url_id_of(case: &str, url: &str) -> String {
          {FUNCTION_URL_MAX_LEN} length, got {} in {url:?}",
         url.len()
     );
-    let suffix = format!(".lambda-url.{REGION}.on.aws/");
-    let id = url
+    let (authority, id) = url
         .strip_prefix("https://")
-        .and_then(|rest| rest.strip_suffix(&suffix))
+        .and_then(|rest| rest.split_once("/_aws/lambda-url/"))
+        .map(|(authority, id)| (authority, id.trim_end_matches('/')))
         .unwrap_or_else(|| {
-            panic!("case {case:?}: expected https://<url-id>{suffix}, got {url:?}")
+            panic!(
+                "case {case:?}: expected the published address \
+                 https://<host:port>/_aws/lambda-url/<url-id>/, got {url:?}"
+            )
         });
+    assert!(
+        authority
+            .rsplit_once(':')
+            .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok()),
+        "case {case:?}: expected the `host:port` a client dials this URL at, got {url:?}"
+    );
     assert!(
         !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
         "case {case:?}: the url id must be a non-empty lowercase alphanumeric label, got {id:?}"

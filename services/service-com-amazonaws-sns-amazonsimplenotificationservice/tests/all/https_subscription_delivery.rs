@@ -675,11 +675,19 @@ async fn an_endpoint_behind_the_emulators_own_authority_is_posted_to() {
     )
     .await;
     let sink = given_function_url(&emulator, function).await;
-    // The same receiver, addressed the other way: the url id the announced host names,
-    // behind the reserved data-plane path of a loopback authority.
+    // The same receiver, addressed the other way: the url id the ANNOUNCED address names —
+    // in the path of the address a function URL is published at
+    // (`https://<host:port>/_aws/lambda-url/<url-id>/`), and in the first host label of the
+    // documented form — behind the reserved data-plane path of a loopback authority.
     let url_id = sink
-        .strip_prefix("https://")
-        .and_then(|rest| rest.split('.').next())
+        .split('/')
+        .skip_while(|segment| *segment != "lambda-url")
+        .nth(1)
+        .filter(|segment| !segment.is_empty())
+        .or_else(|| {
+            sink.strip_prefix("https://")
+                .and_then(|rest| rest.split('.').next())
+        })
         .unwrap_or_else(|| panic!("the announced function URL must name a url id, got {sink:?}"));
     let path = format!("/_aws/lambda-url/{url_id}/take/local");
     let endpoint = format!("https://127.0.0.1:9297{path}");

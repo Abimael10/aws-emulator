@@ -405,9 +405,13 @@ async fn an_http_proxy_method_answers_with_the_function_urls_own_response() {
     given_function(&router, UNGRANTED_FUNCTION).await;
     let endpoint = given_function_url(&router, FUNCTION, true).await;
     let ungranted = given_function_url(&router, UNGRANTED_FUNCTION, false).await;
+    // The ADDRESS the function URL is published at: `https://<host:port>/_aws/lambda-url/
+    // <url-id>/`, the one a consumer of the endpoint reaches it by — which is what an
+    // integration URI carries.
     assert!(
-        endpoint.contains(".lambda-url."),
-        "setup CreateFunctionUrlConfig: expected a function URL endpoint, got {endpoint:?}"
+        endpoint.starts_with("https://") && endpoint.contains("/_aws/lambda-url/"),
+        "setup CreateFunctionUrlConfig: expected a published function URL endpoint, got \
+         {endpoint:?}"
     );
 
     let created = apigw(

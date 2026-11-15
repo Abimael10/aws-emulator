@@ -267,6 +267,8 @@ mod function_url_deletion;
 mod function_url_error_class;
 #[path = "all/function_url_listing.rs"]
 mod function_url_listing;
+#[path = "all/function_url_published_address.rs"]
+mod function_url_published_address;
 #[path = "all/function_url_reported_members.rs"]
 mod function_url_reported_members;
 #[path = "all/function_url_response_stream.rs"]
