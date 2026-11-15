@@ -349,6 +349,8 @@ mod handler_sdk_idempotency_token;
 mod handler_sdk_paginator;
 #[path = "all/handler_sdk_service_inventory.rs"]
 mod handler_sdk_service_inventory;
+#[path = "all/handler_search_domain_identity_actions.rs"]
+mod handler_search_domain_identity_actions;
 #[path = "all/handler_secret_relayed_to_queue.rs"]
 mod handler_secret_relayed_to_queue;
 #[path = "all/handler_secret_sdk.rs"]
