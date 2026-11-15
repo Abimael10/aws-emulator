@@ -341,6 +341,9 @@ pub enum RouteTarget {
     LocalGateway(String),
     /// "The ID of a VPC peering connection" (`Route$VpcPeeringConnectionId`).
     VpcPeeringConnection(String),
+    /// "[IPv6 traffic only] The ID of an egress-only internet gateway"
+    /// (`Route$EgressOnlyInternetGatewayId`).
+    EgressOnlyInternetGateway(String),
 }
 
 /// What ONE route is stored with: where it matches and what it points at.
@@ -454,6 +457,9 @@ impl RouteSpec {
             }
             RouteTarget::VpcPeeringConnection(connection_id) => {
                 route.vpc_peering_connection_id = Some(connection_id)
+            }
+            RouteTarget::EgressOnlyInternetGateway(gateway_id) => {
+                route.egress_only_internet_gateway_id = Some(gateway_id)
             }
         }
         route

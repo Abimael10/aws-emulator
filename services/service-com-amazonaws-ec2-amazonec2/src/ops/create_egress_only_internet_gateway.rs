@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEgressOnlyInternetGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEgressOnlyInternetGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEgressOnlyInternetGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one egress-only internet gateway for the VPC the request names and stores it in
+//! [`crate::state`], where `DescribeEgressOnlyInternetGateways` reports it from and
+//! `DeleteEgressOnlyInternetGateway` removes it. "Creates an egress-only internet gateway for
+//! your VPC" — the create is also the ATTACHMENT, this kind of gateway having no `Attach…`
+//! call of its own, so the gateway is answered attached to that VPC rather than to nothing,
+//! and it carries the tags the request's `TagSpecifications` assign to it.
+//!
+//! A `VpcId` the account holds no VPC for is refused `InvalidVpcId.Malformed`, the refusal
+//! recorded for this operation whatever the value's shape, and a `ClientToken` makes the
+//! create idempotent: the same token replayed reports the gateway it already minted, and
+//! replayed with any other parameter is refused with `IdempotentParameterMismatch`.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +147,174 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEgressOnlyInternetGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEgressOnlyInternetGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The Region this request was signed for: the ambient default network of a Region is
+        // part of what the account holds there, so a request may create a gateway for the
+        // default VPC.
+        let region = crate::state::request_region(ctx.parts());
+        use crate::state;
+
+        // "The tags to assign to the egress-only internet gateway"
+        // (`CreateEgressOnlyInternetGatewayRequest$TagSpecifications`) — the shared reader
+        // refuses a specification naming any other resource type and holds the payload to the
+        // documented bounds.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::EGRESS_ONLY_INTERNET_GATEWAY_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of the
+        // request" (`$ClientToken`). The model puts no `@length` on it and the store keeps it
+        // for the process's lifetime, so the bound this crate holds every client token to is
+        // enforced here.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        // The caller-chosen bytes this create would retain, counted by the ONE definition of
+        // that charge, so the gate below asks exactly what the insert will take.
+        let payload_bytes = state::egress_only_internet_gateway_payload_bytes(&tags);
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The ambient default network of the Region, on the terms `AttachInternetGateway`
+        // seeds it: it was already there at this instant whether or not anybody called.
+        store.ensure_default_network(&region);
+
+        // Idempotency: one token names the one gateway it minted, so a replay of the SAME
+        // request reports that gateway and creates nothing.
+        let replayed = match input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.egress_only_internet_gateway_minted_by_client_token(token))
+        {
+            None => None,
+            Some(gateway_id) => {
+                let gateway = store
+                    .egress_only_internet_gateways
+                    .get(&gateway_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        state::internal_error(format!(
+                            "a client token names egress-only internet gateway \
+                             '{gateway_id}', which is not stored"
+                        ))
+                    })?;
+                // A token is only idempotent for the REQUEST it was first given with:
+                // replayed with a different parameter it names a gateway the caller did not
+                // ask for, which EC2 refuses rather than answers.
+                if !same_request(&gateway, &input.vpc_id, &tags) {
+                    return Err(state::idempotent_parameter_mismatch());
+                }
+                Some(gateway)
+            }
+        };
+
+        // "Creates an egress-only internet gateway for your VPC": an id this account holds no
+        // VPC for is a refusal rather than a gateway for no VPC.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEgressOnlyInternetGateway"))
+        // ONE refusal for every value this operation cannot resolve, whatever the value's
+        // SHAPE ([`state::invalid_vpc_id_malformed`]): the recorded refusal of THIS operation
+        // carries `InvalidVpcId.Malformed`, so the `.NotFound` the surfaces that read a
+        // `VpcId` as one parameter among several answer ([`state::invalid_vpc_id_not_found`])
+        // is not this operation's answer — the same split `CreateCarrierGateway` and
+        // `GetSecurityGroupsForVpc` record for their own `VpcId`. WHICH refusal an
+        // unresolvable `VpcId` gets is a fact of the operation rather than of the value.
+        if !store.vpcs.contains_key(&input.vpc_id) {
+            return Err(state::invalid_vpc_id_malformed(&input.vpc_id));
+        }
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds the tag text the caller chose the length of.
+        // Both are the bounds `insert_egress_only_internet_gateway` itself enforces, asked
+        // HERE so the refusal names what is full. A replay stores nothing, so it is charged
+        // nothing and clears both gates.
+        if replayed.is_none() && !store.has_egress_only_internet_gateway_capacity() {
+            return Err(state::egress_only_internet_gateway_limit_exceeded(format!(
+                "This emulator holds {max} egress-only internet gateways, which is as many as \
+                 it stores",
+                max = state::MAX_STORED_RECORDS_PER_STORE,
+            )));
+        }
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::egress_only_internet_gateway_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you have
+        // the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The gateway that token already minted, exactly as it is stored now.
+        if let Some(gateway) = replayed {
+            return Ok(CreateEgressOnlyInternetGatewayOutput {
+                client_token: input.client_token,
+                egress_only_internet_gateway: Some(gateway),
+            });
+        }
+
+        let Some(gateway_id) = store.insert_egress_only_internet_gateway(&input.vpc_id, tags)
+        else {
+            // Unreachable: both bounds the insert enforces were asked above, and the store is
+            // locked throughout. Answered rather than unwrapped, so a store at a ceiling can
+            // only ever refuse.
+            return Err(state::egress_only_internet_gateway_limit_exceeded(
+                "This emulator has no room for another egress-only internet gateway",
+            ));
+        };
+        // The token is recorded with the gateway it minted, so a replay of this request
+        // reports that gateway instead of creating a second one.
+        if let Some(token) = input.client_token.clone() {
+            store.record_egress_only_internet_gateway_client_token(token, &gateway_id);
+        }
+
+        // The answer is the record as it was stored, so `CreateEgressOnlyInternetGateway` and
+        // `DescribeEgressOnlyInternetGateways` cannot drift apart.
+        let Some(gateway) = store.egress_only_internet_gateways.get(&gateway_id).cloned() else {
+            return Err(state::internal_error(
+                "the egress-only internet gateway just created could not be read back",
+            ));
+        };
+        Ok(CreateEgressOnlyInternetGatewayOutput {
+            // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+            // the request" (`CreateEgressOnlyInternetGatewayResult$ClientToken`): the token the
+            // REQUEST carried, echoed, and nothing at all when it carried none.
+            client_token: input.client_token,
+            egress_only_internet_gateway: Some(gateway),
+        })
     }
+}
+
+/// Does `gateway` — the gateway a replayed `ClientToken` names — hold what THIS request asks
+/// for?
+///
+/// Every member the request decides is compared, so a token replayed with any different
+/// parameter is refused with `IdempotentParameterMismatch` rather than answered with a gateway
+/// the caller did not ask for; the same contract `create_route_table`'s `same_request` has for
+/// a route table. The members this service derives (the id and the attachment state) are not
+/// compared: they follow from the ones that are. Tags are a SET, so the order a request names
+/// them in is not a difference.
+fn same_request(gateway: &EgressOnlyInternetGateway, vpc_id: &str, tags: &[Tag]) -> bool {
+    let attached_vpc = gateway
+        .attachments
+        .iter()
+        .flatten()
+        .find_map(|attachment| attachment.vpc_id.as_deref());
+    attached_vpc == Some(vpc_id)
+        && crate::state::tag_pairs(gateway.tags.as_deref().unwrap_or_default())
+            == crate::state::tag_pairs(tags)
 }

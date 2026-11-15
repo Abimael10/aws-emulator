@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEgressOnlyInternetGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEgressOnlyInternetGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEgressOnlyInternetGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the egress-only internet gateway the request names from [`crate::state`], so the
+//! very next `DescribeEgressOnlyInternetGateways` no longer resolves its id. "Deletes an
+//! egress-only internet gateway": the gateway's attachment to its VPC goes with it, this kind
+//! of gateway having no detach of its own, so there is nothing for the caller to take away
+//! first.
+//!
+//! An id the account holds no such gateway for is refused with `InvalidGatewayID.NotFound`
+//! rather than answered as though something had been deleted.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +135,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEgressOnlyInternetGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEgressOnlyInternetGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEgressOnlyInternetGateway"))
+        use crate::state;
+
+        // An egress-only internet gateway carries no Region or ARN member, and the ambient
+        // default network of a Region holds no such gateway, so nothing this delete reads or
+        // writes is a fact of the Region the request was signed for. The store is reached
+        // through the engine held on `self`, the way the create reaches it.
+        let _ = ctx;
+
+        // No clock-owed transition is materialised here: a gateway of this kind has one
+        // state, written by its create and taken away by this delete, so nothing it reads
+        // moves with the clock.
+
+        let gateway_id = input.egress_only_internet_gateway_id.as_str();
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "The ID of the egress-only internet gateway" (`$EgressOnlyInternetGatewayId`): a
+        // delete that removed nothing must never answer as though it had.
+        // `EgressOnlyInternetGatewayId` publishes no pattern, so an id of ANY form that names
+        // no gateway of the account is the one refusal the describe answers for it too.
+        if !store.egress_only_internet_gateways.contains_key(gateway_id) {
+            return Err(state::invalid_egress_only_internet_gateway_id_not_found(
+                gateway_id,
+            ));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // Removing is also what RESOLVES the id a second time, so the record that left the
+        // store is the record the check above was made against — and the removal gives the
+        // bytes the gateway held back to the store's budget and drops the client tokens that
+        // named it.
+        if store
+            .remove_egress_only_internet_gateway(gateway_id)
+            .is_none()
+        {
+            // The gateway was resolved a moment ago and the store is locked throughout, so
+            // this cannot happen — and if it ever did, the request must not report a removal
+            // that removed nothing.
+            return Err(state::internal_error(
+                "the egress-only internet gateway checked a moment ago could not be removed",
+            ));
+        }
+
+        // "Returns true if the request succeeds; otherwise, it returns an error"
+        // (`DeleteEgressOnlyInternetGatewayResult$ReturnCode`).
+        Ok(DeleteEgressOnlyInternetGatewayOutput {
+            return_code: Some(true),
+        })
     }
 }

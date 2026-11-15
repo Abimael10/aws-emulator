@@ -1729,3 +1729,19 @@ mod lambda_sqs_event_source_attempt_reservation;
 // EVERY comment in this file is an ORDINARY `//` one, this header included, and that is
 // anywhere, no merge of two landings can put one past the first item. Nothing follows the
 // last declaration.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted in sorted position. This file
+//! holds its header and those pairs and NOTHING else, so two branches landing at once insert
+//! two lines in two places and have no prose to duplicate, re-word or mistype.
+//! Three rules bind it, and breaking any one of them fails EVERY suite in this target:
+//! * A suite no `mod` names compiles nowhere and its tests never run, and a suite left at the
+//!   top level of `tests/` fails the build.
+//! * Declare each suite exactly ONCE: this is one crate root, so a second `mod` for the same
+//!   name is `E0428`.
+//! * This header is the only place an inner doc comment (`//!`) may stand: the language
+//!   accepts one only before the first item, so past the first declaration it is `E0753`.
+//! check those rules — the first two for this file and for every service crate's
+//! `tests/all.rs` — so a rule they already pin needs no restating here, and what a suite
+//! covers belongs in that suite's own module doc.
+//! this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each
+//! `mod` is what points it into `tests/all/`. The notes earlier landings appended to this
+//! list live in `all/appended_notes.rs`.

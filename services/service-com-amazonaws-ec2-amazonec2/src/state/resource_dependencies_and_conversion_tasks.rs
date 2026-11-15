@@ -290,6 +290,19 @@ impl ComAmazonawsEc2Amazonec2State {
                 found.push(internet_gateway_id.clone());
             }
         }
+        // An EGRESS-ONLY internet gateway of the VPC is a gateway associated with it on the
+        // same terms, and the delete does not take it away either: it is removed by
+        // `DeleteEgressOnlyInternetGateway`, this kind of gateway having no detach of its own.
+        for (gateway_id, gateway) in &self.egress_only_internet_gateways {
+            if gateway
+                .attachments
+                .iter()
+                .flatten()
+                .any(|attachment| attachment.vpc_id.as_deref() == Some(vpc_id))
+            {
+                found.push(gateway_id.clone());
+            }
+        }
         for (group_id, group) in &self.security_groups {
             if group.vpc_id.as_deref() == Some(vpc_id)
                 && group.group_name.as_deref() != Some(DEFAULT_SECURITY_GROUP_NAME)

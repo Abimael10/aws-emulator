@@ -19,6 +19,9 @@
 // address carries no public DNS name. Declared beside `prefix_lists` for the reason the note
 // above gives: the sorted neighbourhood and the tail of this file are where every new ec2
 // suite inserts its lines.
+// An account's EGRESS-ONLY internet gateways: the create that mints one for a VPC and attaches
+// it, the report that selects and pages over them, the delete that takes one away, and what
+// each of the three refuses. Declared FIRST for the reason the note above gives: the sorted
 // `DescribeSnapshotAttribute`: the one attribute a read reports of a snapshot of each side of
 // the account-visible inventory — who may create a volume from it and the Marketplace codes it
 // is billed through — plus what it refuses. Declared beside `prefix_lists` for the reason the
@@ -31,8 +34,8 @@ mod snapshot_attributes;
 // and through `DescribeTags`, and an id that names nothing is refused in its kind's words.
 // Declared beside `prefix_lists` for the reason the note above gives: the sorted
 // neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
-#[path = "all/taggable_resource_kinds.rs"]
-mod taggable_resource_kinds;
+#[path = "all/egress_only_internet_gateways.rs"]
+mod egress_only_internet_gateways;
 #[path = "all/read_optional_members.rs"]
 mod read_optional_members;
 #[path = "all/prefix_lists.rs"]
@@ -824,10 +827,6 @@ mod capacity_manager_attributes;
 // concurrent ec2 landings insert their lines.
 #[path = "all/accept_capacity_reservation_billing_ownership.rs"]
 mod accept_capacity_reservation_billing_ownership;
-// What `AssociateCapacityReservationBillingOwner` writes: the pending billing assignment
-// request a Capacity Reservation owner initiates for a consumer account, and what it refuses.
-#[path = "all/associate_capacity_reservation_billing_owner.rs"]
-mod associate_capacity_reservation_billing_owner;
 #[path = "all/capacity_reservation_billing_requests.rs"]
 mod capacity_reservation_billing_requests;
 // Which Region `CreateCapacityReservationCancellationQuote` resolves the reservation it
@@ -2372,11 +2371,20 @@ mod id_screening_verdicts;
 // token form, and what it publishes nothing for. Declared at the tail of this file, which is
 #[path = "all/instance_guest_metadata_service.rs"]
 mod instance_guest_metadata_service;
+// Which resource ids a tagging call resolves, over the taggable resource kinds beside the
+// few the other tag suites drive: the write reads back through the resource's own describe
+// and through `DescribeTags`, and an id that names nothing is refused in its kind's words.
+#[path = "all/taggable_resource_kinds.rs"]
+mod taggable_resource_kinds;
 // The code and the sentence this service answers a request the MODEL's own rules refuse: a
 // parameter the request left out, a value outside a declared catalog, a page size outside a
 // declared range, and the enum value it reads without regard to case.
 #[path = "all/parameter_refusal_codes.rs"]
 mod parameter_refusal_codes;
+// What `AssociateCapacityReservationBillingOwner` writes: the pending billing assignment
+// request a Capacity Reservation owner initiates for a consumer account, and what it refuses.
+#[path = "all/associate_capacity_reservation_billing_owner.rs"]
+mod associate_capacity_reservation_billing_owner;
 // What `DeleteIpam` records: the stored IPAM written into the transient delete state of its own
 // catalog with the clock owing its removal, answered with every other member unchanged, read back
 // through `DescribeIpams` and then gone with the scopes it contained and the pools created in them

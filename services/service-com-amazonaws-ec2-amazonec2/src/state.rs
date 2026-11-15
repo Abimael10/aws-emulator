@@ -1896,7 +1896,7 @@ use crate::ops::types::{
     CreateVolumeOutput, DefaultConnectionTrackingConfiguration,
     DescribeFastLaunchImagesSuccessItem, DiskInfo, DisableFastLaunchOutput,
     VolumeModification,
-    EbsBlockDevice,
+    EbsBlockDevice, EgressOnlyInternetGateway,
     EbsInfo, EbsOptimizedInfo, EfaInfo, EnableFastLaunchOutput, GroupIdentifier, Host,
     HostReservation,
     INSTANCE_TYPE_VALUES, Image,
@@ -2025,6 +2025,15 @@ pub use network_acls::*;
 /// reaches them as `crate::state::<item>` like every other primitive of this module.
 pub mod internet_gateways;
 pub use internet_gateways::*;
+
+/// The EGRESS-ONLY internet gateway store's own primitives — the id prefix, the `ResourceType`
+/// a tag specification may name, the bounds, the byte charge, the one writer, the removal, the
+/// `ClientToken` map that makes the create idempotent and the error channel
+/// `CreateEgressOnlyInternetGateway`, `DescribeEgressOnlyInternetGateways` and
+/// `DeleteEgressOnlyInternetGateway` share. Re-exported, so a handler reaches them as
+/// `crate::state::<item>` like every other primitive of this module.
+pub mod egress_only_internet_gateways;
+pub use egress_only_internet_gateways::*;
 
 /// The Traffic Mirror filter store's own primitives — the id prefix, the bounds, the byte
 /// charge and the error channel the Traffic Mirror filter operations share, with the one
@@ -2262,6 +2271,7 @@ macro_rules! taggable_tag_list_stores {
             declarative_policies_reports.report as "declarative-policies-report",
             dedicated_hosts as "dedicated-host",
             dhcp_options as "dhcp-options",
+            egress_only_internet_gateways as "egress-only-internet-gateway",
             export_image_tasks.view as "export-image-task",
             export_tasks.view as "export-instance-task",
             fleets.fleet as "fleet",

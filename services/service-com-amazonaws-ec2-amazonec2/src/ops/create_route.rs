@@ -281,15 +281,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .join(", "),
             )));
         }
-        // Three targets this emulator holds no resource for at all, so a 501 ("nobody has
+        // Two targets this emulator holds no resource for at all, so a 501 ("nobody has
         // written this yet") is the honest answer rather than a refusal that blames the
-        // caller: there is no egress-only internet gateway store
-        // (`CreateEgressOnlyInternetGateway` is still a scaffold), and no Cloud WAN core
-        // network or ODB network resource in this emulator to route to.
-        if matches!(
-            target_member,
-            "egressOnlyInternetGatewayId" | "coreNetworkArn" | "odbNetworkArn"
-        ) {
+        // caller: there is no Cloud WAN core network or ODB network resource in this emulator
+        // to route to.
+        if matches!(target_member, "coreNetworkArn" | "odbNetworkArn") {
             return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                 "CreateRoute with a {target_member} target"
             )));
@@ -491,6 +487,24 @@ fn resolve_target(
                 return Err(state::invalid_vpc_peering_connection_id_not_found(value));
             }
             Ok(RouteTarget::VpcPeeringConnection(value.to_string()))
+        }
+        "egressOnlyInternetGatewayId" => {
+            // "[IPv6 traffic only] The ID of an egress-only internet gateway"
+            // (`CreateRouteRequest$EgressOnlyInternetGatewayId`): a gateway of this kind is
+            // attached to its VPC by its own create, so the rule a gateway target carries
+            // holds for it too — one attached to another VPC cannot carry this VPC's traffic.
+            let Some(attached_vpc) = store.egress_only_internet_gateway_attached_vpc(value) else {
+                return Err(state::invalid_egress_only_internet_gateway_id_not_found(
+                    value,
+                ));
+            };
+            if attached_vpc != vpc_id {
+                return Err(state::invalid_parameter_value(format!(
+                    "route table {route_table_id} and network gateway {value} \
+                     belong to different networks"
+                )));
+            }
+            Ok(RouteTarget::EgressOnlyInternetGateway(value.to_string()))
         }
         // Unreachable: the handler collected these member names itself and answered the
         // three it holds no store for before reaching here.

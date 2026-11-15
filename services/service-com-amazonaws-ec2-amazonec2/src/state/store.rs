@@ -2121,6 +2121,21 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`vpc_internet_path`] module for the attachment `AttachInternetGateway` records on
     /// one.
     pub internet_gateways: BTreeMap<String, InternetGateway>,
+    /// Every EGRESS-ONLY internet gateway the account holds, by `EgressOnlyInternetGatewayId`,
+    /// as the modelled [`crate::ops::types::EgressOnlyInternetGateway`] shape itself — so a
+    /// member a writer sets round-trips through `DescribeEgressOnlyInternetGateways` without a
+    /// field-by-field copy that can silently drop one, the way [`Self::internet_gateways`]
+    /// holds an internet gateway. Ordered by id, the one stable order the describe reports and
+    /// pages over, so a pagination token can name the id the next page starts at.
+    ///
+    /// A fresh account holds NONE here: `CreateEgressOnlyInternetGateway` is what creates one,
+    /// and that create is also what attaches it to its VPC — this kind of gateway has no
+    /// `Attach…` call of its own. See the [`egress_only_internet_gateways`] module for the
+    /// store's own primitives.
+    pub egress_only_internet_gateways: BTreeMap<String, EgressOnlyInternetGateway>,
+    /// A `CreateEgressOnlyInternetGateway` `ClientToken` and the gateway id it minted, so a
+    /// repeat of the same request answers with that gateway instead of creating a second one.
+    pub egress_only_internet_gateway_client_tokens: HashMap<String, String>,
     /// Every route table the account holds, by `RouteTableId`, as the modelled
     /// [`crate::ops::types::RouteTable`] shape itself — the routes it holds and the
     /// associations it has included, since both live on that shape, so
@@ -3672,6 +3687,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // one, so a fresh account holds none; a fresh account's route tables are exactly
             // the main table of every VPC `insert_vpc` stored.
             internet_gateways: BTreeMap::new(),
+            // Nor an egress-only internet gateway: its create is the only thing that makes
+            // one, and no token names a gateway that create has not minted yet.
+            egress_only_internet_gateways: BTreeMap::new(),
+            egress_only_internet_gateway_client_tokens: HashMap::new(),
             route_tables: BTreeMap::new(),
             network_interfaces: BTreeMap::new(),
             network_interfaces_by_instance: BTreeMap::new(),
