@@ -111,6 +111,8 @@ mod memory_read_reflects_last_mutation;
 mod memory_update_and_read_projection;
 #[path = "all/oauth2_credential_provider_configuration.rs"]
 mod oauth2_credential_provider_configuration;
+#[path = "all/oauth2_credential_provider_creation.rs"]
+mod oauth2_credential_provider_creation;
 #[path = "all/oauth2_credential_provider_mutation.rs"]
 mod oauth2_credential_provider_mutation;
 #[path = "all/payment_manager_lifecycle.rs"]

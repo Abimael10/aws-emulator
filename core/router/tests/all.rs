@@ -1807,3 +1807,18 @@ mod declaration_roots_are_canonical_and_complete;
 //! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod <name>;` would resolve to a
 //! SIBLING of this file (`tests/<name>.rs`), which the layout check refuses: every
 //! declaration carries its own `#[path = "all/<name>.rs"]`.
+// EVERY comment in this file is an ORDINARY one, this header included, and that is
+// comment anywhere in the file, no merge of two landings can put one past the first item.
+// The list below is DECLARATIONS ONLY: one `#[path = "all/<name>.rs"]` / `mod <name>;` pair
+// per suite, sorted by name, and no other line — so two branches landing at once insert two
+// lines in two places and have no prose to duplicate, re-word or mistype.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING
+// (`tests/<name>.rs`), which the layout check refuses; the `#[path]` is what points each
+// declaration into `tests/all/`. Declare each suite exactly ONCE: a second `mod` for one
+// name is `E0428` and fails every suite in this target, and a suite no `mod` names is
+// compiled nowhere (this crate's `build.rs` refuses it).
+// WHAT a suite covers, and WHY it belongs to this cross-service target rather than to one
+// service crate's own, is stated in that suite's own module doc, where it is read beside the
+// test it explains. A note about this file itself belongs in `all/appended_notes.rs`.
+// Four suites check the rules above rather than restating them:
+// `all/every_suite_file_is_declared.rs`.
