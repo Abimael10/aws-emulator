@@ -43,6 +43,9 @@ mod object_naming;
 #[path = "all/request_layer_envelopes.rs"]
 mod request_layer_envelopes;
 
+#[path = "all/search_attribute_validation.rs"]
+mod search_attribute_validation;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

@@ -209,7 +209,7 @@ async fn a_search_matches_only_the_attributes_the_request_named() {
         (
             "the same member, under the attribute a directory holds it in",
             "engineers",
-            &["cn"],
+            &["samaccountname"],
             &["engineers"],
         ),
         (
@@ -221,7 +221,7 @@ async fn a_search_matches_only_the_attributes_the_request_named() {
         (
             "a value in another case",
             "ENGINEERS",
-            &["cn"],
+            &["sAMAccountName"],
             &["engineers"],
         ),
         (
@@ -233,7 +233,7 @@ async fn a_search_matches_only_the_attributes_the_request_named() {
         (
             "a built-in group of the BUILTIN authority, by name",
             "Backup Operators",
-            &["cn"],
+            &["sAMAccountName"],
             &["Backup Operators"],
         ),
         (
@@ -299,7 +299,7 @@ async fn a_search_matches_only_the_attributes_the_request_named() {
         (
             "an account name is matched whole, not as a prefix of a longer one",
             "eng",
-            &["cn"],
+            &["sAMAccountName"],
             &["eng"],
         ),
         (
@@ -498,7 +498,7 @@ async fn a_matched_group_carries_the_listing_record_widened_by_what_it_named() {
         (
             "a member the listing already reports",
             "engineers",
-            &["cn"],
+            &["sAMAccountName"],
             &[],
         ),
         (
@@ -522,7 +522,7 @@ async fn a_matched_group_carries_the_listing_record_widened_by_what_it_named() {
         (
             "an attribute the group does not hold",
             "engineers",
-            &["cn", "Department"],
+            &["sAMAccountName", "Department"],
             &[],
         ),
     ];

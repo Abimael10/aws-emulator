@@ -37,6 +37,9 @@ use std::time::{Duration, SystemTime};
 
 mod attribute_schema;
 mod builtin_groups;
+mod search_attributes;
+
+pub use search_attributes::{unsearchable_attribute, INVALID_ATTRIBUTE_FOR_SEARCH};
 
 use sha2::Digest;
 
@@ -167,10 +170,15 @@ pub fn fold(name: &str) -> String {
 // `DistinguishedName`, `UserPrincipalName`, `EmailAddress`, `GivenName`, `Surname`,
 // `Enabled`). One table, used both to match a search and to project its answer.
 
-/// `sAMAccountName`, and `cn`: the directory creates the object as
-/// `CN=<SAMAccountName>` (see [`Directory::distinguished_name`]), so its common name
-/// is that same name.
-const SAM_ACCOUNT_NAME_ATTRIBUTES: &[&str] = &["samaccountname", "cn"];
+/// `sAMAccountName`: the account name itself, which is also the name the model gives the
+/// member carrying it.
+///
+/// The object's common name (`cn`) holds that same value — the directory creates the object
+/// as `CN=<SAMAccountName>` (see [`Directory::distinguished_name`]) — but it is NOT one of
+/// the names a value is matched under here: the service's attribute list does not index it
+/// for search, so a search naming it is refused rather than matched
+/// ([`search_attributes`]).
+const SAM_ACCOUNT_NAME_ATTRIBUTES: &[&str] = &["samaccountname"];
 
 /// `objectSid` is the attribute an object's SID lives in.
 const SID_ATTRIBUTES: &[&str] = &["objectsid", "sid"];

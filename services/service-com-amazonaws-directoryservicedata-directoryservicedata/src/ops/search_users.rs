@@ -10,6 +10,11 @@
 //! when more users match. A token resumes the walk just after the last user the previous
 //! page reported, for that same search.
 //!
+//! A search the directory cannot run it refuses instead of answering: an attribute the
+//! service's attribute list does not index for search is `ValidationException` (HTTP 400)
+//! with the modelled `Reason` for an attribute unfit to search by
+//! (`crate::state::unsearchable_attribute`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -187,6 +192,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let page_size = crate::state::page_size(input.max_results);
+
+        // A directory matches a search against an attribute it INDEXES for search; one it
+        // does not index is refused here, ahead of every read below, so a refused search
+        // reports no user and consults no record.
+        if let Some(refusal) =
+            crate::state::unsearchable_attribute(&input.search_attributes)
+        {
+            return Err(SearchUsersErrorModeled::ValidationException(refusal).into());
+        }
 
         // What the control plane recorded about this directory: the domain its objects live
         // in, and which of its accounts have been given a password.

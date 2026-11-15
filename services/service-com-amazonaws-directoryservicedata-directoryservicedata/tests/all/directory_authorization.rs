@@ -102,7 +102,7 @@ pub(super) fn every_operation() -> Vec<(&'static str, Value)> {
     let group = json!({"SAMAccountName": "engineering"});
     let user = json!({"SAMAccountName": "jdoe"});
     let membership = json!({"GroupName": "engineering", "MemberName": "jdoe"});
-    let search = json!({"SearchString": "j", "SearchAttributes": ["cn"]});
+    let search = json!({"SearchString": "j", "SearchAttributes": ["SAMAccountName"]});
     vec![
         ("/GroupMemberships/AddGroupMember", membership.clone()),
         ("/GroupMemberships/ListGroupMembers", group.clone()),
