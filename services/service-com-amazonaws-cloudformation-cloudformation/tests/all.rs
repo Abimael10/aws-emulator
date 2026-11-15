@@ -373,6 +373,8 @@ mod operation_events;
 mod organizations_access;
 #[path = "all/out_of_band_resource_scan.rs"]
 mod out_of_band_resource_scan;
+#[path = "all/oversized_provider_response_rollback.rs"]
+mod oversized_provider_response_rollback;
 #[path = "all/parameter_and_change_set_conflicts.rs"]
 mod parameter_and_change_set_conflicts;
 #[path = "all/parameter_constraints_precede_the_template.rs"]

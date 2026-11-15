@@ -248,9 +248,14 @@ async fn a_service_timeout_outside_the_documented_range_is_refused_before_the_pr
 
 /// A provider response document of `bytes` bytes exactly: the members a well-formed answer
 /// carries, padded in one `Data` value to the size the row asks for.
-fn response_of_size(bytes: usize, physical_resource_id: &str) -> Value {
+///
+/// `pub(crate)` because the sibling suite that asserts what a document past the bound makes
+/// CloudFormation DO ([`super::oversized_provider_response_rollback`]) sizes its own documents
+/// the same way; one spelling of the padding keeps the two from drifting about what a document
+/// of a given size is.
+pub(crate) fn response_of_size(bytes: usize, status: &str, physical_resource_id: &str) -> Value {
     let mut answer = json!({
-        "Status": custom_resource::SUCCESS,
+        "Status": status,
         "PhysicalResourceId": physical_resource_id,
         "Data": {"Padding": ""},
     });
@@ -298,7 +303,7 @@ async fn a_response_document_past_the_bound_fails_the_resource() {
             &stack_id,
             "Thing",
             &request.request_id,
-            &response_of_size(*size, "sized-answer"),
+            &response_of_size(*size, custom_resource::SUCCESS, "sized-answer"),
         )
         .await;
         assert_eq!(

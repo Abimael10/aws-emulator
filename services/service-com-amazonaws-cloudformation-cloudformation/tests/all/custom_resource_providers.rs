@@ -98,6 +98,59 @@ async fn sns_ok(router: &MultiServiceRouter, case: &str, action: &str, members: 
     );
 }
 
+/// Which barrier of a stack a reader below is after.
+struct Awaiting<'a> {
+    /// The resource it must be about, or `None` for whichever resource the stack is waiting on.
+    logical_id: Option<&'a str>,
+    /// The `RequestType` it must be for, or `None` for whichever request is awaited.
+    request_type: Option<&'a str>,
+    /// Whether no answer may have landed on it yet.
+    unanswered: bool,
+}
+
+/// The ONE walk of a stack's barriers every reader below goes through: the stack's id, the
+/// request it is waiting for an answer to, the physical id that barrier carries and the
+/// resource it is about.
+///
+/// One walk, so no suite can disagree about which barrier is awaited; what each reader needs
+/// of it is stated as an [`Awaiting`] rather than as a walk of its own.
+fn awaited(
+    engine: &Arc<engine::InMemoryEngine>,
+    stack_name: &str,
+    awaiting: Awaiting<'_>,
+) -> Option<(String, custom_resource::ProviderRequest, String, String)> {
+    let held = store(engine);
+    let held = held.lock();
+    let stack = held
+        .stacks
+        .iter()
+        .find(|stack| stack.stack_name == stack_name)?;
+    stack
+        .stabilisations
+        .iter()
+        .filter(|barrier| !barrier.released())
+        .filter(|barrier| {
+            awaiting
+                .logical_id
+                .is_none_or(|logical_id| barrier.logical_id == logical_id)
+        })
+        .filter(|barrier| !awaiting.unanswered || barrier.provider_response.is_none())
+        .find_map(|barrier| {
+            let request = barrier.provider_request.clone()?;
+            awaiting
+                .request_type
+                .is_none_or(|request_type| request.request_type == request_type)
+                .then(|| {
+                    (
+                        stack.stack_id.clone(),
+                        request,
+                        barrier.physical_resource_id.clone(),
+                        barrier.logical_id.clone(),
+                    )
+                })
+        })
+}
+
 /// The provider request this emulator is waiting for an answer to about `logical_id` of
 /// `stack_name`, with the stack's own id: exactly what the published `ResponseURL` is
 /// addressed by.
@@ -106,25 +159,41 @@ pub fn awaited_request(
     stack_name: &str,
     logical_id: &str,
 ) -> Option<(String, custom_resource::ProviderRequest, String)> {
-    let held = store(engine);
-    let held = held.lock();
-    let stack = held
-        .stacks
-        .iter()
-        .find(|stack| stack.stack_name == stack_name)?;
-    let barrier = stack
-        .stabilisations
-        .iter()
-        .find(|barrier| {
-            !barrier.released()
-                && barrier.logical_id == logical_id
-                && barrier.provider_request.is_some()
-        })?;
-    Some((
-        stack.stack_id.clone(),
-        barrier.provider_request.clone()?,
-        barrier.physical_resource_id.clone(),
-    ))
+    let (stack_id, request, physical_resource_id, _) = awaited(
+        engine,
+        stack_name,
+        Awaiting {
+            logical_id: Some(logical_id),
+            request_type: None,
+            unanswered: false,
+        },
+    )?;
+    Some((stack_id, request, physical_resource_id))
+}
+
+/// The same record [`awaited_request`] reads, narrowed to a request of `request_type` that no
+/// answer has landed on yet.
+///
+/// What a suite waiting for the NEXT request a stack operation owes about a resource needs: a
+/// resource is sent one request per operation, and the barrier of the one already answered is
+/// still there until the answer is carried out, so the type and the absence of an answer are
+/// what tell the two apart.
+pub fn awaited_request_of_type(
+    engine: &Arc<engine::InMemoryEngine>,
+    stack_name: &str,
+    logical_id: &str,
+    request_type: &str,
+) -> Option<(String, custom_resource::ProviderRequest, String)> {
+    let (stack_id, request, physical_resource_id, _) = awaited(
+        engine,
+        stack_name,
+        Awaiting {
+            logical_id: Some(logical_id),
+            request_type: Some(request_type),
+            unanswered: true,
+        },
+    )?;
+    Some((stack_id, request, physical_resource_id))
 }
 
 /// PUT one document to the `ResponseURL` the request `request_id` about `logical_id` of the
@@ -286,22 +355,16 @@ fn any_awaited_request(
     engine: &Arc<engine::InMemoryEngine>,
     stack_name: &str,
 ) -> Option<(String, custom_resource::ProviderRequest, String)> {
-    let held = store(engine);
-    let held = held.lock();
-    let stack = held
-        .stacks
-        .iter()
-        .find(|stack| stack.stack_name == stack_name)?;
-    let barrier = stack.stabilisations.iter().find(|barrier| {
-        !barrier.released()
-            && barrier.provider_response.is_none()
-            && barrier.provider_request.is_some()
-    })?;
-    Some((
-        stack.stack_id.clone(),
-        barrier.provider_request.clone()?,
-        barrier.logical_id.clone(),
-    ))
+    let (stack_id, request, _, logical_id) = awaited(
+        engine,
+        stack_name,
+        Awaiting {
+            logical_id: None,
+            request_type: None,
+            unanswered: true,
+        },
+    )?;
+    Some((stack_id, request, logical_id))
 }
 
 /// A stack's reported outputs, as the key/value map a client reads.
