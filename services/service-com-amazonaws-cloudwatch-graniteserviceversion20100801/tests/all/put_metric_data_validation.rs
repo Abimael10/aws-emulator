@@ -9,13 +9,16 @@
 //!    2 hours after the current day and time") and a dimension CloudWatch cannot hold
 //!    ("Dimension values must contain only ASCII characters and must include at least one
 //!    non-whitespace character. ASCII control characters are not supported", `Dimension$Value`)
-//!    are refused, and a refused request stores NOTHING.
+//!    are refused, and a refused request stores NOTHING. Which refusal class answers a
+//!    dimension is the rule it broke: text outside the member's character set is reported as
+//!    that, naming the member path alone.
 //! 2. **A refusal about an input names the REQUEST MEMBER PATH the value arrived on**, so a
 //!    client can locate the batch element to fix — including a datum that is not the first,
 //!    and one that rode in on `EntityMetricData` rather than `MetricData`.
 //! 3. **An entity is validated as `StrictEntityValidation` says it is**: the flag "is
 //!    <i>required</i> when EntityMetricData is included", a strict call fails entirely on an
-//!    invalid entity, and a lenient one still ingests the metric data.
+//!    invalid entity — including one carrying more entity objects than the member accepts —
+//!    and a lenient one still ingests the metric data and reports what it dropped.
 
 use serde_json::{json, Value};
 
@@ -160,41 +163,144 @@ async fn only_a_time_stamp_inside_the_ingest_window_is_stored() {
     );
 }
 
+/// Which rule of `Dimension$Name` / `Dimension$Value` a refused dimension broke, and so which
+/// refusal class CloudWatch answers it in.
+#[derive(Debug, Clone, Copy)]
+enum Fault {
+    /// The text is written in characters the member does not accept: one above ASCII, or an
+    /// ASCII control character. ("Dimension values must contain only ASCII characters […] ASCII
+    /// control characters are not supported as part of dimension values.", `Dimension$Value`.)
+    CharacterSet,
+    /// The text is made of characters the member accepts but is still no dimension text: all
+    /// whitespace, or a name opening with the colon the member forbids.
+    Unusable,
+}
+
+/// The refusal message a dimension of `text` at member path `parameter` is answered with when
+/// it broke `fault` — the character-set class names only the member path, while the
+/// unusable-value class quotes the text as submitted.
+fn dimension_refusal(fault: Fault, text: &str, parameter: &str) -> String {
+    match fault {
+        Fault::CharacterSet => {
+            format!("The value for parameter {parameter} contains non-ASCII characters.")
+        }
+        Fault::Unusable => format!("The value {text} for parameter {parameter} is invalid."),
+    }
+}
+
+/// One row of the dimension table: what the dimension carries, and how CloudWatch answers it.
+///
+/// A row rather than a tuple so the table states what each column is.
+struct DimensionRow {
+    /// What this row varies, named in every assertion it makes.
+    case: &'static str,
+    /// The dimension's name.
+    name: &'static str,
+    /// The dimension's value.
+    value: &'static str,
+    /// How the dimension is refused, or `None` where CloudWatch holds it.
+    refused: Option<Refused>,
+}
+
+/// How a refused dimension is answered: the member whose text is at fault, and the rule that
+/// text broke.
+struct Refused {
+    /// The member of `Dimension` the refusal names (`Name` or `Value`).
+    member: &'static str,
+    /// The rule the text broke, which decides the refusal class.
+    fault: Fault,
+}
+
+/// A row whose dimension CloudWatch can hold.
+const fn held(case: &'static str, name: &'static str, value: &'static str) -> DimensionRow {
+    DimensionRow {
+        case,
+        name,
+        value,
+        refused: None,
+    }
+}
+
+/// A row refused for the CHARACTER SET of the text in `member`.
+const fn character_set(
+    case: &'static str,
+    name: &'static str,
+    value: &'static str,
+    member: &'static str,
+) -> DimensionRow {
+    DimensionRow {
+        case,
+        name,
+        value,
+        refused: Some(Refused {
+            member,
+            fault: Fault::CharacterSet,
+        }),
+    }
+}
+
+/// A row whose `member` carries characters the member accepts but text it cannot use.
+const fn unusable(
+    case: &'static str,
+    name: &'static str,
+    value: &'static str,
+    member: &'static str,
+) -> DimensionRow {
+    DimensionRow {
+        case,
+        name,
+        value,
+        refused: Some(Refused {
+            member,
+            fault: Fault::Unusable,
+        }),
+    }
+}
+
 #[tokio::test]
 async fn only_a_dimension_cloudwatch_can_hold_is_stored() {
-    // (case, the dimension's name, its value, the member at fault, or `None` where the
-    // dimension is accepted)
-    //
     // The rows differ along what the dimension carries: printable ASCII in a name and a
     // value, the ASCII punctuation and spacing CloudWatch does hold, an ASCII CONTROL
     // character, text outside ASCII altogether (accented, ideographic, emoji), whitespace
-    // only, and a name opening with the colon the member forbids. A refused row is answered
-    // in the family this operation answers an unusable input value in, naming the member path
-    // the text arrived on and the text itself, which the loop builds from the row.
-    let rows: &[(&str, &str, &str, Option<&str>)] = &[
-        ("plain ASCII", "InstanceId", "i-0123456789abcdef", None),
-        ("ASCII punctuation and spacing", "Path group", "/api/v1 (read)", None),
-        ("a value of one printable character", "D", "x", None),
-        ("a bell in the value", "Host", "bad\u{0007}value", Some("Value")),
-        ("a null in the value", "Host", "bad\u{0000}value", Some("Value")),
-        ("a newline in the value", "Host", "first\nsecond", Some("Value")),
-        ("a tab in the value", "Host", "first\tsecond", Some("Value")),
-        ("a control character in the name", "ba\u{0001}d", "ok", Some("Name")),
-        ("an accented value", "Server", "café", Some("Value")),
-        ("an ideographic value", "Server", "日本語", Some("Value")),
-        ("an emoji value", "Server", "server-🚀", Some("Value")),
-        ("a non-ASCII name", "Sérvice", "api", Some("Name")),
-        ("a value of only spaces", "Host", "   ", Some("Value")),
-        ("a name of only spaces", "   ", "api", Some("Name")),
-        ("a name opening with a colon", ":reserved", "api", Some("Name")),
+    // only, and a name opening with the colon the member forbids. Which refusal class a
+    // refused row is answered in is the rule it broke: text outside the member's character set
+    // is reported as that, naming the member path alone, and text the member cannot use for
+    // another reason is reported in the unusable-value family, which quotes it.
+    let rows: &[DimensionRow] = &[
+        held("plain ASCII", "InstanceId", "i-0123456789abcdef"),
+        held("ASCII punctuation and spacing", "Path group", "/api/v1 (read)"),
+        held("a value of one printable character", "D", "x"),
+        // The highest and lowest printable ASCII characters, inside the set either way.
+        held("the edges of printable ASCII", "~name!", " x~"),
+        character_set("a bell in the value", "Host", "bad\u{0007}value", "Value"),
+        character_set("a null in the value", "Host", "bad\u{0000}value", "Value"),
+        character_set("a newline in the value", "Host", "first\nsecond", "Value"),
+        character_set("a tab in the value", "Host", "first\tsecond", "Value"),
+        character_set("a delete character in the value", "Host", "bad\u{007F}v", "Value"),
+        character_set("a control character in the name", "ba\u{0001}d", "ok", "Name"),
+        character_set("an accented value", "Server", "café", "Value"),
+        character_set("an ideographic value", "Server", "日本語", "Value"),
+        character_set("an emoji value", "Server", "server-🚀", "Value"),
+        character_set("the first character above ASCII", "Server", "caf\u{0080}", "Value"),
+        character_set("a non-ASCII name", "Sérvice", "api", "Name"),
+        unusable("a value of only spaces", "Host", "   ", "Value"),
+        unusable("a name of only spaces", "   ", "api", "Name"),
+        unusable("a name opening with a colon", ":reserved", "api", "Name"),
     ];
 
-    for (case, name, value, at_fault) in rows {
-        let refusal = at_fault.map(|member| {
-            let text = if member == "Name" { *name } else { *value };
-            format!(
-                "The value {text} for parameter \
-                 MetricData.member.1.Dimensions.member.1.{member} is invalid."
+    for DimensionRow {
+        case,
+        name,
+        value,
+        refused,
+    } in rows
+    {
+        let refusal = refused.as_ref().map(|refused| {
+            let text = if refused.member == "Name" { name } else { value };
+            dimension_refusal(
+                refused.fault,
+                text,
+                &format!("MetricData.member.1.Dimensions.member.1.{}", refused.member),
             )
         });
         let router = build_router();
@@ -771,6 +877,9 @@ async fn more_entity_objects_than_the_documented_two_are_refused() {
     }
 
     // (case, how many entity objects the call carries, whether it is accepted)
+    //
+    // Under STRICT validation the cap is fatal: the rows walk the documented bound and one
+    // past it. What a LENIENT call over the same bound answers is the test below.
     let rows: &[(&str, usize, bool)] = &[
         ("one entity object", 1, true),
         ("the documented two", 2, true),
@@ -819,5 +928,158 @@ async fn more_entity_objects_than_the_documented_two_are_refused() {
                 "case {case:?}: a refused publish must store nothing, got {series} series"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn a_lenient_call_over_the_entity_object_cap_still_ingests_every_datum() {
+    /// One entity object with its own datum, named after its position.
+    fn entity(index: usize) -> Value {
+        json!({
+            "Entity": {"KeyAttributes": {"Type": "Service", "Name": format!("service-{index}")}},
+            "MetricData": [{"MetricName": format!("U{index}"), "Value": 5.0}],
+        })
+    }
+
+    // (case, how many entity objects the call carries, the failure its answer reports)
+    //
+    // "When set to false: Validation errors in the entity will not associate the metric with
+    // the entity, but the metric data will still be accepted and ingested."
+    // (`PutMetricDataInput$StrictEntityValidation`) — carrying more entity objects than the
+    // member accepts is such a validation error, so EVERY row is accepted and every row's
+    // metric data is stored; what the rows differ in is whether the answer reports a dropped
+    // association. The rows walk the documented bound, one past it, and far past it.
+    let rows: &[(&str, usize, Option<&str>)] = &[
+        ("one entity object", 1, None),
+        ("the documented two", 2, None),
+        ("one past the documented two", 3, Some("EntitySizeTooLarge")),
+        ("far past it", 7, Some("EntitySizeTooLarge")),
+    ];
+
+    for (case, count, reported) in rows {
+        let router = build_router();
+        let at = now_secs();
+        let (status, headers, body) = call_with_headers(
+            &router,
+            "PutMetricData",
+            &json!({
+                "Namespace": NAMESPACE,
+                "StrictEntityValidation": false,
+                "EntityMetricData": (0..*count).map(entity).collect::<Vec<Value>>(),
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a lenient call must be accepted, got {status} with {body:?}"
+        );
+        let got = headers
+            .get("x-amz-failure-message")
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(
+            got, *reported,
+            "case {case:?}: expected the answer to report {reported:?}, got {got:?}"
+        );
+        // Over-counting drops the entity ASSOCIATION, never the metric data: every object's
+        // datum is ingested, whichever side of the cap the call sat on.
+        let series = stored_series(&router).await;
+        assert_eq!(
+            series, *count,
+            "case {case:?}: expected {count} series stored, got {series}"
+        );
+        for index in 0..*count {
+            let metric = format!("U{index}");
+            let samples = samples_at(&router, &metric, at).await;
+            assert_eq!(
+                samples, 1.0,
+                "case {case:?}: expected one sample of {metric}, got SampleCount {samples}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_character_set_refusal_names_the_position_the_text_arrived_on() {
+    /// The one metric name every row publishes under, so a row that was refused leaves the
+    /// catalogue empty.
+    const METRIC: &str = "Positioned";
+
+    // (case, the whole request, the member path the refusal has to name)
+    //
+    // The only variable part of the character-set sentence is the member path, and its indices
+    // come from the request's own positions: the rows move the offending dimension to a later
+    // dimension of the same datum, to a later datum of the batch, and onto a datum carried by
+    // `EntityMetricData` rather than `MetricData`.
+    let rows: Vec<(&str, Value, &str)> = vec![
+        (
+            "the second dimension of the first datum",
+            publish(json!({
+                "MetricName": METRIC,
+                "Dimensions": [{"Name": "Host", "Value": "ok"}, {"Name": "Zone", "Value": "sü"}],
+                "Value": 1.0,
+            })),
+            "MetricData.member.1.Dimensions.member.2.Value",
+        ),
+        (
+            "the third datum of the batch",
+            json!({
+                "Namespace": NAMESPACE,
+                "MetricData": [
+                    {"MetricName": METRIC, "Value": 1.0},
+                    {"MetricName": METRIC, "Value": 2.0},
+                    {
+                        "MetricName": METRIC,
+                        "Dimensions": [{"Name": "Host", "Value": "bad\u{0002}"}],
+                        "Value": 3.0,
+                    },
+                ],
+            }),
+            "MetricData.member.3.Dimensions.member.1.Value",
+        ),
+        (
+            "a dimension NAME on an entity-borne datum",
+            json!({
+                "Namespace": NAMESPACE,
+                "StrictEntityValidation": true,
+                "EntityMetricData": [{
+                    "Entity": {"KeyAttributes": {"Type": "Service", "Name": "api"}},
+                    "MetricData": [{
+                        "MetricName": METRIC,
+                        "Dimensions": [{"Name": "Zoné", "Value": "ok"}],
+                        "Value": 1.0,
+                    }],
+                }],
+            }),
+            "EntityMetricData.member.1.MetricData.member.1.Dimensions.member.1.Name",
+        ),
+    ];
+
+    for (case, request, parameter) in rows {
+        let router = build_router();
+        let (status, body) = call(&router, "PutMetricData", &request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the publish to be refused, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterValueException",
+            "case {case:?}: expected the invalid-parameter-value refusal, got {body:?}"
+        );
+        let expected = dimension_refusal(Fault::CharacterSet, "", parameter);
+        let got = message(&body);
+        assert_eq!(
+            got, expected,
+            "case {case:?}: expected the message {expected:?}, got {got:?}"
+        );
+        // "Any validation error (for entity or metric data) will fail the entire request, and
+        // no data will be ingested." — the sound datums of the same batch are not stored
+        // either.
+        let series = stored_series(&router).await;
+        assert_eq!(
+            series, 0,
+            "case {case:?}: a refused publish must store nothing, got {series} series"
+        );
     }
 }

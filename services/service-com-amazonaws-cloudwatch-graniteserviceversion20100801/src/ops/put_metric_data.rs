@@ -264,7 +264,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The cap is the member's own two objects, and a call over it is answered under the
         // failure name the strict flag's documentation gives that cap — see
         // [`entity_size_too_large`].
-        if entities.len() > MAX_ENTITY_METRIC_DATA {
+        //
+        // Carrying more entity objects than the member accepts is an ENTITY validation error
+        // like any other, so which of the two outcomes the strict flag names applies to it:
+        // "When set to true: Any validation error (for entity or metric data) will fail the
+        // entire request, and no data will be ingested. […] When set to false: Validation
+        // errors in the entity will not associate the metric with the entity, but the metric
+        // data will still be accepted and ingested."
+        // (`PutMetricDataInput$StrictEntityValidation`) — a LENIENT call over the cap is
+        // therefore accepted, every datum it carries is ingested below, and the failure it
+        // dropped the associations for is reported in its response header
+        // ([`dropped_entity_failure`]). Over-counting drops the entity association, never the
+        // metric data.
+        if entities.len() > MAX_ENTITY_METRIC_DATA && !is_lenient(&input) {
             return Err(entity_size_too_large());
         }
 
@@ -319,7 +331,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reported in its response header ([`dropped_entity_failure`]).
         // (The flag is required above whenever an entity rides along, so the default here is
         // reached only by a request that carries no entity to validate.)
-        if input.strict_entity_validation.unwrap_or(true) {
+        if !is_lenient(&input) {
             for entity in entities.iter().filter_map(|entry| entry.entity.as_ref()) {
                 if let Some(failure) = entity_failure(&key_attributes(entity)) {
                     return Err(invalid_parameter_value(failure.message()));
@@ -369,25 +381,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // (`Dimension$Value`; `Dimension$Name` carries the same rule and adds "cannot
             // start with a colon".)
             //
-            // Refused in the family this operation answers an unusable input VALUE in — the
-            // one its recorded `Value` and `Namespace` refusals carry — with the member path
-            // and the value taken from the request. The Resolution notes in this issue's
-            // report say what is known about the recorded sentence for this class.
+            // The member states more than one rule, and the refusal says WHICH one the text
+            // broke: text outside the member's character set is refused as that, naming only
+            // the member path it arrived on ([`checked_character_set`]), while text the member
+            // cannot use for another reason — all whitespace, or a name opening with the colon
+            // — is refused in the family this operation answers an unusable input VALUE in,
+            // the one its recorded `Value` and `Namespace` refusals carry, with the member path
+            // and the value taken from the request.
             for (index, dimension) in datum.dimensions.iter().flatten().enumerate() {
                 let dimension_path = member_path(&format!("{path}.Dimensions"), index);
+                let name_path = format!("{dimension_path}.Name");
+                checked_character_set(&dimension.name, &name_path)?;
                 // "Dimension names […] cannot start with a colon (:)." (`Dimension$Name`)
-                if !is_holdable_dimension_text(&dimension.name) || dimension.name.starts_with(':')
-                {
-                    return Err(value_is_invalid(
-                        &dimension.name,
-                        &format!("{dimension_path}.Name"),
-                    ));
+                if !has_non_whitespace(&dimension.name) || dimension.name.starts_with(':') {
+                    return Err(value_is_invalid(&dimension.name, &name_path));
                 }
-                if !is_holdable_dimension_text(&dimension.value) {
-                    return Err(value_is_invalid(
-                        &dimension.value,
-                        &format!("{dimension_path}.Value"),
-                    ));
+                let value_path = format!("{dimension_path}.Value");
+                checked_character_set(&dimension.value, &value_path)?;
+                if !has_non_whitespace(&dimension.value) {
+                    return Err(value_is_invalid(&dimension.value, &value_path));
                 }
             }
             let storage_resolution = storage_resolution(datum, &path)?;
@@ -631,9 +643,25 @@ const MAX_ENTITY_METRIC_DATA: usize = 2;
 /// member's documented two objects, so two are accepted and a third is refused with this.
 fn entity_size_too_large() -> PutMetricDataError {
     invalid_parameter_value(format!(
-        "EntitySizeTooLarge: The total number of EntityMetricData elements must be shorter than \
-         {MAX_ENTITY_METRIC_DATA}"
+        "{ENTITY_SIZE_TOO_LARGE}: The total number of EntityMetricData elements must be shorter \
+         than {MAX_ENTITY_METRIC_DATA}"
     ))
+}
+
+/// The failure NAME `PutMetricDataInput$StrictEntityValidation` gives the entity-object cap
+/// ("EntitySizeTooLarge - The number of EntityMetricData objects allowed is 2.") — what the
+/// strict refusal opens with and what a lenient call's response header reports.
+const ENTITY_SIZE_TOO_LARGE: &str = "EntitySizeTooLarge";
+
+/// Whether `input` asked for a failing entity to be dropped rather than to fail the request.
+///
+/// "When set to false: Validation errors in the entity will not associate the metric with the
+/// entity, but the metric data will still be accepted and ingested."
+/// (`PutMetricDataInput$StrictEntityValidation`) — only an explicit `false` asks for that: a
+/// call carrying an entity and stating no flag at all is refused for the missing flag, and a
+/// call carrying no entity has nothing to validate either way.
+fn is_lenient(input: &PutMetricDataInput) -> bool {
+    input.strict_entity_validation == Some(false)
 }
 
 /// Whether `namespace` lies in the AWS-reserved namespace space.
@@ -711,14 +739,32 @@ fn printed(value: f64) -> String {
     ::service_common::validation_message::float_value_text(value)
 }
 
-/// Whether CloudWatch can hold `text` as a dimension name or value: "Dimension values must
-/// contain only ASCII characters and must include at least one non-whitespace character. ASCII
-/// control characters are not supported as part of dimension values." (`Dimension$Value`, and
-/// `Dimension$Name` for a name.)
-fn is_holdable_dimension_text(text: &str) -> bool {
-    text.is_ascii()
-        && !text.chars().any(char::is_control)
-        && text.chars().any(|character| !character.is_whitespace())
+/// Refuse `text` for the CHARACTER SET it is written in, naming the request member path
+/// `parameter` it arrived on; `Ok(())` for text made only of the characters the member accepts.
+///
+/// "Dimension values must contain only ASCII characters and must include at least one
+/// non-whitespace character. ASCII control characters are not supported as part of dimension
+/// values." (`Dimension$Value`, and `Dimension$Name` for a name.) The member states more than
+/// one rule, and a refusal is only actionable when it says WHICH one the text broke, so the
+/// character set has its own refusal class ([`crate::state::non_ascii_value_message`]): a
+/// character outside ASCII, or an ASCII control character — which is no more holdable than one
+/// above ASCII — is reported as the character-set violation it is. The sibling rules (text made
+/// only of whitespace, a name opening with the colon the member forbids) are a different fault
+/// and keep the unusable-value class ([`value_is_invalid`]).
+fn checked_character_set(text: &str, parameter: &str) -> Result<(), PutMetricDataError> {
+    if text.is_ascii() && !text.chars().any(char::is_control) {
+        return Ok(());
+    }
+    Err(invalid_parameter_value(
+        crate::state::non_ascii_value_message(parameter),
+    ))
+}
+
+/// Whether `text` carries any character that is not whitespace: "[dimension names and values]
+/// must include at least one non-whitespace character" (`Dimension$Name`, `Dimension$Value`) —
+/// text that names nothing identifies nothing.
+fn has_non_whitespace(text: &str) -> bool {
+    text.chars().any(|character| !character.is_whitespace())
 }
 
 /// Refuse a value this operation documents as unsupported, naming the member path it arrived
@@ -889,13 +935,18 @@ fn key_attributes(entity: &Entity) -> ::std::collections::HashMap<String, String
 pub(crate) fn dropped_entity_failure(input: &PutMetricDataInput) -> Option<&'static str> {
     // Only a LENIENT call drops an entity: a strict one is refused outright, and a call that
     // states no flag at all is refused for that.
-    if input.strict_entity_validation != Some(false) {
+    if !is_lenient(input) {
         return None;
     }
-    input
-        .entity_metric_data
+    let entities = input.entity_metric_data.as_deref().unwrap_or_default();
+    // More entity objects than the member accepts is a failure of the request as a whole rather
+    // than of one entity in it — none of the associations can be made — so it is what the answer
+    // reports, whatever the individual entities carry.
+    if entities.len() > MAX_ENTITY_METRIC_DATA {
+        return Some(ENTITY_SIZE_TOO_LARGE);
+    }
+    entities
         .iter()
-        .flatten()
         .filter_map(|entry| entry.entity.as_ref())
         .find_map(|entity| entity_failure(&key_attributes(entity)).map(|failure| failure.name))
 }

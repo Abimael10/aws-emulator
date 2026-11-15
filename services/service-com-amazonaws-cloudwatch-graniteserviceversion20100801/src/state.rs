@@ -374,6 +374,20 @@ pub fn value_is_invalid_message(value: &str, parameter: &str) -> String {
     format!("The value {value} for parameter {parameter} is invalid.")
 }
 
+/// How CloudWatch states text outside the CHARACTER SET its member accepts: the request member
+/// path the text arrived on, and nothing of the text itself.
+///
+/// A member documented as ASCII-only ("Dimension values must contain only ASCII characters […]
+/// ASCII control characters are not supported as part of dimension values.", `Dimension$Value`)
+/// is refused in its own class rather than in the unusable-value one
+/// ([`value_is_invalid_message`]): the message is the only thing that tells a caller WHICH rule
+/// its text broke, and "is invalid." could as well be a length or an empty-value fault. The
+/// text is left out of the sentence — the bytes that broke the character set are the caller's
+/// own and are not restated in the answer.
+pub fn non_ascii_value_message(parameter: &str) -> String {
+    format!("The value for parameter {parameter} contains non-ASCII characters.")
+}
+
 /// What the value half of that sentence states when the request supplied NO value to state.
 ///
 /// The sentence quotes the value the request carried, bare — so a refusal about a parameter
