@@ -268,54 +268,7 @@ pub fn template_context_of(
     call: &Call,
     request_id: &str,
 ) -> BTreeMap<String, String> {
-    let mut values = BTreeMap::new();
-    flattened(
-        "",
-        &request_context(connection, route_key, call, request_id),
-        MAX_CONTEXT_DEPTH,
-        &mut values,
-    );
-    values
-}
-
-/// How deep the walk below descends, which is how deep a `$context` member path goes: the
-/// members the gateway reports are values, beside the two MAPS one level inside the context
-/// (`identity`, and the `authorizer` an authorized connection carries), and an authorizer's
-/// own context carries no object or array as a value — so nothing deeper is a member path a
-/// template can name. Bounded rather than open because that authorizer context is a value a
-/// caller's own function returned.
-const MAX_CONTEXT_DEPTH: usize = 3;
-
-/// `value` written into `values` under the member path a template names it by: a nested
-/// object's members are reached through the dotted path their nesting gives them
-/// (`identity.sourceIp`), and a member the call has no value for at all (`null`) is left out
-/// rather than written as the empty string — a template reference to it then resolves to
-/// nothing, the way a reference to a member the gateway does not report does.
-fn flattened(path: &str, value: &Value, depth: usize, values: &mut BTreeMap<String, String>) {
-    match value {
-        Value::Object(members) => {
-            let Some(deeper) = depth.checked_sub(1) else {
-                return;
-            };
-            for (name, member) in members {
-                let nested = if path.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{path}.{name}")
-                };
-                flattened(&nested, member, deeper, values);
-            }
-        }
-        Value::Null => {}
-        // A string's own characters, and every other scalar as the text its JSON spells —
-        // which is what a template renders a number or a boolean of the context as.
-        Value::String(text) => {
-            values.insert(path.to_string(), text.clone());
-        }
-        other => {
-            values.insert(path.to_string(), other.to_string());
-        }
-    }
+    proxy_event::flattened_context(&request_context(connection, route_key, call, request_id))
 }
 
 /// The `requestContext` of one call: what the gateway reports about the connection and

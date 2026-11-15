@@ -36,6 +36,14 @@
 //! refusal: a decision of DENY is `403` `{"message":"Forbidden"}` — the authorizer ran and
 //! said no — while a request whose identity sources are not all present never reaches the
 //! function and is `401` `{"message":"Unauthorized"}`.
+//!
+//! A function that RAISED states no decision at all, and which refusal that earns is decided
+//! by the error it raised: raising the single word `Unauthorized` is how a Lambda authorizer
+//! signals an unauthenticated caller, and the gateway answers that call `401`
+//! `{"message":"Unauthorized"}` — the same refusal a request that never reached the function
+//! earns, since neither identified a caller. Any OTHER unhandled error is an authorizer that
+//! broke rather than one that refused, so it stays the gateway's own `500`
+//! ([`UNAUTHORIZED_ERROR_MESSAGE`]).
 
 use std::time::{Duration, Instant};
 
@@ -43,7 +51,9 @@ use aws_smithy_runtime_api::http::Response as RtResponse;
 use serde_json::Value;
 use smithy_server_runtime::{EmbeddedEmulator, OperationContext};
 
-use super::super::data_plane::{forbidden, json_response, UNPLACEABLE_STATUS};
+use super::super::data_plane::{
+    forbidden, json_response, UNAUTHORIZED_MESSAGE, UNAUTHORIZED_STATUS, UNPLACEABLE_STATUS,
+};
 use super::lambda;
 use super::proxy_event::{self, Invocation, ProxyRequest, PAYLOAD_FORMAT_1_0, PAYLOAD_FORMAT_2_0};
 use crate::state::authorizer_cache::{result_ttl, CachedDecision};
@@ -64,6 +74,18 @@ const EXECUTE_API_SERVICE: &str = "execute-api";
 /// rather than waiting. It bounds the run the way an integration's `TimeoutInMillis` bounds
 /// a route's, so a function that never returns cannot hold the request open.
 const AUTHORIZER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The error a Lambda authorizer raises to signal an UNAUTHENTICATED caller, which the
+/// gateway answers `401` `{"message":"Unauthorized"}` rather than as a broken authorizer.
+///
+/// The word is the error's own message, so it is matched against the message the run
+/// reported ([`raised_message`]) and against nothing else: an authorizer that raised anything
+/// else stated no decision and no refusal either.
+const UNAUTHORIZED_ERROR_MESSAGE: &str = "Unauthorized";
+
+/// The member Lambda's error document carries the message of the error a run ended in
+/// (`Invoke`: "Details about the error are included in the response payload").
+const ERROR_MESSAGE_MEMBER: &str = "errorMessage";
 
 /// What the authorizer decided, for the caller to carry into the integration's event.
 #[derive(Debug, Clone)]
@@ -94,6 +116,9 @@ pub enum Outcome {
 pub enum Refused {
     /// The authorizer ran and did not authorize the call.
     Denied,
+    /// The authorizer ran and raised [`UNAUTHORIZED_ERROR_MESSAGE`], which is how it signals
+    /// that the call presented no caller it could authenticate.
+    Unauthenticated,
     /// No decision could be obtained: the authorizer names no function, the function could
     /// not be invoked, it raised, or it answered something this authorizer's configuration
     /// cannot be read as. The reason is logged rather than told to the caller.
@@ -182,7 +207,18 @@ pub async fn decided(
     if ran.failed() {
         // "An unhandled error is still HTTP 200" to Lambda's caller, so the run is told
         // from a decision by the signal rather than by the status: a function that raised
-        // returned no decision at all.
+        // returned no decision at all. WHICH refusal that earns is the error's own: the one
+        // word a Lambda authorizer signals an unauthenticated caller with is a refusal of
+        // the call, and every other error is an authorizer that broke.
+        let raised = raised_message(&ran.payload);
+        if raised.as_deref().map(str::trim) == Some(UNAUTHORIZED_ERROR_MESSAGE) {
+            ::tracing::info!(
+                authorizer_id = %authorizer.authorizer_id,
+                "refusing a call: this route's Lambda authorizer raised the error that signals \
+                 an unauthenticated caller"
+            );
+            return Err(Refused::Unauthenticated);
+        }
         return Err(unplaceable(
             authorizer,
             "the authorizer's function ended in an unhandled error, so it returned no \
@@ -255,6 +291,11 @@ pub async fn decide<Eng: Send + Sync + 'static>(
     {
         Ok(decided) => Outcome::Allowed(decided),
         Err(Refused::Denied) => Outcome::Refused(Box::new(forbidden())),
+        Err(Refused::Unauthenticated) => Outcome::Refused(Box::new(json_response(
+            UNAUTHORIZED_STATUS,
+            UNAUTHORIZED_MESSAGE,
+            None,
+        ))),
         Err(Refused::Unplaceable) => Outcome::Refused(Box::new(json_response(
             UNPLACEABLE_STATUS,
             super::INTERNAL_MESSAGE,
@@ -277,6 +318,17 @@ fn decision_of(decision: &CachedDecision) -> Result<Decided, Refused> {
             .and_then(|context| serde_json::from_str(context).ok()),
         principal_id: decision.principal_id.clone(),
     })
+}
+
+/// The message of the error a run ENDED IN, read off Lambda's own error document: the
+/// handler's own message, never a sentence written here. `None` when the payload is no such
+/// document, or carries no message.
+fn raised_message(payload: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(payload)
+        .ok()?
+        .get(ERROR_MESSAGE_MEMBER)?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// [`Refused::Unplaceable`] with the reason logged rather than told to the caller. An allow

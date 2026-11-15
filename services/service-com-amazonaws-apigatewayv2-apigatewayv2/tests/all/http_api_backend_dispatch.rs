@@ -68,6 +68,12 @@ const THROTTLED_MESSAGE: &str = "Too Many Requests";
 const FORBIDDEN: u16 = 403;
 const UNAUTHORIZED: u16 = 401;
 
+/// How long a row keeps asking for a decision while the gateway is still answering its own
+/// `500` for an authorizer whose runtime is starting, and how often it looks: generous, and
+/// bounding no behaviour any row asserts on.
+const DECISION_WAIT: Duration = Duration::from_secs(120);
+const LOOK_INTERVAL: Duration = Duration::from_millis(100);
+
 /// This service and AWS Lambda on ONE engine, with request authentication off.
 pub(crate) fn emulator_with_lambda() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -83,7 +89,7 @@ pub(crate) fn emulator_with_lambda() -> (MultiServiceRouter, Arc<engine::InMemor
 }
 
 /// One control-plane request against THIS service, signed for [`REGION`].
-async fn control(
+pub(crate) async fn control(
     emulator: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -1026,14 +1032,29 @@ async fn a_request_authorizers_own_decision_gates_the_route() {
             &emulator, &engine, case, source, payload_format, simple, 300,
         )
         .await;
-        let answer = send(
-            &emulator,
-            &host,
-            "GET",
-            "/orders",
-            &[("authorization", token)],
-        )
-        .await;
+        // The request is made again while the gateway is still answering its own `500` and
+        // this row expects another status: the authorizer's FIRST invocation starts that
+        // function's runtime, and on a loaded host that start can overrun the deadline the
+        // gateway gives it — a transient refusal the next request does not get. The wait is
+        // for a decision, and nothing here asserts on the clock.
+        let deadline = std::time::Instant::now() + DECISION_WAIT;
+        let answer = loop {
+            let answer = send(
+                &emulator,
+                &host,
+                "GET",
+                "/orders",
+                &[("authorization", token)],
+            )
+            .await;
+            if answer.status != INTEGRATION_FAULT
+                || expected == INTEGRATION_FAULT
+                || std::time::Instant::now() >= deadline
+            {
+                break answer;
+            }
+            tokio::time::sleep(LOOK_INTERVAL).await;
+        };
         assert_eq!(
             answer.status, expected,
             "case {case:?}: expected {expected} from the gated route, got {}",

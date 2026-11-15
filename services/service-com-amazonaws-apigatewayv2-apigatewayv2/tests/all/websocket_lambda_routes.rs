@@ -35,7 +35,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::http_api_backend_dispatch::given_function;
-use crate::websocket_transport_data_plane::{exchange, handshake_at, ClientSocket};
+use crate::websocket_transport_data_plane::{exchanged_reply, handshake_at, ClientSocket};
 
 /// The Region every control-plane request below is signed for.
 const REGION: &str = "us-east-1";
@@ -47,6 +47,16 @@ const STAGE: &str = "prod";
 /// `401` an absent identity source earns.
 const FORBIDDEN: u16 = 403;
 const UNAUTHORIZED: u16 = 401;
+
+/// The status the gateway answers for a connection request whose authorizer it could not get
+/// a decision from at all — which a loaded host can produce transiently while the
+/// authorizer's runtime is starting, so a row expecting another status offers the handshake
+/// again until that decision arrives ([`DECISION_WAIT`]).
+const INTERNAL_SERVER_ERROR: u16 = 500;
+
+/// How long such a row keeps offering the handshake: generous, and bounding no behaviour the
+/// rows assert on.
+const DECISION_WAIT: Duration = Duration::from_secs(120);
 
 /// How long a case waits for a recorded event before failing, and how often it looks: a
 /// lifecycle route's own answer reaches no client, so the record it wrote is read by polling
@@ -609,9 +619,7 @@ async fn each_call_of_a_connection_is_served_by_its_own_routes_function() {
         ("a frame that is no JSON object", "not json at all", None),
     ];
     for (row, frame, expected) in cases {
-        let answer = exchange(case, &mut socket, frame).await.unwrap_or_else(|| {
-            panic!("case {case:?} / {row}: the api must answer this frame, got nothing")
-        });
+        let answer = exchanged_reply(case, &mut socket, frame).await;
         let answered: Value = serde_json::from_str(&answer).unwrap_or_else(|error| {
             panic!("case {case:?} / {row}: expected a JSON frame, got {answer:?}: {error}")
         });
@@ -863,7 +871,22 @@ async fn a_request_authorizer_decides_the_handshake_and_its_context_reaches_the_
             given_route(&emulator, case, &api.api_id, "ping", &ping, true, None).await;
             given_stage(&emulator, case, &api.api_id).await;
 
-            let answered = handshake_at(case, &api.authority, &format!("/{STAGE}{query}")).await;
+            // The handshake is offered again while the gateway is still answering its own
+            // `500` and the row expects another status: the authorizer's FIRST invocation
+            // starts that function's runtime, and on a loaded host that start can overrun the
+            // deadline the gateway gives it — a transient refusal the next handshake does not
+            // get. The wait is for a decision, and nothing here asserts on the clock.
+            let deadline = std::time::Instant::now() + DECISION_WAIT;
+            let answered = loop {
+                let answered =
+                    handshake_at(case, &api.authority, &format!("/{STAGE}{query}")).await;
+                let transient = matches!(answered, Err(status)
+                    if status == INTERNAL_SERVER_ERROR && refused != Some(INTERNAL_SERVER_ERROR));
+                if !transient || std::time::Instant::now() >= deadline {
+                    break answered;
+                }
+                tokio::time::sleep(LOOK_INTERVAL).await;
+            };
             let mut socket = match (refused, answered) {
                 (None, Ok(socket)) => socket,
                 (None, Err(status)) => {
@@ -924,9 +947,7 @@ async fn a_request_authorizer_decides_the_handshake_and_its_context_reaches_the_
             );
 
             // And what it ALLOWED reaches every later call of the connection.
-            let answer = exchange(case, &mut socket, r#"{"action":"ping"}"#)
-                .await
-                .unwrap_or_else(|| panic!("case {case:?}: the ping route must answer"));
+            let answer = exchanged_reply(case, &mut socket, r#"{"action":"ping"}"#).await;
             let answered: Value = serde_json::from_str(&answer).unwrap_or_else(|error| {
                 panic!("case {case:?}: expected JSON, got {answer:?}: {error}")
             });

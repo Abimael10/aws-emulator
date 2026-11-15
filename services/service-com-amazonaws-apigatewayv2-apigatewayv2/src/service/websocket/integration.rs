@@ -16,11 +16,13 @@
 //!   ([`crate::service::invoke::proxy_response::websocket_reply`]) — so the status that
 //!   decides the call and the payload a two-way route sends back are the function's own.
 //! * `MOCK` is answered from the integration's own records ([`super::dispatch::mock_reply`]).
-//! * Every other type — `AWS` and `HTTP` with their templates, `HTTP_PROXY` with an upstream
-//!   URI this emulator opens no connection to, and a first-class service action — reaches a
-//!   backend this data plane does not call over a socket, so it is reported as
-//!   unperformable: the gateway's own `Internal server error` rather than an answer no
-//!   backend gave.
+//! * `AWS` — the non-proxy integration — relays what its own request template RENDERS to the
+//!   backend, and reads the backend's answer back through the selected integration response's
+//!   template ([`super::non_proxy`]).
+//! * Every other type — `HTTP` with its templates, `HTTP_PROXY` with an upstream URI this
+//!   emulator opens no connection to, and a first-class service action — reaches a backend
+//!   this data plane does not call over a socket, so it is reported as unperformable: the
+//!   gateway's own `Internal server error` rather than an answer no backend gave.
 //!
 //! Every answer is the backend's: a function that raised, one that could not be invoked, one
 //! that overran the integration's own `TimeoutInMillis` and one whose answer the structured
@@ -155,6 +157,20 @@ pub async fn perform(
         &integration.integration_type,
         integration.integration_subtype.as_deref(),
     ) {
+        if integration.integration_type == crate::state::AWS_INTEGRATION_TYPE {
+            // The NON-PROXY integration: what the backend receives is what this
+            // integration's own request template renders, not the call's event
+            // ([`super::non_proxy`]).
+            return super::non_proxy::perform(
+                callback,
+                connection,
+                selected,
+                integration,
+                call,
+                request_id,
+            )
+            .await;
+        }
         return Err(Unserved::Unperformable(format!(
             "an integration of type {}{} fronts a backend this data plane does not call for \
              a WebSocket route",
@@ -243,6 +259,6 @@ async fn lambda_proxy(
 /// timeout between 50 and 29,000 milliseconds for WebSocket APIs"
 /// (`Integration$TimeoutInMillis`), which the create and update of an integration bound to
 /// that window, so the stored value is always a duration.
-fn deadline(integration: &Integration) -> Duration {
+pub(super) fn deadline(integration: &Integration) -> Duration {
     Duration::from_millis(u64::try_from(integration.timeout_in_millis.max(0)).unwrap_or_default())
 }

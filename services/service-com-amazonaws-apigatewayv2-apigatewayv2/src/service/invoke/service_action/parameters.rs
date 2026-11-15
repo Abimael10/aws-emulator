@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The PARAMETERS a first-class service-action integration hands the action it names:
-//! `Integration$RequestParameters` read as the mapping it is.
+//! The PARAMETER MAPPING of an HTTP api's integration, read as the mapping it is: the VALUE
+//! language `Integration$RequestParameters` and `Integration$ResponseParameters` are written
+//! in, and the parameters a first-class service-action integration hands the action it names.
 //!
 //! "For HTTP API integrations with a specified `integrationSubtype`, request parameters are
 //! a key-value map specifying parameters that are passed to `AWS_PROXY` integrations. You
@@ -10,9 +11,16 @@
 //! a parameter of the service action and its VALUE is either one mapping expression or a
 //! static value, and this module is the single reading of that value.
 //!
+//! `Integration$ResponseParameters` is the same value language applied to what the BACKEND
+//! answered — "the value can be a static value, or map to response data, stage variables, or
+//! context variables that are evaluated at runtime" — so the response path reads its values
+//! here too ([`Mapping::of_response`], the caller being
+//! [`super::super::response_parameters`]): one reading of the language, so the two legs of a
+//! mapping cannot disagree about what an expression names.
+//!
 //! The expressions, from the mapping-expression catalog API Gateway documents for parameter
-//! mapping (`$request.*`, `$context.*`, `$stageVariables.*`, and a static value for anything
-//! else):
+//! mapping (`$request.*`, `$response.*`, `$context.*`, `$stageVariables.*`, and a static
+//! value for anything else):
 //!
 //! | value | what it resolves to |
 //! |---|---|
@@ -22,9 +30,16 @@
 //! | `$request.path.<name>` | that path variable of the matched route key |
 //! | `$request.body` | the request body, as the text it arrived as |
 //! | `$request.body.<member>[.<member>]` | that member selected out of the JSON body |
+//! | `$response.header.<name>` | that header of the answer being transformed |
+//! | `$response.body` | that answer's body, as the text it is |
+//! | `$response.body.<member>[.<member>]` | that member selected out of the JSON answer |
 //! | `$context.<variable>` | that context variable of the invocation |
 //! | `$stageVariables.<name>` | that variable of the serving stage |
 //! | anything not starting with `$` | itself, as a static value |
+//!
+//! A `$response.…` expression names nothing at all for a mapping read with no answer in hand
+//! (every request-leg mapping), the way a `$request.…` one names nothing the request does not
+//! carry.
 //!
 //! A value that names something the request does not carry — an absent header, a member no
 //! body holds, a variable the stage does not state — resolves to NOTHING, and the parameter
@@ -54,8 +69,10 @@ const EXPRESSION_SIGIL: char = '$';
 /// How a mapping expression's parts are separated.
 const PART_SEPARATOR: char = '.';
 
-/// The three roots a mapping expression selects from.
+/// The three roots a mapping expression selects from, plus the fourth a RESPONSE mapping
+/// adds: the answer being transformed.
 const REQUEST_ROOT: &str = "request";
+const RESPONSE_ROOT: &str = "response";
 const CONTEXT_ROOT: &str = "context";
 const STAGE_VARIABLES_ROOT: &str = "stageVariables";
 
@@ -148,14 +165,7 @@ pub fn resolve(
     request: &ProxyRequest,
     invocation: &Invocation,
 ) -> Mapped {
-    let mut sources = Sources {
-        request,
-        invocation,
-        body_text: None,
-        body_document: None,
-        path_parameters: None,
-        context: None,
-    };
+    let mut mapping = Mapping::of(request, invocation);
     let mut resolved = BTreeMap::new();
     let mut unresolved = BTreeSet::new();
     for (parameter, value) in request_parameters {
@@ -163,7 +173,7 @@ pub fn resolve(
             None => {
                 resolved.insert(parameter.clone(), value.clone());
             }
-            Some(expression) => match sources.value_of(expression) {
+            Some(expression) => match mapping.expression(expression) {
                 Some(mapped) => {
                     resolved.insert(parameter.clone(), mapped);
                 }
@@ -179,6 +189,63 @@ pub fn resolve(
     }
 }
 
+/// The ANSWER a response-side mapping transforms, as its `$response.…` expressions read it.
+pub struct Answered<'a> {
+    /// The answer's headers, by lowercased name, as the backend answered them.
+    pub headers: &'a [(String, String)],
+    /// The answer's body, as the backend answered it.
+    pub body: &'a [u8],
+}
+
+/// One call's mapping values, resolved through the ONE reading of the language.
+///
+/// Held across the entries of one map rather than built per entry, because each SOURCE it
+/// reads is computed at most once ([`Sources`]): a mapping of many `$request.body.…` or
+/// `$response.body.…` entries then costs one parse of that body and not one per entry.
+pub struct Mapping<'i>(Sources<'i>);
+
+impl<'i> Mapping<'i> {
+    /// A mapping of the REQUEST leg: the call, with no answer to read.
+    pub fn of(request: &'i ProxyRequest, invocation: &'i Invocation) -> Self {
+        Self(Sources {
+            request,
+            invocation,
+            answered: None,
+            body_text: None,
+            body_document: None,
+            answered_document: None,
+            path_parameters: None,
+            context: None,
+        })
+    }
+
+    /// A mapping of the RESPONSE leg: the same call, with the answer being transformed.
+    pub fn of_response(
+        request: &'i ProxyRequest,
+        invocation: &'i Invocation,
+        answered: Answered<'i>,
+    ) -> Self {
+        let mut mapping = Self::of(request, invocation);
+        mapping.0.answered = Some(answered);
+        mapping
+    }
+
+    /// The value ONE entry maps for this call: a static value as the text it is, and a
+    /// mapping expression as what it names ([`Mapping::expression`]).
+    pub fn value_of(&mut self, value: &str) -> Option<String> {
+        match value.strip_prefix(EXPRESSION_SIGIL) {
+            None => Some(value.to_string()),
+            Some(expression) => self.expression(expression),
+        }
+    }
+
+    /// The value the expression `$<expression>` selects, or `None` when it names nothing this
+    /// call carries.
+    pub fn expression(&mut self, expression: &str) -> Option<String> {
+        self.0.value_of(expression)
+    }
+}
+
 /// What the mappings of one invoke read, each computed AT MOST ONCE however many entries name
 /// it: the request's body as text and as the document it is, the path variables the matched
 /// route key names, and the invocation's context variables.
@@ -189,11 +256,16 @@ pub fn resolve(
 struct Sources<'i> {
     request: &'i ProxyRequest,
     invocation: &'i Invocation,
+    /// The answer a RESPONSE-leg mapping transforms, and `None` for a request-leg one, whose
+    /// `$response.…` expressions name nothing.
+    answered: Option<Answered<'i>>,
     /// The body as the text it is, or `None` for a body that is not text; the outer `Option`
     /// is "not read yet".
     body_text: Option<Option<&'i str>>,
     /// The body as the JSON document it is, or `None` for a body that is not one.
     body_document: Option<Option<Value>>,
+    /// The ANSWER's body as the JSON document it is, read the same way and once.
+    answered_document: Option<Option<Value>>,
     /// The path variables of the matched route key.
     path_parameters: Option<BTreeMap<String, String>>,
     /// The `$context` variables of this invocation.
@@ -207,6 +279,7 @@ impl Sources<'_> {
         let (root, rest) = split_part(expression);
         match root {
             REQUEST_ROOT => self.request_value(rest?),
+            RESPONSE_ROOT => self.response_value(rest?),
             CONTEXT_ROOT => {
                 let variable = rest?;
                 context_value(variable, self.context())
@@ -242,6 +315,46 @@ impl Sources<'_> {
         }
     }
 
+    /// The value a `$response.…` expression selects out of the answer being transformed.
+    ///
+    /// `None` for a mapping read with no answer in hand, and for a part of the answer it does
+    /// not carry — an absent header, a member no body holds.
+    fn response_value(&mut self, expression: &str) -> Option<String> {
+        let (source, rest) = split_part(expression);
+        match source {
+            // A header is named case-insensitively (RFC 9110 §5.1).
+            HEADER_SOURCE => {
+                let name = rest?.to_ascii_lowercase();
+                self.answered
+                    .as_ref()?
+                    .headers
+                    .iter()
+                    .find(|(held, _)| held.eq_ignore_ascii_case(&name))
+                    .map(|(_, value)| value.clone())
+            }
+            BODY_SOURCE => match rest {
+                None => std::str::from_utf8(self.answered.as_ref()?.body)
+                    .ok()
+                    .map(str::to_string),
+                Some(member_path) => selected_member(self.answered_document()?, member_path),
+            },
+            _ => None,
+        }
+    }
+
+    /// The ANSWER's body as the JSON document it is, parsed once.
+    fn answered_document(&mut self) -> Option<&Value> {
+        if self.answered_document.is_none() {
+            let parsed = self
+                .answered
+                .as_ref()
+                .and_then(|answered| std::str::from_utf8(answered.body).ok())
+                .and_then(|text| serde_json::from_str::<Value>(text).ok());
+            self.answered_document = Some(parsed);
+        }
+        self.answered_document.as_ref()?.as_ref()
+    }
+
     /// The request's body as the text it is, read once.
     ///
     /// A body that is not text names no value at all — a mapped parameter is a string, and a
@@ -253,23 +366,11 @@ impl Sources<'_> {
             .get_or_insert_with(|| std::str::from_utf8(&request.body).ok())
     }
 
-    /// The member `member_path` names, selected out of the document the body is.
-    ///
-    /// A member no body holds names no value. A selected value that is not itself a string is
-    /// carried as the JSON it is, which is what makes `$request.body.detail` usable for a
-    /// parameter whose own content is a document.
+    /// The member `member_path` names, selected out of the document the body is
+    /// ([`selected_member`]).
     fn body_member(&mut self, member_path: &str) -> Option<String> {
         let document = self.body_document()?;
-        let mut selected = document;
-        for member in member_path.split(PART_SEPARATOR) {
-            selected = match selected {
-                // An array is indexed by position, which is how a member path reaches into a
-                // list the body carries.
-                Value::Array(entries) => entries.get(member.parse::<usize>().ok()?)?,
-                _ => selected.get(member)?,
-            };
-        }
-        text_of(selected)
+        selected_member(document, member_path)
     }
 
     /// The request's body as the JSON document it is, parsed once.
@@ -302,6 +403,24 @@ impl Sources<'_> {
                 .unwrap_or(Value::Null)
         })
     }
+}
+
+/// The member `member_path` names, selected out of `document`.
+///
+/// A member no document holds names no value. A selected value that is not itself a string is
+/// carried as the JSON it is, which is what makes `$request.body.detail` usable for a
+/// parameter whose own content is a document.
+fn selected_member(document: &Value, member_path: &str) -> Option<String> {
+    let mut selected = document;
+    for member in member_path.split(PART_SEPARATOR) {
+        selected = match selected {
+            // An array is indexed by position, which is how a member path reaches into a
+            // list the document carries.
+            Value::Array(entries) => entries.get(member.parse::<usize>().ok()?)?,
+            _ => selected.get(member)?,
+        };
+    }
+    text_of(selected)
 }
 
 /// The value a `$context.…` expression selects out of the stated context.
@@ -576,6 +695,64 @@ mod tests {
                 actual.as_deref(),
                 *expected,
                 "case {value:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: a RESPONSE-leg mapping reads the two sources only it has — the answer's headers
+    /// and the answer's body — beside every source the request leg reads, and a
+    /// `$response.…` expression names nothing at all for a mapping read with no answer.
+    #[test]
+    fn a_response_mapping_reads_the_answer_it_transforms() {
+        let (request, invocation) = invoke();
+        let headers = [
+            ("content-type".to_string(), "application/json".to_string()),
+            ("x-from-backend".to_string(), "yes".to_string()),
+        ];
+        let body = br#"{"origin":"lambda","detail":{"note":"deliberate"},"count":3}"#;
+        // Rows span the response sources and the forms that name nothing: a header under
+        // either casing, the whole body, a member, a nested member, a non-string member, and
+        // the parts no answer carries.
+        let rows: &[(&str, Option<&str>)] = &[
+            ("$response.header.x-from-backend", Some("yes")),
+            ("$response.header.X-From-Backend", Some("yes")),
+            ("$response.header.x-absent", None),
+            (
+                "$response.body",
+                Some(r#"{"origin":"lambda","detail":{"note":"deliberate"},"count":3}"#),
+            ),
+            ("$response.body.origin", Some("lambda")),
+            ("$response.body.detail.note", Some("deliberate")),
+            ("$response.body.count", Some("3")),
+            ("$response.body.absent", None),
+            ("$response.nothing", None),
+            // The request leg's own sources resolve for a response mapping too.
+            ("$request.header.x-source", Some("app.orders")),
+            ("$context.requestId", Some("request-1")),
+        ];
+        for (value, expected) in rows {
+            let mut mapping = Mapping::of_response(
+                &request,
+                &invocation,
+                Answered {
+                    headers: &headers,
+                    body,
+                },
+            );
+            let actual = mapping.value_of(value);
+            assert_eq!(
+                actual.as_deref(),
+                *expected,
+                "case {value:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+        // And with no answer in hand, a `$response.…` expression names nothing.
+        let mut request_leg = Mapping::of(&request, &invocation);
+        for (value, _) in rows.iter().filter(|(value, _)| value.starts_with("$response")) {
+            let actual = request_leg.value_of(value);
+            assert_eq!(
+                actual, None,
+                "case {value:?}: a request-leg mapping has no answer to read, got {actual:?}"
             );
         }
     }

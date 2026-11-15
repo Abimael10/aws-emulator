@@ -52,11 +52,15 @@ const REQUEST_PROTOCOL: &str = "HTTP/1.1";
 /// states it: the loopback address, which is where a client of this emulator reaches it
 /// from. `X-Forwarded-For`'s first entry is preferred when a proxy stated it, because that
 /// is the address the request came from.
-const LOOPBACK_SOURCE_IP: &str = "127.0.0.1";
+pub const LOOPBACK_SOURCE_IP: &str = "127.0.0.1";
 
 /// The request header a proxy states the original client's address in (the first entry is
 /// the client's).
-const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
+///
+/// `pub` because it is the one owner of that header's name for this data plane: the hop the
+/// gateway makes appends to it (`crate::service::invoke::backend_headers`) and the stage's
+/// access-log record reads it.
+pub const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
 
 /// The greedy suffix of a path-variable route-key segment (`{proxy+}`), which stands for
 /// "the remainder of the path" and so names one parameter holding every remaining segment.
@@ -228,6 +232,57 @@ pub struct Invocation {
     /// — carried into the event the same way, and `None` for a route no JWT authorizer
     /// fronts.
     pub admitted_jwt: Option<crate::service::jwt::Accepted>,
+}
+
+/// `context` as the values a `$context.<member>` reference reads, keyed by the member path
+/// its nesting gives it (`http.method`).
+///
+/// A member the call has no value for at all (`null`) is left out rather than written as the
+/// empty string, so a reference to it resolves to nothing the way a reference to a member the
+/// gateway does not report does.
+///
+/// Shared with the WEBSOCKET plane, whose own context is flattened the same way
+/// (`crate::service::websocket::event::template_context_of`): one reading of how a nested
+/// context member is named, for both planes.
+pub fn flattened_context(context: &Value) -> BTreeMap<String, String> {
+    let mut values = BTreeMap::new();
+    flattened("", context, MAX_CONTEXT_DEPTH, &mut values);
+    values
+}
+
+/// How deep [`flattened_context`] descends, which is how deep a context member path goes:
+/// the members the gateway reports are values, beside the MAPS one level inside the context
+/// (`http`, `identity`, and the `authorizer` an authorized call carries), whose own members
+/// are values — so nothing deeper is a member path a reference can name. Bounded rather than
+/// open because that authorizer context is a value a caller's own function returned.
+const MAX_CONTEXT_DEPTH: usize = 3;
+
+/// `value` written into `values` under the member path it is named by; see
+/// [`flattened_context`].
+fn flattened(path: &str, value: &Value, depth: usize, values: &mut BTreeMap<String, String>) {
+    match value {
+        Value::Object(members) => {
+            let Some(deeper) = depth.checked_sub(1) else {
+                return;
+            };
+            for (name, member) in members {
+                let nested = if path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{path}.{name}")
+                };
+                flattened(&nested, member, deeper, values);
+            }
+        }
+        Value::Null => {}
+        // A string's own characters, and every other scalar as the text its JSON spells.
+        Value::String(text) => {
+            values.insert(path.to_string(), text.clone());
+        }
+        other => {
+            values.insert(path.to_string(), other.to_string());
+        }
+    }
 }
 
 /// The event a Lambda proxy integration with `PayloadFormatVersion` `2.0` is invoked with.

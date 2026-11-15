@@ -25,6 +25,13 @@
 //! name the action's own parameters, not an operation on the message — and a WebSocket api's
 //! are "an integration request parameter name" mapped from a method request parameter. So
 //! neither carries an operation on a header at all, and neither is read here.
+//!
+//! What a mapping KEY names is read here for both of its readers: the write, which refuses a
+//! mapping on a header the gateway owns, and the data plane, which carries the mapping out
+//! ([`mapping_key`], [`mapped_header`], and the one operand that names the response's own
+//! status, [`STATUS_CODE_OPERAND`]). The VALUE half of the language is
+//! `crate::service::invoke::service_action::parameters`, the one reading of what an
+//! expression selects.
 
 use std::collections::BTreeMap;
 
@@ -66,11 +73,24 @@ pub const RESTRICTED_HEADER_PREFIXES: &[&str] = &["apigw-", "x-amz-", "x-amzn-"]
 
 /// The actions a mapping key may name: "action can be append, overwrite or remove"
 /// (`CreateIntegration$RequestParameters`).
-const MAPPING_ACTIONS: &[&str] = &["append", "overwrite", "remove"];
+pub const APPEND_ACTION: &str = "append";
+pub const OVERWRITE_ACTION: &str = "overwrite";
+pub const REMOVE_ACTION: &str = "remove";
+const MAPPING_ACTIONS: &[&str] = &[APPEND_ACTION, OVERWRITE_ACTION, REMOVE_ACTION];
 
 /// The operand prefix that makes a mapping key name a HEADER — the `header` of
 /// `<action>:<header|querystring|path>.<location>`.
 const HEADER_OPERAND: &str = "header.";
+
+/// The operand that makes a key name the RESPONSE's own status — the `statuscode` of
+/// `overwrite.statuscode`, the one key of this language that operates on something other
+/// than a header (`CreateIntegration$ResponseParameters`).
+pub const STATUS_CODE_OPERAND: &str = "statuscode";
+
+/// What separates a key's action from its operand. The member's own patterns spell the two
+/// keys differently — `<action>:<header>.<location>` and `overwrite.statuscode` — so either
+/// character ends the action and the rest of the key is the operand.
+const ACTION_SEPARATORS: [char; 2] = [':', '.'];
 
 /// How API Gateway words the refusal of a mapping that operates on a reserved header.
 ///
@@ -105,7 +125,7 @@ pub fn validate_integration_parameter_mappings(
     }
     let response_keys = response_parameters.values().flat_map(BTreeMap::keys);
     for key in request_parameters.keys().chain(response_keys) {
-        if let Some(header) = mapped_header(key) {
+        if let Some(header) = keyed_header(key) {
             if header_is_restricted(header) {
                 return Err(restricted_header_message(header));
             }
@@ -114,31 +134,51 @@ pub fn validate_integration_parameter_mappings(
     Ok(())
 }
 
-/// The header a mapping key operates on — the `<location>` of `<action>:header.<location>` —
-/// or `None` for a key that operates on something else (a query string, the path, the status
-/// code) or that is no mapping expression at all.
+/// The `(action, operand)` a mapping key names, or `None` for a key that names no operation
+/// on the message at all — a key whose action is none of [`MAPPING_ACTIONS`], and a value
+/// that is no mapping expression (a subtype parameter's name, a WebSocket integration's
+/// parameter).
 ///
-/// A key this does not read as a header operation is not refused here: what a mapping key
-/// may name beyond this is the mapping language's own question, and this module answers only
-/// which headers are reserved.
-fn mapped_header(key: &str) -> Option<&str> {
-    let (action, operand) = key.split_once(':')?;
+/// The action is compared case-insensitively and the operand carried through as written: what
+/// the operand names — a header, the status — is [`mapped_header`]'s and the caller's to read.
+pub fn mapping_key(key: &str) -> Option<(&str, &str)> {
+    let (action, operand) = key.trim().split_once(ACTION_SEPARATORS)?;
+    let action = action.trim();
+    let operand = operand.trim();
     if !MAPPING_ACTIONS
         .iter()
-        .any(|known| action.trim().eq_ignore_ascii_case(known))
+        .any(|known| action.eq_ignore_ascii_case(known))
     {
         return None;
     }
-    let operand = operand.trim();
-    // Read with `str::get` rather than a slice expression, so an operand shorter than the
-    // prefix — or one whose prefix length falls inside a multi-byte character — answers
-    // `None` instead of being indexed.
+    (!operand.is_empty()).then_some((action, operand))
+}
+
+/// The header an OPERAND operates on — the `<location>` of `header.<location>` — or `None`
+/// for an operand that names something else (a query string, the path, the status code).
+///
+/// The prefix is compared case-insensitively, because a key may be written in any case, while
+/// the header name is carried through as written: it is what a refusal echoes back, and the
+/// message matches a field name case-insensitively itself.
+pub fn mapped_header(operand: &str) -> Option<&str> {
     let prefix = operand.get(..HEADER_OPERAND.len())?;
     if !prefix.eq_ignore_ascii_case(HEADER_OPERAND) {
         return None;
     }
-    let header = operand.get(HEADER_OPERAND.len()..)?;
-    (!header.is_empty()).then_some(header)
+    operand
+        .get(HEADER_OPERAND.len()..)
+        .map(str::trim)
+        .filter(|header| !header.is_empty())
+}
+
+/// The header a mapping KEY operates on, or `None` for a key that operates on something else.
+///
+/// A key this does not read as a header operation is not refused here: what a mapping key
+/// may name beyond this is the mapping language's own question, and this module answers only
+/// which headers are reserved.
+fn keyed_header(key: &str) -> Option<&str> {
+    let (_, operand) = mapping_key(key)?;
+    mapped_header(operand)
 }
 
 /// Whether `header` is one of the headers a mapping may not operate on, read
@@ -182,9 +222,13 @@ mod tests {
             ("integration.request.header.authorization", None),
             ("rewrite:header.authorization", None),
             ("overwrite:header.", None),
+            // The other separator the member's own patterns use (`overwrite.statuscode`),
+            // which operates on the same header when the operand names one.
+            ("overwrite.header.authorization", Some("authorization")),
+            ("overwrite.statuscode", None),
         ];
         for (key, expected) in cases {
-            let read = mapped_header(key);
+            let read = keyed_header(key);
             assert_eq!(
                 read, *expected,
                 "case {key:?}: expected the mapped header {expected:?}, got {read:?}"

@@ -109,6 +109,10 @@ pub mod dispatch;
 pub mod endpoint_http;
 pub mod event;
 pub mod integration;
+// What a NON-PROXY (`AWS`) integration of a WebSocket route relays to its backend and reads
+// back: the request template the call selects, the pass-through behaviour of a call no
+// template keys, and the response template the backend's answer is mapped through.
+pub mod non_proxy;
 // The DATA MAPPING `Integration$RequestParameters` applies to a WebSocket call, which the
 // event above states after it: the member is a mapping from a request parameter of the call
 // (or a quoted static value) onto an integration request parameter, and this module is the
@@ -660,6 +664,8 @@ pub async fn serve_with_transport<Eng: Send + Sync + 'static>(
                     "refusing a WebSocket opening handshake: the connection request's \
                      integration produced no reply"
                 );
+                // The client reads the gateway's own sentence for a connection request whose
+                // route produced no reply, whichever reason it was.
                 return json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None);
             }
         }

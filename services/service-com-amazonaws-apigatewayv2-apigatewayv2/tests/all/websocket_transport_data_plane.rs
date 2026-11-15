@@ -43,6 +43,11 @@ use crate::api_lifecycle::{as_str, call, emulator};
 /// and bounded so a case that will never be answered fails instead of hanging the suite.
 const FRAME_DEADLINE: Duration = Duration::from_secs(10);
 
+/// How long a case that MUST be answered keeps looking ([`exchanged_reply`]): generous, so a
+/// function whose runtime is starting on a loaded host still answers inside it. It bounds no
+/// behaviour any case asserts on.
+const REPLY_DEADLINE: Duration = Duration::from_secs(120);
+
 /// The status a completed handshake carries (RFC 6455 §4.1).
 const SWITCHING_PROTOCOLS: u16 = 101;
 
@@ -292,6 +297,30 @@ pub(crate) async fn exchange(
         Ok(Some(Err(error))) => panic!("case {case:?}: the socket failed: {error}"),
         Ok(None) => panic!("case {case:?}: the socket closed instead of answering"),
         Err(_elapsed) => None,
+    }
+}
+
+/// [`exchange`] for a case that MUST be answered: the message is sent again while no frame
+/// has arrived, until one does or [`REPLY_DEADLINE`] passes.
+///
+/// The first invocation of a function starts its runtime, and on a loaded host that start can
+/// take longer than one exchange waits — a wait that is not the limit any case here tests, so
+/// it is given generous room. The wait is for the api's REPLY, a condition, and nothing
+/// asserts on the clock.
+pub(crate) async fn exchanged_reply(
+    case: &str,
+    socket: &mut ClientSocket,
+    message: &str,
+) -> String {
+    let deadline = tokio::time::Instant::now() + REPLY_DEADLINE;
+    loop {
+        if let Some(reply) = exchange(case, socket, message).await {
+            return reply;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "case {case:?}: the api must answer the message {message:?}"
+        );
     }
 }
 

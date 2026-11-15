@@ -113,6 +113,12 @@ pub enum Unserved {
     /// The backend ANSWERED and its answer is one the gateway cannot read as the reply a
     /// proxy integration owes.
     UnreadableReply(String),
+    /// The call carries a content type this integration maps no request template for, and its
+    /// `PassthroughBehavior` does not pass an unmapped call through, so the backend was never
+    /// reached: "NEVER rejects unmapped content types" (`Integration$PassthroughBehavior`).
+    /// The client reads the gateway's own `Internal server error` frame for it, the answer
+    /// every call whose route produced no reply gets on this data plane.
+    UnsupportedMediaType(String),
 }
 
 impl Unserved {
@@ -132,6 +138,7 @@ impl Unserved {
             Self::NoIntegration
             | Self::NoSelectableResponse
             | Self::Unperformable(_)
+            | Self::UnsupportedMediaType(_)
             | Self::FunctionError(_) => CallOutcome::ExecutionError,
         }
     }
@@ -249,14 +256,14 @@ pub fn selected_route_key(api: &Api, body: &str) -> Option<String> {
     let reference = crate::state::selection_expression_references(&api.route_selection_expression)
         .into_iter()
         .next()?;
-    // The NAMESPACE is read case-insensitively, the way the writer of the member reads it,
-    // and the FIELD is read exactly as written, because a JSON member name is
-    // case-sensitive. Both halves are taken fallibly, so an expression whose bytes do not
-    // split there names no field rather than panicking on a caller's value.
-    let prefix = crate::state::WEBSOCKET_ROUTE_SELECTION_REFERENCE_PREFIX;
-    let namespace = reference.get(..prefix.len())?;
-    let field = reference.get(prefix.len()..).filter(|field| !field.is_empty())?;
-    if !namespace.eq_ignore_ascii_case(prefix) {
+    // WHICH part of the call the reference names is the one reading of that set
+    // (`crate::state::selection_reference`): the namespace is read case-insensitively, the
+    // way the writer of the member reads it, and the FIELD exactly as written, because a JSON
+    // member name is case-sensitive. A WEBSOCKET api's expression names a field of the BODY
+    // (`crate::state::WEBSOCKET_ROUTE_SELECTION_REFERENCE_PREFIX`, the rule every writer of
+    // the member is held to), so a reference naming anything else selects nothing.
+    let (namespace, field) = crate::state::selection_reference(&reference)?;
+    if namespace != crate::state::SelectionNamespace::RequestBody {
         return None;
     }
     let document: ::serde_json::Value = ::serde_json::from_str(body).ok()?;
@@ -380,7 +387,7 @@ pub fn mock_reply(
 /// map's own fallback key rather than a media type the client named; a map holding one
 /// template under some other key is still that integration's one template, so it is the one
 /// rendered.
-fn keyed_template(templates: &BTreeMap<String, String>) -> Option<&str> {
+pub(super) fn keyed_template(templates: &BTreeMap<String, String>) -> Option<&str> {
     if let Some(keyed) = templates
         .get(DEFAULT_SELECTION_KEY)
         .or_else(|| templates.get(JSON_TEMPLATE_KEY))
@@ -407,7 +414,10 @@ fn keyed_template(templates: &BTreeMap<String, String>) -> Option<&str> {
 ///
 /// A template carrying no reference IS the body and renders to itself, which is what a
 /// `MOCK` integration's `{"statusCode": 200}` is.
-fn rendered_template(template: &str, call: Option<TemplateCall<'_>>) -> Result<String, Unserved> {
+pub(super) fn rendered_template(
+    template: &str,
+    call: Option<TemplateCall<'_>>,
+) -> Result<String, Unserved> {
     let inputs = ::service_com_amazonaws_apigateway_backplanecontrolservice::service::mapping_template::TemplateInputs {
         payload: call.and_then(|call| call.body).map(|body| body.as_bytes().to_vec()),
         context: call.map(|call| call.context.clone()).unwrap_or_default(),
@@ -439,7 +449,7 @@ fn status_code_of(rendered: &str) -> Option<String> {
 /// A patterned key is tried first, in key order so the choice is stable whatever order the
 /// map yields, and `$default` is the fallback — which is also the only key a call that
 /// produced NO status can select.
-fn selected_integration_response<'i>(
+pub(super) fn selected_integration_response<'i>(
     integration: &'i Integration,
     status: Option<&str>,
 ) -> Option<&'i IntegrationResponse> {

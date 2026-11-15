@@ -177,6 +177,9 @@ pub(crate) mod lambda;
 pub(crate) mod proxy_event;
 pub(crate) mod proxy_response;
 pub(crate) mod request_authorizer;
+/// How an integration's own `ResponseParameters` transform the response its backend
+/// answered, before the client reads it.
+mod response_parameters;
 mod service_action;
 
 use std::collections::BTreeMap;
@@ -261,6 +264,14 @@ const PAYLOAD_TOO_LARGE_MESSAGE: &str = "Request Entity Too Large";
 /// The request header that states how many bytes the payload has (RFC 9110 §8.6), read
 /// only when the body itself is not in memory to be measured.
 const CONTENT_LENGTH_HEADER: &str = "content-length";
+
+/// The request header that carries the chain of addresses a request was forwarded through,
+/// the leftmost being the client's, which this gateway's own hop appends to
+/// ([`backend_headers`]). Re-exported from the one owner of that header's name.
+use proxy_event::FORWARDED_FOR_HEADER;
+
+/// How that chain separates its elements: one comma-separated field value (RFC 9110 §5.3).
+const FORWARDED_FOR_SEPARATOR: &str = ", ";
 
 /// The status a caller is sent to an upstream with: the redirect that preserves the
 /// request's method and body (RFC 7231 §6.4.7), so the client repeats the request the
@@ -1742,7 +1753,7 @@ fn dispatch(
             raw_path: endpoint_path(stage, route_path),
             route_path: route_path.to_string(),
             raw_query_string: query_of(req.uri()).unwrap_or_default().to_string(),
-            headers: request_headers(req),
+            headers: backend_headers(req),
             query_parameters: joined_query_parameters(req.uri()),
             body: req
                 .body()
@@ -1808,6 +1819,37 @@ fn request_headers(req: &RtRequest) -> BTreeMap<String, String> {
             .or_insert_with(|| value.to_string());
     }
     headers
+}
+
+/// The request as the BACKEND sees it: every header the client sent ([`request_headers`]),
+/// with the one header the gateway's own hop writes onto the message.
+///
+/// A gateway is an intermediary, so the request it relays carries the chain of the hops it
+/// came through: the client's `X-Forwarded-For` is PRESERVED and the address this hop
+/// observed the request FROM is appended to it, which is what makes the backend's last
+/// element the peer the gateway actually read the request from rather than whatever the
+/// client claimed (RFC 7239 §4 states the same ordering for `Forwarded`: "the leftmost node
+/// is the node closest to the client"). A request carrying no chain gets one holding that
+/// address alone. Every other header the client sent — `Via` among them — is relayed exactly
+/// as it arrived.
+fn backend_headers(req: &RtRequest) -> BTreeMap<String, String> {
+    let mut headers = request_headers(req);
+    let chain = match headers.get(FORWARDED_FOR_HEADER).map(String::as_str) {
+        Some(claimed) if !claimed.trim().is_empty() => {
+            format!("{claimed}{FORWARDED_FOR_SEPARATOR}{}", observed_peer())
+        }
+        _ => observed_peer().to_string(),
+    };
+    headers.insert(FORWARDED_FOR_HEADER.to_string(), chain);
+    headers
+}
+
+/// The address this gateway OBSERVED the request from, which is the one it appends to the
+/// forwarded chain: a client reaches this emulator over its own loopback front door, so that
+/// is the peer the connection was read from ([`proxy_event::LOOPBACK_SOURCE_IP`], the same
+/// address every other reading of the caller's address reports).
+fn observed_peer() -> &'static str {
+    proxy_event::LOOPBACK_SOURCE_IP
 }
 
 /// The host of the api's OWN default endpoint — `{api-id}.execute-api.{region}.amazonaws.com`

@@ -43,8 +43,9 @@ pub(crate) const FIRST_ERROR_STATUS: u16 = 400;
 const USER_AGENT_HEADER: &str = "user-agent";
 
 /// The request header the address the request came from is recorded in where it reached the
-/// emulator through a forwarder.
-const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
+/// emulator through a forwarder — the one owner of that header's name
+/// ([`super::proxy_event::FORWARDED_FOR_HEADER`]).
+use super::proxy_event::FORWARDED_FOR_HEADER;
 
 /// The address a request that no forwarder recorded an address for came from: this emulator
 /// is reached in process or over the loopback interface, so that is where such a request

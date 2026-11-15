@@ -1269,3 +1269,15 @@ mod zz_probe_whole_emulator;
 // service crate's `tests/all.rs`. An inner attribute is legal only before the first item,
 // so the one this target needs stands here rather than in the list.
 #![allow(clippy::doc_lazy_continuation)]
+// Single integration-test target for the router: this header, then one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`, sorted by
+// name, and no other line. Put a new suite at `tests/all/<name>.rs` and insert its pair
+// below, in order; what it covers belongs in that suite's own module doc, and a note about
+// this file belongs in `all/appended_notes.rs`.
+// EVERY comment here is an ORDINARY `//` one, this block included: an inner doc comment
+// (`//!`) is legal only before the first item, so with none anywhere in the file no merge of
+// two landings can leave one past the first item, where it is `E0753` and compiles no suite
+// of this target. The suites that pin this shape — `all/all_rs_is_a_canonical_declaration_list.rs`,
+// `all/all_rs_declares_each_suite_once.rs`, `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/declaration_roots_are_canonical_and_complete.rs` — state the rules, so they are not
+// restated here.

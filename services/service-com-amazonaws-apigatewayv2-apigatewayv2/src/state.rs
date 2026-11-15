@@ -4700,6 +4700,14 @@ pub use selection_expression::WEBSOCKET_ROUTE_SELECTION_REFERENCE_PREFIX;
 /// [`selection_expression::selection_expression_references`].
 pub use selection_expression::selection_expression_references;
 
+/// A selection expression EVALUATED against one call — see
+/// [`selection_expression::evaluated_selection_expression`].
+pub use selection_expression::evaluated_selection_expression;
+
+/// Which namespace one variable reference names, and the name inside it — see
+/// [`selection_expression::selection_reference`].
+pub use selection_expression::{selection_reference, SelectionNamespace};
+
 /// The sentence a selection expression naming an unevaluated variable is refused with —
 /// see [`selection_expression::unexpected_selection_variable_message`].
 pub use selection_expression::unexpected_selection_variable_message;

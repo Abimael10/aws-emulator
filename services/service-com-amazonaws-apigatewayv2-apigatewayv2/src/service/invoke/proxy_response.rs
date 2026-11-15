@@ -11,7 +11,8 @@
 //!   `isBase64Encoded` — and, for a function that returns valid JSON naming no
 //!   `statusCode`, INFERS one: "if your function returns valid JSON and doesn't return a
 //!   statusCode, API Gateway assumes a 200 status code, a content-type of application/json,
-//!   and the function's response as the body";
+//!   and the function's response as the body" — the response ITSELF as the body, so a
+//!   function that returned a JSON string answers that string's own text;
 //! * `1.0` admits the structured response only — the format a REST api's proxy integration
 //!   uses, with `multiValueHeaders` beside `headers` — and infers nothing, so a function
 //!   that answers anything else produced no response the gateway can map.
@@ -19,7 +20,11 @@
 //! A response the format does not admit is NOT patched into one: it is reported as the
 //! "integration produced no response" class ([`Malformed`]), which the caller is answered
 //! the gateway's own status for. Inventing a status or a body for it would hand the caller
-//! an answer no function gave.
+//! an answer no function gave. That holds for the TYPE of every member of the structured
+//! response as much as for the shape of the whole ([`TYPED_MEMBERS`]): `body` is a string
+//! member, `headers` an object, `cookies` a list, `isBase64Encoded` a flag — a function that
+//! named one as something else answered no proxy response, and rendering its value as the
+//! member's type would answer the caller something no handler sent.
 //!
 //! Both directions of the base64 flag are the same rule as the request's: an event is a
 //! JSON document, so a payload that is not text travels encoded — "isBase64Encoded: set to
@@ -65,6 +70,77 @@ struct Mapped {
     body: Vec<u8>,
 }
 
+/// Every member a STRUCTURED proxy response carries, with the JSON type the format
+/// documents for it: "statusCode", "headers", "multiValueHeaders", "cookies", "body" and
+/// "isBase64Encoded". `statusCode` is read by [`status_of`], which admits the string spelling
+/// a dynamically typed runtime formats it as, so it is not in this table.
+///
+/// A response naming one of these with a value of another type is NOT a proxy response: the
+/// gateway has no response to map ([`Malformed`]), which is what makes a handler returning a
+/// structured object with, say, a JSON object where the `body` string belongs fail the
+/// request instead of answering the object's rendering as if the handler had sent it.
+const TYPED_MEMBERS: [(&str, MemberType); 5] = [
+    ("headers", MemberType::Object),
+    ("multiValueHeaders", MemberType::Object),
+    ("cookies", MemberType::Array),
+    ("body", MemberType::String),
+    ("isBase64Encoded", MemberType::Boolean),
+];
+
+/// The JSON type one member of a structured proxy response is documented to carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberType {
+    String,
+    Object,
+    Array,
+    Boolean,
+}
+
+impl MemberType {
+    /// Whether `value` is of this type.
+    fn admits(self, value: &Value) -> bool {
+        match self {
+            Self::String => value.is_string(),
+            Self::Object => value.is_object(),
+            Self::Array => value.is_array(),
+            Self::Boolean => value.is_boolean(),
+        }
+    }
+
+    /// The type's own name, for the sentence a refusal is logged with.
+    fn named(self) -> &'static str {
+        match self {
+            Self::String => "a string",
+            Self::Object => "an object",
+            Self::Array => "an array",
+            Self::Boolean => "a boolean",
+        }
+    }
+}
+
+/// `Ok(())`, or why `document` is no structured proxy response: a member it names carries a
+/// value of another type than the format documents for it ([`TYPED_MEMBERS`]).
+///
+/// A member the response does not name at all, and one it names `null`, is a member it did
+/// not set — both formats read those as absent — so neither is weighed here.
+fn well_typed(document: &Value) -> Result<(), Malformed> {
+    for (member, expected) in TYPED_MEMBERS {
+        let Some(value) = document.get(member).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        if !expected.admits(value) {
+            return Err(Malformed {
+                reason: format!(
+                    "the function's response names {member} as something other than {}, so it \
+                     is no proxy response",
+                    expected.named()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The route's response for `payload`, the bytes the function returned, under
 /// `payload_format`.
 pub fn map(payload: &[u8], payload_format: &str) -> Result<RtResponse, Malformed> {
@@ -87,17 +163,22 @@ fn mapped_2_0(payload: &[u8]) -> Result<Mapped, Malformed> {
         .is_some_and(|members| members.contains_key("statusCode"));
     if !names_status {
         // The inferred response: "API Gateway assumes a 200 status code, a content-type of
-        // application/json, and the function's response as the body". The body is the
-        // function's own document, rendered as the JSON it is.
+        // application/json, and the function's response as the body". The function's
+        // response IS the body: a JSON string's own characters — the text the handler
+        // returned, not that text re-quoted — and every other value as the JSON it is.
         return Ok(Mapped {
             status: INFERRED_STATUS,
             headers: vec![(
                 CONTENT_TYPE_HEADER.to_string(),
                 JSON_CONTENT_TYPE.to_string(),
             )],
-            body: serde_json::to_vec(&document).unwrap_or_default(),
+            body: match &document {
+                Value::String(text) => text.clone().into_bytes(),
+                other => serde_json::to_vec(other).unwrap_or_default(),
+            },
         });
     }
+    well_typed(&document)?;
     let status = status_of(&document)?;
     let mut headers = headers_of(&document);
     for cookie in list_of(&document, "cookies") {
@@ -126,6 +207,7 @@ fn mapped_1_0(payload: &[u8]) -> Result<Mapped, Malformed> {
                 .to_string(),
         });
     }
+    well_typed(&document)?;
     let status = status_of(&document)?;
     let mut headers = headers_of(&document);
     // `multiValueHeaders` names a header that is sent more than once, which is how this
@@ -218,9 +300,14 @@ fn body_of(document: &Value) -> Result<Vec<u8>, Malformed> {
     let body = match document.get("body") {
         None | Some(Value::Null) => return Ok(Vec::new()),
         Some(Value::String(text)) => text.clone(),
-        // A body that is not a string is the function's own document; a handler that
-        // returns one means its rendering, which is what AWS sends on.
-        Some(other) => other.to_string(),
+        // A `body` of any other type is refused before this ([`well_typed`]): the proxy
+        // response's body member is a string, and rendering another value as one would
+        // answer the caller something no response named.
+        Some(other) => {
+            return Err(Malformed {
+                reason: format!("the function's response names a body that is no string: {other}"),
+            })
+        }
     };
     if !encoded {
         return Ok(body.into_bytes());
@@ -353,7 +440,7 @@ mod tests {
                 200,
                 r#"{"ok":true}"#,
             ),
-            ("a JSON string, which is inferred", r#""hello""#, 200, r#""hello""#),
+            ("a JSON string, which is inferred", r#""hello""#, 200, "hello"),
             ("a JSON number, which is inferred", "42", 200, "42"),
         ];
         for (case, payload, expected_status, expected_body) in cases {

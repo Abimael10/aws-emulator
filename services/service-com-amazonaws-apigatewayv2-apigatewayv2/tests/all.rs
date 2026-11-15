@@ -113,6 +113,8 @@ mod http_api_cors_data_plane;
 mod http_api_event_path;
 #[path = "all/http_api_integration_fault_status.rs"]
 mod http_api_integration_fault_status;
+#[path = "all/http_api_integration_response_mapping.rs"]
+mod http_api_integration_response_mapping;
 #[path = "all/http_api_jwt_claims_reach_the_integration.rs"]
 mod http_api_jwt_claims_reach_the_integration;
 #[path = "all/http_api_jwt_data_plane.rs"]
@@ -337,12 +339,14 @@ mod websocket_error_class_exclusivity;
 mod websocket_handshake_data_plane;
 #[path = "all/websocket_lambda_routes.rs"]
 mod websocket_lambda_routes;
-#[path = "all/websocket_stage_metrics.rs"]
-mod websocket_stage_metrics;
 #[path = "all/websocket_message_reassembly.rs"]
 mod websocket_message_reassembly;
 #[path = "all/websocket_message_refusals.rs"]
 mod websocket_message_refusals;
+#[path = "all/websocket_non_proxy_integration.rs"]
+mod websocket_non_proxy_integration;
+#[path = "all/websocket_stage_metrics.rs"]
+mod websocket_stage_metrics;
 #[path = "all/websocket_stage_upgrade_counts.rs"]
 mod websocket_stage_upgrade_counts;
 #[path = "all/websocket_tls_transport.rs"]

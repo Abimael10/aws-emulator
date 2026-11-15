@@ -23,6 +23,9 @@
 //!
 //! * a DENY is `403` `{"message":"Forbidden"}` — the authorizer ran and said no, which AWS
 //!   answers the opening handshake with before any route Lambda runs;
+//! * an authorizer that RAISED the error signalling an unauthenticated caller is `401`
+//!   `{"message":"Unauthorized"}`, the same refusal a handshake whose identity sources were
+//!   not all present earns;
 //! * an authorizer whose decision could not be obtained at all is `500`
 //!   `{"message":"Internal server error"}`, a fault of the api's configuration rather than
 //!   of the client.
@@ -94,6 +97,19 @@ pub async fn decided(
             Err((
                 crate::service::data_plane::FORBIDDEN_STATUS,
                 crate::service::data_plane::FORBIDDEN_MESSAGE,
+            ))
+        }
+        Err(Refused::Unauthenticated) => {
+            ::tracing::info!(
+                api_id = %connection.api_id,
+                stage = %connection.stage_name,
+                authorizer_id = %authorizer.authorizer_id,
+                "refusing a WebSocket opening handshake: the connection request's authorizer \
+                 signalled an unauthenticated caller"
+            );
+            Err((
+                crate::service::data_plane::UNAUTHORIZED_STATUS,
+                crate::service::data_plane::UNAUTHORIZED_MESSAGE,
             ))
         }
         Err(Refused::Unplaceable) => Err((

@@ -67,6 +67,12 @@
 //! names, which is what lets one api reach a different backend per stage. A reference the
 //! stage carries no variable for names no backend at all, so it is the "produced no
 //! response" class rather than a call to a URI carrying an unresolved reference.
+//!
+//! The answer a BACKEND gave is then transformed by the integration's own
+//! `ResponseParameters` before the client reads it ([`response_parameters`]) — "you use
+//! response parameters to transform the HTTP response from a backend integration before
+//! returning the response to clients" — which is why that step is applied where a backend
+//! answered and not to a refusal the gateway itself decided.
 
 /// The serving stage's throttle, metered around the answer this step produces.
 mod throttle;
@@ -81,6 +87,7 @@ use super::lambda::{self, Unreached};
 use super::proxy_event::{self, Invocation, ProxyRequest};
 use super::proxy_response;
 use super::request_authorizer::{self, Outcome};
+use super::response_parameters;
 use super::service_action::{self, Unperformed};
 use super::{redirect, INTERNAL_MESSAGE};
 use crate::state::route_throttle::Limits;
@@ -358,7 +365,16 @@ async fn lambda_proxy(
         return json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None);
     }
     match proxy_response::map(&ran.payload, &payload_format) {
-        Ok(response) => response,
+        // The backend ANSWERED, so the integration's own `ResponseParameters` transform that
+        // answer before the client reads it ([`response_parameters`]).
+        Ok(response) => response_parameters::transformed(
+            response,
+            &integration.response_parameters,
+            &response_parameters::Call {
+                request: &dispatch.request,
+                invocation: &dispatch.invocation,
+            },
+        ),
         Err(malformed) => {
             ::tracing::warn!(
                 api_id = %dispatch.request.api_id,

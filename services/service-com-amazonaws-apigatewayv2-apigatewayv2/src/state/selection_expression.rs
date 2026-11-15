@@ -53,14 +53,83 @@ pub fn unexpected_selection_variable_message(reference: &str) -> String {
 /// escaped `$` begins no reference. The reference is returned AS WRITTEN — neither
 /// lowercased nor trimmed — because it is what a refusal echoes back.
 pub fn selection_expression_references(expression: &str) -> Vec<String> {
+    pieces(expression)
+        .into_iter()
+        .filter_map(|piece| match piece {
+            Piece::Reference(reference) => Some(reference),
+            Piece::Literal(_) => None,
+        })
+        .collect()
+}
+
+/// `expression` EVALUATED: its literal text, with every variable reference it makes replaced
+/// by the value `value` gives that reference.
+///
+/// The same reading of the grammar as [`selection_expression_references`] — one scanner
+/// ([`pieces`]) — so what a refusal echoes back and what the data plane evaluates cannot
+/// disagree about where a reference begins and ends. An escaped character is a literal, which
+/// is what makes `\$default` evaluate to the key `$default`.
+///
+/// `None` when a reference has no value for this call: the expression then selects nothing
+/// rather than a key spelled with a hole in it. `None` as well for an expression making more
+/// than [`MAX_EVALUATED_REFERENCES`] references, which is a bound on the work one call does
+/// and not a rule about the grammar.
+pub fn evaluated_selection_expression(
+    expression: &str,
+    value: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let mut evaluated = String::new();
+    let mut resolved = 0_usize;
+    for piece in pieces(expression) {
+        match piece {
+            Piece::Literal(text) => evaluated.push_str(&text),
+            Piece::Reference(reference) => {
+                resolved += 1;
+                if resolved > MAX_EVALUATED_REFERENCES {
+                    return None;
+                }
+                evaluated.push_str(&value(&reference)?);
+            }
+        }
+    }
+    Some(evaluated)
+}
+
+/// How many references one evaluation resolves.
+///
+/// A selection expression names a KEY — the documented ones name one part of the request
+/// (`$request.body.action`) — while its own length is not bounded by the member's shape, so
+/// the bound keeps the work ONE call does independent of how long an expression was stored:
+/// an expression past it selects nothing instead of being evaluated.
+const MAX_EVALUATED_REFERENCES: usize = 32;
+
+/// One piece of a selection expression: literal text, or a variable reference.
+enum Piece {
+    Literal(String),
+    Reference(String),
+}
+
+/// `expression` split into the pieces the grammar makes of it, in order; see
+/// [`selection_expression_references`] for the grammar this reads.
+///
+/// The ONE scanner of a selection expression, so every reader of one — the refusal that
+/// echoes a reference back, the route a message selects, the request template a WebSocket
+/// call selects — reads the same text the same way.
+fn pieces(expression: &str) -> Vec<Piece> {
     let characters: Vec<char> = expression.chars().collect();
-    let mut references = Vec::new();
+    let mut pieces = Vec::new();
+    let mut literal = String::new();
     let mut index = 0;
     while index < characters.len() {
         match characters[index] {
             // An escaped character is a literal: this is how a selection key beginning
             // with `$` is written.
-            '\\' => index += 2,
+            '\\' => {
+                if let Some(escaped) = characters.get(index + 1) {
+                    literal.push(*escaped);
+                }
+                index += 2;
+            }
             '$' => {
                 index += 1;
                 let braced = characters.get(index) == Some(&'{');
@@ -78,13 +147,78 @@ pub fn selection_expression_references(expression: &str) -> Vec<String> {
                     })
                     .collect();
                 index += reference.chars().count() + usize::from(braced);
-                references.push(reference);
+                if !literal.is_empty() {
+                    pieces.push(Piece::Literal(std::mem::take(&mut literal)));
+                }
+                pieces.push(Piece::Reference(reference));
             }
-            _ => index += 1,
+            character => {
+                literal.push(character);
+                index += 1;
+            }
         }
     }
-    references
+    if !literal.is_empty() {
+        pieces.push(Piece::Literal(literal));
+    }
+    pieces
 }
+
+/// WHICH namespace a variable reference names, with the name it names inside it.
+///
+/// The one reading of the namespaces a selection expression may read
+/// ([`SELECTION_EXPRESSION_VARIABLES`]): the namespace is compared case-insensitively, the
+/// way every writer of a selection expression compares it, and the name is read exactly as
+/// written, because a JSON member name, a context member and a stage variable are all
+/// case-sensitive keys. `None` for a reference naming no namespace this service evaluates,
+/// and for one naming a namespace with nothing inside it.
+pub fn selection_reference(reference: &str) -> Option<(SelectionNamespace, &str)> {
+    for (prefix, namespace) in [
+        (
+            WEBSOCKET_ROUTE_SELECTION_REFERENCE_PREFIX,
+            SelectionNamespace::RequestBody,
+        ),
+        (CONTEXT_REFERENCE_PREFIX, SelectionNamespace::Context),
+        (
+            STAGE_VARIABLE_REFERENCE_PREFIX,
+            SelectionNamespace::StageVariables,
+        ),
+    ] {
+        // Read with `str::get` rather than a slice expression, and FALL THROUGH on a
+        // reference shorter than this prefix (or one whose prefix length falls inside a
+        // multi-byte character): such a reference may still name one of the prefixes below,
+        // which is what `$context.id` does.
+        let Some(head) = reference.get(..prefix.len()) else {
+            continue;
+        };
+        if !head.eq_ignore_ascii_case(prefix) {
+            continue;
+        }
+        return reference
+            .get(prefix.len()..)
+            .filter(|name| !name.is_empty())
+            .map(|name| (namespace, name));
+    }
+    None
+}
+
+/// The part of a call a variable reference names ([`selection_reference`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionNamespace {
+    /// A FIELD of the request body, which is what a WebSocket api's expressions read
+    /// ([`WEBSOCKET_ROUTE_SELECTION_REFERENCE_PREFIX`]).
+    RequestBody,
+    /// A `$context` member the gateway reports about the call.
+    Context,
+    /// A variable of the serving stage.
+    StageVariables,
+}
+
+/// The two namespaces beside the message body a selection expression may read, lowercased
+/// for comparison — the `context` and `stagevariables` of
+/// [`SELECTION_EXPRESSION_VARIABLES`], as a reference spells the start of a path into each.
+const CONTEXT_REFERENCE_PREFIX: &str = "context.";
+const STAGE_VARIABLE_REFERENCE_PREFIX: &str = "stagevariables.";
 
 /// `Ok(())`, or why this selection expression cannot be stored — the message for the
 /// operation's `BadRequestException`.
@@ -158,4 +292,92 @@ pub fn validate_route_selection_expression(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reference_names_the_namespace_it_opens_with_and_the_name_inside_it() {
+        // Rows span the three namespaces this service evaluates, the casing a reference may
+        // be written in, references SHORTER than the longest prefix (which must still be
+        // read), a namespace with nothing inside it, and a reference naming no namespace.
+        let cases: &[(&str, Option<(SelectionNamespace, &str)>)] = &[
+            (
+                "request.body.action",
+                Some((SelectionNamespace::RequestBody, "action")),
+            ),
+            (
+                "Request.Body.action",
+                Some((SelectionNamespace::RequestBody, "action")),
+            ),
+            ("context.id", Some((SelectionNamespace::Context, "id"))),
+            (
+                "context.identity.sourceIp",
+                Some((SelectionNamespace::Context, "identity.sourceIp")),
+            ),
+            (
+                "stageVariables.x",
+                Some((SelectionNamespace::StageVariables, "x")),
+            ),
+            // Nothing inside the namespace, and namespaces this service does not evaluate.
+            ("request.body.", None),
+            ("context.", None),
+            ("request.header.token", None),
+            ("nothing.at.all", None),
+            ("", None),
+        ];
+        for (reference, expected) in cases {
+            let read = selection_reference(reference);
+            assert_eq!(
+                read, *expected,
+                "case {reference:?}: expected {expected:?}, got {read:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_expression_evaluates_its_literals_and_the_references_it_has_values_for() {
+        let value = |reference: &str| match reference {
+            "request.body.action" => Some("send".to_string()),
+            "context.stage" => Some("prod".to_string()),
+            _ => None,
+        };
+        // Rows span what the grammar makes of an expression: an escaped literal key, each
+        // spelling of a reference, a reference beside literal text, several references, and a
+        // reference this call has no value for.
+        let cases: &[(&str, Option<&str>)] = &[
+            (r"\$default", Some("$default")),
+            ("$request.body.action", Some("send")),
+            ("${request.body.action}", Some("send")),
+            ("route-$context.stage", Some("route-prod")),
+            ("$context.stage/$request.body.action", Some("prod/send")),
+            ("$request.body.absent", None),
+            ("plain", Some("plain")),
+        ];
+        for (expression, expected) in cases {
+            let evaluated = evaluated_selection_expression(expression, &value);
+            assert_eq!(
+                evaluated.as_deref(),
+                *expected,
+                "case {expression:?}: expected {expected:?}, got {evaluated:?}"
+            );
+        }
+        // And the bound on the work one evaluation does: an expression at it evaluates, one
+        // past it selects nothing.
+        let many = "$context.stage".repeat(MAX_EVALUATED_REFERENCES);
+        let too_many = format!("{many}$context.stage");
+        assert!(
+            evaluated_selection_expression(&many, &value).is_some(),
+            "case {:?}: expected an expression at the bound to evaluate",
+            "as many references as one evaluation resolves"
+        );
+        assert_eq!(
+            evaluated_selection_expression(&too_many, &value),
+            None,
+            "case {:?}: expected one past the bound to evaluate to nothing",
+            "one reference past the bound"
+        );
+    }
 }
