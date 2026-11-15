@@ -931,10 +931,15 @@ async fn operations_outside_this_slice_still_answer_501() {
     let id = created_id(&router, &simple_request("not-yet", "inst-1")).await;
 
     // `GetCampaignStateBatch` used to sit here; it is implemented now, and the batch
-    // state read has its own suite (`campaign_state_batch.rs`).
-    let rows: &[(&str, String, Option<Value>)] = &[
-        ("ResumeCampaign", format!("/campaigns/{id}/resume"), None),
-    ];
+    // state read has its own suite (`campaign_state_batch.rs`). `ResumeCampaign` left
+    // for the same reason, with the resume transition in `campaign_resume.rs`.
+    let rows: &[(&str, String, Option<Value>)] = &[(
+        "UpdateCampaignDialerConfig",
+        format!("/campaigns/{id}/dialer-config"),
+        Some(json!({
+            "dialerConfig": {"progressiveDialerConfig": {"bandwidthAllocation": 0.25}}
+        })),
+    )];
 
     for (case, path, body) in rows {
         let answer = call(&router, "POST", path, body.as_ref()).await;

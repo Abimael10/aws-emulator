@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResumeCampaign
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResumeCampaign`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResumeCampaign::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves a stored campaign's run state back to `Running`. Only a paused campaign has a
+//! suspended run to resume; a campaign already running is answered as the no-op it is,
+//! and a campaign in any other state is refused with `ConflictException` naming the
+//! state it is in.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +167,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResumeCampaign` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResumeCampaignErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResumeCampaign"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ResumeCampaignError::from(ResumeCampaignErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the campaign store is unavailable".to_string(),
+                    x_amz_error_type: None,
+                },
+            ))
+        })?;
+
+        // Only a paused campaign has a suspended run to resume; a running one is already
+        // in the state the call asks for (so the transition rule accepts it as the no-op
+        // it is), a campaign that has never run is started rather than resumed, and
+        // `Stopped` is terminal — nothing resumes a run that has ended.
+        let outcome = state.lock().transition_campaign(
+            &input.id,
+            &[crate::state::CampaignState::Paused],
+            crate::state::CampaignState::Running,
+        );
+
+        match outcome {
+            // A transition that happened is audited; one the campaign did not make —
+            // because it already held the state asked for — is not, since there is no
+            // change to record.
+            Ok(crate::state::TransitionApplied::Moved(now)) => {
+                crate::state::audit_campaign_change(
+                    ctx.parts(),
+                    "ResumeCampaign",
+                    &input.id,
+                    now.as_wire(),
+                );
+                Ok(ResumeCampaignOutput)
+            }
+            Ok(crate::state::TransitionApplied::Unchanged(_)) => Ok(ResumeCampaignOutput),
+            Err(crate::state::TransitionRefused::NoSuchCampaign) => Err(
+                ResumeCampaignErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::campaign_absent_message(&input.id),
+                    x_amz_error_type: None,
+                })
+                .into(),
+            ),
+            Err(crate::state::TransitionRefused::InvalidState(current)) => Err(
+                ResumeCampaignErrorModeled::ConflictException(ConflictException {
+                    message: crate::state::campaign_invalid_state_message(&input.id, current),
+                    x_amz_error_type: None,
+                })
+                .into(),
+            ),
+        }
     }
 }

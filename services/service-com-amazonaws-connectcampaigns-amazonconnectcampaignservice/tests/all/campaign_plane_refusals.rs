@@ -661,8 +661,8 @@ async fn every_reply_announces_the_media_type_this_services_front_end_labels_jso
         (
             "an operation this emulator has not implemented yet",
             "POST",
-            format!("/campaigns/{stored}/resume"),
-            Value::Null,
+            format!("/campaigns/{stored}/dialer-config"),
+            json!({"dialerConfig": {"progressiveDialerConfig": {"bandwidthAllocation": 0.25}}}),
         ),
         (
             "a route this service claims but no modelled operation serves",
