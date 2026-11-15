@@ -79,3 +79,5 @@ mod tagging_resource_arn_refusal;
 mod tags_member_single_rule;
 #[path = "all/web_login_token_caller_identity.rs"]
 mod web_login_token_caller_identity;
+#[path = "all/webserver_published_address.rs"]
+mod webserver_published_address;

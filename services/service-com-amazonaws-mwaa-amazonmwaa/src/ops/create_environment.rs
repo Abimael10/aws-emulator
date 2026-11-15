@@ -486,7 +486,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = crate::state::environment_arn(&region, &name);
         let (status, pending) = crate::state::create_lifecycle(&spec.endpoint_management, now);
         store.insert(crate::state::EnvironmentRecord {
-            webserver_url: crate::state::webserver_url(&region, &arn),
+            // The address this environment's Apache Airflow web server is PUBLISHED at: the
+            // endpoint THIS emulator serves it on, so the URL a later read reports is one a
+            // client can reach (see [`crate::state::webserver_address`]).
+            webserver_url: crate::state::webserver_url(ctx),
             service_role_arn: crate::state::service_role_arn(),
             celery_executor_queue: crate::state::celery_executor_queue(&region, &name),
             webserver_vpc_endpoint_service: crate::state::webserver_vpc_endpoint_service(

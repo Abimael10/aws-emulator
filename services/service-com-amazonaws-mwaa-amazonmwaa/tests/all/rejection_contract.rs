@@ -31,8 +31,10 @@
 //!    words itself (`tests/all/tagging_resource_arn_refusal.rs`).
 //! 4. `CreateWebLoginToken` and `CreateCliToken` mint a token for an environment that
 //!    EXISTS and report it with the web-server host that environment's own stored
-//!    `WebserverUrl` carries; two calls mint two different tokens. Rows vary the
-//!    environment.
+//!    `WebserverUrl` carries — the address this emulator answers that environment's Apache
+//!    Airflow surface at, so every environment of one emulator reports that one host
+//!    (`tests/all/webserver_published_address.rs` pins which address that is); two calls
+//!    mint two different tokens. Rows vary the environment.
 
 use std::sync::Arc;
 
@@ -771,8 +773,10 @@ async fn the_token_operations_report_the_stored_environments_web_server_host() {
         );
     }
 
-    // Two environments never share a web server, so neither do the hosts their tokens
-    // report.
+    // Every environment of one emulator is answered at that one emulator's endpoint, so
+    // the host their tokens report is the host of each one's own stored `WebserverUrl` —
+    // the same host, and the address this emulator is really reached at rather than a
+    // per-environment name in MWAA's own zone that resolves nowhere.
     let hosts: Vec<String> = {
         let mut hosts = Vec::new();
         for name in names {
@@ -786,10 +790,16 @@ async fn the_token_operations_report_the_stored_environments_web_server_host() {
         hosts
     };
     for (left, right) in [(0, 1), (0, 2), (1, 2)] {
-        assert_ne!(
+        assert_eq!(
             hosts[left], hosts[right],
-            "two environments must not report one web-server host, got {:?} and {:?}",
+            "every environment is answered at this emulator's own endpoint, got {:?} and {:?}",
             hosts[left], hosts[right]
+        );
+    }
+    for (name, host) in names.iter().zip(&hosts) {
+        assert!(
+            !host.is_empty() && !host.ends_with(".amazonaws.com"),
+            "case {name:?}: the published host must be this emulator's own, got {host:?}"
         );
     }
 }

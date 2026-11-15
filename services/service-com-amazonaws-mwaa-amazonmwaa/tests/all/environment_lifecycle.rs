@@ -39,6 +39,13 @@ const ACCOUNT: &str = "000000000000";
 /// certainly come due.
 const PAST_TRANSITION: Duration = Duration::from_millis(900);
 
+/// The endpoint this harness's emulator is served at — the base URL a client addresses it
+/// at, which the production router records when its data port starts. Every address this
+/// service publishes for an environment's Apache Airflow web server names it, because that
+/// is where the emulator answers for the environment; the suite that pins that rule over
+/// every form an endpoint takes is `tests/all/webserver_published_address.rs`.
+const EMULATOR_ENDPOINT: &str = "https://127.0.0.1:9297";
+
 /// One HTTP answer, reduced to what these tests assert on.
 struct Answer {
     status: u16,
@@ -82,6 +89,10 @@ impl Harness {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
+        router.set_url_base(
+            smithy_server_runtime::EndpointUrl::parse(EMULATOR_ENDPOINT)
+                .expect("a usable emulator endpoint"),
+        );
         router.register_service(
             service_com_amazonaws_mwaa_amazonmwaa::EmulatedService::new(Arc::clone(&engine)),
         );
@@ -655,10 +666,16 @@ fn assert_minted(case: &EnvCase, environment: &Value) {
             .to_string()
     };
 
+    // The address of the environment's Apache Airflow web server is the address THIS
+    // emulator is reached at, because that is where it answers for the environment: a host
+    // in Amazon MWAA's own zone resolves to nothing here, and a client that dialled one
+    // would leave the emulator. It carries no Region, since one emulator serves every
+    // Region at one endpoint.
     let url = text("WebserverUrl");
-    assert!(
-        url.starts_with("https://") && url.ends_with(&format!(".c2.{REGION}.airflow.amazonaws.com")),
-        "case {name}: WebserverUrl must be an https MWAA host in {REGION}, got {url:?}"
+    assert_eq!(
+        url, EMULATOR_ENDPOINT,
+        "case {name}: WebserverUrl must be the endpoint this emulator is served at, got \
+         {url:?}"
     );
     assert_eq!(
         text("ServiceRoleArn"),

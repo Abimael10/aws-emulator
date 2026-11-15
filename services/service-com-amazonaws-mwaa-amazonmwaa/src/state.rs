@@ -26,6 +26,13 @@ pub mod metrics;
 /// own store lives in.
 pub mod log_groups;
 
+/// The ADDRESS an environment's Apache Airflow web server is published at — the one place
+/// this service builds it, for the URL member the read path reports and the host member the
+/// token operations report alike.
+pub mod webserver_address;
+
+pub use webserver_address::{published_webserver_url, webserver_hostname, webserver_url};
+
 /// STS's own state accessors, which answer who a request's credential speaks for. The
 /// service that MINTS a session is the one asked about it, so the identity this service
 /// reports for a credential is the one `sts:GetCallerIdentity` reports for it.
@@ -1087,6 +1094,11 @@ pub struct EnvironmentRecord {
     /// The transitions the clock owes, soonest first; empty in a settled status.
     pub pending: VecDeque<PendingTransition>,
     pub created_at: SystemTime,
+    /// The address this environment's Apache Airflow web server is PUBLISHED at, decided by
+    /// the create and read by every later report of it: the endpoint this emulator answers
+    /// the environment on ([`webserver_address`]), so the URL a reader is handed and the
+    /// host a minted token is handed cannot drift from one another or from an address a
+    /// client can reach.
     pub webserver_url: String,
     pub service_role_arn: String,
     pub celery_executor_queue: String,
@@ -1749,35 +1761,6 @@ pub fn celery_executor_queue(region: &str, name: &str) -> String {
     ::engine::emulator_arn("sqs", region, &format!("airflow-celery-{name}"))
 }
 
-/// The Apache Airflow web-server host of an environment, as `WebserverUrl`'s pattern
-/// (`^https://.+$`) and MWAA's own host shape
-/// (`https://<environment-id>.c2.<region>.airflow.amazonaws.com`) require.
-///
-/// The id segment is content-derived (a digest of the environment's own ARN, so it is
-/// stable across reads, differs between two environments, and never leaks a clock or a
-/// request id) and is laid out like the UUID AWS uses there.
-pub fn webserver_url(region: &str, arn: &str) -> String {
-    let id = uuid_shaped_id(&format!("webserver/{arn}"));
-    format!("https://{id}.c2.{region}.airflow.amazonaws.com")
-}
-
-/// The `Hostname` of an environment's Apache Airflow web server: the host of the
-/// environment's STORED [`webserver_url`], with the scheme and any path removed —
-/// `Hostname`'s own pattern
-/// (`^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|…)$`) carries a
-/// host and nothing else. Reading it off the stored URL is what keeps the host
-/// `CreateCliToken` and `CreateWebLoginToken` report equal to the one `GetEnvironment`
-/// reports for the same environment.
-pub fn webserver_hostname(webserver_url: &str) -> &str {
-    let without_scheme = webserver_url
-        .split_once("://")
-        .map_or(webserver_url, |(_scheme, rest)| rest);
-    match without_scheme.split_once('/') {
-        Some((host, _path)) => host,
-        None => without_scheme,
-    }
-}
-
 /// The ARN of the IAM identity a request's credential speaks for, the value
 /// `sts:GetCallerIdentity` answers for that same credential.
 ///
@@ -1911,20 +1894,6 @@ fn vpc_endpoint_service(region: &str, seed: &str) -> String {
     let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(seed.as_bytes());
     let suffix = ::hex::encode(&digest[..9]);
     format!("com.amazonaws.vpce.{region}.vpce-svc-{}", &suffix[..17])
-}
-
-/// A UUID-shaped (8-4-4-4-12 hex) id derived from `seed`.
-fn uuid_shaped_id(seed: &str) -> String {
-    let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(seed.as_bytes());
-    let hex = ::hex::encode(&digest[..16]);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
 }
 
 /// One page of a `@paginated` listing: the items to return, plus the cursor that resumes

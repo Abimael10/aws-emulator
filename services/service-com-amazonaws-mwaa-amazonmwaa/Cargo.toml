@@ -21,9 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Content-derived identifiers: the environment-id segment of the Apache Airflow web
-# server host and the vpce-svc id of each VPC endpoint service name are digests of the
-# environment's own ARN, so they are stable across reads and unique per environment.
+# Content-derived identifiers: the vpce-svc id of each VPC endpoint service name is a
+# digest of the environment's own ARN, and the default maintenance window a digest of its
+# name, so both are stable across reads and differ between environments.
 sha2 = { workspace = true }
 # Opaque pagination cursors: hex-encode the internal list cursor so `NextToken` is a
 # single-token string a client only ever echoes back.

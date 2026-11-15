@@ -186,7 +186,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(crate::state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE.to_string()),
             })
         })?;
-        let web_server_hostname = crate::state::webserver_hostname(&stored.webserver_url).to_string();
+        // The host is the host of the address that environment's web server is PUBLISHED
+        // at ([`crate::state::webserver_address`]), which is the endpoint this emulator
+        // answers the environment's Apache Airflow surface on — so the host handed to a
+        // caller together with the token is one the caller can reach. `None` for an endpoint
+        // whose host the `Hostname` shape has no spelling for.
+        let web_server_hostname = crate::state::webserver_hostname(&stored.webserver_url);
         // Nothing below reads or writes the store; holding its lock across the mint would
         // only widen the critical section.
         drop(store);
@@ -208,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(CreateWebLoginTokenOutput {
             airflow_identity: Some(crate::state::airflow_identity(&iam_identity)),
             iam_identity: Some(iam_identity),
-            web_server_hostname: Some(web_server_hostname),
+            web_server_hostname,
             web_token: Some(web_token),
         })
     }

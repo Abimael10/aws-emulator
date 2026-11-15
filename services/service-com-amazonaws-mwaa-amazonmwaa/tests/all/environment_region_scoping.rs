@@ -360,8 +360,12 @@ async fn one_name_names_an_independent_environment_in_each_region() {
             member(&environment, "Arn")
         );
         // Every minted host and ARN this record reports names this Region, and no other.
+        // `WebserverUrl` is NOT one of them: it carries the address this emulator is served
+        // at, which is where the environment's Apache Airflow web server is answered for
+        // every Region at once (`tests/all/webserver_published_address.rs` pins that rule),
+        // so it names no Region — and must therefore name no OTHER Region either, which the
+        // row below asserts.
         for reported in [
-            "WebserverUrl",
             "CeleryExecutorQueue",
             "WebserverVpcEndpointService",
             "DatabaseVpcEndpointService",
@@ -377,6 +381,14 @@ async fn one_name_names_an_independent_environment_in_each_region() {
                     "case {region}/{reported}: must not name {other}, got {value:?}"
                 );
             }
+        }
+        let published = member(&environment, "WebserverUrl");
+        for named in POPULATED_REGIONS {
+            assert!(
+                !published.contains(named),
+                "case {region}/WebserverUrl: the published address is this emulator's own \
+                 endpoint and names no Region, got {published:?}"
+            );
         }
         // And the stored members are this Region's, not a look-alike from another.
         assert_eq!(
