@@ -26,6 +26,9 @@ mod account_links;
 #[path = "all/batch_per_item_error_codes.rs"]
 mod batch_per_item_error_codes;
 
+#[path = "all/concurrent_ip_group_name_claim.rs"]
+mod concurrent_ip_group_name_claim;
+
 #[path = "all/connection_alias_lifecycle.rs"]
 mod connection_alias_lifecycle;
 

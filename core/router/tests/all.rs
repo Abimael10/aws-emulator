@@ -1980,3 +1980,6 @@ mod ses_configuration_set_cursor_shared_across_v1_and_v2;
 // here names is compiled nowhere and its tests never run, and a second `mod` for one name is
 // `E0428` — either fails every suite in this target.
 // Six suites of this target check the rules above rather than restating them:
+// `E0753` and compiles no suite of this target. With no `//!` in the file at all, no landing
+// name is `E0428` and fails every suite in this target too.
+// service crate's own, is stated in that suite's own module header, beside the test it
