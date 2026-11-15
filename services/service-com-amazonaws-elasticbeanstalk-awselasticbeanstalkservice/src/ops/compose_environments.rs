@@ -6,11 +6,12 @@
 //! source bundle of each version label ("The name of each environment and other required
 //! information must be included in the source bundles in an environment manifest named
 //! env.yaml"). This emulator stores a source bundle as the S3 reference the caller passed
-//! and never reads its content, so no manifest exists to name an environment from, and the
-//! request is refused with the service's `MissingParameter` instead of composing an
+//! and never retains its content, so no version label resolves to an application version
+//! this call can compose from, and the request is refused with the service's
+//! `MissingParameter` and its fixed sentence for that class instead of composing an
 //! environment whose name was invented. The application the request names is resolved
 //! FIRST, so a name no application exists under is reported as that rather than as a
-//! defect in a source bundle of an application the caller never created. This is the ONLY
+//! version that cannot be composed. This is the ONLY
 //! file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -207,16 +208,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The manifest lives in the bundle, and a bundle is only ever an S3
         // reference in this emulator (`CreateApplicationVersion` stores
-        // `SourceBundle` as the `S3Location` the caller passed; nothing reads the
-        // object). So the environment name, its solution stack and its links are
-        // all absent, and every validation that comes after resolving them —
-        // which environments the group already has, the environment quota — is
-        // unreachable. Refusing names what is missing; composing would have to
-        // invent an environment name, and reporting an environment nothing
-        // created would be worse than the refusal.
-        Err(ComposeEnvironmentsError::missing_parameter(format!(
-            "The environment manifest (env.yaml) naming the environment to compose is not available from the source bundle of version label '{}'.",
-            version_labels.join("', '")
-        )))
+        // `SourceBundle` as the `S3Location` the caller passed; nothing retains
+        // the object's content). So no version label this request names yields
+        // an application version that can be composed for the application, and
+        // every validation that comes after resolving one — which environments
+        // the group already has, the environment quota — is unreachable.
+        // Composing would have to invent an environment name, and reporting an
+        // environment nothing created would be worse than the refusal.
+        Err(ComposeEnvironmentsError::missing_parameter(
+            NO_VALID_APPLICATION_VERSION_MESSAGE,
+        ))
     }
 }
+
+/// The message this operation refuses a request whose version labels resolve to
+/// no application version it can compose the named application from.
+///
+/// WHOLLY FIXED text: the refusal is the service's own statement for that class
+/// and carries no variable part — not the labels, not the application, and no
+/// diagnosis of what the source bundle behind a label does or does not hold.
+const NO_VALID_APPLICATION_VERSION_MESSAGE: &str = "No valid application version found.";

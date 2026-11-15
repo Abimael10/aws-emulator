@@ -2,7 +2,9 @@
 
 //! @op AssociateEnvironmentOperationsRole
 //! Implemented: stores the operations role on the named environment, so every later
-//! read of that environment reports it. This is the ONLY file to touch for this
+//! read of that environment reports it. An environment whose termination has
+//! completed is no environment this operation acts on, so naming one is refused as
+//! naming no environment is. This is the ONLY file to touch for this
 //! operation.
 //!
 //! ## Shape of an operation
@@ -180,14 +182,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::missing_environment_message(Some(environment_id.as_str()), None),
             )
         })?;
-        // An environment in the shut-down process, or already shut down, acts on
-        // nothing downstream, so there is no role left to associate with it.
-        if environment.status == crate::state::STATUS_TERMINATING || environment.is_terminated() {
+        // A termination that has COMPLETED leaves nothing for this call to act
+        // on: the record stays so the lifecycle reads can still report it, but
+        // the name no longer names an environment a role can be associated
+        // with, so the request is refused exactly as one naming an environment
+        // that was never created is — with the shared not-found wording, naming
+        // the member the caller used. `DisassociateEnvironmentOperationsRole`
+        // resolves the same name the same way, so the pair agrees about which
+        // environments it can see.
+        if environment.is_terminated() {
             return Err(
-                AssociateEnvironmentOperationsRoleError::invalid_parameter_value(format!(
-                    "Environment {} is not in a state from which an operations role can be associated. Current status: {}.",
-                    environment.environment_name, environment.status
-                )),
+                AssociateEnvironmentOperationsRoleError::invalid_parameter_value(
+                    crate::state::missing_environment_message(
+                        None,
+                        Some(input.environment_name.as_str()),
+                    ),
+                ),
+            );
+        }
+        // One still shutting down DOES exist — the reads report it, and
+        // `DescribeEnvironments` lists it — but it is not in the status an
+        // action on a running environment requires, which is the service's
+        // invalid-state refusal rather than a not-found.
+        if environment.status == crate::state::STATUS_TERMINATING {
+            return Err(
+                AssociateEnvironmentOperationsRoleError::invalid_parameter_value(
+                    crate::state::environment_invalid_state_message(
+                        &environment.environment_name,
+                        crate::state::STATUS_READY,
+                    ),
+                ),
             );
         }
 

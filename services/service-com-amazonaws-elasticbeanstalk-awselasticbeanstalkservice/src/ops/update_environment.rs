@@ -387,13 +387,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Ready: Environment is available to have an action performed on it,
         // such as update or terminate." An environment that is launching,
         // updating, aborting or on its way out is in no state to take an update —
-        // the refusal `RebuildEnvironment` and `RestartAppServer` answer in too.
+        // the refusal `RebuildEnvironment` and `RestartAppServer` answer in too,
+        // which is why the sentence is the service's shared one and names the
+        // status the operation requires rather than the one the environment is
+        // in.
         if !environment.is_ready() {
-            return Err(UpdateEnvironmentError::invalid_parameter_value(format!(
-                "Environment {} is not in a state from which it can be updated. \
-                 Current status: {}.",
-                environment.environment_name, environment.status
-            )));
+            return Err(UpdateEnvironmentError::invalid_parameter_value(
+                crate::state::environment_invalid_state_message(
+                    &environment.environment_name,
+                    crate::state::STATUS_READY,
+                ),
+            ));
         }
 
         let application_name = environment.application_name.clone();

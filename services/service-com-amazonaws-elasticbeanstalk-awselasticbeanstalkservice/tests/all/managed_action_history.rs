@@ -617,7 +617,7 @@ async fn a_request_that_names_no_history_is_refused_not_answered_empty() {
             params: vec![],
             code: "MissingParameter",
             message: Some(
-                "Either EnvironmentName or EnvironmentId must be specified.".to_string(),
+                "You must specify either EnvironmentName or EnvironmentId.".to_string(),
             ),
         },
         Refusal {

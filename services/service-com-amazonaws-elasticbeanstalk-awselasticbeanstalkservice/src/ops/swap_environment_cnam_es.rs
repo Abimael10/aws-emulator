@@ -317,10 +317,12 @@ fn swappable_cname(
         )
     })?;
     if environment.status != crate::state::STATUS_READY {
-        return Err(SwapEnvironmentCNAMEsError::invalid_parameter_value(format!(
-            "Environment {} is in status {} and is not in a state from which its CNAME can be swapped.",
-            environment.environment_name, environment.status
-        )));
+        return Err(SwapEnvironmentCNAMEsError::invalid_parameter_value(
+            crate::state::environment_invalid_state_message(
+                &environment.environment_name,
+                crate::state::STATUS_READY,
+            ),
+        ));
     }
     Ok(environment.cname.clone())
 }

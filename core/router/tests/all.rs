@@ -1744,3 +1744,20 @@ mod default_vpc_internet_path_runs_ecs_tasks;
 // `declaration_roots_*` and `all/every_suite_file_is_declared.rs` suites pin every rule above.
 // An inner attribute, like an inner doc comment, is legal only before the first item, so the
 // lint allowance below stands here rather than in the list.
+// had grown hundreds of re-typed copies of its header, many of them written as inner doc
+// comments past the first item (`E0753`), so no suite of this target compiled at all.
+// deliberate: an inner doc comment is legal only before the first item, so with none
+// anywhere in the file, no appended, re-typed or merged copy of a line of it can be one
+// past the first item. `all/all_rs_carries_no_inner_doc_comment.rs` pins that,
+// `all/every_suite_file_is_declared.rs` pin the rules a landing breaks: a module declared
+// twice is `E0428`, an inner doc comment past the first item is `E0753`, and a suite file
+// no `mod` names compiles nowhere. Each of those fails every suite in this target, so put a
+// new suite at `tests/all/<name>.rs`, insert its pair into the sorted list below, and leave
+// what it covers — and why it drives the assembled router rather than one service crate — to
+// that suite's own module doc, where it is read beside the test it explains.
+// An inner attribute, like an inner doc comment, is legal only before the first item, so
+// none stands below this header either: `all/appended_header_notes.rs`,
+// `all/appended_notes.rs`, `all/appended_notes_tail.rs` and `all/appended_prose.rs` keep
+// what the notes landings had appended to this file, and
+// `all/declaration_roots_are_canonical_and_complete.rs` pin that rule here and in every
+// service crate's `tests/all.rs`.

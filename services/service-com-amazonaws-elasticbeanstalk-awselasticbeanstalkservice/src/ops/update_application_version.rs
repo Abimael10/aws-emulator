@@ -161,13 +161,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `VersionLabel`: "If no application version is found with this label,
         // UpdateApplication returns an InvalidParameterValue error." A version is
         // keyed by (application, label), so the same label under a different
-        // application is a different record and does not satisfy this lookup.
+        // application is a different record and does not satisfy this lookup —
+        // which is why the refusal names BOTH halves of the pair that addresses
+        // the record.
         let key = (input.application_name.clone(), input.version_label.clone());
         let Some(version) = store.application_versions.get_mut(&key) else {
             return Err(UpdateApplicationVersionError::invalid_parameter_value(
-                format!(
-                    "No Application Version named '{}' found.",
-                    input.version_label
+                crate::state::missing_application_version_message(
+                    &input.application_name,
+                    &input.version_label,
                 ),
             ));
         };

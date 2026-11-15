@@ -33,7 +33,7 @@
 //! Nothing here reaches into the store: every precondition is created over the
 //! wire and every assertion is made over what the wire answered.
 
-use crate::harness::{Answer, Emulator};
+use crate::harness::{wait_for_status, Answer, Emulator};
 use crate::managed_actions::option_params;
 
 /// The sentence the service refuses an unresolvable `ActionId` with. Fixed text
@@ -66,13 +66,6 @@ const WINDOW: &str = "Tue:09:00";
 
 /// The application every fixture environment of this suite belongs to.
 const APPLICATION: &str = "managed-refusal-app";
-
-/// How long a status change the clock owes is waited for, and how often the wait
-/// looks again. The deadline is generous — it bounds nothing this suite asserts,
-/// it only keeps an environment that never settles from hanging the target.
-const STATUS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
-/// See [`STATUS_DEADLINE`].
-const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// One fixture environment: the managed-update configuration it carries, whether
 /// it runs the release its platform branch has superseded, and how many managed
@@ -205,40 +198,6 @@ async fn launch(emulator: &Emulator, row: &Case, superseded_arn: &str, current_a
         .to_string();
     wait_for_status(emulator, row.case, row.name, "Ready").await;
     environment_id
-}
-
-/// Look again until the environment `name` reports `expected` — the CONDITION
-/// this suite waits on — or until [`STATUS_DEADLINE`] has passed. Terminated
-/// records are included in the report, so a wait for the end of a lifecycle sees
-/// the status it is waiting for.
-async fn wait_for_status(emulator: &Emulator, case: &str, name: &str, expected: &str) {
-    let started = std::time::Instant::now();
-    loop {
-        let described = emulator
-            .call(
-                "DescribeEnvironments",
-                &[
-                    ("EnvironmentNames.member.1", name),
-                    ("IncludeDeleted", "true"),
-                ],
-            )
-            .await;
-        let status = described
-            .values_at("Environments/member/Status")
-            .first()
-            .map(|status| (*status).to_string())
-            .unwrap_or_default();
-        if status == expected {
-            return;
-        }
-        assert!(
-            started.elapsed() < STATUS_DEADLINE,
-            "case {case:?}: environment {name:?} never reached {expected}, last status \
-             {status:?} in body {}",
-            described.body
-        );
-        std::thread::sleep(POLL_INTERVAL);
-    }
 }
 
 /// Every `ActionId` the environment `name` reports a managed action under.

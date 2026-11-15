@@ -551,8 +551,9 @@ async fn composing_environments_resolves_the_application_before_the_source_bundl
         );
     }
 
-    // The application exists, so the refusal is the one about what the source bundle
-    // does not carry — the precondition that comes AFTER the application.
+    // The application exists, so the refusal is the one about the version the
+    // request names — the precondition that comes AFTER the application, and the
+    // service's fixed sentence for it.
     let existing = emulator
         .call(
             "ComposeEnvironments",
@@ -567,9 +568,10 @@ async fn composing_environments_resolves_the_application_before_the_source_bundl
         "case \"existing application\": expected HTTP 400, got {} and body {}",
         existing.status, existing.body
     );
-    assert!(
-        existing.error_message().contains("env.yaml"),
-        "case \"existing application\": expected the manifest precondition, got {}",
+    assert_eq!(
+        existing.error_message(),
+        "No valid application version found.",
+        "case \"existing application\": expected the version precondition, got {}",
         existing.body
     );
 

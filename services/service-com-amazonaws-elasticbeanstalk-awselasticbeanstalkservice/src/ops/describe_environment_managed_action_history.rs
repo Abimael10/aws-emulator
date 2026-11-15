@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(|refusal| match refusal {
                 crate::state::EnvironmentRefusal::NoIdentifier => {
                     DescribeEnvironmentManagedActionHistoryError::missing_parameter(
-                        "Either EnvironmentName or EnvironmentId must be specified.",
+                        crate::state::MISSING_ENVIRONMENT_SELECTOR_MESSAGE,
                     )
                 }
                 crate::state::EnvironmentRefusal::NotFound(message) => {

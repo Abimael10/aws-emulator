@@ -251,7 +251,12 @@ const CONSTRAINT_MARKER: &str = "failed to satisfy constraint: ";
 /// this is only ever called with (see `override_refusal`'s guard) the count is at
 /// least one and the envelope's noun is never read off an empty list.
 fn validation_error_message(violations: &[smithy_server_runtime::Violation]) -> String {
-    let clauses = violation_clauses(violations);
+    // Every clause is built from the violation as THIS service states it, so the
+    // value set an enum violation lists is the published one wherever a clause
+    // carries it — a collapsed collection clause and a plain member clause alike.
+    let stated: Vec<smithy_server_runtime::Violation> =
+        violations.iter().map(as_this_service_states_it).collect();
+    let clauses = violation_clauses(&stated);
     let noun = if clauses.len() == 1 {
         "validation error"
     } else {
@@ -263,6 +268,62 @@ fn validation_error_message(violations: &[smithy_server_runtime::Violation]) -> 
         clauses.join("; ")
     )
 }
+
+/// `violation` as this service states it: the tree's one restatement of an
+/// enumerated value set in the order the SERVICE publishes it
+/// ([`::service_common::validation_message::in_stated_enum_order`]), over the one
+/// row of data that order is — [`PUBLISHED_ENUM_VALUE_SETS`].
+///
+/// Only the REQUIREMENT half can move, and only for a set this service publishes
+/// a statement of: the member path, the value echoed back and the requirement's
+/// wording all keep coming from the framework, so a clause this passes through
+/// cannot say anything different from one it does not.
+fn as_this_service_states_it(
+    violation: &smithy_server_runtime::Violation,
+) -> smithy_server_runtime::Violation {
+    ::service_common::validation_message::in_stated_enum_order(
+        violation,
+        PUBLISHED_ENUM_VALUE_SETS,
+    )
+}
+
+/// The `InstancesHealthAttribute` values this service STATES when it refuses a
+/// value outside that enum, in the order it states them in.
+///
+/// OBSERVED: the bracketed list inside the validation message a
+/// `DescribeInstancesHealth` request carrying an `AttributeNames` element outside
+/// the enum earns. It is the service's own published sequence, so it is neither
+/// sorted nor the order the model file declares the members in; the SET is the
+/// model's, which is what the table below keys it by.
+const PUBLISHED_INSTANCES_HEALTH_ATTRIBUTES: [&str; 11] = [
+    "All",
+    "Color",
+    "Deployment",
+    "LaunchedAt",
+    "AvailabilityZone",
+    "Causes",
+    "RefreshedAt",
+    "HealthStatus",
+    "InstanceType",
+    "System",
+    "ApplicationMetrics",
+];
+
+/// Every enum this service publishes its own statement of the value set for,
+/// keyed by the set the MODEL declares for that enum
+/// (`crate::ops::types::*_VALUES`).
+///
+/// One row per enum whose stated set is known to differ from the declared one; an
+/// enum absent from this table is stated as the model declares it, because this
+/// service has shown no other statement of it. Keying by the declared SET is what
+/// makes the statement hold wherever that enum is validated — in any operation, in
+/// whatever binding carried the value — and what keeps a value out of no refusal:
+/// which values a member admits stays the enum the member targets.
+const PUBLISHED_ENUM_VALUE_SETS:
+    &::service_common::validation_message::StatedEnumValueSets<'static> = &[(
+    crate::ops::types::INSTANCES_HEALTH_ATTRIBUTE_VALUES,
+    &PUBLISHED_INSTANCES_HEALTH_ATTRIBUTES,
+)];
 
 /// One clause per failing MEMBER, in the order the walk found them.
 ///

@@ -4575,6 +4575,56 @@ pub fn missing_environment_message(
     }
 }
 
+/// The message the operations whose model documents NO code for an absent
+/// environment selector pair — the ones whose recorded refusal is the generic
+/// query [`crate::scaffolded::MISSING_PARAMETER`] — refuse a request that named
+/// neither `EnvironmentName` nor `EnvironmentId` with.
+///
+/// WHOLLY FIXED text: the refusal is about what the request did NOT carry, so it
+/// names the two members a caller may use and nothing of the request. Shared by
+/// the operations that answer in it, so they cannot word one refusal several
+/// ways. The operations whose own model documents
+/// `MissingRequiredParameter` for the same absence ("If you do not specify
+/// either, Elastic Beanstalk returns MissingRequiredParameter error") are a
+/// different error class and word their own refusal.
+pub const MISSING_ENVIRONMENT_SELECTOR_MESSAGE: &str =
+    "You must specify either EnvironmentName or EnvironmentId.";
+
+/// The message an operation that acts on an environment in ONE status refuses an
+/// environment in any other with, built from the request and the operation's own
+/// contract: `Environment named <name> is in an invalid state for this
+/// operation. Must be <required>.`
+///
+/// `Ready` is "available to have an action performed on it, such as update or
+/// terminate", so it is the status every operation that acts on a running
+/// environment requires and the one this template is reached with. The sentence
+/// names the environment the request named and the status the operation needs;
+/// it deliberately does NOT report the status the environment is in, which is
+/// what the reads of the environment report.
+pub fn environment_invalid_state_message(environment_name: &str, required_status: &str) -> String {
+    format!(
+        "Environment named {environment_name} is in an invalid state for this operation. \
+         Must be {required_status}."
+    )
+}
+
+/// The message an operation that acts ON an application version — one addressed
+/// by the `(ApplicationName, VersionLabel)` pair that names the record — refuses
+/// a pair no stored version answers to with, built from the request: `Application
+/// version with label '<label>' not found in application '<application>'`.
+///
+/// Both halves are named because both identify the record: a label is unique
+/// only per application ("Constraint: Must be unique per application"), so the
+/// same label under another application is another version and a caller that
+/// passed the right label under the wrong application is told which half was
+/// wrong. The sentence carries no trailing period, the way the service words
+/// this one. An operation that merely REFERS to a version while acting on
+/// something else (an environment a version is deployed to) words its own
+/// refusal, as the two environment not-found templates above do.
+pub fn missing_application_version_message(application_name: &str, version_label: &str) -> String {
+    format!("Application version with label '{version_label}' not found in application '{application_name}'")
+}
+
 /// The role a request gives the environment it names, for an operation that
 /// names MORE than one: `SwapEnvironmentCNAMEs` takes a source and a
 /// destination, and the real service leads the not-found message with that role
@@ -4695,6 +4745,19 @@ pub fn missing_configuration_template_message(
 /// this one sentence whichever of the two was called.
 pub fn invalid_resource_arn_message(resource_arn: &str) -> String {
     format!("The name '{resource_arn}' isn't a valid ARN of an Elastic Beanstalk resource.")
+}
+
+/// The message this service refuses a `ResourceArn` that IS one of its own
+/// resources' ARNs but of a type it does not tag with, built from the request:
+/// `Tags aren't supported for the resource type of the ARN '<arn>'.`
+///
+/// The modelled `ResourceTypeNotSupportedException` — "The type of the specified
+/// Amazon Resource Name (ARN) isn't supported for this operation" — is the error
+/// both tag operations carry it in, so both answer in this one sentence and
+/// cannot disagree about the wording. [`TAGGABLE_RESOURCE_TYPES`] is the set of
+/// types that is NOT refused here.
+pub fn unsupported_tag_resource_type_message(resource_arn: &str) -> String {
+    format!("Tags aren't supported for the resource type of the ARN '{resource_arn}'.")
 }
 
 /// The message this service refuses an `UpdateTagsForResource` whose `TagsToAdd`

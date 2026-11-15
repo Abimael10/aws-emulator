@@ -179,10 +179,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an environment still launching, updating or shutting down has no
         // application container server to restart.
         if !environment.is_ready() {
-            return Err(RestartAppServerError::invalid_parameter_value(format!(
-                "Environment {} is not in a state from which the app server can be restarted. Current status: {}.",
-                environment.environment_name, environment.status
-            )));
+            return Err(RestartAppServerError::invalid_parameter_value(
+                crate::state::environment_invalid_state_message(
+                    &environment.environment_name,
+                    crate::state::STATUS_READY,
+                ),
+            ));
         }
 
         // "Causes the environment to restart the application container server

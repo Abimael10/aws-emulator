@@ -184,10 +184,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one already launching, updating or shutting down has nothing to
         // rebuild from.
         if !environment.is_ready() {
-            return Err(RebuildEnvironmentError::invalid_parameter_value(format!(
-                "Environment {} is not in a state from which it can be rebuilt. Current status: {}.",
-                environment.environment_name, environment.status
-            )));
+            return Err(RebuildEnvironmentError::invalid_parameter_value(
+                crate::state::environment_invalid_state_message(
+                    &environment.environment_name,
+                    crate::state::STATUS_READY,
+                ),
+            ));
         }
 
         // "Deletes and recreates all of the Amazon Web Services resources … for

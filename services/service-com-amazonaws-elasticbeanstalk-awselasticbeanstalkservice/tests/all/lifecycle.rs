@@ -580,6 +580,51 @@ pub(crate) fn instant(rendered: &str, case: &str) -> f64 {
     .as_secs_f64()
 }
 
+/// How long a status change the clock owes is waited for, and how often
+/// [`wait_for_status`] looks again. The deadline is GENEROUS — it bounds nothing
+/// any suite asserts, it only stops an environment that never settles from
+/// hanging the target.
+pub(crate) const STATUS_DEADLINE: Duration = Duration::from_secs(120);
+/// See [`STATUS_DEADLINE`].
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Look again until the environment `name` reports `expected` — the CONDITION the
+/// caller waits on, never a fixed wait for the clock — or until
+/// [`STATUS_DEADLINE`] has passed.
+///
+/// Deleted records are included in the report, so a wait for the end of a
+/// lifecycle sees the status it is waiting for. Shared by every suite that waits
+/// on a transition, so none of them keeps its own copy of the poll.
+pub(crate) async fn wait_for_status(emulator: &Emulator, case: &str, name: &str, expected: &str) {
+    let started = std::time::Instant::now();
+    loop {
+        let described = emulator
+            .call(
+                "DescribeEnvironments",
+                &[
+                    ("EnvironmentNames.member.1", name),
+                    ("IncludeDeleted", "true"),
+                ],
+            )
+            .await;
+        let status = described
+            .values_at("Environments/member/Status")
+            .first()
+            .map(|status| (*status).to_string())
+            .unwrap_or_default();
+        if status == expected {
+            return;
+        }
+        assert!(
+            started.elapsed() < STATUS_DEADLINE,
+            "case {case:?}: environment {name:?} never reached {expected}, last status \
+             {status:?} in body {}",
+            described.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The lifecycle, end to end
 // ---------------------------------------------------------------------------

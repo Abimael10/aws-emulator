@@ -75,10 +75,12 @@ mod events;
 // by. Declared here because every file under `tests/all/` must be.
 #[path = "all/harness.rs"]
 mod harness;
-#[path = "all/lifecycle.rs"]
-mod lifecycle;
+#[path = "all/instances_health_validation_message.rs"]
+mod instances_health_validation_message;
 #[path = "all/launch_configuration_options.rs"]
 mod launch_configuration_options;
+#[path = "all/lifecycle.rs"]
+mod lifecycle;
 #[path = "all/managed_action_history.rs"]
 mod managed_action_history;
 #[path = "all/managed_action_refusal_messages.rs"]
@@ -111,6 +113,8 @@ mod published_solution_stack_validation;
 mod record_projections;
 #[path = "all/recorded_wire_members.rs"]
 mod recorded_wire_members;
+#[path = "all/refusal_message_templates.rs"]
+mod refusal_message_templates;
 #[path = "all/rejection_rules.rs"]
 mod rejection_rules;
 #[path = "all/reported_instant_precision.rs"]

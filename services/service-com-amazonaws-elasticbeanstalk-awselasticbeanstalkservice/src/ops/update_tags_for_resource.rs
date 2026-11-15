@@ -114,8 +114,8 @@ fn refused(
         crate::state::ResourceArnRefusal::UnsupportedType => {
             UpdateTagsForResourceErrorModeled::ResourceTypeNotSupportedException(
                 ResourceTypeNotSupportedException {
-                    message: Some(format!(
-                        "The type of the resource ARN '{resource_arn}' is not supported for tagging."
+                    message: Some(crate::state::unsupported_tag_resource_type_message(
+                        resource_arn,
                     )),
                 },
             )
