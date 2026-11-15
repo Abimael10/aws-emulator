@@ -1400,3 +1400,7 @@ mod lambda_in_function_assumed_role_session;
 // every suite in this target.
 // `all/all_rs_is_a_canonical_declaration_list.rs` check those rules, for this file and for
 // every service crate's `tests/all.rs`, so check there rather than leaving a note here.
+// `all/all_rs_declares_each_suite_once.rs` and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both rules, for this file
+// and for every service crate's `tests/all.rs`, so check there rather than leaving a note
+// here.

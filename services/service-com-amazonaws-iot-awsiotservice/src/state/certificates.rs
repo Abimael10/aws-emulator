@@ -183,6 +183,91 @@ impl RegisteredCertificate {
             certificate_mode: Some(self.certificate_mode.clone()),
         }
     }
+
+    /// This record as the `Certificate` every LISTING of certificates reports: the
+    /// identity, the status, the mode and the creation date — the members the modelled
+    /// shape has (`smithy_query(query="shape",shape="Certificate")`), and no more, so a
+    /// listing never hands out the certificate material a reader of one asks for.
+    ///
+    /// One function, for the same reason [`RegisteredCertificate::description`] is one:
+    /// two listings of the same record cannot report it differently.
+    pub fn summary(&self) -> crate::ops::types::Certificate {
+        crate::ops::types::Certificate {
+            certificate_arn: Some(self.certificate_arn.clone()),
+            certificate_id: Some(self.certificate_id.clone()),
+            status: Some(self.status.clone()),
+            certificate_mode: Some(self.certificate_mode.clone()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
+        }
+    }
+}
+
+/// How many certificates one page of a certificate listing holds when the request names
+/// no `pageSize`: `ListCertificates` documents "The results are paginated with a default
+/// page size of 25".
+pub const DEFAULT_CERTIFICATE_PAGE_SIZE: i32 = 25;
+
+/// The character that separates a listing row's ORDERING POSITION from the certificate
+/// id it names. Neither part can contain it: the position is decimal digits and a
+/// `certificateId` is modelled `^(0x)?[a-fA-F0-9]+$`.
+const LISTING_ROW_SEPARATOR: char = '/';
+
+/// How wide a row's ordering position is rendered: enough decimal digits for every
+/// `u64`, so positions compare as strings exactly as they compare as numbers.
+const LISTING_POSITION_WIDTH: usize = 20;
+
+/// Where `certificate` sits in a certificate listing ordered by creation date, as a row
+/// that sorts ASCENDING in that listing's own order whichever direction it runs.
+///
+/// `ListCertificates$ascendingOrder` is "Specifies the order for results. If True, the
+/// results are returned in ascending order, based on the creation date", so the creation
+/// date is the ordering key and the flag is its direction; a descending listing is the
+/// same key counted down from the end of the range, which keeps every row comparable
+/// with `<` and lets one pager serve both directions. The certificate id only makes the
+/// order total — it breaks a tie between two certificates created in the same
+/// microsecond, the same way in both directions — so a page boundary names exactly one
+/// position.
+pub fn certificate_listing_row(
+    certificate: &RegisteredCertificate,
+    ascending_order: bool,
+) -> String {
+    let created_at = certificate
+        .creation_date
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since_epoch| {
+            u64::try_from(since_epoch.as_micros()).unwrap_or(u64::MAX)
+        });
+    let position = if ascending_order {
+        created_at
+    } else {
+        u64::MAX.saturating_sub(created_at)
+    };
+    format!(
+        "{position:0width$}{LISTING_ROW_SEPARATOR}{id}",
+        width = LISTING_POSITION_WIDTH,
+        id = certificate.certificate_id
+    )
+}
+
+/// The rows `certificates` occupy in a listing of that direction, in the listing's order
+/// — the total order [`certificate_listing_row`] defines, which is what makes a page
+/// boundary meaningful.
+pub fn certificate_listing_rows<'a>(
+    certificates: impl Iterator<Item = &'a RegisteredCertificate>,
+    ascending_order: bool,
+) -> Vec<String> {
+    let mut rows: Vec<String> = certificates
+        .map(|certificate| certificate_listing_row(certificate, ascending_order))
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// The `certificateId` a listing row names, or `None` for a string that is not one
+/// [`certificate_listing_row`] built.
+pub fn certificate_listing_row_id(row: &str) -> Option<&str> {
+    row.split_once(LISTING_ROW_SEPARATOR)
+        .map(|(_position, certificate_id)| certificate_id)
 }
 
 /// A freshly minted key pair and the certificate issued for it: the record to persist,

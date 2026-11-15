@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCertificates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCertificates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCertificates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the certificates this account holds, as the account's certificate store holds
+//! them: one `Certificate` per record, ordered by creation date in the direction
+//! `ascendingOrder` names, one page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +146,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCertificates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCertificatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCertificates"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListCertificatesErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        // A pure read of the certificate store: "Lists the certificates registered in
+        // your Amazon Web Services account", so every record the account holds is a row
+        // of this listing and nothing here writes.
+        let store = state.lock();
+        // The listing's order is the creation date, in the direction `ascendingOrder`
+        // names — "If True, the results are returned in ascending order, based on the
+        // creation date" — as the rows the shared pager walks
+        // ([`crate::state::certificate_listing_rows`]).
+        let rows = crate::state::certificate_listing_rows(
+            store.certificates.values(),
+            input.ascending_order,
+        );
+
+        // One page of that order, resumed after the position the caller's own marker
+        // names ([`crate::state::page_of`]) — the same paging every other `@paginated`
+        // listing of this service uses, so a token is read one way. The scope carries the
+        // direction, so a marker from an ascending listing does not resume a descending
+        // one from a position that means something else there.
+        let scope = format!(
+            "certificates/{}",
+            if input.ascending_order { "a" } else { "d" }
+        );
+        let resume_after = match input.marker.as_deref() {
+            None => None,
+            Some(marker) => {
+                let Some(resume_after) = crate::state::decode_page_marker(marker, &scope) else {
+                    return Err(ListCertificatesErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some("marker is not a marker this listing issued".to_string()),
+                        },
+                    )
+                    .into());
+                };
+                Some(resume_after)
+            }
+        };
+        // "The results are paginated with a default page size of 25", which is what a
+        // request naming no `pageSize` gets. The clamp keeps a named one inside the
+        // modelled `PageSize` range rather than depending on a validation performed
+        // outside this module.
+        let page_size =
+            input
+                .page_size
+                .map_or(crate::state::DEFAULT_CERTIFICATE_PAGE_SIZE, |page_size| {
+                    page_size.clamp(1, crate::state::MAX_LIST_PAGE_SIZE)
+                }) as usize;
+        let (page, next_marker) =
+            crate::state::page_of(rows, &scope, resume_after.as_deref(), page_size);
+
+        // Each entry is projected from the stored record, so what a listing reports and
+        // what `DescribeCertificate` reports cannot drift.
+        Ok(ListCertificatesOutput {
+            certificates: Some(
+                page.iter()
+                    .filter_map(|row| crate::state::certificate_listing_row_id(row))
+                    .filter_map(|certificate_id| store.certificates.get(certificate_id))
+                    .map(crate::state::RegisteredCertificate::summary)
+                    .collect(),
+            ),
+            next_marker,
+        })
     }
 }

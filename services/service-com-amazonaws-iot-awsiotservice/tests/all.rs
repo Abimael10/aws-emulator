@@ -23,6 +23,8 @@ mod bulk_thing_registration;
 mod bulk_thing_registration_reports;
 #[path = "all/certificate_deletion.rs"]
 mod certificate_deletion;
+#[path = "all/certificate_listing.rs"]
+mod certificate_listing;
 #[path = "all/certificate_providers.rs"]
 mod certificate_providers;
 #[path = "all/certificate_status_update.rs"]

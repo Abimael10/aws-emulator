@@ -2948,12 +2948,14 @@ pub use thing_group_update::{ThingGroupUpdate, ThingGroupUpdateRefusal};
 pub mod certificates;
 pub use certificates::{
     active_certificate_deletion_message, attached_policies_deletion_message, certificate_arn,
-    certificate_id, internal_certificate_status_message, mint_keys_and_certificate,
+    certificate_id, certificate_listing_row, certificate_listing_row_id, certificate_listing_rows,
+    internal_certificate_status_message, mint_keys_and_certificate,
     mint_keys_and_certificate_valid_until, missing_certificate_message,
     CertificateDeletionRefusal, CertificateStatusUpdateRefusal, MintedKeysAndCertificate,
     RegisteredCertificate, CERTIFICATE_MODE_DEFAULT, CERTIFICATE_STATUS_ACTIVE,
-    CERTIFICATE_STATUS_INACTIVE, CERTIFICATE_STATUS_REVOKED, FIRST_CERTIFICATE_CUSTOMER_VERSION,
-    INTERNAL_CERTIFICATE_STATUSES, MAX_CERTIFICATES, PROVISIONING_CLAIM_VALIDITY,
+    CERTIFICATE_STATUS_INACTIVE, CERTIFICATE_STATUS_REVOKED, DEFAULT_CERTIFICATE_PAGE_SIZE,
+    FIRST_CERTIFICATE_CUSTOMER_VERSION, INTERNAL_CERTIFICATE_STATUSES, MAX_CERTIFICATES,
+    PROVISIONING_CLAIM_VALIDITY,
 };
 
 // WHICH POLICIES are attached to which target — what a policy target is, how one is
