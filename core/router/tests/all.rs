@@ -1370,3 +1370,5 @@ mod cloudformation_provisions_appsync_event_and_merged_apis;
 // `all/all_rs_declares_each_suite_once.rs`,
 // `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` pin all of that, for
 // this file and for every service crate's own `tests/all.rs`.
+#[path = "all/s3_notification_granted_function_writes_back_into_the_bucket.rs"]
+mod s3_notification_granted_function_writes_back_into_the_bucket;
