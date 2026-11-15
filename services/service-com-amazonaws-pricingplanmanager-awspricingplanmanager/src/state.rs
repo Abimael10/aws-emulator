@@ -14,8 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    ScheduledChange, Subscription, SubscriptionSummary, APPROVAL_MODE_VALUES,
-    SCHEDULED_CHANGE_TYPE_VALUES, STATUS_VALUES,
+    ResourceNotFoundException, ScheduledChange, Subscription, SubscriptionSummary,
+    ValidationException, APPROVAL_MODE_VALUES, SCHEDULED_CHANGE_TYPE_VALUES, STATUS_VALUES,
 };
 
 /// Whether the resources a subscription names are eligible for the plan family it asks
@@ -301,15 +301,66 @@ pub enum PreconditionFailure {
     ETagMismatch,
 }
 
-/// How this service states an `If-Match` that does not match the stored eTag.
+/// How every operation that resolves a subscription ARN states an ARN that names nothing.
 ///
-/// The wording follows `ConflictException`'s own documentation: "The request conflicts
-/// with the current state of the resource. This typically occurs when the `ETag` value in
-/// the `If-Match` header does not match the current version of the subscription. Retrieve
-/// the latest version and retry."
-pub const IF_MATCH_CONFLICT_MESSAGE: &str =
-    "the If-Match header does not match the current version of the subscription; \
-     retrieve the latest version and retry";
+/// `ResourceNotFoundException` is documented "The specified subscription was not found.
+/// Verify that the ARN is correct and that the subscription belongs to your account." and
+/// carries a `@required` `resourceId`
+/// (`smithy_query(query="shape", shape="ResourceNotFoundException")`), so the refusal
+/// names the ARN the request carried in both members. Reporting and mutating handlers
+/// alike refuse through this one constructor, so they state it identically.
+pub fn subscription_not_found(arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!(
+            "Subscription not found: {arn}. Verify the ARN is correct and the subscription \
+             exists in your account."
+        ),
+        resource_id: arn.to_string(),
+    }
+}
+
+/// How every operation that takes a subscription ARN refuses a value that is not one
+/// ([`is_subscription_arn`]): the modelled `ValidationException` (HTTP 400), naming the
+/// ARN the request carried.
+///
+/// A syntax failure is an input the caller must correct, so it is distinct from the
+/// not-found answer a well-formed ARN naming nothing gets.
+pub fn invalid_subscription_arn(arn: &str) -> ValidationException {
+    ValidationException {
+        message: format!("Invalid subscription ARN: {arn}"),
+        // The rejected value travels in the message; `resourceId` is "the identifier of
+        // the resource that failed validation", and a malformed ARN identifies none.
+        resource_id: None,
+    }
+}
+
+/// How every `If-Match`-bearing operation refuses a tag that is not the subscription's
+/// current one.
+///
+/// An entity tag the service has not issued is an input the caller must correct — it
+/// re-reads the resource to learn the current tag — rather than a conflict with the
+/// resource's state, so this is the modelled `ValidationException` (HTTP 400) and not
+/// `ConflictException`, which is reserved for a request the record's own state refuses.
+/// The rejected tag is echoed so a client or a log names the value that was refused.
+pub fn stale_etag(if_match: &str) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "Invalid or outdated ETag '{if_match}': retrieve current ETag and retry."
+        ),
+        resource_id: None,
+    }
+}
+
+/// How `ListSubscriptions` refuses a `nextToken` this service did not issue
+/// ([`decode_page_token`]): the modelled `ValidationException` (HTTP 400).
+///
+/// The token is opaque to the caller, so the refusal names no value from the request.
+pub fn invalid_next_token() -> ValidationException {
+    ValidationException {
+        message: "The nextToken provided is invalid.".to_string(),
+        resource_id: None,
+    }
+}
 
 /// How every handler states a store it could not reach. Reaching it is infallible in
 /// the assembled emulator, so this only covers an engine the service was not mounted on.
@@ -528,7 +579,7 @@ pub fn mint_subscription_arn(region: &str, sequence: u64, now: DateTime) -> Stri
         &digest[16..20],
         &digest[20..32]
     );
-    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("subscription/{id}"))
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("{SUBSCRIPTION_RESOURCE_TYPE}/{id}"))
 }
 
 /// The region the request was signed for, or [`DEFAULT_REGION`] when it carries no
@@ -560,19 +611,82 @@ pub fn decode_page_token(token: &str) -> Option<String> {
         return None;
     }
     let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    is_minted_subscription_arn(&decoded).then_some(decoded)
+    is_subscription_arn(&decoded).then_some(decoded)
 }
 
 /// The modelled maximum length of a `SubscriptionArn` (`@length(min: 1, max: 2048)`).
 const MAX_SUBSCRIPTION_ARN_LENGTH: usize = 2048;
 
-/// Whether `value` has the shape [`mint_subscription_arn`] produces:
-/// `arn:aws:<arn namespace>:<region>:<account>:subscription/<id>`.
-pub fn is_minted_subscription_arn(value: &str) -> bool {
-    value
-        .strip_prefix("arn:aws:")
-        .and_then(|rest| rest.strip_prefix(ARN_NAMESPACE))
-        .is_some_and(|rest| rest.starts_with(':') && rest.contains(":subscription/"))
+/// The resource type a subscription ARN names.
+pub const SUBSCRIPTION_RESOURCE_TYPE: &str = "subscription";
+
+/// Whether `value` is a well-formed subscription ARN — the syntax check every operation
+/// that takes one makes before it looks anything up.
+///
+/// `SubscriptionArn` is a plain string carrying `@arnReference` to
+/// `AWS::PricingPlanManager::Subscription` and no `@pattern`
+/// (`smithy_query(query="shape", shape="SubscriptionArn")`), so what makes a value one is
+/// the ARN grammar it references, read through the workspace's one ARN parse
+/// ([`service_common::arn`]): the six fields, this service's [`ARN_NAMESPACE`] as the
+/// vendor, a region field that is either empty (the subscription is an account-global
+/// resource) or a region label, an account field that is either empty or an account id,
+/// and a [`SUBSCRIPTION_RESOURCE_TYPE`] resource naming a subscription id
+/// ([`is_subscription_id`]). A value outside that grammar is a malformed input rather
+/// than a subscription that is absent, so it is refused with
+/// [`invalid_subscription_arn`] instead of [`subscription_not_found`].
+pub fn is_subscription_arn(value: &str) -> bool {
+    let Some(arn) = ::service_common::arn::parse_of(value, ARN_NAMESPACE) else {
+        return false;
+    };
+    let Some(id) =
+        ::service_common::arn::resource_id_of_type(value, SUBSCRIPTION_RESOURCE_TYPE)
+    else {
+        return false;
+    };
+    (arn.region.is_empty() || ::service_common::arn::region_label(arn.region).is_some())
+        && (arn.account.is_empty() || ::service_common::arn::is_account_id(arn.account))
+        && is_subscription_id(id)
+}
+
+/// Whether `id` is a subscription id.
+///
+/// Two forms are read: the published one, [`SUBSCRIPTION_ID_PREFIX`] followed by an id,
+/// and the one [`mint_subscription_arn`] currently issues, a grouped hexadecimal id — a
+/// service must never refuse an ARN it handed out itself.
+fn is_subscription_id(id: &str) -> bool {
+    is_published_subscription_id(id) || is_minted_subscription_id(id)
+}
+
+/// The prefix a published subscription id carries.
+pub const SUBSCRIPTION_ID_PREFIX: &str = "sub_";
+
+/// Whether `id` is a published subscription id: [`SUBSCRIPTION_ID_PREFIX`] followed by a
+/// non-empty id of ARN-safe characters.
+fn is_published_subscription_id(id: &str) -> bool {
+    id.strip_prefix(SUBSCRIPTION_ID_PREFIX).is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    })
+}
+
+/// The group lengths of the id [`mint_subscription_arn`] builds, 8-4-4-4-12.
+const MINTED_ID_GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// Whether `id` is an id [`mint_subscription_arn`] produces: hexadecimal grouped
+/// [`MINTED_ID_GROUP_LENGTHS`].
+fn is_minted_subscription_id(id: &str) -> bool {
+    let mut groups = id.split('-');
+    for length in MINTED_ID_GROUP_LENGTHS {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        if group.len() != length || !group.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    groups.next().is_none()
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -681,7 +795,7 @@ mod tests {
                 "case {sequence}: got {arn}"
             );
             assert!(
-                is_minted_subscription_arn(&arn),
+                is_subscription_arn(&arn),
                 "case {sequence}: the token decoder must accept a minted ARN, got {arn}"
             );
             let id = arn

@@ -168,6 +168,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The ARN's syntax is checked before the store is reached and before the
+        // `If-Match` header and the new tier are weighed: a value that is not a
+        // subscription ARN is a malformed request, not a subscription that is absent.
+        if !crate::state::is_subscription_arn(&input.arn) {
+            return Err(UpdateSubscriptionErrorModeled::ValidationException(
+                crate::state::invalid_subscription_arn(&input.arn),
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateSubscriptionErrorModeled::InternalServerException(
                 InternalServerException {
@@ -192,19 +202,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(record) => record,
             Err(crate::state::PreconditionFailure::NotFound) => {
                 return Err(UpdateSubscriptionErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!("no subscription with ARN {arn}"),
-                        resource_id: arn,
-                    },
+                    crate::state::subscription_not_found(&arn),
                 )
                 .into());
             }
             Err(crate::state::PreconditionFailure::ETagMismatch) => {
-                return Err(UpdateSubscriptionErrorModeled::ConflictException(
-                    ConflictException {
-                        message: crate::state::IF_MATCH_CONFLICT_MESSAGE.to_string(),
-                        resource_id: arn,
-                    },
+                return Err(UpdateSubscriptionErrorModeled::ValidationException(
+                    crate::state::stale_etag(&if_match),
                 )
                 .into());
             }

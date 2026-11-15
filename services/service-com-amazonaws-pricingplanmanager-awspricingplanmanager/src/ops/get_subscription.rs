@@ -148,6 +148,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The ARN's syntax is checked before anything is looked up: a value that is not a
+        // subscription ARN is a malformed request, not a subscription that is absent.
+        if !crate::state::is_subscription_arn(&input.arn) {
+            return Err(GetSubscriptionErrorModeled::ValidationException(
+                crate::state::invalid_subscription_arn(&input.arn),
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetSubscriptionErrorModeled::InternalServerException(
                 InternalServerException {
@@ -163,10 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.apply_due_changes(crate::state::now());
         let Some(record) = store.subscription(&input.arn) else {
             return Err(GetSubscriptionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no subscription with ARN {}", input.arn),
-                    resource_id: input.arn.clone(),
-                },
+                crate::state::subscription_not_found(&input.arn),
             )
             .into());
         };

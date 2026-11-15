@@ -49,14 +49,20 @@ const REGION: &str = "us-west-2";
 /// The canonical account id every emulated ARN carries.
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
-/// One HTTP exchange: status, parsed body and the `ETag` response header.
+/// One HTTP exchange: status, parsed body, the `ETag` response header and the error
+/// class the `x-amzn-errortype` header names.
 ///
-/// Visible to the sibling suites of this test crate: the same harness drives the
-/// whole-listing form checks in `list_subscriptions_summary_wire_form`.
+/// Visible to the sibling suites of this test crate: this is the ONE HTTP harness of the
+/// crate's integration tests — the lifecycle suite, the whole-listing form checks in
+/// `list_subscriptions_summary_wire_form` and the refusal surface in
+/// `subscription_refusal_surface` all drive it.
 pub(crate) struct Answer {
     pub(crate) status: u16,
     pub(crate) body: Value,
     pub(crate) etag: Option<String>,
+    /// The shape name in `x-amzn-errortype`, without the namespace or URI a restJson1
+    /// server may wrap it in; `None` on a success.
+    pub(crate) error_code: Option<String>,
 }
 
 impl Answer {
@@ -69,19 +75,42 @@ impl Answer {
             .to_string()
     }
 
+    /// The body member `name`, when present.
+    pub(crate) fn opt_string(&self, name: &str) -> Option<String> {
+        self.body
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
     /// The `ETag` response header; panics when the operation did not send one.
     pub(crate) fn require_etag(&self, case: &str) -> String {
         self.etag
             .clone()
             .unwrap_or_else(|| panic!("case {case}: no ETag response header on {:?}", self.body))
     }
+
+    /// The `message` member of an error body, naming the whole body when it is absent.
+    pub(crate) fn message(&self, case: &str) -> String {
+        self.body
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case}: no message member in {:?}", self.body))
+            .to_string()
+    }
 }
 
 /// A router with this one service mounted on a shared engine, request authentication off.
 pub(crate) fn router() -> MultiServiceRouter {
+    router_on(Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// The same router, over an engine the caller keeps a handle to — so a test can read or
+/// backdate the stored state the handlers see.
+pub(crate) fn router_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(Arc::new(engine::InMemoryEngine::new())));
+    router.register_service(EmulatedService::new(engine));
     router
 }
 
@@ -116,8 +145,27 @@ pub(crate) async fn call(
         .get("etag")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
+    let error_code = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split('/')
+                .next()
+                .unwrap_or(value)
+                .split('#')
+                .next_back()
+                .unwrap_or(value)
+                .to_string()
+        });
     let body = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
-    Answer { status, body, etag }
+    Answer {
+        status,
+        body,
+        etag,
+        error_code,
+    }
 }
 
 /// A minimal valid `CreateSubscription` request.

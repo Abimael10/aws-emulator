@@ -170,11 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(arn) => Some(arn),
                 None => {
                     return Err(ListSubscriptionsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: "nextToken is not a token this service issued"
-                                .to_string(),
-                            resource_id: None,
-                        },
+                        crate::state::invalid_next_token(),
                     )
                     .into());
                 }

@@ -5247,3 +5247,16 @@ mod appended_notes;
 // place to insert and nothing to keep consistent. A suite no `mod` names compiles nowhere
 // and its tests never run; a suite left at the top level of `tests/` fails the build; and a
 // suite declared twice is `E0428`, which fails every suite in this target.
+// A new suite's declaration goes in the sorted list above, as its own `#[path]` / `mod`
+// pair, and nothing else belongs in this file: an inner doc comment (`//!`) past the
+// first item is `E0753` and compiles no suite of this target, and what a suite covers
+// belongs in that suite's own module doc, beside the test it explains.
+// The list above is sorted and holds nothing but one `#[path]` / `mod` pair per suite, so a
+// landing has one place to insert and nothing else to keep consistent. Fragments of this
+// file's header that concurrent landings appended below it, where an inner doc comment is
+// `E0753` and compiles no suite of this target, are gone rather than re-typed: the rules
+// they repeated stand in the header, and the two guard suites check them.
+// Fragments of this file's own header that landings had appended below the list, where an
+// inner doc comment is `E0753` and compiles no suite of this target, are gone rather than
+// re-typed: the rules they repeated stand in the header above, and the two guard suites
+// check them.

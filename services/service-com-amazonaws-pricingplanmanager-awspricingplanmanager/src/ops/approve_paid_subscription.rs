@@ -156,6 +156,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The ARN's syntax is checked before the store is reached and before the
+        // `If-Match` header is weighed: a value that is not a subscription ARN is a
+        // malformed request, not a subscription that is absent.
+        if !crate::state::is_subscription_arn(&input.arn) {
+            return Err(ApprovePaidSubscriptionErrorModeled::ValidationException(
+                crate::state::invalid_subscription_arn(&input.arn),
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ApprovePaidSubscriptionErrorModeled::InternalServerException(
                 InternalServerException {
@@ -179,20 +189,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err(crate::state::PreconditionFailure::NotFound) => {
                 return Err(
                     ApprovePaidSubscriptionErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: format!("no subscription with ARN {arn}"),
-                            resource_id: arn,
-                        },
+                        crate::state::subscription_not_found(&arn),
                     )
                     .into(),
                 );
             }
             Err(crate::state::PreconditionFailure::ETagMismatch) => {
-                return Err(ApprovePaidSubscriptionErrorModeled::ConflictException(
-                    ConflictException {
-                        message: crate::state::IF_MATCH_CONFLICT_MESSAGE.to_string(),
-                        resource_id: arn,
-                    },
+                return Err(ApprovePaidSubscriptionErrorModeled::ValidationException(
+                    crate::state::stale_etag(&if_match),
                 )
                 .into());
             }

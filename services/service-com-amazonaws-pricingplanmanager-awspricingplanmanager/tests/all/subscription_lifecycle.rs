@@ -15,7 +15,6 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -24,154 +23,24 @@ use service_com_amazonaws_pricingplanmanager_awspricingplanmanager::state::{
     ComAmazonawsPricingplanmanagerAwspricingplanmanagerState as ServiceState, LIST_PAGE_SIZE,
     MAX_SUBSCRIPTIONS, PLAN_TIERS_ASCENDING,
 };
-use service_com_amazonaws_pricingplanmanager_awspricingplanmanager::EmulatedService;
 
-/// A SigV4 `Authorization` header scoped to this service in `us-west-2`. The router
-/// routes on the credential scope's service name, and the handler reads the region out
-/// of the same scope, so the minted ARNs must carry `us-west-2`.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDEXAMPLE/20260101/us-west-2/pricingplanmanager/aws4_request, \
-     SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000";
-
-/// The region in [`AUTHORIZATION`], which every minted ARN must name.
-const REGION: &str = "us-west-2";
+// The HTTP harness is `subscription_wire_form`'s — the ONE harness of this crate's
+// integration tests, so this suite adds no second copy of the request builder, the
+// response reader, the router or the create helper.
+use super::subscription_wire_form::{
+    call, create, create_body as subscription_body, router, router_on,
+};
 
 /// The canonical account id every emulated ARN carries.
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
-/// One HTTP exchange: status, parsed body, `ETag` header, error code.
-struct Answer {
-    status: u16,
-    body: Value,
-    etag: Option<String>,
-    error_code: Option<String>,
-}
+/// The region the harness signs for, which every minted ARN must name.
+const REGION: &str = "us-west-2";
 
-impl Answer {
-    /// The body member `name`, as a string. Panics with the whole body when absent, so
-    /// a failure names the actual response rather than `None`.
-    fn string(&self, name: &str) -> String {
-        self.body
-            .get(name)
-            .and_then(Value::as_str)
-            .unwrap_or_else(|| panic!("member {name} missing from body {:?}", self.body))
-            .to_string()
-    }
-
-    /// The body member `name`, when present.
-    fn opt_string(&self, name: &str) -> Option<String> {
-        self.body
-            .get(name)
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    }
-
-    /// The `ETag` response header; panics when the operation did not send one.
-    fn require_etag(&self, case: &str) -> String {
-        self.etag
-            .clone()
-            .unwrap_or_else(|| panic!("case {case}: no ETag response header on {:?}", self.body))
-    }
-}
-
-/// A router with this one service mounted on a single shared engine, with request
-/// authentication off so a test does not have to produce real signatures.
-fn router() -> MultiServiceRouter {
-    router_on(Arc::new(engine::InMemoryEngine::new()))
-}
-
-/// The same router, over an engine the caller keeps a handle to — so a test can read or
-/// backdate the stored state the handlers see.
-fn router_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// POST `/v1/<operation>` with `body`, optionally under `If-Match`.
-async fn call(
-    router: &MultiServiceRouter,
-    operation: &str,
-    body: Value,
-    if_match: Option<&str>,
-) -> Answer {
-    let mut builder = http::Request::builder()
-        .method("POST")
-        .uri(format!(
-            "https://pricingplanmanager.{REGION}.amazonaws.com/v1/{operation}"
-        ))
-        .header("host", format!("pricingplanmanager.{REGION}.amazonaws.com"))
-        .header("authorization", AUTHORIZATION)
-        .header("content-type", "application/json");
-    if let Some(tag) = if_match {
-        builder = builder.header("if-match", tag);
-    }
-    let request = builder
-        .body(Bytes::from(
-            serde_json::to_vec(&body).expect("the request body serializes"),
-        ))
-        .expect("a well-formed request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let etag = response
-        .headers()
-        .get("etag")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let error_code = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split('/')
-                .next()
-                .unwrap_or(value)
-                .split('#')
-                .next_back()
-                .unwrap_or(value)
-                .to_string()
-        });
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    Answer {
-        status,
-        body: parsed,
-        etag,
-        error_code,
-    }
-}
-
-/// Create one subscription and return its answer, asserting only that it succeeded.
-async fn create(router: &MultiServiceRouter, body: Value) -> Answer {
-    let answer = call(router, "CreateSubscription", body.clone(), None).await;
-    assert_eq!(
-        answer.status, 200,
-        "CreateSubscription {body:?} must succeed, got {} {:?}",
-        answer.status, answer.body
-    );
-    answer
-}
-
-/// A minimal valid CreateSubscription request for `tier`.
+/// The shared `CreateSubscription` body without a `usageLevel`: the rows of this suite
+/// that need one set it on the body they get back.
 fn create_body(family: &str, tier: &str, resources: usize, approval: Option<&str>) -> Value {
-    let resource_arns: Vec<String> = (0..resources)
-        .map(|index| format!("arn:aws:cloudfront::{ACCOUNT}:distribution/E{index}"))
-        .collect();
-    let mut body = json!({
-        "planFamily": family,
-        "planTier": tier,
-        "resourceArns": resource_arns,
-    });
-    if let Some(mode) = approval {
-        body["approvalMode"] = json!(mode);
-    }
-    body
+    subscription_body(family, tier, resources, None, approval)
 }
 
 // ---------------------------------------------------------------------------
@@ -406,7 +275,7 @@ async fn a_repeated_client_token_returns_the_original_subscription() {
 // If-Match
 // ---------------------------------------------------------------------------
 
-/// Every mutating operation refuses a stale `If-Match` with `ConflictException` (409)
+/// Every mutating operation refuses a stale `If-Match` with a 400 `ValidationException`
 /// and leaves the subscription untouched, then accepts the current one.
 #[tokio::test]
 async fn if_match_is_enforced_by_every_mutating_operation() {
@@ -460,13 +329,13 @@ async fn if_match_is_enforced_by_every_mutating_operation() {
 
             let refused = call(&router, case.operation, body.clone(), Some(stale)).await;
             assert_eq!(
-                refused.status, 409,
-                "case {}/{stale:?}: a stale If-Match must be a conflict, got {} {:?}",
+                refused.status, 400,
+                "case {}/{stale:?}: a stale If-Match must be a validation failure, got {} {:?}",
                 case.operation, refused.status, refused.body
             );
             assert_eq!(
                 refused.error_code.as_deref(),
-                Some("ConflictException"),
+                Some("ValidationException"),
                 "case {}/{stale:?}: unexpected error code for {:?}",
                 case.operation,
                 refused.body
@@ -1051,10 +920,14 @@ async fn bad_requests_are_refused_with_the_modelled_error() {
     }
 
     let long_arn = format!("arn:aws:pricingplanmanager:{REGION}:{ACCOUNT}:subscription/{}", "x".repeat(2048));
-    let max_arn = format!(
-        "arn:{}",
-        "y".repeat(2048 - "arn:".len())
-    );
+    // A well-formed subscription ARN of exactly the modelled maximum length, so the row
+    // below pins the length boundary rather than the ARN syntax.
+    let max_arn = {
+        let prefix = format!("arn:aws:pricingplanmanager::{ACCOUNT}:subscription:sub_");
+        format!("{prefix}{}", "a".repeat(2048 - prefix.len()))
+    };
+    // A well-formed subscription ARN naming a subscription that was never created.
+    let absent_arn = format!("arn:aws:pricingplanmanager::{ACCOUNT}:subscription:sub_doesnotexist");
     let eleven: Vec<String> = (0..11)
         .map(|index| format!("arn:aws:cloudfront::{ACCOUNT}:distribution/E{index}"))
         .collect();
@@ -1119,7 +992,7 @@ async fn bad_requests_are_refused_with_the_modelled_error() {
         Case {
             label: "an arn the store does not hold",
             operation: "GetSubscription",
-            body: json!({"arn": format!("arn:aws:pricingplanmanager:{REGION}:{ACCOUNT}:subscription/does-not-exist")}),
+            body: json!({"arn": absent_arn.clone()}),
             if_match: None,
             status: 404,
             code: "ResourceNotFoundException",
@@ -1127,7 +1000,7 @@ async fn bad_requests_are_refused_with_the_modelled_error() {
         Case {
             label: "an arn the store does not hold, on a mutating operation",
             operation: "CancelSubscription",
-            body: json!({"arn": format!("arn:aws:pricingplanmanager:{REGION}:{ACCOUNT}:subscription/does-not-exist")}),
+            body: json!({"arn": absent_arn.clone()}),
             if_match: Some("deadbeefdeadbeefdeadbeefdeadbeef"),
             status: 404,
             code: "ResourceNotFoundException",

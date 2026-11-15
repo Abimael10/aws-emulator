@@ -20,6 +20,9 @@ mod resource_eligibility_grounding;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/subscription_refusal_surface.rs"]
+mod subscription_refusal_surface;
+
 #[path = "all/subscription_lifecycle.rs"]
 mod subscription_lifecycle;
 
