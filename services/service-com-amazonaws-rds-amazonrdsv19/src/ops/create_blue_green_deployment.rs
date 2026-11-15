@@ -334,7 +334,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     CreateBlueGreenDeploymentErrorModeled::DBClusterNotFoundFault(
                         DBClusterNotFoundFault {
-                            message: Some(crate::state::db_cluster_not_found_message(
+                            message: Some(source_not_found_message(
+                                SOURCE_DB_CLUSTER,
                                 &source_named,
                             )),
                         },
@@ -411,7 +412,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     CreateBlueGreenDeploymentErrorModeled::DBInstanceNotFoundFault(
                         DBInstanceNotFoundFault {
-                            message: Some(format!("DBInstance {source_named} not found.")),
+                            message: Some(source_not_found_message(
+                                SOURCE_DB_INSTANCE,
+                                &source_named,
+                            )),
                         },
                     )
                     .into(),
@@ -506,6 +510,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             blue_green_deployment: Some(blue_green_deployment),
         })
     }
+}
+
+/// How this operation names a source that is a DB INSTANCE, for
+/// [`source_not_found_message`].
+const SOURCE_DB_INSTANCE: &str = "DB instance";
+
+/// How this operation names a source that is a DB CLUSTER, for
+/// [`source_not_found_message`].
+const SOURCE_DB_CLUSTER: &str = "DB cluster";
+
+/// How this operation reports that the database its `Source` names is not there.
+///
+/// `Source` is "the Amazon Resource Name (ARN) of the source production database", and this
+/// operation carries no identifier of either database type of its own — so the refusal is a
+/// statement about the SOURCE of the deployment rather than a bare lookup of a database that
+/// happens to be missing, and a caller can tell which member was at fault. The fixed text
+/// names that role and the kind of database the ARN named (`subject`), brackets the ARN, and
+/// ends at "not found": the one variable part is the value the request passed, reproduced as
+/// it passed it, so the sentence stays readable back against the request.
+///
+/// It is the wording of this operation alone, which is why it lives here rather than beside
+/// the database types' own lookup sentences in `crate::state`: those answer a call whose
+/// SUBJECT is the database.
+fn source_not_found_message(subject: &str, source: &str) -> String {
+    format!("Source {subject} [{source}] not found")
 }
 
 /// The quota fault for the resource type the green environment needs: creating a

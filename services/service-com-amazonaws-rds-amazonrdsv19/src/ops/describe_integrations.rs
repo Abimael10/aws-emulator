@@ -148,10 +148,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // meant to narrow.
         let filters = input.filters.unwrap_or_default();
         if let Some(filter) = filters.first() {
-            return Err(DescribeIntegrationsError::invalid_parameter_value(format!(
-                "unrecognized filter name: {}; this operation publishes no filter names",
-                filter.name
-            )));
+            return Err(DescribeIntegrationsError::invalid_parameter_value(
+                crate::state::unrecognized_filter_name_message(&filter.name),
+            ));
         }
 
         // No store means this service was mounted on an engine it has no state in, so it

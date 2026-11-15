@@ -179,11 +179,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let candidates: Vec<&crate::state::BlueGreenDeploymentRecord> =
             match &input.blue_green_deployment_identifier {
                 Some(requested) => {
-                    crate::state::check_blue_green_deployment_identifier(
-                        "BlueGreenDeploymentIdentifier",
-                        requested,
-                    )
-                    .map_err(DescribeBlueGreenDeploymentsError::invalid_parameter_value)?;
+                    crate::state::check_blue_green_deployment_identifier(requested)
+                        .map_err(DescribeBlueGreenDeploymentsError::invalid_parameter_value)?;
+                    // "This parameter isn't case-sensitive": the handle this report looks up
+                    // is the FOLDED identifier, so that is the spelling the fault quotes
+                    // back — quoting the request's own case would imply the lookup
+                    // distinguished it.
+                    let looked_up = requested.to_ascii_lowercase();
                     let record = store
                         .resolve_blue_green_deployment(&region, requested)
                         .ok_or_else(|| {
@@ -192,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 BlueGreenDeploymentNotFoundFault {
                                     message: Some(
                                         crate::state::blue_green_deployment_not_found_message(
-                                            requested,
+                                            &looked_up,
                                         ),
                                     ),
                                 },
@@ -236,10 +238,8 @@ const SUPPORTED_FILTER_NAMES: [&str; 4] = [
 fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
     for filter in filters {
         if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
-            return Err(format!(
-                "unrecognized filter name: {}; supported filters are {}",
-                filter.name,
-                SUPPORTED_FILTER_NAMES.join(", ")
+            return Err(crate::state::unrecognized_filter_name_message(
+                &filter.name,
             ));
         }
     }

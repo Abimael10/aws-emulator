@@ -364,6 +364,8 @@ mod sibling_global_databases;
 // objects it writes — is driven end to end by `rds_s3_integration` beside it.
 #[path = "all/snapshot_export_to_s3.rs"]
 mod snapshot_export_to_s3;
+#[path = "all/source_lookup_and_filter_refusal_sentences.rs"]
+mod source_lookup_and_filter_refusal_sentences;
 #[path = "all/state_precondition_refusal_sentences.rs"]
 mod state_precondition_refusal_sentences;
 #[path = "all/statement_budget_bounds.rs"]

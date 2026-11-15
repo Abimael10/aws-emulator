@@ -165,11 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // supported", so there is nothing to match on: a request that carries one is
         // refused rather than served a list the filter was meant to narrow.
         if let Some(filter) = input.filters.unwrap_or_default().first() {
-            return Err(DescribeDBLogFilesError::invalid_parameter_value(format!(
-                "unrecognized filter name: {}; Filters isn't currently supported by this \
-                 operation",
-                filter.name
-            )));
+            return Err(DescribeDBLogFilesError::invalid_parameter_value(
+                crate::state::unrecognized_filter_name_message(&filter.name),
+            ));
         }
         let identifier = input.db_instance_identifier.to_ascii_lowercase();
 

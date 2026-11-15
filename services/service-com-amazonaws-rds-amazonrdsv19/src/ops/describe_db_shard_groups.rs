@@ -224,10 +224,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
     match filters.first() {
         None => Ok(()),
-        Some(filter) => Err(format!(
-            "unrecognized filter name: {}; DescribeDBShardGroups documents no supported \
-             filter name",
-            filter.name
+        Some(filter) => Err(crate::state::unrecognized_filter_name_message(
+            &filter.name,
         )),
     }
 }

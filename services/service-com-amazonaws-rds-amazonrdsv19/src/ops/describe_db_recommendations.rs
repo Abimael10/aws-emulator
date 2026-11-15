@@ -239,7 +239,9 @@ const SUPPORTED_FILTER_NAMES: [&str; 8] = [
 fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
     for filter in filters {
         if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
-            return Err(format!("Unrecognized filter name: {}", filter.name));
+            return Err(crate::state::unrecognized_filter_name_message(
+                &filter.name,
+            ));
         }
     }
     Ok(())

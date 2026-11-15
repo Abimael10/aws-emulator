@@ -130,10 +130,8 @@ const SUPPORTED_FILTER_NAME: &str = "region";
 fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
     for filter in filters {
         if filter.name != SUPPORTED_FILTER_NAME {
-            return Err(format!(
-                "unrecognized filter name: {}; the only supported filter is \
-                 {SUPPORTED_FILTER_NAME}",
-                filter.name
+            return Err(crate::state::unrecognized_filter_name_message(
+                &filter.name,
             ));
         }
     }

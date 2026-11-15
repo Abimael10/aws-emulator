@@ -215,14 +215,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // RDS is regional: the source is resolved in the region the request was signed
         // for, by name or by ARN, and a value that names no group there is the modelled
-        // not-found fault.
+        // not-found fault — answered with the one sentence the parameter-group COPY states
+        // for a source that is not there
+        // (`crate::state::PARAMETER_GROUP_DOES_NOT_EXIST_MESSAGE`), which names neither the
+        // group nor the member and so does not report back the identifier the request
+        // carried.
         let Some(source) = store.resolve_cluster_parameter_group(&region, &source_named) else {
             return Err(
                 CopyDBClusterParameterGroupErrorModeled::DBParameterGroupNotFoundFault(
                     DBParameterGroupNotFoundFault {
-                        message: Some(format!(
-                            "DBClusterParameterGroup not found: {source_named}"
-                        )),
+                        message: Some(
+                            crate::state::PARAMETER_GROUP_DOES_NOT_EXIST_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

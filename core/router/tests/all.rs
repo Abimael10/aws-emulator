@@ -1411,3 +1411,20 @@ mod zz_probe_whole_emulator;
 // `all/declaration_roots_are_canonical_and_complete.rs` pin all of that, for this file and for
 // every service crate's `tests/all.rs`. `tests/all.rs` is a test-target CRATE ROOT, so the
 // `#[path]` above each `mod` is what points it into `tests/all/`.
+// sorted by name, with no line between the pairs and none after the last one — so two
+// re-word or mistype. Put a new suite at `tests/all/<name>.rs` and insert its pair in the
+// one place its name sorts to.
+// EVERY comment in this file is an ordinary one, and no inner attribute stands below the
+// header. An inner doc comment and an inner attribute are both legal only before the first
+// item, so a copy of one appended past the declarations is `E0753` and compiles no suite of
+// this target at all; with none anywhere below this block, there is no such line for a
+// landing to copy. A second pair for one name is `E0428`, and a suite file no pair names is
+// compiled nowhere.
+// What a suite covers, and why it drives the assembled router rather than one service crate,
+// belongs in that suite's own module header, where it is read beside the test it explains; a
+// note about this file belongs in `all/appended_notes.rs`. The suites
+// `all/every_suite_file_is_declared.rs` pin all of it, for this file and for every service
+// crate's `tests/all.rs`, so check there rather than leaving a note here.
+// This file is a test-target CRATE ROOT, where a bare `mod` would resolve to a sibling of it
+// (`tests/<name>.rs`) and the layout check refuses that: the `#[path]` above each `mod` is
+// what points it into `tests/all/`.

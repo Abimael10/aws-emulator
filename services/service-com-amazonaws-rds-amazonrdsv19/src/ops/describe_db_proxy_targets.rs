@@ -164,11 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // supported", so there is nothing to match on: a request that carries one is
         // refused rather than served a list the filter was meant to narrow.
         if let Some(filter) = input.filters.unwrap_or_default().first() {
-            return Err(DescribeDBProxyTargetsError::invalid_parameter_value(format!(
-                "unrecognized filter name: {}; Filters is not currently supported by this \
-                 operation",
-                filter.name
-            )));
+            return Err(DescribeDBProxyTargetsError::invalid_parameter_value(
+                crate::state::unrecognized_filter_name_message(&filter.name),
+            ));
         }
 
         // No store means this service was mounted on an engine it has no state in, so it

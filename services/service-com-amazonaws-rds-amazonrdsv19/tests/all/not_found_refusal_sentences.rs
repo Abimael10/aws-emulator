@@ -454,7 +454,7 @@ async fn a_cancellation_naming_no_export_task_names_the_identifier_it_was_sent()
 }
 
 #[tokio::test]
-async fn the_blue_green_paths_name_the_deployment_identifier_they_were_sent() {
+async fn the_blue_green_paths_name_the_deployment_identifier_they_resolved() {
     let router = emulator();
 
     // A deployment this emulator MINTED and then removed, so one row's variable part is a
@@ -494,7 +494,10 @@ async fn the_blue_green_paths_name_the_deployment_identifier_they_were_sent() {
 
     // `(case, the value the request carries, the identifier the sentence must quote)`. The
     // member accepts the deployment's ARN as well as its identifier, so the quoted part is
-    // the identifier either form carries.
+    // the identifier either form carries — in the spelling the operation RESOLVED it in,
+    // which is the request's own for the delete and the folded one for the report whose
+    // member the model documents as not case-sensitive (see
+    // `source_lookup_and_filter_refusal_sentences`).
     let rows: Vec<(&str, String, String)> = vec![
         (
             "an identifier of the assigned form that names nothing",
@@ -537,9 +540,14 @@ async fn the_blue_green_paths_name_the_deployment_identifier_they_were_sent() {
                 "BlueGreenDeploymentNotFoundFault",
             );
             let refused = text(&refused, "Message");
+            let quoted = if action == "DescribeBlueGreenDeployments" {
+                quoted.to_ascii_lowercase()
+            } else {
+                quoted.clone()
+            };
             assert_eq!(
                 refused,
-                blue_green_sentence(quoted),
+                blue_green_sentence(&quoted),
                 "case {case:?}: expected {action} to quote the deployment identifier, got \
                  {refused:?}"
             );

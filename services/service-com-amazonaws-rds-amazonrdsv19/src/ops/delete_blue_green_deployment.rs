@@ -153,7 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The identifier is SYSTEM-generated, so a value of another form is refused as a
         // value this parameter does not accept, before any lookup — see the module docs.
         crate::state::check_blue_green_deployment_identifier(
-            "BlueGreenDeploymentIdentifier",
             &input.blue_green_deployment_identifier,
         )
         .map_err(DeleteBlueGreenDeploymentError::invalid_parameter_value)?;

@@ -196,6 +196,21 @@ pub const FORCE_FAILOVER_REQUIRES_MULTI_AZ_MESSAGE: &str =
     "ForceFailover cannot be specified since the instance is not configured for either \
      MultiAZ or High Availability";
 
+/// What a report refuses a `Filters` entry whose `Name` is not one it supports with.
+///
+/// Amazon RDS answers an unrecognized filter name with ONE sentence: fixed text, then the
+/// name the request carried, and nothing after it — no enumeration of the names the
+/// operation does support, and no mention of the operation. The only variable part is
+/// `name`, read straight off the request's own `Filter$Name`, so a caller validating its
+/// filter names against the refusal reads back the value it sent.
+///
+/// One wording for every report of this service that checks its filter names — the reports
+/// that publish several names and the ones that publish none alike, since what is refused
+/// is the same thing in both cases — so none of them can drift from the others.
+pub fn unrecognized_filter_name_message(name: &str) -> String {
+    format!("Unrecognized filter name: {name}")
+}
+
 /// Refuse a `BackupRetentionPeriod` outside the range the addressed resource accepts,
 /// whichever operation carries the member: the creates, the modifications, the restores and
 /// the promotion hold ONE rule, so none of them can drift from the others. `Err` carries the

@@ -86,7 +86,12 @@ pub fn blue_green_deployment_identifier_of(named: &str) -> &str {
 /// the real service answers an arbitrary identifier with, while an identifier of the
 /// assigned form naming no stored deployment is the modelled not-found fault. `Err`
 /// carries the message the caller is refused with.
-pub fn check_blue_green_deployment_identifier(member: &str, value: &str) -> Result<(), String> {
+///
+/// Amazon RDS words the SHAPE refusal as a statement that the identifier itself is not one:
+/// the fixed text, then the value the request carried and nothing after it — no member name
+/// and no account of the form an identifier takes, which is the service's own business
+/// rather than part of the sentence. `value` is reproduced exactly as the request passed it.
+pub fn check_blue_green_deployment_identifier(value: &str) -> Result<(), String> {
     let identifier = blue_green_deployment_identifier_of(value);
     let token = identifier
         .strip_prefix(BLUE_GREEN_IDENTIFIER_PREFIX)
@@ -94,11 +99,7 @@ pub fn check_blue_green_deployment_identifier(member: &str, value: &str) -> Resu
     if !token.is_empty() && token.len() <= MAX_IDENTIFIER_TOKEN_LEN {
         return Ok(());
     }
-    Err(format!(
-        "invalid value '{value}' for {member}: a blue/green deployment identifier is \
-         assigned by the service and reads {BLUE_GREEN_IDENTIFIER_PREFIX} followed by the \
-         token it assigned"
-    ))
+    Err(format!("Invalid blue-green deployment identifier: {value}"))
 }
 
 /// The sentence a `BlueGreenDeploymentNotFoundFault` carries for a
@@ -111,6 +112,11 @@ pub fn check_blue_green_deployment_identifier(member: &str, value: &str) -> Resu
 /// deployment's ARN, so it is the identifier part of that value
 /// ([`blue_green_deployment_identifier_of`]), which is the handle the caller gave the
 /// deployment.
+///
+/// The SPELLING quoted is the caller's to decide, so each operation hands in the value the
+/// way its own member resolves it: the report whose member the model documents as not
+/// case-sensitive quotes the identifier folded, because that is the handle it looked up,
+/// while a member resolved as sent is quoted as sent.
 pub fn blue_green_deployment_not_found_message(named: &str) -> String {
     format!(
         "Blue Green Deployment '{}' doesn't exist.",

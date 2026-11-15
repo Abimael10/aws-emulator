@@ -162,11 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused rather than served a list the filter was meant to narrow.
         if let Some(filter) = input.filters.unwrap_or_default().first() {
             return Err(DescribeDBProxyTargetGroupsError::invalid_parameter_value(
-                format!(
-                    "unrecognized filter name: {}; Filters is not currently supported by this \
-                     operation",
-                    filter.name
-                ),
+                crate::state::unrecognized_filter_name_message(&filter.name),
             ));
         }
 
