@@ -65,10 +65,15 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # * the "dyn-load" feature is NOT enabled, so QuickJS registers no dynamic host-library
 #   loader; no "loader" feature either, so an `import` resolves to nothing and the only
 #   modules a guest reaches are the ones this crate implements for it;
-# * plain QuickJS registers no filesystem, process, environment, socket or thread API, and
-#   nothing here adds one: the guest's only host functions are this module's own request,
-#   connect and log seams, each removed from the global object before the guest's code is
-#   compiled;
+# * plain QuickJS registers no filesystem, process, environment, socket or thread API. The
+#   `fs`, `process` and `os` a guest reaches are this crate's own and are the MICROVM's,
+#   never this machine's: `fs` reads and writes only the in-memory tree the MicroVM holds
+#   (`src/state/guest_machine.rs`, bounded by its own volume limits) and opens no host
+#   path, `process` and `os` report the identity and the environment the MicroVM published
+#   to the guest and nothing of the process this emulator runs in, and the guest's only
+#   host functions are this crate's request, connect, machine and log seams, each removed
+#   from the global object before the guest's code is compiled. No child-process,
+#   host-library or thread module is registered at all;
 # * it is also a NATIVE component: `rquickjs-sys` compiles the QuickJS C sources with `cc`
 #   at build time and the bindings are `unsafe`. That is accepted because the engine is
 #   what makes a guest's code run at all, and it is the engine four other service crates of

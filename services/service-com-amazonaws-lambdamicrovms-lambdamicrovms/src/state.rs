@@ -54,6 +54,10 @@ pub mod regions;
 /// The guest a MicroVM runs: the program held in the image version's code artifact.
 pub mod guest_program;
 
+/// The MACHINE that guest runs on: the identity its MicroVM publishes to it, the
+/// environment its image declares and the filesystem it reads and writes.
+pub mod guest_machine;
+
 /// RUNNING that guest — the engine the image's own code executes in, and the one request
 /// a published endpoint hands it.
 pub mod guest_runtime;
@@ -1415,6 +1419,13 @@ pub fn mint_microvm_image_id() -> String {
     ::service_common::uuid_from_random_bytes(id)
 }
 
+/// The id a MicroVM's kernel publishes for the boot it has just performed
+/// ([`guest_machine::BOOT_ID_PATH`]): a UUID, minted the way every other identity of this
+/// store is ([`mint_microvm_image_id`]), so two boots of one MicroVM never share one.
+pub fn mint_guest_boot_id() -> String {
+    mint_microvm_image_id()
+}
+
 /// 32 opaque bytes for one minted identifier.
 ///
 /// A digest over a process-wide counter (what makes two mints of the same instant
@@ -1490,6 +1501,13 @@ pub struct Microvm {
     /// accumulate for the process's lifetime; set from the termination instant, and
     /// `None` while the MicroVM has not terminated.
     pub reclaim_due_at: Option<Instant>,
+    /// The MACHINE this MicroVM booted its guest on: the identity it published to the
+    /// guest, the environment its image declared and the tree the guest reads and
+    /// writes ([`guest_machine`]). Minted when the MicroVM REACHES `RUNNING` and kept
+    /// through a suspend ("preserving its full memory and disk state"), so what the
+    /// guest wrote and what it reports of itself outlive every request; `None` before a
+    /// MicroVM has started its guest and once it has terminated.
+    pub guest_machine: Option<::std::sync::Arc<guest_machine::GuestMachine>>,
 }
 
 /// What an `@idempotencyToken` replay must return instead of minting a second
@@ -1543,6 +1561,23 @@ pub struct ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     pub next_microvm_seq: u64,
     /// The sequence the next minted `buildId` is formatted from.
     pub next_build_seq: u64,
+    /// The guest PROCESSES this store runs — the engine each RUNNING MicroVM's own
+    /// program is executing in ([`guest_runtime::GuestProcess`]) — keyed by the region
+    /// and the `microvmId` of the MicroVM running it. Bounded by
+    /// [`guest_runtime::MAX_LIVE_GUESTS`], and reaped where a MicroVM stops being one
+    /// anything can connect to.
+    pub guest_processes: BTreeMap<(String, String), LiveGuest>,
+}
+
+/// One live guest process of [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::guest_processes`]:
+/// the process itself, and when a request was last handed to it — which is what decides
+/// WHICH process makes room when the store is at its ceiling.
+#[derive(Debug, Clone)]
+pub struct LiveGuest {
+    /// The process, shared with whatever request is being answered by it.
+    pub process: ::std::sync::Arc<guest_runtime::GuestProcess>,
+    /// When this store last handed it a request.
+    pub last_used: Instant,
 }
 
 /// One entry of the AWS-managed base-image catalogue, as a reporting operation
@@ -1628,6 +1663,29 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
         }
         self.regions.retain(|_, regional| !regional.is_empty());
         self.expire_auth_tokens(now);
+        self.reap_guest_processes();
+    }
+
+    /// Let go of the guest process of every MicroVM nothing can connect to any more, and
+    /// of every process whose own thread has ended — both owed at this instant whether or
+    /// not anybody called. Dropping the process is what frees its engine.
+    ///
+    /// A SUSPENDED MicroVM keeps its process: `SuspendMicrovm` preserves "its full memory
+    /// and disk state", which is exactly what that process holds.
+    fn reap_guest_processes(&mut self) {
+        let connectable: ::std::collections::BTreeSet<(String, String)> = self
+            .regions
+            .iter()
+            .flat_map(|(region, regional)| {
+                regional
+                    .microvms
+                    .values()
+                    .filter(|vm| is_connectable_microvm_state(&vm.state))
+                    .map(|vm| (region.clone(), vm.microvm_id.clone()))
+            })
+            .collect();
+        self.guest_processes
+            .retain(|key, live| connectable.contains(key) && live.process.is_running());
     }
 }
 
@@ -1741,6 +1799,40 @@ impl regions::RegionalStore {
                 vm.provision_due_at = None;
                 if vm.state == MICROVM_STATE_PENDING {
                     vm.state = MICROVM_STATE_RUNNING.to_string();
+                    // The MicroVM has STARTED, so it has booted the machine its guest
+                    // runs on: this boot's id, the environment the image version
+                    // declares, the module its command starts and the tree the guest
+                    // reads and writes. All of it outlives the requests the guest
+                    // answers, and a suspend preserves it.
+                    let version = self
+                        .arn_index
+                        .get(&vm.image_arn)
+                        .and_then(|name| self.images.get(name))
+                        .and_then(|image| image.versions.get(&vm.image_version));
+                    let env = version
+                        .map(|version| version.environment_variables.clone())
+                        .unwrap_or_default();
+                    // The architecture the version was BUILT for, which is what its
+                    // guest runs on; a version carrying no `cpuConfigurations` was
+                    // normalized to the service's own default.
+                    let architecture = version
+                        .and_then(|version| version.cpu_configurations.first())
+                        .map_or(DEFAULT_CPU_ARCHITECTURE, |cpu| cpu.architecture.as_str())
+                        .to_string();
+                    let program = version.and_then(|version| version.guest.clone());
+                    vm.guest_machine = Some(::std::sync::Arc::new(
+                        guest_machine::GuestMachine::boot(
+                            mint_guest_boot_id(),
+                            vm.microvm_id.clone(),
+                            program.as_deref(),
+                            &architecture,
+                            env,
+                            // The kernel came up when the MicroVM started provisioning,
+                            // which is one span before it reached RUNNING.
+                            now.checked_sub(MICROVM_PROVISION_SPAN).unwrap_or(now),
+                            now,
+                        ),
+                    ));
                 }
             }
             // "The MicroVM transitions through SUSPENDING to SUSPENDED."
@@ -1761,6 +1853,10 @@ impl regions::RegionalStore {
                     // The retention runs from the TERMINATION instant, not from the
                     // request that happened to observe it.
                     vm.reclaim_due_at = Some(due + TERMINATED_MICROVM_RETENTION);
+                    // A terminated MicroVM holds no machine: its memory and its disk
+                    // are gone with it, which is what makes a terminate different from
+                    // a suspend.
+                    vm.guest_machine = None;
                 }
             }
             // "The maximum duration in seconds that the MicroVM can exist before
@@ -1774,6 +1870,7 @@ impl regions::RegionalStore {
                     vm.terminated_at = Some(now_datetime());
                     vm.state_reason = Some(EXPIRY_REASON.to_string());
                     vm.reclaim_due_at = Some(due + TERMINATED_MICROVM_RETENTION);
+                    vm.guest_machine = None;
                 }
             }
         }

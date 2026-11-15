@@ -2016,3 +2016,16 @@ mod every_suite_file_is_declared;
 //! What a suite covers, and why it lives in THIS target rather than in a service crate's
 //! own, belongs in that suite's own module header, where it is read beside the test it
 //! explains.
+//! Single integration-test target for the router: a canonical DECLARATION LIST.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted into the sorted list. The
+//! list holds one pair per suite and NO other line — no prose, no blank line — so two
+//! branches landing at once insert two lines in two places and have nothing to duplicate,
+//! This file is ONE crate root, so it holds one module namespace and one header:
+//! * declare each suite EXACTLY ONCE — a second `mod` for the same name is `E0428`;
+//! * these lines are the ONLY place an inner doc comment (`//!`) may stand — past the
+//!   first declaration one is `E0753`.
+//! Either mistake compiles no suite of this target. A suite file no `mod` here names
+//! compiles nowhere and its tests never run, and a suite left at the top level of
+//! `tests/` fails the build. WHY a suite belongs to this cross-service target rather than
+//! to one service crate's own is stated in that suite's own module doc, where it is read
+//! with the test it explains.

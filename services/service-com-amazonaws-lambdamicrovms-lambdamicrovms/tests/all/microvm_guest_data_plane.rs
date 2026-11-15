@@ -104,7 +104,7 @@ http.createServer(function (req, res) {
 
 /// A router carrying this service and every owner of what a guest's connection is decided
 /// against, over ONE shared engine.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Verifying signatures is the emulator's concern, not this service's; these tests
@@ -171,7 +171,7 @@ fn ec2(router: &MultiServiceRouter) -> aws_sdk_ec2::Client {
 
 /// The .zip a client uploads as a MicroVM image's code artifact: the container
 /// specification that declares which module starts the guest, and the guest itself.
-fn guest_artifact(server: &str) -> Vec<u8> {
+pub(crate) fn guest_artifact(server: &str) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
@@ -194,7 +194,12 @@ fn guest_artifact(server: &str) -> Vec<u8> {
 }
 
 /// Stage `bytes` as the object `key` of `bucket`, through Amazon S3's own operations.
-async fn stage_artifact(router: &MultiServiceRouter, bucket: &str, key: &str, bytes: Vec<u8>) {
+pub(crate) async fn stage_artifact(
+    router: &MultiServiceRouter,
+    bucket: &str,
+    key: &str,
+    bytes: Vec<u8>,
+) {
     let client = s3(router);
     let created = client
         .create_bucket()

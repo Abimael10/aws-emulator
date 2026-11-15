@@ -20,18 +20,18 @@
 //!   there, so `404`;
 //! * no `X-aws-proxy-auth` token, or one this store does not hold live for the MicroVM
 //!   the path names (another MicroVM's, one the clock has expired, or one whose
-//!   `allowedPorts` do not cover the port the MicroVM's image publishes its listener
-//!   on — or name particular ports where that image publishes none, a scope this
-//!   emulator cannot establish) — `403`, the answer `CreateMicrovmAuthToken`'s token is
-//!   what avoids;
+//!   `allowedPorts` do not cover the port THE REQUEST ADDRESSES) — `403`, the answer
+//!   `CreateMicrovmAuthToken`'s token is what avoids;
 //! * an authenticated request — the GUEST's own HTTP response belongs here, so the
 //!   request is handed to the guest the MicroVM's image version holds
 //!   ([`super::guest_program`]) and RUN in the engine embedded in this process
 //!   ([`super::guest_runtime`]): the status, the headers and the body a client reads
 //!   back are the ones the guest's own program produced. Nothing is synthesised in the
-//!   guest's name — a MicroVM whose image holds no guest this engine can run, and a
-//!   guest that produced no response, are each answered with the status the PROXY itself
-//!   answers for a MicroVM it reached nothing inside of ([`NO_GUEST_RESPONSE_STATUS`]).
+//!   guest's name — a MicroVM whose image holds no guest this engine can run, a MicroVM
+//!   whose guest is not running (one still provisioning, and one resting under
+//!   `SuspendMicrovm`) and a guest that produced no response are each answered with the
+//!   status the PROXY itself answers for a MicroVM it reached nothing inside of
+//!   ([`NO_GUEST_RESPONSE_STATUS`]).
 //!
 //! A guest's outbound connections are decided by the MicroVM's `egressNetworkConnectors`
 //! ([`super::microvm_network`]), which this listener answers from the emulated network
@@ -41,12 +41,16 @@
 //! A token is held as a DIGEST, never as the token itself: the caller keeps the only
 //! copy of the secret, and this store keeps just enough to recognise it again.
 //!
-//! `Hooks$port` ("the port number on which the hooks listener runs") is the ONE port
-//! this API records for a guest, so it is the only port a token's `allowedPorts` can be
-//! established against here: the ports a guest actually binds are a property of the
-//! image's code artifact, which no operation of this service reports and which nothing
-//! in this emulator runs. A token scoped to ports that cannot be established is
-//! refused rather than treated as granted.
+//! `allowedPorts` is "the ports on the MicroVM endpoint the token grants access to", so
+//! what a presented token is judged against is the port THE REQUEST ADDRESSES on that
+//! endpoint: the port named in [`PROXY_PORT_HEADER`], and where the request names none,
+//! the port the endpoint FRONTS — the port the MicroVM's own guest bound its server on,
+//! read from the running guest itself, and [`DEFAULT_PROXIED_PORT`] where it bound none.
+//! No metadata of the image the MicroVM runs takes part in that decision: a token scoped
+//! to the port its guest listens on is the least privilege the API invites, and it grants
+//! exactly the requests addressing that port. The addressed port is then the port of the
+//! guest's own server the request is handed to, so a port nothing bound inside the MicroVM
+//! reaches nothing there.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -70,6 +74,22 @@ pub const AUTH_TOKEN_HEADER: &str = "X-aws-proxy-auth";
 /// listener addresses every MicroVM of the store and a guest path appends to the
 /// endpoint exactly as it does against AWS (`<endpoint><path>`).
 pub const MICROVM_PATH_SEGMENT: &str = "microvms";
+
+/// The header a client names the port it addresses on the MicroVM endpoint in, which is
+/// the port a presented token's `allowedPorts` is judged against.
+pub const PROXY_PORT_HEADER: &str = "X-aws-proxy-port";
+
+/// The port the MicroVM endpoint FRONTS where neither the request nor the MicroVM's own
+/// guest names one: the port a request addresses when it carries no
+/// [`PROXY_PORT_HEADER`] and the guest bound no port of its own (one still starting, one
+/// that registered no server, or one listening without naming a port). A MicroVM whose
+/// guest DID bind a port is fronted on that port, which is what the endpoint reads from
+/// the running guest itself.
+pub const DEFAULT_PROXIED_PORT: i32 = 8080;
+
+/// The ports a `PortSpecification` can name: `PortNumber` is `@range min 1, max 65535`,
+/// so a request naming anything outside it addresses no port at all.
+const PORT_RANGE: ::std::ops::RangeInclusive<i32> = 1..=65535;
 
 /// How many live authentication tokens one store keeps.
 ///
@@ -307,19 +327,24 @@ pub async fn serve_request(
             return endpoint_response(head, 404, NO_MICROVM_AT_THIS_ADDRESS);
         };
 
-        let guest_port = store.microvm_guest_port(&region, &microvm_id);
-        let authenticated = presented
+        // What the presented token GRANTS, where this store holds it live for the MicroVM
+        // the address names. Which ports it covers is decided below, against the port the
+        // request addresses; the identity and the clock are decided here.
+        let granted = presented
             .and_then(|digest| store.auth_tokens.get(&digest))
-            .is_some_and(|token| {
+            .filter(|token| {
                 // The token's identity is the REGION and the `microvmId` together: a
                 // token minted against one region's partition grants nothing at
                 // another's.
                 token.region == region
                     && token.microvm_id == microvm_id
                     && token.expires_at > now
-                    && grants_port(&token.allowed_ports, guest_port)
-            });
+            })
+            .map(|token| token.allowed_ports.clone());
         let vm = store.microvm(&region, &microvm_id);
+        // The run state the MicroVM is in AT THIS INSTANT, after the clock's own moves
+        // have been materialised: whether a guest is executing inside it at all.
+        let run_state = vm.map(|vm| vm.state.clone()).unwrap_or_default();
         let egress = super::microvm_network::GuestEgress {
             region: region.clone(),
             connectors: vm
@@ -329,43 +354,85 @@ pub async fn serve_request(
                 .map(|vm| vm.link_local_address.clone())
                 .unwrap_or_default(),
         };
-        // The guest is the program the build of the image version this MicroVM runs
-        // produced, held on that version's record.
-        let running = vm.map(|vm| (vm.image_arn.clone(), vm.image_version.clone()));
-        let guest = running.and_then(|(image_arn, image_version)| {
-            store
-                .image(&region, &image_arn)
-                .and_then(|image| image.versions.get(&image_version))
-                .and_then(|version| version.guest.clone())
-        });
-        (microvm_id, authenticated, egress, guest)
+        // The guest is the PROCESS this MicroVM runs its image version's program in,
+        // started where it is not running yet and reached again where it is — which is
+        // what makes what the guest holds survive from one request to the next. A request
+        // presenting no live token starts nothing.
+        let process = (granted.is_some() && run_state == super::MICROVM_STATE_RUNNING)
+            .then(|| store.guest_process(&region, &microvm_id, now))
+            .flatten();
+        (microvm_id, granted, run_state, egress, process)
     };
-    let (microvm_id, authenticated, egress, guest) = resolved;
+    let (microvm_id, granted, run_state, egress, process) = resolved;
 
-    if !authenticated {
-        // Every attempt on a published endpoint is attributable: the MicroVM addressed
-        // and the outcome. The presented token is NEVER logged — only the caller holds
-        // it — and neither is the path, which carries whatever the client sent.
+    // Every attempt on a published endpoint is attributable: the MicroVM addressed and the
+    // outcome. The presented token is NEVER logged — only the caller holds it — and
+    // neither is the path, which carries whatever the client sent.
+    let refused = |head: bool| {
         ::tracing::info!(
             audit = true,
             operation = "MicrovmEndpointRequest",
             outcome = "refused",
             microvm_id = %microvm_id,
-            "MicroVM endpoint request without a live authentication token"
+            "MicroVM endpoint request without a live authentication token for the port it \
+             addressed"
         );
-        return endpoint_response(head, 403, AUTH_TOKEN_REQUIRED);
+        endpoint_response(head, 403, AUTH_TOKEN_REQUIRED)
+    };
+
+    let Some(allowed_ports) = granted else {
+        return refused(head);
+    };
+
+    // The port the request ADDRESSES, which is what the token's `allowedPorts` has to
+    // cover: the port it names in `X-aws-proxy-port`, and otherwise the port this endpoint
+    // FRONTS — the port the MicroVM's own guest bound ([`PROXY_PORT_HEADER`],
+    // [`DEFAULT_PROXIED_PORT`]).
+    let fronted = match &process {
+        Some(process) => process
+            .fronted_port()
+            .await
+            .unwrap_or(DEFAULT_PROXIED_PORT),
+        None => DEFAULT_PROXIED_PORT,
+    };
+    let Some(addressed_port) = addressed_port(req, fronted) else {
+        return refused(head);
+    };
+    if !grants_port(&allowed_ports, addressed_port) {
+        return refused(head);
+    }
+
+    // A guest answers only while the MicroVM is RUNNING it: one still provisioning has
+    // not started it yet, and one resting under `SuspendMicrovm` ("preserving its full
+    // memory and disk state") is not executing it, so the proxy reaches nothing inside
+    // either — the same answer as a MicroVM with no guest to reach.
+    if run_state != super::MICROVM_STATE_RUNNING {
+        ::tracing::debug!(
+            microvm_id = %microvm_id,
+            state = %run_state,
+            "the MicroVM is not running its guest, so nothing inside it answers"
+        );
+        return endpoint_response(head, NO_GUEST_RESPONSE_STATUS, NO_GUEST_RESPONSE);
     }
 
     // The guest's own response, or the proxy's answer for a MicroVM it reached nothing
     // inside of.
-    let Some(guest) = guest else {
+    let Some(process) = process else {
         ::tracing::debug!(
             microvm_id = %microvm_id,
-            "the MicroVM's image holds no guest program this emulator's engine can run"
+            "the MicroVM runs no guest process this emulator could hand the request to"
         );
         return endpoint_response(head, NO_GUEST_RESPONSE_STATUS, NO_GUEST_RESPONSE);
     };
-    match run_guest(connectors, callback, &egress, guest, guest_request(req)).await {
+    match run_guest(
+        connectors,
+        callback,
+        &egress,
+        &process,
+        guest_request(req, addressed_port),
+    )
+    .await
+    {
         super::guest_runtime::GuestOutcome::Answered(answer) => guest_response(head, &answer),
         other => {
             ::tracing::debug!(
@@ -378,21 +445,21 @@ pub async fn serve_request(
     }
 }
 
-/// Run `guest` over `request`, answering the outbound connections it opens from the
-/// emulated network as it waits on them.
+/// Hand `request` to the MicroVM's guest PROCESS, answering the outbound connections it
+/// opens from the emulated network as it waits on them.
 ///
-/// The guest runs on a blocking thread and this future is what decides its connections,
-/// so the two run together: the run asks, this answers, and the run's own bounds
+/// The guest runs on its own thread and this future is what decides its connections, so
+/// the two run together: the run asks, this answers, and the run's own bounds
 /// ([`super::guest_runtime`]) are what end it either way.
 async fn run_guest(
     connectors: Option<&::engine::ServiceState<super::microvm_network::ConnectorState>>,
     callback: &::smithy_server_runtime::EmbeddedEmulator,
     egress: &super::microvm_network::GuestEgress,
-    guest: ::std::sync::Arc<super::guest_program::GuestProgram>,
+    process: &super::guest_runtime::GuestProcess,
     request: super::guest_runtime::GuestRequest,
 ) -> super::guest_runtime::GuestOutcome {
     let (asks, mut answers) = ::tokio::sync::mpsc::unbounded_channel();
-    let mut running = Box::pin(super::guest_runtime::serve(guest, request, asks));
+    let mut running = Box::pin(process.serve(request, asks));
     loop {
         ::tokio::select! {
             Some(ask) = answers.recv() => {
@@ -415,17 +482,23 @@ async fn run_guest(
 
 /// The request a client sent, as the guest's own HTTP server is handed it.
 ///
-/// `req.url` is the path the client appended to the published endpoint — the guest's own
-/// path, with the segments addressing the MicroVM taken off, exactly as the request would
-/// arrive at a server inside the MicroVM — and the headers are lowercased, as a Node
-/// server reports them. The body is read as the TEXT a guest reads.
-fn guest_request(req: &::http::Request<Vec<u8>>) -> super::guest_runtime::GuestRequest {
+/// `port` is the port of the MicroVM the request addressed, so the guest's server bound to
+/// THAT port is the one that answers it. `req.url` is the path the client appended to the
+/// published endpoint — the guest's own path, with the segments addressing the MicroVM
+/// taken off, exactly as the request would arrive at a server inside the MicroVM — and the
+/// headers are lowercased, as a Node server reports them. The body is read as the TEXT a
+/// guest reads.
+fn guest_request(
+    req: &::http::Request<Vec<u8>>,
+    port: i32,
+) -> super::guest_runtime::GuestRequest {
     let query = req
         .uri()
         .query()
         .map(|query| format!("?{query}"))
         .unwrap_or_default();
     super::guest_runtime::GuestRequest {
+        port,
         method: req.method().as_str().to_string(),
         url: format!("{}{query}", guest_path(req.uri().path())),
         headers: req
@@ -500,22 +573,33 @@ fn addressed_microvm(path: &str) -> Option<String> {
     (!identifier.is_empty()).then(|| identifier.to_string())
 }
 
-/// Whether `allowed` grants access to the port a MicroVM publishes its guest listener
-/// on — each arm of the `PortSpecification` union as the model declares it (`port`, a
-/// `range` inclusive of both endpoints, or `allPorts`).
+/// The port a request ADDRESSES on the MicroVM endpoint: the one it names in
+/// [`PROXY_PORT_HEADER`], and `fronted` — the port this endpoint fronts — where it names
+/// none.
 ///
-/// Where the MicroVM's image declares no listener port there is no port to match the
-/// scope against, so a token scoped to particular ports grants nothing that can be
-/// established and is refused; only a token for EVERY port covers such a request. A
-/// scope this emulator cannot establish is never read as a granted one.
-fn grants_port(allowed: &[PortSpecification], guest_port: Option<i32>) -> bool {
-    allowed.iter().any(|spec| match (spec, guest_port) {
-        (PortSpecification::AllPorts(_), _) => true,
-        (PortSpecification::Port(allowed), Some(port)) => *allowed == port,
-        (PortSpecification::Range(range), Some(port)) => {
-            range.start_port <= port && port <= range.end_port
-        }
-        (PortSpecification::Port(_) | PortSpecification::Range(_), None) => false,
+/// `None` where the header carries something that is no port at all (a value that is not
+/// a number, or one outside [`PORT_RANGE`]): such a request addresses no port of the
+/// MicroVM, so no scope covers it.
+fn addressed_port(req: &::http::Request<Vec<u8>>, fronted: i32) -> Option<i32> {
+    let Some(named) = req.headers().get(PROXY_PORT_HEADER) else {
+        return Some(fronted);
+    };
+    named
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|port| PORT_RANGE.contains(port))
+}
+
+/// Whether `allowed` grants access to `port`, the port the request addresses — each arm
+/// of the `PortSpecification` union as the model declares it (`port`, a `range` inclusive
+/// of both endpoints, or `allPorts`).
+fn grants_port(allowed: &[PortSpecification], port: i32) -> bool {
+    allowed.iter().any(|spec| match spec {
+        PortSpecification::AllPorts(_) => true,
+        PortSpecification::Port(allowed) => *allowed == port,
+        PortSpecification::Range(range) => range.start_port <= port && port <= range.end_port,
     })
 }
 
@@ -601,23 +685,6 @@ impl ServiceState {
             },
         );
         expires_at
-    }
-
-    /// The port a MicroVM's guest publishes its listener on: `Hooks$port`, "the port
-    /// number on which the hooks listener runs", of the image version the MicroVM runs.
-    /// `None` when that image version declares none.
-    ///
-    /// Both records are read in `region`: a MicroVM and the image it runs are resources
-    /// of the same regional partition.
-    pub fn microvm_guest_port(&self, region: &str, microvm_id: &str) -> Option<i32> {
-        let vm = self.microvm(region, microvm_id)?;
-        let image = self.image(region, &vm.image_arn)?;
-        image
-            .versions
-            .get(&vm.image_version)?
-            .hooks
-            .as_ref()?
-            .port
     }
 
     /// Forget every authentication token the clock has expired, and every one whose

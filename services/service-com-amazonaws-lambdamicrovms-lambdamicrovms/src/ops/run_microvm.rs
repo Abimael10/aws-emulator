@@ -404,6 +404,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     terminate_due_at: None,
                     expiry_due_at: Some(now + ::std::time::Duration::from_secs(maximum_duration)),
                     reclaim_due_at: None,
+                    // The MicroVM has not started its guest yet: the machine it runs on
+                    // is booted where it REACHES `RUNNING`.
+                    guest_machine: None,
                 },
             );
         if let Some(token) = input.client_token {

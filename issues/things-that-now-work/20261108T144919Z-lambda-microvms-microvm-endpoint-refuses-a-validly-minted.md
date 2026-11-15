@@ -1,16 +1,26 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lambda-microvms.microvm-auth-token-grants-endpoint-access lambda-microvms.suspend-resume-microvm-transitions lambda-microvms.suspend-resume-preserves-guest-memory-and-process-identity
+Issue-Trace-Ids: lambda-microvms.microvm-auth-token-grants-endpoint-access lambda-microvms.suspend-resume-microvm-transitions
 Issue-Shape-Id: com.amazonaws.lambdamicrovms#LambdaMicrovms
 Issue-Key: lambda-microvms.microvm-auth-token-grants-endpoint-access|_http_get#9|HTTPError|with urllib.request.urlopen(req, timeout=20) as resp:
 Issue-Key: lambda-microvms.suspend-resume-microvm-transitions|_get_state#9|AssertionError|raise AssertionError(
-Issue-Key: lambda-microvms.suspend-resume-preserves-guest-memory-and-process-identity|_get_json#10|AssertionError|assert status == 200, f"GET {url!r} answered HTTP {status} with {body[:200]!r}"
 Issue-Commit: 5bdc422e571ff089197010dd8b23a6f4d1e72235
 
 # lambda-microvms MicroVM endpoint refuses a validly minted port-scoped auth token with HTTP 403, and serves 501 instead of the guest's response
 
 > _Note: this issue was identified against the code base at commit `5bdc422e571ff089197010dd8b23a6f4d1e72235`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+> _Resolved for the two keys above: the endpoint now decides a token's `allowedPorts`
+> against the port the request addresses, and a MicroVM runs its guest as one process
+> whose memory, disk and published identity survive its requests and a suspend/resume._
+>
+> _The third check this report was filed with,
+> `lambda-microvms.suspend-resume-preserves-guest-memory-and-process-identity`
+> (`_get_json#10`), is NOT resolved and is NOT claimed here: its code artifact is a Python
+> program, and this emulator's guest engine runs JavaScript only. That key and its trace
+> moved to `issues/things-that-do-not-work/20261115T120000Z-lambda-microvms-the-microvm-endpoint-runs-no-python-guest.md`,
+> which is the capability it needs._
 
 ## Operation
 CreateMicrovmAuthToken

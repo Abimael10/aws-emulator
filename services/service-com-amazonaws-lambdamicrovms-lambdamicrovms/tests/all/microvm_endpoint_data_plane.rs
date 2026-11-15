@@ -304,18 +304,19 @@ async fn a_published_microvm_endpoint_is_an_address_a_client_can_open() {
 
 /// RULE: a published endpoint answers an HTTP STATUS for every request — `404` where
 /// the address names no MicroVM that can be connected to, `403` where no live token
-/// `CreateMicrovmAuthToken` minted for THAT MicroVM (and covering the port its image
-/// publishes its listener on) is presented in `X-aws-proxy-auth`, and otherwise the
-/// GUEST's own answer — which, for a MicroVM whose image holds no guest program this
-/// emulator's engine can run (these images' code artifacts were never served), is the
-/// status the proxy answers for a MicroVM it reached nothing inside of. Never a transport
-/// failure, whatever the guest path, the method or the token.
+/// `CreateMicrovmAuthToken` minted for THAT MicroVM (and covering the port the request
+/// addresses) is presented in `X-aws-proxy-auth`, and otherwise the GUEST's own answer —
+/// which, for a MicroVM whose image holds no guest program this emulator's engine can run
+/// (these images' code artifacts were never served), is the status the proxy answers for a
+/// MicroVM it reached nothing inside of. Never a transport failure, whatever the guest
+/// path, the method or the token.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
     let (router, engine) = emulator_with_engine();
 
-    // One image DECLARES the port its guest listener runs on (`Hooks$port`), one
-    // declares none — the two cases a token's `allowedPorts` is judged against.
+    // One image DECLARES a hooks port, one declares none: nothing of the image takes
+    // part in the token decision, so both are judged against the port the request
+    // addresses.
     let (status, created) = call(
         &router,
         "POST",
@@ -397,7 +398,7 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
             403,
         ),
         (
-            "a token whose range excludes the published port",
+            "a token whose range excludes the addressed port",
             &ported,
             "/health",
             "GET",
@@ -413,7 +414,7 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
             NO_GUEST_RESPONSE_STATUS,
         ),
         (
-            "a token naming the published port exactly",
+            "a token naming the addressed port exactly",
             &ported,
             "/health",
             "GET",
@@ -421,7 +422,7 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
             NO_GUEST_RESPONSE_STATUS,
         ),
         (
-            "a token whose range covers the published port",
+            "a token whose range covers the addressed port",
             &ported,
             "/health",
             "GET",
@@ -437,7 +438,8 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
             NO_GUEST_RESPONSE_STATUS,
         ),
         (
-            "a MicroVM whose image publishes no port, with a token scoped to one port",
+            "a MicroVM whose image publishes no port, with a token scoped to a port the \
+             request does not address",
             &portless,
             "/health",
             "GET",
