@@ -22,6 +22,8 @@ mod admission_preconditions;
 mod alias_viewer_certificate;
 #[path = "all/announced_location_uri.rs"]
 mod announced_location_uri;
+#[path = "all/announced_location_uri_resources.rs"]
+mod announced_location_uri_resources;
 #[path = "all/anycast_ip_list_lifecycle.rs"]
 mod anycast_ip_list_lifecycle;
 #[path = "all/anycast_ip_list_list.rs"]

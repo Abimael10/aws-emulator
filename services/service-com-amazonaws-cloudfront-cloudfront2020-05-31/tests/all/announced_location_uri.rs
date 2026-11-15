@@ -37,19 +37,22 @@ const SERVICE_HOST: &str = HOST;
 
 /// One host a request below is addressed to, and the authority the `Location` it is answered
 /// with has to be rooted at.
-struct Addressed {
-    case: &'static str,
+pub(crate) struct Addressed {
+    pub(crate) case: &'static str,
     /// The `Host` the request carries.
-    host: &'static str,
+    pub(crate) host: &'static str,
     /// The authority the announced URI must name.
-    authority: &'static str,
+    pub(crate) authority: &'static str,
     /// Whether that authority is the emulator's OWN endpoint, which is the case where
     /// following the announced URI has to reach the resource over this same harness.
-    own_endpoint: bool,
+    pub(crate) own_endpoint: bool,
 }
 
 /// The hosts every create below is issued from.
-fn addressed_hosts() -> Vec<Addressed> {
+///
+/// `pub(crate)` so the sibling suite that drives the RESOURCE creates over the same rule reads
+/// one spelling of this table rather than a copy of it.
+pub(crate) fn addressed_hosts() -> Vec<Addressed> {
     vec![
         Addressed {
             case: "the emulator's own loopback endpoint",
@@ -91,7 +94,9 @@ struct Create {
 }
 
 /// A minimal `CloudFrontOriginAccessIdentityConfig`: both members are required on the wire.
-fn origin_access_identity_xml(reference: &str) -> String {
+///
+/// `pub(crate)` for the reason [`addressed_hosts`] is.
+pub(crate) fn origin_access_identity_xml(reference: &str) -> String {
     format!(
         "<CloudFrontOriginAccessIdentityConfig \
          xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
@@ -147,7 +152,9 @@ fn creates(row: usize, distribution: &str) -> Vec<Create> {
 }
 
 /// The `Id` the created resource reports, which is what its `Location` has to end at.
-fn created_id(answer: &Answer, case: &str) -> String {
+///
+/// `pub(crate)` for the reason [`addressed_hosts`] is.
+pub(crate) fn created_id(answer: &Answer, case: &str) -> String {
     answer
         .root()
         .find_text("Id")
