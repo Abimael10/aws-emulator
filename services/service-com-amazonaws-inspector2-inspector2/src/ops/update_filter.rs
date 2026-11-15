@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         let stored = guard.filters.get_mut(&input.filter_arn).ok_or_else(|| {
             UpdateFilterErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("The filter {} does not exist.", input.filter_arn),
+                message: crate::state::filter_not_found_message(&input.filter_arn),
             })
         })?;
 

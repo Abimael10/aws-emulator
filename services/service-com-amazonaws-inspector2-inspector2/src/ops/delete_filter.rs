@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // gone, so the lookup that reports it cannot find it either.
         let removed = guard.filters.remove(&input.arn).ok_or_else(|| {
             DeleteFilterErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("The filter {} does not exist.", input.arn),
+                message: crate::state::filter_not_found_message(&input.arn),
             })
         })?;
 

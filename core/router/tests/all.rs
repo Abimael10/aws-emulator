@@ -4802,3 +4802,15 @@ mod appended_notes;
 //! not a note about one: this list carries nothing but the pairs, so two landings in the
 //! same window conflict on one line instead of on a paragraph.
 //! each module into `tests/all/`.
+//! One `#[path]` / `mod` pair per suite, kept sorted. A suite this file does not declare
+//! compiles nowhere and its tests never run; a suite left at the top level of `tests/`
+//! fails the build; and a suite declared twice is `E0428`, which fails every suite in this
+//! target, because this is ONE crate root and each `mod <name>;` introduces `<name>` into
+//! its single namespace.
+//! the first item one is `E0753`, which likewise fails every suite here. Below, add a
+//! declaration — not a note about one, and not another copy of this header. WHY a suite
+//! has to be a cross-service suite belongs in that suite's own module doc, beside the code
+//! it describes, which is also the one place it cannot collide with a concurrent landing.
+//! The `#[path]` attribute is what points a module into `tests/all/`: this file is a
+//! test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of it, which the
+//! layout check refuses.

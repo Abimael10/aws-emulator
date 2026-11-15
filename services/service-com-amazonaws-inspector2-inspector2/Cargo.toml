@@ -26,7 +26,9 @@ tracing = { workspace = true }
 hex = { workspace = true }
 # `validation_message`: the shared home for how a service states the framework's boundary
 # refusal — the `@pattern` rendering and the clause that states no value — so this crate
-# does not spell either itself.
+# does not spell either itself. `relayed_refusal`: the workspace's one rendering of the
+# envelope a refusal relayed from another service is reported inside, and the request id it
+# names that call by.
 service-common = { path = "../common" }
 
 [build-dependencies]

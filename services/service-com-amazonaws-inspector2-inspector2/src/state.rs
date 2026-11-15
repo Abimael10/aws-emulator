@@ -609,6 +609,40 @@ pub fn invalid_filter_arn_message(value: &str) -> String {
     format!("Invalid Filter Arn {value}")
 }
 
+/// The findings backend that serves this service's filter plane, as the SDK layer relaying
+/// the call to it names that call's service in the envelope around a refusal — neither this
+/// service's endpoint prefix nor its `sdkId`.
+///
+/// No model states a message's text, so this is recorded behaviour: a filter refusal reaches
+/// a client wrapped in the envelope of the relayed call that produced it.
+pub const FILTER_BACKEND_SERVICE: &str = "MandoFindings";
+
+/// The HTTP status a filter lookup that finds nothing is refused with, which is also the
+/// status the relayed call to [`FILTER_BACKEND_SERVICE`] answered with.
+/// Source: `smithy_query(query="shape", shape="ResourceNotFoundException")` — `httpError`
+/// 404.
+pub const FILTER_NOT_FOUND_STATUS: u16 = 404;
+
+/// How this service words its refusal of a WELL-FORMED filter ARN ([`is_filter_arn`]) that
+/// names no stored filter, so every operation that looks a filter up refuses the same way.
+///
+/// The ARN comes FIRST, echoed exactly as the request sent it, with no noun phrase before
+/// it; then the bare sentence " does not exist", with no closing period; then the envelope
+/// the relayed call to the findings backend is reported inside — that backend's name, the
+/// status it answered with, that call's own request id and how many attempts it took. The
+/// envelope itself is `service_common::relayed_refusal`, the workspace's one rendering of
+/// it, so the request id is freshly minted per response and two refusals never report one
+/// id.
+pub fn filter_not_found_message(value: &str) -> String {
+    ::service_common::relayed_refusal::relayed_refusal_message(
+        &format!("{value} does not exist"),
+        ::service_common::relayed_refusal::RelayedCall::once(
+            FILTER_BACKEND_SERVICE,
+            FILTER_NOT_FOUND_STATUS,
+        ),
+    )
+}
+
 /// The `ValidationExceptionReason` token for a request whose member carried a value the
 /// service rejects: the field itself failed validation.
 /// Source: `smithy_query(query="shape", shape="ValidationExceptionReason")` —

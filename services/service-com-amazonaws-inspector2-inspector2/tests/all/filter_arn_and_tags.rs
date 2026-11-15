@@ -23,19 +23,58 @@ use crate::filters_and_enablement::{post_in, router};
 /// `UpdateFilter`'s route and the member it takes the filter's ARN in.
 /// Source: `smithy_query(query="operation", operation="UpdateFilter")` —
 /// `POST /filters/update`, `filterArn` required.
-const UPDATE: (&str, &str) = ("/filters/update", "filterArn");
+pub(crate) const UPDATE: (&str, &str) = ("/filters/update", "filterArn");
 
 /// `DeleteFilter`'s route and the member it takes the filter's ARN in.
 /// Source: `smithy_query(query="operation", operation="DeleteFilter")` —
 /// `POST /filters/delete`, `arn` required.
-const DELETE: (&str, &str) = ("/filters/delete", "arn");
+pub(crate) const DELETE: (&str, &str) = ("/filters/delete", "arn");
 
 /// The single account id every generated emulator presents
 /// (`engine::emulator_account_id`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
+
+/// Well-formed filter ARNs this emulator never minted, one per part of the ARN that may be
+/// unfamiliar: the partition, the region, the account, the owner (an account and an
+/// organization) and the id. Every one of them passes the shape check, so each reaches the
+/// store and is answered as a MISSING RESOURCE rather than as a bad request.
+///
+/// Shared with the suite that pins how that refusal is WORDED, so one table serves both
+/// halves of the rule instead of two drifting copies.
+pub(crate) fn unknown_filter_arns() -> [(&'static str, String); 6] {
+    [
+        (
+            "this emulator's own shape, never minted",
+            format!("arn:aws:inspector2:us-east-1:{ACCOUNT}:owner/{ACCOUNT}/filter/deadbeefdeadbeef"),
+        ),
+        (
+            "another partition",
+            format!("arn:aws-us-gov:inspector2:us-gov-west-1:{ACCOUNT}:owner/{ACCOUNT}/filter/1"),
+        ),
+        (
+            "another region",
+            format!("arn:aws:inspector2:ap-southeast-2:{ACCOUNT}:owner/{ACCOUNT}/filter/abc123"),
+        ),
+        (
+            "another account",
+            "arn:aws:inspector2:us-east-1:111122223333:owner/111122223333/filter/abc123".to_string(),
+        ),
+        (
+            "an organization as the owner",
+            format!("arn:aws:inspector2:us-east-1:{ACCOUNT}:owner/o-abcdefghij/filter/abc123"),
+        ),
+        (
+            "a long opaque id",
+            format!(
+                "arn:aws:inspector2:us-east-1:{ACCOUNT}:owner/{ACCOUNT}/filter/{}",
+                "f".repeat(32)
+            ),
+        ),
+    ]
+}
 
 /// A `CreateFilter` body, optionally carrying `tags`.
-fn create_body(name: &str, tags: Option<&Value>) -> Value {
+pub(crate) fn create_body(name: &str, tags: Option<&Value>) -> Value {
     let mut body = json!({
         "action": "NONE",
         "name": name,
@@ -48,7 +87,10 @@ fn create_body(name: &str, tags: Option<&Value>) -> Value {
 }
 
 /// Create one filter and answer its minted ARN.
-async fn create_filter(router: &smithy_server_runtime::MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn create_filter(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    name: &str,
+) -> String {
     let (status, _, created) =
         post_in(router, "us-east-1", "/filters/create", &create_body(name, None)).await;
     assert_eq!(
@@ -161,34 +203,7 @@ async fn malformed_filter_arns_are_refused_as_invalid() {
 /// check must accept.
 #[tokio::test]
 async fn well_formed_filter_arns_reach_the_store() {
-    let unknown: [(&str, String); 6] = [
-        (
-            "this emulator's own shape, never minted",
-            format!("arn:aws:inspector2:us-east-1:{ACCOUNT}:owner/{ACCOUNT}/filter/deadbeefdeadbeef"),
-        ),
-        (
-            "another partition",
-            format!("arn:aws-us-gov:inspector2:us-gov-west-1:{ACCOUNT}:owner/{ACCOUNT}/filter/1"),
-        ),
-        (
-            "another region",
-            format!("arn:aws:inspector2:ap-southeast-2:{ACCOUNT}:owner/{ACCOUNT}/filter/abc123"),
-        ),
-        (
-            "another account",
-            "arn:aws:inspector2:us-east-1:111122223333:owner/111122223333/filter/abc123".to_string(),
-        ),
-        (
-            "an organization as the owner",
-            format!("arn:aws:inspector2:us-east-1:{ACCOUNT}:owner/o-abcdefghij/filter/abc123"),
-        ),
-        (
-            "a long opaque id",
-            format!("arn:aws:inspector2:us-east-1:{ACCOUNT}:owner/{ACCOUNT}/filter/{}", "f".repeat(32)),
-        ),
-    ];
-
-    for (case, candidate) in unknown {
+    for (case, candidate) in unknown_filter_arns() {
         for (uri, member) in [UPDATE, DELETE] {
             let router = router();
             let mut body = json!({ member: candidate });
