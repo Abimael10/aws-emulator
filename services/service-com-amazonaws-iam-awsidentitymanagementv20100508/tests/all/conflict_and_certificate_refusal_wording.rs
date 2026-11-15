@@ -12,8 +12,8 @@
 //!    versions and whichever of them is the default;
 //! 2. where SEVERAL classes of dependent block one delete, the refusal names the one AWS
 //!    names: the binding a separate resource holds (the instance profile that holds a
-//!    role) before a managed policy ATTACHED to the entity, and an attachment before a
-//!    policy EMBEDDED in it;
+//!    role) before the entity's own policies, and a policy EMBEDDED in the entity before
+//!    a managed policy ATTACHED to it;
 //! 3. `UploadSigningCertificate` refuses a body it cannot read as a certificate with the
 //!    sentence that QUOTES the value it was sent;
 //! 4. `UploadServerCertificate` refuses certificate material it cannot read with its own
@@ -249,7 +249,7 @@ struct Blocked {
 /// RULE 2: a blocked delete carries AWS's fixed sentence for the class of dependent AWS
 /// names, and where several classes block one delete it names exactly one of them, in
 /// AWS's own precedence — the instance profile that holds a role, then the policies
-/// attached to the entity, then the policies embedded in it.
+/// embedded in the entity, then the managed policies attached to it.
 ///
 /// The rows span the identity kinds and the COMBINATIONS: each class alone, each pair, and
 /// all three together.
@@ -286,7 +286,7 @@ async fn a_delete_blocked_by_several_dependents_names_the_one_aws_names() {
             inline: true,
             attached: true,
             profile: false,
-            expected: MUST_DETACH_ALL_POLICIES,
+            expected: MUST_DELETE_POLICIES,
         },
         Blocked {
             case: "a role embedding a policy and held by an instance profile",
@@ -334,7 +334,7 @@ async fn a_delete_blocked_by_several_dependents_names_the_one_aws_names() {
             inline: true,
             attached: true,
             profile: false,
-            expected: MUST_DETACH_ALL_POLICIES,
+            expected: MUST_DELETE_POLICIES,
         },
         Blocked {
             case: "a group embedding an inline policy",
@@ -358,7 +358,7 @@ async fn a_delete_blocked_by_several_dependents_names_the_one_aws_names() {
             inline: true,
             attached: true,
             profile: false,
-            expected: MUST_DETACH_ALL_POLICIES,
+            expected: MUST_DELETE_POLICIES,
         },
     ];
 

@@ -87,6 +87,8 @@ mod delegation_request_rejection;
 mod delegation_request_updates;
 #[path = "all/delegation_token_dispatch.rs"]
 mod delegation_token_dispatch;
+#[path = "all/embedded_policy_conflict_precedence.rs"]
+mod embedded_policy_conflict_precedence;
 #[path = "all/empty_member_reports.rs"]
 mod empty_member_reports;
 #[path = "all/entities_for_policy.rs"]

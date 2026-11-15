@@ -219,9 +219,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // removed by different operations: a member is REMOVED (`RemoveUserFromGroup`),
         // an inline policy is DELETED (`DeleteGroupPolicy`) and an attachment is
         // DETACHED (`DetachGroupPolicy`), so the caller can tell from the message which
-        // call it has to make. The two policy kinds are reported in the order
-        // `crate::ops::delete_user` reports the same two, so a group and a user carrying
-        // both are refused alike.
+        // call it has to make. Where both policy kinds block one delete, the EMBEDDED one
+        // is named first, as the delete-conflict constants' documentation states, and as
+        // `crate::ops::delete_user` and `crate::ops::delete_role` name the same two, so a
+        // group, a user and a role carrying both are refused alike.
         let holds_users = store
             .group_members
             .get(&key)
@@ -236,18 +237,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        let carries_attachments = store
-            .group_attached_policies
-            .get(&key)
-            .is_some_and(|attached| !attached.is_empty());
-        if carries_attachments {
-            return Err(DeleteGroupErrorModeled::DeleteConflictException(
-                DeleteConflictException {
-                    message: Some(crate::state::DELETE_CONFLICT_DETACH_POLICIES.to_string()),
-                },
-            )
-            .into());
-        }
         let embeds_policies = store
             .group_inline_policies
             .get(&key)
@@ -256,6 +245,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeleteGroupErrorModeled::DeleteConflictException(
                 DeleteConflictException {
                     message: Some(crate::state::DELETE_CONFLICT_DELETE_POLICIES.to_string()),
+                },
+            )
+            .into());
+        }
+        let carries_attachments = store
+            .group_attached_policies
+            .get(&key)
+            .is_some_and(|attached| !attached.is_empty());
+        if carries_attachments {
+            return Err(DeleteGroupErrorModeled::DeleteConflictException(
+                DeleteConflictException {
+                    message: Some(crate::state::DELETE_CONFLICT_DETACH_POLICIES.to_string()),
                 },
             )
             .into());

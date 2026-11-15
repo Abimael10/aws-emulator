@@ -3519,9 +3519,11 @@ pub fn principal_has_no_scope(principal_id: &str) -> String {
 ///
 /// Where SEVERAL classes block one delete, IAM names exactly one of them, and which one
 /// follows a fixed precedence: a binding held by a SEPARATE resource (the instance
-/// profile that holds a role) comes first, then a managed policy ATTACHED to the entity,
-/// then a policy EMBEDDED in it — the dependents furthest from the entity before the ones
-/// inside it. Each delete handler checks in that order, so the caller is told to remove
+/// profile that holds a role) comes first, then a policy EMBEDDED in the entity, then a
+/// managed policy ATTACHED to it — the binding no delete of this entity could clear
+/// before the policies, and the policies in the order the entity deletes' own
+/// documentation lists the items to remove in ("inline policies, attached managed
+/// policies"). Each delete handler checks in that order, so the caller is told to remove
 /// the same dependent IAM would name.
 pub const DELETE_CONFLICT_DETACH_POLICIES: &str =
     "Cannot delete entity, must detach all policies first.";
