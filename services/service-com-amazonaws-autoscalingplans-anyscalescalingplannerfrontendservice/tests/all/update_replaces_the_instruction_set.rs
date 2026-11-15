@@ -11,11 +11,14 @@
 //!   configuration in force afterwards, entry for entry and member for member — a
 //!   resource it no longer names is dropped, one it adds is covered, and the target
 //!   tracking policies the plan derives track exactly the configurations it asked for.
-//!   The operation answers an EMPTY body and moves neither `ScalingPlanVersion` ("This
-//!   value is always 1") nor `CreationTime`, so the applied plan's `StatusMessage` — "A
-//!   simple message about the current status of the scaling plan" — is what reports that
-//!   the update took: a created-and-applied plan and an updated-and-applied plan report
-//!   two different sentences.
+//!   The ONE member an update does not re-point is the target value of a metric an
+//!   applied policy already tracks, whose rule
+//!   [`crate::update_keeps_an_applied_policys_target_value`] spans and whose expectation
+//!   every row here is read through. The operation answers an EMPTY body and moves
+//!   neither `ScalingPlanVersion` ("This value is always 1") nor `CreationTime`, so the
+//!   applied plan's `StatusMessage` — "A simple message about the current status of the
+//!   scaling plan" — is what reports that the update took: a created-and-applied plan and
+//!   a plan whose update changed what it applies report two different sentences.
 //! * the `PolicyName` of a policy a plan derives from a target tracking configuration is
 //!   built from the plan: the literal `AutoScaling-`, the `ScalingPlanName` verbatim, a
 //!   `-`, and an id the service generates for that policy. The name is the only handle
@@ -43,6 +46,7 @@ use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice
 use crate::applied_policies_and_status_narratives::{applied_plan, described, resources};
 use crate::documented_entry_count_wording::entry_count_refusal;
 use crate::scaling_plan_lifecycle::{error_code, error_message, stack_source, Emulator};
+use crate::update_keeps_an_applied_policys_target_value::in_force_after_update;
 
 /// The narrative a plan reports once its creation has been applied.
 const CREATED_MESSAGE: &str = "Scaling plan has been created and applied to all resources.";
@@ -118,7 +122,8 @@ fn service_instruction(target: f64) -> Value {
 }
 
 /// One row of the replacement table: the instructions in force and the instructions the
-/// update carries. What the plan must report afterwards IS the second list.
+/// update carries. What the plan must report afterwards is the second list read through
+/// the one exception, [`in_force_after_update`].
 struct Case {
     label: &'static str,
     in_force: Vec<Value>,
@@ -315,20 +320,21 @@ async fn an_update_puts_the_instruction_set_it_carries_in_force() {
             "case {label:?}: UpdateScalingPlan answers an empty body, got {body:?}"
         );
 
+        let expected = in_force_after_update(&case.in_force, &case.requested);
         let plan = described(&emulator, "my-plan").await;
         assert_eq!(
             plan.get("ScalingInstructions"),
-            Some(&Value::Array(case.requested.clone())),
+            Some(&Value::Array(expected.clone())),
             "case {label:?}: the update's instruction set must be the one in force, got \
              {plan:?}"
         );
 
         // The same rule read through the resource envelope: the derived policies track
-        // the configurations the update asked for, and nothing else.
+        // the configurations now in force, and nothing else.
         let tracked = tracked_configurations(&emulator, "my-plan").await;
         assert_eq!(
             tracked,
-            expected_configurations(&case.requested),
+            expected_configurations(&expected),
             "case {label:?}: the derived policies must track the configurations the \
              update put in force, got {tracked:?}"
         );
@@ -351,19 +357,33 @@ async fn an_applied_update_is_reported_as_an_update_while_version_and_creation_t
         "case created: an applied create reports its own narrative, got {created:?}"
     );
 
-    // Each row updates the plan again, differing in what the request carries: a new
-    // instruction set, nothing but the identity, and a new application source.
+    // Each row updates the plan again with a change the plan APPLIES to its resources,
+    // differing in what the request carries: a wider capacity band, a second metric, and
+    // a new application source. (An update that changes nothing applied keeps the
+    // narrative of the application in force; that half of the rule is spanned by
+    // [`crate::update_keeps_an_applied_policys_target_value`].)
     let updates: Vec<(&str, Value)> = vec![
         (
-            "a new instruction set",
+            "a wider capacity band for the resource",
             json!({
                 "ScalingInstructions": [table_instruction(
-                    vec![predefined("DynamoDBReadCapacityUtilization", 75.0)],
-                    json!({}),
+                    vec![predefined("DynamoDBReadCapacityUtilization", 50.0)],
+                    json!({ "MinCapacity": 4, "MaxCapacity": 400 }),
                 )],
             }),
         ),
-        ("no member beyond the plan's identity", json!({})),
+        (
+            "a second metric on the resource",
+            json!({
+                "ScalingInstructions": [table_instruction(
+                    vec![
+                        predefined("DynamoDBReadCapacityUtilization", 50.0),
+                        customized("queue-depth", 30.0),
+                    ],
+                    json!({ "MinCapacity": 4, "MaxCapacity": 400 }),
+                )],
+            }),
+        ),
         (
             "another application source",
             json!({ "ApplicationSource": stack_source(2) }),

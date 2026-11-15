@@ -11,22 +11,28 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-autoscalingplans-anyscalescalingplannerfrontendservice.json");
 
+// The shapes a plan's own CONFIGURATION is made of carry `PartialEq` beside the derives
+// the scaffold emits: `UpdateScalingPlan` decides whether an update changed what the plan
+// APPLIES to its resources by comparing the configuration in force with the one it
+// computed, and a narrative that reports an application has to be decided on the values,
+// not on the fact that a request arrived.
+
 #[smithy_macros::smithy(shape = "com.amazonaws.autoscalingplans#ApplicationSource")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ApplicationSource {
     pub cloud_formation_stack_arn: Option<String>,
     pub tag_filters: Option<Vec<TagFilter>>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.autoscalingplans#TagFilter")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TagFilter {
     pub key: Option<String>,
     pub values: Option<Vec<String>>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.autoscalingplans#ScalingInstruction")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ScalingInstruction {
     pub service_namespace: String,
     pub resource_id: String,
@@ -45,7 +51,7 @@ pub struct ScalingInstruction {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.autoscalingplans#TargetTrackingConfiguration")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TargetTrackingConfiguration {
     pub predefined_scaling_metric_specification: Option<PredefinedScalingMetricSpecification>,
     pub customized_scaling_metric_specification: Option<CustomizedScalingMetricSpecification>,
@@ -57,14 +63,14 @@ pub struct TargetTrackingConfiguration {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.autoscalingplans#PredefinedScalingMetricSpecification")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PredefinedScalingMetricSpecification {
     pub predefined_scaling_metric_type: String,
     pub resource_label: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.autoscalingplans#CustomizedScalingMetricSpecification")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CustomizedScalingMetricSpecification {
     pub metric_name: String,
     pub namespace: String,
@@ -74,21 +80,21 @@ pub struct CustomizedScalingMetricSpecification {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.autoscalingplans#MetricDimension")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MetricDimension {
     pub name: String,
     pub value: String,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.autoscalingplans#PredefinedLoadMetricSpecification")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PredefinedLoadMetricSpecification {
     pub predefined_load_metric_type: String,
     pub resource_label: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.autoscalingplans#CustomizedLoadMetricSpecification")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CustomizedLoadMetricSpecification {
     pub metric_name: String,
     pub namespace: String,

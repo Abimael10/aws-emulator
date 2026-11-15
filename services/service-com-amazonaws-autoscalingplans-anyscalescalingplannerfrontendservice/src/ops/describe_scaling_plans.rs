@@ -5,6 +5,11 @@
 //! `ScalingPlan` structures, filtered by name or application source and paged by
 //! `MaxResults`/`NextToken`.
 //!
+//! Every reported plan carries `LastMutatingRequestTime` beside the members the model
+//! declares: AWS emits it on every entry, so the structure is written by hand rather than
+//! derived (`super::types::scaling_plan_wire`), and the instant comes from the plan's own
+//! record, stamped by the request that last wrote it.
+//!
 //! A read, except for the transitions the clock already owes: `settle_due` applies
 //! only what was due at this instant whether or not anybody called.
 //!
@@ -292,8 +297,15 @@ const APPLICATION_SOURCES_CONFLICT: &str =
 /// Namespace for this operation's `NextToken` cursors.
 const CURSOR_KIND: &str = "plans";
 
-/// The stored record as the modelled `ScalingPlan` output shape — a pure projection:
+/// The stored record as the `ScalingPlan` output shape — a pure projection:
 /// every member comes from state, none from the request.
+///
+/// `LastMutatingRequestTime` is reported on EVERY entry, in every lifecycle phase, from
+/// the instant the plan's own record stamped when it was last written: it is what a
+/// caller polling the plan compares against the time of its own Create/Update/Delete to
+/// tell a read that has seen that write from a pre-write snapshot. It tracks the last
+/// WRITE, not the last status change — a transition the clock settles moves
+/// `StatusStartTime` and leaves this where the request left it.
 fn project(record: &crate::state::ScalingPlanRecord) -> ScalingPlan {
     ScalingPlan {
         scaling_plan_name: record.name.clone(),
@@ -304,6 +316,9 @@ fn project(record: &crate::state::ScalingPlanRecord) -> ScalingPlan {
         status_message: Some(record.status_message().to_string()),
         status_start_time: Some(crate::state::to_date_time(record.status_start_time)),
         creation_time: Some(crate::state::to_date_time(record.creation_time)),
+        last_mutating_request_time: Some(crate::state::to_date_time(
+            record.last_mutating_request_time,
+        )),
     }
 }
 

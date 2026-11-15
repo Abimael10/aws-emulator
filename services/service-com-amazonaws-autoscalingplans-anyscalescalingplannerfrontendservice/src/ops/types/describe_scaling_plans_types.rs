@@ -28,16 +28,8 @@ pub struct DescribeScalingPlansOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.autoscalingplans#ScalingPlan")]
-#[derive(Debug, Clone, Default)]
-pub struct ScalingPlan {
-    pub scaling_plan_name: String,
-    pub scaling_plan_version: i64,
-    pub application_source: ApplicationSource,
-    pub scaling_instructions: Vec<ScalingInstruction>,
-    pub status_code: String,
-    pub status_message: Option<String>,
-    pub status_start_time: Option<::aws_smithy_types::DateTime>,
-    pub creation_time: Option<::aws_smithy_types::DateTime>,
-}
+// `ScalingPlan` itself is NOT derived here: every plan this operation reports carries a
+// member the published model does not declare (`LastMutatingRequestTime`), which the
+// derive cannot express, so the structure, its schema and its serializer live in
+// `super::scaling_plan_wire` and reach this module through `use super::*`.
 

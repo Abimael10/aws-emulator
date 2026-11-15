@@ -29,7 +29,8 @@ hex = { workspace = true }
 # bounded PolicyName as a fixed-width digest of itself.
 sha2 = { workspace = true }
 # The in-process SigV4 signature a call this service makes to Application Auto Scaling —
-# the service that owns the target tracking scaling policies a plan installs — carries.
+# the service that owns the target tracking scaling policies a plan installs — carries,
+# and the family's UUID layout the id inside a derived policy name is rendered in.
 service-common = { path = "../common" }
 
 [build-dependencies]

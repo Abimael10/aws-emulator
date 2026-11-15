@@ -5,17 +5,21 @@
 //!
 //! The rule: `UpdateScalingPlan` puts the instruction set it carries in force, so the
 //! target value of every target tracking configuration it sends is the value the plan
-//! reports and the value the derived policy tracks to — a resource whose instruction
-//! turned dynamic scaling off (`DisableDynamicScaling` "Controls whether dynamic scaling
-//! by AWS Auto Scaling is disabled. When dynamic scaling is enabled, AWS Auto Scaling
-//! creates target tracking scaling policies based on the specified target tracking
-//! configurations", `smithy_query(query="shape",shape="ScalingInstruction")`) carries no
-//! policy at all, and one that leaves it enabled carries a policy per configuration; the
-//! value in force is the update's either way.
+//! reports and the value the derived policy tracks to — UNLESS the plan has already
+//! applied a policy for that metric, whose value such an update does not re-point
+//! ([`crate::update_keeps_an_applied_policys_target_value`] spans that rule). A resource
+//! whose instruction turned dynamic scaling off (`DisableDynamicScaling` "Controls
+//! whether dynamic scaling by AWS Auto Scaling is disabled. When dynamic scaling is
+//! enabled, AWS Auto Scaling creates target tracking scaling policies based on the
+//! specified target tracking configurations",
+//! `smithy_query(query="shape",shape="ScalingInstruction")`) carries no policy at all, so
+//! there is nothing for an update to re-point and the value in force is the update's;
+//! one that leaves dynamic scaling enabled carries a policy per configuration, and the
+//! value those policies track to stands.
 //!
 //! [`crate::update_replaces_the_instruction_set`] spans the whole replacement rule; the
-//! rows here differ along the one member that used to decide it — whether the instruction
-//! in force had applied a policy for the metric — crossed with the form of the metric
+//! rows here differ along the one member that decides it — whether the instruction in
+//! force had applied a policy for the metric — crossed with the form of the metric
 //! (predefined vs customized), the number of configurations on the resource, the kind of
 //! scalable resource, and whether the update itself moves the dynamic-scaling flag.
 //!
@@ -26,6 +30,7 @@ use serde_json::{json, Value};
 
 use crate::applied_policies_and_status_narratives::{applied_plan, described, resources};
 use crate::scaling_plan_lifecycle::Emulator;
+use crate::update_keeps_an_applied_policys_target_value::in_force_after_update;
 
 /// A target tracking configuration on the one predefined metric the DynamoDB
 /// read-capacity dimension supports
@@ -134,14 +139,14 @@ fn cases() -> Vec<Case> {
             requested: vec![cluster_instruction(60.0, true)],
         },
         Case {
-            // The other side of the old rule: there IS a policy here, tracking the value
-            // in force, and the update re-points it like any other.
-            label: "a policy tracking the metric is re-pointed at the update's value",
+            // The other side of the rule: there IS a policy here, tracking the value in
+            // force, and the update cannot re-point it.
+            label: "a policy tracking the metric keeps the value it tracks",
             in_force: vec![table_instruction(vec![predefined(40.0)], None)],
             requested: vec![table_instruction(vec![predefined(70.0)], None)],
         },
         Case {
-            label: "a policied metric takes the update's value as the update turns scaling off",
+            label: "a policied metric keeps its value as the update turns scaling off",
             in_force: vec![table_instruction(vec![predefined(40.0)], None)],
             requested: vec![table_instruction(vec![predefined(70.0)], Some(true))],
         },
@@ -174,7 +179,7 @@ async fn tracked_configurations(emulator: &Emulator, name: &str, label: &str) ->
 }
 
 #[tokio::test]
-async fn an_update_sets_the_target_value_of_every_metric_it_configures() {
+async fn an_update_sets_the_target_value_of_every_metric_no_applied_policy_tracks() {
     for case in cases() {
         let emulator = Emulator::new();
         let label = case.label;
@@ -192,18 +197,18 @@ async fn an_update_sets_the_target_value_of_every_metric_it_configures() {
             .await;
         emulator.make_all_due();
 
+        let expected = in_force_after_update(&case.in_force, &case.requested);
         let plan = described(&emulator, "my-plan").await;
         assert_eq!(
             plan.get("ScalingInstructions"),
-            Some(&Value::Array(case.requested.clone())),
+            Some(&Value::Array(expected.clone())),
             "case {label:?}: wrong ScalingInstructions in force after the update, got {plan:?}"
         );
 
         // Whatever the instructions in force say, the policies on the resources track to
         // them: a resource whose instruction disabled dynamic scaling carries none, and
         // one whose instruction enables it carries a policy per configuration.
-        let expected_configurations: Vec<Value> = case
-            .requested
+        let expected_configurations: Vec<Value> = expected
             .iter()
             .filter(|instruction| instruction["DisableDynamicScaling"] != json!(true))
             .flat_map(|instruction| {
@@ -222,17 +227,15 @@ async fn an_update_sets_the_target_value_of_every_metric_it_configures() {
 }
 
 #[tokio::test]
-async fn a_resource_takes_the_target_value_of_every_update_in_turn() {
+async fn a_resource_takes_the_target_value_of_every_update_until_a_policy_tracks_it() {
     let emulator = Emulator::new();
-    applied_plan(
-        &emulator,
-        "my-plan",
-        vec![table_instruction(vec![predefined(40.0)], Some(true))],
-    )
-    .await;
+    let mut in_force = vec![table_instruction(vec![predefined(40.0)], Some(true))];
+    applied_plan(&emulator, "my-plan", in_force.clone()).await;
 
-    // Each update in turn sets the value — the rule is decided on the request, not on
-    // how many updates have run or on whether a policy tracked the metric before.
+    // Each update in turn sets the value of a metric no applied policy tracks — the rule
+    // is decided on the state of the resource, not on how many updates have run — and
+    // once dynamic scaling is back on, the policy the plan applies for the metric is what
+    // the following updates can no longer re-point.
     for (disabled, target) in [
         (Some(true), 70.0),
         (Some(true), 90.0),
@@ -240,25 +243,28 @@ async fn a_resource_takes_the_target_value_of_every_update_in_turn() {
         (Some(false), 55.0),
         (None, 80.0),
     ] {
-        let requested = table_instruction(vec![predefined(target)], disabled);
+        let requested = vec![table_instruction(vec![predefined(target)], disabled)];
         emulator
             .ok(
                 "UpdateScalingPlan",
                 json!({
                     "ScalingPlanName": "my-plan",
                     "ScalingPlanVersion": 1,
-                    "ScalingInstructions": [requested.clone()],
+                    "ScalingInstructions": requested.clone(),
                 }),
             )
             .await;
         emulator.make_all_due();
 
+        let expected = in_force_after_update(&in_force, &requested);
         let plan = described(&emulator, "my-plan").await;
         assert_eq!(
             plan.get("ScalingInstructions"),
-            Some(&Value::Array(vec![requested])),
+            Some(&Value::Array(expected.clone())),
             "case target {target:?} (dynamic scaling disabled: {disabled:?}): the update's \
-             target value must be in force, got {plan:?}"
+             target value must be in force wherever no applied policy tracks the metric, \
+             got {plan:?}"
         );
+        in_force = expected;
     }
 }

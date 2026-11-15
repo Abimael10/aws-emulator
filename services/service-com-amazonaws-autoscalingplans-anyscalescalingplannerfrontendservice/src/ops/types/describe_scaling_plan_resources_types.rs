@@ -40,8 +40,11 @@ pub struct ScalingPlanResource {
     pub scaling_status_message: Option<String>,
 }
 
+// `PartialEq` beside the derives the scaffold emits: the policies a plan has applied to
+// its resources are what `UpdateScalingPlan` compares an update against to decide whether
+// it changed anything the plan applies (`crate::state::ScalingPlanRecord::applied_footprint`).
 #[smithy_macros::smithy(shape = "com.amazonaws.autoscalingplans#ScalingPolicy")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ScalingPolicy {
     pub policy_name: String,
     pub policy_type: String,

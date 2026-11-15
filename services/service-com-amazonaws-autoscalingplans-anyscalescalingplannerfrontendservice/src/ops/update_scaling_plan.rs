@@ -7,15 +7,18 @@
 //! `ScalingInstructions` the request carries REPLACE the ones in force, entry for entry:
 //! "Updates the specified scaling plan", and the member is the plan's whole instruction
 //! set, so a resource the request no longer names is dropped, one it adds is covered, and
-//! every member of an instruction it re-sends — the target value a target tracking
-//! configuration tracks to included — is what the plan reports and what the target
-//! tracking policies derived from it track afterwards.
+//! every member of an instruction it re-sends is what the plan reports and what the target
+//! tracking policies derived from it track afterwards — except that an update does not
+//! re-point a policy the plan has already APPLIED: the target value in force for a metric
+//! such a policy tracks is kept
+//! (`crate::state::ScalingPlanRecord::applied_update`).
 //!
 //! Neither `ScalingPlanVersion` ("This value is always 1") nor `CreationTime` moves on an
 //! update, so the plan's status narrative is what tells a caller the update was applied:
 //! a successful update leaves the plan in `UpdateInProgress`, with the move back to
 //! `Active` already owed on the clock, and the applied status it comes back to reports the
-//! update rather than the create (`crate::state::ScalingPlanRecord::begin_update`).
+//! update rather than the create — whenever the update CHANGED what the plan applies
+//! (`crate::state::ScalingPlanRecord::begin_update`).
 //!
 //! An `ApplicationSource` the request carries is held to the same rule a create is:
 //! "You can create one scaling plan per application source", so a source another
@@ -246,18 +249,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // Replace only what the request carries; everything else stays as stored. The
             // instruction set it carries is the plan's whole instruction set, so it is
-            // written straight over the one in force.
+            // written over the one in force — save for the target values the policies the
+            // plan has already applied track to, which an update does not re-point
+            // (`crate::state::ScalingPlanRecord::applied_update`).
+            let mut applied_change = false;
             if let Some(source) = input.application_source {
+                applied_change |= source != plan.application_source;
                 plan.application_source = source;
             }
             let replaced = plan.scaling_instructions.clone();
+            let applied_before = plan.applied_footprint(&replaced);
             if let Some(instructions) = input.scaling_instructions {
-                plan.scaling_instructions = instructions;
+                let in_force = plan.applied_update(instructions);
+                plan.scaling_instructions = in_force;
             }
-            // The plan goes back to the applied status reporting that an UPDATE was
-            // applied, which — the version and the creation time staying put — is what
-            // makes the update observable to a caller reading the plan back.
-            plan.begin_update(now);
+            applied_change |= plan.applied_footprint(&plan.scaling_instructions) != applied_before;
+            // The plan goes back to the applied status, whose narrative reports an UPDATE
+            // once this one changed what the plan applies — which, the version and the
+            // creation time staying put, is what makes such an update observable to a
+            // caller reading the plan back. An update that left the applied configuration
+            // exactly as it was applied nothing, so it does not re-narrate the plan.
+            plan.begin_update(applied_change, now);
             (replaced, plan.scaling_instructions.clone())
         };
 

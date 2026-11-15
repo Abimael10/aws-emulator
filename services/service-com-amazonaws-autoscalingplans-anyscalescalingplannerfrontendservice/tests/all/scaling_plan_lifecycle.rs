@@ -709,9 +709,20 @@ async fn an_update_replaces_only_what_the_request_carries() {
         75.0,
     );
     // What the update above leaves in force: an update puts the instruction set it
-    // carries in force, entry for entry, so the new capacity bounds and the new target
-    // value both apply; the whole rule is tabulated in
-    // [`crate::update_replaces_the_instruction_set`].
+    // carries in force, entry for entry, so the new capacity bounds apply — while the
+    // target value of the metric whose policy the plan has already applied is the one
+    // that policy tracks, which an update does not re-point; the whole rule is tabulated
+    // in [`crate::update_replaces_the_instruction_set`] and
+    // [`crate::update_keeps_an_applied_policys_target_value`].
+    let in_force = instruction(
+        "autoscaling",
+        "autoScalingGroup/my-asg",
+        "autoscaling:autoScalingGroup:DesiredCapacity",
+        3,
+        30,
+        "ASGAverageCPUUtilization",
+        40.0,
+    );
 
     // Rows: which members the update carries, and what each one leaves behind.
     for (label, request_extras, expect_source, expect_instructions) in [
@@ -719,19 +730,19 @@ async fn an_update_replaces_only_what_the_request_carries() {
             "instructions only",
             json!({ "ScalingInstructions": [updated.clone()] }),
             source.clone(),
-            json!([updated.clone()]),
+            json!([in_force.clone()]),
         ),
         (
             "application source only",
             json!({ "ApplicationSource": other_source }),
             other_source.clone(),
-            json!([updated.clone()]),
+            json!([in_force.clone()]),
         ),
         (
             "neither member",
             json!({}),
             other_source.clone(),
-            json!([updated.clone()]),
+            json!([in_force.clone()]),
         ),
         (
             "both members",

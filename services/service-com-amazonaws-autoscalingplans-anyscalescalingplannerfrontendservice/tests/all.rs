@@ -23,6 +23,8 @@ mod aws_worded_client_refusals;
 mod concurrent_update_refusal;
 #[path = "all/customized_metric_statistic_rules.rs"]
 mod customized_metric_statistic_rules;
+#[path = "all/derived_policy_name_format.rs"]
+mod derived_policy_name_format;
 #[path = "all/describe_scaling_plans_selector_bounds.rs"]
 mod describe_scaling_plans_selector_bounds;
 #[path = "all/describe_scaling_plans_version_member.rs"]
@@ -45,6 +47,8 @@ mod forecast_window_point_membership;
 mod forecast_window_precision;
 #[path = "all/identity_key_separators.rs"]
 mod identity_key_separators;
+#[path = "all/last_mutating_request_time.rs"]
+mod last_mutating_request_time;
 #[path = "all/mutating_plan_admission.rs"]
 mod mutating_plan_admission;
 #[path = "all/next_token_authenticity.rs"]
@@ -97,6 +101,8 @@ mod state_roundtrip;
 mod tag_filter_entry_bounds;
 #[path = "all/tag_filter_names_a_tag.rs"]
 mod tag_filter_names_a_tag;
+#[path = "all/update_keeps_an_applied_policys_target_value.rs"]
+mod update_keeps_an_applied_policys_target_value;
 #[path = "all/update_replaces_the_instruction_set.rs"]
 mod update_replaces_the_instruction_set;
 #[path = "all/update_target_value_without_an_applied_policy.rs"]

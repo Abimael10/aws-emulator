@@ -352,11 +352,43 @@ async fn a_resource_narrative_never_claims_a_policy_the_same_read_denies() {
         assert_report(&emulator, name, &case, &statuses[2]).await;
 
         emulator.make_all_due();
-        // The applied status again, now reporting the update that was applied.
+        // This update carried nothing beyond the plan's identity, so it changed nothing
+        // the plan applies: the narrative of the application in force stands
+        // ([`crate::update_keeps_an_applied_policys_target_value`] spans that rule).
+        assert_report(&emulator, name, &case, &statuses[1]).await;
+
+        // An update that DOES change what the plan applies — here a wider capacity band
+        // for every resource it covers — is the one the applied status re-narrates.
+        emulator
+            .ok(
+                "UpdateScalingPlan",
+                json!({
+                    "ScalingPlanName": name,
+                    "ScalingPlanVersion": 1,
+                    "ScalingInstructions": wider_capacity(&case.instructions),
+                }),
+            )
+            .await;
+        emulator.make_all_due();
         assert_report(&emulator, name, &case, &statuses[4]).await;
 
         emulator.ok("DeleteScalingPlan", version.clone()).await;
         emulator.hold_pending(name);
         assert_report(&emulator, name, &case, &statuses[3]).await;
     }
+}
+
+/// The same instructions, each with room for one more unit of capacity: a change the plan
+/// APPLIES to the resource (its capacity band), which leaves the resource's identity and
+/// the metrics it tracks — everything [`assert_report`] reads — exactly as they were.
+fn wider_capacity(instructions: &[Value]) -> Vec<Value> {
+    instructions
+        .iter()
+        .map(|instruction| {
+            let mut instruction = instruction.clone();
+            let maximum = instruction["MaxCapacity"].as_i64().unwrap_or_default();
+            instruction["MaxCapacity"] = json!(maximum + 1);
+            instruction
+        })
+        .collect()
 }

@@ -8,9 +8,18 @@
 //! Application Auto Scaling resource, so the policy AWS Auto Scaling reports for a plan's
 //! resource is one that service's own `DescribeScalingPolicies` reports, under the name
 //! the plan derives for it (`AutoScaling-<ScalingPlanName>-<generated id>`), tracking the
-//! configuration the instruction in force states — and an `UpdateScalingPlan` that
-//! re-points that configuration, or a `DeleteScalingPlan` that removes it, moves that same
-//! record.**
+//! configuration the instruction in force states — and an `UpdateScalingPlan` that moves
+//! what the plan applies to that resource, or a `DeleteScalingPlan` that removes it, moves
+//! that same record.**
+//!
+//! What an update moves and what it leaves alone is the plan's own rule, pinned over
+//! tables in
+//! `services/service-com-amazonaws-autoscalingplans-anyscalescalingplannerfrontendservice/tests/all/update_keeps_an_applied_policys_target_value.rs`:
+//! the update's instruction set is the one in force, except that the target value of a
+//! metric the plan has ALREADY APPLIED a policy for is kept, because that value is what
+//! that policy tracks to. So the update below moves the capacity window the plan registers
+//! — a change it does apply — and re-sends the target value, and what this suite reaches
+//! is that both halves land where the policy and the scalable target really live.
 //!
 //! Three services have to agree for that to hold: AWS Auto Scaling writes the policy,
 //! Application Auto Scaling holds it and reports it, and DynamoDB holds the table whose
@@ -24,8 +33,8 @@
 //! lives.
 //!
 //! The rows differ along what the rule generalises over: which half of a table's
-//! provisioned capacity the instruction scales, the metric it tracks, and the target
-//! values the create and the update state.
+//! provisioned capacity the instruction scales, the metric it tracks, the target value the
+//! create states, and the capacity window the update moves it to.
 
 use std::time::{Duration, Instant};
 
@@ -61,9 +70,13 @@ const TARGET_TRACKING_SCALING: &str = "TargetTrackingScaling";
 const CREATED_MESSAGE: &str = "Scaling plan has been created and applied to all resources.";
 const UPDATED_MESSAGE: &str = "Scaling plan has been updated successfully.";
 
-/// The capacity window every instruction here states.
+/// The capacity window every instruction here states, and the wider one its update moves
+/// to — a change the plan APPLIES to the resource, which is what makes the update
+/// observable both on the plan's narrative and on the scalable target.
 const MIN_CAPACITY: i64 = 1;
 const MAX_CAPACITY: i64 = 10;
+const UPDATED_MIN_CAPACITY: i64 = 2;
+const UPDATED_MAX_CAPACITY: i64 = 20;
 
 /// How long a lifecycle step is given to come due, polled rather than waited out: the
 /// deadline is generous only so a failure is a failure rather than a hang.
@@ -190,14 +203,22 @@ async fn given_provisioned_table(router: &MultiServiceRouter, case: &str, name: 
     panic!("case {case:?}: the table {name:?} never reached ACTIVE, last {last}");
 }
 
-/// One scaling instruction over `table`'s `dimension`, tracking `metric` to `target`.
-fn instruction(table: &str, dimension: &str, metric: &str, target: f64) -> Value {
+/// One scaling instruction over `table`'s `dimension`, tracking `metric` to `target`,
+/// with the capacity window `min`..`max`.
+fn instruction(
+    table: &str,
+    dimension: &str,
+    metric: &str,
+    target: f64,
+    min: i64,
+    max: i64,
+) -> Value {
     json!({
         "ServiceNamespace": "dynamodb",
         "ResourceId": format!("table/{table}"),
         "ScalableDimension": dimension,
-        "MinCapacity": MIN_CAPACITY,
-        "MaxCapacity": MAX_CAPACITY,
+        "MinCapacity": min,
+        "MaxCapacity": max,
         "TargetTrackingConfigurations": [{
             "PredefinedScalingMetricSpecification": { "PredefinedScalingMetricType": metric },
             "TargetValue": target
@@ -307,25 +328,23 @@ async fn held_until(
 #[tokio::test]
 async fn a_plans_target_tracking_policy_is_held_by_application_auto_scaling() {
     // (case, the dimension the instruction scales, the metric it tracks, the target value
-    //  the create states, the target value the update states)
-    let rows: &[(&str, &str, &str, f64, f64)] = &[
+    //  the create states)
+    let rows: &[(&str, &str, &str, f64)] = &[
         (
             "the read half of a table's provisioned capacity",
             "dynamodb:table:ReadCapacityUnits",
             "DynamoDBReadCapacityUtilization",
             50.0,
-            75.0,
         ),
         (
-            "the write half, tracked to another pair of values",
+            "the write half, tracked to another value",
             "dynamodb:table:WriteCapacityUnits",
             "DynamoDBWriteCapacityUtilization",
             40.0,
-            80.0,
         ),
     ];
 
-    for (case, dimension, metric, created_target, updated_target) in rows {
+    for (case, dimension, metric, created_target) in rows {
         let router = router();
         let table = "plan-scaled-table";
         let plan = "router-scaling-plan";
@@ -338,7 +357,14 @@ async fn a_plans_target_tracking_policy_is_held_by_application_auto_scaling() {
             &json!({
                 "ScalingPlanName": plan,
                 "ApplicationSource": { "TagFilters": [{ "Key": "suite", "Values": [plan] }] },
-                "ScalingInstructions": [instruction(table, dimension, metric, *created_target)],
+                "ScalingInstructions": [instruction(
+                    table,
+                    dimension,
+                    metric,
+                    *created_target,
+                    MIN_CAPACITY,
+                    MAX_CAPACITY,
+                )],
             }),
         )
         .await;
@@ -409,8 +435,11 @@ async fn a_plans_target_tracking_policy_is_held_by_application_auto_scaling() {
              states, got {targets}"
         );
 
-        // An update re-points the very same policy: the name is kept, the target value is
-        // the update's.
+        // An update that moves what the plan applies to the resource — here the capacity
+        // window its scalable target is registered with — moves the very same records: the
+        // policy keeps its name and the value it tracks (an update does not re-point a
+        // policy the plan has already applied), and the scalable target reports the new
+        // window.
         plans(
             &router,
             case,
@@ -418,7 +447,14 @@ async fn a_plans_target_tracking_policy_is_held_by_application_auto_scaling() {
             &json!({
                 "ScalingPlanName": plan,
                 "ScalingPlanVersion": 1,
-                "ScalingInstructions": [instruction(table, dimension, metric, *updated_target)],
+                "ScalingInstructions": [instruction(
+                    table,
+                    dimension,
+                    metric,
+                    *created_target,
+                    UPDATED_MIN_CAPACITY,
+                    UPDATED_MAX_CAPACITY,
+                )],
             }),
         )
         .await;
@@ -433,8 +469,29 @@ async fn a_plans_target_tracking_policy_is_held_by_application_auto_scaling() {
         let configuration = &held[0]["TargetTrackingScalingPolicyConfiguration"];
         assert_eq!(
             (held[0]["PolicyName"].clone(), configuration["TargetValue"].as_f64()),
-            (json!(policy_name), Some(*updated_target)),
-            "case {case:?}: the update must re-point the policy it installed, got {held:?}"
+            (json!(policy_name), Some(*created_target)),
+            "case {case:?}: the update must move the policy it installed, not replace it, \
+             got {held:?}"
+        );
+        let targets = application_auto_scaling(
+            &router,
+            case,
+            "DescribeScalableTargets",
+            &json!({
+                "ServiceNamespace": "dynamodb",
+                "ResourceIds": [format!("table/{table}")],
+                "ScalableDimension": dimension,
+            }),
+        )
+        .await;
+        assert_eq!(
+            (
+                targets["ScalableTargets"][0]["MinCapacity"].as_i64(),
+                targets["ScalableTargets"][0]["MaxCapacity"].as_i64()
+            ),
+            (Some(UPDATED_MIN_CAPACITY), Some(UPDATED_MAX_CAPACITY)),
+            "case {case:?}: the update must register the capacity window its instruction \
+             states, got {targets}"
         );
 
         // Deleting the plan deletes the policy it installed: nothing is left tracking the

@@ -59,3 +59,14 @@ Both clusters reported owned_by: [] and an empty stub_path, so no open issue car
 3. Cause 1: call DescribeScalingPlans for that plan name. Observe that ScalingPlans[0] has no LastMutatingRequestTime member; expected an epoch-seconds timestamp equal to the time of the CreateScalingPlan call. Repeat after an UpdateScalingPlan and after a DeleteScalingPlan — the member must be present each time and must advance to the time of the latest mutating call.
 4. Cause 2: call DescribeScalingPlanResources for the same plan/version. Observe ScalingPlanResources[0].ScalingPolicies[0].PolicyName of the form '<plan name>/TargetTracking/<hex>/<hex>'; expected a single flat token 'AutoScaling-<plan name>-<uuid>' containing no '/'.
 5. Re-replay autoscalingplans-scaling-plan-delete-is-not-idempotent-envelope (task#4) and autoscalingplans-scaling-plan-lifecycle (task#4, task#5, task#7); both causes must pass before this issue is closed.
+
+## Resolution
+
+Both causes are fixed, and both recorded fixtures now replay clean (20 of 20 steps).
+
+Cause 1 — `DescribeScalingPlans` reports `LastMutatingRequestTime` on every `ScalingPlan` entry, in every lifecycle phase. The stored plan carries a last-mutating-request instant, stamped by each mutating operation (create, update, delete) and never by a read or by a transition the clock settles; the `ScalingPlan` structure is written by hand (`src/ops/types/scaling_plan_wire.rs`) because the published model declares no such member, so the model file itself is untouched.
+
+Cause 2 — a derived policy is named `AutoScaling-<plan name>-<uuid>`: the id the name ends in is now laid out as a UUID (`8-4-4-4-12`) rather than printed as a digest, so the whole value is one flat token with no `/`. It is still a function of the policy's identity (the resource and the metric), so the name a resource reports is stable across reads and across an update that leaves that resource's metric alone.
+
+Two further causes of the same read path, which the replay surfaced behind Cause 1 at `autoscalingplans-scaling-plan-lifecycle#task#7`, are fixed with them: an update does not re-point the target value of a metric whose policy the plan has already applied (the rule the merge path had been given, narrowed to the applied-policy precondition it states), and the narrative of the applied status reports the mutation that last changed what the plan applies, so an update that changed nothing applied does not re-narrate the plan as updated.
+

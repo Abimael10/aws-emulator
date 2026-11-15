@@ -19,6 +19,9 @@ pub mod delete_scaling_plan_types;
 pub mod describe_scaling_plan_resources_types;
 pub mod describe_scaling_plans_types;
 pub mod get_scaling_plan_resource_forecast_data_types;
+/// The `ScalingPlan` structure `DescribeScalingPlans` reports, which carries one member
+/// beyond the ones the published model declares and so cannot come from the derive.
+pub mod scaling_plan_wire;
 pub mod shared_types;
 pub mod update_scaling_plan_types;
 
@@ -32,6 +35,8 @@ pub use describe_scaling_plan_resources_types::*;
 pub use describe_scaling_plans_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_scaling_plan_resource_forecast_data_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use scaling_plan_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use shared_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

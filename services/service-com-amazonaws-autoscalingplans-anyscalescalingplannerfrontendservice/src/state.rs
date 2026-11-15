@@ -236,8 +236,10 @@ pub struct PendingTransition {
     pub outcome: PendingOutcome,
 }
 
-/// One stored scaling plan: exactly the members the `ScalingPlan` output shape
-/// requires, so `DescribeScalingPlans` is a pure projection of this record.
+/// One stored scaling plan: the members the `ScalingPlan` structure reports, so
+/// `DescribeScalingPlans` is a pure projection of this record. That structure carries one
+/// member the published shape does not declare — the last-mutating-request instant below
+/// — which is why it is written by hand in `crate::ops::types::scaling_plan_wire`.
 #[derive(Debug, Clone)]
 pub struct ScalingPlanRecord {
     /// `ScalingPlanName` — the primary key.
@@ -254,6 +256,12 @@ pub struct ScalingPlanRecord {
     pub status_start_time: SystemTime,
     /// `CreationTime`.
     pub creation_time: SystemTime,
+    /// When the last request that MUTATED this plan was made — the create that minted
+    /// it, or the latest update or delete applied to it.
+    ///
+    /// Distinct from [`Self::status_start_time`], which the clock also moves when a
+    /// transition it owed comes due: this instant moves only when a caller writes.
+    pub last_mutating_request_time: SystemTime,
     /// Which mutation the plan's applied status reports — the create it was minted by,
     /// or the last in-place update applied to it.
     pub applied_mutation: AppliedMutation,
@@ -278,6 +286,7 @@ impl ScalingPlanRecord {
             status_code: STATUS_CREATION_IN_PROGRESS.to_string(),
             status_start_time: now,
             creation_time: now,
+            last_mutating_request_time: now,
             applied_mutation: AppliedMutation::Created,
             pending: Some(PendingTransition {
                 due_at: now + SETTLE_AFTER,
@@ -287,9 +296,16 @@ impl ScalingPlanRecord {
     }
 
     /// Enter a non-terminal `status`, owing `outcome` at `now + SETTLE_AFTER`.
+    ///
+    /// Entered only from a MUTATING request — the update and the delete paths — so this
+    /// is also where the last-mutating-request stamp of an already-stored plan is taken;
+    /// the create takes it in [`Self::creating`]. The clock's own work ([`
+    /// ComAmazonawsAutoscalingplansAnyscalescalingplannerfrontendserviceState::settle_due`])
+    /// goes nowhere near it: a transition coming due is not a request.
     pub fn begin(&mut self, status: &str, outcome: PendingOutcome, now: SystemTime) {
         self.status_code = status.to_string();
         self.status_start_time = now;
+        self.last_mutating_request_time = now;
         self.pending = Some(PendingTransition {
             due_at: now + SETTLE_AFTER,
             outcome,
@@ -303,8 +319,16 @@ impl ScalingPlanRecord {
     /// update ([`APPLIED_AFTER_UPDATE_MESSAGE`]) rather than the create, which — since an
     /// update moves neither `ScalingPlanVersion` nor `CreationTime` — is what makes the
     /// update observable to a caller reading the plan back.
-    pub fn begin_update(&mut self, now: SystemTime) {
-        self.applied_mutation = AppliedMutation::Updated;
+    ///
+    /// `applied_change` says whether this update changed what the plan APPLIES to its
+    /// resources. `ScalingPlan$StatusMessage` is "A simple message about the current
+    /// status of the scaling plan", and the applied status is reached by applying a
+    /// configuration, so an update that left the configuration in force exactly as it was
+    /// applied nothing and leaves the narrative of the application in force alone.
+    pub fn begin_update(&mut self, applied_change: bool, now: SystemTime) {
+        if applied_change {
+            self.applied_mutation = AppliedMutation::Updated;
+        }
         self.begin(STATUS_UPDATE_IN_PROGRESS, PendingOutcome::Active, now);
     }
 
@@ -418,6 +442,91 @@ impl ScalingPlanRecord {
             .collect()
     }
 
+    /// The instruction set in force after an update that carried `requested`.
+    ///
+    /// `UpdateScalingPlan` takes the plan's whole `ScalingInstructions` list, so the list
+    /// the request carries is the configuration in force afterwards — with ONE exception,
+    /// which is what this method applies: an update does not re-point a target tracking
+    /// policy the plan has ALREADY APPLIED. For a configuration whose scaling metric a
+    /// policy applied to that resource already tracks, the target value in force is kept,
+    /// because that value is what the applied policy tracks to; every other member of the
+    /// configuration, every configuration no applied policy tracks (a resource whose
+    /// instruction turned dynamic scaling off, a metric the resource did not track
+    /// before), and every instruction for a resource the plan did not cover, is the
+    /// update's to set.
+    ///
+    /// "Already applied" is read from [`Self::applied_policies`] — the one answer this
+    /// crate gives to "which policies has this plan put on that resource?" — so the
+    /// exception cannot apply to a policy that does not exist, and the values kept are the
+    /// ones those very policies report tracking.
+    ///
+    /// A resource is matched by its own identity (`(ServiceNamespace, ResourceId,
+    /// ScalableDimension)`, "Each scaling instruction applies to one resource") and a
+    /// metric by [`target_metric_identity`], never by a position in a list: an update
+    /// rewrites the instruction list in the order the request carries it.
+    pub fn applied_update(&self, requested: Vec<ScalingInstruction>) -> Vec<ScalingInstruction> {
+        requested
+            .into_iter()
+            .map(|mut instruction| {
+                let Some(in_force) = self.scaling_instructions.iter().find(|applied| {
+                    resource_identity(applied) == resource_identity(&instruction)
+                }) else {
+                    return instruction;
+                };
+                // The metric each policy APPLIED to that resource tracks, with the target
+                // value it tracks to.
+                let tracked: BTreeMap<String, f64> = self
+                    .applied_policies(in_force)
+                    .into_iter()
+                    .filter_map(|policy| {
+                        let configuration = policy.target_tracking_configuration?;
+                        Some((
+                            target_metric_identity(&configuration)?,
+                            configuration.target_value,
+                        ))
+                    })
+                    .collect();
+                for configuration in &mut instruction.target_tracking_configurations {
+                    if let Some(in_force) = target_metric_identity(configuration)
+                        .and_then(|metric| tracked.get(&metric))
+                    {
+                        configuration.target_value = *in_force;
+                    }
+                }
+                instruction
+            })
+            .collect()
+    }
+
+    /// What this plan has APPLIED to the resources it covers, under the instruction set
+    /// `instructions`: per resource, the capacity band the plan registered for it and the
+    /// target tracking scaling policies it put on it.
+    ///
+    /// This is what an update is compared against ([`Self::begin_update`]): the narrative
+    /// of the applied status reports what the plan last applied to its resources, so an
+    /// update that leaves this footprint exactly as it was is not reported as having
+    /// updated the plan, however the request spelled the instructions it re-sent.
+    ///
+    /// Keyed by resource identity rather than by list position, so re-sending the same
+    /// instructions in another order is the same footprint.
+    pub fn applied_footprint(
+        &self,
+        instructions: &[ScalingInstruction],
+    ) -> BTreeMap<String, (i32, i32, Vec<ScalingPolicy>)> {
+        instructions
+            .iter()
+            .map(|instruction| {
+                (
+                    resource_identity_key(instruction),
+                    (
+                        instruction.min_capacity,
+                        instruction.max_capacity,
+                        self.applied_policies(instruction),
+                    ),
+                )
+            })
+            .collect()
+    }
 }
 
 /// Which refusal the mutating-plan admission rule answers with.
@@ -469,59 +578,67 @@ const POLICY_NAME_PREFIX: &str = "AutoScaling-";
 /// configuration.
 ///
 /// The service generates the name, out of the plan it belongs to: it is
-/// [`POLICY_NAME_PREFIX`], then the `ScalingPlanName` verbatim, then `-` and an id the
-/// service generates for that policy. The plan name is what joins a policy back to the
+/// [`POLICY_NAME_PREFIX`], then the `ScalingPlanName` verbatim, then `-` and a UUID the
+/// service mints for that policy. The plan name is what joins a policy back to the
 /// plan that installed it — `DescribeScalingPolicies`, `PutScalingPolicy` and the
 /// CloudWatch alarms of a target tracking policy are all keyed on the policy name — so a
-/// client can select a plan's policies by the derivation alone. `ScalingPolicy$PolicyName`
-/// only constrains the result: a printable string of 1-256 characters.
+/// client can select a plan's policies by the derivation alone, and the whole value is
+/// one flat token: no `/`, which is also why a `ScalingPlanName` may carry none.
+/// `ScalingPolicy$PolicyName` only constrains the result: a printable string of 1-256
+/// characters.
 ///
-/// The generated id is derived from the state that identifies the policy inside its plan
-/// — the resource the policy was applied to and the configuration within that resource's
-/// instruction it came from — so no two policies of one plan share a name, and the name a
-/// resource reports does not change between reads or when an update rewrites the
-/// instruction list around it.
+/// The UUID is minted from the state that identifies the policy inside its plan — the
+/// resource the policy was applied to and the configuration within that resource's
+/// instruction it came from ([`policy_uuid`]) — so no two policies of one plan share a
+/// name, and the name a resource reports does not change between reads or when an update
+/// rewrites the instruction list around it.
 ///
 /// `resource` is the [`resource_identity_key`] of the instruction the policy was minted
 /// from and `configuration` the [`target_metric_identity`] of the configuration inside
 /// it — the two IDENTITIES, never the positions those values happen to hold in a list,
 /// because an update rewrites the instruction list in the order the request carries it
 /// and so moves every position in it.
-///
-/// Both identities are built out of caller-supplied text the model lets run long — a
-/// `ResourceId` alone reaches 1600 characters and a customized metric's namespace, name
-/// and dimensions are plain strings — while a `PolicyName` has 256. They therefore reach
-/// the name as the fixed-width [`identity_digest`] of the pair: the name stays a function
-/// of the identities, and of nothing else, at a length the plan name bounds.
 fn policy_name(plan_name: &str, resource: &str, configuration: &str) -> String {
     format!(
         "{POLICY_NAME_PREFIX}{plan_name}-{}",
-        identity_digest(resource, configuration)
+        policy_uuid(resource, configuration)
     )
 }
 
-/// How many BYTES of an identity's SHA-256 digest a policy name carries.
+/// How many BYTES of an identity's SHA-256 digest the policy's UUID is laid out from.
 ///
-/// 16 bytes is 32 hex characters, so a `ScalingPlanName` at its modelled maximum of 128
-/// characters, plus the fixed prefix, the separator and the digest, occupies 173 of the
+/// A UUID is 16 bytes, rendered as 36 characters, so a `ScalingPlanName` at its modelled
+/// maximum of 128 characters, plus the fixed prefix and separator, occupies 177 of the
 /// 256 characters `ScalingPolicy$PolicyName` allows, whatever the identities are spelled
-/// with; 128 bits of digest is why two identities of one plan do not render one name.
-const IDENTITY_DIGEST_BYTES: usize = 16;
+/// with; 122 bits of digest reach the UUID, which is why two identities of one plan do
+/// not render one name.
+const UUID_BYTES: usize = 16;
 
-/// A fixed-width, printable rendering of the identity pair one policy is minted for.
+/// The UUID the plan mints for the policy of one identity pair.
 ///
-/// The digest is what lets UNBOUNDED identities name a policy inside the bounded
-/// `PolicyName`: equal pairs render equal, different pairs render different, and the
-/// rendering is the same on every read because it reads nothing but the pair. The
-/// resource's own length goes into the digest ahead of the two keys, so a character
-/// moved from the end of one key to the start of the other is a different pair.
-fn identity_digest(resource: &str, configuration: &str) -> String {
+/// Both identities are built out of caller-supplied text the model lets run long — a
+/// `ResourceId` alone reaches 1600 characters and a customized metric's namespace, name
+/// and dimensions are plain strings — so they reach the fixed-width UUID as the leading
+/// [`UUID_BYTES`] of their SHA-256 digest: the name stays a function of the identities,
+/// and of nothing else, at a length the plan name bounds. Equal pairs render equal,
+/// different pairs render different, and the rendering is the same on every read because
+/// it reads nothing but the pair. The resource's own length goes into the digest ahead of
+/// the two keys, so a character moved from the end of one key to the start of the other
+/// is a different pair.
+///
+/// The digest bytes are laid out as a UUID rather than printed as a digest, because what
+/// the policy carries is a UUID. The layout itself is the family's
+/// (`service_common::uuid_from_random_bytes`), which renders 16 opaque bytes a service
+/// minted in the hyphenated form with the version and variant bits a UUID carries.
+fn policy_uuid(resource: &str, configuration: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update((resource.len() as u64).to_be_bytes());
     hasher.update(resource.as_bytes());
     hasher.update(configuration.as_bytes());
     let digest = hasher.finalize();
-    hex::encode(&digest[..IDENTITY_DIGEST_BYTES])
+    let mut bytes = [0u8; UUID_BYTES];
+    bytes.copy_from_slice(&digest[..UUID_BYTES]);
+    ::service_common::uuid_from_random_bytes(bytes)
 }
 
 /// Per-service state for com-amazonaws-autoscalingplans-anyscalescalingplannerfrontendservice. A handler reaches it through [`service_state`].

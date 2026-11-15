@@ -158,16 +158,17 @@ async fn every_described_status_carries_the_narrative_that_explains_it() {
 
         emulator.make_all_due();
         if operation == "UpdateScalingPlan" {
-            // The settled plan reports the applied narrative on both envelopes — on the
-            // plan, the narrative of the mutation that was applied, which here was an
-            // update (the rule is spanned by
-            // [`crate::update_replaces_the_instruction_set`]).
+            // The settled plan reports the applied narrative on both envelopes. This
+            // update carried nothing beyond the plan's identity, so it changed nothing
+            // the plan applies and the narrative of the application in force — the
+            // create's — stands ([`crate::update_keeps_an_applied_policys_target_value`]
+            // spans that rule).
             let plan = described(&emulator, "my-plan").await;
             assert_eq!(
                 (plan.get("StatusCode"), plan.get("StatusMessage")),
                 (
                     Some(&json!("Active")),
-                    Some(&json!("Scaling plan has been updated successfully."))
+                    Some(&json!("Scaling plan has been created and applied to all resources."))
                 ),
                 "case {label}: an applied plan reports the applied narrative, got {plan:?}"
             );
@@ -434,7 +435,10 @@ struct ReplacementCase {
 /// value vs the cooldowns and the scale-in flag), whether the instruction asks for the
 /// resource's policies to be replaced, the FORM of the metric (predefined vs
 /// customized), and whether the resource is one the plan already covers. Whatever the
-/// row, what the plan reports afterwards is the instruction set the update carried.
+/// row, what the plan reports afterwards is the instruction set the update carried — save
+/// for the target value of a metric an applied policy already tracks, which an update
+/// does not re-point ([`crate::update_keeps_an_applied_policys_target_value`] spans that
+/// rule).
 fn replacement_cases() -> Vec<ReplacementCase> {
     let tracked = table_instruction("DynamoDBReadCapacityUtilization", 50.0);
     vec![
@@ -451,6 +455,8 @@ fn replacement_cases() -> Vec<ReplacementCase> {
                 "DynamoDBReadCapacityUtilization",
                 75.0,
             )],
+            // The bounds are the update's; the target value is the one the policy the
+            // plan already applied for that metric tracks to.
             expected: vec![instruction(
                 "dynamodb",
                 "table/my-table",
@@ -458,7 +464,7 @@ fn replacement_cases() -> Vec<ReplacementCase> {
                 4,
                 400,
                 "DynamoDBReadCapacityUtilization",
-                75.0,
+                50.0,
             )],
         },
         ReplacementCase {
@@ -479,8 +485,8 @@ fn replacement_cases() -> Vec<ReplacementCase> {
                 "ScalingPolicyUpdateBehavior": "ReplaceExternalPolicies"
             })],
             // `ReplaceExternalPolicies` deletes the policies that are EXTERNAL to AWS
-            // Auto Scaling; the policy this plan applied itself is re-pointed by the
-            // instruction set the update carries, like it is without that behaviour.
+            // Auto Scaling; the policy this plan applied itself keeps the target value it
+            // tracks to, like it does without that behaviour.
             expected: vec![json!({
                 "ServiceNamespace": "dynamodb",
                 "ResourceId": "table/my-table",
@@ -491,7 +497,7 @@ fn replacement_cases() -> Vec<ReplacementCase> {
                     "PredefinedScalingMetricSpecification": {
                         "PredefinedScalingMetricType": "DynamoDBReadCapacityUtilization"
                     },
-                    "TargetValue": 75.0
+                    "TargetValue": 50.0
                 }],
                 "ScalingPolicyUpdateBehavior": "ReplaceExternalPolicies"
             })],
@@ -499,8 +505,8 @@ fn replacement_cases() -> Vec<ReplacementCase> {
         ReplacementCase {
             label: "cooldowns and the scale-in flag on a metric already tracked",
             in_force: vec![tracked.clone()],
-            // Every member of the configuration is the update's to set, the target value
-            // included.
+            // Every member of the configuration is the update's to set, except the target
+            // value an applied policy of that metric already tracks.
             requested: vec![json!({
                 "ServiceNamespace": "dynamodb",
                 "ResourceId": "table/my-table",
@@ -527,7 +533,7 @@ fn replacement_cases() -> Vec<ReplacementCase> {
                     "PredefinedScalingMetricSpecification": {
                         "PredefinedScalingMetricType": "DynamoDBReadCapacityUtilization"
                     },
-                    "TargetValue": 75.0,
+                    "TargetValue": 50.0,
                     "DisableScaleIn": true,
                     "ScaleOutCooldown": 90,
                     "ScaleInCooldown": 600
@@ -571,7 +577,8 @@ fn replacement_cases() -> Vec<ReplacementCase> {
                         "PredefinedScalingMetricSpecification": {
                             "PredefinedScalingMetricType": "DynamoDBReadCapacityUtilization"
                         },
-                        "TargetValue": 75.0
+                        // The metric whose policy is applied keeps the value it tracks.
+                        "TargetValue": 50.0
                     },
                     {
                         "CustomizedScalingMetricSpecification": {
@@ -579,6 +586,7 @@ fn replacement_cases() -> Vec<ReplacementCase> {
                             "Namespace": "MyApp",
                             "Statistic": "Sum"
                         },
+                        // No policy tracks this metric yet, so the update's value takes.
                         "TargetValue": 30.0
                     }
                 ]
@@ -653,7 +661,8 @@ fn replacement_cases() -> Vec<ReplacementCase> {
                         "Statistic": "Sum",
                         "Dimensions": [{ "Name": "Queue", "Value": "orders" }]
                     },
-                    "TargetValue": 60.0
+                    // The applied policy of this metric keeps the value it tracks.
+                    "TargetValue": 25.0
                 }]
             })],
         },

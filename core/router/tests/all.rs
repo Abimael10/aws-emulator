@@ -1674,3 +1674,13 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 // What a suite covers, and why it lives in THIS cross-service target rather than in one
 // service crate's own, belongs in that suite's own module header, where it is read beside
 // the test it explains; `all/appended_notes.rs` keeps the notes this list had collected.
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted into the sorted list: this
+// file holds those pairs and NOTHING else, so a landing has one place to insert and no
+// prose to duplicate, re-word or mistype.
+// every suite in this target. EVERY comment in this file is an ORDINARY `//` one, this
+// block included, and that is deliberate: an inner doc comment (`//!`) is legal only
+// before the first item, so one appended past the declarations is `E0753` and compiles no
+// suite of this target — with none anywhere, no merge of two landings can produce one.
+// service crate's own, is stated in that suite's own module header, where it is read
+// beside the test it explains. `all/all_rs_declares_each_suite_once.rs`,
+// every service crate's `tests/all.rs`, so a note about any of them belongs there.
