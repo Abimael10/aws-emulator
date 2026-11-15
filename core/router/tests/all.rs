@@ -1721,3 +1721,13 @@ mod default_vpc_internet_path_runs_ecs_tasks;
 // wraps a list item without the indentation `clippy::doc_lazy_continuation` asks for is then
 // a note rather than a build failure. An inner attribute, like an inner doc comment, is legal
 // only before the first item, so it stands here rather than in the list.
+// Single integration-test target for the router: the declaration list of every cross-service
+// suite under `tests/all/`, and nothing else.
+// suite file, sorted strictly by name, and no other line. Put a new suite at
+// module header, and a note about THIS file in `all/appended_notes.rs`.
+// comment and an inner attribute are legal only ahead of the first item, so one left below the
+// list compiles no suite of this target at all.
+// this file, which the layout check refuses: the `#[path]` above each `mod` is what points the
+// The `all/all_rs_*.rs` suites, `all/every_suite_file_is_declared.rs` and
+// `all/declaration_roots_are_canonical_and_complete.rs` pin all of that, for this file and for
+// every service crate's `tests/all.rs`, so a note about those rules belongs there rather than

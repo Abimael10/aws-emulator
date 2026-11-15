@@ -29,6 +29,8 @@ mod component_policy;
 mod component_policy_lifecycle;
 #[path = "all/container_recipe.rs"]
 mod container_recipe;
+#[path = "all/dependency_refusal_wording.rs"]
+mod dependency_refusal_wording;
 #[path = "all/distribution_configuration.rs"]
 mod distribution_configuration;
 #[path = "all/error_response_envelope.rs"]
