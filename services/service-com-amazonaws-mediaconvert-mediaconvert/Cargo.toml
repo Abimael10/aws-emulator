@@ -50,6 +50,14 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
     "rt-tokio",
 ] }
 
+# The ISO base media demuxer `Probe` reads an MP4, QuickTime, 3GP or 3G2 file's movie
+# header and tracks with, so the container, the track layout and each track's geometry
+# are read off the caller's own bytes rather than assumed.
+mp4 = "0.14"
+# The RIFF/WAVE reader `Probe` reads a Wave file's format chunk with (sample rate,
+# channel count, bit depth, frame count), for the same reason.
+hound = "3.5"
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
@@ -63,6 +71,10 @@ tokio = { workspace = true, features = ["time"] }
 # without them mounted there is nothing for the publication to reach.
 service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# S3 is mounted beside MediaConvert on one engine in the `Probe` integration tests: the
+# operation reads the media file the request addresses out of S3 over the in-process
+# callback, so without an S3 holding the object there is nothing for it to read.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

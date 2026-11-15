@@ -40,19 +40,8 @@ pub const WRITE_ACTION: &str = "s3:PutObject";
 /// can read.
 const DEFAULT_PARTITION: &str = "aws";
 
-/// The service label an Amazon S3 endpoint's host carries.
-const S3_HOST_LABEL: &str = "s3";
-
 /// The scheme of the `https://` spelling, whose authority is an Amazon S3 endpoint.
 const HTTPS_SCHEME: &str = "https";
-
-/// What separates a virtual-hosted bucket from the endpoint in a host, where the endpoint
-/// spells the Region with a `.` (`<bucket>.s3.<region>.amazonaws.com`).
-const HOST_SERVICE_LABEL_DOT: &str = ".s3.";
-
-/// The same, where the endpoint spells the Region with the legacy `-`
-/// (`<bucket>.s3-<region>.amazonaws.com`).
-const HOST_SERVICE_LABEL_DASH: &str = ".s3-";
 
 /// The longest `BlockedReason` the model carries (`OfflineStoreStatus$BlockedReason`,
 /// `length 0..1024`), so an explanation naming a long role ARN and a long location stays
@@ -122,18 +111,16 @@ impl OfflineStoreLocation {
             crate::s3_uri::S3_SCHEME => Self::of(host, &path),
             HTTPS_SCHEME => {
                 // Virtual-hosted: the bucket is the label ahead of the service name in the
-                // host, whether the endpoint spells the Region with a `.` or the legacy `-`.
-                for separator in [HOST_SERVICE_LABEL_DOT, HOST_SERVICE_LABEL_DASH] {
-                    if let Some((bucket, _endpoint)) = host.split_once(separator) {
-                        return Self::of(bucket, &path);
-                    }
+                // host, whether the endpoint spells the Region with a `.` or the legacy
+                // `-`. Which hosts those are is read by the shared reading of an Amazon S3
+                // endpoint host ([`crate::s3_uri`]), so this member and every other one
+                // admitting such a URL recover the same bucket from it.
+                if let Some(bucket) = crate::s3_uri::endpoint_host_bucket(host) {
+                    return Self::of(bucket, &path);
                 }
                 // Path-style: the host is the service endpoint itself and the bucket is the
                 // first path segment.
-                if host == S3_HOST_LABEL
-                    || host.starts_with(&format!("{S3_HOST_LABEL}."))
-                    || host.starts_with(&format!("{S3_HOST_LABEL}-"))
-                {
+                if crate::s3_uri::host_is_endpoint(host) {
                     let trimmed = path.trim_matches('/');
                     let (bucket, prefix) = trimmed.split_once('/').unwrap_or((trimmed, ""));
                     return Self::of(bucket, prefix);

@@ -52,6 +52,82 @@ use ::smithy_server_runtime::EmbeddedEmulator;
 /// too) name the same scheme as this module rather than their own copy of it.
 pub const S3_SCHEME: &str = "s3";
 
+/// The schemes an Amazon S3 ENDPOINT URL is written with, which a member admitting "the S3,
+/// HTTP, or HTTPS URL" of an object carries beside the `s3://` spelling.
+const ENDPOINT_SCHEMES: [&str; 2] = ["https", "http"];
+
+/// The service label an Amazon S3 endpoint's host carries.
+const ENDPOINT_LABEL: &str = "s3";
+
+/// What separates a VIRTUAL-HOSTED bucket from the endpoint in a host, where the endpoint
+/// spells the Region with a `.` (`<bucket>.s3.<region>.amazonaws.com`), and the same for the
+/// legacy `-` spelling (`<bucket>.s3-<region>.amazonaws.com`).
+const HOST_LABEL_SEPARATORS: [&str; 2] = [".s3.", ".s3-"];
+
+/// The bucket a VIRTUAL-HOSTED Amazon S3 endpoint host names — the label ahead of the
+/// service name in `<bucket>.s3.<region>.amazonaws.com` — or `None` when the host carries
+/// no bucket.
+///
+/// Public, and the ONE reading of such a host, because a member that admits an endpoint URL
+/// has to recover the same bucket from it whichever service reads it. The host is only ever
+/// read FOR the bucket and then dropped: every call this emulator makes about the object
+/// goes over the in-process hop ([`crate::s3_client`]), whose address comes from the Region
+/// alone, so no part of a caller's URL is ever a destination.
+#[must_use]
+pub fn endpoint_host_bucket(host: &str) -> Option<&str> {
+    HOST_LABEL_SEPARATORS
+        .into_iter()
+        .find_map(|separator| host.split_once(separator))
+        .map(|(bucket, _endpoint)| bucket)
+        .filter(|bucket| !bucket.is_empty())
+}
+
+/// Whether `host` is an Amazon S3 ENDPOINT host itself, which is how a PATH-STYLE URL
+/// addresses a bucket: the bucket is then the first segment of the path rather than a label
+/// of the host.
+#[must_use]
+pub fn host_is_endpoint(host: &str) -> bool {
+    host == ENDPOINT_LABEL
+        || host.starts_with(&format!("{ENDPOINT_LABEL}."))
+        || host.starts_with(&format!("{ENDPOINT_LABEL}-"))
+}
+
+/// The bucket and the key the URL `url` names, in any spelling a member admitting "the S3,
+/// HTTP, or HTTPS URL" of a media file or an asset carries, or `None` when it names no
+/// object: the `s3://` URI ([`object_address`]), or an Amazon S3 endpoint URL, virtual-hosted
+/// (`https://<bucket>.s3.<region>.amazonaws.com/<key>`) or path-style
+/// (`https://s3.<region>.amazonaws.com/<bucket>/<key>`).
+///
+/// The ONE reading of that member, so the same object is reached whichever spelling a caller
+/// wrote and whichever service reads it. Each spelling keeps its own key rule, which is the
+/// difference between the two: an `s3://` URI's key is the RAW text after the authority (see
+/// [`split`]), while an endpoint URL's key is its path percent-DECODED
+/// ([`decoded_key`]) — in a URL the escaping is the URL's, and what it spells is a key.
+#[must_use]
+pub fn url_object_address(url: &str) -> Option<(String, String)> {
+    let trimmed = url.trim();
+    let parsed = ::url::Url::parse(trimmed).ok()?;
+    if parsed.scheme() == S3_SCHEME {
+        return object_address(trimmed);
+    }
+    if !ENDPOINT_SCHEMES.contains(&parsed.scheme()) {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    let path = decoded_key(parsed.path().trim_start_matches('/'));
+    let (bucket, key) = match endpoint_host_bucket(host) {
+        // Virtual-hosted: the whole path is the key.
+        Some(bucket) => (bucket.to_string(), path),
+        // Path-style: the first segment is the bucket and the rest is the key.
+        None if host_is_endpoint(host) => {
+            let (bucket, key) = path.split_once('/')?;
+            (bucket.to_string(), key.to_string())
+        }
+        None => return None,
+    };
+    (!key.is_empty() && crate::s3_bucket_name::is_well_formed(&bucket)).then_some((bucket, key))
+}
+
 /// What separates a URI's scheme from its authority.
 const SCHEME_SEPARATOR: &str = "://";
 
@@ -307,6 +383,93 @@ mod tests {
             assert_eq!(
                 actual, expected,
                 "case {case:?} ({uri}): expected bucket {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// One row of the URL table below: the case, the URL and the object address it names.
+    type UrlRow = (&'static str, &'static str, Option<(&'static str, &'static str)>);
+
+    /// RULE: a member admitting "the S3, HTTP, or HTTPS URL" of an object names that object
+    /// in any of the spellings Amazon S3 publishes for it — the `s3://` URI, a
+    /// virtual-hosted endpoint URL and a path-style one — and each spelling keeps its own
+    /// key rule.
+    ///
+    /// The rows span the scheme, the addressing style (virtual-hosted, path-style, both
+    /// Region spellings, the global endpoint), the key (nested, escaped, absent) and the
+    /// hosts that are no Amazon S3 endpoint at all.
+    #[test]
+    fn an_object_url_names_the_bucket_and_key_it_spells() {
+        let rows: &[UrlRow] = &[
+            (
+                "the s3 URI, whose key is the raw text after the authority",
+                "s3://bda-samples/in/one%20two.mp4",
+                Some(("bda-samples", "in/one%20two.mp4")),
+            ),
+            (
+                "a virtual-hosted endpoint URL",
+                "https://bda-samples.s3.us-west-2.amazonaws.com/in/one.mp4",
+                Some(("bda-samples", "in/one.mp4")),
+            ),
+            (
+                "a virtual-hosted URL on the global endpoint",
+                "https://bda-samples.s3.amazonaws.com/in/one.mp4",
+                Some(("bda-samples", "in/one.mp4")),
+            ),
+            (
+                "a virtual-hosted URL spelling the Region the legacy way",
+                "https://bda-samples.s3-us-west-2.amazonaws.com/in/one.mp4",
+                Some(("bda-samples", "in/one.mp4")),
+            ),
+            (
+                "a path-style endpoint URL",
+                "https://s3.us-west-2.amazonaws.com/bda-samples/in/one.mp4",
+                Some(("bda-samples", "in/one.mp4")),
+            ),
+            (
+                "a path-style URL over http",
+                "http://s3-us-west-2.amazonaws.com/bda-samples/in/one.mp4",
+                Some(("bda-samples", "in/one.mp4")),
+            ),
+            (
+                "an endpoint URL whose path is escaped, which spells the key it decodes to",
+                "https://s3.us-west-2.amazonaws.com/bda-samples/in%2Fone%20two.mp4",
+                Some(("bda-samples", "in/one two.mp4")),
+            ),
+            (
+                "a virtual-hosted URL naming the bucket alone",
+                "https://bda-samples.s3.us-west-2.amazonaws.com/",
+                None,
+            ),
+            (
+                "a path-style URL naming the bucket alone",
+                "https://s3.us-west-2.amazonaws.com/bda-samples",
+                None,
+            ),
+            (
+                "a path-style URL whose first segment is no bucket name",
+                "https://s3.us-west-2.amazonaws.com/BDA-Samples/in/one.mp4",
+                None,
+            ),
+            (
+                "a host that is no Amazon S3 endpoint",
+                "https://example.com/in/one.mp4",
+                None,
+            ),
+            (
+                "a host whose label only ends in the service name",
+                "https://not-s3.amazonaws.com/in/one.mp4",
+                None,
+            ),
+            ("no scheme at all", "bda-samples/in/one.mp4", None),
+            ("no URL at all", "", None),
+        ];
+        for (case, url, expected) in rows {
+            let expected = expected.map(|(bucket, key)| (bucket.to_string(), key.to_string()));
+            let actual = url_object_address(url);
+            assert_eq!(
+                actual, expected,
+                "case {case:?} ({url}): expected {expected:?}, got {actual:?}"
             );
         }
     }

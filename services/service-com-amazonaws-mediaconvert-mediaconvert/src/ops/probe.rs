@@ -1,15 +1,56 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Probe
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Probe`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Probe::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## How this operation answers
+//!
+//! Every value in a `ProbeResult` is read from the media file itself. The bytes come from
+//! the object the request's `FileUrl` addresses, fetched over the in-process callback the
+//! way every emulated service reads a caller's object
+//! ([`::service_common::s3_client`], [`::service_common::s3_object_read`]), and the
+//! container, its tracks and the file's metadata are then read off those bytes:
+//!
+//! * `Container.Format` comes from the file's own SIGNATURE ([`container_format`]) — the
+//!   ISO base media `ftyp` brand, the RIFF form, the EBML doc type, a codec syncword —
+//!   never from the key's extension or from the object's `Content-Type`, neither of which
+//!   the bytes have to agree with. `Metadata.MimeType` is the media type of the container
+//!   the bytes turned out to be, for the same reason.
+//! * `Container.Tracks` is read by a demuxer: the ISO base media family (MP4, QuickTime,
+//!   3GP, 3G2) by the `mp4` crate, RIFF/WAVE by `hound`. A container this emulator
+//!   carries no demuxer for is still reported — its format, and the object's own
+//!   metadata, are facts about the file — with the track list ABSENT rather than guessed,
+//!   which is how this operation reports every field it cannot read: "a field isn't
+//!   returned when the source doesn't contain it, or when it isn't available".
+//! * `Container.BitRate` is computed from the two values the member documents it as
+//!   "(file size in bytes * 8) / duration in seconds".
+//! * `Metadata` is the OBJECT's: the size of the bytes read, and the entity tag and last
+//!   modification instant S3 reported for them.
+//!
+//! The bytes are a CALLER's, so each demuxer runs behind a panic barrier: one that trips
+//! an assertion on a file nobody wrote by the book leaves this operation answering "not a
+//! container this service can read" rather than taking the request down with it. Reading a
+//! container is CPU-bound, so it runs on the blocking pool rather than on the async worker
+//! serving the request, and it is bounded by its INPUT: the object read is ranged to
+//! [`MAX_PROBED_FILE_BYTES`].
+//!
+//! `FileUrl` is "the S3, HTTP, or HTTPS URL for your media file", and an S3 object is
+//! addressable in either form, so both are resolved to the object they name
+//! ([`object_address`]) and read through the in-process callback. A URL that addresses
+//! something ELSE is refused, not fetched: this emulator opens no outbound connection, so
+//! there is nothing to report about a file it cannot reach.
+//!
+//! The response carries one result per `InputFiles` entry, in request order. A file that
+//! cannot be read or recognised refuses the whole call — `ProbeResult` has no member to
+//! report a per-file failure in, so a partial list would claim the files it left out were
+//! never asked about. How many files one call reads, and how large each may be, have
+//! chosen ceilings ([`MAX_PROBED_FILES`], [`MAX_PROBED_FILE_BYTES`]): the list and the
+//! files are the caller's to choose, so the work one call costs is bounded.
+//!
+//! This operation persists NOTHING: there is no probe to get, list or delete, so a later
+//! caller sees exactly what it saw before. The only state it reads is this service's
+//! store being there at all, which every door of this service answers for alike. The
+//! account's input policy is not consulted either: `Policy` allows or disallows "jobs
+//! that specify" inputs, and this call submits no job.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +203,1089 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Probe` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ProbeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Probe"))
+        // This operation stores nothing, so the store is never locked here — but a
+        // service whose store cannot be reached is not serving requests at all, and every
+        // other door of this service says so in the same sentence.
+        if crate::state::service_state(&*self.engine).is_none() {
+            return Err(ProbeErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("this service's state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "Specify a media file to probe": a request that names no file asks for nothing,
+        // which is the same problem in the request as a member that carries no
+        // characters, answered in this crate's one sentence for it.
+        let files = input.input_files.unwrap_or_default();
+        if files.is_empty() {
+            return Err(ProbeErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::blank_member_message("inputFiles")),
+            })
+            .into());
+        }
+        // How many files one call reads is the caller's to choose, so it has a ceiling:
+        // each entry costs an object read, and a request is refused rather than served
+        // with the files past the ceiling silently left out — there is one result per
+        // file, so a short list would claim the rest were never asked about.
+        if files.len() > MAX_PROBED_FILES {
+            return Err(ProbeErrorModeled::BadRequestException(BadRequestException {
+                message: Some(too_many_files_message(files.len())),
+            })
+            .into());
+        }
+
+        // Every file's ADDRESS is resolved before any of them is read, so a request
+        // carrying one file this service cannot address costs no object read at all —
+        // the same order `CreateJob` answers its local refusals in. WHICH object a
+        // `FileUrl` names is the shared reading of that member
+        // ([`::service_common::s3_uri::url_object_address`]), so every spelling of one
+        // object's address reaches the same object here as anywhere else; a URL that names
+        // no object of this emulator's own store is refused rather than fetched, because
+        // nothing outside this process is reachable.
+        let mut addresses = Vec::with_capacity(files.len());
+        for file in &files {
+            let url = file.file_url.as_deref().unwrap_or_default();
+            if crate::state::carries_no_characters(url) {
+                return Err(ProbeErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(crate::state::blank_member_message("fileUrl")),
+                })
+                .into());
+            }
+            let Some((bucket, key)) = ::service_common::s3_uri::url_object_address(url) else {
+                return Err(ProbeErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(unreadable_location_message(url)),
+                })
+                .into());
+            };
+            addresses.push((url.to_string(), bucket, key));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut results = Vec::with_capacity(addresses.len());
+        for (url, bucket, key) in addresses {
+            let object = read_object(ctx, &region, &bucket, &key, &url).await?;
+            // Reading a container — one file's bytes, bounded by the ceiling the read above
+            // is ranged to — is CPU-bound, so it runs on the blocking pool and not on the
+            // async worker: a worker busy inside a demuxer serves no other request and
+            // lands no timeout, cancellation or shutdown signal, and `spawn_blocking(..)
+            // .await` is the await point those land on instead.
+            //
+            // The work is bounded by its INPUT rather than by a wait on it, and this
+            // handler WAITS for the task it started: giving up on the wait would not stop
+            // a demuxer — nothing interrupts a blocking task — so it would leave the
+            // thread and the file's buffer live with nothing accounting for them. The
+            // files of one request are read one after another, so a request occupies one
+            // such thread at a time, and the pool it runs on is itself bounded.
+            let reading = ::tokio::task::spawn_blocking({
+                let url = url.clone();
+                move || probe_result(&url, &object)
+            });
+            match reading.await {
+                Ok(result) => results.push(result?),
+                // The task did not run to completion: the runtime is shutting down, or it
+                // was cancelled. Nothing was established about the file, so nothing is
+                // reported about it.
+                Err(_) => return Err(unread_file(&url).into()),
+            }
+        }
+
+        Ok(ProbeOutput {
+            probe_results: Some(results),
+        })
+    }
+}
+
+/// How many media files one call reads.
+///
+/// A CHOSEN ceiling, as the job input probe's own is: `InputFiles` is caller-driven and
+/// each entry costs an object read, so the per-request work has to have a bound. It is the
+/// same count the job probe stops at, so neither door of this service reads more of a
+/// caller's media per call than the other. Published so a test can state the ceiling
+/// rather than restate the number.
+pub const MAX_PROBED_FILES: usize = 20;
+
+/// How large a media file this operation reads.
+///
+/// A CHOSEN ceiling too, for the same reason: the file is read whole — a container's index
+/// may sit anywhere in it — so the size a caller can make this operation hold in memory is
+/// bounded here rather than by whatever the object store happens to hold.
+const MAX_PROBED_FILE_BYTES: usize = 256 * 1024 * 1024;
+
+/// The `Format` values this service reports, spelled as the model's `Format` enum spells
+/// them. The catalogue is held against the generated `FORMAT_VALUES` by this module's own
+/// unit test, so a reported format cannot drift from the model.
+const FORMAT_MP4: &str = "mp4";
+const FORMAT_QUICKTIME: &str = "quicktime";
+const FORMAT_MATROSKA: &str = "matroska";
+const FORMAT_WEBM: &str = "webm";
+const FORMAT_MXF: &str = "mxf";
+const FORMAT_WAVE: &str = "wave";
+const FORMAT_AVI: &str = "avi";
+const FORMAT_MPEGTS: &str = "mpegts";
+const FORMAT_MPEGPS: &str = "mpegps";
+const FORMAT_MP3: &str = "mp3";
+const FORMAT_FLAC: &str = "flac";
+const FORMAT_ASF: &str = "asf";
+const FORMAT_OGG: &str = "ogg";
+const FORMAT_THREE_GP: &str = "three_gp";
+const FORMAT_THREE_G2: &str = "three_g2";
+const FORMAT_AAC: &str = "aac";
+const FORMAT_AC3: &str = "ac3";
+const FORMAT_EAC3: &str = "eac3";
+
+/// The `Codec` values this service reports, spelled as the model's `Codec` enum spells
+/// them, and held against the generated `CODEC_VALUES` by this module's own unit test.
+/// `UNKNOWN` is the enum's own entry for a track whose codec is not one it names, which is
+/// what a demuxer that read the track but not a codec it knows reports.
+const CODEC_UNKNOWN: &str = "UNKNOWN";
+const CODEC_AAC: &str = "AAC";
+const CODEC_AVC: &str = "AVC";
+const CODEC_HEVC: &str = "HEVC";
+const CODEC_VP9: &str = "VP9";
+const CODEC_PCM: &str = "PCM";
+
+/// The `TrackType` values, as that enum spells them: MediaConvert reports a caption or
+/// subtitle track as a DATA track, the third of the three the enum carries.
+const TRACK_TYPE_VIDEO: &str = "video";
+const TRACK_TYPE_AUDIO: &str = "audio";
+const TRACK_TYPE_DATA: &str = "data";
+
+/// The channel layouts named in `AudioProperties$ChannelLayout` ("such as \"mono\",
+/// \"stereo\", \"5.1\", or \"7.1\""), each against the channel count that carries it. A
+/// count this table does not name is reported as a count with NO layout: the layout of a
+/// track whose channel assignment the container does not state is not derivable from the
+/// count alone.
+const CHANNEL_LAYOUTS: &[(i32, &str)] = &[(1, "mono"), (2, "stereo"), (6, "5.1"), (8, "7.1")];
+
+/// The media type of each container this service reports, from the IANA media type
+/// registry (`video/mp4`, `video/quicktime`, `video/3gpp`, `video/3gpp2`, `video/webm`,
+/// `audio/mpeg`, `audio/flac`, `audio/ogg`, `audio/aac`, `video/mp2t`, `video/mpeg`,
+/// `application/mxf`) and, for the containers IANA registers no type for, the type their
+/// vendors publish (`video/x-matroska`, `audio/wav`, `video/x-msvideo`,
+/// `video/x-ms-asf`, `audio/ac3`, `audio/eac3`).
+const MEDIA_TYPES: &[(&str, &str)] = &[
+    (FORMAT_MP4, "video/mp4"),
+    (FORMAT_QUICKTIME, "video/quicktime"),
+    (FORMAT_MATROSKA, "video/x-matroska"),
+    (FORMAT_WEBM, "video/webm"),
+    (FORMAT_MXF, "application/mxf"),
+    (FORMAT_WAVE, "audio/wav"),
+    (FORMAT_AVI, "video/x-msvideo"),
+    (FORMAT_MPEGTS, "video/mp2t"),
+    (FORMAT_MPEGPS, "video/mpeg"),
+    (FORMAT_MP3, "audio/mpeg"),
+    (FORMAT_FLAC, "audio/flac"),
+    (FORMAT_ASF, "video/x-ms-asf"),
+    (FORMAT_OGG, "audio/ogg"),
+    (FORMAT_THREE_GP, "video/3gpp"),
+    (FORMAT_THREE_G2, "video/3gpp2"),
+    (FORMAT_AAC, "audio/aac"),
+    (FORMAT_AC3, "audio/ac3"),
+    (FORMAT_EAC3, "audio/eac3"),
+];
+
+/// One media file as it was read: its bytes, and what the object store reports about them.
+#[derive(Debug)]
+struct ProbedObject {
+    /// The bytes as the store handed them over, not copied again: a caller-sized buffer is
+    /// held once.
+    bytes: ::bytes::Bytes,
+    /// The entity tag S3 reported, with the quoting the HTTP header carries taken off.
+    e_tag: Option<String>,
+    last_modified: Option<::aws_smithy_types::DateTime>,
+}
+
+/// Read the object at `bucket`/`key` of `region`, through this emulator's own Amazon S3 over
+/// the in-process hop.
+///
+/// The hop, the bound and the reading of the store's answer are all the shared ones
+/// ([`::service_common::s3_client`], [`::service_common::s3_object_read`]): the read is
+/// RANGED to [`MAX_PROBED_FILE_BYTES`], so a larger object is refused rather than buffered
+/// whole, and what the store's refusal ESTABLISHED is the one rule every emulated service
+/// reads an object by — the store itself saying it holds nothing there, the store saying the
+/// read is not permitted, or nothing having answered at all (no object store is mounted),
+/// which is never the caller's fault.
+///
+/// The read is made HERE rather than through the shared [`::service_common::s3_object_read::read_object`]
+/// because that one answers an object's BYTES alone, and `Metadata` reports the entity tag
+/// and the last modification instant of the very same answer.
+async fn read_object(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+    key: &str,
+    url: &str,
+) -> Result<ProbedObject, ProbeErrorModeled> {
+    // The Region the hop is addressed with is held to the Region-label grammar, as every
+    // shared read of an object holds it: nothing else of the request reaches the address.
+    let Some(region) = ::service_common::arn::region_label(region) else {
+        return Err(unread_file(url));
+    };
+    let answered = ::service_common::s3_client::s3_client(ctx.callback(), region)
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        // Ranged, so at most the ceiling plus the one byte that shows the object is past it
+        // is ever buffered.
+        .range(format!("bytes=0-{MAX_PROBED_FILE_BYTES}"))
+        .send()
+        .await;
+    let output = match answered {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(
+                match ::service_common::s3_object_read::answered_refusal(&error) {
+                    // The store answered that it holds nothing at that address: the file
+                    // the request named is not there, which is the modelled 404 naming the
+                    // member the URL arrived in.
+                    ::service_common::s3_object_read::ObjectRead::Absent => {
+                        ProbeErrorModeled::NotFoundException(NotFoundException {
+                            message: Some(crate::state::not_found_message("fileUrl")),
+                        })
+                    }
+                    // The store answered that the read is not permitted. The file may well
+                    // be there; what was established is that these credentials may not
+                    // fetch it, which is this service's own modelled 403.
+                    ::service_common::s3_object_read::ObjectRead::Denied => {
+                        ProbeErrorModeled::ForbiddenException(ForbiddenException {
+                            message: Some(unreadable_permission_message(url)),
+                        })
+                    }
+                    // Anything else establishes nothing about the file: the read itself did
+                    // not happen, which is a server-side failure rather than a statement
+                    // about the caller's media.
+                    _ => unread_file(url),
+                },
+            )
+        }
+    };
+    // The entity tag travels quoted in the `ETag` header; what the member reports is the
+    // tag itself.
+    let e_tag = output
+        .e_tag()
+        .map(|tag| tag.trim_matches('"').to_string())
+        .filter(|tag| !tag.is_empty());
+    let last_modified = output.last_modified().copied();
+    let bytes = match output.body.collect().await {
+        Ok(bytes) => bytes.into_bytes(),
+        Err(error) => {
+            ::tracing::warn!(
+                %url,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "a media file did not arrive in full for a probe"
+            );
+            return Err(unread_file(url));
+        }
+    };
+    // The range above is what bounds the read; this is the store having served more than it
+    // was asked for, which is an object larger than this operation probes.
+    if bytes.len() > MAX_PROBED_FILE_BYTES {
+        return Err(ProbeErrorModeled::BadRequestException(BadRequestException {
+            message: Some(file_too_large_message(url)),
+        }));
+    }
+    Ok(ProbedObject {
+        bytes,
+        e_tag,
+        last_modified,
+    })
+}
+
+/// How this operation reports a media file whose read did not happen at all, with a warning:
+/// a deployment where no media file can be read is worth noticing.
+fn unread_file(url: &str) -> ProbeErrorModeled {
+    ::tracing::warn!(%url, "a media file could not be read for a probe");
+    ProbeErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(unread_file_message(url)),
+    })
+}
+
+/// What `object` IS, as one `ProbeResult`.
+///
+/// A file whose bytes carry no container signature this service recognises is the modelled
+/// 422: the service read the file and could not make a container of it. Nothing about such
+/// a file is reported, because everything a result carries beyond the object's own size is
+/// a statement about a container.
+fn probe_result(url: &str, object: &ProbedObject) -> Result<ProbeResult, ProbeErrorModeled> {
+    let Some(format) = container_format(&object.bytes) else {
+        return Err(ProbeErrorModeled::UnprocessableEntityException(
+            UnprocessableEntityException {
+                message: Some(unrecognised_container_message(url)),
+            },
+        ));
+    };
+    let file_size = i64::try_from(object.bytes.len()).unwrap_or(i64::MAX);
+    // Which demuxer reads a container is the container's own business; one it has none for
+    // contributes no duration and no tracks.
+    let read = match format {
+        FORMAT_MP4 | FORMAT_QUICKTIME | FORMAT_THREE_GP | FORMAT_THREE_G2 => {
+            iso_bmff_tracks(&object.bytes)
+        }
+        FORMAT_WAVE => wave_tracks(&object.bytes),
+        _ => None,
+    };
+    let (duration, tracks) = match read {
+        Some((duration, tracks)) => (duration, tracks),
+        None => (None, Vec::new()),
+    };
+    // The mapping is the track list indexed by type, so it is reported exactly when the
+    // tracks themselves are.
+    let track_mappings = (!tracks.is_empty()).then(|| ::std::vec![track_mapping(&tracks)]);
+    let container = Container {
+        format: Some(format.to_string()),
+        duration,
+        // "This is derived from the file size and duration as (file size in bytes * 8) /
+        // duration in seconds."
+        bit_rate: duration.and_then(|seconds| overall_bit_rate(file_size, seconds)),
+        // "Note that this field is null when the container does not include an embedded
+        // start timecode": no demuxer here reads one, so none is ever reported.
+        start_timecode: None,
+        tracks: (!tracks.is_empty()).then_some(tracks),
+    };
+    Ok(ProbeResult {
+        container: Some(container),
+        metadata: Some(Metadata {
+            e_tag: object.e_tag.clone(),
+            file_size: Some(file_size),
+            last_modified: object.last_modified,
+            mime_type: media_type(format).map(str::to_string),
+        }),
+        track_mappings,
+    })
+}
+
+/// The container `bytes` ARE, read from the file's own signature, or `None` for bytes that
+/// carry none this service recognises.
+///
+/// Each test below is the format's published signature: the ISO base media `ftyp` box and
+/// its brand (ISO/IEC 14496-12, and the brands registered with MP4RA), the RIFF form, the
+/// EBML magic with the doc type Matroska states in its header, the `fLaC` and `OggS`
+/// stream markers, the ASF header-object GUID, the SMPTE KLV key an MXF file opens with,
+/// the MPEG transport-stream sync byte at the stride TS packets are written at, the MPEG
+/// program-stream pack header, the ADTS and MPEG-audio frame syncwords, and the AC-3
+/// syncword with the `bsid` that tells E-AC-3 from AC-3.
+fn container_format(bytes: &[u8]) -> Option<&'static str> {
+    let at = |range: ::std::ops::Range<usize>| bytes.get(range);
+    if at(4..8) == Some(b"ftyp") {
+        return Some(iso_bmff_format(at(8..12)?));
+    }
+    if at(0..4) == Some(b"RIFF") {
+        return match at(8..12) {
+            Some(b"WAVE") => Some(FORMAT_WAVE),
+            Some(b"AVI ") => Some(FORMAT_AVI),
+            _ => None,
+        };
+    }
+    if at(0..4) == Some(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        // The doc type sits in the EBML header the file opens with, so it is found within
+        // the first few dozen bytes or not at all.
+        let header = bytes.get(..EBML_HEADER_SCAN.min(bytes.len()))?;
+        return match header.windows(4).any(|window| window == b"webm") {
+            true => Some(FORMAT_WEBM),
+            false => Some(FORMAT_MATROSKA),
+        };
+    }
+    if at(0..4) == Some(b"fLaC") {
+        return Some(FORMAT_FLAC);
+    }
+    if at(0..4) == Some(b"OggS") {
+        return Some(FORMAT_OGG);
+    }
+    if at(0..4) == Some(&[0x30, 0x26, 0xb2, 0x75]) {
+        return Some(FORMAT_ASF);
+    }
+    if at(0..4) == Some(&[0x06, 0x0e, 0x2b, 0x34]) {
+        return Some(FORMAT_MXF);
+    }
+    if at(0..4) == Some(&[0x00, 0x00, 0x01, 0xba]) {
+        return Some(FORMAT_MPEGPS);
+    }
+    if bytes.first() == Some(&TS_SYNC_BYTE)
+        && bytes.get(TS_PACKET_SIZE) == Some(&TS_SYNC_BYTE)
+        && bytes.get(2 * TS_PACKET_SIZE) == Some(&TS_SYNC_BYTE)
+    {
+        return Some(FORMAT_MPEGTS);
+    }
+    if at(0..3) == Some(b"ID3") {
+        return Some(FORMAT_MP3);
+    }
+    if at(0..2) == Some(&[0x0b, 0x77]) {
+        // ATSC A/52: the 5-bit `bsid` field says which syntax the frame is in — up to 8
+        // is AC-3, and 16 is the E-AC-3 (Annex E) syntax.
+        let bsid = bytes.get(5).map(|byte| byte >> 3).unwrap_or(0);
+        return match bsid > AC3_MAX_BSID {
+            true => Some(FORMAT_EAC3),
+            false => Some(FORMAT_AC3),
+        };
+    }
+    let (Some(first), Some(second)) = (bytes.first(), bytes.get(1)) else {
+        return None;
+    };
+    if *first == 0xff {
+        // An ADTS frame's sync is 12 set bits followed by a zero layer field; an MPEG
+        // audio frame's is 11 set bits with a layer field that is not zero.
+        if second & 0xf6 == 0xf0 {
+            return Some(FORMAT_AAC);
+        }
+        if second & 0xe0 == 0xe0 {
+            return Some(FORMAT_MP3);
+        }
+    }
+    None
+}
+
+/// How far into the file the EBML doc type is looked for.
+const EBML_HEADER_SCAN: usize = 64;
+
+/// The byte every MPEG transport-stream packet starts with, and the stride it is written
+/// at (ISO/IEC 13818-1: a 188-byte packet opening with `0x47`).
+const TS_SYNC_BYTE: u8 = 0x47;
+const TS_PACKET_SIZE: usize = 188;
+
+/// The highest `bsid` the AC-3 syntax uses; a frame above it is in the E-AC-3 syntax.
+const AC3_MAX_BSID: u8 = 10;
+
+/// Which member of the ISO base media family a `ftyp` brand names.
+///
+/// The brands are MP4RA's: `qt  ` is QuickTime's own, the `3gp`/`3gg`/`3gs` families are
+/// 3GPP's and `3g2` is 3GPP2's. Every other brand in the family (`isom`, `iso2`, `mp41`,
+/// `mp42`, `avc1`, `M4V `, `M4A `, …) is an MP4 file.
+fn iso_bmff_format(brand: &[u8]) -> &'static str {
+    match brand {
+        b"qt  " => FORMAT_QUICKTIME,
+        _ if brand.starts_with(b"3g2") => FORMAT_THREE_G2,
+        _ if brand.starts_with(b"3gp") || brand.starts_with(b"3gg") || brand.starts_with(b"3gs") => {
+            FORMAT_THREE_GP
+        }
+        _ => FORMAT_MP4,
+    }
+}
+
+/// The media type of `format`, from [`MEDIA_TYPES`].
+fn media_type(format: &str) -> Option<&'static str> {
+    MEDIA_TYPES
+        .iter()
+        .find(|(name, _)| *name == format)
+        .map(|(_, media_type)| *media_type)
+}
+
+/// The overall bit rate of a file of `file_size` bytes running `seconds`, as
+/// `Container$BitRate` documents it: "(file size in bytes * 8) / duration in seconds".
+fn overall_bit_rate(file_size: i64, seconds: f64) -> Option<i64> {
+    (seconds > 0.0).then(|| (file_size as f64 * 8.0 / seconds).round() as i64)
+}
+
+/// A duration in seconds, or `None` when the container states no time at all — a file that
+/// runs for no time states no duration rather than one of zero.
+fn positive(seconds: f64) -> Option<f64> {
+    (seconds.is_finite() && seconds > 0.0).then_some(seconds)
+}
+
+/// The track indexes of a file, by track type, as `TrackMapping` reports them: the index
+/// of each track that is a video, an audio or a data track. A type the file carries no
+/// track of is left out rather than reported as an empty list.
+fn track_mapping(tracks: &[Track]) -> TrackMapping {
+    let indexes = |kind: &str| {
+        let indexes: Vec<i32> = tracks
+            .iter()
+            .filter(|track| track.track_type.as_deref() == Some(kind))
+            .filter_map(|track| track.index)
+            .collect();
+        (!indexes.is_empty()).then_some(indexes)
+    };
+    TrackMapping {
+        video_track_indexes: indexes(TRACK_TYPE_VIDEO),
+        audio_track_indexes: indexes(TRACK_TYPE_AUDIO),
+        data_track_indexes: indexes(TRACK_TYPE_DATA),
+    }
+}
+
+/// The layout [`CHANNEL_LAYOUTS`] names for `channels`, or `None` for a count it does not.
+fn channel_layout(channels: i32) -> Option<&'static str> {
+    CHANNEL_LAYOUTS
+        .iter()
+        .find(|(count, _)| *count == channels)
+        .map(|(_, layout)| *layout)
+}
+
+/// A frame rate as the fraction `numerator / denominator`, reduced to lowest terms — the
+/// exact form `FrameRate` asks for, which is what keeps a rate like 30000/1001 exact.
+fn frame_rate(numerator: u64, denominator: u64) -> Option<FrameRate> {
+    if numerator == 0 || denominator == 0 {
+        return None;
+    }
+    let divisor = greatest_common_divisor(numerator, denominator);
+    Some(FrameRate {
+        numerator: i32::try_from(numerator / divisor).ok(),
+        denominator: i32::try_from(denominator / divisor).ok(),
+    })
+}
+
+/// Euclid's algorithm, for reducing a frame rate to lowest terms.
+fn greatest_common_divisor(a: u64, b: u64) -> u64 {
+    match b {
+        0 => a.max(1),
+        _ => greatest_common_divisor(b, a % b),
+    }
+}
+
+/// The three-character language code a container states for a track, or `None` when it
+/// states none. `LanguageCode` is "in three character ISO 639-3 format", which is what a
+/// container's own language field carries.
+fn language_code(language: &str) -> Option<String> {
+    (language.len() == 3).then(|| language.to_string())
+}
+
+/// What the ISO base media demuxer reads from `bytes`: the movie's duration in seconds and
+/// its tracks, in track-id order. `None` when the bytes are not a file it can read.
+///
+/// The caller's bytes are parsed inside a panic barrier, as the one other place in this
+/// workspace that reads a caller's container does: a demuxer that trips an assertion on a
+/// file nobody wrote by the book must leave this operation answering "not a container
+/// this service can read" rather than taking the request down with it.
+fn iso_bmff_tracks(bytes: &[u8]) -> Option<(Option<f64>, Vec<Track>)> {
+    let size = u64::try_from(bytes.len()).ok()?;
+    ::std::panic::catch_unwind(|| {
+        let media = ::mp4::Mp4Reader::read_header(::std::io::Cursor::new(bytes), size).ok()?;
+        let mut ids: Vec<u32> = media.tracks().keys().copied().collect();
+        ids.sort_unstable();
+        let tracks = ids
+            .iter()
+            .enumerate()
+            .filter_map(|(position, id)| {
+                let track = media.tracks().get(id)?;
+                Some(iso_bmff_track(track, position + 1))
+            })
+            .collect();
+        Some((positive(media.duration().as_secs_f64()), tracks))
+    })
+    .ok()
+    .flatten()
+}
+
+/// One ISO base media track as `Track` reports it, at the 1-based `index`
+/// (`Track$Index`: "The unique index number of the track, starting at 1").
+fn iso_bmff_track(track: &::mp4::Mp4Track, index: usize) -> Track {
+    let kind = track.track_type().ok();
+    let seconds = positive(track.duration().as_secs_f64());
+    let language = language_code(track.language());
+    let (video_properties, audio_properties, data_properties) = match kind {
+        Some(::mp4::TrackType::Video) => (Some(iso_bmff_video(track)), None, None),
+        Some(::mp4::TrackType::Audio) => (None, Some(iso_bmff_audio(track, language)), None),
+        // A caption or subtitle track is a DATA track, and what the container states about
+        // it is its language.
+        Some(::mp4::TrackType::Subtitle) => (
+            None,
+            None,
+            Some(DataProperties {
+                language_code: language,
+            }),
+        ),
+        None => (None, None, None),
+    };
+    Track {
+        index: i32::try_from(index).ok(),
+        track_type: kind.map(iso_bmff_track_type).map(str::to_string),
+        codec: Some(iso_bmff_codec(track).to_string()),
+        duration: seconds,
+        video_properties,
+        audio_properties,
+        data_properties,
+    }
+}
+
+/// The `TrackType` value an ISO base media handler type is reported as.
+fn iso_bmff_track_type(kind: ::mp4::TrackType) -> &'static str {
+    match kind {
+        ::mp4::TrackType::Video => TRACK_TYPE_VIDEO,
+        ::mp4::TrackType::Audio => TRACK_TYPE_AUDIO,
+        ::mp4::TrackType::Subtitle => TRACK_TYPE_DATA,
+    }
+}
+
+/// The `Codec` value a track's sample entry names, or `UNKNOWN` for a sample entry this
+/// demuxer reads no codec from.
+fn iso_bmff_codec(track: &::mp4::Mp4Track) -> &'static str {
+    match track.media_type() {
+        Ok(::mp4::MediaType::H264) => CODEC_AVC,
+        Ok(::mp4::MediaType::H265) => CODEC_HEVC,
+        Ok(::mp4::MediaType::VP9) => CODEC_VP9,
+        Ok(::mp4::MediaType::AAC) => CODEC_AAC,
+        _ => CODEC_UNKNOWN,
+    }
+}
+
+/// What the container states about a video track: its geometry, the rate its samples run
+/// at, and the rate the track was written at. A value the track does not state is left
+/// absent — a width of no pixels or a rate of no frames is not a measurement.
+fn iso_bmff_video(track: &::mp4::Mp4Track) -> VideoProperties {
+    VideoProperties {
+        width: positive_count(i32::from(track.width())),
+        height: positive_count(i32::from(track.height())),
+        frame_rate: iso_bmff_frame_rate(track),
+        bit_rate: positive_rate(i64::from(track.bitrate())),
+        // Everything below is read from the CODEC's own essence headers rather than from
+        // the container, which this emulator does not decode: absent, as every field it
+        // cannot read is.
+        bit_depth: None,
+        codec_metadata: None,
+        color_primaries: None,
+        display_aspect_ratio: None,
+        hdr_metadata: None,
+        matrix_coefficients: None,
+        rotation: None,
+        sample_aspect_ratio: None,
+        transfer_characteristics: None,
+    }
+}
+
+/// The exact frame rate of a track: its sample count over its duration, both in the
+/// track's own timescale, so a rate like 30000/1001 comes out exact rather than rounded.
+fn iso_bmff_frame_rate(track: &::mp4::Mp4Track) -> Option<FrameRate> {
+    let timescale = u64::from(track.timescale());
+    let units = (track.duration().as_secs_f64() * timescale as f64).round();
+    if units <= 0.0 {
+        return None;
+    }
+    frame_rate(
+        u64::from(track.sample_count()).checked_mul(timescale)?,
+        units as u64,
+    )
+}
+
+/// What the container states about an audio track.
+fn iso_bmff_audio(track: &::mp4::Mp4Track, language: Option<String>) -> AudioProperties {
+    let channels = track.channel_config().ok().map(iso_bmff_channels);
+    AudioProperties {
+        sample_rate: track
+            .sample_freq_index()
+            .ok()
+            .and_then(|index| i32::try_from(index.freq()).ok())
+            .and_then(positive_count),
+        channels,
+        channel_layout: channels
+            .and_then(channel_layout)
+            .map(str::to_string),
+        bit_rate: positive_rate(i64::from(track.bitrate())),
+        language_code: language,
+        // The nominal bit depth of a lossy codec and the object count of an immersive one
+        // are read from the codec's own headers, which this emulator does not decode.
+        bit_depth: None,
+        frame_rate: None,
+        object_count: None,
+    }
+}
+
+/// How many channels a channel configuration carries.
+fn iso_bmff_channels(config: ::mp4::ChannelConfig) -> i32 {
+    match config {
+        ::mp4::ChannelConfig::Mono => 1,
+        ::mp4::ChannelConfig::Stereo => 2,
+        ::mp4::ChannelConfig::Three => 3,
+        ::mp4::ChannelConfig::Four => 4,
+        ::mp4::ChannelConfig::Five => 5,
+        ::mp4::ChannelConfig::FiveOne => 6,
+        ::mp4::ChannelConfig::SevenOne => 8,
+    }
+}
+
+/// What the RIFF/WAVE reader reads from `bytes`: the duration of the stream and the one
+/// audio track a Wave file carries. `None` when the bytes are not a file it can read.
+///
+/// Behind the same panic barrier, for the same reason, as [`iso_bmff_tracks`].
+fn wave_tracks(bytes: &[u8]) -> Option<(Option<f64>, Vec<Track>)> {
+    ::std::panic::catch_unwind(|| {
+        let reader = ::hound::WavReader::new(::std::io::Cursor::new(bytes)).ok()?;
+        let format = reader.spec();
+        let sample_rate = u64::from(format.sample_rate);
+        if sample_rate == 0 {
+            return None;
+        }
+        let channels = i32::from(format.channels);
+        let bit_depth = i32::from(format.bits_per_sample);
+        let seconds = positive(u64::from(reader.duration()) as f64 / sample_rate as f64);
+        let track = Track {
+            index: Some(1),
+            track_type: Some(TRACK_TYPE_AUDIO.to_string()),
+            codec: Some(CODEC_PCM.to_string()),
+            duration: seconds,
+            audio_properties: Some(AudioProperties {
+                sample_rate: i32::try_from(format.sample_rate).ok(),
+                channels: Some(channels),
+                channel_layout: channel_layout(channels).map(str::to_string),
+                // Linear PCM carries no frame headers: every sample of every channel is
+                // written at the stated depth, so the rate is exactly that product —
+                // which is why `BitDepth` "is exact for PCM".
+                bit_rate: positive_rate(
+                    sample_rate as i64 * i64::from(channels) * i64::from(bit_depth),
+                ),
+                bit_depth: positive_count(bit_depth),
+                language_code: None,
+                frame_rate: None,
+                object_count: None,
+            }),
+            video_properties: None,
+            data_properties: None,
+        };
+        Some((seconds, ::std::vec![track]))
+    })
+    .ok()
+    .flatten()
+}
+
+/// A count a container states, or `None` when it states none: a geometry, a rate or a
+/// depth of zero is the field's absence, not a measurement of zero.
+fn positive_count(value: i32) -> Option<i32> {
+    (value > 0).then_some(value)
+}
+
+/// [`positive_count`] for the 64-bit rates.
+fn positive_rate(value: i64) -> Option<i64> {
+    (value > 0).then_some(value)
+}
+
+/// How this operation refuses a `FileUrl` that addresses no media file this emulator can
+/// read: it names the URL as sent and says what can be read instead.
+///
+/// The second sentence is this emulator's own limit, worded the way the service's other
+/// missing-engine sentence is (`crate::state`'s, for a job whose transcode never ran): no
+/// outbound connection is ever made, so a file that is not in this emulator's own object
+/// storage is one nothing can be reported about.
+fn unreadable_location_message(url: &str) -> String {
+    format!(
+        "Unable to open input file [{url}]. This emulator reads media files from Amazon S3 \
+         only, so specify an s3:// URI or an S3 URL for your media file."
+    )
+}
+
+/// How this operation reports a media file the object store answered it will not serve
+/// these credentials: the file may well be there, and what was established is that it
+/// cannot be fetched — which is what `ForbiddenException` is modelled for ("You don't have
+/// permissions for this action with the credentials you sent").
+fn unreadable_permission_message(url: &str) -> String {
+    format!("Unable to open input file [{url}]. The read of that location was denied.")
+}
+
+/// How this operation reports a media file it could not read, where the object store did
+/// not say the file is absent: the read itself failed, which is the service's own failure
+/// rather than a statement about the file.
+fn unread_file_message(url: &str) -> String {
+    format!("Unable to open input file [{url}]. The service could not read that location.")
+}
+
+/// How this operation reports a file whose bytes are not a container it can read, which is
+/// what `UnprocessableEntityException` is modelled for: "The input file was recognized but
+/// appears to be malformed or corrupt."
+fn unrecognised_container_message(url: &str) -> String {
+    format!(
+        "Unable to probe input file [{url}]. The file is not in a container format that \
+         this service recognizes."
+    )
+}
+
+/// How this operation refuses a request naming more files than [`MAX_PROBED_FILES`]: it
+/// names the ceiling and the count the request carried.
+fn too_many_files_message(count: usize) -> String {
+    format!("inputFiles must name at most {MAX_PROBED_FILES} media files, got {count}.")
+}
+
+/// How this operation refuses a media file larger than [`MAX_PROBED_FILE_BYTES`]: it names
+/// the file and the ceiling.
+fn file_too_large_message(url: &str) -> String {
+    format!(
+        "Unable to open input file [{url}]. This emulator probes media files of up to \
+         {MAX_PROBED_FILE_BYTES} bytes."
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `Format` this operation can report is a value the model's own enum carries:
+    /// the catalogue above is held against the generated one, so a reported format cannot
+    /// drift from the model.
+    #[test]
+    fn every_format_is_modelled() {
+        for (format, media_type) in MEDIA_TYPES {
+            assert!(
+                FORMAT_VALUES.contains(format),
+                "case {format:?}: not a modelled Format value, which are {FORMAT_VALUES:?}"
+            );
+            assert!(
+                media_type.contains('/'),
+                "case {format:?}: expected a media type, got {media_type:?}"
+            );
+        }
+        assert_eq!(
+            MEDIA_TYPES.len(),
+            FORMAT_VALUES.len(),
+            "every modelled Format needs a media type, got {} for {}",
+            MEDIA_TYPES.len(),
+            FORMAT_VALUES.len()
+        );
+    }
+
+    /// The same for every `Codec` and `TrackType` value this operation reports.
+    #[test]
+    fn every_codec_is_modelled() {
+        for codec in [
+            CODEC_UNKNOWN,
+            CODEC_AAC,
+            CODEC_AVC,
+            CODEC_HEVC,
+            CODEC_VP9,
+            CODEC_PCM,
+        ] {
+            assert!(
+                CODEC_VALUES.contains(&codec),
+                "case {codec:?}: not a modelled Codec value, which are {CODEC_VALUES:?}"
+            );
+        }
+        for kind in [TRACK_TYPE_VIDEO, TRACK_TYPE_AUDIO, TRACK_TYPE_DATA] {
+            assert!(
+                TRACK_TYPE_VALUES.contains(&kind),
+                "case {kind:?}: not a modelled TrackType value, which are \
+                 {TRACK_TYPE_VALUES:?}"
+            );
+        }
+    }
+
+    /// The signature catalogue, on one sample per container it names.
+    ///
+    /// Each sample is the published signature of that container — the bytes a file of it
+    /// opens with — so this table is what holds [`container_format`] to the formats the
+    /// model carries rather than to the two containers this service also demuxes.
+    #[test]
+    fn a_container_is_recognised_by_its_own_signature() {
+        /// One row: what the file opens with, and the container that is.
+        struct Case {
+            case: &'static str,
+            bytes: Vec<u8>,
+            expected: Option<&'static str>,
+        }
+        /// An ISO base media file box of `brand`, as a `ftyp` box is laid out: the box
+        /// length, the box type, then the major brand.
+        fn ftyp(brand: &[u8; 4]) -> Vec<u8> {
+            let mut bytes = vec![0x00, 0x00, 0x00, 0x18];
+            bytes.extend_from_slice(b"ftyp");
+            bytes.extend_from_slice(brand);
+            bytes
+        }
+        /// A RIFF file of `form`: the magic, the length field, then the form type.
+        fn riff(form: &[u8; 4]) -> Vec<u8> {
+            let mut bytes = b"RIFF".to_vec();
+            bytes.extend_from_slice(&[0x24, 0x00, 0x00, 0x00]);
+            bytes.extend_from_slice(form);
+            bytes
+        }
+        /// An EBML header declaring `doc_type`, which is where Matroska and WebM differ.
+        fn ebml(doc_type: &[u8]) -> Vec<u8> {
+            let mut bytes = vec![0x1a, 0x45, 0xdf, 0xa3, 0x42, 0x82, 0x88];
+            bytes.extend_from_slice(doc_type);
+            bytes
+        }
+        /// An AC-3 or E-AC-3 sync frame whose `bsid` field says which syntax it is in.
+        fn ac3_frame(bsid: u8) -> Vec<u8> {
+            vec![0x0b, 0x77, 0x00, 0x00, 0x00, bsid << 3, 0x00, 0x00]
+        }
+        /// A transport stream: the sync byte at the head of each 188-byte packet.
+        fn transport_stream() -> Vec<u8> {
+            let mut bytes = vec![0x00; 2 * TS_PACKET_SIZE + 1];
+            for packet in 0..3 {
+                bytes[packet * TS_PACKET_SIZE] = TS_SYNC_BYTE;
+            }
+            bytes
+        }
+        let cases = vec![
+            Case {
+                case: "an ISO base media file under the base brand",
+                bytes: ftyp(b"isom"),
+                expected: Some(FORMAT_MP4),
+            },
+            Case {
+                case: "one under an MP4 version brand",
+                bytes: ftyp(b"mp42"),
+                expected: Some(FORMAT_MP4),
+            },
+            Case {
+                case: "QuickTime's own brand",
+                bytes: ftyp(b"qt  "),
+                expected: Some(FORMAT_QUICKTIME),
+            },
+            Case {
+                case: "a 3GPP brand",
+                bytes: ftyp(b"3gp5"),
+                expected: Some(FORMAT_THREE_GP),
+            },
+            Case {
+                case: "another of the 3GPP families",
+                bytes: ftyp(b"3gs7"),
+                expected: Some(FORMAT_THREE_GP),
+            },
+            Case {
+                case: "a 3GPP2 brand",
+                bytes: ftyp(b"3g2a"),
+                expected: Some(FORMAT_THREE_G2),
+            },
+            Case {
+                case: "a RIFF file of the WAVE form",
+                bytes: riff(b"WAVE"),
+                expected: Some(FORMAT_WAVE),
+            },
+            Case {
+                case: "a RIFF file of the AVI form",
+                bytes: riff(b"AVI "),
+                expected: Some(FORMAT_AVI),
+            },
+            Case {
+                case: "an EBML file declaring Matroska",
+                bytes: ebml(b"matroska"),
+                expected: Some(FORMAT_MATROSKA),
+            },
+            Case {
+                case: "an EBML file declaring WebM",
+                bytes: ebml(b"webm"),
+                expected: Some(FORMAT_WEBM),
+            },
+            Case {
+                case: "a FLAC stream marker",
+                bytes: b"fLaC\x00\x00\x00\x22".to_vec(),
+                expected: Some(FORMAT_FLAC),
+            },
+            Case {
+                case: "an Ogg page",
+                bytes: b"OggS\x00\x02\x00\x00".to_vec(),
+                expected: Some(FORMAT_OGG),
+            },
+            Case {
+                case: "the ASF header object GUID",
+                bytes: vec![0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11],
+                expected: Some(FORMAT_ASF),
+            },
+            Case {
+                case: "the SMPTE KLV key an MXF file opens with",
+                bytes: vec![0x06, 0x0e, 0x2b, 0x34, 0x02, 0x05, 0x01, 0x01],
+                expected: Some(FORMAT_MXF),
+            },
+            Case {
+                case: "an MPEG program stream pack header",
+                bytes: vec![0x00, 0x00, 0x01, 0xba, 0x44, 0x00, 0x04, 0x00],
+                expected: Some(FORMAT_MPEGPS),
+            },
+            Case {
+                case: "an MPEG transport stream",
+                bytes: transport_stream(),
+                expected: Some(FORMAT_MPEGTS),
+            },
+            Case {
+                case: "an MP3 file with an ID3 tag",
+                bytes: b"ID3\x04\x00\x00\x00\x00".to_vec(),
+                expected: Some(FORMAT_MP3),
+            },
+            Case {
+                case: "a bare MPEG audio frame",
+                bytes: vec![0xff, 0xfb, 0x90, 0x44, 0x00, 0x00, 0x00, 0x00],
+                expected: Some(FORMAT_MP3),
+            },
+            Case {
+                case: "an ADTS AAC frame",
+                bytes: vec![0xff, 0xf1, 0x4c, 0x80, 0x00, 0x00, 0x00, 0x00],
+                expected: Some(FORMAT_AAC),
+            },
+            Case {
+                case: "an AC-3 frame",
+                bytes: ac3_frame(8),
+                expected: Some(FORMAT_AC3),
+            },
+            Case {
+                case: "an E-AC-3 frame, which the same syncword opens",
+                bytes: ac3_frame(16),
+                expected: Some(FORMAT_EAC3),
+            },
+            Case {
+                case: "a file that is not media at all",
+                bytes: b"this is just some text".to_vec(),
+                expected: None,
+            },
+            Case {
+                case: "a RIFF file of a form that is no media container",
+                bytes: riff(b"JUNK"),
+                expected: None,
+            },
+            Case {
+                case: "no bytes at all",
+                bytes: Vec::new(),
+                expected: None,
+            },
+        ];
+        for case in &cases {
+            let actual = container_format(&case.bytes);
+            assert_eq!(
+                actual, case.expected,
+                "case {:?}: expected {:?}, got {actual:?}",
+                case.case, case.expected
+            );
+        }
+        // Every container the model names is recognised by one of the rows above, so the
+        // catalogue is tested whole rather than on the containers this service demuxes.
+        for format in FORMAT_VALUES {
+            assert!(
+                cases
+                    .iter()
+                    .any(|case| case.expected == Some(*format)),
+                "case {format:?}: the signature catalogue needs a sample for every \
+                 modelled Format"
+            );
+        }
+    }
+
+    /// A frame rate comes out exact, reduced to lowest terms.
+    #[test]
+    fn a_frame_rate_is_an_exact_reduced_fraction() {
+        /// One row: the fraction as the demuxer measured it, and the reduced rate.
+        struct Case {
+            numerator: u64,
+            denominator: u64,
+            expected: Option<(i32, i32)>,
+        }
+        let cases = &[
+            Case {
+                numerator: 25_000,
+                denominator: 1_000,
+                expected: Some((25, 1)),
+            },
+            Case {
+                numerator: 900_000,
+                denominator: 30_030,
+                expected: Some((30_000, 1_001)),
+            },
+            Case {
+                numerator: 60_000,
+                denominator: 1_000,
+                expected: Some((60, 1)),
+            },
+            Case {
+                numerator: 0,
+                denominator: 1_000,
+                expected: None,
+            },
+            Case {
+                numerator: 1_000,
+                denominator: 0,
+                expected: None,
+            },
+        ];
+        for case in cases {
+            let actual = frame_rate(case.numerator, case.denominator)
+                .and_then(|rate| Some((rate.numerator?, rate.denominator?)));
+            assert_eq!(
+                actual, case.expected,
+                "case {}/{}: expected {:?}, got {actual:?}",
+                case.numerator, case.denominator, case.expected
+            );
+        }
     }
 }

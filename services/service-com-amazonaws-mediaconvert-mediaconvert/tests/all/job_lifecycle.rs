@@ -159,6 +159,42 @@ impl Emulator {
         (status, decoded)
     }
 
+    /// One request to a service mounted BESIDE this one whose protocol is NOT an RPC over
+    /// `POST /` — S3's REST, where the bucket and the key are the request's path — the way
+    /// a client makes it: `method uri` with a credential scoped to `signing_name`, which
+    /// is what the router picks the service from. The reply comes back whole (status,
+    /// headers and body), because what such a service reports about a resource — an entity
+    /// tag, say — travels in its headers.
+    pub(crate) async fn rest(
+        &self,
+        signing_name: &str,
+        method: &str,
+        uri: &str,
+        body: Vec<u8>,
+    ) -> (u16, ::http::HeaderMap, Vec<u8>) {
+        let credential = format!(
+            "AKIDTESTTESTTESTTEST/20260101/{REGION}/{signing_name}/aws4_request, \
+             SignedHeaders=host;x-amz-date, Signature=deadbeef"
+        );
+        let request = ::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", format!("{signing_name}.{REGION}.amazonaws.com"))
+            .header("content-type", "application/octet-stream")
+            .header(
+                "authorization",
+                format!("AWS4-HMAC-SHA256 Credential={credential}"),
+            )
+            .body(::bytes::Bytes::from(body))
+            .expect("build the request");
+        let response = self.router.dispatch(request).await;
+        (
+            response.status().as_u16(),
+            response.headers().clone(),
+            response.body().to_vec(),
+        )
+    }
+
     /// An emulator whose jobs are due to leave `SUBMITTED` after `span`.
     pub(crate) fn with_settle_span(span: Duration) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
