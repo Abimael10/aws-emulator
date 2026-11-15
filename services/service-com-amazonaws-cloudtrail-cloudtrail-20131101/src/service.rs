@@ -704,9 +704,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //   which no other request shape carries at its root — `EventCategory` and the
         //   `LookupAttributes` list — is that modelled error
         //   (`InvalidEventCategoryException` / `InvalidLookupAttributesException`). Both
-        //   the code and the message are replaced, because a client branches on the code;
-        //   the message is built from the request (the value it sent and the rule it
-        //   broke);
+        //   the code and the message are replaced: a client branches on the code, and the
+        //   message is the FIXED sentence CloudTrail words that error class with, which
+        //   carries no part of the request ([`lookup_events_refusal`]);
         // * a violated `@pattern`, a value outside a modelled `@range` bound, and a value
         //   outside an enumerated type's value set are a `ValidationException` whose
         //   clause names the member and the requirement WITHOUT the value that broke it
@@ -733,20 +733,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if let Some(refused) = invalid_event_selectors(violations) {
             return Some(refused);
         }
-        let modelled = violations.iter().find_map(|violation| {
-            if violation.path == EVENT_CATEGORY_PATH {
-                Some((INVALID_EVENT_CATEGORY_CODE, violation))
-            } else if is_under(&violation.path, LOOKUP_ATTRIBUTES_PATH) {
-                Some((INVALID_LOOKUP_ATTRIBUTES_CODE, violation))
-            } else {
-                None
-            }
-        });
-        if let Some((code, violation)) = modelled {
-            return Some(Refused {
-                code: code.to_string(),
-                message: refusal_message(violation),
-            });
+        if let Some(refused) = lookup_events_refusal(violations) {
+            return Some(refused);
         }
         Some(Refused {
             code: VALIDATION_EXCEPTION.to_string(),
@@ -795,32 +783,46 @@ fn is_under(path: &str, member: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('.'))
 }
 
-/// How this service states a refusal it words itself: the value the request sent, the
-/// member it sent it at, and the rule that value broke — enough for a caller to fix the
-/// request from the message alone.
-fn refusal_message(violation: &Violation) -> String {
-    let sent = violation.value.clone().unwrap_or_default();
-    let requirement = match &violation.kind {
-        ViolationKind::MissingRequiredMember => "the member is required".to_string(),
-        ViolationKind::EnumValue(allowed) => {
-            format!("the supported values are [{}]", allowed.join(", "))
+/// The member a lookup attribute's KEY sits at, as the validating walk spells a member
+/// path (lowerCamel): the last step of `lookupAttributes.<1-based index>.member.<member>`.
+const ATTRIBUTE_KEY_MEMBER: &str = "attributeKey";
+
+/// How this service answers a `LookupEvents` refusal the model declares an error OF ITS
+/// OWN for: that error's code, and the fixed sentence CloudTrail words that error class
+/// with.
+///
+/// Each of those sentences is FIXED text. It carries no part of the request — not the
+/// value that was rejected, not the member path the validating walk spells, not the value
+/// set the model declares — so every refusal of one class reads the same, which is what
+/// lets a client match it. The sentences themselves live with the operation that words
+/// them (`crate::ops::lookup_events`), so this seam cannot drift from the handler: a
+/// value the boundary rejects (one outside a modelled enum, refused before any handler
+/// runs) and one only the handler can judge (an attribute value outside the domain of its
+/// key) are answered alike.
+///
+/// Which of the two lookup-attribute sentences is the class the violation falls in: an
+/// attribute is read BY its key, so a key the service cannot read — absent, or outside
+/// the keys lookup supports — is the absent-key sentence, and anything else about the
+/// attribute is the attribute-not-valid one.
+fn lookup_events_refusal(violations: &[Violation]) -> Option<Refused> {
+    violations.iter().find_map(|violation| {
+        if violation.path == EVENT_CATEGORY_PATH {
+            return Some(Refused {
+                code: INVALID_EVENT_CATEGORY_CODE.to_string(),
+                message: crate::ops::lookup_events::INVALID_EVENT_CATEGORY_MESSAGE.to_string(),
+            });
         }
-        ViolationKind::MinLength(min) => {
-            format!("the value must be at least {min} characters long")
+        if !is_under(&violation.path, LOOKUP_ATTRIBUTES_PATH) {
+            return None;
         }
-        ViolationKind::MaxLength(max) => format!("the value must be at most {max} characters long"),
-        ViolationKind::MinValue(min) => format!("the value must be {min} or more"),
-        ViolationKind::MaxValue(max) => format!("the value must be {max} or less"),
-        ViolationKind::Pattern(pattern) => {
-            format!("the value must match the pattern {pattern}")
-        }
-        ViolationKind::UniqueItems => "the values must be unique".to_string(),
-        // `ViolationKind` is `#[non_exhaustive]`: a constraint the framework adds later
-        // is still stated, just without its own sentence.
-        _ => "the value is not valid".to_string(),
-    };
-    format!(
-        "Value '{sent}' at '{}' is not valid: {requirement}",
-        violation.path
-    )
+        let message = if violation.path.rsplit('.').next() == Some(ATTRIBUTE_KEY_MEMBER) {
+            crate::ops::lookup_events::ABSENT_LOOKUP_ATTRIBUTE_KEY_MESSAGE
+        } else {
+            crate::ops::lookup_events::INVALID_LOOKUP_ATTRIBUTE_MESSAGE
+        };
+        Some(Refused {
+            code: INVALID_LOOKUP_ATTRIBUTES_CODE.to_string(),
+            message: message.to_string(),
+        })
+    })
 }

@@ -21,8 +21,10 @@
 //!   for 90 days"), so a `StartTime` further in the past is refused with
 //!   `InvalidParameterException` rather than answered with a shortened series;
 //! * `LookupEvents`' refusals carry CloudTrail's own fixed sentences — an inverted
-//!   window and a marker the service cannot read each have ONE wording, with no part
-//!   of the request interpolated into it;
+//!   window, a marker the service cannot read, an event category outside the categories
+//!   a lookup selects on, a lookup attribute whose key the service cannot read and a
+//!   lookup attribute value outside the domain of its key each have ONE wording, with no
+//!   part of the request interpolated into it;
 //! * `PutEventConfiguration` judges the request's own parameters BEFORE it resolves the
 //!   resource they are for, so a call that states no configuration is refused on the
 //!   parameters whatever the registry holds.
@@ -34,7 +36,8 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_cloudtrail_cloudtrail_20131101::ops::types::{
-    EVENT_CATEGORY_AGGREGATION_VALUES, TEMPLATE_VALUES, TYPE_VALUES,
+    EVENT_CATEGORY_AGGREGATION_VALUES, EVENT_CATEGORY_VALUES, LOOKUP_ATTRIBUTE_KEY_VALUES,
+    TEMPLATE_VALUES, TYPE_VALUES,
 };
 use service_com_amazonaws_cloudtrail_cloudtrail_20131101::state::{
     event_data_store_arn, invalid_s3_bucket_name_message, s3_bucket_does_not_exist_message,
@@ -73,6 +76,56 @@ const INVERTED_WINDOW: &str = "The start time precedes the end time.";
 /// The refusal text for a `NextToken` CloudTrail cannot read: its fixed sentence for
 /// `InvalidNextTokenException`, which names no part of the request.
 const UNREADABLE_MARKER: &str = "Can't decrypt marker";
+
+/// The refusal text for an `EventCategory` outside the categories a lookup selects on:
+/// CloudTrail's fixed sentence for `InvalidEventCategoryException`, which quotes neither
+/// the category that was sent nor the ones it serves.
+const INVALID_EVENT_CATEGORY: &str = "Invalid event category specified.";
+
+/// The refusal text for a lookup attribute whose KEY CloudTrail cannot read — one outside
+/// the keys lookup supports is no key at all: its fixed sentence for that
+/// `InvalidLookupAttributesException` class.
+const UNREADABLE_ATTRIBUTE_KEY: &str = "Lookup attribute key cannot be null or empty.";
+
+/// The refusal text for a lookup attribute that is otherwise not valid — a readable key
+/// whose value is outside the domain that key filters on: CloudTrail's other fixed
+/// sentence for `InvalidLookupAttributesException`.
+const INVALID_ATTRIBUTE: &str = "Lookup attribute key is invalid.";
+
+/// The spellings a refusal of this class must NOT carry: the member paths the validating
+/// walk spells, which are an internal detail of how the request was read.
+const MEMBER_PATHS: [&str; 4] = [
+    "eventCategory",
+    "lookupAttributes",
+    "attributeKey",
+    "attributeValue",
+];
+
+/// Assert `message` is fixed text: exactly `expected`, carrying neither a member path nor
+/// any of the `sent` values the request was refused for.
+///
+/// A `sent` value shorter than two characters is skipped — a one-character value can sit
+/// inside the sentence's own words by coincidence, which says nothing about whether the
+/// sentence was built from the request.
+fn assert_fixed_sentence(case: &str, message: &str, expected: &str, sent: &[&str]) {
+    assert_eq!(
+        message, expected,
+        "case {case:?}: expected CloudTrail's fixed sentence {expected:?}, got {message:?}"
+    );
+    for path in MEMBER_PATHS {
+        assert!(
+            !message.contains(path),
+            "case {case:?}: a refusal must not name the member path {path:?}, got {message:?}"
+        );
+    }
+    for value in sent {
+        assert!(
+            value.len() < 2 || !message.contains(value),
+            "case {case:?}: a refusal must not echo the rejected value {value:?}, got \
+             {message:?}"
+        );
+    }
+}
 
 /// The id of the event data store the configuration cases address.
 const STORE_ID: &str = "55555555-5555-4555-8555-555555555555";
@@ -754,4 +807,147 @@ async fn an_event_configuration_call_is_judged_on_its_parameters_before_its_targ
         REFUSED_STATUS,
         "TrailNotFoundException",
     );
+}
+
+/// An `EventCategory` outside the categories a lookup selects on is refused with ONE
+/// fixed sentence, whatever the rejected value is: the wording carries neither the value
+/// nor the categories the service serves.
+#[tokio::test]
+async fn an_event_category_outside_the_catalogue_carries_one_fixed_sentence() {
+    let emulator = Emulator::new();
+
+    // Rows spanning the forms a value outside the catalogue takes: another category's
+    // own name, a served value in another case, a value of a neighbouring enum, the
+    // empty string, a long value and a value carrying punctuation and a space.
+    let rows: [(&str, &str); 7] = [
+        ("another category's name", "management"),
+        ("a served value capitalised", "Insight"),
+        ("a served value upper-cased", "INSIGHT"),
+        ("a neighbouring enum's value", EVENT_CATEGORY_AGGREGATION_VALUES[0]),
+        ("the empty category", ""),
+        ("a long category", "insights-events-for-this-account-and-region"),
+        ("a category with punctuation", "insight, data"),
+    ];
+
+    for (case, category) in rows {
+        let reply = emulator
+            .call("LookupEvents", &json!({ "EventCategory": category }))
+            .await;
+        reply.expect_error(case, REFUSED_STATUS, "InvalidEventCategoryException");
+        assert_fixed_sentence(case, reply.message(), INVALID_EVENT_CATEGORY, &[category]);
+    }
+
+    // The other half of the rule: every category the model declares is served rather
+    // than refused, so the rows above are about the values outside the catalogue. The
+    // catalogue is the generated value list of the model's own `EventCategory` enum, so
+    // a value a later revision adds is served by this control too.
+    for category in EVENT_CATEGORY_VALUES {
+        let reply = emulator
+            .call("LookupEvents", &json!({ "EventCategory": category }))
+            .await;
+        reply.expect_ok(&format!("the {category} category"));
+    }
+}
+
+/// A lookup attribute CloudTrail cannot act on is refused with one of its two fixed
+/// sentences — the absent-key one for a key the service cannot read, the
+/// attribute-not-valid one for a value outside the domain of its key — and neither
+/// carries the rejected value or the member it sat at.
+#[tokio::test]
+async fn an_unusable_lookup_attribute_carries_one_of_two_fixed_sentences() {
+    let emulator = Emulator::new();
+
+    // (case, the attribute list the request carries, the value it is refused for, the
+    // sentence that refusal carries). The key rows span the forms an unreadable key
+    // takes — an unknown name, a name differing from a supported one only in case, the
+    // empty key, and an unknown key BESIDE a supported one, in either position; the
+    // value rows span the forms a `ReadOnly` value outside its domain takes, because
+    // that key filters on a flag an event reports as `true` or `false`.
+    let rows: Vec<(&str, Value, &str, &str)> = vec![
+        (
+            "a key lookup does not support",
+            json!([{"AttributeKey": "NotARealAttributeKey", "AttributeValue": "y"}]),
+            "NotARealAttributeKey",
+            UNREADABLE_ATTRIBUTE_KEY,
+        ),
+        (
+            "a key differing from a supported one only in case",
+            json!([{"AttributeKey": "eventname", "AttributeValue": "CreateTrail"}]),
+            "eventname",
+            UNREADABLE_ATTRIBUTE_KEY,
+        ),
+        (
+            "the empty key",
+            json!([{"AttributeKey": "", "AttributeValue": "CreateTrail"}]),
+            "",
+            UNREADABLE_ATTRIBUTE_KEY,
+        ),
+        (
+            "an unsupported key beside a supported one",
+            json!([
+                {"AttributeKey": "EventName", "AttributeValue": "CreateTrail"},
+                {"AttributeKey": "NotARealAttributeKey", "AttributeValue": "y"},
+            ]),
+            "NotARealAttributeKey",
+            UNREADABLE_ATTRIBUTE_KEY,
+        ),
+        (
+            "an unsupported key before a supported one",
+            json!([
+                {"AttributeKey": "EventRegion", "AttributeValue": HOME_REGION},
+                {"AttributeKey": "EventName", "AttributeValue": "CreateTrail"},
+            ]),
+            "EventRegion",
+            UNREADABLE_ATTRIBUTE_KEY,
+        ),
+        (
+            "a flag value that is not a boolean",
+            json!([{"AttributeKey": "ReadOnly", "AttributeValue": "maybe"}]),
+            "maybe",
+            INVALID_ATTRIBUTE,
+        ),
+        (
+            "a flag value in another spelling",
+            json!([{"AttributeKey": "ReadOnly", "AttributeValue": "yes"}]),
+            "yes",
+            INVALID_ATTRIBUTE,
+        ),
+        (
+            "a flag value capitalised",
+            json!([{"AttributeKey": "ReadOnly", "AttributeValue": "True"}]),
+            "True",
+            INVALID_ATTRIBUTE,
+        ),
+        (
+            "a flag value as a number",
+            json!([{"AttributeKey": "ReadOnly", "AttributeValue": "10"}]),
+            "10",
+            INVALID_ATTRIBUTE,
+        ),
+    ];
+
+    for (case, attributes, sent, expected) in rows {
+        let reply = emulator
+            .call("LookupEvents", &json!({ "LookupAttributes": attributes }))
+            .await;
+        reply.expect_error(case, REFUSED_STATUS, "InvalidLookupAttributesException");
+        assert_fixed_sentence(case, reply.message(), expected, &[sent]);
+    }
+
+    // The other half of the rule: every key lookup supports is served, with a value
+    // inside the domain that key filters on. The keys come from the generated value list
+    // of the model's own `LookupAttributeKey` enum, so a key a later revision adds is
+    // served by this control too.
+    for key in LOOKUP_ATTRIBUTE_KEY_VALUES {
+        // `ReadOnly` filters on the flag an event reports, which takes the two values an
+        // event reports it as; every other key filters on free text.
+        let value = if *key == "ReadOnly" { "false" } else { "CreateTrail" };
+        let reply = emulator
+            .call(
+                "LookupEvents",
+                &json!({"LookupAttributes": [{"AttributeKey": key, "AttributeValue": value}]}),
+            )
+            .await;
+        reply.expect_ok(&format!("a lookup on {key}"));
+    }
 }

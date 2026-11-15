@@ -315,6 +315,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// error shape and a different sentence, each as recorded for it.
 const INVERTED_TIME_RANGE_MESSAGE: &str = "The start time precedes the end time.";
 
+/// How CloudTrail words an `EventCategory` outside the categories a lookup selects on:
+/// the fixed sentence for that error class, carrying no part of the request.
+///
+/// `InvalidEventCategoryException` "occurs if an event category that is not valid is
+/// specified as a value of EventCategory", and the recorded refusal of such a value is
+/// this one sentence: it quotes neither the category that was sent nor the categories the
+/// model declares, so every value outside the set is refused with the same words.
+///
+/// Read by BOTH exits a category refusal can leave through — this handler, and the
+/// pre-dispatch validating walk's seam in `crate::service`, which refuses a value outside
+/// the modelled enum before any handler runs — so the two cannot drift apart.
+pub(crate) const INVALID_EVENT_CATEGORY_MESSAGE: &str = "Invalid event category specified.";
+
+/// How CloudTrail words a lookup attribute whose KEY it cannot read: the fixed sentence
+/// for that error class, carrying no part of the request.
+///
+/// A key is what a lookup attribute is read BY, and the key is one of an enumerated set,
+/// so a key outside that set is no key at all — the recorded refusal of an unmodelled key
+/// is the service's absent-key sentence, the same one an absent or empty key is refused
+/// with, and it quotes neither the key that was sent nor the keys lookup supports.
+///
+/// Read by both exits this refusal can leave through, as [`INVALID_EVENT_CATEGORY_MESSAGE`]
+/// is.
+pub(crate) const ABSENT_LOOKUP_ATTRIBUTE_KEY_MESSAGE: &str =
+    "Lookup attribute key cannot be null or empty.";
+
+/// How CloudTrail words a lookup attribute that is otherwise not valid — a readable key
+/// whose VALUE is outside the domain that key filters on, say: the fixed sentence for
+/// that error class, carrying no part of the request.
+///
+/// The recorded refusal of a value outside its key's domain is this one sentence, which
+/// (like the key sentence above) names neither the value, nor the key, nor the domain.
+///
+/// Read by both exits this refusal can leave through, as [`INVALID_EVENT_CATEGORY_MESSAGE`]
+/// is.
+pub(crate) const INVALID_LOOKUP_ATTRIBUTE_MESSAGE: &str = "Lookup attribute key is invalid.";
+
 /// How CloudTrail words a `NextToken` it cannot read: the fixed sentence for that
 /// error class, carrying no part of the request.
 ///
@@ -391,13 +428,9 @@ fn wanted_category(requested: Option<&str>) -> Result<&'static str, LookupEvents
     match requested {
         None => Ok(EVENT_CATEGORY_MANAGEMENT),
         Some(INSIGHT_EVENT_CATEGORY) => Ok(EVENT_CATEGORY_INSIGHT),
-        Some(value) => Err(LookupEventsErrorModeled::InvalidEventCategoryException(
+        Some(_) => Err(LookupEventsErrorModeled::InvalidEventCategoryException(
             InvalidEventCategoryException {
-                message: Some(format!(
-                    "EventCategory '{value}' is not valid: the supported event \
-                     categories are [{}]",
-                    EVENT_CATEGORY_VALUES.join(", ")
-                )),
+                message: Some(INVALID_EVENT_CATEGORY_MESSAGE.to_string()),
             },
         )
         .into()),
@@ -413,46 +446,52 @@ fn wanted_category(requested: Option<&str>) -> Result<&'static str, LookupEvents
 fn single_attribute(
     requested: Option<Vec<LookupAttribute>>,
 ) -> Result<Option<LookupAttribute>, LookupEventsError> {
-    let refuse = |message: String| {
-        LookupEventsErrorModeled::InvalidLookupAttributesException(
-            InvalidLookupAttributesException {
-                message: Some(message),
-            },
-        )
-    };
-
     let requested = requested.unwrap_or_default();
+    // Each attribute is judged on ITSELF before the list's length is judged, which is the
+    // order the service answers in: a list carrying a key the service cannot read is
+    // refused for that key whether or not it also carries more attributes than one lookup
+    // filters on.
+    for attribute in &requested {
+        readable_attribute(attribute)?;
+    }
     if requested.len() > 1 {
-        return Err(refuse(format!(
+        return Err(invalid_lookup_attributes(format!(
             "LookupAttributes carries {} attributes: a lookup filters on at most one \
              attribute",
             requested.len()
-        ))
-        .into());
+        )));
     }
-    let Some(attribute) = requested.into_iter().next() else {
-        return Ok(None);
-    };
+    Ok(requested.into_iter().next())
+}
+
+/// The refusal a lookup attribute this service cannot act on is answered with.
+fn invalid_lookup_attributes(message: String) -> LookupEventsError {
+    LookupEventsErrorModeled::InvalidLookupAttributesException(InvalidLookupAttributesException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Whether one lookup attribute is one this service can filter on: a key lookup supports,
+/// carrying a value inside the domain that key filters on.
+///
+/// Both refusals are `InvalidLookupAttributesException` ones, each worded with the fixed
+/// sentence CloudTrail states that class with — the absent-key sentence for a key it
+/// cannot read, the attribute-not-valid sentence for a value outside its key's domain.
+fn readable_attribute(attribute: &LookupAttribute) -> Result<(), LookupEventsError> {
     if !LOOKUP_ATTRIBUTE_KEY_VALUES.contains(&attribute.attribute_key.as_str()) {
-        return Err(refuse(format!(
-            "AttributeKey '{}' is not valid: the supported lookup attributes are [{}]",
-            attribute.attribute_key,
-            LOOKUP_ATTRIBUTE_KEY_VALUES.join(", ")
-        ))
-        .into());
+        return Err(invalid_lookup_attributes(
+            ABSENT_LOOKUP_ATTRIBUTE_KEY_MESSAGE.to_string(),
+        ));
     }
     if attribute.attribute_key == READ_ONLY_ATTRIBUTE_KEY
         && !READ_ONLY_VALUES.contains(&attribute.attribute_value.as_str())
     {
-        return Err(refuse(format!(
-            "AttributeValue '{}' is not valid for AttributeKey {READ_ONLY_ATTRIBUTE_KEY}: \
-             the supported values are [{}]",
-            attribute.attribute_value,
-            READ_ONLY_VALUES.join(", ")
-        ))
-        .into());
+        return Err(invalid_lookup_attributes(
+            INVALID_LOOKUP_ATTRIBUTE_MESSAGE.to_string(),
+        ));
     }
-    Ok(Some(attribute))
+    Ok(())
 }
 
 /// The `LookupAttributeKey` whose value is a boolean rather than free text.

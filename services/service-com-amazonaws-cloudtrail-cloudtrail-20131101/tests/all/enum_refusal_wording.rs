@@ -34,9 +34,10 @@
 //! this case — `EventCategory` (`InvalidEventCategoryException`, "Occurs if an event
 //! category that is not valid is specified as a value of EventCategory") and
 //! `LookupAttributes` (`InvalidLookupAttributesException`, "Occurs when a lookup
-//! attribute is specified that is not valid") — is answered in THAT error, by the same
-//! rule the selectors follow: where the model names the error for a case, a client
-//! branches on that code, and the generic envelope would hide it.
+//! attribute is specified that is not valid") — is answered in THAT error, with
+//! CloudTrail's own fixed sentence for the class rather than this envelope's clause, by
+//! the same rule the selectors follow: where the model names the error for a case, a
+//! client branches on that code, and the generic envelope would hide it.
 
 use serde_json::{json, Value};
 
@@ -177,8 +178,13 @@ async fn a_value_outside_a_modelled_enum_is_refused_without_quoting_it() {
 /// not valid", both on `LookupEvents` (`smithy_query(query="operation",
 /// operation="LookupEvents")`), and `ValidationException` is not an error that operation
 /// declares at all — so a client catching the modelled error would miss these refusals
-/// altogether. The message is built from the request (the value it sent, the member it
-/// sat at and the rule it broke), so the RULE is the requirement and not one sentence.
+/// altogether.
+///
+/// The message is the FIXED sentence CloudTrail words that error class with and carries no
+/// part of the request, which is the clause envelope's opposite; the sentences themselves,
+/// and the forms of value they hold over, are asserted in
+/// `tests/all/request_validation.rs`. What this case pins is that the error the model
+/// names takes the envelope's place for these members, message included.
 #[tokio::test]
 async fn a_lookup_events_enum_violation_keeps_its_modelled_error() {
     let emulator = Emulator::new();
@@ -192,14 +198,12 @@ async fn a_lookup_events_enum_violation_keeps_its_modelled_error() {
             .call("LookupEvents", &json!({"EventCategory": value}))
             .await;
         reply.expect_error(&case, 400, "InvalidEventCategoryException");
-        assert!(
-            reply.message().contains("eventCategory")
-                && EVENT_CATEGORY_VALUES
-                    .iter()
-                    .all(|allowed| reply.message().contains(allowed)),
-            "case {case}: the refusal must name the member and the model's value set, \
-             got {:?}",
-            reply.message()
+        assert_eq!(
+            reply.message(),
+            "Invalid event category specified.",
+            "case {case}: expected CloudTrail's fixed sentence for a category it does \
+             not serve, got {:?}",
+            reply.body
         );
     }
 
@@ -230,10 +234,12 @@ async fn a_lookup_events_enum_violation_keeps_its_modelled_error() {
     for (case, request) in &attribute_rows {
         let reply = emulator.call("LookupEvents", request).await;
         reply.expect_error(case, 400, "InvalidLookupAttributesException");
-        assert!(
-            reply.message().contains("ttributeKey"),
-            "case {case}: the refusal must name the member at fault, got {:?}",
-            reply.message()
+        assert_eq!(
+            reply.message(),
+            "Lookup attribute key cannot be null or empty.",
+            "case {case}: expected CloudTrail's fixed sentence for a key it cannot read, \
+             got {:?}",
+            reply.body
         );
     }
 }
