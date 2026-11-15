@@ -1647,3 +1647,19 @@ mod cloudtrail_iam_credential_write_audit;
 // which the layout check refuses: the `#[path]` is what points each declaration into
 // `all/appended_notes.rs`, and four suites check the rules above rather than restating them:
 // `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`.
+// Single integration-test target for the router: the canonical DECLARATION LIST, and
+// nothing else.
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file under `tests/all/`, sorted
+// by name, and NO other line. Put a new suite at `tests/all/<name>.rs` and insert its pair
+// in order: a landing then has one place to insert and no prose to duplicate, re-word or
+// mistype.
+// EVERY comment in this file is an ORDINARY `//` one, this header included, and that is
+// lands past the declarations — which is what concurrent landings appending to this file
+// kept producing — is `E0753` and compiles no suite of this target. With no `//!` anywhere
+// in the file, no merge of two landings can leave one past the first item.
+// A suite file no `mod` here names is compiled nowhere and its tests never run; a suite left
+// at the top level of `tests/` fails the build; and a second `mod` for one name is `E0428`.
+// Each of those fails EVERY suite of this target. `tests/all.rs` is a test-target CRATE
+// ROOT, so a bare `mod` would resolve to a SIBLING of this file (`tests/<name>.rs`), which
+// the layout check refuses: the `#[path]` is what points each declaration into `tests/all/`.
+// test it explains. The notes earlier landings had appended to the tail of this file live in

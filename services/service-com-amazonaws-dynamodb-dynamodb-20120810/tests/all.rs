@@ -129,6 +129,8 @@ mod key_refusal_classes_and_batch_bounds;
 mod key_schema_and_vector_parameter_refusals;
 #[path = "all/key_schema_element_refusals.rs"]
 mod key_schema_element_refusals;
+#[path = "all/kinesis_destination_command_member_sets.rs"]
+mod kinesis_destination_command_member_sets;
 #[path = "all/kinesis_destination_consumer_positions.rs"]
 mod kinesis_destination_consumer_positions;
 #[path = "all/kinesis_destination_delivery.rs"]
