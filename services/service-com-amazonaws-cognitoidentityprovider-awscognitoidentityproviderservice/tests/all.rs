@@ -139,6 +139,8 @@ mod get_tokens_from_refresh_token;
 mod get_user;
 #[path = "all/get_user_auth_factors.rs"]
 mod get_user_auth_factors;
+#[path = "all/global_sign_out.rs"]
+mod global_sign_out;
 #[path = "all/group_lifecycle.rs"]
 mod group_lifecycle;
 #[path = "all/group_membership.rs"]
