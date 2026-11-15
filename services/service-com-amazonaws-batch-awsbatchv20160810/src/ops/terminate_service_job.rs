@@ -140,7 +140,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as batch;
 
-        let _ = ctx;
         let Some(state) = batch::service_state(&*self.engine) else {
             return Err(TerminateServiceJobErrorModeled::ServerException(
                 batch::unreachable_state(),
@@ -148,15 +147,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let now = batch::now_millis();
-        let mut state = state.lock();
-        // Materialise what the clock already owed BEFORE terminating, so a record that
-        // has already reached a terminal status is not dragged back out of it.
-        state.materialize_due(now);
+        // The dispatch steps the service-job plane already owed, driven before the
+        // termination, so a job whose work the downstream service already reported finished
+        // is not dragged out of the status it reached (`state::service_job_dispatch`).
+        batch::advance_service_job_dispatch(&*self.engine, ctx, now).await;
+        {
+            let mut state = state.lock();
+            // Materialise what the clock already owed BEFORE terminating, so a record that
+            // has already reached a terminal status is not dragged back out of it.
+            state.materialize_due(now);
 
-        // `state::terminate_service_job` ends a service job that is not terminal yet,
-        // leaves one that already is exactly as it is, and changes nothing for an id the
-        // store holds no service job for.
-        state.terminate_service_job(&input.job_id, &input.reason, now);
+            // `state::terminate_service_job` ends a service job that is not terminal yet,
+            // leaves one that already is exactly as it is, and changes nothing for an id the
+            // store holds no service job for.
+            state.terminate_service_job(&input.job_id, &input.reason, now);
+            // A terminated job gives back the capacity it was holding, and this call is what
+            // freed it: a job RESTING on that capacity is placeable again one dispatch span
+            // from here.
+            state.rearm_resting_service_jobs(now);
+        }
+        // The work this job was dispatched as ends with the job: the stop the termination
+        // owes the downstream service is the next step this drives.
+        batch::advance_service_job_dispatch(&*self.engine, ctx, now).await;
 
         Ok(TerminateServiceJobOutput {})
     }

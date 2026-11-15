@@ -183,7 +183,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Ok(DeleteSchedulingPolicyOutput {});
         };
-        // "You can't delete a scheduling policy that's used in any job queues."
+        // A policy a job queue still names carries the same relationship sentence the two
+        // environment deletes answer ([`batch::SCHEDULING_POLICY_IN_USE`]).
         if state
             .job_queues
             .values()

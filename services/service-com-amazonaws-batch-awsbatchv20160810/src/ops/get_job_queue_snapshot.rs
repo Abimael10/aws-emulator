@@ -3,13 +3,17 @@
 //! @op GetJobQueueSnapshot
 //!
 //! Answers the snapshot from [`crate::state`]: the `RUNNABLE` jobs of the queue the
-//! request names, in the order that queue dispatches them, plus the capacity its
-//! dispatched jobs are using. A queue this service holds nothing for is refused with the
-//! modelled `ClientException` (HTTP 400).
+//! request names — whichever KIND of job that queue holds, container jobs or service jobs —
+//! in the order that queue dispatches them, plus the capacity its dispatched jobs are using,
+//! broken down by share for a queue whose attached policy allocates by one. A queue this
+//! service holds nothing for is refused with the modelled `ClientException` (HTTP 400).
 //!
-//! This is a REPORTING operation: it materialises what the clock already owed
-//! ([`crate::state::ComAmazonawsBatchAwsbatchv20160810State::materialize_due`]) and writes
-//! nothing else, so two reads at the same instant answer identically.
+//! This is a REPORTING operation: the only writes it makes are the ones already due at the
+//! instant it was called — what the clock owed
+//! ([`crate::state::ComAmazonawsBatchAwsbatchv20160810State::materialize_due`]) and the
+//! dispatch the scheduler owed
+//! ([`crate::state::advance_service_job_dispatch`]) — so two reads at the same instant
+//! answer identically.
 //!
 //! ## Shape of an operation
 //!
@@ -160,6 +164,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let now = batch::now_millis();
+        // The dispatch steps the service-job plane already owed, driven before this read, so
+        // the snapshot is of the queue as it stands at `now`
+        // (`state::service_job_dispatch`).
+        batch::advance_service_job_dispatch(&*self.engine, ctx, now).await;
         let snapshot = {
             let mut state = state.lock();
             // A reporting operation materialises what the clock already owed, so the
@@ -175,52 +183,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             };
             let queue_arn = queue.arn.clone();
-            // Whether this queue's scheduling policy is a QUOTA-SHARE one, which is what
-            // decides whether `frontOfQuotaShares` is reported at all ("For job queues
-            // with an attached quota-share policy, the first RUNNABLE job in each quota
-            // share is also listed").
-            let on_quota_shares = queue
+            // Which KIND of scheduling policy is attached to this queue, which is what
+            // decides which breakdowns are reported at all ("break downs by share for job
+            // queues with attached fair-share or quota-share scheduling policies").
+            let policy = queue
                 .scheduling_policy_arn
                 .as_deref()
-                .and_then(|arn| state.scheduling_policy(arn))
-                .is_some_and(|policy| policy.quota_share_policy.is_some());
+                .and_then(|arn| state.scheduling_policy(arn));
+            let on_quota_shares = policy.is_some_and(|policy| policy.quota_share_policy.is_some());
+            let on_fairshare = policy.is_some_and(|policy| policy.fairshare_policy.is_some());
 
-            let queued = state.runnable_jobs_of_queue(&queue_arn);
             // "The first 100 RUNNABLE jobs in the job queue are listed in order of
             // dispatch." Which order that is belongs to the QUEUE, not to this report
-            // (`crate::state::ComAmazonawsBatchAwsbatchv20160810State::runnable_jobs_of_queue`):
+            // (`crate::state::ComAmazonawsBatchAwsbatchv20160810State::front_of_queue`):
             // submission order, with a job's own priority deciding first on a queue with a
-            // fair-share policy attached.
+            // fair-share policy attached, over whichever kind of job the queue holds.
+            let queued = state.front_of_queue(&queue_arn);
             let jobs: Vec<FrontOfQueueJobSummary> = queued
                 .iter()
-                .take(batch::MAX_FRONT_OF_QUEUE_JOBS)
-                .map(|job| FrontOfQueueJobSummary {
-                    job_arn: Some(job.job_arn.clone()),
-                    earliest_time_at_position: job.at_position_since,
+                .map(|entry| FrontOfQueueJobSummary {
+                    job_arn: Some(entry.job_arn.clone()),
+                    earliest_time_at_position: entry.earliest_time_at_position,
                 })
                 .collect();
             // The first RUNNABLE job of each share, in the same dispatch order: a share is
-            // named by the job's own `shareIdentifier`, and a job that names none is in no
-            // share.
+            // named by the job's own share member, and a job that names none is in no share.
             let quota_shares = on_quota_shares.then(|| {
                 let mut firsts: ::std::collections::HashMap<
                     String,
                     Vec<FrontOfQuotaShareJobSummary>,
                 > = ::std::collections::HashMap::new();
-                for job in &queued {
-                    let Some(share) = job.share_identifier.clone() else {
+                for entry in &queued {
+                    let Some(share) = entry
+                        .quota_share_name
+                        .clone()
+                        .or_else(|| entry.share_identifier.clone())
+                    else {
                         continue;
                     };
-                    firsts
-                        .entry(share)
-                        .or_insert_with(|| {
-                            vec![FrontOfQuotaShareJobSummary {
-                                job_arn: Some(job.job_arn.clone()),
-                                earliest_time_at_position: job.at_position_since,
-                            }]
-                        });
+                    firsts.entry(share).or_insert_with(|| {
+                        vec![FrontOfQuotaShareJobSummary {
+                            job_arn: Some(entry.job_arn.clone()),
+                            earliest_time_at_position: entry.earliest_time_at_position,
+                        }]
+                    });
                 }
                 firsts
+            });
+
+            // "Capacity utilization for already dispatched jobs": what the queue's
+            // dispatched jobs are HOLDING right now, summed over the queue and broken down
+            // by share for a queue whose attached policy allocates by one.
+            let total_capacity_usage: Vec<QueueSnapshotCapacityUsage> = state
+                .queue_capacity_usage(&queue_arn)
+                .into_iter()
+                .map(|(capacity_unit, quantity)| QueueSnapshotCapacityUsage {
+                    capacity_unit: Some(capacity_unit),
+                    quantity: Some(quantity),
+                })
+                .collect();
+            let fairshare_utilization = on_fairshare.then(|| FairshareUtilizationDetail {
+                active_share_count: Some(
+                    state.active_share_count(&queue_arn, batch::ShareDimension::FairShare),
+                ),
+                top_capacity_utilization: Some(
+                    state
+                        .queue_capacity_usage_by_share(
+                            &queue_arn,
+                            batch::ShareDimension::FairShare,
+                        )
+                        .into_iter()
+                        .map(|(share_identifier, holding)| FairshareCapacityUtilization {
+                            share_identifier: Some(share_identifier),
+                            capacity_usage: Some(
+                                holding
+                                    .into_iter()
+                                    .map(|(capacity_unit, quantity)| FairshareCapacityUsage {
+                                        capacity_unit: Some(capacity_unit),
+                                        quantity: Some(quantity),
+                                    })
+                                    .collect(),
+                            ),
+                        })
+                        .collect(),
+                ),
+            });
+            let quota_share_utilization = on_quota_shares.then(|| QuotaShareUtilizationDetail {
+                top_capacity_utilization: Some(
+                    state
+                        .queue_capacity_usage_by_share(
+                            &queue_arn,
+                            batch::ShareDimension::QuotaShare,
+                        )
+                        .into_iter()
+                        .map(|(quota_share_name, holding)| QuotaShareCapacityUtilization {
+                            quota_share_name: Some(quota_share_name),
+                            capacity_usage: Some(
+                                holding
+                                    .into_iter()
+                                    .map(|(capacity_unit, quantity)| QuotaShareCapacityUsage {
+                                        capacity_unit: Some(capacity_unit),
+                                        quantity: Some(quantity),
+                                    })
+                                    .collect(),
+                            ),
+                        })
+                        .collect(),
+                ),
             });
 
             GetJobQueueSnapshotOutput {
@@ -234,14 +303,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         last_updated_at: Some(now),
                     }
                 }),
-                // "capacity utilization for already dispatched jobs": nothing in this
-                // emulator dispatches a job — a job rests in `RUNNABLE` until a caller
-                // ends it (`crate::state`) — so no capacity is in use, and the breakdowns
-                // per share report nothing rather than a quantity nothing consumed.
                 queue_utilization: Some(QueueSnapshotUtilizationDetail {
-                    total_capacity_usage: Some(Vec::new()),
-                    fairshare_utilization: None,
-                    quota_share_utilization: None,
+                    total_capacity_usage: Some(total_capacity_usage),
+                    fairshare_utilization,
+                    quota_share_utilization,
                     last_updated_at: Some(now),
                 }),
             }

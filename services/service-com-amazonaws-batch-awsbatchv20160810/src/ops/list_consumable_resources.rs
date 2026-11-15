@@ -174,17 +174,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `maxResults`: "This value can be between 1 and 100." A plain `Integer` in the
-        // model, so the published bound is applied here.
-        if let Some(requested) = input.max_results.filter(|requested| {
+        // model, so the published bound is applied here — and refused the way this service
+        // words every page-size bound ([`batch::max_results_bound_message`]).
+        if input.max_results.is_some_and(|requested| {
             !(batch::MIN_LIST_CONSUMABLE_RESOURCES_RESULTS
                 ..=batch::MAX_LIST_CONSUMABLE_RESOURCES_RESULTS)
-                .contains(requested)
+                .contains(&requested)
         }) {
             return Err(ListConsumableResourcesErrorModeled::ClientException(
-                batch::client_exception(format!(
-                    "maxResults {requested} must be between {} and {}",
+                batch::client_exception_enveloped(batch::max_results_bound_message(
                     batch::MIN_LIST_CONSUMABLE_RESOURCES_RESULTS,
-                    batch::MAX_LIST_CONSUMABLE_RESOURCES_RESULTS
+                    batch::MAX_LIST_CONSUMABLE_RESOURCES_RESULTS,
                 )),
             )
             .into());

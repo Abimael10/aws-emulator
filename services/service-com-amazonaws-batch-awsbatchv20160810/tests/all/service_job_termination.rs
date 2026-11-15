@@ -46,7 +46,12 @@ const SERVICE_JOB_TYPE: &str = "SAGEMAKER_TRAINING";
 
 /// The members `TerminateServiceJob` is allowed to change on the service job it ends.
 /// Every other member of the `DescribeServiceJob` answer must read back unchanged.
-const TERMINATION_MEMBERS: &[&str] = &["status", "statusReason", "stoppedAt", "isTerminated"];
+///
+/// `attempts` is among them because the attempt a termination closes carries the ending's
+/// own reason (`ServiceJobAttemptDetail$statusReason`: "additional details for the current
+/// status of the service job attempt"), which is asserted on its own below.
+const TERMINATION_MEMBERS: &[&str] =
+    &["status", "statusReason", "stoppedAt", "isTerminated", "attempts"];
 
 /// The `ServiceJobStatus` values a service job never leaves. The model's enum lists
 /// FAILED, PENDING, RUNNABLE, RUNNING, SCHEDULED, STARTING, SUBMITTED, SUCCEEDED
@@ -136,6 +141,18 @@ pub(crate) fn seed(batch: &Batch, status: &str, filled: Filled) -> ServiceJob {
         // token nor the digest of one.
         client_token: None,
         request_digest: None,
+        // A seeded record stands for a job whose work the downstream service already
+        // holds once the row's status says it has been dispatched, so the identifiers a
+        // dispatch would have recorded are seeded with it and nothing is owed.
+        dispatch_state: if dispatched {
+            state::ServiceJobDispatchState::Dispatched
+        } else {
+            state::ServiceJobDispatchState::Waiting
+        },
+        dispatch_attempted_at: dispatched.then_some(created_at + 5),
+        service_resource_name: dispatched.then(|| "t-1".to_string()),
+        service_resource_arn: dispatched
+            .then(|| format!("arn:aws:sagemaker:{REGION}:000000000000:training-job/t-1")),
     };
     store
         .insert_service_job(job.clone())
@@ -268,6 +285,21 @@ async fn terminating_a_live_service_job_ends_it_with_the_callers_reason() {
             "case {case}: terminating must change only {TERMINATION_MEMBERS:?}, got {after} \
              from {before}"
         );
+        // The attempt a termination closes carries the ending's own reason, and it is the
+        // same one attempt the dispatch started.
+        if before["latestAttempt"] != Value::Null {
+            assert_eq!(
+                after["attempts"][0]["statusReason"].as_str(),
+                Some(reason.as_str()),
+                "case {case}: the attempt the termination closed carries its reason, got \
+                 {after}"
+            );
+            assert_eq!(
+                after["latestAttempt"], before["latestAttempt"],
+                "case {case}: the resource the work was dispatched as does not change, got \
+                 {after}"
+            );
+        }
     }
 }
 
@@ -450,12 +482,42 @@ async fn describe_service_job_reports_the_stored_record_member_for_member() {
             Some(false),
             "case {case}: nothing terminated this job, got {detail}"
         );
-        for member in ["attempts", "latestAttempt", "capacityUsage", "preemptionSummary"] {
+        // The identifiers a dispatch records are reported only for a job whose work the
+        // downstream service was actually handed: a seeded row that has not been dispatched
+        // has had no attempt, so it reports none.
+        let dispatched = seeded.service_resource_arn.is_some();
+        if dispatched {
+            assert_eq!(
+                detail["latestAttempt"]["serviceResourceId"],
+                json!({
+                    "name": "TrainingJobArn",
+                    "value": seeded.service_resource_arn.clone().unwrap_or_default(),
+                }),
+                "case {case}: expected the attempt to name the stored resource, got {detail}"
+            );
+            assert_eq!(
+                detail["attempts"][0]["serviceResourceId"]["value"].as_str(),
+                seeded.service_resource_arn.as_deref(),
+                "case {case}: the one attempt a dispatch started names the same resource, \
+                 got {detail}"
+            );
+        } else {
+            for member in ["attempts", "latestAttempt"] {
+                assert_eq!(
+                    detail[member],
+                    Value::Null,
+                    "case {case}: nothing dispatched this job's work, so {member} is not \
+                     invented, got {detail}"
+                );
+            }
+        }
+        // The seeded payload states no `ResourceConfig`, so the job asks for no capacity
+        // this service can measure and holds none; nothing here preempts a job either.
+        for member in ["capacityUsage", "preemptionSummary"] {
             assert_eq!(
                 detail[member],
                 Value::Null,
-                "case {case}: nothing dispatched this job's work, so {member} is not \
-                 invented, got {detail}"
+                "case {case}: {member} is not invented, got {detail}"
             );
         }
 

@@ -156,6 +156,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = batch::request_region(ctx);
         let now = batch::now_millis();
+        // The dispatch steps the service-job plane already owed, driven first, so the status
+        // this call judges the service job by is the one a read at the same instant reports
+        // (`state::service_job_dispatch`).
+        batch::advance_service_job_dispatch(&*self.engine, ctx, now).await;
         let mut state = state.lock();
         // Materialise what the clock already owed BEFORE the update, so the status this
         // call judges the service job by is the one a read at the same instant reports.

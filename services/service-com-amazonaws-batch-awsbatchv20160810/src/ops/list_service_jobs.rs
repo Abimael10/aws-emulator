@@ -197,22 +197,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `maxResults`: "This value can be between 1 and 100." A plain `Integer` in the
-        // model, so the published bound is applied here.
-        if let Some(requested) = input.max_results.filter(|requested| {
+        // model, so the published bound is applied here — and refused the way this service
+        // words every page-size bound ([`batch::max_results_bound_message`]).
+        if input.max_results.is_some_and(|requested| {
             !(batch::MIN_LIST_SERVICE_JOBS_RESULTS..=batch::MAX_LIST_SERVICE_JOBS_RESULTS)
-                .contains(requested)
+                .contains(&requested)
         }) {
-            return Err(ListServiceJobsErrorModeled::ClientException(batch::client_exception(
-                format!(
-                    "maxResults {requested} must be between {} and {}",
+            return Err(ListServiceJobsErrorModeled::ClientException(
+                batch::client_exception_enveloped(batch::max_results_bound_message(
                     batch::MIN_LIST_SERVICE_JOBS_RESULTS,
-                    batch::MAX_LIST_SERVICE_JOBS_RESULTS
-                ),
-            ))
+                    batch::MAX_LIST_SERVICE_JOBS_RESULTS,
+                )),
+            )
             .into());
         }
 
         let now = batch::now_millis();
+        // The dispatch steps the service-job plane already owed, driven before this read, so
+        // what it reports is the jobs as they stand at `now` (`state::service_job_dispatch`).
+        batch::advance_service_job_dispatch(&*self.engine, ctx, now).await;
         // The store's lock lives in THIS block and no longer, so nothing holds it while
         // the transitions it materialised are published below (that call reaches another
         // service in-process).
@@ -330,7 +333,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let job_summary_list = page
             .into_iter()
             .map(|job| ServiceJobSummary {
-                job_arn: Some(job.job_arn),
+                job_arn: Some(job.job_arn.clone()),
+                // `isTerminated`: "This field is only present when the value is true."
+                is_terminated: job.is_terminated.then_some(true),
+                // What the dispatch of this job's work produced, read off the record — the
+                // same two members `DescribeServiceJob` reports, so the two readers cannot
+                // disagree about one job.
+                latest_attempt: job.latest_attempt(),
+                capacity_usage: job.capacity_usage_summary(),
                 job_id: job.job_id,
                 job_name: job.job_name,
                 service_job_type: job.service_job_type,
@@ -342,12 +352,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stopped_at: job.stopped_at,
                 share_identifier: job.share_identifier,
                 quota_share_name: job.quota_share_name,
-                // `isTerminated`: "This field is only present when the value is true."
-                is_terminated: job.is_terminated.then_some(true),
-                // A service job's work is dispatched to another service, which nothing
-                // here runs, so no attempt or capacity usage is invented for it.
-                latest_attempt: None,
-                capacity_usage: None,
             })
             .collect();
 

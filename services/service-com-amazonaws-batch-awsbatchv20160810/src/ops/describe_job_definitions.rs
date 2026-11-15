@@ -185,17 +185,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "This value can be between 1 and 100. If this parameter isn't used, then
         // DescribeJobDefinitions returns up to 100 results" (`maxResults`). The
-        // member targets a plain `Integer`, so the framework enforces no range.
+        // member targets a plain `Integer`, so the framework enforces no range — and the
+        // page-size bound is refused the way this service words every one of them
+        // ([`crate::state::max_results_bound_message`]), inside the input-validation
+        // envelope that family carries.
         let page_size = match input.max_results {
             Some(requested) => {
                 if !(crate::state::MIN_DESCRIBE_PAGE_SIZE..=crate::state::MAX_DESCRIBE_PAGE_SIZE)
                     .contains(&requested)
                 {
-                    return Err(client_exception(&format!(
-                        "maxResults must be between {} and {}",
-                        crate::state::MIN_DESCRIBE_PAGE_SIZE,
-                        crate::state::MAX_DESCRIBE_PAGE_SIZE
-                    )));
+                    return Err(DescribeJobDefinitionsErrorModeled::ClientException(
+                        crate::state::client_exception_enveloped(
+                            crate::state::max_results_bound_message(
+                                crate::state::MIN_DESCRIBE_PAGE_SIZE,
+                                crate::state::MAX_DESCRIBE_PAGE_SIZE,
+                            ),
+                        ),
+                    )
+                    .into());
                 }
                 requested
             }

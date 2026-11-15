@@ -11,15 +11,15 @@
 //! this service stores for one job ([`crate::state::limits::MAX_SERVICE_REQUEST_PAYLOAD_BYTES`])
 //! and a full store are each the modelled `ClientException` (HTTP 400).
 //!
-//! The work itself is NOT run: nothing here runs SageMaker AI, so a job the scheduler can
-//! place is walked by the clock `SUBMITTED` -> `RUNNABLE` and then ended in the modelled
-//! failure state with [`crate::state::NO_SERVICE_JOB_RUNTIME_REASON`], inventing no
-//! `scheduledAt`, `startedAt`, attempt or capacity usage. A job whose request asks for more
-//! capacity than the service environments of its queue publish is never placed, so it rests
-//! in `RUNNABLE` instead of reaching any terminal status
-//! ([`crate::state::capacity_admits`]). What capacity the request asks for is derived HERE,
-//! once, and kept on the record ([`crate::state::requested_capacity`]), so no later call
-//! re-reads the payload.
+//! The work itself is DISPATCHED: a job the scheduler places has its
+//! `serviceRequestPayload` handed on to SageMaker AI as a `CreateTrainingJob` request
+//! ([`crate::state::advance_service_job_dispatch`]), and every status, reason and instant
+//! the job reports from then on is read off the training job that service holds for it. A
+//! job whose request asks for more capacity than its quota share or the service environments
+//! of its queue have free is never placed, so it rests in `RUNNABLE` until a later call frees
+//! or publishes some ([`crate::state::capacity_admits_with_usage`]). What capacity the
+//! request asks for is derived HERE, once, and kept on the record
+//! ([`crate::state::requested_capacity`]), so no later call re-reads the payload.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -195,6 +195,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = batch::request_region(ctx);
         let now = batch::now_millis();
+        // The dispatch steps the service-job plane already owed, driven before this call
+        // reads or writes anything (`state::service_job_dispatch`).
+        batch::advance_service_job_dispatch(&*self.engine, ctx, now).await;
         let mut state = state.lock();
         state.materialize_due(now);
 
@@ -345,6 +348,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags,
             client_token: input.client_token,
             request_digest: Some(digest),
+            // Nothing has been handed on to the service that runs the work yet: the
+            // scheduler decides that, one span from now
+            // (`state::service_job_dispatch`).
+            dispatch_state: batch::ServiceJobDispatchState::Waiting,
+            dispatch_attempted_at: None,
+            service_resource_name: None,
+            service_resource_arn: None,
         };
         // The service jobs store is bounded (`state::limits::MAX_SERVICE_JOBS`): room is
         // made by evicting the service jobs that have been terminal longest, and a store

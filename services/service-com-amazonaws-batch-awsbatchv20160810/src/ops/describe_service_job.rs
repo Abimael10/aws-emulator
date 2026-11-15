@@ -2,8 +2,11 @@
 
 //! @op DescribeServiceJob
 //! Reports one service job from the persisted record `SubmitServiceJob` stored and
-//! `TerminateServiceJob` ends: a pure read, so two calls at the same instant answer
-//! identically. A `jobId` the service holds no service job for is a `ClientException`.
+//! `TerminateServiceJob` ends: a REPORTING operation, so the only writes it makes are the
+//! ones already due at the instant it was called — the clock's own moves and the dispatch
+//! the scheduler owed ([`crate::state::advance_service_job_dispatch`]) — and two calls at
+//! the same instant answer identically. A `jobId` the service holds no service job for is a
+//! `ClientException`.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -189,6 +192,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = batch::request_region(ctx);
         let now = batch::now_millis();
+        // The dispatch steps the service-job plane already owed, driven before this read, so
+        // what it reports is the job as it stands at `now` (`state::service_job_dispatch`).
+        batch::advance_service_job_dispatch(&*self.engine, ctx, now).await;
         let mut state = state.lock();
         // A read: this only materialises what the clock already owed at `now`, so a
         // later caller sees exactly what this caller saw.
@@ -217,7 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: Some(job.created_at),
             scheduled_at: job.scheduled_at,
             // Modelled as required, so it is always serialized; 0 until the job starts,
-            // which a job no runtime here ever dispatched never does.
+            // which is when the service its work was dispatched to has it running.
             started_at: job.started_at.unwrap_or_default(),
             stopped_at: job.stopped_at,
             is_terminated: Some(job.is_terminated),
@@ -229,11 +235,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             timeout_config: job.timeout_config.clone(),
             preemption_configuration: job.preemption_configuration.clone(),
             tags: batch::materialized_tags(&job.tags),
-            // A service job's work is dispatched to another service, which nothing here
-            // runs, so no attempt, capacity usage or preemption is invented for it.
-            attempts: None,
-            latest_attempt: None,
-            capacity_usage: None,
+            // What the dispatch of this job's work produced, read off the record: the
+            // attempt it started, the resource the downstream service holds it as, and the
+            // capacity the job is using while that work is being done. A job nothing has
+            // been dispatched for has had no attempt, so it reports none.
+            attempts: job.attempt_details(),
+            latest_attempt: job.latest_attempt(),
+            capacity_usage: job.capacity_usage_detail(),
+            // "Information about the preemption of the service job": nothing here preempts
+            // one, so none is reported.
             preemption_summary: None,
         })
     }

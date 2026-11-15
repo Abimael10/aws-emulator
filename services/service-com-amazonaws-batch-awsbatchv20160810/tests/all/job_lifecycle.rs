@@ -75,6 +75,12 @@ fn status_rank(status: &str) -> u8 {
 /// it (`state::job_logs`), so without it mounted there is nowhere for the stream to be.
 /// Each claims only requests scoped to its own signing name (`events`, `sqs`, `logs`), so
 /// no Batch request below is routed any differently for their presence.
+///
+/// SageMaker AI is deliberately NOT mounted here: a service job's work is DISPATCHED to it
+/// (`state::service_job_dispatch`), so a suite with it mounted is asserting the dispatched
+/// work's own progress, which `service_job_dispatch` builds its own emulator for. Without it,
+/// a placed service job's dispatch reaches nothing and the job waits in `RUNNABLE`, which is
+/// what the rows below expect.
 pub(crate) struct Batch {
     router: smithy_server_runtime::MultiServiceRouter,
     /// The SAME engine the mounted service holds, so a test can read or seed the store

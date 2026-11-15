@@ -192,11 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let attached = state.queues_using_compute_environment(&environment.arn);
         if !attached.is_empty() {
+            // The relationship rule's own CLOSED sentence, naming no queue: the refusal is
+            // that a `JobQueue` relationship exists, and AWS keeps which queue opaque
+            // ([`batch::job_queue_relationship_message`]).
             return Err(DeleteComputeEnvironmentErrorModeled::ClientException(
-                batch::client_exception(format!(
-                    "Cannot delete, found existing JobQueue relationship: {}",
-                    attached.join(", ")
-                )),
+                batch::client_exception(batch::job_queue_relationship_message()),
             )
             .into());
         }

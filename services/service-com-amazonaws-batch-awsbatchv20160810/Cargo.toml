@@ -57,6 +57,13 @@ emulator-core-build-support = { workspace = true }
 service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+# SageMaker AI is mounted beside Batch on that same engine too, because a service job's
+# work is DISPATCHED to it as a `CreateTrainingJob` request
+# (`state::service_job_dispatch`): without it mounted there is nothing for the dispatch to
+# reach. Amazon S3 goes with it, because a training job's run reads its channels and writes
+# its model artifact in the service that OWNS objects.
+service-com-amazonaws-sagemaker-sagemaker = { workspace = true }
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

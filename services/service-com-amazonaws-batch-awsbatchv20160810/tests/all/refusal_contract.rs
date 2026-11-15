@@ -527,8 +527,8 @@ async fn list_jobs_reports_the_selector_condition_that_holds() {
 }
 
 /// RULE: `SubmitJob` resolves the `jobDefinition` BEFORE the `jobQueue`, and the two ways
-/// a reference fails to name a runnable revision — nothing stored, and a revision that is
-/// not `ACTIVE` — are the same refusal.
+/// a reference fails to name a runnable revision — nothing stored, and a stored revision
+/// that is not `ACTIVE` — are DISTINCT refusals.
 #[tokio::test]
 async fn submit_job_resolves_the_job_definition_before_the_queue() {
     let batch = Batch::new();
@@ -547,13 +547,15 @@ async fn submit_job_resolves_the_job_definition_before_the_queue() {
         "case deregister jd-inactive: expected 200, got {deregistered:?}"
     );
 
-    /// The refusal a row expects: the job definition's (naming the reference) or the
-    /// queue's own.
+    /// The refusal a row expects: the job definition's not-found (naming the reference),
+    /// the not-`ACTIVE` refusal (naming the stored revision's ARN), or the queue's own.
     enum Expected {
-        /// `JobDefinition name <reference> does not exist or is not in ACTIVE status.`
-        JobDefinition,
+        /// `JobDefinition <reference> not found.`
+        DefinitionAbsent,
+        /// `JobDefinition <arn> is not in ACTIVE status.`, carrying the stored ARN.
+        DefinitionInactive(String),
         /// The queue's refusal, which names the queue and not the job definition.
-        JobQueue,
+        Queue,
     }
 
     // Each row varies the reference FORM (bare name, `name:revision`, ARN) and which of
@@ -564,50 +566,50 @@ async fn submit_job_resolves_the_job_definition_before_the_queue() {
             "neither the definition nor the queue exists",
             "jd-absent".to_string(),
             "q-absent",
-            Expected::JobDefinition,
+            Expected::DefinitionAbsent,
         ),
         (
             "an absent definition by name:revision, queue absent too",
             "jd-absent:7".to_string(),
             "q-absent",
-            Expected::JobDefinition,
+            Expected::DefinitionAbsent,
         ),
         (
             "an absent definition by ARN, with a queue that exists",
             absent_definition_arn,
             "q-precedence",
-            Expected::JobDefinition,
+            Expected::DefinitionAbsent,
         ),
         (
             "a revision of a stored name that was never registered",
             "jd-active:9".to_string(),
             "q-precedence",
-            Expected::JobDefinition,
+            Expected::DefinitionAbsent,
         ),
         (
             "a deregistered (INACTIVE) revision by ARN",
             inactive_arn.clone(),
             "q-precedence",
-            Expected::JobDefinition,
+            Expected::DefinitionInactive(inactive_arn.clone()),
         ),
         (
             "a deregistered name with no ACTIVE revision left",
             "jd-inactive".to_string(),
             "q-precedence",
-            Expected::JobDefinition,
+            Expected::DefinitionInactive(inactive_arn.clone()),
         ),
         // Only once the definition resolves does the queue's own refusal surface.
         (
             "an ACTIVE definition and an absent queue",
             "jd-active".to_string(),
             "q-absent",
-            Expected::JobQueue,
+            Expected::Queue,
         ),
         (
             "an ACTIVE definition by ARN and an absent queue",
             active_arn.clone(),
             "q-absent",
-            Expected::JobQueue,
+            Expected::Queue,
         ),
     ];
 
@@ -629,14 +631,19 @@ async fn submit_job_resolves_the_job_definition_before_the_queue() {
         );
         let message = error_message(&body);
         match expected {
-            Expected::JobDefinition => assert_eq!(
+            Expected::DefinitionAbsent => assert_eq!(
                 message,
-                format!(
-                    "JobDefinition name {definition} does not exist or is not in ACTIVE status."
-                ),
-                "case submit with {case}: expected the job-definition refusal, got {message:?}"
+                format!("JobDefinition {definition} not found."),
+                "case submit with {case}: expected the job-definition not-found refusal, got \
+                 {message:?}"
             ),
-            Expected::JobQueue => assert!(
+            Expected::DefinitionInactive(arn) => assert_eq!(
+                message,
+                format!("JobDefinition {arn} is not in ACTIVE status."),
+                "case submit with {case}: expected the not-ACTIVE refusal naming the stored \
+                 ARN, got {message:?}"
+            ),
+            Expected::Queue => assert!(
                 !message.contains("JobDefinition") && message.contains(queue),
                 "case submit with {case}: expected the queue's own refusal, got {message:?}"
             ),

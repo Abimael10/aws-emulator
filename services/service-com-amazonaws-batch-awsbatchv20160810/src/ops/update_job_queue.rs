@@ -346,7 +346,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 }
-                Some(requested.to_string())
+                // The replacement must RESOLVE, exactly as the one `CreateJobQueue` binds
+                // must: a queue is never left naming a policy this service holds nothing
+                // for.
+                if !batch::is_scheduling_policy_reference(&region, requested) {
+                    return Err(UpdateJobQueueErrorModeled::ClientException(
+                        batch::scheduling_policy_arn_not_valid(requested),
+                    )
+                    .into());
+                }
+                let Some(policy) = state.scheduling_policy(requested) else {
+                    return Err(UpdateJobQueueErrorModeled::ClientException(
+                        batch::not_found_exception("SchedulingPolicy", requested),
+                    )
+                    .into());
+                };
+                Some(policy.arn.clone())
             }
         };
 

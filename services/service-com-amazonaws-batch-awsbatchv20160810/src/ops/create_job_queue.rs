@@ -281,6 +281,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
         }
 
+        // `schedulingPolicyArn` is "the Amazon Resource Name (ARN) of the fair-share
+        // scheduling policy", so it must RESOLVE: a queue bound to a policy this service
+        // holds nothing for could never schedule by the shares that policy declares, and
+        // the create is the one moment the caller can be told. Resolved here, before
+        // anything is written, so a refusal leaves no queue behind. An identifier that
+        // cannot name a policy of this endpoint at all is the shape refusal the sibling
+        // scheduling-policy operations answer; one of the right shape that resolves to
+        // nothing is the service layer's own not-found.
+        let scheduling_policy_arn = match input.scheduling_policy_arn.as_deref() {
+            None => None,
+            Some(reference) => {
+                if !batch::is_scheduling_policy_reference(&region, reference) {
+                    return Err(CreateJobQueueErrorModeled::ClientException(
+                        batch::scheduling_policy_arn_not_valid(reference),
+                    )
+                    .into());
+                }
+                let Some(policy) = state.scheduling_policy(reference) else {
+                    return Err(CreateJobQueueErrorModeled::ClientException(
+                        batch::not_found_exception("SchedulingPolicy", reference),
+                    )
+                    .into());
+                };
+                Some(policy.arn.clone())
+            }
+        };
+
         let name = input.job_queue_name.clone();
         let arn = batch::job_queue_arn(&region, &name);
         let queue = batch::JobQueue {
@@ -293,7 +320,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status_reason: None,
             status_due_at: Some(now + batch::JOB_PHASE_MILLIS),
             priority: input.priority,
-            scheduling_policy_arn: input.scheduling_policy_arn,
+            scheduling_policy_arn,
             compute_environment_order,
             service_environment_order: (!service_environment_order.is_empty())
                 .then_some(service_environment_order),

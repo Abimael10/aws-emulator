@@ -41,8 +41,8 @@ use super::*;
 /// A placed job's work is a container image, which this emulator has no runtime for and
 /// the engine contract (`vendor/engine/src/lib.rs`) forbids pretending to run: so the run
 /// the caller asked for ends in the modelled failure state saying exactly that, and no
-/// `startedAt`, `stoppedAt` or `exitCode` is invented for it. Worded as
-/// [`NO_SERVICE_JOB_RUNTIME_REASON`] is, naming the runtime that is missing.
+/// `startedAt`, `stoppedAt` or `exitCode` is invented for it. It names the condition that
+/// stopped the run and nothing from the job.
 pub const NO_CONTAINER_RUNTIME_REASON: &str =
     "This emulator does not run containers, so the job's container was never started";
 

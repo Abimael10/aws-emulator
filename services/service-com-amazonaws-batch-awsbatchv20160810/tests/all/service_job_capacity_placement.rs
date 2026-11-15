@@ -5,10 +5,12 @@
 //! The rules under test, each asserted over a SET of inputs rather than one request:
 //!
 //! * a service job is placed only when the capacity its request asks for fits the capacity
-//!   limits the service environments of its queue publish; a job that fits is walked on by
-//!   the clock, and one that does NOT fit is never placed, so it RESTS in the non-terminal
-//!   `RUNNABLE` status instead of reaching any terminal status — no `statusReason`,
-//!   `stoppedAt` or attempt is reported for work the scheduler never handed on;
+//!   limits the service environments of its queue publish; a job that fits is PLACED, so its
+//!   work is owed to the service it is dispatched to, and one that does NOT fit is never
+//!   placed, so it RESTS in the non-terminal `RUNNABLE` status owing nothing — and either
+//!   way no `statusReason`, `stoppedAt` or attempt is reported, because nothing mounted
+//!   beside this emulator serves that dispatch (`service_job_dispatch` is the suite that
+//!   mounts it);
 //! * a job resting in `RUNNABLE` stays readable: `DescribeServiceJob` reads every member
 //!   the submit carried back unchanged — the integers as submitted, the payload
 //!   byte-identical — and reports an optional member the submit never carried as ABSENT;
@@ -27,7 +29,7 @@
 //! enabled service environment, specify the instance type (for example, `ml.m5.large`).
 //! Otherwise, use `NUM_INSTANCES`."
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -47,11 +49,59 @@ const SMALL_INSTANCE_TYPE: &str = "ml.m5.large";
 /// another. Named in the `ResourceConfig` doc's instance-type list.
 const LARGE_INSTANCE_TYPE: &str = "ml.p4d.24xlarge";
 
-/// Long enough for every clock-owed service-job transition to have fallen due: a placeable
-/// job makes two ([`state::JOB_PHASE_MILLIS`] each), and the margin covers a slow machine.
-async fn wait_for_the_clock() {
-    let span = u64::try_from(state::JOB_PHASE_MILLIS).unwrap_or(500);
-    tokio::time::sleep(Duration::from_millis(span * 4)).await;
+/// How long a poll below gives the clock: far longer than the spans the state gives a
+/// service job's moves, so a loaded host still settles well inside it.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How often a poll looks again. Only the loop's condition decides when it stops.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Look again until `job_id`'s status is `status`, answering the read that saw it.
+async fn polled_until_status(batch: &Batch, case: &str, job_id: &str, status: &str) -> Value {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let detail = described(batch, case, job_id).await;
+        if detail["status"].as_str() == Some(status) {
+            return detail;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case}: expected the status {status:?}, last read {detail}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Whether the scheduler has PLACED `job_id`: its work is owed to, or already with, the
+/// service it is dispatched to.
+///
+/// Read from the store the handlers read and write (`Batch::store`), because the dispatch is
+/// the one part of a placement a client cannot see when nothing serves it: a placed job and a
+/// resting one are both `RUNNABLE` on the wire until that service answers.
+fn is_placed(batch: &Batch, job_id: &str) -> bool {
+    let store = batch.store();
+    let store = store.lock();
+    store.service_jobs.get(job_id).is_some_and(|job| {
+        job.dispatch_state != state::ServiceJobDispatchState::Waiting
+    })
+}
+
+/// Look again until the scheduler has placed `job_id` ([`is_placed`]).
+async fn polled_until_placed(batch: &Batch, case: &str, job_id: &str) {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        // A read is what drives the dispatch the clock made due, so the job is described
+        // before the store is looked at.
+        let detail = described(batch, case, job_id).await;
+        if is_placed(batch, job_id) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case}: expected the job to be placed, last read {detail}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// A service environment publishing `capacity_limits`, and a `SAGEMAKER_TRAINING` queue
@@ -237,45 +287,44 @@ fn placements() -> Vec<Placement> {
 }
 
 /// RULE: a service job is placed only when the capacity its request asks for fits what the
-/// service environments of its queue publish; one that does not fit rests in the
-/// non-terminal `RUNNABLE` status with nothing terminal invented for it, while one that
-/// fits is walked on by the clock.
+/// service environments of its queue publish; one that does not fit RESTS in the
+/// non-terminal `RUNNABLE` status owing nothing, with nothing terminal invented for it,
+/// while one that fits is PLACED — its work owed to the service it is dispatched to.
 #[tokio::test]
 async fn a_service_job_is_placed_only_within_the_capacity_its_environment_publishes() {
     let batch = Batch::new();
 
-    // Every row is submitted first, so ONE wait covers the transitions all of them owe.
+    // Every row is submitted first, so the polls below cover them all at once.
     let mut submitted: Vec<(Placement, String)> = Vec::new();
     for row in placements() {
-        let queue =
-            environment_and_queue(&batch, row.suffix, row.capacity_limits.clone()).await;
+        let queue = environment_and_queue(&batch, row.suffix, row.capacity_limits.clone()).await;
         let job_id = submit(&batch, row.suffix, &queue, &row.payload).await;
         submitted.push((row, job_id));
     }
-    wait_for_the_clock().await;
 
     for (row, job_id) in &submitted {
         let case = row.label;
-        let detail = described(&batch, case, job_id).await;
         if row.placeable {
+            polled_until_placed(&batch, case, job_id).await;
+            let detail = described(&batch, case, job_id).await;
             assert_eq!(
                 detail["status"].as_str(),
-                Some(state::SERVICE_JOB_FAILED),
-                "case {case}: a placeable job is walked on by the clock, and nothing here \
-                 runs SageMaker AI, got {detail}"
+                Some(state::SERVICE_JOB_RUNNABLE),
+                "case {case}: a placed job's work is owed to a service nothing mounted beside \
+                 this emulator serves, so it waits in RUNNABLE, got {detail}"
             );
             assert_eq!(
-                detail["statusReason"].as_str(),
-                Some(state::NO_SERVICE_JOB_RUNTIME_REASON),
-                "case {case}: the failure must say why nothing ran, got {detail}"
+                detail["statusReason"], Value::Null,
+                "case {case}: a job whose dispatch reached nothing reports no reason, got \
+                 {detail}"
             );
             continue;
         }
-        assert_eq!(
-            detail["status"].as_str(),
-            Some(state::SERVICE_JOB_RUNNABLE),
-            "case {case}: a job the published capacity cannot hold rests in RUNNABLE, \
-             got {detail}"
+        let detail = polled_until_status(&batch, case, job_id, state::SERVICE_JOB_RUNNABLE).await;
+        assert!(
+            !is_placed(&batch, job_id),
+            "case {case}: a job the published capacity cannot hold is never placed, got \
+             {detail}"
         );
         // Nothing placed or dispatched the job, so nothing a placement would produce is
         // reported for it.
@@ -307,20 +356,28 @@ async fn a_service_job_is_placed_only_within_the_capacity_its_environment_publis
         );
     }
 
-    // Nor does more time passing: ONE further wait covers every resting row.
-    wait_for_the_clock().await;
-    for (row, job_id) in &submitted {
-        if row.placeable {
-            continue;
+    // Nor does more time passing: every resting row is read again and again over a window
+    // far longer than the spans this service's moves take, and must not move.
+    let settled = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < settled {
+        for (row, job_id) in &submitted {
+            if row.placeable {
+                continue;
+            }
+            let case = row.label;
+            let later = described(&batch, case, job_id).await;
+            assert_eq!(
+                later["status"].as_str(),
+                Some(state::SERVICE_JOB_RUNNABLE),
+                "case {case}: a job that still cannot be placed still rests in RUNNABLE, \
+                 got {later}"
+            );
+            assert!(
+                !is_placed(&batch, job_id),
+                "case {case}: a job that still cannot be placed is still not placed"
+            );
         }
-        let case = row.label;
-        let later = described(&batch, case, job_id).await;
-        assert_eq!(
-            later["status"].as_str(),
-            Some(state::SERVICE_JOB_RUNNABLE),
-            "case {case}: a job that still cannot be placed still rests in RUNNABLE, \
-             got {later}"
-        );
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
@@ -391,12 +448,10 @@ async fn a_resting_service_job_reads_every_submitted_member_back_unchanged() {
             .await;
         submitted.push(accepted["jobId"].as_str().unwrap_or_default().to_string());
     }
-    wait_for_the_clock().await;
-
     for ((case, priority, attempts, seconds, share, payload), job_id) in
         rows.iter().zip(&submitted)
     {
-        let detail = described(&batch, case, job_id).await;
+        let detail = polled_until_status(&batch, case, job_id, state::SERVICE_JOB_RUNNABLE).await;
         assert_eq!(
             detail["status"].as_str(),
             Some(state::SERVICE_JOB_RUNNABLE),
@@ -469,15 +524,20 @@ async fn capacity_published_later_is_what_moves_a_resting_service_job_on() {
     .to_string();
     let job_id = submit(&batch, "rearm", "jq-rearm", &payload).await;
 
-    wait_for_the_clock().await;
-    let resting = described(&batch, "before the capacity grows", &job_id).await;
-    assert_eq!(
-        resting["status"].as_str(),
-        Some(state::SERVICE_JOB_RUNNABLE),
-        "case before the capacity grows: expected the job to rest in RUNNABLE, got {resting}"
+    let resting = polled_until_status(
+        &batch,
+        "before the capacity grows",
+        &job_id,
+        state::SERVICE_JOB_RUNNABLE,
+    )
+    .await;
+    assert!(
+        !is_placed(&batch, &job_id),
+        "case before the capacity grows: expected the job to rest unplaced, got {resting}"
     );
 
-    // Still too small: the job owes nothing, so it stays where it is.
+    // Still too small: the job owes nothing, so it stays where it is — read again and again
+    // over a window far longer than the spans this service's moves take.
     batch
         .ok(
             "/v1/updateserviceenvironment",
@@ -487,15 +547,23 @@ async fn capacity_published_later_is_what_moves_a_resting_service_job_on() {
             }),
         )
         .await;
-    wait_for_the_clock().await;
-    let still_resting = described(&batch, "capacity still too small", &job_id).await;
-    assert_eq!(
-        still_resting["status"].as_str(),
-        Some(state::SERVICE_JOB_RUNNABLE),
-        "case capacity still too small: expected the job to keep resting, got {still_resting}"
-    );
+    let settled = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < settled {
+        let still_resting = described(&batch, "capacity still too small", &job_id).await;
+        assert_eq!(
+            still_resting["status"].as_str(),
+            Some(state::SERVICE_JOB_RUNNABLE),
+            "case capacity still too small: expected the job to keep resting, got \
+             {still_resting}"
+        );
+        assert!(
+            !is_placed(&batch, &job_id),
+            "case capacity still too small: expected the job to stay unplaced"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 
-    // Enough capacity: the move is owed again, and a span later the clock has made it.
+    // Enough capacity: the placement is owed again, and a span later it has been made.
     batch
         .ok(
             "/v1/updateserviceenvironment",
@@ -506,25 +574,12 @@ async fn capacity_published_later_is_what_moves_a_resting_service_job_on() {
         )
         .await;
     let straight_after = described(&batch, "straight after the capacity grows", &job_id).await;
-    assert_eq!(
-        straight_after["status"].as_str(),
-        Some(state::SERVICE_JOB_RUNNABLE),
-        "case straight after the capacity grows: the owed move takes a span, so the \
-         transient status is still observable, got {straight_after}"
+    assert!(
+        !is_placed(&batch, &job_id),
+        "case straight after the capacity grows: the owed placement takes a span, so the \
+         unplaced state is still observable, got {straight_after}"
     );
-    wait_for_the_clock().await;
-    let moved = described(&batch, "after the capacity grows", &job_id).await;
-    assert_eq!(
-        moved["status"].as_str(),
-        Some(state::SERVICE_JOB_FAILED),
-        "case after the capacity grows: the placed job is walked on by the clock, and \
-         nothing here runs SageMaker AI, got {moved}"
-    );
-    assert_eq!(
-        moved["statusReason"].as_str(),
-        Some(state::NO_SERVICE_JOB_RUNTIME_REASON),
-        "case after the capacity grows: the failure must say why nothing ran, got {moved}"
-    );
+    polled_until_placed(&batch, "after the capacity grows", &job_id).await;
 }
 
 /// RULE: the same holds for the OTHER call that changes which capacity a job's queue can
@@ -556,13 +611,16 @@ async fn pointing_a_queue_at_a_bigger_environment_moves_a_resting_service_job_on
     .to_string();
     let job_id = submit(&batch, "reorder", &queue, &payload).await;
 
-    wait_for_the_clock().await;
-    let resting = described(&batch, "before the queue is re-pointed", &job_id).await;
-    assert_eq!(
-        resting["status"].as_str(),
-        Some(state::SERVICE_JOB_RUNNABLE),
-        "case before the queue is re-pointed: expected the job to rest in RUNNABLE, \
-         got {resting}"
+    let resting = polled_until_status(
+        &batch,
+        "before the queue is re-pointed",
+        &job_id,
+        state::SERVICE_JOB_RUNNABLE,
+    )
+    .await;
+    assert!(
+        !is_placed(&batch, &job_id),
+        "case before the queue is re-pointed: expected the job to rest unplaced, got {resting}"
     );
 
     batch
@@ -576,14 +634,7 @@ async fn pointing_a_queue_at_a_bigger_environment_moves_a_resting_service_job_on
             }),
         )
         .await;
-    wait_for_the_clock().await;
-    let moved = described(&batch, "after the queue is re-pointed", &job_id).await;
-    assert_eq!(
-        moved["status"].as_str(),
-        Some(state::SERVICE_JOB_FAILED),
-        "case after the queue is re-pointed: the job the new environment can hold is \
-         walked on by the clock, and nothing here runs SageMaker AI, got {moved}"
-    );
+    polled_until_placed(&batch, "after the queue is re-pointed", &job_id).await;
 }
 
 /// RULE: every caller-filled list and payload this placement rule reads is kept to a

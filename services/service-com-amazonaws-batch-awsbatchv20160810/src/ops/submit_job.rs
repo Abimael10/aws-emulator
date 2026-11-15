@@ -9,8 +9,10 @@
 //! no ACTIVE revision or an unknown `dependsOn` job id is a `ClientException`, never a 200
 //! carrying an id nothing stored. The `jobDefinition` is resolved FIRST, so a submit that
 //! names neither a stored definition nor a stored queue is refused on the DEFINITION, and
-//! a reference naming nothing and one naming a revision that is not `ACTIVE` are the same
-//! refusal ("does not exist or is not in ACTIVE status."). The job id is a fresh UUID, and
+//! a reference naming nothing and one naming a revision that is not `ACTIVE` are DISTINCT
+//! refusals: the first is the service layer's not-found naming the reference, the second
+//! names the stored revision by its ARN
+//! ([`crate::state::job_definition_not_active_message`]). The job id is a fresh UUID, and
 //! the record keeps the queue ARN, the resolved
 //! revision's ARN, `createdAt` in epoch milliseconds, the parameters (the definition's
 //! defaults with the request's applied over them), the effective container
@@ -292,20 +294,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // AWS resolves the JOB DEFINITION before the job queue: a submit naming
             // neither is refused on the definition. The two ways a reference fails to name
-            // a runnable revision — nothing stored for it, and a stored revision that is
-            // not ACTIVE — are ONE refusal, worded from the reference the request gave.
-            let definition = state
+            // a runnable revision are DISTINCT refusals: nothing stored for it is the
+            // service layer's own not-found, worded from the reference the request gave,
+            // while a revision that IS stored but is not `ACTIVE` names the revision by the
+            // ARN the record carries — so a caller that deregistered a revision is told to
+            // correct that revision instead of being left unsure it ever existed.
+            //
+            // A reference with no revision names "the latest active revision", so it
+            // resolves through the ACTIVE lookup first and falls back to the latest stored
+            // revision only to report WHY nothing runnable answered to it.
+            let runnable = state
                 .job_definition(&input.job_definition)
                 .filter(|definition| definition.status.as_deref() == Some(batch::STATUS_ACTIVE))
                 .cloned();
-            let Some(definition) = definition else {
-                return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
-                    format!(
-                        "JobDefinition name {} does not exist or is not in ACTIVE status.",
-                        input.job_definition
-                    ),
-                ))
-                .into());
+            let definition = match runnable {
+                Some(definition) => definition,
+                None => {
+                    let stored = state
+                        .job_definition_key(&input.job_definition)
+                        .and_then(|key| state.job_definitions.get(&key))
+                        .cloned();
+                    let Some(stored) = stored else {
+                        return Err(SubmitJobErrorModeled::ClientException(
+                            batch::not_found_exception("JobDefinition", &input.job_definition),
+                        )
+                        .into());
+                    };
+                    return Err(SubmitJobErrorModeled::ClientException(
+                        batch::client_exception(batch::job_definition_not_active_message(
+                            &stored.job_definition_arn,
+                        )),
+                    )
+                    .into());
+                }
             };
             if definition.container_properties.is_none() && definition.node_properties.is_none() {
                 return Err(crate::scaffolded::Scaffolded::not_implemented(

@@ -192,11 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let attached = state.queues_using_service_environment(&environment.arn);
         if !attached.is_empty() {
+            // The same closed relationship sentence `DeleteComputeEnvironment` answers,
+            // naming no queue ([`batch::job_queue_relationship_message`]).
             return Err(DeleteServiceEnvironmentErrorModeled::ClientException(
-                batch::client_exception(format!(
-                    "Cannot delete, found existing JobQueue relationship: {}",
-                    attached.join(", ")
-                )),
+                batch::client_exception(batch::job_queue_relationship_message()),
             )
             .into());
         }

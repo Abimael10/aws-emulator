@@ -23,15 +23,16 @@
 //!   resolves to the job the first submit minted and mints nothing, the same token with a
 //!   different payload is refused, and two different tokens mint two jobs;
 //! * a submitted service job is handed back in the non-terminal `SUBMITTED` status and
-//!   only the CLOCK moves it — never a read — to `RUNNABLE` and then into the modelled
-//!   failure state, because nothing here runs SageMaker AI: no `scheduledAt`,
-//!   `startedAt`, attempt or capacity usage is invented for work nothing dispatched;
+//!   only the CLOCK moves it — never a read — to `RUNNABLE`, where a service job waits for
+//!   the service its work is dispatched to: with nothing mounted beside this emulator to
+//!   serve that dispatch it waits there, and no `scheduledAt`, `startedAt`, attempt or
+//!   capacity usage is invented for work nothing answered for;
 //! * a `SAGEMAKER_TRAINING` queue's `serviceEnvironmentOrder` resolves each entry by name
 //!   or ARN and stores the service environment's ARN; an entry that resolves to nothing is
 //!   a `ClientException` and the queue is not created.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -51,17 +52,20 @@ const SERVICE_JOB_TYPE: &str = "SAGEMAKER_TRAINING";
 /// (`smithy_query(query="shape", shape="ServiceEnvironmentType")`).
 const ENVIRONMENT_TYPE: &str = "SAGEMAKER_TRAINING";
 
-/// The statuses a service job this emulator accepted passes through, in order: it is
-/// accepted in `SUBMITTED`, the scheduler may place it in `RUNNABLE`, and — nothing here
-/// running SageMaker AI — it ends in the modelled failure state. Each value is one of the
-/// model's own `ServiceJobStatus` values (`smithy_query(query="shape",
-/// shape="ServiceJobStatus")`, which lists them alphabetically, so the ORDER here is the
-/// lifecycle the service's own status docs describe, not the enum's listing order).
-const STATUS_CHAIN: &[&str] = &[
-    state::SERVICE_JOB_SUBMITTED,
-    state::SERVICE_JOB_RUNNABLE,
-    state::SERVICE_JOB_FAILED,
-];
+/// The statuses a service job this emulator holds passes through, in order: it is accepted
+/// in `SUBMITTED` and the clock moves it to `RUNNABLE`, which is where a service job waits
+/// for the service its work is dispatched to. Each value is one of the model's own
+/// `ServiceJobStatus` values (`smithy_query(query="shape", shape="ServiceJobStatus")`, which
+/// lists them alphabetically, so the ORDER here is the lifecycle the service's own status
+/// docs describe, not the enum's listing order).
+const STATUS_CHAIN: &[&str] = &[state::SERVICE_JOB_SUBMITTED, state::SERVICE_JOB_RUNNABLE];
+
+/// How long a poll below gives the clock: far longer than the spans the state gives a
+/// service job's moves, so a loaded host still settles well inside it.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How often a poll looks again. Only the loop's condition decides when it stops.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The rank of `status` in [`STATUS_CHAIN`]; panics for a status this emulator never puts
 /// a service job in, which is itself the assertion.
@@ -835,14 +839,13 @@ async fn a_client_token_makes_submitting_a_service_job_idempotent() {
 }
 
 /// RULE: a submitted service job is handed back in the non-terminal `SUBMITTED` status and
-/// only the CLOCK moves it — a read never does — forward through the statuses this
-/// emulator mints, ending in the modelled failure state with the reason that nothing here
-/// dispatched its work. Nothing a dispatch would have produced is invented on the way.
+/// only the CLOCK moves it — a read never does — into `RUNNABLE`, where a service job WAITS
+/// for the service its work is dispatched to. Nothing a dispatch would have produced is
+/// invented while it waits.
 #[tokio::test]
 async fn a_submitted_service_job_moves_only_with_the_clock_and_never_because_of_a_read() {
     let batch = Batch::new();
     let (queue_name, _) = environment_and_queue(&batch).await;
-    let span = u64::try_from(state::JOB_PHASE_MILLIS).unwrap_or(500);
 
     let accepted = bracketed(submitted(
         &batch,
@@ -873,12 +876,13 @@ async fn a_submitted_service_job_moves_only_with_the_clock_and_never_because_of_
         None,
     );
 
-    // Poll to the end, checking the status never goes backwards and only ever takes a
-    // value this emulator mints.
+    // Poll until the clock has moved it, checking the status never goes backwards and only
+    // ever takes a value this emulator mints. Only the CONDITION ends the loop.
     let mut rank = 0_usize;
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-    let mut detail = before.value;
-    for _ in 0..12 {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    let mut detail;
+    loop {
         detail = described(&batch, "poll", &job_id).await;
         let status = detail["status"].as_str().unwrap_or_default().to_string();
         let observed = status_rank(&status, &detail);
@@ -891,29 +895,23 @@ async fn a_submitted_service_job_moves_only_with_the_clock_and_never_because_of_
         if rank == STATUS_CHAIN.len() - 1 {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(span / 2)).await;
+        assert!(
+            Instant::now() < deadline,
+            "case poll: the clock must move the job on, last read {detail}, having been in \
+             {seen:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 
     assert_eq!(
         detail["status"].as_str(),
-        Some(state::SERVICE_JOB_FAILED),
-        "case poll to the end: nothing here runs SageMaker AI, so the job ends in the \
-         modelled failure state, got {detail}"
-    );
-    assert_eq!(
-        detail["statusReason"].as_str(),
-        Some(state::NO_SERVICE_JOB_RUNTIME_REASON),
-        "case poll to the end: the failure must say why nothing ran, got {detail}"
+        Some(state::SERVICE_JOB_RUNNABLE),
+        "case poll to the end: a service job WAITS in RUNNABLE for the service its work is \
+         dispatched to, which nothing mounted beside this emulator serves, got {detail}"
     );
     assert!(
         seen.contains_key(state::SERVICE_JOB_RUNNABLE),
         "case poll to the end: the job passes through RUNNABLE, saw {seen:?}"
-    );
-    assert!(
-        detail["stoppedAt"]
-            .as_i64()
-            .is_some_and(|stopped| stopped >= detail["createdAt"].as_i64().unwrap_or_default()),
-        "case poll to the end: expected stoppedAt at or after createdAt, got {detail}"
     );
     assert_eq!(
         detail["isTerminated"].as_bool(),
@@ -922,6 +920,8 @@ async fn a_submitted_service_job_moves_only_with_the_clock_and_never_because_of_
     );
     // Nothing dispatched the work, so nothing a dispatch would produce is reported.
     for member in [
+        "statusReason",
+        "stoppedAt",
         "scheduledAt",
         "attempts",
         "latestAttempt",
@@ -939,13 +939,17 @@ async fn a_submitted_service_job_moves_only_with_the_clock_and_never_because_of_
         "case poll to the end: the job never started, so startedAt stays 0, got {detail}"
     );
 
-    // A terminal service job stays exactly where it is.
-    tokio::time::sleep(Duration::from_millis(span * 2)).await;
-    let later = described(&batch, "after the end", &job_id).await;
-    assert_eq!(
-        later, detail,
-        "case after the end: a terminal service job never changes again, got {later}"
-    );
+    // Nor does more time passing move a waiting service job: it is read again until the
+    // deadline, and every read must answer what the one before it did.
+    let settled = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < settled {
+        let later = described(&batch, "after the wait", &job_id).await;
+        assert_eq!(
+            later, detail,
+            "case after the wait: a waiting service job never changes again, got {later}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// RULE: a `SAGEMAKER_TRAINING` queue's `serviceEnvironmentOrder` resolves each entry by
