@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The audit record the state-changing replication, metrics, encryption,
-//! record-expiration and rename operations emit.
+//! record-expiration, tagging and rename operations emit.
 //!
 //! The rule under test: a call that changes stored state leaves exactly ONE
 //! structured record on the service's audit target, naming the operation, the
@@ -567,6 +567,77 @@ async fn each_metrics_delete_accounts_for_what_it_changed() {
             "DeleteTableBucketMetricsConfiguration",
             "a bucket the store does not hold",
         );
+    }
+}
+
+#[tokio::test]
+async fn a_tag_removal_accounts_for_the_resource_it_changed() {
+    let emulator = Emulator::new();
+    let region = "us-east-1";
+    let arn = emulator
+        .create_table_bucket(region, &json!({ "name": "audited-untag-bucket" }))
+        .await
+        .text("arn");
+    let tagged = emulator
+        .tag_resource(region, &arn, &json!({ "owner": "team" }))
+        .await;
+    assert_eq!(
+        tagged.status, 200,
+        "case \"the tagged bucket\": the write must succeed, got {status} {body}",
+        status = tagged.status,
+        body = tagged.body
+    );
+
+    // The removal that takes the key away accounts for it.
+    {
+        let (capture, _guard) = capture_events();
+        let removed = emulator.untag_resource(region, &arn, &["owner"]).await;
+        assert_eq!(
+            removed.status, 204,
+            "case \"the removal\": the removal must succeed, got {status} {body}",
+            status = removed.status,
+            body = removed.body
+        );
+        assert_record(&capture, "UntagResource", &arn, "untagged", "the removal");
+    }
+
+    // A removal that finds every named key already gone leaves the resource as
+    // it was, which is the outcome its record carries.
+    {
+        let (capture, _guard) = capture_events();
+        let again = emulator.untag_resource(region, &arn, &["owner"]).await;
+        assert_eq!(
+            again.status, 204,
+            "case \"nothing to remove\": the removal must succeed, got {status} {body}",
+            status = again.status,
+            body = again.body
+        );
+        assert_record(
+            &capture,
+            "UntagResource",
+            &arn,
+            "unchanged",
+            "nothing to remove",
+        );
+    }
+
+    // A refused removal changes nothing, so it accounts for nothing.
+    {
+        let (capture, _guard) = capture_events();
+        let refused = emulator
+            .untag_resource(
+                region,
+                &expected_bucket_arn(region, "audited-untag-absent"),
+                &["owner"],
+            )
+            .await;
+        assert_eq!(
+            refused.status, 404,
+            "case \"a bucket the store does not hold\": expected 404, got {status} {body}",
+            status = refused.status,
+            body = refused.body
+        );
+        capture.assert_silent("UntagResource", "a bucket the store does not hold");
     }
 }
 

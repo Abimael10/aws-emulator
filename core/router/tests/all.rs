@@ -7515,3 +7515,11 @@ mod events_lambda_target_permission_granted_after_the_rule;
 //! says what that suite is for, which is where an explanation belongs — a note here is a
 //! copy that goes stale, and the runs of them landings had appended past the end of this
 //! list live in `all/appended_notes.rs` instead.
+//! fails every suite in this target. `tests/all.rs` is a test-target CRATE ROOT, so a
+//! bare `mod` resolves to a SIBLING of this file, which the layout check refuses — the
+//! down must be an ordinary `//` comment — better still, leave none. Below, add a
+//! declaration, not a note about one: `all/all_rs_declares_each_suite_once.rs` and
+//! writing anything about the rules here. What a suite covers, and why it lives in this
+//! cross-service target rather than in one service crate's own, belongs in that suite's
+//! own module doc, where it is read beside the test it describes; a note about this file
+//! itself belongs in `all/appended_notes.rs`.

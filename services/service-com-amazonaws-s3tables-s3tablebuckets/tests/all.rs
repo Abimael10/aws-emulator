@@ -85,6 +85,8 @@ mod table_metadata_location;
 mod table_modification_record;
 #[path = "all/table_record_expiration.rs"]
 mod table_record_expiration;
+#[path = "all/untag_resource.rs"]
+mod untag_resource;
 #[path = "all/wire_forms.rs"]
 mod wire_forms;
 #[path = "all/metrics_configuration_delete_scope.rs"]

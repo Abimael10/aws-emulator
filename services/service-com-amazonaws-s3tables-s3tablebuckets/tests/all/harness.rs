@@ -942,6 +942,31 @@ impl Emulator {
         .await
     }
 
+    /// `UntagResource`: the resource's ARN is the one path label and the keys to
+    /// remove travel as repeated `tagKeys` query parameters
+    /// (`DELETE /tag/{resourceArn}?tagKeys=…`).
+    pub async fn untag_resource(
+        &self,
+        region: &str,
+        resource_arn: &str,
+        tag_keys: &[&str],
+    ) -> Reply {
+        self.call("DELETE", &untag_path(resource_arn, tag_keys), region, None)
+            .await
+    }
+
+    /// `UntagResource` as another emulated service reaches it, on the in-process
+    /// path the tags this service's own control plane sets travel on.
+    pub async fn untag_resource_in_process(
+        &self,
+        region: &str,
+        resource_arn: &str,
+        tag_keys: &[&str],
+    ) -> Reply {
+        self.call_in_process("DELETE", &untag_path(resource_arn, tag_keys), region, None)
+            .await
+    }
+
     /// `TagResource` as another emulated service reaches it while provisioning a
     /// resource on a caller's behalf.
     pub async fn tag_resource_in_process(
@@ -1009,9 +1034,23 @@ impl Default for Emulator {
     }
 }
 
+/// The `UntagResource` request path for `resource_arn` and the keys to remove:
+/// the ARN is the one path label and each key travels as its own `tagKeys` query
+/// parameter, so both arrival paths address the operation the same way.
+fn untag_path(resource_arn: &str, tag_keys: &[&str]) -> String {
+    let query: Vec<(&str, String)> = tag_keys
+        .iter()
+        .map(|key| ("tagKeys", (*key).to_string()))
+        .collect();
+    format!("/tag/{}{}", encode(resource_arn), query_string(&query))
+}
+
 /// An `@httpLabel` is ONE path segment and a query value ends at the next `&`, so
 /// an ARN's `:` and `/` have to travel as `%3A` and `%2F` or the request
-/// addresses a different route.
+/// addresses a different route. A `+` and a SPACE travel escaped for the same
+/// reason: a query string decodes a literal `+` as a space and a raw space ends
+/// the request line, so a value carrying either would arrive as a different
+/// value — which is why SigV4's own URI encoding escapes both.
 pub fn encode(value: &str) -> String {
     value
         .replace('%', "%25")
@@ -1019,6 +1058,8 @@ pub fn encode(value: &str) -> String {
         .replace('/', "%2F")
         .replace('&', "%26")
         .replace('=', "%3D")
+        .replace('+', "%2B")
+        .replace(' ', "%20")
 }
 
 /// The path of the Iceberg REST catalog's table endpoint for one table.

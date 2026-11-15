@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes from the table bucket or the table its `resourceArn` addresses exactly the
+//! tag keys the request names, leaving every other key the resource carries as it was.
+//! IDEMPOTENT, as the model declares the operation: a key the resource does not carry is
+//! already absent, so the call is served and changes nothing. The resource is resolved
+//! out of the store by the one resolution every tagging operation shares, which lives in
+//! [`crate::state`]'s tagging module — as does the reserved namespace rule, so a key a
+//! caller may not write is one it may not take away either.
 //!
 //! ## Shape of an operation
 //!
@@ -118,6 +117,33 @@ impl From<UntagResourceErrorModeled> for UntagResourceError {
     }
 }
 
+/// `BadRequestException` (HTTP 400) — "The request is invalid or malformed."
+/// The refusal this operation models for a request the boundary accepted but
+/// the service's own rules reject.
+fn bad_request(message: String) -> UntagResourceError {
+    UntagResourceErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// How this operation words a `resourceArn` that reached no resource of the
+/// store: the `NotFoundException` (HTTP 404) it models for a table bucket or a
+/// table the store does not hold, and its `BadRequestException` (HTTP 400) for a
+/// value that addresses no taggable resource at all. The two classes, and the
+/// sentence each is stated with, are the ones the other tagging operations state
+/// them with — the resolution all three share decides which.
+fn unresolved_resource(refusal: crate::state::TaggableResourceRefusal) -> UntagResourceError {
+    let message = refusal.message().to_string();
+    if refusal.is_absent() {
+        return UntagResourceErrorModeled::NotFoundException(NotFoundException {
+            message: Some(message),
+        })
+        .into();
+    }
+    bad_request(message)
+}
+
 /// The `UntagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -154,18 +180,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServerErrorException(InternalServerErrorException {
+                message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+            })
+        })?;
+
+        // The keys to remove, deduplicated: a list naming one key twice asks for
+        // the same removal twice, which is one removal.
+        let requested: ::std::collections::BTreeSet<String> = input.tag_keys.into_iter().collect();
+
+        // A tag in the reserved namespace is the service's OWN, and a key a
+        // caller may not write is one it may not take away either: the rule is
+        // ownership of the key, not which operation touches it, so the same
+        // sentence `TagResource` refuses such a key with refuses a request to
+        // remove one. The in-process path the service's own control plane sets
+        // those tags on may remove them, exactly as it may set them. Judged
+        // BEFORE the resource is resolved and before anything is written, so a
+        // refused request removes no tag at all — not even the acceptable keys
+        // that travelled with the refused one. The reserved-namespace predicate
+        // is read on its own rather than through `tag_keys_refusal`, which a
+        // write uses: that one also judges the CHARACTER SET a tag key is made
+        // of, and a key no resource can carry is just a key the resource does not
+        // carry — a removal has nothing to refuse it for.
+        if crate::state::tag_key_origin(ctx) == crate::state::TagKeyOrigin::Caller
+            && requested
+                .iter()
+                .any(|key| crate::state::is_reserved_tag_key(key))
+        {
+            return Err(bad_request(
+                crate::state::RESERVED_TAG_KEY_MESSAGE.to_string(),
+            ));
+        }
+
+        let mut store = state.lock();
+
+        // The ARN is resolved against the store rather than trusted, exactly as a
+        // tag write resolves it: a deleted table's ARN is still well formed, and
+        // only the store can tell it from a live one.
+        let resident = store
+            .resource_tags_mut(&input.resource_arn)
+            .map_err(unresolved_resource)?;
+
+        // ONLY the named keys go: every other tag the resource carries stays. A
+        // key the resource does not carry is already absent, so removing it is
+        // the no-op this idempotent operation serves — nothing about the request
+        // is refused for it.
+        let removed = requested
+            .iter()
+            .filter(|key| resident.remove(key.as_str()).is_some())
+            .count();
+        let remaining = resident.len();
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+
+        // The access record for a state-changing operation: who, what and the
+        // outcome — which tells a call that removed a tag from one that found
+        // every named key already gone, as the other removing operations of this
+        // service do. Metadata only: how many tags the resource now carries,
+        // never a tag key or a tag value.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            resource = %input.resource_arn,
+            tags = remaining,
+            outcome = if removed == 0 { "unchanged" } else { "untagged" },
+            "resource tags removed",
+        );
+
+        Ok(UntagResourceOutput {})
     }
 }
