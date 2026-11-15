@@ -66,6 +66,86 @@ pub fn missing_stream_message(stream_id: &str) -> String {
     )
 }
 
+/// The refusal a create whose file names an object the account's object storage holds
+/// nothing at is answered with: the modelled `InvalidRequestException` (HTTP 400).
+///
+/// A stream's file IS the S3 object it names — "A stream transports data bytes in chunks
+/// or blocks packaged as MQTT messages from a source like S3" (`CreateStream`) — so a
+/// file pointed at nothing could never be streamed to a device. The fixed text is the
+/// sentence this error class carries, and the one variable part is the `s3://` address
+/// built from the request's own `bucket` and `key`.
+pub fn absent_stream_file_message(bucket: &str, key: &str) -> String {
+    format!("The S3 object s3://{bucket}/{key} does not exist")
+}
+
+/// The address of the FIRST of `files` this emulator's own Amazon S3 answered that it
+/// holds no object at, as the sentence [`absent_stream_file_message`] states it — or
+/// `None` when the store held, or said nothing about, every one of them.
+///
+/// Reading the object is what decides whether a stream can serve its files at all, and
+/// the read is a HEAD: what has to be established is that the object IS there, and
+/// nothing here fetches firmware bytes. Amazon S3 is reached the way any emulated
+/// service reaches another — the AWS SDK over the emulator's own in-process callback
+/// ([`::service_common::s3_client`]), which opens no socket and resolves no name — so an
+/// object a caller staged with `PutObject` is the object this read serves.
+///
+/// Only what the store ANSWERED refuses a create
+/// ([`::service_common::s3_object_read::answered_refusal`]): with no object store mounted
+/// to ask, or with an answer that says something else about the object, nothing is
+/// established about it and the caller's request is not what is at fault.
+///
+/// NOTHING of the request reaches the ADDRESS this read is made to. The client's endpoint
+/// is built from the Region alone, and that Region is held to the Region-label grammar
+/// ([`::service_common::arn::region_label`]) before it gets there, so a value carrying a
+/// host, a port or a path separator addresses nothing and the create is refused for
+/// nothing. The bucket and key travel as the path of a request the emulator's own Amazon S3
+/// serves — the hop is path-style over the in-process callback, which opens no socket,
+/// resolves no name and cannot leave this process, so no bucket a caller names is a
+/// destination.
+pub async fn absent_stream_file(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    files: &[StreamFile],
+) -> Option<String> {
+    // A Region that is not a Region label is no address at all: nothing is asked, and so
+    // nothing about the files is established.
+    let region = ::service_common::arn::region_label(region)?;
+    // One client for every file of the stream, configured exactly as every other hop
+    // this tree makes into the object store.
+    let client = ::service_common::s3_client::s3_client(ctx.callback(), region);
+    for file in files {
+        // A file naming no object at all is refused before any of this, so one here
+        // names an address for the store to answer about.
+        let Some(location) = file.s3_location.as_ref() else {
+            continue;
+        };
+        let (Some(bucket), Some(key)) = (location.bucket.as_deref(), location.key.as_deref())
+        else {
+            continue;
+        };
+        let mut head = client.head_object().bucket(bucket).key(key);
+        // "The S3 bucket version": a file pinned to one version is that version of the
+        // object, so that is the object the store is asked about.
+        if let Some(version) = location
+            .version
+            .as_deref()
+            .map(str::trim)
+            .filter(|version| !version.is_empty())
+        {
+            head = head.version_id(version);
+        }
+        let Err(answer) = head.send().await else {
+            continue;
+        };
+        if ::service_common::s3_object_read::answered_refusal(&answer)
+            == ::service_common::s3_object_read::ObjectRead::Absent
+        {
+            return Some(absent_stream_file_message(bucket, key));
+        }
+    }
+    None
+}
+
 /// One stream in the store, as this service persists it.
 ///
 /// The files are kept as the MODELLED `StreamFile`s the request carried, so a reader

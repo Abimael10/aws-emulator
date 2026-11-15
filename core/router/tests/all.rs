@@ -71,13 +71,10 @@
 // `all/every_suite_file_is_declared.rs` check the rules above rather than restating them.
 // Single integration-test target for the router: the CANONICAL DECLARATION LIST of its
 // cross-service suites, and nothing else.
-//
-// Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
 // suite file under `tests/all/`, sorted by name, and no other line. Put a new suite at
 // `tests/all/<name>.rs` and insert its pair into the sorted list — nothing beside it, so two
 // branches landing at once insert two lines in two places and have no prose to duplicate,
 // re-word or mistype.
-// EVERY comment in this file is an ORDINARY `//` one, this header included, and that is
 // deliberate: an inner doc comment (`//!`) is legal only before the first item, so one that
 // deliberate: an inner doc comment (`//`) is legal only before the first item, so one that
 // lands past the declarations — which is what concurrent landings appending notes to this
@@ -89,7 +86,6 @@
 // nowhere and its tests never run (this crate's `build.rs` refuses it), and a suite declared
 // twice is `E0428` — each fails every suite in this target, which is why four suites pin the
 // shape above rather than restating it here: `all/all_rs_declares_each_suite_once.rs`,
-// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
 // `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`.
 // WHAT a suite covers, and WHY it belongs to this cross-service target rather than to one
 // test it explains; `all/appended_notes.rs` keeps the notes earlier landings had appended
@@ -175,7 +171,6 @@
 // is `E0428`; and an inner doc comment (`//`) is legal only before the first item, so one
 // written past the declarations is `E0753`. Each of those fails EVERY suite of this
 // target, which is why `all/all_rs_declares_each_suite_once.rs`,
-// `all/all_rs_is_a_canonical_declaration_list.rs` and
 // `all/every_suite_file_is_declared.rs` pin the shape above. Every comment here is an
 // ordinary `//` one, this header included, so no merge of two landings can leave a doc
 // comment past the first item.
@@ -193,7 +188,6 @@
 // cross-service target rather than to one service crate's own, is stated in that suite's own
 // module header; the notes earlier landings had appended to the tail of this file live in
 // `all/appended_notes.rs`, declared below like any other module.
-// Put a new suite at `tests/all/<name>.rs` and declare it below with one
 // Single integration-test target for the router: the declaration list, and nothing else.
 // Put a new suite at `tests/all/<name>.rs` and declare it below with a
 // `#[path = "all/<name>.rs"]` / `mod <name>;` pair, in the one place its name sorts to.
@@ -259,10 +253,8 @@
 // (`tests/boot_serve.rs`) — which the layout check refuses. The `#[path]` is what points
 // each declaration into `tests/all/`.
 // (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is what points each
-// declaration into `tests/all/`.
 // of this target at all, so the list holds pairs only — and with no `//!` anywhere in this
 // file, no merge of two landings can leave a doc comment past the first item.
-// (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what points each
 // The note paragraphs concurrent landings had appended to this file wrapped without the
 // indentation `clippy::doc_lazy_continuation` asks of a doc list item; the lint is allowed
 // here so a re-appended note is a note rather than a build failure.
@@ -275,7 +267,6 @@
 // nothing, so add a declaration below rather than a note about one — the notes earlier
 // landings appended live in `all/appended_notes.rs`.
 // `all/all_rs_is_a_canonical_declaration_list.rs` check those rules — the first two for
-// (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is what points each
 // The header paragraphs above wrap without the indentation `clippy::doc_lazy_continuation`
 // asks of a doc list item; the lint is allowed here so a header line is a header line
 // rather than a build failure.
@@ -2107,9 +2098,6 @@ mod zz_probe_whole_emulator;
 //! What a suite covers, and why it drives the assembled router rather than one service crate,
 //! belongs in that suite's own module header; the notes earlier landings had appended to the
 //! tail of this file live in `all/appended_notes.rs`.
-// The note paragraphs concurrent landings had appended to this file wrapped without the
-// indentation `clippy::doc_lazy_continuation` asks of a doc list item; the lint is allowed
-// here so a re-appended note is a note rather than a build failure.
 // cross-service suites.
 // so two branches landing at once insert two lines in two places and have no prose to
 // duplicate, re-word or mistype. Put a new suite at `tests/all/<name>.rs` and insert its
@@ -2169,7 +2157,6 @@ mod cloudformation_cloudfront_published_edge_address;
 // or merged copy of a line of it can be an inner doc comment past the first item. The rules
 // this root is held to are checked by `all/all_rs_carries_no_inner_doc_comment.rs`,
 // `all/every_suite_file_is_declared.rs` rather than restated here.
-// deliberate: an inner doc comment (`//!`) is legal only before the first item, so one that
 // file keep producing — is `E0753` and compiles no suite of this target. With no `//!`
 // SIBLING of this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]`
 // above each `mod` is what points the declaration into `tests/all/`. A suite no `mod` names
@@ -2231,8 +2218,6 @@ mod ses_configuration_set_cursor_shared_across_v1_and_v2;
 // `E0753` and compiles no suite of this target. With no `//!` in the file at all, no landing
 // `all/all_rs_carries_no_inner_doc_comment.rs` and
 // is `E0428`), every comment an ORDINARY `//` one (an inner `//!` past the first item is
-// of this target at all, so the list holds pairs only — and with no `//!` anywhere in this
-// file, no merge of two landings can leave a doc comment past the first item.
 // suite file, sorted by name, and no other line, so two branches landing at once insert two
 // lines in two places and have no prose to duplicate, re-word or mistype. Put a new suite at
 // `tests/all/<name>.rs` and insert its pair in the one place its name sorts to.
@@ -2497,3 +2482,11 @@ mod declaration_roots_keep_inner_attributes_ahead_of_the_first_item;
 // Single integration-target for the router.
 // had grown hundreds of re-typed copies of its header, many of them written as inner doc
 // comments past the first item (`E0753`), so no suite of this target compiled at all.
+// here is an ORDINARY one, this block included: an inner doc comment is legal only before the
+// first item, so with none anywhere in the file no merge of two landings can put one past the
+// first item, where it is `E0753` and compiles no suite of this target.
+// Some of the files below are shared harnesses or probes rather than suites; all are declared,
+// because a file no declaration names is compiled nowhere.
+// here so a re-appended note is a note rather than a build failure. An inner attribute, like
+// an inner doc comment, is legal only before the first item, so it stands here rather than in
+// the list below.

@@ -119,6 +119,8 @@ mod role_alias_registry;
 mod role_alias_update;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stream_file_objects.rs"]
+mod stream_file_objects;
 #[path = "all/streams.rs"]
 mod streams;
 #[path = "all/thing_group_hierarchy.rs"]

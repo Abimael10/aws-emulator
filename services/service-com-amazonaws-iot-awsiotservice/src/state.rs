@@ -3147,8 +3147,8 @@ pub use provisioning_templates::{
 // one reports — lives in `state/streams.rs`.
 pub mod streams;
 pub use streams::{
-    missing_stream_message, stream_arn, RegisteredStream, FIRST_STREAM_VERSION, MAX_STREAMS,
-    MAX_STREAM_TAGS,
+    absent_stream_file, absent_stream_file_message, missing_stream_message, stream_arn,
+    RegisteredStream, FIRST_STREAM_VERSION, MAX_STREAMS, MAX_STREAM_TAGS,
 };
 
 // WHEN an authorizer may be deleted — the status a record must carry before a delete of

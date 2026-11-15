@@ -184,6 +184,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A file is the S3 object it names, so a file pointed at an object the account's
+        // object storage ANSWERS it holds nothing at could never be streamed to a device:
+        // the create is refused with the modelled `InvalidRequestException` (HTTP 400)
+        // and nothing is written. The read goes to the emulator's OWN Amazon S3 over the
+        // in-process callback — no part of the request reaches that address — and is asked
+        // BEFORE the store is locked, so the lock is never held across it.
+        if let Some(absent) = crate::state::absent_stream_file(ctx, &region, &input.files).await {
+            return Err(CreateStreamErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(absent),
+                },
+            )
+            .into());
+        }
+
         let requested_tags = input.tags.unwrap_or_default();
         if requested_tags.len() > crate::state::streams::MAX_STREAM_TAGS {
             return Err(CreateStreamErrorModeled::InvalidRequestException(
