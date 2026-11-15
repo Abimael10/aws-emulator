@@ -35,6 +35,16 @@ const REGION: &str = "us-east-1";
 /// `RecommenderSchemaFieldList`.
 const MAX_FIELDS_PER_DATASET: usize = MAX_RECOMMENDER_SCHEMA_COLUMNS;
 
+/// The service's refusal message for a domain that holds no backing data table for the
+/// recommender data: fixed text, with no part of it taken from the request — the
+/// `_webAnalytics` in it is literal and not the dataset type the request named.
+const NO_DATA_TABLE_MESSAGE: &str = "Unable to create recommender: Required data table \
+     for _webAnalytics is missing. Before creating a recommender, please ensure you have: \
+     1. Ingested user interaction data (such as clicks, purchases, or views) and 2. \
+     Uploaded your product/item catalog data. The system will automatically create \
+     necessary tables when you import this data. Refer documentation for details: \
+     https://docs.aws.amazon.com/connect/latest/adminguide/predictive-insights-get-started.html";
+
 /// Define the domain's data table for `dataset_type` — the object type the domain ingests
 /// that data through — asserting it was stored.
 async fn define_data_table(emulator: &Emulator, domain: &str, dataset_type: &str) {
@@ -81,6 +91,41 @@ async fn get(emulator: &Emulator, domain: &str, name: &str) -> (u16, Value) {
             None,
         )
         .await
+}
+
+/// `ListRecommenderSchemas` over the wire: `GET /domains/{DomainName}/recommender-schemas`,
+/// with the paging parameters the model binds to the query string (`max-results`,
+/// `next-token`) appended as `query`.
+async fn list(emulator: &Emulator, domain: &str, query: &str) -> (u16, Value) {
+    emulator
+        .send(
+            "GET",
+            &format!("/domains/{domain}/recommender-schemas{query}"),
+            None,
+        )
+        .await
+}
+
+/// The `RecommenderSchemas` of a listing, as a vector of summaries.
+fn listed(body: &Value) -> Vec<Value> {
+    body.get("RecommenderSchemas")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The `RecommenderSchemaName` of every summary in a listing, in the order listed.
+fn listed_names(body: &Value) -> Vec<String> {
+    listed(body)
+        .iter()
+        .map(|schema| {
+            schema
+                .get("RecommenderSchemaName")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
 }
 
 /// A column definition: the required target field name, plus whichever of the two
@@ -515,7 +560,7 @@ async fn an_absent_domain_or_schema_is_reported_absent() {
             "case {case:?}: expected ResourceNotFoundException, got {:?}",
             error_code(&body)
         );
-        let expected = format!("The recommender schema {name} does not exist in domain recdom");
+        let expected = format!("RecommenderSchema {name} is not found");
         assert_eq!(
             error_message(&body),
             expected,
@@ -527,28 +572,37 @@ async fn an_absent_domain_or_schema_is_reported_absent() {
 
 /// A schema selects columns OF a data table, so a dataset type the domain holds no data
 /// table for is refused and nothing is stored — and the same request is admitted once the
-/// domain defines that table. The rows span which of the supported dataset types is
-/// missing, including a request naming both when only one is defined.
+/// domain defines that table.
+///
+/// The refusal states the DOMAIN's readiness, not one dataset type's, so its message is
+/// ONE fixed sentence that carries nothing from the request: the rows span which data
+/// tables the domain already holds (none, either one of them) and which dataset types the
+/// request names, and every row expects the identical text — including the rows whose
+/// request never mentions `_webAnalytics`, the token the sentence names literally.
 #[tokio::test]
 async fn a_dataset_type_with_no_data_table_is_refused_until_the_domain_defines_one() {
     let emulator = Emulator::new();
-    emulator.create_domain("tableless", 90).await;
     emulator.create_domain("tabled", 90).await;
 
-    let rows: [(&str, &str, Value); 3] = [
+    let web = || json!({ "Fields": { "_webAnalytics": [field("Attributes.PageUrl", None, None)] } });
+    let catalog = || json!({ "Fields": { "_catalogItem": [field("Attributes.Sku", None, None)] } });
+
+    let rows: [(&str, &[&str], Value); 5] = [
+        ("no table at all, the request naming the web-analytics one", &[], web()),
+        ("no table at all, the request naming the catalog one", &[], catalog()),
         (
-            "the web-analytics table",
-            "_webAnalytics",
-            json!({ "Fields": { "_webAnalytics": [field("Attributes.PageUrl", None, None)] } }),
+            "only the catalog table defined, the request naming the web-analytics one",
+            &["_catalogItem"],
+            web(),
         ),
         (
-            "the catalog-item table",
-            "_catalogItem",
-            json!({ "Fields": { "_catalogItem": [field("Attributes.Sku", None, None)] } }),
+            "only the web-analytics table defined, the request naming the catalog one",
+            &["_webAnalytics"],
+            catalog(),
         ),
         (
-            "both tables, with neither defined",
-            "_catalogItem",
+            "both dataset types named, with neither table defined",
+            &[],
             json!({
                 "Fields": {
                     "_catalogItem": [field("Attributes.Sku", None, None)],
@@ -558,9 +612,15 @@ async fn a_dataset_type_with_no_data_table_is_refused_until_the_domain_defines_o
         ),
     ];
 
-    for (index, (case, missing, request)) in rows.into_iter().enumerate() {
+    for (index, (case, already_defined, request)) in rows.into_iter().enumerate() {
+        let domain = format!("tableless{index}");
+        emulator.create_domain(&domain, 90).await;
+        for dataset_type in already_defined {
+            define_data_table(&emulator, &domain, dataset_type).await;
+        }
+
         let name = format!("NeedsTable{index}");
-        let (status, body) = create(&emulator, "tableless", &name, request.clone()).await;
+        let (status, body) = create(&emulator, &domain, &name, request.clone()).await;
         assert_eq!(
             status, 400,
             "case {case:?}: expected 400 while the domain holds no data table, got {status} {body:?}"
@@ -572,17 +632,16 @@ async fn a_dataset_type_with_no_data_table_is_refused_until_the_domain_defines_o
             error_code(&body)
         );
         // The sentence is written out here rather than taken from the handler's own
-        // formatter, so a change to that wording has to be made in both places
-        // deliberately: the kind of resource, the name the request carried, and
-        // "not found" — the form this service's `ObjectType {name} not found` takes.
-        let expected = format!("DataTable {missing} not found");
+        // constant, so a change to that wording has to be made in both places
+        // deliberately. It is the service's remediation text for a domain that has not
+        // ingested the recommender source data, and every character of it is fixed.
         assert_eq!(
             error_message(&body),
-            expected,
-            "case {case:?}: expected {expected:?}, got {:?}",
+            NO_DATA_TABLE_MESSAGE,
+            "case {case:?}: expected {NO_DATA_TABLE_MESSAGE:?}, got {:?}",
             error_message(&body)
         );
-        let (status, read) = get(&emulator, "tableless", &name).await;
+        let (status, read) = get(&emulator, &domain, &name).await;
         assert_eq!(
             status, 404,
             "case {case:?}: expected the refused schema to be absent, got {status} {read:?}"
@@ -751,4 +810,216 @@ async fn a_tag_key_outside_the_modelled_bounds_is_refused() {
             "case {case:?}: expected 200 for tag key {key:?}, got {status} {created:?}"
         );
     }
+}
+
+/// The listing reports the schemas of the domain it names and nothing else: every stored
+/// schema, each summary carrying what the create stored, a schema whose create was refused
+/// omitted, a schema of another domain omitted, and a domain that holds none answered with
+/// an empty list rather than an absence.
+#[tokio::test]
+async fn the_listing_reports_every_stored_schema_of_its_domain() {
+    let emulator = Emulator::new();
+    domain_with_data_tables(&emulator, "recdom", 90).await;
+    domain_with_data_tables(&emulator, "other", 90).await;
+    domain_with_data_tables(&emulator, "empty", 90).await;
+
+    // The rows differ along what a summary reports: which dataset types the schema
+    // covers, how many columns each carries, and which optional column settings are set.
+    let stored: [(&str, Value); 3] = [
+        (
+            "Beta",
+            json!({ "Fields": { "_webAnalytics": [field("Attributes.PageUrl", None, None)] } }),
+        ),
+        (
+            "Alpha",
+            json!({
+                "Fields": {
+                    "_catalogItem": [
+                        field("Attributes.Sku", Some("STRING"), Some("CATEGORICAL")),
+                        field("Attributes.Price", Some("NUMBER"), None),
+                    ],
+                },
+            }),
+        ),
+        (
+            "Gamma",
+            json!({
+                "Fields": {
+                    "_catalogItem": [field("Attributes.Sku", None, None)],
+                    "_webAnalytics": fields(MAX_FIELDS_PER_DATASET),
+                },
+            }),
+        ),
+    ];
+
+    let mut created_bodies = Vec::new();
+    for (name, request) in stored.clone() {
+        let (status, created) = create(&emulator, "recdom", name, request).await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected 200, got {status} {created:?}"
+        );
+        created_bodies.push((name, created));
+    }
+
+    // A refused create stores nothing, so the listing does not report it.
+    let (status, refused) = create(
+        &emulator,
+        "recdom",
+        "Refused",
+        json!({ "Fields": { "_clickstream": [field("Attributes.PageUrl", None, None)] } }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case \"a refused create\": expected 400, got {status} {refused:?}"
+    );
+    // A schema of another domain belongs to that domain only.
+    create(
+        &emulator,
+        "other",
+        "Elsewhere",
+        json!({ "Fields": { "_webAnalytics": [field("Attributes.PageUrl", None, None)] } }),
+    )
+    .await;
+
+    let (status, body) = list(&emulator, "recdom", "").await;
+    assert_eq!(
+        status, 200,
+        "case \"the whole listing\": expected 200, got {status} {body:?}"
+    );
+    assert_eq!(
+        listed_names(&body),
+        vec!["Alpha".to_string(), "Beta".to_string(), "Gamma".to_string()],
+        "case \"the whole listing\": expected the stored names in name order, got {:?}",
+        listed_names(&body)
+    );
+    assert!(
+        body.get("NextToken").is_none_or(Value::is_null),
+        "case \"the whole listing\": expected no continuation token, got {:?}",
+        body.get("NextToken")
+    );
+
+    // Each summary reports what the create stored, for every member the summary carries.
+    for (name, created) in &created_bodies {
+        let summary = listed(&body)
+            .into_iter()
+            .find(|schema| schema.get("RecommenderSchemaName").and_then(Value::as_str) == Some(name))
+            .unwrap_or_else(|| panic!("case {name:?}: the listing omits the stored schema"));
+        for member in ["Fields", "CreatedAt", "Status"] {
+            assert_eq!(
+                summary.get(member),
+                created.get(member),
+                "case {name:?}: expected the listed {member} to be the stored one {:?}, got {:?}",
+                created.get(member),
+                summary.get(member)
+            );
+        }
+    }
+
+    let (status, body) = list(&emulator, "other", "").await;
+    assert_eq!(
+        status, 200,
+        "case \"the other domain\": expected 200, got {status} {body:?}"
+    );
+    assert_eq!(
+        listed_names(&body),
+        vec!["Elsewhere".to_string()],
+        "case \"the other domain\": expected only its own schema, got {:?}",
+        listed_names(&body)
+    );
+
+    let (status, body) = list(&emulator, "empty", "").await;
+    assert_eq!(
+        status, 200,
+        "case \"a domain holding no schema\": expected 200, got {status} {body:?}"
+    );
+    assert_eq!(
+        listed(&body).len(),
+        0,
+        "case \"a domain holding no schema\": expected an empty list, got {body:?}"
+    );
+
+    let (status, body) = list(&emulator, "nosuchdomain", "").await;
+    assert_eq!(
+        status, 404,
+        "case \"a domain that was never created\": expected 404, got {status} {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ResourceNotFoundException",
+        "case \"a domain that was never created\": expected ResourceNotFoundException, got {:?}",
+        error_code(&body)
+    );
+}
+
+/// Paging the listing walks every stored schema exactly once, in name order, whatever page
+/// size the caller asks for: the rows span a page size under, at and over the number of
+/// stored schemas, and the published bounds of `MaxResults`.
+#[tokio::test]
+async fn paging_the_listing_walks_every_schema_exactly_once() {
+    let emulator = Emulator::new();
+    domain_with_data_tables(&emulator, "recdom", 90).await;
+
+    let names: Vec<String> = (0..5).map(|i| format!("Schema{i}")).collect();
+    for name in &names {
+        let (status, created) = create(
+            &emulator,
+            "recdom",
+            name,
+            json!({ "Fields": { "_webAnalytics": [field("Attributes.PageUrl", None, None)] } }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected 200, got {status} {created:?}"
+        );
+    }
+
+    // `MaxResults` is `maxSize100` (range 1..100), so 1 and 100 are its published bounds.
+    for page_size in [1, 2, 4, 5, 6, 100] {
+        let mut walked: Vec<String> = Vec::new();
+        let mut query = format!("?max-results={page_size}");
+        let mut pages = 0;
+        loop {
+            let (status, body) = list(&emulator, "recdom", &query).await;
+            assert_eq!(
+                status, 200,
+                "case {page_size}: expected 200 on page {pages}, got {status} {body:?}"
+            );
+            let page = listed_names(&body);
+            assert!(
+                page.len() <= page_size,
+                "case {page_size}: expected at most {page_size} per page, got {:?}",
+                page
+            );
+            walked.extend(page);
+            pages += 1;
+            match body.get("NextToken").and_then(Value::as_str) {
+                Some(token) => query = format!("?max-results={page_size}&next-token={token}"),
+                None => break,
+            }
+            assert!(
+                pages <= names.len() + 1,
+                "case {page_size}: paging did not terminate, walked {walked:?}"
+            );
+        }
+        assert_eq!(
+            walked, names,
+            "case {page_size}: expected every schema once in name order, got {walked:?}"
+        );
+    }
+
+    // A page size past the published maximum is refused by the modelled range, with
+    // nothing listed.
+    let (status, body) = list(&emulator, "recdom", "?max-results=101").await;
+    assert_eq!(
+        status, 400,
+        "case \"one past the published maximum\": expected 400, got {status} {body:?}"
+    );
+    let (status, body) = list(&emulator, "recdom", "?max-results=0").await;
+    assert_eq!(
+        status, 400,
+        "case \"one under the published minimum\": expected 400, got {status} {body:?}"
+    );
 }

@@ -159,13 +159,21 @@ pub const CONTENT_TYPE_STRING: &str = "STRING";
 /// The `ContentType` of a column holding numbers.
 pub const CONTENT_TYPE_NUMBER: &str = "NUMBER";
 
-/// The `BadRequestException` message for a dataset type the domain holds no data table
-/// for, worded as this service words a resource of a kind it cannot find: the kind, the
-/// name the request carried, and "not found" (the same form `ObjectType {name} not found`
-/// takes).
-pub fn data_table_not_found(dataset_type: &str) -> String {
-    format!("DataTable {dataset_type} not found")
-}
+/// The `BadRequestException` message for a domain that holds no backing data table for
+/// the recommender data it would be trained on.
+///
+/// The readiness this states is the DOMAIN's, not one dataset type's: the service answers
+/// one fixed remediation sentence — ingest the interaction data, upload the item catalog,
+/// the tables follow from that import — and interpolates nothing from the request or from
+/// stored state, so the `_webAnalytics` in it is literal text and not the dataset type the
+/// request happened to carry.
+pub const RECOMMENDER_DATA_TABLE_MISSING_MESSAGE: &str = "Unable to create recommender: \
+     Required data table for _webAnalytics is missing. Before creating a recommender, \
+     please ensure you have: 1. Ingested user interaction data (such as clicks, purchases, \
+     or views) and 2. Uploaded your product/item catalog data. The system will \
+     automatically create necessary tables when you import this data. Refer documentation \
+     for details: \
+     https://docs.aws.amazon.com/connect/latest/adminguide/predictive-insights-get-started.html";
 
 /// The fewest columns one dataset type of a recommender schema may list: the `@length`
 /// minimum of `RecommenderSchemaFieldList`.
@@ -2252,12 +2260,12 @@ pub fn profile_object_not_found(profile_object_unique_key: &str) -> String {
 }
 
 /// The `ResourceNotFoundException` message for a recommender schema a domain does not
-/// hold, worded like every other per-domain resource this service reports absent: the
-/// resource kind, the name the request carried, and the domain it was looked for in.
-pub fn recommender_schema_not_found(domain_name: &str, recommender_schema_name: &str) -> String {
-    format!(
-        "The recommender schema {recommender_schema_name} does not exist in domain {domain_name}"
-    )
+/// hold, as the service words that refusal: the resource kind as the API spells it and
+/// "is not found", whose only variable part is the name the request's
+/// `{RecommenderSchemaName}` label carried. The domain is the one the request addressed,
+/// so it is not restated.
+pub fn recommender_schema_not_found(recommender_schema_name: &str) -> String {
+    format!("RecommenderSchema {recommender_schema_name} is not found")
 }
 
 /// The `ResourceNotFoundException` message for a calculated attribute definition a domain

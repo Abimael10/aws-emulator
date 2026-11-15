@@ -204,14 +204,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A schema selects COLUMNS OF a data table, so every dataset type it names has to
         // be one the domain holds a data table for: that table is the object type the
         // domain ingests that data through, and a domain holding none for the dataset type
-        // has no columns for the schema to select.
-        let mut dataset_types: Vec<&String> = input.fields.keys().collect();
-        dataset_types.sort();
-        if let Some(absent) = dataset_types
-            .into_iter()
-            .find(|dataset_type| !domain.holds_data_table(dataset_type))
+        // has no columns for the schema to select. The refusal states the DOMAIN's
+        // readiness, so it is one fixed sentence whichever dataset type is unbacked.
+        if input
+            .fields
+            .keys()
+            .any(|dataset_type| !domain.holds_data_table(dataset_type))
         {
-            return Err(bad_request(crate::state::data_table_not_found(absent)));
+            return Err(bad_request(
+                crate::state::RECOMMENDER_DATA_TABLE_MISSING_MESSAGE.to_string(),
+            ));
         }
 
         // The name identifies the schema within the domain, so a name the domain already

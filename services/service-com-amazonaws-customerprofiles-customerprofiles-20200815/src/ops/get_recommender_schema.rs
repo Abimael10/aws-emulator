@@ -164,7 +164,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.recommender_schema_name)
             .ok_or_else(|| {
                 not_found(crate::state::recommender_schema_not_found(
-                    &input.domain_name,
                     &input.recommender_schema_name,
                 ))
             })?;
