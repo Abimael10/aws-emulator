@@ -213,7 +213,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let workspace_status = workspace.status_code.clone();
         let workspace_arn = workspace.arn.clone();
 
         // Nothing to delete: the policy is the resource that doesn't exist (404). That
@@ -238,24 +237,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if !replays_pending_delete {
             // "Update/Deletion is disallowed until Resource-based Policy is ACTIVE and
-            // Workspace is ACTIVE" (`WorkspacePolicyStatusCode`) — ConflictException (409).
-            if !crate::state::policy_mutation_allowed(workspace) {
-                return Err(DeleteResourcePolicyErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "The workspace is {} and its resource-based policy is {}; a \
-                             deletion is allowed only while the workspace is {} and the \
-                             policy is {}",
-                            workspace_status,
-                            policy.status_code,
-                            crate::state::STATUS_ACTIVE,
-                            crate::state::POLICY_STATUS_ACTIVE,
-                        ),
-                        resource_id: input.workspace_id.clone(),
-                        resource_type: crate::state::POLICY_RESOURCE_TYPE.to_string(),
-                    },
-                )
-                .into());
+            // Workspace is ACTIVE" (`WorkspacePolicyStatusCode`) — ConflictException
+            // (409), worded with the one sentence a policy mutation the status gate
+            // forbids answers, whichever of the two mutations it stopped, and carrying
+            // the status that forbade it (`crate::state::policy_mutation_conflict`).
+            if let Some(blocking_status) = crate::state::policy_mutation_blocking_status(workspace)
+            {
+                let refusal =
+                    crate::state::policy_mutation_conflict(&input.workspace_id, blocking_status);
+                return Err(DeleteResourcePolicyErrorModeled::ConflictException(refusal).into());
             }
 
             // The same optimistic lock a put takes: a `revisionId` that does not name

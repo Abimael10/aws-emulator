@@ -1456,19 +1456,65 @@ pub fn logging_mutation_allowed(workspace_status: &str, logging_status: &str) ->
     workspace_status == STATUS_ACTIVE && logging_status == LOGGING_STATUS_ACTIVE
 }
 
-/// Whether a workspace and its attached policy are in the state the modelled
-/// `WorkspacePolicyStatusCode` requires before a resource-policy put or delete may act.
+/// The status that FORBIDS a resource-based policy mutation on `workspace`, or `None`
+/// when nothing does — the gate a put and a delete both take, handing back the value a
+/// refusal has to report.
 ///
-/// Every entry of that enum documents the same rule: "Update/Deletion is disallowed
-/// until Resource-based Policy is ACTIVE and Workspace is ACTIVE." A workspace with no
-/// policy attached yet has nothing to wait for, so only the workspace's own status
-/// gates the first put.
-pub fn policy_mutation_allowed(workspace: &Workspace) -> bool {
-    workspace.status_code == STATUS_ACTIVE
-        && workspace
-            .policy
-            .as_ref()
-            .is_none_or(|policy| policy.status_code == POLICY_STATUS_ACTIVE)
+/// Every entry of the modelled `WorkspacePolicyStatusCode` documents the same rule:
+/// "Update/Deletion is disallowed until Resource-based Policy is ACTIVE and Workspace is
+/// ACTIVE." That names two conditions, and a refusal states the ONE that is not met: the
+/// status of the policy the call acts on while that policy is still settling, otherwise
+/// the status of the workspace holding it — a value of the same vocabulary
+/// (`CREATING | ACTIVE | UPDATING | DELETING`) either way. A workspace that holds no
+/// policy has nothing to wait for, so only its own status gates the first put.
+pub fn policy_mutation_blocking_status(workspace: &Workspace) -> Option<&str> {
+    match workspace.policy.as_ref() {
+        Some(policy) if policy.status_code != POLICY_STATUS_ACTIVE => Some(&policy.status_code),
+        _ if workspace.status_code != STATUS_ACTIVE => Some(&workspace.status_code),
+        _ => None,
+    }
+}
+
+/// How a resource-based policy mutation the status gate forbids is refused: the modelled
+/// `ConflictException` (409) carrying [`policy_mutation_conflict_message`] for the status
+/// that blocked it, the workspace the policy hangs off in `resourceId` and the policy's
+/// own AWS type name ([`POLICY_RESOURCE_TYPE`]) in `resourceType`.
+///
+/// ONE composition for `PutResourcePolicy` and `DeleteResourcePolicy`, which share the
+/// gate: whichever of them a status stops, a caller reads the same refusal.
+pub fn policy_mutation_conflict(
+    workspace_id: &str,
+    blocking_status: &str,
+) -> crate::ops::types::ConflictException {
+    crate::ops::types::ConflictException {
+        message: policy_mutation_conflict_message(blocking_status),
+        resource_id: workspace_id.to_string(),
+        resource_type: POLICY_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The sentence the service answers when the status gate forbids a mutation of a
+/// workspace's resource-based policy.
+///
+/// RECORDED BEHAVIOUR: a put that arrives while the policy it would replace is still
+/// settling is refused "Can't update the workspace resource policy in non-(ACTIVE) state.
+/// Current status is UPDATING" — fixed text, including the parenthesised ACTIVE this
+/// family words the refusal with and no trailing period, up to ONE variable part: the
+/// status that blocked the call, read from this store ([`policy_mutation_blocking_status`]).
+/// Neither the workspace, nor the second status of the pair the gate checks, nor anything
+/// of the request appears in it.
+///
+/// The gate is one rule for both mutations ("Update/Deletion is disallowed until
+/// Resource-based Policy is ACTIVE and Workspace is ACTIVE"), so a put and a delete it
+/// stops answer this one sentence. It is worded here rather than through
+/// [`status_forbids_call_message`] because that template carries the status of the ONE
+/// resource its call acts on and spells the state unparenthesised, which is the recorded
+/// wording for the workspace itself and not for its policy.
+pub fn policy_mutation_conflict_message(blocking_status: &str) -> String {
+    format!(
+        "Can't update the workspace resource policy in non-({POLICY_STATUS_ACTIVE}) state. \
+         Current status is {blocking_status}"
+    )
 }
 
 /// Whether a request naming `revision_id` may act on the policy a workspace currently

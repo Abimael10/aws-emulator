@@ -237,26 +237,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Update/Deletion is disallowed until Resource-based Policy is ACTIVE and
         // Workspace is ACTIVE" (`WorkspacePolicyStatusCode`): putting over a policy that
         // is still settling, or onto a workspace that is not active, would leave an
-        // inconsistent state — ConflictException (409).
-        if !crate::state::policy_mutation_allowed(workspace) {
-            let policy_status = existing
-                .as_ref()
-                .map_or("not attached", |policy| policy.status_code.as_str());
-            return Err(PutResourcePolicyErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "The workspace is {} and its resource-based policy is {}; a put is \
-                         allowed only while the workspace is {} and any policy it holds is {}",
-                        workspace_status,
-                        policy_status,
-                        crate::state::STATUS_ACTIVE,
-                        crate::state::POLICY_STATUS_ACTIVE,
-                    ),
-                    resource_id: input.workspace_id.clone(),
-                    resource_type: crate::state::POLICY_RESOURCE_TYPE.to_string(),
-                },
-            )
-            .into());
+        // inconsistent state — ConflictException (409), worded with the service's one
+        // sentence for a policy mutation the status gate forbids, carrying the status
+        // that forbade it (`crate::state::policy_mutation_conflict`).
+        if let Some(blocking_status) = crate::state::policy_mutation_blocking_status(workspace) {
+            let refusal =
+                crate::state::policy_mutation_conflict(&input.workspace_id, blocking_status);
+            return Err(PutResourcePolicyErrorModeled::ConflictException(refusal).into());
         }
 
         // The optimistic lock: a `revisionId` that does not name the policy's current

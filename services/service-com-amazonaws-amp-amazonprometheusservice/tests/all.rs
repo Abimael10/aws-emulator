@@ -63,6 +63,8 @@ mod rejection_codes;
 mod replay_while_a_removal_is_owed;
 #[path = "all/resource_policy_lifecycle.rs"]
 mod resource_policy_lifecycle;
+#[path = "all/resource_policy_mutation_conflict.rs"]
+mod resource_policy_mutation_conflict;
 #[path = "all/rule_group_name_bound.rs"]
 mod rule_group_name_bound;
 #[path = "all/rule_groups_namespace_deletion.rs"]
