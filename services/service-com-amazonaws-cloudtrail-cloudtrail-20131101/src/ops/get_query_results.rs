@@ -233,7 +233,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The deprecated `EventDataStore` is "The ARN (or ID suffix of the ARN) of the
         // event data store against which the query was run": a value that cannot be
         // read as either is refused as an ARN, and one that can only narrows which
-        // store's query this request addresses.
+        // store's query this request addresses — the query id is what this operation
+        // resolves on, the same reading `DescribeQuery` and `CancelQuery` apply
+        // (`crate::state::addressed_query`).
         let named_store = input
             .event_data_store
             .as_deref()
@@ -249,11 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let owner = input.event_data_store_owner_account_id.as_deref();
 
         let query = store
-            .query(
-                &input.query_id,
-                &region,
-                named_store.as_ref().map(|identifier| identifier.id.as_str()),
-            )
+            .addressed_query(&input.query_id, &region, named_store.as_ref())
             // `EventDataStoreOwnerAccountId` "The account ID of the event data store
             // owner": a query whose store belongs to another account is not the one
             // this request addresses.

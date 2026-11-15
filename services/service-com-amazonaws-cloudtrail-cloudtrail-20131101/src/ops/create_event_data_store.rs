@@ -339,7 +339,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource" (model doc for `InvalidTagParameterException`): a tag set is a map
         // on the wire even though the model carries it as a list, and the limit is the
         // one the model documents for every taggable CloudTrail resource.
-        let tags = input.tags_list.unwrap_or_default();
+        let tags = crate::state::tags_stored(input.tags_list.unwrap_or_default());
         if tags.len() > crate::state::TAGS_PER_RESOURCE_LIMIT {
             return Err(CreateEventDataStoreErrorModeled::InvalidTagParameterException(
                 InvalidTagParameterException {

@@ -96,6 +96,10 @@ sha2 = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Polls several requests of this service AT ONCE, so a suite can assert what concurrent
+# writers of one resource leave behind (`tests/all/dashboard_concurrent_updates.rs`).
+# Already in this workspace's lock file; only the combinator (`join_all`) is used.
+futures = "0.3"
 # Reads the base64 an `awsJson1_1` body carries a blob member in, so a suite can decode the
 # DER public key `ListPublicKeys` reported and parse it back.
 base64 = "0.22"

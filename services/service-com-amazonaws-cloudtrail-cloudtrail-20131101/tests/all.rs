@@ -241,3 +241,24 @@ mod advanced_event_selector_rules;
 // addresses, before the operation acts on it.
 #[path = "all/identity_authorization.rs"]
 mod identity_authorization;
+// `event_data_store_member_refusals` pins what an `EventDataStore` member a request
+// carries is refused with: the form the federation and event-configuration operations
+// judge it on, and that the DEPRECATED member of the query operations only narrows which
+// store's query a request addresses.
+#[path = "all/event_data_store_member_refusals.rs"]
+mod event_data_store_member_refusals;
+// `trail_status_deprecated_members` pins the split between the two halves of
+// `GetTrailStatus`'s report: the deprecated String members, always present and empty until
+// set, and their `Date` twins, omitted until then.
+#[path = "all/trail_status_deprecated_members.rs"]
+mod trail_status_deprecated_members;
+// `tagging_reader_fidelity` pins what the tagging reader reports: a tag stored with no
+// `Value` carries the member empty, and `ListTags` answers one positional entry per ARN
+// however many its list names.
+#[path = "all/tagging_reader_fidelity.rs"]
+mod tagging_reader_fidelity;
+// `dashboard_concurrent_updates` pins what concurrent `UpdateDashboard` calls leave: one
+// accepted writer's values in force, the dashboard reporting UPDATED, and every answer a
+// success or the modelled conflict refusal.
+#[path = "all/dashboard_concurrent_updates.rs"]
+mod dashboard_concurrent_updates;

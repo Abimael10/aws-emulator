@@ -265,9 +265,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             is_logging: Some(status.is_logging),
             start_logging_time: status.start_logging_time.map(::aws_smithy_types::DateTime::from),
             stop_logging_time: status.stop_logging_time.map(::aws_smithy_types::DateTime::from),
-            // The deprecated string forms of the two instants above.
-            time_logging_started: status.start_logging_time.and_then(crate::state::iso8601),
-            time_logging_stopped: status.stop_logging_time.and_then(crate::state::iso8601),
+            // The deprecated string forms of the two instants above: a member of that
+            // half of the report is always present, empty while it has no instant to
+            // carry (see [`reported`]).
+            time_logging_started: reported(status.start_logging_time.and_then(crate::state::iso8601)),
+            time_logging_stopped: reported(status.stop_logging_time.and_then(crate::state::iso8601)),
             // "Specifies the date and time that CloudTrail last delivered log files to an
             // account's Amazon S3 bucket": the newest log file this trail's bucket holds,
             // and `None` for a trail none of whose calls has been delivered yet.
@@ -275,8 +277,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The deprecated string forms of that same instant: the attempt CloudTrail
             // made, and the one that succeeded — which, for a delivery whose object the
             // bucket holds, are the same attempt.
-            latest_delivery_attempt_time: latest_delivery.and_then(crate::state::iso8601),
-            latest_delivery_attempt_succeeded: latest_delivery.and_then(crate::state::iso8601),
+            latest_delivery_attempt_time: reported(
+                latest_delivery.and_then(crate::state::iso8601),
+            ),
+            latest_delivery_attempt_succeeded: reported(
+                latest_delivery.and_then(crate::state::iso8601),
+            ),
             // Nothing has failed a delivery, delivered a digest file, written to
             // CloudWatch Logs or sent a notification for this trail, so there is no error,
             // digest, log-group delivery or notification to report.
@@ -287,8 +293,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             latest_cloud_watch_logs_delivery_time: None,
             latest_digest_delivery_time: None,
             latest_digest_delivery_error: None,
-            latest_notification_attempt_time: None,
-            latest_notification_attempt_succeeded: None,
+            // Still the deprecated string half of the report, so still present: this
+            // trail has no notification attempt to carry.
+            latest_notification_attempt_time: reported(None),
+            latest_notification_attempt_succeeded: reported(None),
         })
     }
+}
+
+/// One of the report's deprecated String members, as this operation always reports it.
+///
+/// `GetTrailStatusResponse` states the same six facts twice: as a `Date` member
+/// (`LatestDeliveryTime`, `StartLoggingTime`, …) and as a String member the model marks
+/// "This field is no longer in use" (`LatestDeliveryAttemptTime`, `TimeLoggingStarted`,
+/// …) — `smithy_query(query="operation",operation="GetTrailStatus")` lists both halves.
+/// The two halves are reported differently, and that split is the contract: the recorded
+/// status of a trail that has never logged carries every String member as `""` and
+/// OMITS every `Date` member, so a client reading the deprecated half unconditionally
+/// finds the member whether or not the trail has the instant it would carry.
+fn reported(value: Option<String>) -> Option<String> {
+    Some(value.unwrap_or_default())
 }

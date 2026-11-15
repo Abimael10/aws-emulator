@@ -48,6 +48,11 @@ const ACCESS_DENIED: (u16, &str) = (403, "AccessDeniedException");
 /// The bucket every trail in this suite delivers to; the harness records it for the call.
 const BUCKET: &str = "authz-trail-logs";
 
+/// The one value `ListInsightsDataType` publishes
+/// (`smithy_query(query="shape",shape="ListInsightsDataType")`), so the Insights read's
+/// required members are stated the way the model admits them.
+const INSIGHTS_EVENTS_DATA_TYPE: &str = "InsightsEvents";
+
 /// The ARN the account holds the IAM user under — what a refusal names as the caller.
 fn user_arn() -> String {
     format!(
@@ -288,6 +293,38 @@ async fn a_call_is_served_only_when_an_identity_policy_allows_its_action() {
             resource: Some(trail_arn("authz-allowed-write")),
             refused_because: None,
         },
+        Row {
+            // The Insights read, which addresses no single CloudTrail resource of its own
+            // (`ListInsightsDataRequest` carries no identifier member naming one), so it
+            // is judged against every resource of this service and the sentence states no
+            // resource clause.
+            case: "no policy at all, on the Insights data read",
+            document: None,
+            operation: "ListInsightsData",
+            request: json!({
+                "InsightSource": trail_arn("authz-read"),
+                "DataType": INSIGHTS_EVENTS_DATA_TYPE,
+            }),
+            resource: None,
+            refused_because: Some(no_policy_allows("cloudtrail:ListInsightsData")),
+        },
+        Row {
+            case: "an explicit deny of the Insights data read beside an allow of everything",
+            document: Some(json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Effect": "Allow", "Action": "*", "Resource": "*"},
+                    {"Effect": "Deny", "Action": "cloudtrail:ListInsightsData", "Resource": "*"},
+                ],
+            })),
+            operation: "ListInsightsData",
+            request: json!({
+                "InsightSource": trail_arn("authz-read"),
+                "DataType": INSIGHTS_EVENTS_DATA_TYPE,
+            }),
+            resource: None,
+            refused_because: Some(EXPLICIT_DENY.to_string()),
+        },
     ];
 
     for Row {
@@ -320,6 +357,32 @@ async fn a_call_is_served_only_when_an_identity_policy_allows_its_action() {
             }
         }
     }
+
+    // Removing the deny decides the very next call: with an allow of this service in
+    // force, the same Insights read is no longer refused by the gate — whatever the
+    // operation then answers about the trail's Insights configuration.
+    given_user_policy(
+        emulator.engine(),
+        Some(&policy("Allow", json!("cloudtrail:*"), json!("*"))),
+    );
+    let case = "the Insights data read once the deny is lifted";
+    let reply = emulator
+        .call_in_as(
+            "ListInsightsData",
+            USER_KEY_ID,
+            HOME_REGION,
+            &json!({
+                "InsightSource": trail_arn("authz-read"),
+                "DataType": INSIGHTS_EVENTS_DATA_TYPE,
+            }),
+        )
+        .await;
+    assert_ne!(
+        (reply.status, reply.error_code()),
+        ACCESS_DENIED,
+        "case {case:?}: an allowed call must not be refused by the authorization gate, got \
+         {reply:?}"
+    );
 
     // The refused write stored nothing, and the allowed one did: the decision is taken
     // before the operation acts, so a denial cannot leave a trail behind.

@@ -391,7 +391,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> 
             .into());
         }
 
-        let tags = input.tags_list.take().unwrap_or_default();
+        let tags = crate::state::tags_stored(input.tags_list.take().unwrap_or_default());
         if tags.len() > crate::state::TAGS_PER_RESOURCE_LIMIT {
             return Err(CreateTrailErrorModeled::TagsLimitExceededException(
                 TagsLimitExceededException {

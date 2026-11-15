@@ -11320,6 +11320,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "flate2",
+ "futures",
  "hex",
  "http",
  "md-5 0.10.6",

@@ -225,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         match target {
             crate::state::EventConfigurationTarget::EventDataStore(identifier) => {
-                let parsed = crate::state::parse_event_data_store_identifier(&identifier)
+                let parsed = crate::state::parse_minted_event_data_store_identifier(&identifier)
                     .map_err(|rejection| {
                         GetEventConfigurationErrorModeled::EventDataStoreARNInvalidException(
                             EventDataStoreARNInvalidException {

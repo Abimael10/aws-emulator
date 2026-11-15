@@ -12,10 +12,9 @@
 //!   `InactiveQueryException` names ("FINISHED, FAILED, TIMED_OUT, or CANCELLED") —
 //!   cannot be cancelled, and the refusal leaves the run as it was;
 //! * `EventDataStore` is "the ARN (or the ID suffix of the ARN) of an event data
-//!   store": an unreadable one is `EventDataStoreARNInvalidException`, a readable
-//!   one naming no store in the addressed Region is
-//!   `EventDataStoreNotFoundException`, and a store awaiting deletion is
-//!   `InactiveEventDataStoreException`;
+//!   store", and it is DEPRECATED on this request: an unreadable one is
+//!   `EventDataStoreARNInvalidException`, and a readable one only NARROWS which
+//!   store's query the request addresses;
 //! * a query is resolved on its QUERY ID, the deprecated `EventDataStore` member
 //!   only narrowing which store's query a request addresses: a request that names
 //!   no store needs no store to exist, so an id naming no query is
@@ -494,15 +493,14 @@ async fn a_query_id_that_resolves_to_no_query_here_is_not_found() {
     }
 }
 
-/// RULE: `EventDataStore` is "the ARN (or the ID suffix of the ARN) of an event
-/// data store": an unreadable value is refused as an invalid ARN, and a readable
-/// one naming no store in the Region it addresses is not found — before the query
-/// id is read, so a request naming a persisted query is refused all the same. The
-/// member is deprecated and optional, so a request that names NO store resolves on
-/// its query id alone: an id naming no query is `QueryIdNotFoundException` whether
-/// or not the Region holds a store.
+/// RULE: the deprecated `EventDataStore` member only NARROWS which store's query a
+/// request addresses — the QUERY ID is what this operation resolves on. So an id naming
+/// no query the request addresses is `QueryIdNotFoundException` whether or not the store
+/// named exists, and only a value the service cannot read as a store at all is refused on
+/// the member's own form. The store a RESOLVED query ran on still has to be one the
+/// registry holds.
 #[tokio::test]
-async fn the_event_data_store_resolves_before_the_query_id() {
+async fn the_query_id_resolves_before_the_deprecated_event_data_store() {
     let emulator = Emulator::new();
     let record = query_in(1, QueryState::Running);
     seed_query(&emulator, &record);
@@ -530,20 +528,21 @@ async fn the_event_data_store_resolves_before_the_query_id() {
 
     seed_store(&emulator, STORE_ID, HOME_REGION, EventDataStoreState::Enabled);
 
-    // Readable, but naming no store in the Region it addresses.
+    // Readable, but narrowing to a store the query did not run on: the request addresses
+    // no query, which is what it is answered about.
     for identifier in [
         "ffffffff-5555-6666-7777-888888888888".to_string(),
         event_data_store_arn("eu-west-1", STORE_ID),
         event_data_store_arn(HOME_REGION, "ffffffff-5555-6666-7777-888888888888"),
     ] {
-        let case = format!("unknown EventDataStore {identifier}");
+        let case = format!("EventDataStore {identifier} narrowing to another store");
         emulator
             .call(
                 "CancelQuery",
                 &json!({ "QueryId": record.query_id, "EventDataStore": identifier }),
             )
             .await
-            .expect_error(&case, NOT_FOUND_STATUS, "EventDataStoreNotFoundException");
+            .expect_error(&case, NOT_FOUND_STATUS, "QueryIdNotFoundException");
     }
 
     // Unreadable: ARN-shaped, but not an event data store ARN.

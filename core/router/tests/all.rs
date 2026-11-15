@@ -1,5 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: the DECLARATION LIST, and nothing else.
+//
+// Put a new suite at `tests/all/<name>.rs` and declare it below with one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted so the list stays sorted by
+// name. Why a suite belongs to this cross-service target rather than to one service
+// crate's own is stated in that suite's own module doc, which is where it stays readable:
+// a note here is prose two landing branches duplicate, re-word and mistype.
+//
+// Three rules this file lives or dies by, each pinned by a suite of its own
+// (`all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
+// `all/all_rs_is_a_canonical_declaration_list.rs`): one declaration per suite (a second
+// is `E0428`), every comment an ORDINARY `//` one (an inner `//!` past the first item is
+// `E0753`), and nothing in the list but declaration pairs. Each failure compiles no suite
+// of this target at all, so the list holds pairs only.
 //! Single integration-test target for the router.
 //!
 //! One `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted, and nothing else:

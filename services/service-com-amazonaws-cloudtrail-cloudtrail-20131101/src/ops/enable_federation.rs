@@ -240,8 +240,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is read here rather than through
         // `ComAmazonawsCloudtrailCloudtrail20131101State::event_data_store` so the
         // refusal below can name the ARN it addressed.
-        let identifier = crate::state::parse_event_data_store_identifier(&input.event_data_store)
-            .map_err(|rejection| {
+        let identifier = crate::state::parse_minted_event_data_store_identifier(
+            &input.event_data_store,
+        )
+        .map_err(|rejection| {
             EnableFederationErrorModeled::EventDataStoreARNInvalidException(
                 EventDataStoreARNInvalidException {
                     message: Some(rejection.message(&region)),

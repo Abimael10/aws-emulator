@@ -40,16 +40,14 @@ const EVENT_DATA_STORE: &str = "EVENT_DATA_STORE";
 /// See [`EVENT_DATA_STORE`].
 const CUSTOM_SOURCE: &str = "Custom";
 
-/// One tag set as a row writes it: each key, and the value it carries if any ("If you
-/// specify a key without a value, the tag will be created with the specified key and a
-/// value of null").
+/// One tag set as a row writes it: each key, and the value it carries if any — `Tag$Value`
+/// is an optional member, so a request may leave it out.
 type TagPairs<'a> = &'a [(&'a str, Option<&'a str>)];
 
 /// One tag set as the registry holds it: each key and the value it carries, if any.
 type StoredPairs = Vec<(String, Option<String>)>;
 
-/// A tag set as the wire carries it — the shape of a `TagsList` in a request and in a
-/// `ListTags` reply alike.
+/// A tag set as a REQUEST carries it: a key with a value, or a key alone.
 fn wire_tags(pairs: TagPairs<'_>) -> Value {
     Value::Array(
         pairs
@@ -62,11 +60,29 @@ fn wire_tags(pairs: TagPairs<'_>) -> Value {
     )
 }
 
-/// The same tag set as a snapshot of the registry holds it.
+/// The same tag set as a READ reports it: every tag carries its `Value`, empty for one
+/// the request stated none for — a tag stored without a value is reported with the member
+/// present and empty rather than dropped.
+fn read_back_tags(pairs: TagPairs<'_>) -> Value {
+    Value::Array(
+        pairs
+            .iter()
+            .map(|(key, value)| json!({"Key": key, "Value": value.unwrap_or_default()}))
+            .collect(),
+    )
+}
+
+/// The same tag set as a snapshot of the registry holds it: the STORED form, in which a
+/// tag the request stated no value for carries the empty one.
 fn stored_pairs(pairs: TagPairs<'_>) -> StoredPairs {
     pairs
         .iter()
-        .map(|(key, value)| ((*key).to_string(), value.map(str::to_string)))
+        .map(|(key, value)| {
+            (
+                (*key).to_string(),
+                Some(value.unwrap_or_default().to_string()),
+            )
+        })
         .collect()
 }
 
@@ -281,7 +297,7 @@ async fn list_tags_reports_the_stored_tag_set_of_every_taggable_kind() {
     // The rows differ in the KIND the ARN names, the Region it pins, the SIZE of the
     // stored tag set (none, one, two, three) and whether a tag carries a value.
     let rows: Vec<(&str, &String, Value)> = vec![
-        ("a trail's tag set", &trail, wire_tags(trail_tags)),
+        ("a trail's tag set", &trail, read_back_tags(trail_tags)),
         (
             "a trail nobody tagged, in another Region",
             &untagged_trail,
@@ -290,10 +306,14 @@ async fn list_tags_reports_the_stored_tag_set_of_every_taggable_kind() {
         (
             "a dashboard's tag set",
             &dashboard,
-            wire_tags(dashboard_tags),
+            read_back_tags(dashboard_tags),
         ),
-        ("an event data store's tag set", &store, wire_tags(store_tags)),
-        ("a channel's tag set", &channel, wire_tags(channel_tags)),
+        (
+            "an event data store's tag set",
+            &store,
+            read_back_tags(store_tags),
+        ),
+        ("a channel's tag set", &channel, read_back_tags(channel_tags)),
         (
             "a channel nobody tagged, in another Region",
             &untagged_channel,
@@ -395,9 +415,9 @@ async fn a_channels_tag_set_round_trips_through_the_tagging_operations() {
         let listed = listed_tags(&emulator, case, &channel).await;
         assert_eq!(
             listed,
-            wire_tags(held),
+            read_back_tags(held),
             "case {case}: expected the tag set {:?}, got {listed:?}",
-            wire_tags(held)
+            read_back_tags(held)
         );
         // And the registry the handlers read holds the same thing.
         let stored = stored_channel_tags(&emulator, HOME_REGION, &id);

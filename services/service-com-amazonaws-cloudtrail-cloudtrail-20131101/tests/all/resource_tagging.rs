@@ -227,9 +227,8 @@ fn arn(region: &str, resource_type: &str, id: &str) -> String {
     format!("arn:aws:cloudtrail:{region}:{ACCOUNT}:{resource_type}/{id}")
 }
 
-/// `TagsList` as the wire carries it: a key with a value, or a key alone ("If you
-/// specify a key without a value, the tag will be created with the specified key and
-/// a value of null").
+/// `TagsList` as the wire carries it: a key with a value, or a key alone — the member is
+/// optional, so a request may leave it out.
 fn tags(pairs: &[(&str, Option<&str>)]) -> Value {
     Value::Array(
         pairs
@@ -238,6 +237,19 @@ fn tags(pairs: &[(&str, Option<&str>)]) -> Value {
                 Some(value) => json!({"Key": key, "Value": value}),
                 None => json!({"Key": key}),
             })
+            .collect(),
+    )
+}
+
+/// The same tag set as a READ reports it: every tag carries its `Value`, empty for one
+/// the request stated none for. A tag stored with no value is read back with the member
+/// present and empty rather than dropped, so a present-but-empty value never reads as a
+/// missing one.
+fn reported_tags(pairs: &[(&str, Option<&str>)]) -> Value {
+    Value::Array(
+        pairs
+            .iter()
+            .map(|(key, value)| json!({"Key": key, "Value": value.unwrap_or_default()}))
             .collect(),
     )
 }
@@ -715,10 +727,14 @@ async fn a_tag_list_naming_one_key_twice_is_refused() {
 }
 
 /// RULE: `ListTags` reports the stored tag set of every ARN the request names, in the
-/// order the request named them, and one call names at most the documented 20 ARNs
-/// ("The list has a limit of 20 ARNs").
+/// order the request named them, one positional entry per element and duplicates
+/// included — however MANY ARNs the list carries. The 20 the doc for `ResourceIdList`
+/// mentions ("The list has a limit of 20 ARNs") bounds nothing the service refuses: the
+/// list shape carries no `@length` constraint
+/// (`smithy_query(query="shape",shape="ResourceIdList")`) and the operation models no
+/// error for an over-long one.
 #[tokio::test]
-async fn list_tags_reports_every_named_arn_in_order_and_bounds_the_list() {
+async fn list_tags_reports_every_named_arn_in_order_however_many_it_names() {
     let emulator = Emulator::new();
     let trail = emulator
         .trail_with_tags("ordered-trail", HOME_REGION, &[tag("t", "1")])
@@ -765,21 +781,39 @@ async fn list_tags_reports_every_named_arn_in_order_and_bounds_the_list() {
         );
     }
 
-    // The documented bound, and one ARN past it. Every entry is the same stored
-    // trail, so the only thing that changes across the two calls is the COUNT.
-    let at_limit: Vec<&String> = (0..state::LIST_TAGS_RESOURCE_LIMIT).map(|_| &trail).collect();
-    emulator
-        .call("ListTags", &json!({"ResourceIdList": at_limit}))
-        .await
-        .expect_ok("the documented maximum of 20 ARNs");
-
-    let past_limit: Vec<&String> = (0..=state::LIST_TAGS_RESOURCE_LIMIT)
-        .map(|_| &trail)
-        .collect();
-    emulator
-        .call("ListTags", &json!({"ResourceIdList": past_limit}))
-        .await
-        .expect_error("one ARN past the documented maximum", 400, "ValidationException");
+    // The count the doc for `ResourceIdList` mentions ("The list has a limit of 20
+    // ARNs"), and lists well past it: the list shape carries no `@length` constraint and
+    // `ListTags` models no error for an over-long one, so the count bounds nothing — each
+    // call is answered with one positional entry per element, duplicates included, and no
+    // `NextToken`. Every entry is the same stored trail, so the only thing that changes
+    // across the rows is the COUNT.
+    for count in [
+        state::LIST_TAGS_RESOURCE_LIMIT,
+        state::LIST_TAGS_RESOURCE_LIMIT + 1,
+        state::LIST_TAGS_RESOURCE_LIMIT + 5,
+        state::LIST_TAGS_RESOURCE_LIMIT * 2 + 11,
+    ] {
+        let ids: Vec<&String> = (0..count).map(|_| &trail).collect();
+        let case = format!("a ResourceIdList of {count} ARNs");
+        let reply = emulator
+            .call("ListTags", &json!({"ResourceIdList": ids}))
+            .await;
+        let body = reply.expect_ok(&case);
+        let reported = body
+            .get("ResourceTagList")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
+        assert_eq!(
+            reported, count,
+            "case {case}: expected one entry per named ARN, got {body:?}"
+        );
+        assert_eq!(
+            body.get("NextToken"),
+            None,
+            "case {case}: one page carries every ARN the request named, got {body:?}"
+        );
+    }
 
     // `NextToken` is "Reserved for future use" and a page carries every ARN the
     // request named, so no call this service serves ever mints one: a token the
@@ -1061,7 +1095,7 @@ async fn add_tags_merges_the_request_into_the_resource_its_arn_names() {
             .await;
         assert_eq!(
             after_first,
-            tags(&first),
+            reported_tags(&first),
             "case {case:?}: the first AddTags did not persist its tags, got {after_first:?}"
         );
 
@@ -1074,7 +1108,7 @@ async fn add_tags_merges_the_request_into_the_resource_its_arn_names() {
             .await;
         assert_eq!(
             actual,
-            tags(&held),
+            reported_tags(&held),
             "case {case:?}: wrong merged tag set, got {actual:?}"
         );
     }
@@ -1131,7 +1165,7 @@ async fn an_event_data_store_is_tagged_out_of_the_registry_that_holds_it() {
         .await;
     assert_eq!(
         actual,
-        tags(&[("team", Some("security")), ("stage", None)]),
+        reported_tags(&[("team", Some("security")), ("stage", None)]),
         "case an event data store the account holds: wrong tag set, got {actual:?}"
     );
 

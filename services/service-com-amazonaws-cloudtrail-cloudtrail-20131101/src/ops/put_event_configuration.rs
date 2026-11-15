@@ -362,16 +362,23 @@ fn configure_event_data_store(
         );
     }
 
-    // The store the call addresses, read the way `EnableFederation`,
-    // `DisableFederation` and `GetEventConfiguration` read one.
-    let parsed =
-        crate::state::parse_event_data_store_identifier(identifier).map_err(|rejection| {
-            PutEventConfigurationErrorModeled::EventDataStoreARNInvalidException(
-                EventDataStoreARNInvalidException {
-                    message: Some(rejection.message(region)),
+    // The store the call addresses. `PutEventConfiguration` judges this member as a
+    // PARAMETER of its own request: a value that is neither an event data store ARN nor
+    // a store id is a parameter it cannot use, which is the modelled
+    // `InvalidParameterException` — the error the service was recorded answering this
+    // operation with for such a value, where its read-side siblings
+    // (`GetEventConfiguration`, `EnableFederation`, `DisableFederation`) answer the
+    // ARN-format error instead. The store's EXISTENCE and its status are resolved the
+    // way those siblings resolve one, below.
+    let parsed = crate::state::parse_minted_event_data_store_identifier(identifier).map_err(
+        |_rejection| {
+            PutEventConfigurationErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::UNUSABLE_EVENT_DATA_STORE_MESSAGE.to_string()),
                 },
             )
-        })?;
+        },
+    )?;
     let addressed_arn = parsed.arn(region);
     let Some(record) = store.addressed_event_data_store_mut(&parsed, region, now) else {
         return Err(crate::scaffolded::Scaffolded::modeled_with_status(

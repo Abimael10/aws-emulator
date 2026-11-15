@@ -622,8 +622,11 @@ async fn describe_query_resolves_a_query_within_its_region_and_store() {
 }
 
 /// `EventDataStore` is "the ARN (or the ID suffix of the ARN) of an event data
-/// store": every readable form resolves, an unreadable one is refused as an
-/// invalid ARN, and one naming no store in the addressed Region is not found.
+/// store", and it is DEPRECATED on this request ("EventDataStore is no longer required
+/// by DescribeQueryRequest"): every readable form NARROWS which store's query the
+/// request addresses, an unreadable one is refused as an invalid ARN, and one that
+/// narrows to a store the query did not run on leaves the request addressing no query —
+/// which is what the caller is answered about.
 #[tokio::test]
 async fn describe_query_resolves_the_event_data_store_it_is_given() {
     let emulator = Emulator::new();
@@ -647,20 +650,22 @@ async fn describe_query_resolves_the_event_data_store_it_is_given() {
         expect_reported(&case, reply.expect_ok(&case), &record);
     }
 
-    // Readable, but naming no store in the Region it addresses.
+    // Readable, but narrowing to a store the query did not run on: the deprecated member
+    // decides nothing about whether a store exists, so the QUERY is what the refusal
+    // names.
     for identifier in [
         "cccccccc-1111-2222-3333-444444444444".to_string(),
         event_data_store_arn("eu-west-1", STORE_ID),
         event_data_store_arn(HOME_REGION, "cccccccc-1111-2222-3333-444444444444"),
     ] {
-        let case = format!("unknown EventDataStore {identifier}");
+        let case = format!("EventDataStore {identifier} narrowing to another store");
         emulator
             .call(
                 "DescribeQuery",
                 &json!({ "QueryId": record.query_id, "EventDataStore": identifier }),
             )
             .await
-            .expect_error(&case, NOT_FOUND_STATUS, "EventDataStoreNotFoundException");
+            .expect_error(&case, NOT_FOUND_STATUS, "QueryIdNotFoundException");
     }
 
     // Unreadable: ARN-shaped, but not an event data store ARN.

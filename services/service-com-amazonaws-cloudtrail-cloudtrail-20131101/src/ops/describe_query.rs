@@ -242,53 +242,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reporting operation makes.
         store.settle_queries(now);
 
-        // An event data store NAMED in the request is resolved first — the member
-        // is deprecated here, but a store that cannot be read or found is still
-        // what the caller is told about.
-        let named_store = match input.event_data_store.as_deref() {
-            None => None,
-            Some(identifier) => {
-                let record = store
-                    .event_data_store(identifier, &region)
-                    .map_err(|rejection| {
-                        DescribeQueryErrorModeled::EventDataStoreARNInvalidException(
-                            EventDataStoreARNInvalidException {
-                                message: Some(rejection.message(&region)),
-                            },
-                        )
-                    })?
-                    .ok_or_else(event_data_store_not_found)?;
-                if !record.status.is_queryable() {
-                    return Err(DescribeQueryErrorModeled::InactiveEventDataStoreException(
-                        InactiveEventDataStoreException {
-                            message: Some(format!(
-                                "The event data store {} is {} and does not serve queries.",
-                                record.id,
-                                record.status.as_wire()
-                            )),
-                        },
-                    )
-                    .into());
-                }
-                Some(record)
-            }
-        };
-        let event_data_store_id = named_store.map(|record| record.id.as_str());
+        // The deprecated `EventDataStore` is read for its FORM only: a value that can be
+        // read as neither a store ARN nor the bare id suffix of one is refused as an
+        // ARN, and one that can only NARROWS which store's query this request
+        // addresses. The member is "no longer required by DescribeQueryRequest", so it
+        // decides nothing about whether a store EXISTS — the query selector is what this
+        // operation resolves on, and what a call that resolves none is answered about
+        // (`crate::state::addressed_query`). `GetQueryResults` reads its member the same
+        // way.
+        let named_store = input
+            .event_data_store
+            .as_deref()
+            .map(crate::state::parse_event_data_store_identifier)
+            .transpose()
+            .map_err(|rejection| {
+                DescribeQueryErrorModeled::EventDataStoreARNInvalidException(
+                    EventDataStoreARNInvalidException {
+                        message: Some(rejection.message(&region)),
+                    },
+                )
+            })?;
 
-        // A query is resolved on the SELECTOR the request carries: `EventDataStore` is
-        // deprecated here ("no longer required by DescribeQueryRequest"), so a request
-        // that names no store names no store to resolve, and the selector is what the
-        // caller is answered about. A request that DOES name one has had it resolved
-        // above, and only narrows which store's query this call addresses;
-        // `EventDataStoreOwnerAccountId` names the account that owns it, for a query run
-        // against a store shared from another account, and is held against the store the
-        // query actually ran on below.
+        // `EventDataStoreOwnerAccountId` names the account that owns the store a query
+        // ran on, for a query run against a store shared from another account; it is held
+        // against the store the resolved query actually ran on, below.
         let owner = input.event_data_store_owner_account_id.as_deref();
-        if let (Some(record), Some(owner)) = (named_store, owner) {
-            if record.owner() != owner {
-                return Err(event_data_store_not_found());
-            }
-        }
 
         // "You must specify either QueryId or QueryAlias": exactly one of the two
         // selects the query, and `RefreshId` narrows an alias to one dashboard
@@ -314,37 +292,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ));
                 }
                 store
-                    .query(query_id, &region, event_data_store_id)
+                    .addressed_query(query_id, &region, named_store.as_ref())
                     .ok_or_else(|| query_not_found("QueryId", query_id))?
             }
             (None, Some(alias)) => store
-                .last_query_for_alias(
+                .addressed_query_for_alias(
                     alias,
                     input.refresh_id.as_deref(),
                     &region,
-                    event_data_store_id,
+                    named_store.as_ref(),
                 )
                 .ok_or_else(|| query_not_found("QueryAlias", alias))?,
         };
 
         // The store the resolved query actually RAN on is the one the call is really
         // addressing: a query whose store the registry no longer holds resolves no store
-        // at all, and a cross-account request has to name that store's owner — not
-        // merely some store of that account.
-        if !store
-            .event_data_stores
-            .contains_key(&query.event_data_store_id)
-        {
+        // at all, a store awaiting deletion serves no query, and a cross-account request
+        // has to name that store's owner — not merely some store of that account.
+        let Some(ran_on) = store.event_data_stores.get(&query.event_data_store_id) else {
             return Err(event_data_store_not_found());
+        };
+        if !ran_on.status.is_queryable() {
+            return Err(DescribeQueryErrorModeled::InactiveEventDataStoreException(
+                InactiveEventDataStoreException {
+                    message: Some(format!(
+                        "The event data store {} is {} and does not serve queries.",
+                        ran_on.id,
+                        ran_on.status.as_wire()
+                    )),
+                },
+            )
+            .into());
         }
-        if let Some(owner) = owner {
-            let ran_on_owned_store = store
-                .event_data_stores
-                .get(&query.event_data_store_id)
-                .is_some_and(|record| record.region == region && record.owner() == owner);
-            if !ran_on_owned_store {
-                return Err(event_data_store_not_found());
-            }
+        if owner.is_some_and(|owner| ran_on.region != region || ran_on.owner() != owner) {
+            return Err(event_data_store_not_found());
         }
 
         Ok(DescribeQueryOutput {

@@ -220,60 +220,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a terminated state" is decided on the status the run is already in.
         store.settle_queries(now);
 
-        // An event data store NAMED in the request is resolved first — the member is
-        // deprecated here ("EventDataStore is no longer required by
-        // CancelQueryRequest"), but a store that cannot be read or found is still what
-        // the caller is told about, before the query id is looked at.
-        let named_store = match input.event_data_store.as_deref() {
-            None => None,
-            Some(identifier) => {
-                let record = store
-                    .event_data_store(identifier, &region)
-                    .map_err(|rejection| {
-                        CancelQueryErrorModeled::EventDataStoreARNInvalidException(
-                            EventDataStoreARNInvalidException {
-                                message: Some(rejection.message(&region)),
-                            },
-                        )
-                    })?
-                    .ok_or_else(event_data_store_not_found)?;
-                if !record.status.is_queryable() {
-                    return Err(inactive_event_data_store(&record.id, record.status));
-                }
-                // Owned values, so the immutable borrow of the store ends here and the
-                // cancellation below can take the mutable one.
-                Some((record.id.clone(), record.owner().to_string()))
-            }
-        };
-        let named_store_id = named_store.as_ref().map(|(id, _)| id.clone());
-
-        // A query is resolved on its QUERY ID: `EventDataStore` is deprecated here ("no
-        // longer required by CancelQueryRequest"), so a request that names no store
-        // names no store to resolve, and the id is what the caller is answered about.
-        // A request that DOES name one has had it resolved above, and only narrows which
-        // store's query this call addresses; `EventDataStoreOwnerAccountId` names the
-        // account that owns it, for a query run against a store shared from another
-        // account, and is held against the store the query actually ran on below.
-        let owner = input.event_data_store_owner_account_id.as_deref();
-        if let (Some((_, store_owner)), Some(owner)) = (named_store.as_ref(), owner) {
-            if store_owner != owner {
-                return Err(event_data_store_not_found());
-            }
-        }
+        // The deprecated `EventDataStore` is read for its FORM only: a value that can be
+        // read as neither a store ARN nor the bare id suffix of one is refused as an
+        // ARN, and one that can only NARROWS which store's query this request addresses.
+        // The member is "no longer required by CancelQueryRequest", so it decides nothing
+        // about whether a store EXISTS — the query id is what this operation resolves on,
+        // and what a call that resolves none is answered about
+        // (`crate::state::addressed_query`), exactly as `DescribeQuery` and
+        // `GetQueryResults` resolve theirs.
+        let named_store = input
+            .event_data_store
+            .as_deref()
+            .map(crate::state::parse_event_data_store_identifier)
+            .transpose()
+            .map_err(|rejection| {
+                CancelQueryErrorModeled::EventDataStoreARNInvalidException(
+                    EventDataStoreARNInvalidException {
+                        message: Some(rejection.message(&region)),
+                    },
+                )
+            })?;
 
         // "The ID of the query that you want to cancel is also required": the query id
-        // selects the query, within the Region it ran in and the store it ran on.
+        // selects the query, within the Region it ran in and the store the deprecated
+        // member narrows to. `EventDataStoreOwnerAccountId` names the account that owns
+        // the store the query ran on, and is held against that store below.
+        let owner = input.event_data_store_owner_account_id.as_deref();
         let query = store
-            .query(&input.query_id, &region, named_store_id.as_deref())
+            .addressed_query(&input.query_id, &region, named_store.as_ref())
             .ok_or_else(|| query_not_found("QueryId", &input.query_id))?;
         let ran_on = query.event_data_store_id.clone();
         let status = query.status;
 
         // The store the resolved query actually RAN on is the one the call is really
-        // addressing, so the two rules the named-store path applies hold for it too: a
-        // query whose store the registry no longer holds resolves no store at all, a
-        // cross-account request has to name that store's owner, and a store awaiting
-        // deletion serves no query.
+        // addressing: a query whose store the registry no longer holds resolves no store
+        // at all, a cross-account request has to name that store's owner, and a store
+        // awaiting deletion serves no query.
         let Some(ran_on_store) = store.event_data_stores.get(&ran_on) else {
             return Err(event_data_store_not_found());
         };

@@ -238,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `InvalidTagParameterException` covers both "duplicate tags" and "too many
         // tags on the resource"; the limit is the one the model documents for every
         // taggable CloudTrail resource.
-        let tags = input.tags_list.unwrap_or_default();
+        let tags = crate::state::tags_stored(input.tags_list.unwrap_or_default());
         if tags.len() > crate::state::TAGS_PER_RESOURCE_LIMIT {
             return Err(CreateDashboardErrorModeled::InvalidTagParameterException(
                 InvalidTagParameterException {

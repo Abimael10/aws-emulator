@@ -580,6 +580,10 @@ async fn a_configuration_call_that_breaks_a_rule_is_refused_and_writes_nothing()
             "EventDataStoreNotFoundException",
         ),
         (
+            // `PutEventConfiguration` judges this member as a PARAMETER of its own
+            // request, so a value it cannot read as a store is `InvalidParameterException`
+            // rather than the ARN-format error its read-side siblings answer (see
+            // `tests/all/event_data_store_member_refusals.rs`).
             "an identifier that is neither a store ARN nor a store id",
             json!({
                 "EventDataStore": format!(
@@ -589,7 +593,7 @@ async fn a_configuration_call_that_breaks_a_rule_is_refused_and_writes_nothing()
                 "ContextKeySelectors": selectors,
             }),
             400,
-            "EventDataStoreARNInvalidException",
+            "InvalidParameterException",
         ),
         (
             "a store awaiting deletion",

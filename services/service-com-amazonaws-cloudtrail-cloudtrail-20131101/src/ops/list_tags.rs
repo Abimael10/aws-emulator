@@ -153,8 +153,8 @@ pub enum ListTagsErrorModeled {
 /// the wrapper is its other two channels:
 /// [`crate::scaffolded::Scaffolded::ModeledWithStatus`] for a modelled error CloudTrail
 /// answers with a status its `@httpError` does not declare (see [`not_found`]), and
-/// `ValidationException` for the one refusal this operation's model carries no shape
-/// for — more ARNs than one call may name.
+/// `ValidationException` for the one refusal this operation's model carries no shape for
+/// — a reply past this emulator's own ceiling on what one call may produce.
 pub type ListTagsError = crate::scaffolded::Scaffolded<ListTagsErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
@@ -264,12 +264,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Region itself, so nothing about this call depends on how it was signed.
         let _ = ctx;
 
-        if input.resource_id_list.len() > crate::state::LIST_TAGS_RESOURCE_LIMIT {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "ResourceIdList names {} ARNs; one ListTags call has a limit of {} ARNs",
-                input.resource_id_list.len(),
-                crate::state::LIST_TAGS_RESOURCE_LIMIT
-            )));
+        // HOW MANY ARNs the request names is not a refusal the real service makes: the
+        // documented limit on `ResourceIdList` is a guideline the service does not
+        // enforce, the list shape carries no `@length` constraint
+        // (`smithy_query(query="shape",shape="ResourceIdList")`), and `ListTags` models
+        // no error for an over-long one — a request naming more ARNs than the doc
+        // mentions is answered with one entry per element, like any other
+        // (`crate::state::LIST_TAGS_RESOURCE_LIMIT`).
+        //
+        // What IS bounded is the work and the reply ONE call may produce, which the
+        // caller otherwise chooses: the number of entries and the number of tags across
+        // them, each against this emulator's own ceiling
+        // (`crate::state::list_tags_beyond_reply_ceiling_message`). Both sit far above
+        // any list the real service has been seen to answer, so no faithful call reaches
+        // them.
+        if let Some(message) =
+            crate::state::list_tags_beyond_reply_ceiling_message(input.resource_id_list.len(), None)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
         // `NextToken` is "Reserved for future use", and a page carries every ARN the
@@ -287,6 +299,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Every ARN is read BEFORE the registry is reached: a malformed entry refuses the
+        // whole call whatever the registry holds, and the parse needs no lock.
+        let addressed: Vec<TaggableArn> = input
+            .resource_id_list
+            .iter()
+            .map(|resource_id| {
+                crate::state::parse_taggable_arn(resource_id)
+                    .map_err(|rejection| ListTagsError::from(arn_rejection(rejection)))
+            })
+            .collect::<Result<_, _>>()?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListTagsErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
                 message: Some(
@@ -296,23 +319,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             })
         })?;
-        let store = state.lock();
 
-        // One entry per ARN the request named, in the order it named them. A malformed
-        // ARN, or one naming no stored resource, refuses the WHOLE call: a reply that
-        // dropped it silently would read as "that resource carries no tags".
-        let mut resource_tags = Vec::with_capacity(input.resource_id_list.len());
-        for resource_id in &input.resource_id_list {
-            let arn = crate::state::parse_taggable_arn(resource_id)
-                .map_err(|rejection| ListTagsError::from(arn_rejection(rejection)))?;
-            let Some(tags) = store.resource_tags(&arn) else {
-                return Err(not_found(&arn, resource_id));
-            };
-            resource_tags.push(ResourceTag {
-                resource_id: Some(resource_id.clone()),
-                tags_list: Some(tags.to_vec()),
-            });
+        // ONE read per DISTINCT ARN, under one short lock: a list that names the same
+        // resource many times reads its tag set once, and the guard is released before
+        // the reply is built. An ARN naming no stored resource refuses the WHOLE call: a
+        // reply that dropped it silently would read as "that resource carries no tags".
+        let mut held: ::std::collections::HashMap<&str, Vec<Tag>> =
+            ::std::collections::HashMap::new();
+        {
+            let store = state.lock();
+            for (resource_id, arn) in input.resource_id_list.iter().zip(&addressed) {
+                if held.contains_key(resource_id.as_str()) {
+                    continue;
+                }
+                let Some(tags) = store.resource_tags(arn) else {
+                    return Err(not_found(arn, resource_id));
+                };
+                held.insert(resource_id.as_str(), tags.to_vec());
+            }
         }
+
+        // How many tags the reply would carry, held against the same ceiling before any
+        // of them is copied into it.
+        let reported_tags = input
+            .resource_id_list
+            .iter()
+            .map(|resource_id| held.get(resource_id.as_str()).map_or(0, Vec::len))
+            .sum();
+        if let Some(message) = crate::state::list_tags_beyond_reply_ceiling_message(
+            input.resource_id_list.len(),
+            Some(reported_tags),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // One entry per ARN the request named, in the order it named them.
+        let resource_tags: Vec<ResourceTag> = input
+            .resource_id_list
+            .iter()
+            .map(|resource_id| ResourceTag {
+                resource_id: Some(resource_id.clone()),
+                tags_list: Some(held.get(resource_id.as_str()).cloned().unwrap_or_default()),
+            })
+            .collect();
 
         Ok(ListTagsOutput {
             resource_tag_list: Some(resource_tags),

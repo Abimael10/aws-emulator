@@ -1169,6 +1169,17 @@ pub fn query_not_found_message(member: &str, value: &str) -> String {
     format!("The {member} value {value} does not exist or is not in the same region.")
 }
 
+/// The refusal text for a request whose `EventDataStore` member the service cannot read
+/// as a store at all, worded as the service words that PARAMETER refusal: a fixed
+/// sentence naming the member and the two forms it takes, carrying no part of the value
+/// the request supplied.
+///
+/// It is the text of the recorded `InvalidParameterException` `PutEventConfiguration`
+/// answers such a value with. The ARN-FORMAT refusal its read-side siblings answer is a
+/// different error with its own wording ([`EventDataStoreIdentifierRejection::message`]).
+pub const UNUSABLE_EVENT_DATA_STORE_MESSAGE: &str =
+    "The EventDataStore value must be a valid EventDataStore ARN or ID.";
+
 /// Mint the page token that resumes a paged read of `resource_id` at `offset`.
 ///
 /// Every paged operation of this service hands out the same shape of token — the
@@ -1940,6 +1951,30 @@ pub fn parse_event_data_store_identifier(
     }
 }
 
+/// Read a caller-supplied event data store identifier the way the FEDERATION and
+/// EVENT-CONFIGURATION operations read one: as [`parse_event_data_store_identifier`]
+/// does, and only when the id it names is one this service could have minted
+/// ([`is_event_data_store_id`]) — so an ARN whose resource suffix is not such an id is
+/// refused on its FORM rather than reported as an absent store.
+///
+/// The two readings differ only there, and each is the recorded classification of its own
+/// operations. `EnableFederation`, `DisableFederation` and `GetEventConfiguration` were
+/// recorded answering a CloudTrail store ARN whose resource id is not a store id with
+/// `EventDataStoreARNInvalidException`, and `PutEventConfiguration` — which judges the
+/// member as a parameter of its own request — with `InvalidParameterException`; the
+/// operations that keep the lenient reading report the ARN's suffix as the store it names
+/// and answer its absence instead, each in the class its own recording carries (see
+/// `crate::ops::get_insight_selectors`).
+pub fn parse_minted_event_data_store_identifier(
+    value: &str,
+) -> Result<EventDataStoreIdentifier, EventDataStoreRejection> {
+    let identifier = parse_event_data_store_identifier(value)?;
+    if !is_event_data_store_id(&identifier.id) {
+        return Err(EventDataStoreRejection::InvalidArn(value.to_string()));
+    }
+    Ok(identifier)
+}
+
 /// Read the BARE id form of an event data store identifier — "the ID suffix of the
 /// ARN" — with or without the `eventdatastore/` resource prefix the whole ARN carries,
 /// and only when the suffix is an id this service could have minted
@@ -2420,6 +2455,60 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
         self.queries
             .get(query_id)
             .filter(|record| record.addressed_by(request_region, event_data_store_id))
+    }
+
+    /// The query a call made in `request_region` addresses by `query_id`, with the
+    /// DEPRECATED `EventDataStore` member it may carry only NARROWING the lookup.
+    ///
+    /// `DescribeQueryRequest$EventDataStore` and `CancelQueryRequest$EventDataStore` are
+    /// marked deprecated ("EventDataStore is no longer required by …"), and
+    /// `GetQueryResultsRequest$EventDataStore` is documented as the store "against which
+    /// the query was run": in all three the query id is what the call resolves on, so a
+    /// store the member names decides only WHICH store's query is addressed and never
+    /// whether a store exists — a call whose selector matches no query it addresses is
+    /// answered about the QUERY. A member naming a store in another Region narrows to a
+    /// store no query of this Region ran on, so it addresses no query at all.
+    pub fn addressed_query(
+        &self,
+        query_id: &str,
+        request_region: &str,
+        named_store: Option<&EventDataStoreIdentifier>,
+    ) -> Option<&QueryRecord> {
+        match named_store {
+            None => self.query(query_id, request_region, None),
+            Some(identifier) => {
+                if identifier.addressed_region(request_region) != request_region {
+                    return None;
+                }
+                self.query(query_id, request_region, Some(&identifier.id))
+            }
+        }
+    }
+
+    /// [`Self::addressed_query`] for the `QueryAlias` selector: the LAST query run for
+    /// `alias`, narrowed by the same deprecated member and, when `refresh_id` is given,
+    /// to one dashboard refresh.
+    pub fn addressed_query_for_alias(
+        &self,
+        alias: &str,
+        refresh_id: Option<&str>,
+        request_region: &str,
+        named_store: Option<&EventDataStoreIdentifier>,
+    ) -> Option<&QueryRecord> {
+        match named_store {
+            None => self.last_query_for_alias(alias, refresh_id, request_region, None),
+            Some(identifier) => {
+                if identifier.addressed_region(request_region) != request_region {
+                    return None;
+                }
+                self.last_query_for_alias(
+                    alias,
+                    refresh_id,
+                    request_region,
+                    Some(&identifier.id),
+                )
+            }
+        }
     }
 
     /// The LAST query run for `alias` — what `DescribeQuery` reports when it is
@@ -3531,9 +3620,64 @@ fn is_valid_principal(principal: &::serde_json::Value) -> bool {
 /// tagging operations are the only place the model's status and the wire's disagree.
 pub const TAGGING_REFUSAL_STATUS: u16 = 400;
 
-/// How many ARNs one `ListTags` call may name, from the model doc for
-/// `ListTagsRequest$ResourceIdList`: "The list has a limit of 20 ARNs."
+/// How many ARNs the doc for `ListTagsRequest$ResourceIdList` mentions: "The list has a
+/// limit of 20 ARNs."
+///
+/// It is a DOCUMENTED guideline and not a refusal: the list shape carries no `@length`
+/// constraint (`smithy_query(query="shape",shape="ResourceIdList")`), `ListTags` models
+/// no error for an over-long list, and the service was recorded answering lists well
+/// past this count with one entry per element. Named here so the reader and its tests
+/// can state the count the doc mentions without any call being bounded by it.
 pub const LIST_TAGS_RESOURCE_LIMIT: usize = 20;
+
+/// How many entries one `ListTags` reply of THIS emulator carries, at most.
+///
+/// Nothing in the model or in the recorded behaviour bounds the list a request may name,
+/// so without a ceiling the work one call costs — a read per element and a tag set copied
+/// into the reply for each — is chosen by the caller alone. This is the emulator's OWN
+/// bound on that, not a claim about any account's limit: it sits 50 times above the count
+/// the doc mentions ([`LIST_TAGS_RESOURCE_LIMIT`]) and far above every list the service
+/// has been seen to answer, so no faithful call reaches it.
+pub const LIST_TAGS_REPLY_RESOURCE_CEILING: usize = 1_000;
+
+/// How many TAGS one `ListTags` reply of this emulator carries, at most — the other half
+/// of [`LIST_TAGS_REPLY_RESOURCE_CEILING`], which bounds the reply rather than the
+/// request.
+///
+/// A list may name the same resource many times, so the reply grows with the product of
+/// the entry count and the tags each entry carries ([`TAGS_PER_RESOURCE_LIMIT`]) while
+/// the request grows only with the entry count. Capping that product is what keeps a
+/// small request from producing an unbounded reply; like the ceiling above it is this
+/// emulator's own, and it admits every entry count the one above does at a realistic tag
+/// set.
+pub const LIST_TAGS_REPLY_TAG_CEILING: usize = 10_000;
+
+/// The refusal text for a `ListTags` call whose reply would pass one of this emulator's
+/// ceilings, and `None` for one that would not.
+///
+/// `tags` is the number of tags the reply would carry, which is known only once the
+/// addressed resources have been read; a caller that does not know it yet passes `None`
+/// and holds the entry count against its ceiling first. The sentence states the emulator's
+/// bound rather than any rule of the service, because it is not one: the real service
+/// answers such a call.
+pub fn list_tags_beyond_reply_ceiling_message(
+    resources: usize,
+    tags: Option<usize>,
+) -> Option<String> {
+    if resources > LIST_TAGS_REPLY_RESOURCE_CEILING {
+        return Some(format!(
+            "ResourceIdList names {resources} ARNs; one ListTags reply of this emulator \
+             carries at most {LIST_TAGS_REPLY_RESOURCE_CEILING}"
+        ));
+    }
+    match tags {
+        Some(tags) if tags > LIST_TAGS_REPLY_TAG_CEILING => Some(format!(
+            "the {resources} ARNs named carry {tags} tags between them; one ListTags reply \
+             of this emulator carries at most {LIST_TAGS_REPLY_TAG_CEILING}"
+        )),
+        _ => None,
+    }
+}
 
 /// A well-formed tagging ARN: which kind of resource it names, the Region that
 /// resource lives in, and its name or id.
@@ -3855,16 +3999,39 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
 /// key not already on the resource is appended.
 ///
 /// The merged set is handed back rather than written in place, so a caller can hold it
-/// against the per-resource limit before it becomes the resource's tag set.
+/// against the per-resource limit before it becomes the resource's tag set. What is
+/// merged in is the STORED form of the tags the request carried ([`tags_stored`]).
 pub fn tags_merged(existing: &[Tag], added: Vec<Tag>) -> Vec<Tag> {
     let mut merged = existing.to_vec();
-    for tag in added {
+    for tag in tags_stored(added) {
         match merged.iter_mut().find(|held| held.key == tag.key) {
             Some(held) => held.value = tag.value,
             None => merged.push(tag),
         }
     }
     merged
+}
+
+/// The STORED form of the tags a request carried: every tag carries a `Value`, empty for
+/// one the request stated no value for.
+///
+/// `Tag$Value` is an optional member (`smithy_query(query="shape",shape="Tag")`), so a
+/// caller may leave it out — but a tag the service stored without one is read back
+/// carrying the member, empty: the recorded `ListTags` of a tag added with no `Value`
+/// reports `Value: ""` rather than dropping the member. Normalising where a tag ENTERS
+/// the registry is what makes every reader of a tag set — the tagging reader and the
+/// create/read pairs of all four taggable resources — report that one form, and keeps a
+/// present-but-empty value from reading as a missing one.
+///
+/// Every writer of a caller-supplied tag set goes through this: `AddTags` (via
+/// [`tags_merged`]) and the four creates that take a tag list.
+pub fn tags_stored(tags: Vec<Tag>) -> Vec<Tag> {
+    tags.into_iter()
+        .map(|tag| Tag {
+            key: tag.key,
+            value: Some(tag.value.unwrap_or_default()),
+        })
+        .collect()
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

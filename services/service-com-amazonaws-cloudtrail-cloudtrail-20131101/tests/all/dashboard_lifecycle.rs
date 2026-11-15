@@ -82,6 +82,27 @@ fn arn(region: &str, name: &str) -> String {
     format!("arn:aws:cloudtrail:{region}:000000000000:dashboard/{name}")
 }
 
+/// The `TagsList` a READ reports for the one a request carried: every tag carries its
+/// `Value`, empty for one the request left out, because a tag stored without a value is
+/// reported with the member present and empty rather than dropped. An absent member is
+/// the empty set.
+fn reported_tag_set(requested: Option<&Value>) -> Value {
+    let Some(tags) = requested.and_then(Value::as_array) else {
+        return json!([]);
+    };
+    Value::Array(
+        tags.iter()
+            .map(|tag| {
+                let mut tag = tag.clone();
+                if tag.get("Value").is_none() {
+                    tag["Value"] = json!("");
+                }
+                tag
+            })
+            .collect(),
+    )
+}
+
 /// The `RefreshSchedule` a request's schedule is STORED as: the request's own, with
 /// `TimeOfDay` defaulted to `00:00` (`RefreshSchedule$TimeOfDay`: "default is 00:00").
 fn expected_schedule(request: &Value) -> Value {
@@ -165,7 +186,7 @@ async fn a_created_dashboard_reports_the_configuration_it_was_given() {
         let created = created.expect_ok(case).clone();
 
         let expected_widgets = request.get("Widgets").cloned().unwrap_or_else(|| json!([]));
-        let expected_tags = request.get("TagsList").cloned().unwrap_or_else(|| json!([]));
+        let expected_tags = reported_tag_set(request.get("TagsList"));
         let expected_protection = request
             .get("TerminationProtectionEnabled")
             .and_then(Value::as_bool)
