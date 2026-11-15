@@ -25,6 +25,8 @@ mod component_versions_and_resolution;
 mod concurrent_deployment_creates;
 #[path = "all/connectivity_info_publication.rs"]
 mod connectivity_info_publication;
+#[path = "all/connectivity_info_request_contract.rs"]
+mod connectivity_info_request_contract;
 #[path = "all/core_device_data_plane_authorization.rs"]
 mod core_device_data_plane_authorization;
 #[path = "all/core_device_fleet.rs"]

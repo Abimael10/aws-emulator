@@ -1794,3 +1794,20 @@ mod default_vpc_internet_path_runs_ecs_tasks;
 // crate's `tests/all.rs`, so check there rather than leaving a note here.
 // An inner attribute, like a module doc comment, is legal only ahead of the first item, so the
 // one this target needs stands here rather than in the list below.
+// Put a new suite at `tests/all/<name>.rs` and insert ONE `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair into the sorted list below. This file holds this header and those
+// pairs and no other line, so two branches landing at once insert two lines in two places
+// and have no prose to duplicate, re-word or mistype.
+// `E0753` and compiles no suite of this target at all — and with none in the file, no merge
+// of two landings can leave one there. An inner attribute (`#![...]`) is legal only there
+// too, which is why the one below stands in this header and nothing of the kind belongs
+// under the list. A second pair for one name is `E0428`, and a suite file no pair names is
+// compiled nowhere. `tests/all.rs` is a test-target CRATE ROOT, where a bare `mod` would
+// resolve to a SIBLING of this file, which the layout check refuses: the `#[path]` above
+// each declaration is what points it into `tests/all/`.
+// crate, belongs in that suite's own module doc, where it is read beside the test it
+// explains. The `all_rs_*` suites, `all/every_suite_file_is_declared.rs` and
+// `all/declaration_roots_are_canonical_and_complete.rs` pin the rules above, for this file
+// here; `all/appended_notes.rs`, `all/appended_notes_tail.rs`, `all/appended_header_notes.rs`
+// and `all/appended_prose.rs` are where the prose earlier landings appended to this file's
+// tail went.

@@ -35,13 +35,13 @@ use service_com_amazonaws_greengrassv2_greengrassv2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region these requests are signed for.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The status and sentence this surface refuses an unreadable connectivity list with —
 /// written here as the literals AWS answers rather than read from the implementation's
 /// constants, so a wording that drifts away from AWS fails this suite.
 const UNPARSABLE_STATUS: u16 = 400;
-const UNPARSABLE_MESSAGE: &str =
+pub(crate) const UNPARSABLE_MESSAGE: &str =
     "The following required parameter(s) are unparsable: connectivityInfoList.";
 
 /// The status the framework refuses a value outside a modelled bound at, before any
@@ -56,7 +56,7 @@ const PORT_MAX: i64 = 65_535;
 
 /// The emulator front door with only this service mounted, over ONE shared engine —
 /// exactly how `core/router` assembles it.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -66,7 +66,7 @@ fn emulator() -> MultiServiceRouter {
 
 /// Dispatch one signed request at a core device's connectivity-info route and return its
 /// status and parsed JSON body.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     thing_name: &str,
@@ -101,7 +101,7 @@ async fn call(
 }
 
 /// `UpdateConnectivityInfo` for `thing_name`, publishing `entries`.
-async fn publish(
+pub(crate) async fn publish(
     router: &MultiServiceRouter,
     thing_name: &str,
     entries: &Value,
@@ -112,12 +112,12 @@ async fn publish(
 }
 
 /// `GetConnectivityInfo` for `thing_name`.
-async fn read(router: &MultiServiceRouter, thing_name: &str) -> (u16, Value) {
+pub(crate) async fn read(router: &MultiServiceRouter, thing_name: &str) -> (u16, Value) {
     call(router, "GET", thing_name, Vec::new()).await
 }
 
 /// A string member of a JSON object, or the empty string when absent.
-fn text(body: &Value, key: &str) -> String {
+pub(crate) fn text(body: &Value, key: &str) -> String {
     body.get(key)
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -125,7 +125,7 @@ fn text(body: &Value, key: &str) -> String {
 }
 
 /// The `ConnectivityInfo` list a body reports, or an empty list when it carries none.
-fn reported(body: &Value) -> Vec<Value> {
+pub(crate) fn reported(body: &Value) -> Vec<Value> {
     body.get("ConnectivityInfo")
         .and_then(Value::as_array)
         .cloned()
@@ -134,7 +134,7 @@ fn reported(body: &Value) -> Vec<Value> {
 
 /// Publish `entries` for `thing_name` and answer the version token the write reported,
 /// having checked the status and that a token was named at all.
-async fn published_version(
+pub(crate) async fn published_version(
     router: &MultiServiceRouter,
     case: &str,
     thing_name: &str,
