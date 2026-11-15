@@ -127,6 +127,10 @@ pub mod guest_select;
 /// The Amazon S3 half of that seam, whose own protocol binds a request per operation.
 mod aws_s3;
 
+/// The URL an SDK in a running handler PRESIGNS for somebody else to fetch, which is signed
+/// for this emulator's own endpoint rather than sent anywhere.
+mod presigned_url;
+
 /// The CloudFront half of it, for the same reason: that service's own `restXml` protocol
 /// binds a request per operation rather than carrying an input document in a JSON body.
 mod aws_cloudfront;

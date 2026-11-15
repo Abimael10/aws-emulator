@@ -1421,6 +1421,11 @@ pub struct AwsAccess {
     /// data plane, for a request the handler SENDS ITSELF to one
     /// ([`super::guest_http`]). `None` where this emulator vends no such records.
     published: Option<::service_common::published_data_planes::PublishedPlanes>,
+    /// The base URL this emulator is reached on, which a URL the handler's SDK PRESIGNS has
+    /// to lead back to ([`super::presigned_url`]). `None` where the run was given no
+    /// endpoint, in which case no URL is signed at all rather than one signed for an address
+    /// nothing answers.
+    endpoint: Option<::smithy_server_runtime::EndpointUrl>,
 }
 
 impl AwsAccess {
@@ -1436,6 +1441,7 @@ impl AwsAccess {
             identity: None,
             trace_header: None,
             published: None,
+            endpoint: None,
         })
     }
 
@@ -1473,6 +1479,19 @@ impl AwsAccess {
         published: Option<::service_common::published_data_planes::PublishedPlanes>,
     ) -> Self {
         self.published = published;
+        self
+    }
+
+    /// The same access, signing a URL the handler asks the SDK to PRESIGN for `endpoint` —
+    /// the base URL this emulator is reached on, which is the one address a URL handed to a
+    /// later caller can be fetched from ([`super::presigned_url`]).
+    ///
+    /// `None` leaves such a URL unsigned, which is reported as a URL that was not signed:
+    /// this emulator answers on its own endpoint alone, so a URL addressed anywhere else is
+    /// one nothing can be fetched from.
+    #[must_use]
+    pub fn addressed_at(mut self, endpoint: ::smithy_server_runtime::EndpointUrl) -> Self {
+        self.endpoint = Some(endpoint);
         self
     }
 
@@ -1681,13 +1700,16 @@ impl AwsAccess {
 
     /// The URL one call carries ITS OWN signature in, as an SDK presigns one.
     ///
-    /// Nothing is sent. The URL names the service's own endpoint and carries a signature
-    /// over exactly that request, made with the SAME identity the handler's ordinary calls
-    /// are made as — the session of the function's own execution role
+    /// Nothing is sent. The URL addresses the base URL this emulator is reached on — the one
+    /// address a later caller can fetch it from — and carries a signature over exactly that
+    /// request, made with the SAME identity the handler's ordinary calls are made as: the
+    /// session of the function's own execution role
     /// ([`super::execution_role_session`]). The guest holds that credential no more than it
-    /// holds any other: what it gets back is an access key id and a signature over the one
-    /// request the URL names, good for `expires_in` and for nothing else, which is what a
-    /// presigned URL is.
+    /// holds any other: what it gets back is the key id, the session token and a signature
+    /// over the one request the URL names — never the secret they were signed with — good
+    /// for `expires_in` and for nothing else, which is what a presigned URL is, and the
+    /// service that serves that later request judges it as that identity, exactly as it
+    /// judges a call the handler makes itself.
     ///
     /// Only an OBJECT URL is presigned ([`super::aws_s3::presigned`]), because that is the
     /// one a handler hands out; a URL asked for of any other service is reported as one that
@@ -1716,29 +1738,37 @@ impl AwsAccess {
                 api.sdk_token
             )));
         }
+        let Some(endpoint) = self.endpoint.as_ref() else {
+            return Err(Refusal::NotMade(
+                "this invocation was given no endpoint for a signed URL to lead back to, so \
+                 none was signed"
+                    .to_string(),
+            ));
+        };
         let region = if well_formed_region(region) {
             region.to_string()
         } else {
             self.region.clone()
         };
-        let expires_in = expires_in.min(MAX_PRESIGNED_LIFETIME);
-        self.runtime.block_on(super::aws_s3::presigned(
-            &self.callback,
-            self.identity.as_ref(),
-            &region,
+        let signing = super::presigned_url::Signing {
+            endpoint,
+            identity: self.identity.as_ref(),
+            callback: &self.callback,
+            region: &region,
+        };
+        super::aws_s3::presigned(
+            &signing,
+            api.signing_name,
             operation,
             body,
-            expires_in,
-        ))
+            expires_in.min(MAX_PRESIGNED_LIFETIME),
+        )
     }
 }
 
-/// The longest a presigned URL this seam hands back is good for.
-///
-/// SigV4's own ceiling for a query-signed request is seven days
-/// ("X-Amz-Expires … the maximum value is 604800"), so a guest asking for longer is given a
-/// URL good for that, not one that is refused.
-const MAX_PRESIGNED_LIFETIME: Duration = Duration::from_secs(604_800);
+/// The longest a presigned URL this seam hands back is good for, which is the window a query
+/// signature may carry at all ([`super::presigned_url::MAX_LIFETIME`]).
+const MAX_PRESIGNED_LIFETIME: Duration = super::presigned_url::MAX_LIFETIME;
 
 /// Why a call was not made at all.
 ///

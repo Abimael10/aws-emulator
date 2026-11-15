@@ -307,6 +307,8 @@ mod handler_object_store_sdk;
 mod handler_parameter_store_sdk;
 #[path = "all/handler_pipes_sdk.rs"]
 mod handler_pipes_sdk;
+#[path = "all/handler_presigned_object_url.rs"]
+mod handler_presigned_object_url;
 #[path = "all/handler_query_compatible_error_code.rs"]
 mod handler_query_compatible_error_code;
 #[path = "all/handler_retrieves_an_aoss_backed_knowledge_base.rs"]

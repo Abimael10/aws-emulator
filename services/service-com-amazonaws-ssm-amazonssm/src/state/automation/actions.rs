@@ -363,7 +363,8 @@ fn sdk_access<Eng: Send + Sync + 'static>(
 ) -> Option<AwsAccess> {
     match claimed.assume_role.as_deref() {
         Some(role) => function_sdk_access(engine, ctx, region, role, &claimed.execution_id),
-        None => AwsAccess::new(ctx.callback().clone(), region),
+        None => AwsAccess::new(ctx.callback().clone(), region)
+            .map(|access| access.addressed_at(ctx.endpoint())),
     }
 }
 

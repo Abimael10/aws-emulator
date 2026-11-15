@@ -366,6 +366,13 @@ impl Caller {
 /// already made due: that write is owed at the same instant whether or not anybody called,
 /// which is why a REPORTING operation of this service may take this decision too.
 ///
+/// The key id is read WHEREVER SigV4 put it ([`::service_common::request_access_key_id`]):
+/// the `Authorization` header of a header-signed request, and the `X-Amz-Credential` scope of
+/// a query-signed (presigned) one. A presigned URL is signed by whoever minted it and carries
+/// that credential's own scope, so the later request it names is judged on the policies in
+/// force on THAT principal — which is what makes a presigned URL no more than its signer may
+/// do — rather than on nobody's.
+///
 /// A request another service made as its own SERVICE PRINCIPAL is that principal and nothing
 /// else ([`service_principal_call`], and the module docs for why): its credential is one the
 /// emulator minted for that one call, so no session and no IAM identity stands behind it.
@@ -388,7 +395,7 @@ pub fn request_caller<Eng: Send + Sync + 'static>(
             ..Caller::of_service_principal(call)
         };
     }
-    let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+    let access_key_id = ::service_common::request_access_key_id(ctx.parts());
     let iam_state = sts_store::iam_state(engine);
     // A long-term access key speaks for the IAM user that holds it, which is the identity
     // STS itself reports for it; a key no store holds is the account's own credential.

@@ -187,59 +187,55 @@ fn addresses_an_access_point(bucket: &str) -> bool {
         .is_some_and(|arn| arn.resource_type() == ACCESS_POINT_RESOURCE_TYPE)
 }
 
+/// The query field a presigned read of ONE VERSION of an object carries that version in
+/// (`GetObject$VersionId`, bound to the `versionId` query parameter).
+const VERSION_ID_FIELD: &str = "versionId";
+
+/// The header a presigned read asks for a RANGE of the object in (`GetObject$Range`, bound to
+/// the `Range` header), which the caller sends with the request the URL names.
+const RANGE_HEADER: &str = "range";
+
+/// The header a presigned WRITE declares the object's media type in (`PutObject$ContentType`,
+/// bound to the `Content-Type` header), sent the same way.
+const CONTENT_TYPE_HEADER: &str = "content-type";
+
 /// The URL a presigned object request carries its own signature in.
 ///
-/// The URL is built AND signed by the S3 client this module holds, with the same identity
-/// and the same endpoint a call made here uses, so what comes back addresses this emulator's
-/// own object endpoint and carries a SigV4 query signature over exactly the request it
-/// names, good for `expires_in`. Nothing is sent: presigning is a signature over a request
-/// that has not been made.
+/// Nothing is sent: presigning is a signature over a request that has not been made, so what
+/// comes back is the ADDRESS that request is sent to and a signature over exactly it. The
+/// address is this emulator's own endpoint with the object's path-style S3 address under it —
+/// the form this emulator routes an object request on — and the signature is the invocation's
+/// own identity's, which is what lets the service serving the later request authorize it as
+/// that identity ([`super::presigned_url`] holds both halves).
 ///
 /// Only the two operations a presigned URL is handed out for are signed — reading an object
-/// and writing one — and any other is reported as a URL that was not signed, naming it.
-pub async fn presigned(
-    callback: &EmbeddedEmulator,
-    identity: Option<&CallerIdentity>,
-    region: &str,
+/// and writing one — and any other is reported as a URL that was not signed, naming it. Each
+/// carries the members that operation's own model binds, where that binding puts them: the
+/// version in the query, the range and the media type as headers the caller sends.
+pub fn presigned(
+    signing: &super::presigned_url::Signing<'_>,
+    signing_name: &str,
     operation: &str,
     body: &str,
     expires_in: ::std::time::Duration,
 ) -> Result<String, Refusal> {
     let input = Input::read(body)?;
-    let client = client(
-        callback,
-        identity,
-        region,
-        Observed::default(),
-        input.text("Bucket")?.as_deref(),
-    );
-    let config = ::aws_sdk_s3::presigning::PresigningConfig::expires_in(expires_in)
-        .map_err(|error| Refusal::NotMade(error.to_string()))?;
-    let signed = match operation {
+    let (method, query, headers) = match operation {
         "GetObject" => {
             input.only(&["Bucket", "Key", "VersionId", "Range"])?;
-            client
-                .get_object()
-                .bucket(input.required_text("Bucket")?)
-                .key(input.required_text("Key")?)
-                .set_version_id(input.text("VersionId")?)
-                .set_range(input.text("Range")?)
-                .presigned(config)
-                .await
-                .map(|presigned| presigned.uri().to_string())
-                .map_err(|error| error.to_string())
+            (
+                ::http::Method::GET,
+                carried(VERSION_ID_FIELD, input.text("VersionId")?),
+                carried(RANGE_HEADER, input.text("Range")?),
+            )
         }
         "PutObject" => {
             input.only(&["Bucket", "Key", "ContentType"])?;
-            client
-                .put_object()
-                .bucket(input.required_text("Bucket")?)
-                .key(input.required_text("Key")?)
-                .set_content_type(input.text("ContentType")?)
-                .presigned(config)
-                .await
-                .map(|presigned| presigned.uri().to_string())
-                .map_err(|error| error.to_string())
+            (
+                ::http::Method::PUT,
+                Vec::new(),
+                carried(CONTENT_TYPE_HEADER, input.text("ContentType")?),
+            )
         }
         other => {
             return Err(Refusal::NotMade(format!(
@@ -248,7 +244,39 @@ pub async fn presigned(
             )))
         }
     };
-    signed.map_err(Refusal::NotMade)
+    let path = format!(
+        "/{}/{}",
+        input.required_text("Bucket")?,
+        input.required_text("Key")?
+    );
+    let (query, headers) = (borrowed(&query), borrowed(&headers));
+    let request = super::presigned_url::Request {
+        method,
+        signing_name,
+        path: &path,
+        query: &query,
+        headers: &headers,
+    };
+    super::presigned_url::signed(signing, &request, expires_in).ok_or_else(|| {
+        Refusal::NotMade(
+            "this Amazon S3 request could not be signed as a URL this emulator answers"
+                .to_string(),
+        )
+    })
+}
+
+/// One field or header a presigned request carries, as a list that is empty where the input
+/// named no value for it: a member the handler left out travels nowhere.
+fn carried(name: &'static str, value: Option<String>) -> Vec<(&'static str, String)> {
+    value.map(|value| (name, value)).into_iter().collect()
+}
+
+/// The same pairs as the slice of borrowed pairs the signer takes.
+fn borrowed<'a>(carried: &'a [(&'static str, String)]) -> Vec<(&'a str, &'a str)> {
+    carried
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect()
 }
 
 /// `GetObject`: the bytes and the metadata of the version the request addresses.

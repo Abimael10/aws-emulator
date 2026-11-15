@@ -17,7 +17,9 @@
 //! answers to at all (a real AWS service this runtime binds no requests for, a near miss on
 //! one it does, and the empty token). One row — the object store, whose protocol is its own —
 //! also asserts the URL its client PRESIGNS, so a token that is merely listed but bound to
-//! nothing fails here.
+//! nothing fails here: the URL leads back to the base URL this emulator is reached on, which
+//! is the one address a caller handed it can fetch it from (the suite over everything such a
+//! URL carries is `crate::handler_presigned_object_url`).
 //!
 //! Every row runs in ONE invocation: the probe presigns rather than sends, so no row needs the
 //! named service mounted, and an invocation is the dearest thing this target does.
@@ -31,7 +33,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use serde_json::json;
 use service_com_amazonaws_lambda_awsgirapiservice::state::execution::aws_api::reachable_services;
-use smithy_server_runtime::MultiServiceRouter;
+use smithy_server_runtime::{MultiServiceRouter, UNSERVED_URL_BASE};
 
 use crate::event_source_mappings::{await_function_active, call, router_on};
 // The one .zip writer this crate's suites package a handler with, exported by the suite that
@@ -348,9 +350,11 @@ async fn the_runtimes_sdk_answers_to_every_service_token_its_call_seam_binds() {
 
     // The object store's client is bound as well as listed: the URL it presigns addresses this
     // emulator's own object endpoint and carries a SigV4 query signature over that one request.
+    // The router of this suite is served on no port, so its base URL is the one an unserved
+    // emulator hands out.
     let object_url = probed["s3"]["url"].as_str().unwrap_or_default();
     assert!(
-        object_url.starts_with(&format!("https://s3.{REGION}.amazonaws.com/{BUCKET}/{KEY}?"))
+        object_url.starts_with(&format!("{UNSERVED_URL_BASE}/{BUCKET}/{KEY}?"))
             && object_url.contains("X-Amz-Signature=")
             && object_url.contains("X-Amz-Expires=120"),
         "case {case:?}: expected a presigned object URL for the object store, got \

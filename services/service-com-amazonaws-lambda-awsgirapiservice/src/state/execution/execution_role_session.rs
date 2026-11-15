@@ -129,6 +129,10 @@ fn sessions_state<Eng: Send + Sync + 'static>(
 /// live in: a handler that read such an address out of a control-plane response and dials it
 /// is reaching the service that published it
 /// ([`::service_common::published_data_planes`]).
+///
+/// And it carries the base URL this emulator is reached on, because a URL the handler's SDK
+/// PRESIGNS is handed to a later caller: it leads back to this emulator or it leads nowhere
+/// ([`super::presigned_url`]).
 #[must_use]
 pub fn function_sdk_access<Eng: Send + Sync + 'static>(
     engine: &Eng,
@@ -147,6 +151,7 @@ pub fn function_sdk_access<Eng: Send + Sync + 'static>(
     Some(
         super::AwsAccess::new(ctx.callback().clone(), region)?
             .signing_as(identity)
+            .addressed_at(ctx.endpoint())
             .resolving_published_planes(
                 ::service_common::published_data_planes::PublishedPlanes::of(engine),
             ),
