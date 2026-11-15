@@ -229,13 +229,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     invocation_step_id: step_id,
                 });
             }
-            return Err(PutInvocationStepErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Invocation step {step_id} already exists in invocation {} with different \
-                     content.",
-                    invocation.invocation_id
-                )),
-            })
+            // The refusal states the PAIR the request addressed and nothing else: the
+            // conflict is keyed on `(invocationIdentifier, invocationStepId)`, so its
+            // sentence names those two ids as the caller submitted them and says nothing
+            // about either side's content.
+            return Err(PutInvocationStepErrorModeled::ConflictException(
+                crate::state::invocation_step_already_exists(
+                    &input.invocation_identifier,
+                    &step_id,
+                ),
+            )
             .into());
         }
         if invocation.steps.len() >= crate::state::MAX_STEPS_PER_INVOCATION {

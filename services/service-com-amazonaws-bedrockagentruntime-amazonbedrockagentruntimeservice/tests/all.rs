@@ -17,6 +17,8 @@ mod agent_and_flow_invocations;
 mod agent_memory;
 #[path = "all/collection_length_refusals.rs"]
 mod collection_length_refusals;
+#[path = "all/conflict_refusal_messages.rs"]
+mod conflict_refusal_messages;
 #[path = "all/date_time_wire_form.rs"]
 mod date_time_wire_form;
 #[path = "all/document_content.rs"]

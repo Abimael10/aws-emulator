@@ -386,9 +386,50 @@ pub fn invocation_step_not_found(
     invocation_step_id: &str,
 ) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
-            "Combination of Invocation with ID {invocation_identifier} and Invcoation Step \
-             with ID {invocation_step_id} not found"
+        message: Some(invocation_step_pair_sentence(
+            invocation_identifier,
+            invocation_step_id,
+            "not found",
+        )),
+    }
+}
+
+/// The ONE sentence frame the service states ABOUT a `(invocationIdentifier,
+/// invocationStepId)` pair, with `outcome` as its closing clause.
+///
+/// Both refusals a pair earns — it resolves to nothing, or it is already taken — are the
+/// same sentence up to that clause, including the service's own spelling of the second
+/// noun, so the frame is written once here and neither copy can drift from the other.
+/// The variable parts are the two ids as the REQUEST carried them, and the sentence takes
+/// no trailing period.
+fn invocation_step_pair_sentence(
+    invocation_identifier: &str,
+    invocation_step_id: &str,
+    outcome: &str,
+) -> String {
+    format!(
+        "Combination of Invocation with ID {invocation_identifier} and Invcoation Step \
+         with ID {invocation_step_id} {outcome}"
+    )
+}
+
+/// The modelled `ConflictException` (HTTP 409) `PutInvocationStep` answers when the
+/// `(invocationIdentifier, invocationStepId)` pair the request addresses is one the store
+/// already holds.
+///
+/// The same frame as [`invocation_step_not_found`], closing in ` already exists`: the
+/// refusal is keyed on the two ids and states nothing else — not the session the write ran
+/// under, and nothing about the payload either side carries, since what the caller is told
+/// is that the pair is taken.
+pub fn invocation_step_already_exists(
+    invocation_identifier: &str,
+    invocation_step_id: &str,
+) -> ConflictException {
+    ConflictException {
+        message: Some(invocation_step_pair_sentence(
+            invocation_identifier,
+            invocation_step_id,
+            "already exists",
         )),
     }
 }
@@ -443,6 +484,23 @@ pub const ACTIVE_SESSION_NOT_DELETABLE: &str = "Cannot delete session in ACTIVE 
 pub fn active_session_not_deletable() -> ConflictException {
     ConflictException {
         message: Some(ACTIVE_SESSION_NOT_DELETABLE.to_string()),
+    }
+}
+
+/// The refusal `EndSession` answers when the session it names is already terminated — the
+/// `ACTIVE` -> `ENDED` transition it performs has already happened
+/// (`smithy_query(query="doc",shape="EndSession")`).
+///
+/// A CONSTANT sentence, like [`ACTIVE_SESSION_NOT_DELETABLE`]: it interpolates NOTHING —
+/// neither the identifier the request carried nor the status the store holds — so the
+/// refusal states the precondition and discloses no session state, and a client matches
+/// one fixed string however the session reached a terminal status.
+pub const SESSION_ALREADY_TERMINATED: &str = "Cannot end a terminated session";
+
+/// The modelled `ConflictException` (HTTP 409) carrying [`SESSION_ALREADY_TERMINATED`].
+pub fn session_already_terminated() -> ConflictException {
+    ConflictException {
+        message: Some(SESSION_ALREADY_TERMINATED.to_string()),
     }
 }
 

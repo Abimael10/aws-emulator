@@ -191,13 +191,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // answering as though it had performed one. The whole handler holds the store
         // lock, so exactly one of N concurrent calls performs it.
         if session.status != crate::state::SessionStatus::Active {
-            return Err(EndSessionErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Session {} has status {} and cannot be ended.",
-                    session.session_id,
-                    session.status.as_wire()
-                )),
-            })
+            return Err(EndSessionErrorModeled::ConflictException(
+                crate::state::session_already_terminated(),
+            )
             .into());
         }
         session.status = crate::state::SessionStatus::Ended;
