@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeBrokerEngineTypes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeBrokerEngineTypes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeBrokerEngineTypes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a REPORTING operation. It answers with Amazon MQ's published
+//! engine-type catalog — one entry per engine type the service offers, each carrying
+//! the engine versions currently offered for creation on that engine, newest first —
+//! narrowed by the `engineType` filter the request set and paged by `MaxResults` with
+//! an opaque round-trippable `NextToken`.
+//!
+//! The catalog describes the SERVICE, not the account: it is computed from the
+//! published engine/version set, so no record is read from the store and none is
+//! written, and two identical calls answer identically. The versions are the ones
+//! `DescribeBrokerInstanceOptions` reports and `CreateBroker` accepts
+//! ([`state::published_engine_versions`]), so a client that picks a version here can
+//! create a broker with it.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +81,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +153,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeBrokerEngineTypes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeBrokerEngineTypesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeBrokerEngineTypes"))
+        // What this operation reports describes what Amazon MQ OFFERS, not what the
+        // account created, so it is computed from the published engine/version set
+        // rather than read from a record — and nothing is written, so a later caller
+        // sees exactly what this one did.
+        let _ = (&self.engine, ctx);
+
+        // `engineType` targets `__string` on the wire
+        // (`smithy_query(query="operation", operation="DescribeBrokerEngineTypes")`),
+        // so a filter the request sent empty narrows nothing, exactly like one it
+        // omitted.
+        let engine_type = state::requested_filter(input.engine_type.as_deref());
+
+        // `engineType` names values the model enumerates (`EngineType`), so a value
+        // outside the set is refused naming the member at fault rather than quietly
+        // matching nothing. Same sentence as every other operation of this service
+        // states it with.
+        if let Some(engine_type) = engine_type {
+            state::validate_enum("engineType", engine_type, ENGINE_TYPE_VALUES)
+                .map_err(bad_request)?;
+        }
+
+        // `maxResults` carries the modelled `@range(min: 1, max: 100)`, which this
+        // handler enforces rather than the boundary validator, so the refusal names
+        // the member the way Amazon MQ does (`skip_validation` in
+        // `super::types::describe_broker_engine_types_types`).
+        if let Some(max_results) = input.max_results {
+            state::validate_range(
+                "maxResults",
+                max_results,
+                state::MIN_MAX_RESULTS,
+                state::MAX_MAX_RESULTS,
+            )
+            .map_err(bad_request)?;
+        }
+
+        // Only a token this service issued names an offset; anything else is a client
+        // error, not an empty page.
+        let offset = match state::requested_filter(input.next_token.as_deref()) {
+            None => 0,
+            Some(token) => state::decode_page_token(token).ok_or_else(|| {
+                bad_request(state::Invalid::new(
+                    "nextToken",
+                    state::invalid_page_token_message(token),
+                ))
+            })?,
+        };
+
+        let engine_types: Vec<BrokerEngineType> = published_broker_engine_types()
+            .into_iter()
+            .filter(|entry| state::selected_by(entry.engine_type.as_deref(), engine_type))
+            .collect();
+
+        let page = state::page_of(engine_types.len(), input.max_results, offset);
+        Ok(DescribeBrokerEngineTypesOutput {
+            // The page is taken through the checked accessor every listing of this
+            // service pages with, so an offset a token carries can never index past
+            // what THIS call's filter left to report.
+            broker_engine_types: Some(state::page_slice(&engine_types, &page).to_vec()),
+            max_results: Some(input.max_results.unwrap_or(DEFAULT_PAGE_SIZE)),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// The page size this operation reports when the request names none, from the output
+/// member's own documentation: "The maximum number of engine types that can be returned
+/// per page (20 by default)" — the same default every listing of this service uses
+/// ([`state::DEFAULT_MAX_RESULTS`]).
+const DEFAULT_PAGE_SIZE: i32 = state::DEFAULT_MAX_RESULTS as i32;
+
+/// The engine versions one catalog entry reports: the versions Amazon MQ currently
+/// offers for creation on that engine ([`state::published_engine_versions`], which holds
+/// them oldest first so a create defaults to the last), reported NEWEST first — the
+/// order Amazon MQ publishes a version list in, and the order
+/// `DescribeBrokerInstanceOptions` reports its `supportedEngineVersions` in.
+fn offered_engine_versions(engine_type: &str) -> Vec<EngineVersion> {
+    state::published_engine_versions(engine_type)
+        .iter()
+        .rev()
+        .map(|version| EngineVersion {
+            name: Some((*version).to_string()),
+        })
+        .collect()
+}
+
+/// Amazon MQ's whole engine-type catalog, in the order the service reports it: one entry
+/// per engine type the model enumerates (`ENGINE_TYPE_VALUES`, from
+/// `smithy_query(query="shape", shape="EngineType")`), in that order — which is what
+/// makes a `NextToken` offset name the same entry on a later call.
+fn published_broker_engine_types() -> Vec<BrokerEngineType> {
+    ENGINE_TYPE_VALUES
+        .iter()
+        .map(|engine_type| BrokerEngineType {
+            engine_type: Some((*engine_type).to_string()),
+            engine_versions: Some(offered_engine_versions(engine_type)),
+        })
+        .collect()
+}
+
+/// Lift a refused value into this operation's modelled `BadRequestException` (HTTP 400).
+fn bad_request(invalid: state::Invalid) -> DescribeBrokerEngineTypesError {
+    DescribeBrokerEngineTypesErrorModeled::BadRequestException(BadRequestException {
+        error_attribute: invalid.attribute,
+        message: Some(invalid.message),
+        resource_share_errors: None,
+    })
+    .into()
 }

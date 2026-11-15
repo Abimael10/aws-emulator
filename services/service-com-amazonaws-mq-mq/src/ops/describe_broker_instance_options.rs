@@ -163,9 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`smithy_query(query="operation", operation="DescribeBrokerInstanceOptions")`),
         // so a filter the request sent empty narrows nothing, exactly like one it
         // omitted.
-        let engine_type = requested_filter(input.engine_type.as_deref());
-        let host_instance_type = requested_filter(input.host_instance_type.as_deref());
-        let storage_type = requested_filter(input.storage_type.as_deref());
+        let engine_type = state::requested_filter(input.engine_type.as_deref());
+        let host_instance_type = state::requested_filter(input.host_instance_type.as_deref());
+        let storage_type = state::requested_filter(input.storage_type.as_deref());
 
         // `engineType` and `storageType` name values the model enumerates
         // (`EngineType`, `BrokerStorageType`), so a value outside the set is refused
@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Only a token this service issued names an offset; anything else is a client
         // error, not an empty page.
-        let offset = match requested_filter(input.next_token.as_deref()) {
+        let offset = match state::requested_filter(input.next_token.as_deref()) {
             None => 0,
             Some(token) => state::decode_page_token(token).ok_or_else(|| {
                 bad_request(state::Invalid::new(
@@ -209,9 +209,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let options: Vec<BrokerInstanceOption> = published_instance_options(&region)
             .into_iter()
             .filter(|option| {
-                selected_by(option.engine_type.as_deref(), engine_type)
-                    && selected_by(option.host_instance_type.as_deref(), host_instance_type)
-                    && selected_by(
+                state::selected_by(option.engine_type.as_deref(), engine_type)
+                    && state::selected_by(
+                        option.host_instance_type.as_deref(),
+                        host_instance_type,
+                    )
+                    && state::selected_by(
                         option.storage_type.as_deref(),
                         storage_type.map(catalog_storage_type).as_deref(),
                     )
@@ -228,18 +231,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token: page.next_token,
         })
     }
-}
-
-/// A filter the request actually set. A member it omitted and a member it sent empty
-/// both mean "do not narrow by this one".
-fn requested_filter(value: Option<&str>) -> Option<&str> {
-    value.filter(|value| !value.is_empty())
-}
-
-/// Whether a catalog entry's member satisfies a filter: a filter the request did not
-/// set selects every entry, one it did set selects the entries whose member equals it.
-fn selected_by(value: Option<&str>, filter: Option<&str>) -> bool {
-    filter.is_none_or(|filter| value == Some(filter))
 }
 
 /// Refuse a `storageType` filter that names no `BrokerStorageType` value.

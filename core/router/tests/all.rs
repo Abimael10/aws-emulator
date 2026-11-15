@@ -2203,3 +2203,14 @@ mod zz_probe_whole_emulator;
 // service crate's own, is stated in that suite's own module header, where it is read beside
 // the test it explains; a note about THIS file belongs in `all/appended_notes.rs`, declared
 // below like any other suite. The `all/all_rs_*.rs` suites,
+// belongs in that suite's own module header, where it is read beside the test it explains.
+// A note about THIS file belongs in `all/appended_notes.rs`, which is declared below like
+// any other suite.
+// deliberate: a doc comment of the inner form documents the module it stands in, so the
+// language accepts it only ahead of the first item, and one appended past the declarations
+// compiles no suite of this target. With none anywhere in the file, no appended, re-typed
+// or merged copy of a line of it can be one.
+// A suite declared twice fails every suite of this target too, and a suite file no
+// declaration names is compiled nowhere. The `all_rs_*` suites,
+// `all/declaration_roots_are_canonical_and_complete.rs` check all of that, for this file
+// This file is a test-target CRATE ROOT, where a bare `mod` would resolve to a SIBLING of

@@ -1294,6 +1294,22 @@ pub fn validate_subnet_ids(deployment_mode: &str, subnet_ids: &[String]) -> Resu
     }
 }
 
+/// A filter a request actually set. Every filter member of this service's
+/// catalogs targets `__string` on the wire, so a member the request omitted and
+/// a member it sent EMPTY both mean "do not narrow by this one".
+pub fn requested_filter(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty())
+}
+
+/// Whether a catalog entry's member satisfies a filter: a filter the request did
+/// not set selects every entry, one it did set selects the entries whose member
+/// equals it. Both catalogs this service reports narrow through this one
+/// function, so "a filter the request did not set narrows nothing" has one
+/// definition.
+pub fn selected_by(value: Option<&str>, filter: Option<&str>) -> bool {
+    filter.is_none_or(|filter| value == Some(filter))
+}
+
 /// The page size a listing of this service uses when the request omits
 /// `MaxResults`, from the member's own documentation: "The maximum number of
 /// brokers that Amazon MQ can return per page (20 by default)", worded the same
