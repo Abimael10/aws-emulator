@@ -22,7 +22,7 @@ aws-smithy-types = { workspace = true }
 # (`state::event_source_poller`) waits between passes with `tokio::time::sleep` rather
 # than parking a worker thread, and `sync` for the run slots an invocation takes one of
 # (`state::execution`).
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -258,6 +258,16 @@ percent-encoding = "2.3"
 # already in this workspace's lock file.
 aws-sigv4 = { version = "1", default-features = false, features = ["http1", "sign-http"] }
 aws-credential-types = "1"
+# The TLS CLIENT one of those connections negotiates its session with
+# (`state::execution::guest_socket`): a data plane whose protocol runs over TLS is reached by
+# running the client side of a real handshake against the certificate this emulator's core
+# presents on the plane it reached, whose end runs the server side of it — so the version, the
+# suite and the peer certificate a handler reads back are the ones that handshake negotiated.
+# The same implementation the core's own listeners terminate TLS with, so one process has one
+# TLS stack, and `tokio-rustls` is that implementation over the in-process stream the
+# connection is.
+rustls = { workspace = true }
+tokio-rustls = "0.26"
 # The platform's own values for the names a complete POSIX module carries as plain data —
 # the `open` flags the standard library reads off `os` while being imported
 # (`state::execution::host_posix`) — taken from the C headers rather than written out here.
@@ -278,8 +288,10 @@ service-com-amazonaws-kms-trentservice = { workspace = true }
 # A deployment package the invoke tests upload is a .zip archive they write in memory.
 zip = { version = "9", default-features = false, features = ["deflate"] }
 # `time` on top of the workspace features: the data-plane tests wait out the state-settle
-# span and the poller's passes with `tokio::time::sleep`.
-tokio = { workspace = true, features = ["time"] }
+# span and the poller's passes with `tokio::time::sleep`, and `io-util` for the listener the
+# socket tests open on this emulator's own core: its protocol handler reads and writes the
+# connection the core hands it.
+tokio = { workspace = true, features = ["io-util", "time"] }
 # The services a mapping's event source and its own metrics live in are mounted beside
 # lambda on ONE engine in the data-plane tests, because a delivery is asserted where a
 # client sees it: on the stream the records were put to, and in the series CloudWatch

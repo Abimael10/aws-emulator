@@ -241,6 +241,12 @@ pub struct DbEngineEndpoint {
     /// The same, for the read-only endpoint of this engine where it has one: dropping the
     /// record closes both ports.
     _reader_listener: Option<::emulator_server::ResourceListener>,
+    /// The records that say these addresses are ones this emulator has opened a plane at, so
+    /// an in-process client of this emulator that was handed one — the code of a Lambda
+    /// function attached to the instance's VPC — can open a connection to it, served by the
+    /// same handler as the listener itself (`service_common::dialable_data_planes`). Dropping
+    /// them withdraws the addresses, exactly as dropping the listeners above closes the ports.
+    _dialable: Vec<::service_common::dialable_data_planes::OpenedPlanes>,
 }
 
 /// Written by hand rather than derived: the endpoint holds a core `ResourceListener` and a
@@ -613,26 +619,73 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
             next_connection_id: Arc::clone(&next_connection_id),
         })
     };
+    // ONE protocol handler per endpoint, served at both of its ends: the listener the core
+    // accepts a client's connections on, and the connections an IN-PROCESS client of this
+    // emulator opens to the address this endpoint publishes
+    // (`service_common::dialable_data_planes`) — a handler running in a Lambda function
+    // attached to this resource's VPC reads `Endpoint` out of the control plane and opens a
+    // connection to exactly that address. Both ends are the same handler over the same
+    // database, so a session is served the same way whichever end it arrived on.
     let open = |context: wire_session::SessionContext| async {
-        match wire {
+        let opened = match wire {
             EngineWire::Postgres => {
+                let served = Arc::new(pg_wire::PostgresWire::new(context));
                 listeners
-                    .tcp_plaintext(pg_wire::PostgresWire::new(context))
+                    .tcp_plaintext(::service_common::dialable_data_planes::SharedHandler(
+                        Arc::clone(&served),
+                    ))
                     .await
+                    .map(|listener| {
+                        // The wire negotiates its own encryption in band, so the plane is
+                        // handed byte 0 at both ends and upgrades it itself.
+                        let plane =
+                            ::service_common::dialable_data_planes::served_in_process(served, None);
+                        (listener, plane)
+                    })
             }
             EngineWire::MySql => {
+                let served = Arc::new(mysql_wire::MySqlWire::new(context));
                 listeners
-                    .tcp_plaintext(mysql_wire::MySqlWire::new(context))
+                    .tcp_plaintext(::service_common::dialable_data_planes::SharedHandler(
+                        Arc::clone(&served),
+                    ))
                     .await
+                    .map(|listener| {
+                        let plane =
+                            ::service_common::dialable_data_planes::served_in_process(served, None);
+                        (listener, plane)
+                    })
             }
-        }
-        .map_err(|error| format!("the engine endpoint could not be opened: {error}"))
+        };
+        opened.map_err(|error| format!("the engine endpoint could not be opened: {error}"))
     };
-    let listener = open(context_for(role)?).await?;
-    let reader_listener = match reader {
+    let (listener, writing) = open(context_for(role)?).await?;
+    let reader_endpoint = match reader {
         true => Some(open(context_for(EndpointRole::Reader)?).await?),
         false => None,
     };
+    let (reader_listener, reading) = match reader_endpoint {
+        Some((listener, plane)) => (Some(listener), Some(plane)),
+        None => (None, None),
+    };
+    // The addresses are now ones this emulator SERVES: each is recorded as the address its
+    // own plane answers at, and the records are withdrawn with the listeners themselves.
+    let dialable: Vec<::service_common::dialable_data_planes::OpenedPlanes> =
+        match ::service_common::dialable_data_planes::DialablePlanes::of(engine) {
+            Some(planes) => [
+                Some((&listener, &writing)),
+                reader_listener.as_ref().zip(reading.as_ref()),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|(listener, plane)| {
+                let authority =
+                    ::service_common::data_plane_addressing::listener_authority(listener);
+                planes.opening([authority], SIGNING_NAME, plane)
+            })
+            .collect(),
+            None => Vec::new(),
+        };
     Ok(DbEngineEndpoint {
         endpoint: ServedEndpoint {
             host: listener.host(),
@@ -648,8 +701,13 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
         generation,
         _listener: listener,
         _reader_listener: reader_listener,
+        _dialable: dialable,
     })
 }
+
+/// The SigV4 signing name of this service, which is what the records above name as the
+/// service answering at an address it opened.
+const SIGNING_NAME: &str = "rds";
 
 /// The SHARED engine this service is mounted on, which owns the listener surface: call it
 /// with a handler's `&*self.engine`.

@@ -28,17 +28,23 @@
 //!   reach a host file, process or descriptor raises;
 //! * `socket` is one of those: no socket EXTENSION is registered — `_socket` and `_ssl` stay
 //!   off the allow-list above, so the standard library's own `socket` has nothing to be built
-//!   on and no guest code can create a host socket, resolve a name or open a connection. What
-//!   this runtime supplies on the import path instead ([`super::guest_http`], with the
-//!   datagram half of [`super::xray_daemon`]) opens nothing: its one reachable destination is
-//!   the in-process X-Ray daemon, whose datagrams travel over the SAME bounded AWS SDK seam
-//!   below, and every other destination raises the error a host with no route to it answers;
-//! * the only host functions the guest can call are the six on [`HOST_MODULE`]: the
+//!   on and no guest code holds a host socket or a host descriptor. What this runtime supplies
+//!   on the import path instead ([`super::guest_http`], with the sockets of
+//!   [`super::xray_daemon`] and the connections of [`super::guest_socket`]) reaches THIS
+//!   emulator and nothing else: a datagram's one destination is the in-process X-Ray daemon,
+//!   whose datagrams travel over the SAME bounded AWS SDK seam below, and a stream socket's
+//!   one destination is an address this emulator itself opened a resource's data-plane
+//!   listener at — every other destination raises the error a host answers for it, and no name
+//!   but this machine's own resolves;
+//! * the only host functions the guest can call are the eight on [`HOST_MODULE`]: the
 //!   invocation log, a sleep clamped to what is left of the run, ONE AWS SDK call into this
 //!   same emulator ([`super::aws_api`], which decides which services are reachable, signs the
 //!   request itself and bounds it by what the run has left), the authentication token an
-//!   SDK mints in its client, the one request a handler sends itself and the one URL it has
-//!   signed. No host path, host environment variable, host credential or
+//!   SDK mints in its client, the one request a handler sends itself, the one URL it has
+//!   signed, what a called operation's own model says about paging, and the one call a handler
+//!   makes on a stream socket it opened ([`super::guest_socket`], which decides which
+//!   addresses are dialable and bounds every wait by what the run has left). No host path,
+//!   host environment variable, host credential or
 //!   other function's state is reachable from guest code, and NO bound of the run — no
 //!   deadline, no step count and no memory baseline — is reachable from it either: where one
 //!   PHASE of a run ends and the next begins is decided by the HOST, between two calls it
@@ -583,6 +589,10 @@ pub(super) struct Session {
     serving: Mutex<Serving>,
     /// How many calls into this emulator the invocation being served has made.
     calls: AtomicU64,
+    /// The CONNECTIONS the invocation being served has open, and what it has carried on them
+    /// ([`super::guest_socket`]). Held by the environment, like the session itself, and given
+    /// up with the invocation that opened them.
+    sockets: super::guest_socket::Sockets,
 }
 
 /// The invocation an environment is serving right now.
@@ -609,6 +619,7 @@ impl Session {
                 aws: aws.cloned(),
             }),
             calls: AtomicU64::new(0),
+            sockets: super::guest_socket::Sockets::default(),
         })
     }
 
@@ -627,6 +638,9 @@ impl Session {
         serving.aws = aws.cloned();
         drop(serving);
         self.calls.store(0, Ordering::SeqCst);
+        // Nothing of the invocation before it is carried over on a connection either: every
+        // socket it opened is closed here, and the next invocation starts with none.
+        self.sockets.release();
     }
 
     /// Where the invocation being served writes its output.
@@ -661,12 +675,36 @@ impl Session {
     }
 
     /// Stop holding the SDK seam of the invocation just served, so an environment standing
-    /// idle holds no credential of the caller whose invocation it served.
+    /// idle holds no credential of the caller whose invocation it served — and close every
+    /// connection that invocation opened, so an environment standing idle holds no socket of
+    /// it either.
     fn release_access(&self) {
         self.serving
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .aws = None;
+        self.sockets.release();
+    }
+
+    /// ONE call the invocation being served made on a STREAM socket of its own
+    /// ([`super::guest_socket`]): the connections are this environment's, WHERE a connection
+    /// may be opened is decided by the register of the planes this emulator has opened, and
+    /// the plane's own handler runs on the async runtime the invocation's seam holds. An
+    /// invocation with no seam reaches no plane, which is what a run with no seam is.
+    fn socket_call(&self, verb: &str, document: &str, within: Duration) -> Option<String> {
+        let access = self
+            .serving
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .aws
+            .clone()?;
+        Some(self.sockets.answered(
+            access.dialing().as_ref(),
+            &access.runtime(),
+            verb,
+            document,
+            within,
+        ))
     }
 
     /// Whether the invocation being served may make one more call into this emulator, which
@@ -1459,12 +1497,13 @@ fn clamp_recursion(vm: &VirtualMachine, limit: usize) -> PyResult<()> {
 }
 
 /// The module the host functions live on, and the whole of what guest code can call of
-/// this process: `log`, `sleep`, `aws`, `db_auth_token`, `request`, `presign` and
-/// `pagination` — the invocation log, a sleep clamped to what the run has left, ONE AWS SDK
+/// this process: `log`, `sleep`, `aws`, `db_auth_token`, `request`, `presign`, `pagination`
+/// and `net` — the invocation log, a sleep clamped to what the run has left, ONE AWS SDK
 /// call into this same emulator, the authentication token an SDK mints in its client, the one
-/// request a handler sends itself, the one URL it has signed, and what the called service's
-/// own model states about paging one operation through. Nothing else of the host is
-/// reachable from guest code, and nothing here moves a bound.
+/// request a handler sends itself, the one URL it has signed, what the called service's
+/// own model states about paging one operation through, and the one call a handler makes on a
+/// stream socket it opened to a data-plane listener of this emulator. Nothing else of the
+/// host is reachable from guest code, and nothing here moves a bound.
 ///
 /// Installed ONCE per execution environment, with its interpreter: every one of these
 /// functions reads the invocation being served from the environment's [`Session`], so the log
@@ -1702,6 +1741,52 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
             Ok(vm.ctx.new_str(answered).into())
         },
     );
+    // The ONE call a handler makes on a STREAM SOCKET of its own, for a data plane whose wire
+    // protocol is its own rather than HTTP. WHERE a connection may be opened, the connections
+    // themselves and how many bytes one invocation may carry are all
+    // [`super::guest_socket`]'s; the two bounds that are this run's — how many calls it may
+    // make when it OPENS one, and how long any one call may wait — are held here, where no
+    // guest code can reach them.
+    let dialing = Arc::clone(session);
+    set_function(
+        vm,
+        &module,
+        "net",
+        move |args: FuncArgs, vm: &VirtualMachine| {
+            let (verb, document): (String, String) = args.bind(vm)?;
+            let call_bounds = dialing.bounds();
+            if let Some(stop) = call_bounds.stopped() {
+                return Err(vm.new_runtime_error(stop.reason().to_owned()));
+            }
+            // OPENING a connection is one of the calls an invocation is allowed; carrying
+            // bytes on one that is already open is not, because a wire protocol's session is
+            // many reads and writes on the one connection.
+            if verb == "connect" && !dialing.may_call() {
+                return Err(vm.new_runtime_error(format!(
+                    "one invocation may make at most {MAX_CALLS_PER_RUN} calls into this \
+                     emulator"
+                )));
+            }
+            let remaining = call_bounds.remaining();
+            if remaining.is_zero() {
+                return Err(vm.new_runtime_error(Stop::Deadline.reason().to_owned()));
+            }
+            let answered = dialing.socket_call(&verb, &document, remaining).unwrap_or_else(
+                || {
+                    ::serde_json::json!({
+                        "error": {
+                            "kind": "other",
+                            "errno": ::serde_json::Value::Null,
+                            "message": "this invocation was given no seam to open a \
+                                        connection on, so none was opened",
+                        }
+                    })
+                    .to_string()
+                },
+            );
+            Ok(vm.ctx.new_str(answered).into())
+        },
+    );
     // What the SDK's own PAGINATOR for one operation drives: the input member a continuation
     // value is sent back in, the output member it arrives in, the member a page's size is
     // asked for and the members a page's results arrive in, read out of the CALLED service's
@@ -1744,6 +1829,7 @@ const HOST_MODULE_FUNCTIONS: &[&str] = &[
     "request",
     "presign",
     "pagination",
+    "net",
 ];
 
 /// What the guest reads back from one AWS SDK call: the service's own answer, or the
@@ -2941,6 +3027,7 @@ mod tests {
             "aws",
             "db_auth_token",
             "log",
+            "net",
             "pagination",
             "presign",
             "request",

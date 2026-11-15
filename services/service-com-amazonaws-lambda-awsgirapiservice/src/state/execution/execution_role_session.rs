@@ -125,10 +125,12 @@ fn sessions_state<Eng: Send + Sync + 'static>(
 /// `None` where there is no seam at all, which is a run with no SDK.
 ///
 /// It also carries the records of WHICH service answers at an address this emulator
-/// published for a resource's own data plane, out of the same shared engine the roles above
-/// live in: a handler that read such an address out of a control-plane response and dials it
-/// is reaching the service that published it
-/// ([`::service_common::published_data_planes`]).
+/// published for a resource's data plane, and WHICH data planes this emulator has opened and
+/// at which addresses, out of the same shared engine the roles above live in: a handler that
+/// read such an address out of a control-plane response reaches, over HTTP or over a socket it
+/// opens itself, the plane the service that published it opened
+/// ([`::service_common::published_data_planes`],
+/// [`::service_common::dialable_data_planes`]).
 ///
 /// And it carries the base URL this emulator is reached on, because a URL the handler's SDK
 /// PRESIGNS is handed to a later caller: it leads back to this emulator or it leads nowhere
@@ -154,6 +156,9 @@ pub fn function_sdk_access<Eng: Send + Sync + 'static>(
             .addressed_at(ctx.endpoint())
             .resolving_published_planes(
                 ::service_common::published_data_planes::PublishedPlanes::of(engine),
+            )
+            .dialing_opened_planes(
+                ::service_common::dialable_data_planes::DialablePlanes::of(engine),
             ),
     )
 }

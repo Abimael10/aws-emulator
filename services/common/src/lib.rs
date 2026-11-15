@@ -376,6 +376,11 @@ pub mod data_plane_addressing;
 /// route an in-process client that was handed that address, which cannot read a service off
 /// an address the way it can off an endpoint host.
 pub mod published_data_planes;
+/// The data planes an IN-PROCESS client may open a connection to and the `host:port` each
+/// answers at — recorded by the service that opened the resource's listener, and read by a
+/// client of this emulator that was handed one of those addresses, so the connection it opens
+/// is a pipe to that plane's own handler rather than a socket.
+pub mod dialable_data_planes;
 /// The ONE rendering of a `restJson1` timestamp whose model declares the `date-time` form,
 /// for every service of that class — which the generated member schemas drop, so without it
 /// such a member goes on the wire as the protocol's default epoch-seconds NUMBER.

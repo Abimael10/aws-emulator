@@ -8,13 +8,15 @@
 //! `AWS_XRAY_DAEMON_ADDRESS`, and the daemon submits them. That is what this module is, in
 //! two halves:
 //!
-//! * [`DATAGRAM_SOURCE`], the datagram sockets of the `socket` module this runtime supplies
+//! * [`DATAGRAM_SOURCE`], the sockets of the `socket` module this runtime supplies
 //!   ([`super::guest_http::runtime_stdlib_modules`], which this source is appended to). The
-//!   interpreter a run happens in registers no host socket extension at all — nothing of a run
-//!   may open a connection ([`super::python`]) — so a socket here opens nothing: the ONE
-//!   reachable destination is the daemon address this invocation's environment names, and every
-//!   other destination raises the error a host with no route to it answers, exactly as the rest
-//!   of that module's calls do.
+//!   interpreter a run happens in registers no host socket extension at all
+//!   ([`super::python`]), so every socket of a run is this source's. The one destination a
+//!   DATAGRAM of it reaches is the daemon address this invocation's environment names, and
+//!   every other datagram destination raises the error a host with no route to it answers; a
+//!   STREAM socket's calls are the stream half appended beside this one
+//!   ([`super::guest_socket`]), which connects to the data-plane listeners this emulator has
+//!   opened.
 //! * the DAEMON itself, in that same source: a datagram is read as the daemon's own framing —
 //!   a header line declaring the format, then one segment document per line — and the documents
 //!   it carries are submitted to X-Ray through `PutTraceSegments`, over the one AWS SDK seam a
@@ -52,10 +54,12 @@ pub const CONTEXT_MISSING_VARIABLE: &str = "AWS_XRAY_CONTEXT_MISSING";
 /// The value that variable carries.
 pub const CONTEXT_MISSING_LOG_ERROR: &str = "LOG_ERROR";
 
-/// The DATAGRAM half of the `socket` module this runtime supplies, appended to the names,
-/// errors and conversions that module already states
+/// The SOCKETS of the `socket` module this runtime supplies, appended to the names, errors
+/// and conversions that module already states
 /// ([`super::guest_http::runtime_stdlib_modules`]) — so there is ONE `socket` a handler can
-/// import, and the only thing this adds to it is the daemon a datagram can reach.
+/// import. What this adds to it is the socket itself and the daemon a datagram of one
+/// reaches; where a socket is a STREAM socket, its calls are the stream half beside this one
+/// ([`super::guest_socket::STREAM_SOURCE`]).
 pub const DATAGRAM_SOURCE: &str = r#"
 
 # ---------------------------------------------------------------------------
@@ -151,8 +155,13 @@ def _delivered(data):
 
 
 class socket(object):
-    """One socket of the invocation. A datagram socket delivers to the daemon; a stream
-    socket has nothing to connect to."""
+    """One socket of the invocation.
+
+    A DATAGRAM socket delivers to the daemon, and every other destination has no route. A
+    STREAM socket carries bytes on a connection the host opens for it, to an address this
+    emulator serves a resource's own data plane at: those calls are the stream half of this
+    module, appended below.
+    """
 
     def __init__(self, family=AF_INET, type=SOCK_STREAM, proto=0, fileno=None):
         self.family = family
@@ -161,6 +170,8 @@ class socket(object):
         self._closed = False
         self._peer = None
         self._timeout = None
+        # The connection a STREAM socket holds, once it has one. A datagram socket holds none.
+        self._handle = None
 
     def __enter__(self):
         return self
@@ -176,7 +187,12 @@ class socket(object):
             self.proto,
         )
 
+    def _is_stream(self):
+        return self.type != SOCK_DGRAM
+
     def close(self):
+        if self._is_stream():
+            _stream_close(self)
         self._closed = True
 
     def detach(self):
@@ -208,6 +224,8 @@ class socket(object):
         return None
 
     def getsockname(self):
+        # A connection of this runtime is served in process, so it is bound to no address of
+        # its own: the same answer an unbound socket gives, which is what this is.
         return ("0.0.0.0", 0)
 
     def getpeername(self):
@@ -218,34 +236,56 @@ class socket(object):
     def sendto(self, data, *arguments):
         if not arguments:
             raise TypeError("sendto() takes an address")
+        if self._is_stream():
+            raise error(_ENETUNREACH, _NO_ROUTE)
         self._deliver(data, _named(arguments[-1]))
         return len(_datagram_text(data).encode("utf-8"))
 
     def connect(self, address):
+        if self._is_stream():
+            return _stream_connect(self, address)
         self._reachable(_named(address))
         self._peer = address
+        return None
 
     def connect_ex(self, address):
         try:
             self.connect(address)
-        except OSError:
-            return _ENETUNREACH
+        except OSError as failed:
+            number = failed.errno
+            return number if number else _ENETUNREACH
         return 0
 
     def send(self, data, flags=0):
+        if self._is_stream():
+            return _stream_send(self, data)
         if self._peer is None:
             raise error(_ENETUNREACH, _NO_ROUTE)
         self._deliver(data, _named(self._peer))
         return len(_datagram_text(data).encode("utf-8"))
 
     def sendall(self, data, flags=0):
+        if self._is_stream():
+            payload = _stream_bytes(data)
+            while payload:
+                payload = payload[_stream_send(self, payload) :]
+            return None
         self.send(data, flags)
         return None
 
     def recv(self, size, flags=0):
+        if self._is_stream():
+            return _stream_recv(self, size)
+        raise error(_ENETUNREACH, _NO_ROUTE)
+
+    def recv_into(self, buffer, nbytes=None, flags=0):
+        if self._is_stream():
+            return _stream_recv_into(self, buffer, nbytes)
         raise error(_ENETUNREACH, _NO_ROUTE)
 
     def recvfrom(self, size, flags=0):
+        if self._is_stream():
+            return (_stream_recv(self, size), self.getpeername())
         raise error(_ENETUNREACH, _NO_ROUTE)
 
     def listen(self, backlog=0):
@@ -255,9 +295,13 @@ class socket(object):
         raise error(_ENETUNREACH, _NO_ROUTE)
 
     def makefile(self, *arguments, **keywords):
+        if self._is_stream():
+            return _stream_makefile(self, *arguments, **keywords)
         raise error(_ENETUNREACH, _NO_ROUTE)
 
     def shutdown(self, how):
+        if self._is_stream():
+            return _stream_shutdown(self, how)
         return None
 
     def _reachable(self, named):

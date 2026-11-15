@@ -1475,6 +1475,10 @@ pub struct AwsAccess {
     /// data plane, for a request the handler SENDS ITSELF to one
     /// ([`super::guest_http`]). `None` where this emulator vends no such records.
     published: Option<::service_common::published_data_planes::PublishedPlanes>,
+    /// The data planes this emulator has OPENED and the addresses they answer at, for a
+    /// STREAM SOCKET the handler opens itself ([`super::guest_socket`]). `None` where this
+    /// emulator vends no such records, and then no address answers at all.
+    dialable: Option<::service_common::dialable_data_planes::DialablePlanes>,
     /// The base URL this emulator is reached on, which a URL the handler's SDK PRESIGNS has
     /// to lead back to ([`super::presigned_url`]). `None` where the run was given no
     /// endpoint, in which case no URL is signed at all rather than one signed for an address
@@ -1495,6 +1499,7 @@ impl AwsAccess {
             identity: None,
             trace_header: None,
             published: None,
+            dialable: None,
             endpoint: None,
         })
     }
@@ -1534,6 +1539,37 @@ impl AwsAccess {
     ) -> Self {
         self.published = published;
         self
+    }
+
+    /// The same access, opening a connection to a data plane this emulator OPENED against
+    /// `dialable` — the records the service that opened that plane wrote
+    /// ([`::service_common::dialable_data_planes`]).
+    ///
+    /// `None` leaves every address answering nowhere, so a connection a handler opens to one
+    /// is answered the way a host with nothing listening answers it: the position every
+    /// address was in before a service opened a plane.
+    #[must_use]
+    pub fn dialing_opened_planes(
+        mut self,
+        dialable: Option<::service_common::dialable_data_planes::DialablePlanes>,
+    ) -> Self {
+        self.dialable = dialable;
+        self
+    }
+
+    /// The records a STREAM SOCKET's destination is resolved against, for the seam that holds
+    /// a running handler's connections ([`super::guest_socket`]).
+    #[must_use]
+    pub fn dialing(&self) -> Option<::service_common::dialable_data_planes::DialablePlanes> {
+        self.dialable.clone()
+    }
+
+    /// The async runtime a call of this seam is driven on, for a caller that has to block its
+    /// own thread on one: the handle the invocation's seam was built with, which is the
+    /// runtime the emulator's own planes and services run on.
+    #[must_use]
+    pub fn runtime(&self) -> ::tokio::runtime::Handle {
+        self.runtime.clone()
     }
 
     /// The same access, signing a URL the handler asks the SDK to PRESIGN for `endpoint` —

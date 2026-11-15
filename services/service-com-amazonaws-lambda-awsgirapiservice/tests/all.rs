@@ -295,6 +295,8 @@ mod handler_bucket_administration_sdk;
 mod handler_customer_key_access;
 #[path = "all/handler_db_auth_token.rs"]
 mod handler_db_auth_token;
+#[path = "all/handler_data_plane_socket.rs"]
+mod handler_data_plane_socket;
 #[path = "all/handler_lambda_sdk.rs"]
 mod handler_lambda_sdk;
 #[path = "all/handler_logging_facility.rs"]

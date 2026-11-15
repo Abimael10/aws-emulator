@@ -469,19 +469,22 @@ fn refusal_document(refused: &Refusal) -> String {
 /// entries, so these are the `socket`, `http.client` and `ssl` a handler imports, and a
 /// package shipping its own still wins.
 ///
-/// The socket module is [`SOCKET_SOURCE`] and the DATAGRAM half of it
-/// ([`super::xray_daemon::DATAGRAM_SOURCE`]) together: the names, the errors and the
-/// conversions a program reads off `socket` are the former's, and the sockets themselves are
-/// the latter's — so there is ONE `socket` a handler can import, whose only reachable
-/// destination is the in-process X-Ray daemon.
+/// The socket module is [`SOCKET_SOURCE`], the DATAGRAM half of it
+/// ([`super::xray_daemon::DATAGRAM_SOURCE`]) and the STREAM half beside it
+/// ([`super::guest_socket::STREAM_SOURCE`]) together: the names, the errors and the
+/// conversions a program reads off `socket` are the first's, the sockets themselves are the
+/// second's, and the connections a stream socket carries bytes on are the third's — so there
+/// is ONE `socket` a handler can import, whose reachable destinations are the in-process
+/// X-Ray daemon and the data-plane listeners this emulator has opened.
 #[must_use]
 pub fn runtime_stdlib_modules() -> Vec<PackageModule> {
     [
         (
             "socket.py",
             format!(
-                "{SOCKET_SOURCE}{}",
-                super::xray_daemon::DATAGRAM_SOURCE
+                "{SOCKET_SOURCE}{}{}",
+                super::xray_daemon::DATAGRAM_SOURCE,
+                super::guest_socket::STREAM_SOURCE
             ),
         ),
         ("http/client.py", HTTP_CLIENT_SOURCE.to_string()),
@@ -496,17 +499,20 @@ pub fn runtime_stdlib_modules() -> Vec<PackageModule> {
 }
 
 /// `socket`: the NAMES, errors and conversions a Python program reads off the module it
-/// reaches a socket through. The sockets themselves are the datagram half appended to this
-/// source ([`super::xray_daemon::DATAGRAM_SOURCE`]).
+/// reaches a socket through. The sockets themselves are the datagram and stream halves
+/// appended to this source ([`super::xray_daemon::DATAGRAM_SOURCE`],
+/// [`super::guest_socket::STREAM_SOURCE`]).
 ///
-/// A Lambda function in this emulator has no host network: there is no name to resolve and no
-/// address to connect to, so every call that would do one of those raises the error a Python
-/// program handles for it, and the one address a datagram can reach is the in-process X-Ray
-/// daemon. The NAMES are all here — the address families, the socket types, the option levels,
-/// the errors and the default timeout — so a module that imports `socket` to name one of them
-/// imports cleanly, which is what the standard library's own HTTP, email and URL modules do.
+/// A Lambda function in this emulator has no HOST network: there is no name service to resolve
+/// a name against and no host interface to bind or listen on, so every call that would do one
+/// of those raises the error a Python program handles for it. What a function CAN reach is
+/// this emulator's own: the in-process X-Ray daemon a datagram goes to, and the data-plane
+/// listeners this emulator has opened, which a stream socket connects to. The NAMES are all
+/// here — the address families, the socket types, the option levels, the errors and the
+/// default timeout — so a module that imports `socket` to name one of them imports cleanly,
+/// which is what the standard library's own HTTP, email and URL modules do.
 const SOCKET_SOURCE: &str = r#"
-"""The socket interface of this runtime: no host socket is reachable from a function."""
+"""The socket interface of this runtime: a connection reaches this emulator's own listeners."""
 
 AF_UNSPEC = 0
 AF_INET = 2
@@ -549,6 +555,11 @@ _GLOBAL_DEFAULT_TIMEOUT = object()
 
 _UNREACHABLE = "a Lambda function in this emulator has no host network to reach"
 
+# The loopback interface of this machine, which is where the planes this emulator opens are
+# served: the one name this runtime resolves, because it names THIS process's own host.
+_LOOPBACK_NAMES = ("localhost", "localhost.localdomain", "ip6-localhost")
+_LOOPBACK_ADDRESS = "127.0.0.1"
+
 
 def getdefaulttimeout():
     return None
@@ -562,28 +573,99 @@ def socketpair(*_arguments, **_keywords):
     raise error(_UNREACHABLE)
 
 
-def create_connection(*_arguments, **_keywords):
-    raise error(_UNREACHABLE)
+def create_connection(
+    address,
+    timeout=_GLOBAL_DEFAULT_TIMEOUT,
+    source_address=None,
+    all_errors=False,
+):
+    """A stream socket connected to `address`, as the standard library's own builds one.
+
+    The connection is the runtime's: an address this emulator serves a data plane at is
+    connected to, and any other is answered the way a host with nothing listening there
+    answers it. `source_address` binds nothing, because a function has no host interface to
+    bind to.
+    """
+    opened = socket(AF_INET, SOCK_STREAM)
+    try:
+        if timeout is not _GLOBAL_DEFAULT_TIMEOUT:
+            opened.settimeout(timeout)
+        opened.connect(address)
+    except BaseException:
+        opened.close()
+        raise
+    return opened
 
 
 def create_server(*_arguments, **_keywords):
     raise error(_UNREACHABLE)
 
 
-def getaddrinfo(*_arguments, **_keywords):
-    raise gaierror(_UNREACHABLE)
+def _is_ipv4_address(value):
+    parts = value.split(".")
+    if len(parts) != 4:
+        return False
+    return all(part.isdigit() and 0 <= int(part) <= 255 for part in parts)
+
+
+def _is_ipv6_address(value):
+    """Whether `value` is an IPv6 address literal: hexadecimal pieces separated by at least
+    two colons, as an address has, so a name carrying one colon is not read as an address."""
+    pieces = value.split(":")
+    if len(pieces) < 3 or len(pieces) > 8:
+        return False
+    return all(
+        not piece or len(piece) <= 4 and all(digit in "0123456789abcdefABCDEF" for digit in piece)
+        for piece in pieces
+    )
+
+
+def getaddrinfo(host, port, family=AF_UNSPEC, type=0, proto=0, flags=0):
+    """The addresses `host`:`port` names.
+
+    An ADDRESS is a pure conversion: the address itself is the answer, resolved against
+    nothing. The loopback NAME is this machine, which is where the planes this emulator opens
+    are served, so it answers the loopback address. Any other name has no resolver to answer
+    it — a function has no host name service — so it raises what a resolver raises for a name
+    it holds nothing for, and an address of a family the caller did not ask for raises what a
+    resolver raises for that.
+    """
+    if isinstance(host, (bytes, bytearray)):
+        host = bytes(host).decode("utf-8", "replace")
+    named = "" if host is None else str(host)
+    number = _stream_port(port)
+    kind = type or SOCK_STREAM
+    protocol = proto or (IPPROTO_UDP if kind == SOCK_DGRAM else IPPROTO_TCP)
+    address = named.strip("[]")
+    if named.lower() in _LOOPBACK_NAMES:
+        address = _LOOPBACK_ADDRESS
+    if _is_ipv4_address(address):
+        if family not in (AF_UNSPEC, AF_INET):
+            raise gaierror(-6, "Address family for hostname not supported")
+        return [(AF_INET, kind, protocol, "", (address, number))]
+    if _is_ipv6_address(address):
+        if family not in (AF_UNSPEC, AF_INET6):
+            raise gaierror(-6, "Address family for hostname not supported")
+        return [(AF_INET6, kind, protocol, "", (address, number, 0, 0))]
+    raise gaierror(-2, "Name or service not known")
 
 
 def getnameinfo(*_arguments, **_keywords):
     raise gaierror(_UNREACHABLE)
 
 
-def gethostbyname(*_arguments, **_keywords):
-    raise gaierror(_UNREACHABLE)
+def gethostbyname(name):
+    """The address a name stands for: the loopback address for this machine's own name, and
+    nothing for any other — this runtime has no host name service."""
+    if str(name).lower() in _LOOPBACK_NAMES:
+        return _LOOPBACK_ADDRESS
+    if _is_ipv4_address(str(name)):
+        return str(name)
+    raise gaierror(-2, "Name or service not known")
 
 
-def gethostbyname_ex(*_arguments, **_keywords):
-    raise gaierror(_UNREACHABLE)
+def gethostbyname_ex(name):
+    return (str(name), [], [gethostbyname(name)])
 
 
 def gethostbyaddr(*_arguments, **_keywords):

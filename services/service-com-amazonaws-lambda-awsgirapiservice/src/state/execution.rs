@@ -120,6 +120,10 @@ pub mod runtime_api;
 /// the socket interface it is built on.
 pub mod guest_tls;
 
+/// The STREAM sockets of that same socket interface, and the connections the host holds for
+/// them: one TCP connection per socket, to a data-plane listener this emulator opened.
+pub mod guest_socket;
+
 /// The waiting interface of that same standard library — the `select` module a handler, or a
 /// client library it vendors, imports beside the socket interface.
 pub mod guest_select;

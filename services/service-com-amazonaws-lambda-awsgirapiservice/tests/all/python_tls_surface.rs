@@ -481,12 +481,16 @@ async fn a_certificate_encoding_is_computed(router: &MultiServiceRouter, probe: 
     1
 }
 
-/// A call that needs a negotiated session is refused as the module's own error, and the
-/// sockets and buffers under it keep answering what they are.
+/// A call that needs a negotiated session is refused as the module's own error while there is
+/// no connection under it to negotiate one on, and the sockets and buffers under it keep
+/// answering what they are.
 ///
 /// The rows differ along WHICH call needs the session: the handshake itself, a write, a
 /// read, the peer's certificate, the channel binding, a handshake over memory buffers, and
-/// the two calls that would open the connection a session runs on.
+/// the two calls that would open the connection a session runs on — addressed, here, at a
+/// host name nothing resolves. What such a session reports once it IS negotiated, on a
+/// connection to a data plane of this emulator, is pinned by
+/// [`crate::handler_data_plane_socket`].
 ///
 /// Answers how many cases a run answered.
 async fn a_call_that_needs_a_session_is_refused_as_the_modules_own_error(
@@ -508,10 +512,12 @@ async fn a_call_that_needs_a_session_is_refused_as_the_modules_own_error(
         "bio_handshake": "SSLError",
         "peer_certificate": "ValueError",
         "channel_binding": "ValueError",
-        // The connection a session would run on: a function opens none.
-        "connect": "OSError",
-        "create_connection": "OSError",
-        "server_certificate": "OSError",
+        // The connection a session would run on: the host name these rows address is one no
+        // resolver of this runtime holds an address for, so it is answered as a host answers
+        // a name it cannot resolve, and nothing is connected to.
+        "connect": "gaierror",
+        "create_connection": "gaierror",
+        "server_certificate": "gaierror",
         // Nothing was negotiated, so nothing of a session is reported.
         "version": null,
         "cipher": null,

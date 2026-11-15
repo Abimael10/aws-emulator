@@ -24,12 +24,16 @@
 //!   name is checked) are kept;
 //! * the ENCODINGS of a certificate (`PEM`/`DER`) and the certificate TIME format are
 //!   computation, so they are performed here rather than refused;
-//! * a SESSION is not: a Lambda function in this emulator opens no connection
-//!   ([`super::guest_http`], whose `socket` reaches only the in-process X-Ray daemon), so
-//!   there is no byte stream for a handshake to run on. Every call that would need one —
-//!   the handshake itself, reading or writing through it, the peer's certificate, the
-//!   channel binding — raises this module's own `SSLError`, and a certificate file of the
-//!   HOST raises the one file refusal this runtime has ([`super::python`]).
+//! * a SESSION over a CONNECTION is real: a socket of this runtime carries its bytes on a
+//!   connection the host opened to a data-plane listener of this emulator
+//!   ([`super::guest_socket`]), and wrapping such a socket runs the client side of a real
+//!   handshake on it — so the version, the cipher suite and the peer's certificate a caller
+//!   reads back are the ones that handshake negotiated, and reading and writing through the
+//!   session carry encrypted bytes. A socket with NO connection has nothing to hand shake
+//!   over, so every call that would need one raises this module's own `SSLError`, and a
+//!   certificate file of the HOST raises the one file refusal this runtime has
+//!   ([`super::python`]). A session over memory BUFFERS is not negotiated either: there is no
+//!   peer at the other end of a buffer.
 //!
 //! Nothing here is the containment, and nothing here invents a session: a call that cannot
 //! be served says so, and a value a caller reads back is one this module computed or was
@@ -54,10 +58,11 @@ pub fn runtime_stdlib_modules() -> Vec<PackageModule> {
 ///
 /// The surface is the standard library's, so a handler and the standard library's own
 /// modules that are built on TLS (`http.client`, `urllib.request`, `smtplib`, `ftplib`,
-/// `poplib`) read the names they expect; what no call synthesises is a SESSION, because
-/// this runtime opens no connection for one.
+/// `poplib`) read the names they expect; what no call synthesises is a SESSION — a session
+/// over a connection is negotiated by the runtime and reported as it was negotiated, and a
+/// call with no connection under it says so.
 const SSL_SOURCE: &str = r#"
-"""The TLS layer of this runtime: a session needs a connection, which a function has none of."""
+"""The TLS layer of this runtime: a session is negotiated on the connection underneath."""
 
 import base64
 import collections
@@ -65,11 +70,19 @@ import enum
 
 import socket as _socket
 
-# What a call that would need a negotiated session answers. There is no byte stream to hand
-# shake over, because this runtime opens no connection.
-_NO_SESSION = (
-    "a Lambda function in this emulator negotiates no TLS session: it opens no connection "
-    "for one to run on"
+# What a call that would need a negotiated session answers when there is no connection under
+# it to hand shake over.
+_NO_CONNECTION = (
+    "a TLS session needs a connection, and this socket is connected to nothing"
+)
+
+# And what one answers before the handshake has been run at all.
+_NO_SESSION = "no TLS session is negotiated on this socket"
+
+# What a session over memory BUFFERS answers: there is no peer at the other end of a buffer,
+# so nothing can be negotiated with one.
+_NO_PEER = (
+    "a TLS session needs a peer to negotiate with, and a memory buffer has none"
 )
 
 # The PEM framing of a certificate, which is the form a certificate is carried in.
@@ -400,8 +413,10 @@ class SSLSession(object):
 class SSLContext(object):
     """The TLS settings a client or a server would negotiate with.
 
-    Everything a caller sets here is held and read back; what the settings are never used
-    for is a session, because this runtime opens no connection for one.
+    Everything a caller sets here is held and read back. What a session a socket of this
+    runtime negotiates is verified against is the certificate this emulator's core presents
+    on the listener the connection reached, so a store or a verification mode a caller sets
+    here decides nothing about it.
     """
 
     def __init__(self, protocol=PROTOCOL_TLS_CLIENT):
@@ -591,9 +606,9 @@ class SSLContext(object):
 class SSLSocket(object):
     """A socket with the TLS layer put on it.
 
-    The socket's own calls are the wrapped socket's; the calls that need a negotiated
-    session — the handshake, reading and writing through it, the peer's certificate —
-    raise, because this runtime opens no connection for a session to run on.
+    The socket's own calls are the wrapped socket's; the calls that need a negotiated session
+    run on the session the handshake negotiated on the connection underneath. A socket
+    connected to nothing has no session, so those calls raise this module's own error.
     """
 
     def __init__(
@@ -614,6 +629,9 @@ class SSLSocket(object):
         self.do_handshake_on_connect = do_handshake_on_connect
         self._held_session = session
         self._handshaken = False
+        # What the handshake negotiated, as the runtime reported it: the protocol version,
+        # the cipher suite, the protocol ALPN selected and the certificate the peer presented.
+        self._negotiated_session = None
 
     def __enter__(self):
         return self
@@ -701,60 +719,125 @@ class SSLSocket(object):
     # The calls that need a session.
 
     def do_handshake(self, block=False):
-        raise SSLError(_NO_SESSION)
+        """Negotiate the session on the connection underneath.
+
+        The handshake is run by the runtime on that connection, so what this reports is what
+        was negotiated with the listener at the other end of it. A socket connected to
+        nothing, and the server side of a handshake — a function listens for no client —
+        raise this module's own error.
+        """
+        if self.server_side:
+            raise SSLError(_NO_CONNECTION)
+        if not self._connected():
+            raise SSLError(_NO_CONNECTION)
+        try:
+            self._negotiated_session = _socket._stream_tls(
+                self._sock, self.server_hostname
+            )
+        except _socket._TlsFailed as failed:
+            raise SSLError(str(failed)) from None
+        self._handshaken = True
 
     def send(self, data, flags=0):
         self._negotiated()
+        return self._sock.send(data)
 
     def sendall(self, data, flags=0):
         self._negotiated()
+        return self._sock.sendall(data)
 
     def sendto(self, data, flags_or_address, address=None):
         raise ValueError("sendto not allowed on instances of %s" % (self.__class__,))
 
     def sendfile(self, file, offset=0, count=None):
         self._negotiated()
+        sent = 0
+        while count is None or sent < count:
+            asked = 8192 if count is None else min(8192, count - sent)
+            block = file.read(asked)
+            if not block:
+                break
+            self._sock.sendall(block)
+            sent += len(block)
+        return sent
 
     def recv(self, buflen=1024, flags=0):
         self._negotiated()
+        return self._sock.recv(buflen)
 
     def recv_into(self, buffer, nbytes=None, flags=0):
         self._negotiated()
+        return self._sock.recv_into(buffer, nbytes)
 
     def recvfrom(self, buflen=1024, flags=0):
         raise ValueError("recvfrom not allowed on instances of %s" % (self.__class__,))
 
     def read(self, len=1024, buffer=None):
         self._negotiated()
+        if buffer is not None:
+            return self._sock.recv_into(buffer, len)
+        return self._sock.recv(len)
 
     def write(self, data):
         self._negotiated()
+        return self._sock.send(data)
 
     def makefile(self, *arguments, **keywords):
         self._negotiated()
+        return self._sock.makefile(*arguments, **keywords)
 
     def pending(self):
         return 0
 
     def unwrap(self):
+        """Close the session and answer with the socket, which stays connected."""
         self._negotiated()
+        try:
+            _socket._stream_untls(self._sock)
+        except _socket._TlsFailed as failed:
+            raise SSLError(str(failed)) from None
+        self._negotiated_session = None
+        self._handshaken = False
+        return self._sock
 
     def verify_client_post_handshake(self):
         raise SSLError(_NO_SESSION)
 
     def getpeercert(self, binary_form=False):
-        raise ValueError("handshake not done yet")
+        """The certificate the peer presented in the handshake.
+
+        `binary_form` answers the certificate's own bytes, as the handshake received them.
+        The parsed form is a reading of a certificate's fields, which this runtime does not
+        perform, so it answers the empty mapping the standard library answers for a peer
+        certificate it did not validate itself.
+        """
+        if self._negotiated_session is None:
+            raise ValueError("handshake not done yet")
+        held = self._negotiated_session.get("certificate")
+        if not binary_form:
+            return {}
+        return base64.b64decode(held) if held else None
 
     def get_channel_binding(self, cb_type="tls-unique"):
         raise ValueError(
             "'%s' channel binding type not implemented" % (cb_type,)
         )
 
-    # What a session WOULD report, read off one that was never negotiated: nothing, which
-    # is what the standard library answers before a handshake too.
+    # What the session REPORTS, read off the one the handshake negotiated: nothing at all
+    # before there is one, which is what the standard library answers then too.
 
     def cipher(self):
-        return None
+        """The suite, the protocol version and the secret bits the session negotiated."""
+        if self._negotiated_session is None:
+            return None
+        suite = self._negotiated_session.get("cipher")
+        if not suite:
+            return None
+        return (
+            suite,
+            self._negotiated_session.get("protocol"),
+            self._negotiated_session.get("bits") or 0,
+        )
 
     def shared_ciphers(self):
         return None
@@ -763,10 +846,14 @@ class SSLSocket(object):
         return None
 
     def version(self):
-        return None
+        if self._negotiated_session is None:
+            return None
+        return self._negotiated_session.get("protocol")
 
     def selected_alpn_protocol(self):
-        return None
+        if self._negotiated_session is None:
+            return None
+        return self._negotiated_session.get("alpn")
 
     def selected_npn_protocol(self):
         return None
@@ -781,7 +868,9 @@ class SSLSocket(object):
 
     @property
     def session_reused(self):
-        return None
+        if self._negotiated_session is None:
+            return None
+        return False
 
     def _connected(self):
         """Whether the socket underneath already has a peer."""
@@ -792,15 +881,17 @@ class SSLSocket(object):
         return True
 
     def _negotiated(self):
-        """The session this call needs, of which there is none: this always raises."""
-        raise SSLError(_NO_SESSION)
+        """The session this call needs: a handshake has to have been run on the connection."""
+        if self._negotiated_session is None:
+            raise SSLError(_NO_SESSION if self._connected() else _NO_CONNECTION)
+        return self._negotiated_session
 
 
 class SSLObject(object):
     """The TLS layer over a pair of memory buffers rather than over a socket.
 
-    The buffers are real (MemoryBIO); the session over them is not, for the same reason a
-    socket's is not.
+    The buffers are real (MemoryBIO); the session over them is not, because a buffer has no
+    peer to negotiate one with — unlike a socket of this runtime, whose connection has one.
     """
 
     def __init__(
@@ -820,19 +911,19 @@ class SSLObject(object):
         self._held_session = session
 
     def do_handshake(self):
-        raise SSLError(_NO_SESSION)
+        raise SSLError(_NO_PEER)
 
     def read(self, len=1024, buffer=None):
-        raise SSLError(_NO_SESSION)
+        raise SSLError(_NO_PEER)
 
     def write(self, data):
-        raise SSLError(_NO_SESSION)
+        raise SSLError(_NO_PEER)
 
     def unwrap(self):
-        raise SSLError(_NO_SESSION)
+        raise SSLError(_NO_PEER)
 
     def verify_client_post_handshake(self):
-        raise SSLError(_NO_SESSION)
+        raise SSLError(_NO_PEER)
 
     def getpeercert(self, binary_form=False):
         raise ValueError("handshake not done yet")
@@ -935,7 +1026,8 @@ def get_server_certificate(
 ):
     """The certificate the server at `addr` presents, read by connecting to it.
 
-    The connection is the socket module's, which a function has no host network for.
+    The connection is the socket module's, so the certificate is the one the listener at
+    `addr` presented in the handshake.
     """
     host, port = addr
     if ca_certs is not None:
