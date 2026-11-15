@@ -902,21 +902,60 @@ pub const MAX_RETENTION_DAYS_EBS_VOLUME: i32 = 7;
 /// days".
 pub const MAX_RETENTION_DAYS_SNAPSHOT_OR_IMAGE: i32 = 365;
 
-/// The longest retention period, in days, the service retains `resource_type` for — the
-/// per-type bound the member's own documentation publishes, which is tighter than the
-/// `@range` the model declares (that range is the union over every type, so it admits a
-/// period no single type supports).
+/// The SHORTEST retention period any resource type is retained for, which both halves of the
+/// bound a refused period states come from: the member's own `@range` opens at 1, and every
+/// per-type span its documentation publishes opens at one DAY ("EBS volumes: 1 - 7 days",
+/// "EBS snapshots and EBS-backed AMIs: 1 - 365 days").
+pub const MIN_RETENTION_PHRASE: &str = "1 day";
+
+/// The longest period each resource type is retained for, in the WORDS Recycle Bin states that
+/// bound in when it refuses a longer one: the span, not a count of days, so the 365 days an EBS
+/// snapshot or an EBS-backed AMI is retained for is stated as the year it is.
 ///
-/// `None` for a resource type this catalog does not name, which leaves such a type held
-/// to the modelled range alone rather than to a bound nothing publishes.
-pub fn max_retention_period_days(resource_type: &str) -> Option<i32> {
+/// Source: the same member documentation as the day counts above, read as the span it
+/// publishes — `MAX_RETENTION_DAYS_SNAPSHOT_OR_IMAGE` days is one year, and
+/// `MAX_RETENTION_DAYS_EBS_VOLUME` days is that many days.
+pub const MAX_RETENTION_PHRASE_SNAPSHOT_OR_IMAGE: &str = "1 year";
+pub const MAX_RETENTION_PHRASE_EBS_VOLUME: &str = "7 days";
+
+/// The longest period each resource type is retained for: the count of DAYS a period is read
+/// against, and the WORDS Recycle Bin states that bound in when it refuses a longer one — the
+/// span rather than a count, so the 365 days an EBS snapshot or an EBS-backed AMI is retained
+/// for is stated as the year it is.
+///
+/// ONE table for both halves, so a type's bound and the sentence that states it cannot drift
+/// apart: a type this catalog names has both, and a type it does not name has neither
+/// (`None`), which leaves such a type held to the modelled range alone rather than to a bound
+/// nothing publishes. The per-type bound is tighter than the `@range` the model declares, that
+/// range being the union over every type, so it admits a period no single type supports.
+pub fn max_retention_period(resource_type: &str) -> Option<(i32, &'static str)> {
     match resource_type {
-        RESOURCE_TYPE_EBS_VOLUME => Some(MAX_RETENTION_DAYS_EBS_VOLUME),
-        RESOURCE_TYPE_EBS_SNAPSHOT | RESOURCE_TYPE_EC2_IMAGE => {
-            Some(MAX_RETENTION_DAYS_SNAPSHOT_OR_IMAGE)
-        }
+        RESOURCE_TYPE_EBS_VOLUME => Some((
+            MAX_RETENTION_DAYS_EBS_VOLUME,
+            MAX_RETENTION_PHRASE_EBS_VOLUME,
+        )),
+        RESOURCE_TYPE_EBS_SNAPSHOT | RESOURCE_TYPE_EC2_IMAGE => Some((
+            MAX_RETENTION_DAYS_SNAPSHOT_OR_IMAGE,
+            MAX_RETENTION_PHRASE_SNAPSHOT_OR_IMAGE,
+        )),
         _ => None,
     }
+}
+
+/// The DAY-count half of [`max_retention_period`], for a reader that compares a period against
+/// the bound without wording a refusal.
+pub fn max_retention_period_days(resource_type: &str) -> Option<i32> {
+    max_retention_period(resource_type).map(|(days, _)| days)
+}
+
+/// The requirement a retention period longer than its resource type supports fails, as Recycle
+/// Bin states it: the SPAN the period has to fall in, from one day to the longest that type is
+/// retained for ([`max_retention_period`]).
+///
+/// The sentence states the BOUND and nothing of the request: the value a caller sent is not
+/// echoed back into it.
+pub fn retention_period_requirement(max_phrase: &str) -> String {
+    format!("Retention period value must be between {MIN_RETENTION_PHRASE} and {max_phrase} inclusive")
 }
 
 /// The modelled 400 for a retention period longer than the resource type it would be
@@ -924,9 +963,14 @@ pub fn max_retention_period_days(resource_type: &str) -> Option<i32> {
 ///
 /// `RetentionPeriodUnit` models `DAYS` alone — "Currently, only `DAYS` is supported" — so
 /// the period's value IS its length in days and is read against the per-type maximum
-/// directly. The clause is worded the way a range the boundary validator refuses is
-/// worded, so a caller reads one form whichever bound a period failed, and it names the
-/// bound rather than echoing the value the request sent.
+/// directly. The sentence is the service's own for that refusal
+/// ([`retention_period_requirement`]): it states the SPAN a period has to fall in, and
+/// nothing of the value the request sent.
+///
+/// It is NOT the clause the boundary validator words for the modelled `@range`: that range is
+/// the union over every type and is refused by the framework's own constraint walk, while this
+/// bound is the service's own knowledge of what it can retain and is worded as the service
+/// words it.
 ///
 /// Every door onto a rule's retention period goes through this: `CreateRule`, where the
 /// type is the one the request names, and `UpdateRule`, where it is the stored one (the
@@ -936,14 +980,14 @@ pub fn retention_period_unsupported(
     resource_type: &str,
     retention_period: &RetentionPeriod,
 ) -> Option<ValidationException> {
-    let max = max_retention_period_days(resource_type)?;
+    let (max, max_phrase) = max_retention_period(resource_type)?;
     if retention_period.retention_period_value <= max {
         return None;
     }
-    Some(member_validation_failed(
-        RETENTION_PERIOD_VALUE_MEMBER,
-        &format!("Member must have value less than or equal to {max}"),
-    ))
+    Some(ValidationException {
+        message: Some(retention_period_requirement(max_phrase)),
+        reason: Some(VALIDATION_REASON_INVALID_PARAMETER_VALUE.to_string()),
+    })
 }
 
 /// The modelled 409 for a lock, modify or delete the rule's own state forbids.

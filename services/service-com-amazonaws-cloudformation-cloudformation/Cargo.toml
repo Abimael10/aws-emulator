@@ -248,6 +248,11 @@ service-com-amazonaws-memorydb-amazonmemorydb = { workspace = true }
 # stack fails — and the domain the stack published is read back, and driven, through that
 # service's own wire.
 service-com-amazonaws-customerprofiles-customerprofiles-20200815 = { workspace = true }
+# Recycle Bin, for the `AWS::Rbin::Rule` a stack really creates there
+# (`state::provisioner::rbin_rules`): a suite that deploys one must have its owning service
+# mounted beside CloudFormation, or the create is refused and the stack fails — and the
+# retention rule the stack published is read back through that service's own wire.
+service-com-amazonaws-rbin-amazonrecyclebin = { workspace = true }
 # AWS Amplify, for the `AWS::Amplify::App` and `AWS::Amplify::Branch` a stack really creates
 # there (`state::provisioner::amplify_apps`, `::amplify_branches`): a suite that deploys one
 # must have its owning service mounted beside CloudFormation, or the create is refused and the

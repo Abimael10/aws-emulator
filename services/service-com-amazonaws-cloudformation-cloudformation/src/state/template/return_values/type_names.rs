@@ -288,6 +288,45 @@ pub(super) const CUSTOMER_PROFILES_DOMAIN_ATTRIBUTES: &[&str] = &[
     "Stats.TotalSize",
 ];
 
+/// The `AWS::<cloudFormationName>::<Resource>` type of a RECYCLE BIN retention rule: the
+/// account-wide guardrail that keeps a deleted resource recoverable for a period, which that
+/// service's own `CreateRule` makes. The middle segment is that model's own `awsService.sdkId`
+/// (`rbin`) with the initial capitalised, as the resource-type namespace publishes it.
+///
+/// "Ref returns the rule ARN" — the type's primary identifier — and `Fn::GetAtt` reads
+/// [`RBIN_RULE_ATTRIBUTES`]. Recycle Bin MINTS the rule's `Identifier`
+/// (`^[0-9a-zA-Z]{11}$`, which no name CloudFormation decides satisfies) and the `RuleArn`
+/// built around it, and the create takes no identifier at all, which is why
+/// [`identity_is_service_assigned`] names this type: the identity in force is the one that
+/// service answered.
+pub const RBIN_RULE: &str = "AWS::Rbin::Rule";
+
+/// Every `Fn::GetAtt` attribute an [`RBIN_RULE`] publishes, in the sorted order a resource's
+/// own attribute map holds them in: the rule's ARN, the identifier Recycle Bin minted and the
+/// lock state it keeps.
+///
+/// Source: the type's own "Return values" section. The ARN and the identifier are that
+/// service's to mint, so both are STAND-INS of the forms its model fixes until
+/// [`crate::state::provisioner`] has reported what `CreateRule` really answered; the lock state
+/// follows from the declaration itself — a rule declared with a lock configuration is created
+/// locked and one declared without it has never been locked
+/// ([`crate::state::provisioner::rbin_rules::declared_lock_state`]).
+pub(super) const RBIN_RULE_ATTRIBUTES: &[&str] = &["Arn", "Identifier", "LockState"];
+
+/// Recycle Bin's ARN namespace, which is the namespace a retention rule's ARN carries
+/// (`RuleArn`: `^arn:\S+:rbin:[a-z\-0-9]{0,63}:[0-9]{12}:rule/[0-9a-zA-Z]{11}…$`).
+pub const RBIN_ARN_NAMESPACE: &str = "rbin";
+
+/// The resource path a rule ARN carries before the identifier Recycle Bin minted for it, from
+/// that same pattern.
+pub(super) const RBIN_RULE_PATH: &str = "rule";
+
+/// The salt the rule-identifier stand-in is derived under, and how many characters it carries:
+/// a `RuleIdentifier` is `^[0-9a-zA-Z]{11}$`, so the stand-in is exactly eleven alphanumeric
+/// characters and carries no separator.
+pub(super) const RBIN_RULE_ID_SALT: &str = "rbin/rule";
+pub(super) const RBIN_RULE_ID_DIGITS: usize = 11;
+
 /// The `AWS::<cloudFormationName>::<Resource>` types of the two OpenSearch Serverless
 /// resources a stack creates. The middle segment is that service's own
 /// `awsService.cloudFormationName` (`OpenSearchServerless`).

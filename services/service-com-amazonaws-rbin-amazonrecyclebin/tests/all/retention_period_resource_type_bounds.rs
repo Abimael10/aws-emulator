@@ -32,12 +32,30 @@ const SUPPORTED_MAXIMUM: [(&str, i64); 3] = [
     ("EC2_IMAGE", 365),
 ];
 
+/// That same bound in the WORDS the service states it in when it refuses a longer period: the
+/// span its documentation publishes rather than a count of days, so the 365 days a snapshot or
+/// an EBS-backed AMI is retained for is stated as the year it is.
+const SUPPORTED_MAXIMUM_PHRASE: [(&str, &str); 3] = [
+    ("EBS_VOLUME", "7 days"),
+    ("EBS_SNAPSHOT", "1 year"),
+    ("EC2_IMAGE", "1 year"),
+];
+
 /// The published maximum for `resource_type`, as the table above states it.
 fn supported_maximum(resource_type: &str) -> i64 {
     SUPPORTED_MAXIMUM
         .iter()
         .find(|(named, _)| *named == resource_type)
         .map(|(_, max)| *max)
+        .unwrap_or_else(|| panic!("resource type {resource_type:?} has no published maximum"))
+}
+
+/// That bound in the words a refusal states it in, as the table above states them.
+fn supported_maximum_phrase(resource_type: &str) -> &'static str {
+    SUPPORTED_MAXIMUM_PHRASE
+        .iter()
+        .find(|(named, _)| *named == resource_type)
+        .map(|(_, phrase)| *phrase)
         .unwrap_or_else(|| panic!("resource type {resource_type:?} has no published maximum"))
 }
 
@@ -104,8 +122,9 @@ fn message_of(body: &serde_json::Value) -> String {
         .to_string()
 }
 
-/// Assert a refusal is the modelled `ValidationException` that names the retention
-/// period's member path and the bound `resource_type` publishes.
+/// Assert a refusal is the modelled `ValidationException` that states the span `resource_type`
+/// publishes — the service's own sentence for a period it cannot retain, which states the
+/// BOUND and nothing of the value the request sent.
 fn assert_refused_for_type(case: &str, resource_type: &str, body: &serde_json::Value) {
     assert_eq!(
         body["Reason"].as_str(),
@@ -115,10 +134,8 @@ fn assert_refused_for_type(case: &str, resource_type: &str, body: &serde_json::V
     );
     let message = message_of(body);
     let expected = format!(
-        "1 validation error detected: Value at \
-         'retentionPeriod.retentionPeriodValue' failed to satisfy constraint: Member must \
-         have value less than or equal to {}",
-        supported_maximum(resource_type)
+        "Retention period value must be between 1 day and {} inclusive",
+        supported_maximum_phrase(resource_type)
     );
     assert_eq!(
         message, expected,

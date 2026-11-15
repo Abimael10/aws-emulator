@@ -77,6 +77,10 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // ("Ref returns the spending limit ARN"), which is the handle every spending-limit
         // API takes — the type declares no name a client could name one by.
         BRAKET_SPENDING_LIMIT => "SpendingLimitArn",
+        // A Recycle Bin retention rule, identified by the ARN that service built around the
+        // identifier it minted ("Ref returns the rule ARN") — the type declares no name a
+        // client could name one by.
+        RBIN_RULE => "Arn",
         // An AWS Amplify app, identified by the ARN that service built around the id it minted
         // ("Ref returns the ARN of the app"), which is the type's primary identifier. (The
         // three Amplify UI Builder entities need no row: each is identified by the app, the

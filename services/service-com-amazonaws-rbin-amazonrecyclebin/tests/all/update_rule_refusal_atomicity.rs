@@ -43,12 +43,6 @@ use service_com_amazonaws_rbin_amazonrecyclebin::state::{
     RULE_STATUS_AVAILABLE, RULE_STATUS_PENDING, STATUS_TRANSITION,
 };
 
-/// The member path a refused retention period is named by, as a validation clause spells
-/// a member: each modelled member name in lower camel case, joined by dots.
-/// Source: smithy_query(query="operation", operation="UpdateRule") — input member
-/// `RetentionPeriod`, whose `RetentionPeriodValue` carries the bound.
-const RETENTION_PERIOD_VALUE_MEMBER: &str = "retentionPeriod.retentionPeriodValue";
-
 /// The member path a refused `ExcludeResourceTags` is named by.
 /// Source: smithy_query(query="operation", operation="UpdateRule") — input member
 /// `ExcludeResourceTags`.
@@ -63,6 +57,29 @@ const TAG_LEVEL_REQUIREMENT: &str = "Member must not be specified for a tag-leve
 /// The fault class a refused parameter value is reported under.
 /// Source: smithy_query(query="shape", shape="ValidationExceptionReason").
 const INVALID_PARAMETER_VALUE: &str = "INVALID_PARAMETER_VALUE";
+
+/// The longest period each resource type is retained for, in the WORDS the service states
+/// that bound in when it refuses a longer one: the SPAN its documentation publishes, not a
+/// count of days.
+/// Source: smithy_query(query="doc", shape="RetentionPeriod", member="RetentionPeriodValue") —
+/// "EBS volumes: 1 - 7 days / EBS snapshots and EBS-backed AMIs: 1 - 365 days", the latter
+/// being one year.
+const SUPPORTED_MAXIMUM_PHRASE: [(&str, &str); 3] = [
+    ("EBS_VOLUME", "7 days"),
+    ("EBS_SNAPSHOT", "1 year"),
+    ("EC2_IMAGE", "1 year"),
+];
+
+/// The sentence the service refuses a period past `resource_type`'s own bound with: the span a
+/// period has to fall in, which is what a caller is told instead of the value it sent.
+fn past_the_bound_message(resource_type: &str) -> String {
+    let phrase = SUPPORTED_MAXIMUM_PHRASE
+        .iter()
+        .find(|(named, _)| *named == resource_type)
+        .map(|(_, phrase)| *phrase)
+        .unwrap_or_else(|| panic!("resource type {resource_type:?} has no published maximum"));
+    format!("Retention period value must be between 1 day and {phrase} inclusive")
+}
 
 /// Long enough that the `pending` -> `available` transition the clock owes a rule
 /// modified before the wait started is past due.
@@ -83,10 +100,7 @@ struct Refusal {
 /// otherwise be applied, and a merged selection no rule can hold.
 fn refusals_for(resource_type: &str) -> Vec<Refusal> {
     let max = supported_retention_max(resource_type);
-    let past_the_bound = one_validation_error(
-        RETENTION_PERIOD_VALUE_MEMBER,
-        &format!("Member must have value less than or equal to {max}"),
-    );
+    let past_the_bound = past_the_bound_message(resource_type);
     vec![
         Refusal {
             case: format!("{resource_type}: one day past the period its stored type supports"),

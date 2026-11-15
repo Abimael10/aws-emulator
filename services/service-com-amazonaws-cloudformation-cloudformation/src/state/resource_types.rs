@@ -86,7 +86,7 @@ use super::template::{
     AMPLIFYUIBUILDER_FORM, AMPLIFYUIBUILDER_THEME, AMPLIFY_APP, AMPLIFY_BRANCH,
     APIGATEWAY_ACCOUNT,
     APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME, BRAKET_SPENDING_LIMIT,
-    CUSTOMER_PROFILES_DOMAIN, GLUE_TABLE_OPTIMIZER, MWAA_ENVIRONMENT,
+    CUSTOMER_PROFILES_DOMAIN, GLUE_TABLE_OPTIMIZER, MWAA_ENVIRONMENT, RBIN_RULE,
 };
 
 /// The namespace Amazon Web Services' own resource types live under: a type spelled with
@@ -773,6 +773,9 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::RDS::OptionGroup",
     // Amazon CloudWatch RUM
     "AWS::RUM::AppMonitor",
+    // Recycle Bin. The retention rule is created in the owning service
+    // (`super::provisioner`), through that service's own `CreateRule`.
+    RBIN_RULE,
     // Amazon Redshift. The snapshot copy grant is created in the owning service
     // (`super::provisioner`), through that service's own `CreateSnapshotCopyGrant`.
     "AWS::Redshift::Cluster",

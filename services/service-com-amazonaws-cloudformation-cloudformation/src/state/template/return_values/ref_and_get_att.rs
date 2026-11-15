@@ -1460,6 +1460,34 @@ pub(crate) fn return_values(
             attributes.insert("SpendingLimitArn".to_string(), arn.clone());
             (arn, attributes)
         }
+        // Recycle Bin's own control plane: the retention rule an `AWS::Rbin::Rule` declares.
+        // "Ref returns the rule ARN" (the type's primary identifier); Fn::GetAtt reads `Arn`,
+        // `Identifier` and `LockState`. That service MINTS the identifier —
+        // `CreateRule` takes none and answers the `Identifier` it assigned
+        // (`^[0-9a-zA-Z]{11}$`) with the `RuleArn` built around it — so the two values here
+        // are STAND-INS of the forms its own model fixes, which `super::provisioning`
+        // re-points at what the create really answered
+        // ([`super::provisioner::Provisioner::RbinRule`]). The lock state follows from the
+        // declaration: a rule declared with a lock configuration is created locked, and one
+        // declared without it has never been locked, which this type publishes as the
+        // `unlocked` state that denotes.
+        RBIN_RULE => {
+            let identifier =
+                service_assigned_label(RBIN_RULE_ID_SALT, name, RBIN_RULE_ID_DIGITS);
+            let arn = ::emulator_server::emulator_arn(
+                RBIN_ARN_NAMESPACE,
+                region,
+                &format!("{RBIN_RULE_PATH}/{identifier}"),
+            );
+            attributes.insert("Arn".to_string(), arn.clone());
+            attributes.insert("Identifier".to_string(), identifier);
+            attributes.insert(
+                "LockState".to_string(),
+                crate::state::provisioner::rbin_rules::declared_lock_state(properties)
+                    .to_string(),
+            );
+            (arn, attributes)
+        }
         // AWS Amplify's own control plane: the app an `AWS::Amplify::App` declares. "Ref
         // returns the ARN of the app"; `Fn::GetAtt` reads [`AMPLIFY_APP_ATTRIBUTES`]. Every
         // one of those is a value only that service can produce — the `appId` it mints, the

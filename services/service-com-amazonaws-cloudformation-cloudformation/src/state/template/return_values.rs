@@ -239,6 +239,10 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // service's own report of the limit rather than from here, exactly as a knowledge
         // base's instants do.
         BRAKET_SPENDING_LIMIT => &["SpendingLimitArn"],
+        // A retention rule publishes the ARN and the identifier Recycle Bin minted for it and
+        // the lock state it keeps, all three of which these naming rules compute a stand-in
+        // for before the rule exists.
+        RBIN_RULE => RBIN_RULE_ATTRIBUTES,
         AMPLIFYUIBUILDER_COMPONENT | AMPLIFYUIBUILDER_THEME => AMPLIFYUIBUILDER_TIMED_ATTRIBUTES,
         AMPLIFYUIBUILDER_FORM => AMPLIFYUIBUILDER_ATTRIBUTES,
         AMPLIFY_APP => AMPLIFY_APP_ATTRIBUTES,
@@ -612,6 +616,13 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // That ARN is also what every call on a limit takes (`UpdateSpendingLimit` and
         // `DeleteSpendingLimit` each address one by it).
         || resource_type == BRAKET_SPENDING_LIMIT
+        // A RECYCLE BIN retention rule is one more: `CreateRule` takes no identifier for the
+        // rule — the declaration states what to retain and for how long — and answers the
+        // `Identifier` that service minted (`^[0-9a-zA-Z]{11}$`) with the `RuleArn` built
+        // around it, which is what "Ref returns the rule ARN" publishes and what `GetRule`,
+        // `UpdateRule` and `DeleteRule` each address a rule by. A name CloudFormation decides
+        // satisfies neither, so the identity in force is the one that service answered.
+        || resource_type == RBIN_RULE
         // The three Amplify UI Builder entities are three more: each create takes the app and
         // the environment as its URI labels and the entity's NAME in its payload, takes no
         // identifier at all, and answers the `Uuid` that service assigned — the `id` of the

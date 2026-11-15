@@ -415,6 +415,10 @@ mod publisher_gate_scope;
 mod publisher_reads;
 #[path = "all/publisher_registration.rs"]
 mod publisher_registration;
+#[path = "all/rbin_rule_provisioning.rs"]
+mod rbin_rule_provisioning;
+#[path = "all/rbin_rule_resource_type.rs"]
+mod rbin_rule_resource_type;
 #[path = "all/rds_db_instance_replacement_plan.rs"]
 mod rds_db_instance_replacement_plan;
 #[path = "all/rds_generated_resource_names.rs"]

@@ -4236,6 +4236,16 @@ const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // Rds, Status Code: 400, Request ID: …)" (RequestToken: …, HandlerErrorCode:
     // InvalidRequest)`).
     ("rds", "Rds", SdkDiagnostic::Envelope),
+    // Recycle Bin's SDK names it `Rbin` — that model's own `sdkId` (`rbin`) with the initial
+    // capitalised, exactly as Amazon RDS's above is — and words the ATTEMPT-counting shape, as
+    // the recorded `ResourceStatusReason` of an `AWS::Rbin::Rule` whose retention period is
+    // longer than the resource type it retains supports carries it (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, check
+    // `cloudformation__rbin.deploy-rbin-rule-retention-period-over-one-year-rejected`, whose
+    // reason reads `Resource handler returned message: "<the service's sentence> (Service:
+    // Rbin, Status Code: 400, Request ID: …) (SDK Attempt Count: …)" (RequestToken: …,
+    // HandlerErrorCode: InvalidRequest)`).
+    ("rbin", "Rbin", SdkDiagnostic::Attempts),
     // Amazon Route 53's SDK names it by its `sdkId` without the space, exactly as
     // Application Auto Scaling's does (`smithy_query(query="service_info")`: `sdkId:
     // "Route 53"`). The shape is the ATTEMPT-counting one, as the recorded

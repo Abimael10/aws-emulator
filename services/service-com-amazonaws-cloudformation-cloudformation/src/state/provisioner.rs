@@ -505,7 +505,8 @@ use super::template::{
     KINESIS_STREAM,
     KMS_ALIAS, KMS_KEY,
     MQ_BROKER, MSK_CLUSTER,
-    MSK_SERVERLESS_CLUSTER, MWAA_ENVIRONMENT, OPENSEARCH_DOMAIN, PIPES_PIPE, REDSHIFT_CLUSTER,
+    MSK_SERVERLESS_CLUSTER, MWAA_ENVIRONMENT, OPENSEARCH_DOMAIN, PIPES_PIPE, RBIN_RULE,
+    REDSHIFT_CLUSTER,
     REDSHIFT_CLUSTER_SUBNET_GROUP, RESOURCE_GROUPS_GROUP, ROUTE53RESOLVER_ENDPOINT,
     ROUTE53RESOLVER_FIREWALL_DOMAIN_LIST, ROUTE53RESOLVER_FIREWALL_RULE_GROUP,
     ROUTE53RESOLVER_FIREWALL_RULE_GROUP_ASSOCIATION,
@@ -1103,6 +1104,13 @@ pub(super) enum Provisioner {
     /// `PutPermission` installs under the declaration's `StatementId` and `RemovePermission`
     /// revokes by that same id.
     EventsEventBusPolicy,
+    /// `AWS::Rbin::Rule`: the Recycle Bin retention rule `CreateRule` makes for the resource
+    /// type the declaration names, `UpdateRule` reconfigures and `DeleteRule` removes. That
+    /// service MINTS the rule's identifier and the ARN built around it — the create takes no
+    /// identifier at all — so the ARN it answered is the resource's physical id, and the
+    /// identifier inside it is the handle every call on a rule takes
+    /// ([`rbin_rules`]).
+    RbinRule,
     /// `AWS::CustomerProfiles::Domain`: the customer-data domain Amazon Connect Customer
     /// Profiles' own `CreateDomain` makes under the name the template states, `UpdateDomain`
     /// reconfigures and `DeleteDomain` removes. The name IS the handle every call on a domain
@@ -1295,6 +1303,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         }
         MEMORYDB_SUBNET_GROUP => Some(Provisioner::MemoryDbGroup(memorydb_groups::Group::Subnet)),
         CUSTOMER_PROFILES_DOMAIN => Some(Provisioner::CustomerProfilesDomain),
+        RBIN_RULE => Some(Provisioner::RbinRule),
         _ => None,
     }
 }
@@ -1963,6 +1972,10 @@ impl Provisioner {
             Self::CustomerProfilesDomain => {
                 create_customer_profiles_domain(ctx, region, resource, propagated).await
             }
+            // `AWS::Rbin::Rule` publishes `Tags`, and `CreateRule` takes a `TagList` of its
+            // own, so a retention rule a stack creates carries the tags CloudFormation gives
+            // it beside the ones the declaration asks for.
+            Self::RbinRule => create_rbin_rule(ctx, region, resource, propagated).await,
         }
     }
 
@@ -2112,6 +2125,11 @@ impl Provisioner {
                 // `CreateDomain`'s `Tags` map and `UpdateDomain`'s run — so a domain carries
                 // the stack's own tags without the three.
                 | Self::CustomerProfilesDomain
+                // Recycle Bin refuses a tag key in the reserved namespace on every call that
+                // takes tags — `CreateRule`'s own `Tags` list and `TagResource` alike, in the
+                // one check its own crate's tag validation makes — so a retention rule carries
+                // the stack's own tags without the three.
+                | Self::RbinRule
         );
         propagated
             .iter()
@@ -2992,6 +3010,14 @@ impl Provisioner {
                     .await
                     .map(Some)
             }
+            // `UpdateRule` reconfigures the retention rule the stack created, by the
+            // identifier Recycle Bin minted for it, taking the description, the retention
+            // period and either resource selection — so a changed declaration of one of those
+            // is applied to that rule rather than replacing it. Its tags travel separately
+            // ([`Self::retag`]).
+            Self::RbinRule => update_rbin_rule(ctx, region, resource, declared)
+                .await
+                .map(Some),
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -3081,6 +3107,13 @@ impl Provisioner {
             // the set a domain is to end up carrying is reconciled.
             Self::CustomerProfilesDomain => {
                 retag_customer_profiles_domain(ctx, region, resource, declared, propagated).await
+            }
+            // A retention rule's tags are Recycle Bin's own `TagResource` and `UntagResource`:
+            // `CreateRule`'s `Tags` member applies to the rule that call creates, and
+            // `UpdateRule` carries no tags at all, so this is where the set a rule is to end
+            // up carrying is reconciled.
+            Self::RbinRule => {
+                retag_rbin_rule(ctx, region, resource, declared, propagated).await
             }
             // Every other type's re-tagging is its own entry here, for the same reason its
             // create, update and delete are: the tag set is the same for every type, but the
@@ -3672,6 +3705,9 @@ impl Provisioner {
             Self::CustomerProfilesDomain => {
                 delete_customer_profiles_domain(ctx, region, physical_resource_id).await
             }
+            // The delete addresses the rule by the identifier inside the ARN Recycle Bin
+            // minted for it, which is this resource's physical id.
+            Self::RbinRule => delete_rbin_rule(ctx, region, physical_resource_id).await,
         }
     }
 
@@ -4229,6 +4265,8 @@ impl Provisioner {
             Self::CustomerProfilesDomain => {
                 describe_customer_profiles_domain(ctx, region, physical_resource_id).await
             }
+            // Recycle Bin's own read of the rule, by the identifier it minted for it.
+            Self::RbinRule => describe_rbin_rule(ctx, region, physical_resource_id).await,
         }
     }
 }
@@ -4275,6 +4313,11 @@ mod mwaa_environments;
 /// `AWS::CustomerProfiles::Domain` declares, created in the service that owns it so a client's
 /// own reads and the domain's data plane resolve the name the stack publishes.
 mod customer_profiles_domains;
+/// The Recycle Bin RETENTION RULE arms: the rule an `AWS::Rbin::Rule` declares, created in the
+/// service that owns it so a client's own reads resolve the identity the stack publishes.
+/// Visible to the rest of this service's state because the LOCK STATE a declaration asks for
+/// is read by the return-value catalogue too, beside the arms that provision the rule.
+pub(in crate::state) mod rbin_rules;
 /// The AWS Glue TABLE OPTIMIZER arms: the optimizer an `AWS::Glue::TableOptimizer` declares
 /// on one of the Data Catalog tables [`platform_services`] creates, which that service keys
 /// by the catalog, the database, the table and the optimizer's own type together.
@@ -4354,6 +4397,7 @@ use amplify_apps::*;
 use amplify_branches::*;
 use mwaa_environments::*;
 use customer_profiles_domains::*;
+use rbin_rules::*;
 use glue_table_optimizers::*;
 use iam_identities::*;
 use data_and_storage::*;

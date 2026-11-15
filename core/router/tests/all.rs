@@ -52,11 +52,20 @@
 // points it into `tests/all/`.
 // Single integration-test target for the router: this header, then one
 // `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file under `tests/all/`, sorted
-// by name, and no other line. Put a new suite at `tests/all/<name>.rs` and insert its pair
-// where its name sorts to, so two branches landing at once insert two lines in two places and
-// have no prose to duplicate, re-word or mistype.
+// by name, and no other line — no prose between the pairs, no blank line, and nothing after
+// the last pair. Put a new suite at `tests/all/<name>.rs` and insert its pair where its name
+// sorts to, so two branches landing at once insert two lines in two places and have no prose
+// to duplicate, re-word or mistype.
 // What a suite covers, and why it drives the assembled router rather than one service crate,
 // belongs in that suite's OWN module header, where it is read beside the test it explains; a
+// note about THIS file belongs in one of `all/appended_header_notes.rs`,
+// `all/appended_notes.rs`, `all/appended_notes_tail.rs` and `all/appended_prose.rs`, which
+// keep what earlier landings had appended here and are declared below like any other suite.
+// EVERY comment in this file is an ordinary `//` one, this header included: an inner doc
+// comment, like an inner attribute, is legal only before the first item, so one left past the
+// declarations compiles no suite of this target at all — which is what the re-typed copies of
+// this header that kept arriving in its tail had done. With none anywhere below this block, no
+// merge of two landings can leave one there.
 // note about THIS file belongs in `all/appended_notes.rs`. The suites
 // `all/all_rs_carries_no_inner_doc_comment.rs`, `all/all_rs_declares_each_suite_once.rs`,
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
@@ -68,7 +77,6 @@
 // the first item, so it stands here rather than in the list below.
 // note about THIS file belongs in `all/appended_notes.rs`, declared below like any other
 // suite.
-// EVERY comment in this file is an ordinary `//` one, this header included: an inner doc
 // comment is legal only before the first item, so one left past the declarations is `E0753`
 // and compiles no suite of this target. With none anywhere in the file, no merge of two
 // landings can leave one there.
@@ -462,6 +470,8 @@ mod cloudformation_provisions_msk_clusters;
 mod cloudformation_provisions_mwaa_environments;
 #[path = "all/cloudformation_provisions_opensearch_domains.rs"]
 mod cloudformation_provisions_opensearch_domains;
+#[path = "all/cloudformation_provisions_rbin_rules.rs"]
+mod cloudformation_provisions_rbin_rules;
 #[path = "all/cloudformation_provisions_redshift_clusters.rs"]
 mod cloudformation_provisions_redshift_clusters;
 #[path = "all/cloudformation_provisions_redshift_snapshot_copy_grants.rs"]
