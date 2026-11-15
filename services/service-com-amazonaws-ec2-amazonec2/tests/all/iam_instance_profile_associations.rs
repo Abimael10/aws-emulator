@@ -538,12 +538,17 @@ async fn associate_refuses_a_profile_reference_it_cannot_act_on() {
 #[tokio::test]
 async fn associate_refuses_an_instance_it_cannot_resolve() {
     // The association is over ONE instance, so an id that names none of this account's
-    // instances is refused — and a value that is not an instance id at all is told apart
-    // from a well-formed id that names nothing.
+    // instances is refused — and a value this service cannot READ as an instance id is told
+    // apart from one it can read that names nothing.
     let rows: Vec<(&str, &str, &str)> = vec![
         (
-            "a well-formed id the account holds no instance for",
+            "a long-form id whose identifier the mint never handed out",
             "i-0123456789abcdef0",
+            INVALID_INSTANCE_ID_MALFORMED,
+        ),
+        (
+            "the retired short form, nothing launched for it",
+            "i-0abc1234",
             INVALID_INSTANCE_ID_NOT_FOUND,
         ),
         (

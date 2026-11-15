@@ -192,10 +192,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The ID of the VPC to associate with the carrier gateway"
         // (`CreateCarrierGatewayRequest$VpcId`): a VPC id this account holds no VPC for is
-        // a refusal, not a gateway in no VPC. This surface answers its own code for that —
-        // see `state::carrier_gateway_vpc_id_malformed`.
+        // a refusal, not a gateway in no VPC — and WHICH refusal follows the FORM question
+        // this surface asks first. A value it cannot read as a VPC id at all is malformed
+        // before any lookup; a readable id the account holds no VPC for does not exist
+        // (`state::unresolvable_vpc_id`, where both halves are worded).
         if !store.vpcs.contains_key(&input.vpc_id) {
-            return Err(state::carrier_gateway_vpc_id_malformed(&input.vpc_id));
+            return Err(state::unresolvable_vpc_id(&store, &input.vpc_id));
         }
 
         let replayed = match replayed_id {

@@ -48,8 +48,6 @@ mod published_nvme_compute_catalog_rows;
 // `ModifyInstanceAttribute`: the one attribute a modify writes onto the stored instance, read
 // back through the attribute read, the instance report and the interface or volume that
 // carries it, plus what it refuses. Declared beside `prefix_lists` for the reason the note
-// above gives: the sorted neighbourhood and the tail of this file are where every new ec2
-// suite inserts its lines.
 #[path = "all/modify_instance_attribute.rs"]
 mod modify_instance_attribute;
 // The published EBS-performance, instance-store, network and host-feature rows of a compute
@@ -71,7 +69,6 @@ mod published_accelerator_and_connection_facts;
 // processor, boot mode, core count and host-feature members AWS publishes per type, each
 // served from that type's own catalog row rather than computed from the size multiplier in its
 // name. Declared beside `prefix_lists` for the reason the note above gives: the sorted
-// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/published_instance_type_family_tables.rs"]
 mod published_instance_type_family_tables;
 // What `CreateClientVpnEndpoint` persists — the endpoint it stores from the request's members,
@@ -173,7 +170,6 @@ mod address_attribute_modify;
 // The account's KEY PAIRS: the key `CreateKeyPair` generates for each type and format, the
 // public half the store keeps and `DescribeKeyPairs` reports, the fingerprint each type is
 // fingerprinted with, what each call refuses, and what the published filters select.
-// Declared beside `prefix_lists` for the reason the note above gives: the sorted
 #[path = "all/key_pairs.rs"]
 mod key_pairs;
 // The key pair as a resource the rest of the service uses: what a created key pair is good for
@@ -432,11 +428,6 @@ mod disassociate_subnet_cidr_block;
 // position, and nothing repeated back by a class whose sentence interpolates nothing.
 #[path = "all/per_resource_refusal_wording.rs"]
 mod per_resource_refusal_wording;
-// The code and the sentence this service answers a request the MODEL's own rules refuse: a
-// parameter the request left out, a value outside a declared catalog, a page size outside a
-// declared range, and the enum value it reads without regard to case.
-#[path = "all/parameter_refusal_codes.rs"]
-mod parameter_refusal_codes;
 // What `ModifyTransitGateway` applies to a stored transit gateway, what it leaves alone,
 // what it refuses, and the `modifying` -> `available` move the clock owes the gateway.
 #[path = "all/modify_transit_gateway.rs"]
@@ -2102,8 +2093,6 @@ mod delete_fleets;
 mod get_associated_ipv6_pool_cidrs;
 // `DeleteManagedPrefixList`: the stored list a delete answers in `delete-in-progress`, the
 // removal the clock then owes it, the references that refuse it and what else it refuses.
-// Declared beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood
-// and the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/delete_managed_prefix_list.rs"]
 mod delete_managed_prefix_list;
 // `CreateLocalGatewayVirtualInterfaceGroup`: the group it mints and persists on the local
@@ -2365,7 +2354,6 @@ mod modify_transit_gateway_vpc_attachment;
 // reported with the policy left in the transient state of a change under way and the clock
 // owing it the state a policy in force is in — beside the ids, the removal of something it does
 // not meter, the policy on its way out and the dry run it refuses without changing anything.
-// Declared at the tail of this file, which is where every new ec2 suite lands.
 #[path = "all/modify_transit_gateway_metering_policy.rs"]
 mod modify_transit_gateway_metering_policy;
 // What `DeleteTransitGatewayVpcAttachment` records: the stored VPC attachment the request names
@@ -2375,17 +2363,24 @@ mod modify_transit_gateway_metering_policy;
 // tail of this file, which is where every new ec2 suite lands.
 #[path = "all/delete_transit_gateway_vpc_attachment.rs"]
 mod delete_transit_gateway_vpc_attachment;
+// WHICH half of EC2's id rule a refusal carries: the FORM question before the EXISTENCE one,
+// over the resource kinds and operations that screen a resource id.
+#[path = "all/id_screening_verdicts.rs"]
+mod id_screening_verdicts;
+// The instance metadata service one instance's guest reads itself from: the published
+// categories, the signed identity document its agents register the machine with, the IMDSv2
+// token form, and what it publishes nothing for. Declared at the tail of this file, which is
+#[path = "all/instance_guest_metadata_service.rs"]
+mod instance_guest_metadata_service;
+// The code and the sentence this service answers a request the MODEL's own rules refuse: a
+// parameter the request left out, a value outside a declared catalog, a page size outside a
+// declared range, and the enum value it reads without regard to case.
+#[path = "all/parameter_refusal_codes.rs"]
+mod parameter_refusal_codes;
 // What `DeleteIpam` records: the stored IPAM written into the transient delete state of its own
 // catalog with the clock owing its removal, answered with every other member unchanged, read back
 // through `DescribeIpams` and then gone with the scopes it contained and the pools created in them
 // — beside the unresolvable ids, the pools that block it, the `Cascade` that takes the private
 // ones with it, the second delete and the dry run it refuses without writing anything. Declared at
-// the tail of this file, which is where every new ec2 suite lands.
 #[path = "all/delete_ipam.rs"]
 mod delete_ipam;
-// The instance metadata service one instance's guest reads itself from: the published
-// categories, the signed identity document its agents register the machine with, the IMDSv2
-// token form, and what it publishes nothing for. Declared at the tail of this file, which is
-// where every new ec2 suite lands.
-#[path = "all/instance_guest_metadata_service.rs"]
-mod instance_guest_metadata_service;

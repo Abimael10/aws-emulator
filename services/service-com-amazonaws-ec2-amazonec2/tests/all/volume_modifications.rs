@@ -410,11 +410,15 @@ async fn one_unmodified_volume_refuses_a_request_that_names_several() {
 async fn an_unresolvable_volume_id_is_refused_before_its_modification() {
     let (router, _engine) = super::ec2_query::emulator();
 
-    // Every row is a different way of being unresolvable: the short and the long id form
-    // for the unknown case, and for the malformed case a wrong prefix, a wrong length,
-    // non-hex digits, upper-case hex and no prefix at all.
+    // Every row is a different way of being unresolvable: the short id form for the unknown
+    // case, and for the malformed case a long-form identifier the mint never handed out, a
+    // wrong prefix, a wrong length, non-hex digits, upper-case hex and no prefix at all.
     for (case, volume_id, expected) in [
-        ("unknown, long form", "vol-0123456789abcdef0", INVALID_VOLUME_ID_NOT_FOUND),
+        (
+            "a long-form identifier the mint never handed out",
+            "vol-0123456789abcdef0",
+            INVALID_VOLUME_ID_MALFORMED,
+        ),
         ("unknown, short form", "vol-0123abcd", INVALID_VOLUME_ID_NOT_FOUND),
         ("another resource's id", "i-0123456789abcdef0", INVALID_VOLUME_ID_MALFORMED),
         ("one hex digit short", "vol-0123abc", INVALID_VOLUME_ID_MALFORMED),
@@ -1011,8 +1015,8 @@ async fn dry_run_reports_whether_the_request_would_have_succeeded() {
             INVALID_VOLUME_MODIFICATION_NOT_FOUND,
         ),
         (
-            "an unknown volume",
-            indexed("VolumeId", &["vol-0123456789abcdef0"]),
+            "an unknown volume, in the retired short form",
+            indexed("VolumeId", &["vol-0123abcd"]),
             INVALID_VOLUME_ID_NOT_FOUND,
         ),
         (
@@ -1706,18 +1710,19 @@ mod modify_volume {
         }
     }
 
-    /// RULE 2, continued: the volume id itself. An id that is not shaped like one is malformed
-    /// before it is looked up, and one that names no volume of the account is not found.
+    /// RULE 2, continued: the volume id itself. An id this service cannot READ is malformed
+    /// before it is looked up, and one it can read that names no volume of the account is not
+    /// found.
     #[tokio::test]
     async fn an_unresolvable_volume_id_is_refused() {
         let rows: [(&str, &str, &str); 4] = [
             (
-                "a well-formed id no volume has (long form)",
+                "a long-form identifier the mint never handed out",
                 "vol-0123456789abcdef0",
-                "InvalidVolume.NotFound",
+                "InvalidVolumeID.Malformed",
             ),
             (
-                "a well-formed id no volume has (short form)",
+                "a readable id no volume has (the retired short form)",
                 "vol-12345678",
                 "InvalidVolume.NotFound",
             ),

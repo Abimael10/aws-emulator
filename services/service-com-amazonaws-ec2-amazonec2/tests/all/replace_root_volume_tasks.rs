@@ -881,8 +881,8 @@ async fn an_unresolvable_resource_is_refused_before_the_task_is_started() {
             "InvalidVolumeID.Malformed",
         ),
         (
-            "a well-formed volume id no volume exists for",
-            vec![p("VolumeId", "vol-0fedcba987654321f")],
+            "a short-form volume id no volume exists for",
+            vec![p("VolumeId", "vol-0fedcba9")],
             "InvalidVolume.NotFound",
         ),
         (

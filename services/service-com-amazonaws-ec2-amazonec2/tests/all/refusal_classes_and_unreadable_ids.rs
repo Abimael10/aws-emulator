@@ -411,9 +411,10 @@ async fn multi_attach_on_a_type_that_does_not_support_it_is_a_parameter_combinat
 }
 
 /// RULE 3 (and the parameter-layer half of rule 1): `DescribeVolumes` validates each
-/// `VolumeIds` entry as a PARAMETER against the form EC2 ISSUES, so a value outside that form
-/// is `InvalidParameterValue` naming the parameter and the form, while an id INSIDE it the
-/// account holds no volume for is the volume's own not-found class.
+/// `VolumeIds` entry as a PARAMETER against what this service can READ as a volume id — the
+/// form EC2 issues, plus the decode it makes of a long-form identifier — so a value outside
+/// that is `InvalidParameterValue` naming the parameter and the form, while an id it CAN read
+/// that the account holds no volume for is the volume's own not-found class.
 #[tokio::test]
 async fn a_volume_id_outside_the_issued_form_is_a_parameter_level_refusal() {
     let (router, _engine) = emulator();
@@ -461,9 +462,9 @@ async fn a_volume_id_outside_the_issued_form_is_a_parameter_level_refusal() {
         ),
         ("another kind's id", "snap-00000000000000001", "InvalidParameterValue"),
         (
-            "an id inside the issued form nothing was created for",
+            "an identifier inside the issued form that the mint never handed out",
             "vol-00000000000000999",
-            "InvalidVolume.NotFound",
+            "InvalidParameterValue",
         ),
         (
             "the retired short form, nothing created for it",

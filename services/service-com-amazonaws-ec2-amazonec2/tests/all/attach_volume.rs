@@ -422,10 +422,10 @@ async fn an_attach_is_refused_unless_the_request_and_the_state_behind_it_admit_i
             "InvalidInstanceID.Malformed",
         ),
         (
-            "a well-formed volume id the account holds no volume for",
+            "a volume id whose long-form identifier the mint never handed out",
             attach_params(UNKNOWN_VOLUME, &instance_id, "/dev/sdf"),
             400,
-            "InvalidVolume.NotFound",
+            "InvalidVolumeID.Malformed",
         ),
         (
             "a well-formed instance id the account holds no instance for",

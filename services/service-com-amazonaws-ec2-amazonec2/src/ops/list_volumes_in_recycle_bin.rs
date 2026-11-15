@@ -153,8 +153,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             MAX_RESOURCE_IDS, RECYCLE_BIN_PAGE_SIZE_RANGE, decode_page_token, dry_run_operation,
-            encode_page_token, invalid_pagination_token, invalid_volume_id_malformed,
-            invalid_volume_id_not_found, require_service_state, volume_id_is_well_formed,
+            encode_page_token, invalid_pagination_token,
+            invalid_volume_id_not_found, require_readable_volume_id, require_service_state,
         };
 
         // `ctx` carries request metadata only; this operation reads none of it. The store is
@@ -207,12 +207,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `RestoreVolumeFromRecycleBin`, which refuses that same id.
         store.materialize_due_transitions();
 
-        // An id the request named has to be a volume the bin holds: a malformed one is
-        // answered as malformed, and a well-formed one the bin does not hold as not found.
+        // An id the request named has to be a volume the bin holds: one this service cannot
+        // READ as a volume id is answered as malformed, and a readable one the bin does not
+        // hold as not found.
         for volume_id in &requested_ids {
-            if !volume_id_is_well_formed(volume_id) {
-                return Err(invalid_volume_id_malformed(volume_id));
-            }
+            require_readable_volume_id(&store, volume_id)?;
             if !store.volumes_in_recycle_bin.contains_key(volume_id) {
                 return Err(invalid_volume_id_not_found(volume_id));
             }

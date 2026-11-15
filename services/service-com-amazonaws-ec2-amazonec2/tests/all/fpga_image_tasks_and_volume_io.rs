@@ -66,10 +66,13 @@ type Params = Vec<(String, String)>;
 const DRY_RUN_STATUS: u16 = 412;
 
 /// A well-formed id of each kind that the account holds no resource for. The long (17 hex
-/// digit) form, which is what EC2 mints today.
+/// digit) form, which is what EC2 mints today — except the volume, whose id is read against
+/// the DECODE this service makes of a long-form identifier as well as against the form
+/// (`ec2::state::volume_id_is_readable`), so a volume the account does not hold is named in
+/// the retired SHORT form, which carries no identifier to decode.
 const UNKNOWN_FPGA_IMAGE_ID: &str = "afi-0123456789abcdef0";
 const UNKNOWN_IMAGE_ID: &str = "ami-0123456789abcdef0";
-const UNKNOWN_VOLUME_ID: &str = "vol-0123456789abcdef0";
+const UNKNOWN_VOLUME_ID: &str = "vol-0abc1234";
 const UNKNOWN_INSTANCE_ID: &str = "i-0123456789abcdef0";
 const UNKNOWN_REPORT_ID: &str = "imgusgrpt-0123456789abcdef0";
 

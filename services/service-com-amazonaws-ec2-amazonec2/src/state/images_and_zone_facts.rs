@@ -1084,6 +1084,26 @@ pub fn image_id_is_well_formed(id: &str) -> bool {
     prefixed_id_is_well_formed(IMAGE_ID_PREFIX, id)
 }
 
+/// Whether this service can READ `id` as an AMI id at all.
+///
+/// [`image_id_is_well_formed`]'s printed form PLUS the decode EC2 makes of a long-form id
+/// before it resolves anything: a long-form value whose obfuscated identifier this service
+/// never issued names no image it could ever have held, so it is no AMI id rather than an
+/// image the account cannot see
+/// ([`ComAmazonawsEc2Amazonec2State::long_form_id_was_never_issued`], where that clause and
+/// its reasoning live) — the `ami-0123456789abcdef0` shape documentation examples and
+/// hand-written probes reach for. The retired SHORT form carries no identifier to decode, so
+/// a short-form id the account can see no image for is reported absent, which is what the
+/// describes of this account's images were recorded answering for one.
+///
+/// Weaker than [`image_id_was_issued`], which also holds the printed form to the issued long
+/// form, and stronger than [`image_id_is_well_formed`]: this is the reading of an operation
+/// that RESOLVES the image it names, so that a value EC2 cannot read is told apart from an
+/// image that is not there.
+pub fn image_id_is_readable(store: &ComAmazonawsEc2Amazonec2State, id: &str) -> bool {
+    image_id_is_well_formed(id) && !store.long_form_id_was_never_issued(id)
+}
+
 /// The id prefix of an Amazon Machine Image, as every reading of an AMI id here spells it.
 pub const IMAGE_ID_PREFIX: &str = "ami";
 
@@ -1163,7 +1183,10 @@ pub fn invalid_ami_id_not_found<E>(image_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_AMI_ID_NOT_FOUND,
         400,
-        format!("The image id '[{image_id}]' does not exist"),
+        format!(
+            "The image id '[{}]' does not exist",
+            echoed_resource_id(image_id)
+        ),
     )
 }
 

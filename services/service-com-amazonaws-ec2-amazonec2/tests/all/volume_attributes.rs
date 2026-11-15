@@ -40,8 +40,9 @@ const PRODUCT_CODES: &str = ec2::state::VOLUME_ATTRIBUTE_PRODUCT_CODES;
 /// cannot be left untested here.
 const ATTRIBUTES: [&str; 2] = [AUTO_ENABLE_IO, PRODUCT_CODES];
 
-/// A volume id of the right shape that no volume of the account has.
-const ABSENT_VOLUME: &str = "vol-0000000000000beef";
+/// A volume id this service can READ — the retired SHORT form, which carries no obfuscated
+/// identifier to decode — that no volume of the account has.
+const ABSENT_VOLUME: &str = "vol-0000beef";
 
 /// A volume id that is not shaped like one at all.
 const MALFORMED_VOLUME: &str = "vol-not-an-id";

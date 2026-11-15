@@ -1836,46 +1836,63 @@ pub fn require_visible_image<E>(
     Ok(())
 }
 
-/// Refuse an AMI id an operation with EC2's STRICT image-id validator cannot resolve: HTTP
+/// Refuse an AMI id an operation with EC2's STRICT image-id validator cannot READ: HTTP
 /// 400 [`INVALID_AMI_ID_MALFORMED`], `The image ID '<id>' is malformed`.
 ///
-/// EC2's per-operation validators do NOT agree about an id they cannot resolve. The strict
-/// ones answer this one code and wording for ANY value that does not name an image this
-/// account can see — including a value in the long `ami-` id form that names none — where
-/// the describes of the account's images draw the distinction the shared
-/// [`require_visible_image`] keeps: [`invalid_ami_id_malformed`] for a value that is no AMI
-/// id at all and [`invalid_ami_id_not_found`] for a well-formed id no visible image has.
-/// Two recorded units pin the strict answer, `ec2-image-store-restore-error-paths#task#1` for
-/// `CreateStoreImageTask` and the recorded `DescribeImageAttribute` refusal, so the wording
-/// lives here rather than beside either caller. The message's one variable part is the id the
-/// request sent. `GetImageAncestry` words its MALFORMED refusal from here too while keeping the
-/// `.NotFound` of a well-formed id no visible image has, so a caller of it still tells the two
-/// apart.
+/// EC2's per-operation validators do NOT agree about how they WORD a value they cannot read
+/// as an AMI id: the strict ones answer this sentence, where the describes of the account's
+/// images answer [`invalid_ami_id_malformed`]'s shared template. Which one an operation
+/// answers is a fact of that operation, recorded by its caller — two recorded units pin this
+/// one, `ec2-image-store-restore-error-paths#task#1` for `CreateStoreImageTask` and the
+/// recorded `DescribeImageAttribute` refusal, both of a fabricated long-form id — so the
+/// wording lives here rather than beside either caller. The message's one variable part is
+/// the id the request sent.
+///
+/// What it is answered FOR is one rule for every validator: a value outside what this
+/// service can read as an AMI id ([`image_id_is_readable`]), asked before any image is
+/// looked up, so a readable id the account can see no image for still gets
+/// [`invalid_ami_id_not_found`] — `CreateStoreImageTask` is recorded answering that for a
+/// short-form id, and `GetImageAncestry` for one too.
 pub fn unresolvable_image_id<E>(image_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_AMI_ID_MALFORMED,
         400,
-        format!("The image ID '{image_id}' is malformed"),
+        format!(
+            "The image ID '{}' is malformed",
+            echoed_resource_id(image_id)
+        ),
     )
 }
 
-/// Resolve the image an operation with EC2's strict image-id validator names, or refuse the
-/// id with [`unresolvable_image_id`].
+/// Resolve the image an operation with EC2's strict image-id validator names, telling a
+/// value it cannot READ as an AMI id ([`unresolvable_image_id`]) from a readable id the
+/// account can see no image for ([`invalid_ami_id_not_found`]).
 ///
 /// The images an account may name are the ones it can see at all, read through the crate's
 /// one definition of that question ([`image_is_visible`]), so a strict operation and the
 /// describes agree about which AMIs exist for a caller. The resolved image is handed back,
 /// so a caller that needs a fact of it reads it once rather than looking the same id up
 /// again.
+///
+/// The FORM question is asked before the EXISTENCE one, and it is the service's own reading
+/// ([`image_id_is_readable`]): the printed form plus the decode EC2 makes of a long-form id.
+/// That is what separates the two recorded refusals of this validator — a fabricated
+/// long-form id (`CreateStoreImageTask` and `DescribeImageAttribute` are each recorded
+/// answering `InvalidAMIID.Malformed` with this sentence for one) from a short-form id the
+/// account can see no image for, which `CreateStoreImageTask` is recorded answering
+/// `InvalidAMIID.NotFound` for.
 pub fn require_resolvable_image<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
     image_id: &str,
 ) -> Result<&'store Image, Scaffolded<E>> {
+    if !image_id_is_readable(store, image_id) {
+        return Err(unresolvable_image_id(image_id));
+    }
     store
         .images
         .get(image_id)
         .filter(|image| image_is_visible(image, ::engine::emulator_account_id()))
-        .ok_or_else(|| unresolvable_image_id(image_id))
+        .ok_or_else(|| invalid_ami_id_not_found(image_id))
 }
 
 /// Refuse an image id a Windows fast launch change names that cannot carry one.

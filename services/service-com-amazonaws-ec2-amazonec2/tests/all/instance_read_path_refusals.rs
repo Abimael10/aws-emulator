@@ -63,12 +63,13 @@ fn modify_volume(volume_id: &str) -> Vec<Param> {
 fn rows() -> Vec<Row> {
     let mut rows = vec![
         Row {
-            // A well-formed volume id the account holds no volume for: the OTHER half of
-            // the id rule, which is what makes the malformed rows above a distinct answer
-            // rather than the only one.
+            // A SHORT-form volume id the account holds no volume for: that form carries no
+            // obfuscated identifier to decode, so it is looked up and reported absent — the
+            // OTHER half of the id rule, which is what makes the malformed rows below a
+            // distinct answer rather than the only one.
             case: "a modification of a volume the account does not hold",
             action: "ModifyVolumeAttribute",
-            params: modify_volume("vol-0000000000000beef"),
+            params: modify_volume("vol-0000beef"),
             status: 400,
             code: ec2::state::INVALID_VOLUME_ID_NOT_FOUND,
         },

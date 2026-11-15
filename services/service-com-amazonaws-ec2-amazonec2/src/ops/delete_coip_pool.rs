@@ -158,13 +158,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lookup and removed by another: the record reported below is the record that left
         // the store.
         //
-        // THIS operation's refusal for an id it cannot resolve is `InvalidParameterValue`,
-        // whatever the id's form: the recorded answers for it name the value as one the
-        // delete cannot act on rather than as a pool that is missing, where the operations
-        // that READ a pool (`CreateCoipCidr`, `GetCoipPoolUsage`) answer the pool's own
-        // `InvalidPoolID.NotFound` for a well-formed id. The sentence is the one this
-        // surface words a `CoipPoolId` it holds no pool for with, so both halves say the
-        // same thing about the same value.
+        // THIS operation asks the FORM question before the EXISTENCE one, as EC2 does: a
+        // value it cannot read as a pool id at all is refused before any lookup with the
+        // code and sentence this surface is recorded answering for that class
+        // (`InvalidIpv4PoolCoipId.Malformed`, "The coip-pool ID '<id>' is malformed"), while
+        // a value that READS as a pool id and names none is refused as one this delete
+        // cannot act on — `InvalidParameterValue` with the sentence this surface words a
+        // `CoipPoolId` it holds no pool for, which is what its recorded refusals carry,
+        // where the operations that READ a pool (`CreateCoipCidr`, `GetCoipPoolUsage`)
+        // answer the pool's own `InvalidPoolID.NotFound`.
         //
         // A pool that still holds address ranges is not refused here: EC2 does not keep a
         // `CreateCoipCidr`-provisioned range from being deleted with its pool, and inventing
@@ -181,9 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::coip_pool_does_not_exist_message(pool_id),
                 )
             } else {
-                // A value that is no pool id at all is `InvalidPoolID.Malformed` BEFORE
-                // anything is looked up, through the crate's one reader of that failure.
-                crate::state::coip_pool_id_does_not_exist(pool_id)
+                // A value that is no pool id at all is refused BEFORE anything is looked up,
+                // with the code and sentence this surface is recorded answering for that
+                // class ([`crate::state::coip_pool_id_is_malformed`]).
+                crate::state::coip_pool_id_is_malformed(pool_id)
             }
         })?;
 

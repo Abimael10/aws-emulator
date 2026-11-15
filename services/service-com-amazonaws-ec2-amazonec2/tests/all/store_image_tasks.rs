@@ -17,9 +17,10 @@
 //! 3. a bucket name that is not a bucket name, an AMI id the account cannot resolve, a page
 //!    size outside the published range, a filter name the operation does not publish and a
 //!    `MaxResults` beside `ImageIds` are refused with EC2's own error code, and nothing is
-//!    stored. For the create, EVERY AMI id it cannot resolve to an image this account can see
-//!    is the one strict refusal `InvalidAMIID.Malformed`, "The image ID '<id>' is malformed",
-//!    whatever form the value has, and a bucket name outside Amazon S3's naming rules is the
+//!    stored. For the create, an AMI id this service cannot READ is the strict refusal
+//!    `InvalidAMIID.Malformed`, "The image ID '<id>' is malformed", answered before any image
+//!    is looked up, while an id it CAN read that resolves to no image this account can see is
+//!    `InvalidAMIID.NotFound`; a bucket name outside Amazon S3's naming rules is the
 //!    malformed-parameter refusal `CreateRestoreImageTask` answers for the same value;
 //! 4. `ImageIds`, `Filters` and `MaxResults` narrow and page the report, newest task first
 //!    — and `ImageIds` makes the filters it is given beside IGNORED.
@@ -842,18 +843,20 @@ async fn the_create_refuses_a_bad_request() {
     );
 }
 
-/// RULE 3, continued: EVERY AMI id the create cannot resolve to an image the calling account
-/// can see is refused with the SAME code and the same message — `InvalidAMIID.Malformed`,
-/// `The image ID '<id>' is malformed` — whatever form the value has, where a describe of the
-/// account's images keeps the malformed/not-found split instead.
+/// RULE 3, continued: the create asks the FORM question before the EXISTENCE one, as EC2
+/// does — an AMI id this service cannot READ is `InvalidAMIID.Malformed` with this
+/// validator's own sentence (`The image ID '<id>' is malformed`) before any image is looked
+/// up, and an id it CAN read that resolves to no image the calling account can see is
+/// `InvalidAMIID.NotFound` (`The image id '[<id>]' does not exist`).
 ///
-/// The rows differ along the FORM of the id (the long and the short `ami-` form, one hex
-/// digit short of the long form, uppercase hex, a character outside the id alphabet, another
-/// resource kind's id) and along WHY it resolves to nothing (no image stored under it, and an
-/// image of another account this caller cannot see). An EMPTY `ImageId` is not one of them:
-/// it gave the parameter no value at all, which is `MissingParameter`, asserted by
-/// [`the_create_refuses_a_bad_request`]. The positive side of the same rule closes the test:
-/// an image this account CAN see is stored, including a public image of another account.
+/// The rows differ along the FORM of the id (the long `ami-` form whose identifier the mint
+/// never handed out, the retired short form, one hex digit short of the long form, uppercase
+/// hex, a character outside the id alphabet, another resource kind's id) and along WHY it
+/// resolves to nothing (no image stored under it, and an image of another account this
+/// caller cannot see). An EMPTY `ImageId` is not one of them: it gave the parameter no value
+/// at all, which is `MissingParameter`, asserted by [`the_create_refuses_a_bad_request`]. The
+/// positive side of the same rule closes the test: an image this account CAN see is stored,
+/// including a public image of another account.
 #[tokio::test]
 async fn the_create_refuses_every_unresolvable_ami_id() {
     let (router, engine) = super::ec2_query::emulator();
@@ -883,44 +886,68 @@ async fn the_create_refuses_every_unresolvable_ami_id() {
         (invisible, public)
     };
 
-    let unresolvable: Vec<(&str, String)> = vec![
-        ("the long form, no image stored", UNKNOWN_IMAGE_ID.to_string()),
-        ("the short form, no image stored", "ami-0ffffffe".to_string()),
+    // (what the row probes, the value, whether the service can READ it as an AMI id)
+    let unresolvable: Vec<(&str, String, bool)> = vec![
+        // EC2's long id form is an obfuscated identifier: one this service never issued
+        // cannot be decoded, so there is nothing to look up.
+        (
+            "the long form, an identifier the mint never handed out",
+            UNKNOWN_IMAGE_ID.to_string(),
+            false,
+        ),
+        // The retired short form carries no identifier to decode, so it is looked up.
+        ("the short form, no image stored", "ami-0ffffffe".to_string(), true),
         (
             "one hex digit short of the long form",
             "ami-0fffffffffffffff".to_string(),
+            false,
         ),
         (
             "the long form in uppercase hex",
             "ami-0FFFFFFFFFFFFFFFF".to_string(),
+            false,
         ),
         (
             "a character outside the id alphabet",
             MALFORMED_IMAGE_ID.to_string(),
+            false,
         ),
         (
             "another resource kind's id",
             "i-0ffffffffffffffff".to_string(),
+            false,
         ),
+        // An id this service DID issue, so it is read and reported as an image the caller
+        // cannot see — which is what keeps the not-found half of the rule reachable.
         (
             "a private image of another account",
             invisible_image_id.clone(),
+            true,
         ),
     ];
-    for (case, image_id) in &unresolvable {
+    for (case, image_id, readable) in &unresolvable {
         let (status, body) = store(&router, image_id, "ami-archive").await;
         assert_eq!(
             status, 400,
             "case {case:?}: expected HTTP 400, got {status} with body {body}"
         );
+        let (expected_code, expected) = if *readable {
+            (
+                "InvalidAMIID.NotFound",
+                format!("The image id '[{image_id}]' does not exist"),
+            )
+        } else {
+            (
+                "InvalidAMIID.Malformed",
+                format!("The image ID '{image_id}' is malformed"),
+            )
+        };
         let code = error_code(&body);
         assert_eq!(
-            code, "InvalidAMIID.Malformed",
-            "case {case:?}: expected the code \"InvalidAMIID.Malformed\", got {code:?} in \
-             body {body}"
+            code, expected_code,
+            "case {case:?}: expected the code {expected_code:?}, got {code:?} in body {body}"
         );
         let message = error_message(&body);
-        let expected = format!("The image ID '{image_id}' is malformed");
         assert_eq!(
             message, expected,
             "case {case:?}: expected the message {expected:?}, got {message:?} in body {body}"

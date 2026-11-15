@@ -148,8 +148,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            dry_run_operation, incorrect_state_of, internal_error, invalid_volume_id_malformed,
-            invalid_volume_id_not_found, require_service_state, volume_id_is_well_formed,
+            dry_run_operation, incorrect_state_of, internal_error,
+            invalid_volume_id_not_found, require_readable_volume_id, require_service_state,
             volume_in_use, VolumeRecord,
         };
 
@@ -158,16 +158,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // engine held on `self`.
         let _ = ctx;
 
-        // A value that is not a volume id names no volume in any account, so it is refused
-        // BEFORE the store is asked about it — the ordering `require_volume` keeps, spelled
-        // out here because the state check below needs the record mutably.
-        if !volume_id_is_well_formed(&input.volume_id) {
-            return Err(invalid_volume_id_malformed(&input.volume_id));
-        }
-
         let state_handle = require_service_state(&*self.engine)?;
         let mut store = state_handle.lock();
         let now = ::std::time::Instant::now();
+
+        // A value this service cannot READ as a volume id names no volume in any account, so
+        // it is refused BEFORE the store is asked about it — the ordering `require_volume`
+        // keeps, spelled out here because the state check below needs the record mutably. The
+        // reading is the store's own ([`crate::state::require_readable_volume_id`]), because
+        // EC2 decodes a long-form id before it resolves anything and only this service knows
+        // which identifiers it ever issued.
+        require_readable_volume_id(&store, &input.volume_id)?;
 
         // "Deletes the specified EBS volume": a volume id this account holds no volume for
         // is a refusal, not a no-op — a caller that deletes twice has to be able to tell the

@@ -250,9 +250,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // WELL-FORMED VPC id the account holds no VPC for, so the `.NotFound` the surfaces
         // that read a `VpcId` as one parameter among several answer
         // ([`crate::state::invalid_vpc_id_not_found`], which `DescribeStaleSecurityGroups`
-        // keeps) is not this operation's answer. WHICH refusal an unresolvable `VpcId` gets
-        // is a fact of the operation rather than of the value — the same split
-        // `CreateCarrierGateway` records for its own `VpcId`.
+        // and `CreateCarrierGateway` keep) is not this operation's answer. WHICH refusal an
+        // unresolvable `VpcId` gets is a fact of the operation rather than of the value.
         if !store.vpcs.contains_key(&input.vpc_id) {
             return Err(crate::state::invalid_vpc_id_malformed(&input.vpc_id));
         }

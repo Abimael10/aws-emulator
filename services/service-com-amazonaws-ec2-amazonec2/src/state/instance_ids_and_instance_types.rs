@@ -391,14 +391,33 @@ pub fn require_decoded_instance_record<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
     instance_id: &str,
 ) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
+    require_decoded_instance_record_worded(
+        store,
+        instance_id,
+        crate::scaffolded::Scaffolded::invalid_instance_id_malformed,
+    )
+}
+
+/// [`require_decoded_instance_record`] with the MALFORMED half worded by `malformed`.
+///
+/// The same reason [`require_instance_record_worded`] exists: EC2's per-operation validators
+/// do not agree about how they WORD an instance id they cannot read, and which sentence an
+/// operation answers is a fact of that operation, recorded by its caller — so the RULE lives
+/// here once and the sentence is passed in. `AssociateIamInstanceProfile` is recorded
+/// answering `InvalidInstanceID.Malformed` with
+/// [`crate::scaffolded::Scaffolded::instance_id_is_malformed`]'s sentence for a long-form id
+/// this service never issued.
+pub fn require_decoded_instance_record_worded<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    instance_id: &str,
+    malformed: impl Fn(&str) -> crate::scaffolded::Scaffolded<E>,
+) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
     if long_form_identifier(instance_id)
         .is_some_and(|identifier| identifier > u128::from(store.next_instance))
     {
-        return Err(crate::scaffolded::Scaffolded::invalid_instance_id_malformed(
-            instance_id,
-        ));
+        return Err(malformed(instance_id));
     }
-    require_instance_record(store, instance_id)
+    require_instance_record_worded(store, instance_id, malformed)
 }
 
 /// The stored instance `instance_id` names, refusing an id this service cannot resolve

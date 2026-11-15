@@ -661,16 +661,17 @@ pub fn require_known_volume<E>(
     Ok(())
 }
 
-/// The ONE definition of how this service resolves a volume id a request named: an id that
-/// is not shaped like one is answered as malformed, and a well-formed one this account
-/// holds no volume for as not found — the way the service orders the two. A volume whose
+/// The ONE definition of how this service resolves a volume id a request named: an id it
+/// cannot READ as a volume id ([`volume_id_is_readable`]) is answered as malformed, and a
+/// readable one this account holds no volume for as not found — the way the service orders
+/// the two, the FORM question before the EXISTENCE question. A volume whose
 /// withdrawal the clock has made due is one the account no longer holds
 /// ([`ComAmazonawsEc2Amazonec2State::volume_is_withdrawn`]), so it resolves as not found.
 pub fn require_volume<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
     volume_id: &str,
 ) -> Result<&'store VolumeRecord, crate::scaffolded::Scaffolded<E>> {
-    require_well_formed_volume_id(volume_id)?;
+    require_readable_volume_id(store, volume_id)?;
     let now = Instant::now();
     store
         .volumes
@@ -686,7 +687,7 @@ pub fn require_volume_mut<'store, E>(
 ) -> Result<&'store mut VolumeRecord, crate::scaffolded::Scaffolded<E>> {
     // The malformed half of the rule first, shared with `require_volume` rather than
     // repeated, because the mutable borrow of the store cannot be taken before it.
-    require_well_formed_volume_id(volume_id)?;
+    require_readable_volume_id(store, volume_id)?;
     let now = Instant::now();
     store
         .volumes
@@ -695,12 +696,41 @@ pub fn require_volume_mut<'store, E>(
         .ok_or_else(|| invalid_volume_id_not_found(volume_id))
 }
 
-/// The first half of that rule on its own: a volume id that is not shaped like one is
-/// refused BEFORE it is looked up, so both halves of [`require_volume`] exist once each.
-pub(super) fn require_well_formed_volume_id<E>(
+/// Whether this service can READ `volume_id` as a volume id at all.
+///
+/// Two clauses:
+///
+/// * the printed form EC2 ISSUES ([`volume_id_is_well_formed`]) — `vol-` and one of the two
+///   published digit counts, the long one under a leading `0` and never the all-zero
+///   placeholder;
+/// * the DECODE EC2 makes of a long-form id before it resolves anything: it is an obfuscated
+///   identifier, so a value whose identifier this service never issued names no volume it
+///   could ever have held
+///   ([`ComAmazonawsEc2Amazonec2State::long_form_id_was_never_issued`], where that clause and
+///   its reasoning live) — the `vol-0123456789abcdef0` shape documentation examples and
+///   hand-written probes reach for.
+///
+/// The retired SHORT form carries no identifier to decode, so a short-form id the account
+/// holds no volume for is reported absent rather than unreadable; and an id the mint DID hand
+/// out stays readable after the volume is gone, so a deleted volume's own id is resolved and
+/// reported absent. Those two are what keep the NOT-FOUND half of the rule reachable.
+///
+/// The ONE reading of a `VolumeId` this service resolves, so the operations that act on one
+/// named volume cannot answer one value two ways.
+pub fn volume_id_is_readable(
+    store: &ComAmazonawsEc2Amazonec2State,
+    volume_id: &str,
+) -> bool {
+    volume_id_is_well_formed(volume_id) && !store.long_form_id_was_never_issued(volume_id)
+}
+
+/// The first half of that rule on its own: a volume id this service cannot read is refused
+/// BEFORE it is looked up, so both halves of [`require_volume`] exist once each.
+pub fn require_readable_volume_id<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
     volume_id: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    if volume_id_is_well_formed(volume_id) {
+    if volume_id_is_readable(store, volume_id) {
         Ok(())
     } else {
         Err(invalid_volume_id_malformed(volume_id))
@@ -763,11 +793,18 @@ pub fn volume_id_not_in_recycle_bin<E>(volume_id: &str) -> crate::scaffolded::Sc
 
 /// Refuse a request that named a volume id no volume of the account has, the way EC2
 /// does: HTTP 400 `InvalidVolume.NotFound`.
+///
+/// The id comes from the REQUEST, so the echo is bounded by [`echoed_resource_id`], the one
+/// bound every refusal of this crate that quotes a caller-chosen id holds it to — the same
+/// bound [`malformed_volume_id_message`] takes for the other half of the rule.
 pub fn invalid_volume_id_not_found<E>(volume_id: &str) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(
         INVALID_VOLUME_ID_NOT_FOUND,
         400,
-        format!("The volume '{volume_id}' does not exist."),
+        format!(
+            "The volume '{}' does not exist.",
+            echoed_resource_id(volume_id)
+        ),
     )
 }
 

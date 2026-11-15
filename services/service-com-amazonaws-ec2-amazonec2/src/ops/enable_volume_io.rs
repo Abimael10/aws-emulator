@@ -156,7 +156,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
             dry_run_operation, incorrect_state, invalid_volume_id_malformed,
-            invalid_volume_id_not_found, require_service_state, volume_id_is_well_formed,
+            invalid_volume_id_not_found, require_readable_volume_id, require_service_state,
+            volume_id_is_well_formed,
         };
 
         // A volume carries its own Availability Zone, so nothing here depends on the Region
@@ -174,6 +175,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
+        // The rest of the same FORM question, which only the store can answer: EC2 decodes a
+        // long-form id before it resolves anything, so a value whose identifier this service
+        // never issued is no volume id at all
+        // ([`crate::state::require_readable_volume_id`]).
+        require_readable_volume_id(&store, &input.volume_id)?;
         let Some(record) = store.volumes.get_mut(&input.volume_id) else {
             return Err(invalid_volume_id_not_found(&input.volume_id));
         };

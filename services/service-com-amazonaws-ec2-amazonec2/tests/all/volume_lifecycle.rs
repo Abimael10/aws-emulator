@@ -981,7 +981,12 @@ async fn describe_volumes_narrows_by_id_filter_and_page() {
     // id LIST as a request parameter, that refusal is the parameter-level
     // `InvalidParameterValue` naming the parameter and the form it expects.
     for (case, volume_id, expected_code) in [
-        ("unknown", "vol-00000000000000999", "InvalidVolume.NotFound"),
+        ("unknown, in the retired short form", "vol-00000999", "InvalidVolume.NotFound"),
+        (
+            "a long-form identifier the mint never handed out",
+            "vol-00000000000000999",
+            "InvalidParameterValue",
+        ),
         ("malformed", "vol-not-hex", "InvalidParameterValue"),
         ("not an id at all", "banana", "InvalidParameterValue"),
         ("another resource's prefix", "snap-00000000000000999", "InvalidParameterValue"),

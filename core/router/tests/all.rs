@@ -1505,3 +1505,5 @@ mod lambda_in_function_assumed_role_session;
 // The `#[path]` attribute is what points each module into `tests/all/`: this file is a
 // test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of it, which the layout
 // check refuses.
+// each declaration into `tests/all/`. Notes that belong to this file rather than to a suite
+// live in `all/appended_notes.rs`.

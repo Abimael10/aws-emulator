@@ -154,10 +154,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // over can be given a profile again.
         store.materialize_due_transitions();
 
-        // "The ID of the instance" (`AssociateIamInstanceProfileRequest$InstanceId`): an id
-        // this account holds no instance for is refused the way every operation of this
-        // crate that resolves ONE instance refuses it.
-        crate::state::require_known_instance(&store, &input.instance_id)?;
+        // "The ID of the instance" (`AssociateIamInstanceProfileRequest$InstanceId`): this
+        // operation asks the FORM question before the EXISTENCE one and DECODES a long-form
+        // id first — EC2's long id form is an obfuscated identifier, so one this service
+        // never issued is `InvalidInstanceID.Malformed` in this operation's own wording
+        // before any lookup, and a readable id the account holds no instance for is
+        // `InvalidInstanceID.NotFound`.
+        crate::state::require_decoded_instance_record_worded(
+            &store,
+            &input.instance_id,
+            crate::scaffolded::Scaffolded::instance_id_is_malformed,
+        )?;
 
         // "You cannot associate more than one IAM instance profile with an instance"
         // (`AssociateIamInstanceProfile`), so an instance that already holds an association

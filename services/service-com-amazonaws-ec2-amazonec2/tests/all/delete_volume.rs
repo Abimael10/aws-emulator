@@ -538,9 +538,9 @@ async fn an_id_that_names_no_volume_is_refused_and_removes_nothing() {
         ("the prefix alone", "vol-", INVALID_VOLUME_ID_MALFORMED),
         ("no prefix at all", "not-a-volume", INVALID_VOLUME_ID_MALFORMED),
         (
-            "a well-formed long id nothing was created for",
+            "a long id whose identifier the mint never handed out",
             "vol-04fd27e9e8a1b2c3d",
-            INVALID_VOLUME_ID_NOT_FOUND,
+            INVALID_VOLUME_ID_MALFORMED,
         ),
         (
             "a well-formed short id nothing was created for",

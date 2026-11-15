@@ -467,10 +467,10 @@ async fn unresolvable_ids_and_dry_run_are_refused_with_ec2s_own_codes() {
 
     let table: Vec<RefusalRow> = vec![
         (
-            "an unknown long id",
+            "a long-form identifier the mint never handed out",
             indexed("VolumeId", &["vol-0123456789abcdef0"]),
             400,
-            "InvalidVolume.NotFound",
+            "InvalidVolumeID.Malformed",
         ),
         (
             "an unknown short id",
@@ -504,7 +504,7 @@ async fn unresolvable_ids_and_dry_run_are_refused_with_ec2s_own_codes() {
         ),
         (
             "a known id beside an unknown one",
-            indexed("VolumeId", &[volume_id.as_str(), "vol-0123456789abcdef0"]),
+            indexed("VolumeId", &[volume_id.as_str(), "vol-01234567"]),
             400,
             "InvalidVolume.NotFound",
         ),
@@ -521,7 +521,7 @@ async fn unresolvable_ids_and_dry_run_are_refused_with_ec2s_own_codes() {
         (
             "DryRun on a request that would have been refused",
             {
-                let mut params = indexed("VolumeId", &["vol-0123456789abcdef0"]);
+                let mut params = indexed("VolumeId", &["vol-01234567"]);
                 params.push(p("DryRun", "true"));
                 params
             },

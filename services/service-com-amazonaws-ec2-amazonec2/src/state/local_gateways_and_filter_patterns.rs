@@ -945,11 +945,14 @@ pub fn idempotent_parameter_mismatch<E>() -> crate::scaffolded::Scaffolded<E> {
 
 /// Refuse a request that named a VPC id no VPC of the account has, the way EC2 does:
 /// HTTP 400 `InvalidVpcID.NotFound`.
+///
+/// The id comes from the REQUEST, so the echo is bounded by [`echoed_resource_id`], the one
+/// bound every refusal of this crate that quotes a caller-chosen id holds it to.
 pub fn invalid_vpc_id_not_found<E>(vpc_id: &str) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(
         INVALID_VPC_ID_NOT_FOUND,
         400,
-        format!("The vpc ID '{vpc_id}' does not exist"),
+        format!("The vpc ID '{}' does not exist", echoed_resource_id(vpc_id)),
     )
 }
 
@@ -1090,6 +1093,42 @@ pub fn coip_pool_does_not_exist_message(pool_id: &str) -> String {
 /// back for a value outside it.
 pub fn coip_pool_id_is_invalid_message(pool_id: &str) -> String {
     format!("The pool ID '{}' is invalid.", echoed_pool_id(pool_id))
+}
+
+/// The resource token EC2 names a customer-owned IPv4 address pool with in a refusal of its
+/// id: `coip-pool`, as the `ResourceType` enum spells it
+/// (`smithy_query(query="shape",shape="ResourceType")`).
+///
+/// One spelling for the crate, so the `TagSpecification` a `CreateCoipPool` may carry and
+/// the refusals of a `CoipPoolId` name the resource the same way.
+pub const RESOURCE_TYPE_COIP_POOL: &str = "coip-pool";
+
+/// `InvalidIpv4PoolCoipId.Malformed` (HTTP 400): the code the `DeleteCoipPool` surface
+/// answers for a value that is no customer-owned address pool id AT ALL, so there is nothing
+/// to look up.
+///
+/// Spelled from the id MEMBER's own name (`Ipv4PoolCoipId`) rather than from the resource,
+/// which is what the recorded refusal of that operation carries — where the same surface's
+/// `DescribeCoipPools` is recorded answering [`INVALID_POOL_ID_MALFORMED`]
+/// (`InvalidPoolID.Malformed`) for the same class of value. WHICH code an operation answers
+/// is a fact of that operation, recorded by its caller; what is one rule is that the class
+/// is decided BEFORE any lookup.
+pub const INVALID_IPV4_POOL_COIP_ID_MALFORMED: &str = "InvalidIpv4PoolCoipId.Malformed";
+
+/// Refuse a value that is no customer-owned address pool id at all on the surface recorded
+/// answering this code: HTTP 400 [`INVALID_IPV4_POOL_COIP_ID_MALFORMED`], with the sentence
+/// EC2 words a malformed id of this resource with — `The coip-pool ID '<id>' is malformed`,
+/// the resource named as [`RESOURCE_TYPE_COIP_POOL`] spells it and the id taken from the
+/// REQUEST (bounded by [`MAX_ECHOED_COIP_POOL_ID_CHARS`], as every echo of this id is).
+pub fn coip_pool_id_is_malformed<E>(pool_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_IPV4_POOL_COIP_ID_MALFORMED,
+        400,
+        format!(
+            "The {RESOURCE_TYPE_COIP_POOL} ID '{}' is malformed",
+            echoed_pool_id(pool_id)
+        ),
+    )
 }
 
 /// Refuse a request that named an address-pool id no pool of the account has, the way

@@ -223,6 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The `ResourceType` a `TagSpecification` of this action may name: the CoIP pool it
-/// creates, as the `ResourceType` enum spells it
-/// (`smithy_query(query="shape",shape="ResourceType")`).
-const RESOURCE_TYPE_COIP_POOL: &str = "coip-pool";
+/// creates, as the `ResourceType` enum spells it — the crate's one spelling of that token
+/// ([`crate::state::RESOURCE_TYPE_COIP_POOL`]), which the refusals of a `CoipPoolId` name
+/// the resource with too.
+use crate::state::RESOURCE_TYPE_COIP_POOL;

@@ -342,17 +342,18 @@ async fn every_copy_type_accepts_its_published_size_bounds_and_refuses_one_past_
     }
 }
 
-/// RULE 1: `SourceVolumeId` must name a volume of the account — an id that is not shaped
-/// like a volume id is malformed, and a well-formed id the account holds no volume for is
-/// not found.
+/// RULE 1: `SourceVolumeId` must name a volume of the account — a value this service cannot
+/// READ as a volume id (a value outside the published forms, and a long-form identifier the
+/// mint never handed out) is malformed, and an id it can read that the account holds no
+/// volume for is not found.
 #[tokio::test]
 async fn the_source_volume_must_be_one_the_account_holds() {
     // (case, the id the request names, the error code it is refused with)
     let rows: [(&str, &str, &str); 6] = [
         (
-            "a long id no volume has",
+            "a long id the mint never handed out",
             "vol-0123456789abcdef0",
-            "InvalidVolume.NotFound",
+            "InvalidVolumeID.Malformed",
         ),
         (
             "a short id no volume has",

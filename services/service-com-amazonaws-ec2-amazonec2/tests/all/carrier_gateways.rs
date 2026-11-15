@@ -18,9 +18,10 @@
 //!   the `pending` state the model publishes, and the clock owes it `available` one
 //!   [`ec2::state::TRANSITION_DELAY`] later. The rows differ in the VPC, the number of tags
 //!   and the client token.
-//! * A `VpcId` this surface CANNOT RESOLVE is refused with one code and one message
-//!   whatever the value's shape, and the create stores nothing. The rows differ in the
-//!   shape of the unresolvable value.
+//! * A `VpcId` this surface CANNOT RESOLVE is refused with the half of EC2's id rule that
+//!   value is due — a value that is no VPC id at all before any lookup, a readable id the
+//!   account holds no VPC for after it — and the create stores nothing. The rows differ in
+//!   the shape of the unresolvable value.
 
 use std::time::Duration;
 
@@ -28,7 +29,7 @@ use ec2::ops::types::Tag;
 use ec2::state::{
     CARRIER_GATEWAY_ID_PREFIX, CARRIER_GATEWAY_STATE_AVAILABLE, CARRIER_GATEWAY_STATE_PENDING,
     CarrierGatewaySpec, ComAmazonawsEc2Amazonec2State as Ec2State,
-    IDEMPOTENT_PARAMETER_MISMATCH, INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED,
+    IDEMPOTENT_PARAMETER_MISMATCH, INVALID_VPC_ID_MALFORMED, INVALID_VPC_ID_NOT_FOUND,
     MAX_CLIENT_TOKEN_CHARS, TRANSITION_DELAY,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
@@ -652,13 +653,13 @@ async fn a_create_that_cannot_be_honoured_is_refused_and_stores_nothing() {
     let cases: Vec<RefusalCase> = vec![
         (
             "a VPC the account does not have",
-            vec![param("VpcId", "vpc-0ffffffffffffffff")],
-            INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED,
+            vec![param("VpcId", "vpc-0fffffff")],
+            INVALID_VPC_ID_NOT_FOUND,
         ),
         (
             "a malformed VPC id",
             vec![param("VpcId", "not-a-vpc")],
-            INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED,
+            INVALID_VPC_ID_MALFORMED,
         ),
         (
             "a tag specification for another resource type",
@@ -718,30 +719,60 @@ async fn a_create_that_cannot_be_honoured_is_refused_and_stores_nothing() {
     );
 }
 
-/// Every `VpcId` this surface cannot resolve gets the SAME refusal, whatever the value's
-/// shape: `InvalidVpcId.Malformed`, naming the value the request sent. The rows differ in
-/// the shape of the unresolvable value — the 17-digit form the mint issues, the 8-digit
-/// short form, a prefix with no digits, another resource's id, and a value that is no id at
-/// all — so the rule cannot be read as a check on the id's syntax.
+/// Every `VpcId` this surface cannot resolve gets the half of EC2's id rule that value is
+/// due: a value the service cannot READ as a VPC id is `InvalidVpcID.Malformed` before any
+/// lookup, and a readable id the account holds no VPC for is `InvalidVpcID.NotFound`. The
+/// rows differ in the shape of the unresolvable value — the 17-digit form the mint issues
+/// but never handed out, the 8-digit short form, a prefix with no digits, another resource's
+/// id, and a value that is no id at all — so the verdict follows the value rather than one
+/// fixed answer.
 #[tokio::test]
-async fn a_vpc_id_this_surface_cannot_resolve_is_refused_as_malformed() {
+async fn a_vpc_id_this_surface_cannot_resolve_is_refused_with_the_verdict_it_is_due() {
     let (router, engine) = super::ec2_query::emulator();
     // One VPC the account DOES hold, so the table's refusals are about the id each row
     // sends rather than about an account with no VPC at all.
     let held = create_vpc(&router, "10.9.0.0/16").await;
 
-    let cases: Vec<(&str, String)> = vec![
-        ("the long form", "vpc-0ffffffffffffffff".to_string()),
-        ("the short form", "vpc-0fffffff".to_string()),
-        ("a prefix with no digits", "vpc-".to_string()),
-        ("another resource's id", "subnet-0ffffffffffffffff".to_string()),
-        ("no id at all", "not-a-vpc".to_string()),
-        // The held VPC's id with one digit changed: the account holds a VPC, just not this
-        // one.
-        ("a near miss of a held id", format!("{held}0")),
+    // (what the row probes, the value, the verdict it is due)
+    let cases: Vec<(&str, String, &str)> = vec![
+        // EC2's long id form is an obfuscated identifier: one the service never issued
+        // cannot be decoded, so it is no VPC id at all.
+        (
+            "a long-form identifier the mint never issued",
+            "vpc-0ffffffffffffffff".to_string(),
+            INVALID_VPC_ID_MALFORMED,
+        ),
+        // The retired short form carries no identifier to decode, so it is looked up.
+        (
+            "the short form, nothing created under it",
+            "vpc-0fffffff".to_string(),
+            INVALID_VPC_ID_NOT_FOUND,
+        ),
+        (
+            "a prefix with no digits",
+            "vpc-".to_string(),
+            INVALID_VPC_ID_MALFORMED,
+        ),
+        (
+            "another resource's id",
+            "subnet-0ffffffffffffffff".to_string(),
+            INVALID_VPC_ID_MALFORMED,
+        ),
+        (
+            "no id at all",
+            "not-a-vpc".to_string(),
+            INVALID_VPC_ID_MALFORMED,
+        ),
+        // The held VPC's id with one digit appended: a digit count outside both published
+        // forms, so it is no VPC id however close it reads.
+        (
+            "a near miss of a held id",
+            format!("{held}0"),
+            INVALID_VPC_ID_MALFORMED,
+        ),
     ];
 
-    for (case, vpc_id) in &cases {
+    for (case, vpc_id, expected_code) in &cases {
         let (status, body) = create(&router, &[param("VpcId", vpc_id)]).await;
         assert_eq!(
             status, 400,
@@ -749,13 +780,18 @@ async fn a_vpc_id_this_surface_cannot_resolve_is_refused_as_malformed() {
         );
         assert_eq!(
             error_code(&body),
-            INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED,
-            "case {case:?}: expected {INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED}, got {body}"
+            *expected_code,
+            "case {case:?}: expected {expected_code}, got {body}"
         );
+        let expected_message = if *expected_code == INVALID_VPC_ID_MALFORMED {
+            format!("The vpc ID '{vpc_id}' is malformed")
+        } else {
+            format!("The vpc ID '{vpc_id}' does not exist")
+        };
         assert_eq!(
             error_message(&body),
-            format!("The vpc ID '{vpc_id}' is malformed"),
-            "case {case:?}: unexpected message in {body}"
+            expected_message,
+            "case {case:?}: expected {expected_message:?}, got body {body}"
         );
         assert!(
             engine

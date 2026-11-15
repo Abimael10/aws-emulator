@@ -9,10 +9,12 @@
 //! code a refusal carries, each asserted over a table of inputs rather than over one
 //! recorded call:
 //!
-//! 1. AN ID OUTSIDE THE FORM EC2 ISSUES IS A BAD ID, NOT A MISSING RESOURCE. A volume id is
-//!    `vol-` plus 8 or 17 lowercase hexadecimal digits; anything outside that form is
-//!    refused before any lookup, and only a well-formed id the account holds no volume for
-//!    is `InvalidVolume.NotFound`.
+//! 1. AN ID THIS SERVICE CANNOT READ IS A BAD ID, NOT A MISSING RESOURCE. A volume id is
+//!    `vol-` plus 8 or 17 lowercase hexadecimal digits, and the long form is an obfuscated
+//!    identifier the service decodes before it resolves anything; anything outside that —
+//!    including a long-form identifier the mint never handed out — is refused before any
+//!    lookup, and only an id it can read that the account holds no volume for is
+//!    `InvalidVolume.NotFound`.
 //! 2. WHICH bad-id code is a fact of the OPERATION, not of the id: one that resolves the
 //!    single volume it acts on (`CopyVolumes`) answers the resource-level
 //!    `InvalidVolumeID.Malformed`, while one whose id LIST is validated as a request
@@ -60,17 +62,19 @@ const PARAMETER_VALUE: &str = "InvalidParameterValue";
 
 /// The volume ids the table below is written against.
 ///
-/// The first two rows are ids of the form EC2 issues — the long and the short one — so they
-/// are resolved and found missing. Every other row is outside that form, along a different
-/// way of being outside it: a suffix of neither published length, a non-hexadecimal digit,
-/// an upper-case digit, another resource's prefix and no prefix at all.
+/// The first row is a long-form id whose obfuscated identifier the mint never handed out,
+/// so there is nothing to decode and it is refused on its form; the second is the retired
+/// SHORT form, which carries no identifier to decode and so is resolved and found missing.
+/// Every other row is outside the printed form, along a different way of being outside it: a
+/// suffix of neither published length, a non-hexadecimal digit, an upper-case digit, another
+/// resource's prefix and no prefix at all.
 fn volume_id_cases() -> Vec<VolumeIdCase> {
     vec![
         (
-            "a long id nothing was created for",
+            "a long id whose identifier the mint never handed out",
             "vol-04fd27e9e8a1b2c3d",
-            NOT_FOUND,
-            NOT_FOUND,
+            MALFORMED,
+            PARAMETER_VALUE,
         ),
         (
             "a short id nothing was created for",

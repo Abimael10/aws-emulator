@@ -70,15 +70,15 @@ fn unknown_id(prefix: &str) -> String {
     format!("{prefix}-{UNKNOWN_SUFFIX}")
 }
 
-/// A VOLUME id inside the form EC2 ISSUES that no volume of this store has.
+/// A VOLUME id this service can READ that no volume of this store has.
 ///
-/// A volume id is read against the issued form rather than the printed one
-/// (`ec2::state::volume_id_is_well_formed`): the long form carries 68 digits' worth of a
-/// 64-bit identifier, so an issued id reads `vol-0…` and is never the all-zero placeholder
-/// [`UNKNOWN_SUFFIX`] is. So this names a volume the account does not hold, where that
-/// placeholder would be a value EC2 cannot read at all.
+/// A volume id is read against the issued form plus the DECODE of a long-form identifier
+/// (`ec2::state::volume_id_is_readable`): the long form is an obfuscated identifier, so one
+/// the mint never handed out is a value EC2 cannot read at all, as the all-zero placeholder
+/// [`UNKNOWN_SUFFIX`] is. The retired SHORT form carries no identifier to decode, so it
+/// names a volume the account does not hold.
 fn unknown_volume_id() -> String {
-    format!("{}-00000000000000999", ec2::state::VOLUME_ID_PREFIX)
+    format!("{}-00000999", ec2::state::VOLUME_ID_PREFIX)
 }
 
 /// The Elastic IP allocation id prefix. Spelled out rather than taken from `ec2::state`,

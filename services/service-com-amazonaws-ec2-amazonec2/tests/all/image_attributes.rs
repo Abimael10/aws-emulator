@@ -559,9 +559,9 @@ async fn refuses_what_it_cannot_report() {
 
     // Rows: (case, image id, attribute, extra members, status, code, message). The image
     // ids span the forms a caller sends: a value that is not an AMI id at all, the long
-    // 17-hexadecimal-digit form the service issues, the short 8-digit form, and a
-    // well-formed id naming another account's private image — each of which this operation
-    // answers with the one refusal it gives an id it cannot resolve.
+    // 17-hexadecimal-digit form whose identifier the mint never handed out, the short 8-digit
+    // form, and a well-formed id naming another account's private image — the FORM question
+    // this operation asks first separating the first two from the last two, which it looks up.
     let partner_private = images.partner_private.clone();
     let unresolvable = |case: &'static str, image_id: &str, attribute: &'static str| Refusal {
         case,
@@ -572,6 +572,15 @@ async fn refuses_what_it_cannot_report() {
         code: "InvalidAMIID.Malformed",
         message: format!("The image ID '{image_id}' is malformed"),
     };
+    let absent = |case: &'static str, image_id: &str, attribute: &'static str| Refusal {
+        case,
+        image_id: image_id.to_string(),
+        attribute,
+        extra: Vec::new(),
+        status: 400,
+        code: "InvalidAMIID.NotFound",
+        message: format!("The image id '[{image_id}]' does not exist"),
+    };
     let cases: Vec<Refusal> = vec![
         unresolvable(
             "a value that is not an AMI id at all",
@@ -579,16 +588,16 @@ async fn refuses_what_it_cannot_report() {
             "description",
         ),
         unresolvable(
-            "a long-form AMI id that names no image",
+            "a long-form AMI id whose identifier the mint never handed out",
             "ami-0123456789abcdef0",
             "launchPermission",
         ),
-        unresolvable(
+        absent(
             "a short-form AMI id that names no image",
             "ami-0abc1234",
             "productCodes",
         ),
-        unresolvable(
+        absent(
             "another account's private image",
             &partner_private,
             "description",

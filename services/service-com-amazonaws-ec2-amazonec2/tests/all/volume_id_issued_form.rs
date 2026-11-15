@@ -6,24 +6,28 @@
 //! (README.md / OPERATIONS.md "Wire protocol").
 //!
 //! The rule under test is the SPLIT between the two refusal classes: EC2 validates a volume
-//! id against the form it ISSUES before it looks anything up, so a value outside that form is
+//! id against what it can READ before it looks anything up, so a value it cannot read is
 //! `InvalidVolumeID.Malformed` (the id-level class, worded `The volume ID '<the value sent>'
 //! is malformed` — the sentence AWS words this id kind's unreadable values with), and only a
-//! value INSIDE it that names no volume of the account is `InvalidVolume.NotFound`. The two
+//! value it CAN read that names no volume of the account is `InvalidVolume.NotFound`. The two
 //! mean different things to a caller: the first is a permanent input bug, the second a
 //! resource that may yet appear — so a client that retries on not-found spins forever on an
 //! id EC2 could never have issued.
 //!
-//! The issued form is the two forms EC2 has published — 8 or 17 lowercase hexadecimal digits
-//! — with the long one led by `0` (it carries 68 digits' worth of a 64-bit identifier) and
-//! never the all-zero placeholder no mint can reach
-//! (`ec2::state::volume_id_is_well_formed`). The table below therefore spans that class
-//! rather than one recorded id: each way a value can fall outside the form (a leading digit
+//! What it can read is the two forms EC2 has published — 8 or 17 lowercase hexadecimal digits
+//! — with the long one led by `0` (it carries 68 digits' worth of a 64-bit identifier),
+//! never the all-zero placeholder no mint can reach, and, because the long form is an
+//! OBFUSCATED identifier the service decodes before it resolves anything, never a long-form
+//! identifier this service's mint has not reached
+//! (`ec2::state::volume_id_is_readable`). The table below therefore spans that class
+//! rather than one recorded id: each way a value can fall outside it (a leading digit
 //! above zero, every digit above zero, the placeholder, a non-hexadecimal digit, a digit
-//! count between the two forms, another resource kind's prefix, upper case) beside each way
-//! it can fall inside it and still name nothing (both published forms) — and the volume the
-//! account really holds, so every row is about the id it names rather than about an empty
-//! store.
+//! count between the two forms, another resource kind's prefix, upper case, a long-form
+//! identifier the mint never handed out) beside the way it can fall inside it and still name
+//! nothing (the retired short form) — and the volume the account really holds, so every row
+//! is about the id it names rather than about an empty store. The not-found half for an id
+//! the mint DID hand out is asserted in [`super::id_screening_verdicts`], which drives a
+//! created-then-deleted volume through it.
 //!
 //! Every row is asked of SEVERAL operations, because the reading belongs to the service and
 //! not to one handler: `ModifyVolumeAttribute`, `DescribeVolumeAttribute` and
@@ -169,9 +173,9 @@ fn rows(held: &str) -> Vec<Row> {
             Class::Malformed,
         ),
         owned(
-            "an id inside the issued long form nothing was created for",
+            "a long-form identifier the mint never handed out, so there is nothing to decode",
             "vol-00000000000000999".to_string(),
-            Class::NotFound,
+            Class::Malformed,
         ),
         owned(
             "an id inside the retired short form nothing was created for",
@@ -186,10 +190,10 @@ fn rows(held: &str) -> Vec<Row> {
     ]
 }
 
-/// RULE: `ModifyVolumeAttribute` reads its `VolumeId` against the form EC2 ISSUES before any
-/// lookup — a value outside it is `InvalidVolumeID.Malformed` with the id-level sentence
-/// naming the value as sent, a value inside it naming nothing is `InvalidVolume.NotFound`,
-/// and the volume the account holds is modified.
+/// RULE: `ModifyVolumeAttribute` reads its `VolumeId` against what this service can READ
+/// before any lookup — a value it cannot read is `InvalidVolumeID.Malformed` with the
+/// id-level sentence naming the value as sent, a value it can read that names nothing is
+/// `InvalidVolume.NotFound`, and the volume the account holds is modified.
 #[tokio::test]
 async fn modify_volume_attribute_splits_the_two_volume_id_refusal_classes() {
     let (router, _engine) = super::ec2_query::emulator();

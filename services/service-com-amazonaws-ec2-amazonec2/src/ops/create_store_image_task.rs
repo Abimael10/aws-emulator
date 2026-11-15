@@ -9,13 +9,15 @@
 //! cannot describe one task differently. The object key the response names is derived from
 //! the AMI's id and read back out of the store.
 //!
-//! The AMI is resolved by THIS operation's own validator, EC2's strict one: an image id it
-//! cannot resolve to an image the calling account can see is answered
-//! `InvalidAMIID.Malformed` whether or not the value reads like the long `ami-` id form
-//! ([`crate::state::require_resolvable_image`]), which is what the recorded unit
-//! `ec2-image-store-restore-error-paths#task#1` pins for this operation — the same answer
-//! `DescribeImageAttribute` gives, and not the malformed-before-not-found split the
-//! describes of the account's images keep.
+//! The AMI is resolved by THIS operation's own validator, which asks the FORM question
+//! before the EXISTENCE one ([`crate::state::require_resolvable_image`]): a value this
+//! service cannot READ as an AMI id — a long-form value whose obfuscated identifier it never
+//! issued included — is `InvalidAMIID.Malformed` in this validator's own wording, which is
+//! what the recorded unit `ec2-image-store-restore-error-paths#task#1` pins for this
+//! operation, while a readable id the account can see no image for is
+//! `InvalidAMIID.NotFound`, which is what the recorded unit
+//! `ec2-image-tasks-and-usage-report-invalid-input-errors#task#3` pins for a short-form one.
+//! `DescribeImageAttribute` resolves its `ImageId` through the same validator.
 //!
 //! The same storage-location rule `CreateRestoreImageTask` keeps applies first: a bucket name
 //! outside Amazon S3's published naming rules names no bucket at all
@@ -199,13 +201,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_transitions();
 
         // "The ID of the AMI" (`ImageId`): an AMI has to be there to be stored, and this
-        // operation's validator is EC2's STRICT one — every id it cannot resolve to an image
-        // this account can see is `InvalidAMIID.Malformed`, whether or not the value reads
-        // like the long `ami-` id form ([`crate::state::require_resolvable_image`], which
-        // records why the malformed-before-not-found
-        // [`crate::state::require_visible_image`] is not what answers here). The image it
-        // hands back is dropped: no member of this response is a fact of the AMI — the task's
-        // object key is derived from its id — so the id is all this operation reads of it.
+        // operation's validator asks the FORM question before the EXISTENCE one in this
+        // validator's own wording — a value this service cannot READ as an AMI id is
+        // `InvalidAMIID.Malformed` before any image is looked up, and a readable id the
+        // account can see no image for is `InvalidAMIID.NotFound`
+        // ([`crate::state::require_resolvable_image`], where both halves are worded). The
+        // image it hands back is dropped: no member of this response is a fact of the AMI —
+        // the task's object key is derived from its id — so the id is all this operation
+        // reads of it.
         require_resolvable_image(&store, &input.image_id)?;
 
         // A count ceiling is not a memory bound on its own: the bucket name is

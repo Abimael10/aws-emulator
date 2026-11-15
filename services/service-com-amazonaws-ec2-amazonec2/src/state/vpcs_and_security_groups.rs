@@ -269,7 +269,7 @@ impl ComAmazonawsEc2Amazonec2State {
         region: &str,
         tags: Vec<Tag>,
     ) -> String {
-        let vpc_id = self.next_id("vpc");
+        let vpc_id = self.next_id(VPC_ID_PREFIX);
         let association_id = self.next_id("vpc-cidr-assoc");
         let dhcp_options_id = self.default_dhcp_options_id(region);
         let vpc = Vpc {

@@ -97,8 +97,8 @@
 use super::types::*;
 use crate::state::{
     ComAmazonawsEc2Amazonec2State, account_can_see_image, dry_run_operation, image_creation_time,
-    image_id_is_well_formed, image_is_visible, invalid_ami_id_not_found, require_service_state,
-    unresolvable_image_id,
+    image_id_is_readable, image_id_is_well_formed, image_is_visible, invalid_ami_id_not_found,
+    require_service_state, unresolvable_image_id,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -198,6 +198,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         if !account_can_see_image(&store, &input.image_id) {
+            // The rest of the FORM question, which only the store can answer: EC2 decodes a
+            // long-form id before it resolves anything, and the identifiers this service
+            // ever issued are the ones its mint has counted
+            // ([`crate::state::image_id_is_readable`]), so a value it could never have
+            // issued is no AMI id at all rather than an image the account cannot see.
+            if !image_id_is_readable(&store, &input.image_id) {
+                return Err(unresolvable_image_id(&input.image_id));
+            }
             return Err(invalid_ami_id_not_found(&input.image_id));
         }
 

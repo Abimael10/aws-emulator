@@ -2694,17 +2694,22 @@ pub fn carrier_gateway_limit_exceeded<E>(message: impl Into<String>) -> Scaffold
     Scaffolded::service_error(CARRIER_GATEWAY_LIMIT_EXCEEDED, 400, message)
 }
 
-/// `InvalidVpcId.Malformed` (HTTP 400): the carrier gateway surface's refusal of a `VpcId`
-/// it cannot resolve.
+/// `InvalidVpcId.Malformed` (HTTP 400): the ONE code the surfaces that answer a single
+/// refusal for every `VpcId` they cannot resolve carry, whatever the value's shape.
 ///
 /// The code is spelled `Id` rather than `ID` and says `Malformed` rather than `NotFound`,
 /// which is a DIVERGENCE from [`INVALID_VPC_ID_NOT_FOUND`], the code the rest of this
-/// crate answers for a VPC id the account holds no VPC for. It is what a recorded
-/// `CreateCarrierGateway` refusal carries: that surface asks one question of the member —
-/// does it name a VPC this account has a carrier gateway to attach to — and answers the
-/// one code whatever the value's shape, so a well-formed id with no VPC behind it is
-/// refused exactly as a value that is no id at all is.
-pub const INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED: &str = "InvalidVpcId.Malformed";
+/// crate answers for a VPC id the account holds no VPC for. It is what the recorded
+/// `GetSecurityGroupsForVpc` refusal carries for a WELL-FORMED VPC id the account holds no
+/// VPC for: that surface asks one question of the member — does it name a VPC this account
+/// has — and answers the one code whatever the value's shape. A surface recorded DRAWING
+/// the malformed/not-found distinction answers [`INVALID_VPC_ID_MALFORMED`] and
+/// [`INVALID_VPC_ID_NOT_FOUND`] instead ([`vpc_id_is_malformed`]).
+pub const INVALID_VPC_ID_MALFORMED_ONE_CODE: &str = "InvalidVpcId.Malformed";
+
+/// The id prefix a VPC is minted with, as every reading of a VPC id here spells it and as
+/// the model's own id pattern reads (`^vpc-([0-9a-f]{8}|[0-9a-f]{17})$`).
+pub const VPC_ID_PREFIX: &str = "vpc";
 
 /// The most characters of a refused `VpcId` its message repeats back.
 ///
@@ -2716,7 +2721,7 @@ pub const INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED: &str = "InvalidVpcId.Malform
 pub const MAX_ECHOED_VPC_ID_CHARS: usize = 128;
 
 /// Refuse a `VpcId` the surfaces recorded answering this refusal cannot resolve: HTTP 400
-/// [`INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED`] (`InvalidVpcId.Malformed`), with the sentence
+/// [`INVALID_VPC_ID_MALFORMED_ONE_CODE`] (`InvalidVpcId.Malformed`), with the sentence
 /// those recordings carry — `The vpc ID '<value>' is malformed`, built from the value the
 /// request sent and bounded by [`MAX_ECHOED_VPC_ID_CHARS`].
 ///
@@ -2725,31 +2730,70 @@ pub const MAX_ECHOED_VPC_ID_CHARS: usize = 128;
 /// surface asks ONE question of the member (does it name a VPC this account holds) and
 /// answers one code. It is NOT the code for every unresolvable `VpcId` of this service:
 /// WHICH refusal an operation answers is a fact of the operation, and the ones recorded
-/// answering `InvalidVpcID.NotFound` keep [`invalid_vpc_id_not_found`].
-///
-/// The ONE definition of this refusal, for both of its call sites —
-/// [`carrier_gateway_vpc_id_malformed`] is the same answer reached from the carrier gateway
-/// surface — so the two cannot word one unresolvable VPC id differently. It lives in this
-/// section because that surface is where the rule was first recorded.
+/// drawing the distinction keep [`vpc_id_is_malformed`] and [`invalid_vpc_id_not_found`].
 pub fn invalid_vpc_id_malformed<E>(vpc_id: &str) -> Scaffolded<E> {
     let echoed: String = vpc_id.chars().take(MAX_ECHOED_VPC_ID_CHARS).collect();
     Scaffolded::service_error(
-        INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED,
+        INVALID_VPC_ID_MALFORMED_ONE_CODE,
         400,
         format!("The vpc ID '{echoed}' is malformed"),
     )
 }
 
-/// Refuse a `CreateCarrierGateway` whose `VpcId` names no VPC of the account: HTTP 400
-/// [`INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED`], worded the way this surface words it —
-/// `The vpc ID '<id>' is malformed`, built from the id the request sent.
+/// Refuse a value a surface that DRAWS the malformed/not-found distinction cannot read as a
+/// VPC id at all: HTTP 400 [`INVALID_VPC_ID_MALFORMED`] — `InvalidVpcID.Malformed`, spelt
+/// `ID` the way its not-found half [`INVALID_VPC_ID_NOT_FOUND`] is — with the sentence EC2
+/// words a malformed VPC id with, `The vpc ID '<value>' is malformed`, built from the value
+/// the request sent and bounded by [`MAX_ECHOED_VPC_ID_CHARS`].
 ///
-/// The same refusal [`invalid_vpc_id_malformed`] answers, which is where it is worded: this
-/// surface reached the rule first, so the name is kept for its call site. The id it names is
-/// bounded there ([`MAX_ECHOED_VPC_ID_CHARS`], far above any id EC2 issues), so a value
-/// longer than that bound is named only as far as it.
-pub fn carrier_gateway_vpc_id_malformed<E>(vpc_id: &str) -> Scaffolded<E> {
-    invalid_vpc_id_malformed(vpc_id)
+/// The FORM half of the pair [`invalid_vpc_id_not_found`] is the existence half of, for a
+/// surface that asks the two questions in EC2's order — `CreateCarrierGateway` is recorded
+/// answering that not-found half for a well-formed VPC id the account holds no VPC for, so
+/// its refusal of a value that is no VPC id at all is this one. The surfaces recorded
+/// answering ONE code whatever the value's shape keep
+/// [`invalid_vpc_id_malformed`]'s `InvalidVpcId.Malformed` instead; the two sentences are
+/// identical, only the code's spelling differs, which is what those recordings carry.
+pub fn vpc_id_is_malformed<E>(vpc_id: &str) -> Scaffolded<E> {
+    let echoed: String = vpc_id.chars().take(MAX_ECHOED_VPC_ID_CHARS).collect();
+    Scaffolded::service_error(
+        INVALID_VPC_ID_MALFORMED,
+        400,
+        format!("The vpc ID '{echoed}' is malformed"),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether this service can READ `vpc_id` as a VPC id at all.
+    ///
+    /// The printed form the model publishes for one
+    /// (`^vpc-([0-9a-f]{8}|[0-9a-f]{17})$`, read through [`prefixed_id_is_well_formed`])
+    /// PLUS the decode EC2 makes of a long-form id before it resolves anything: a long-form
+    /// value whose obfuscated identifier this service never issued names no VPC it could
+    /// ever have held ([`Self::long_form_id_was_never_issued`], where that clause and its
+    /// reasoning live). The retired SHORT form carries no identifier to decode, so a
+    /// short-form id the account holds no VPC for is reported absent — which is what
+    /// `CreateCarrierGateway` is recorded answering for one.
+    pub fn vpc_id_is_readable(&self, vpc_id: &str) -> bool {
+        prefixed_id_is_well_formed(VPC_ID_PREFIX, vpc_id)
+            && !self.long_form_id_was_never_issued(vpc_id)
+    }
+}
+
+/// Refuse a `VpcId` a surface that draws the malformed/not-found distinction holds no VPC
+/// for: a value it cannot READ as a VPC id is [`vpc_id_is_malformed`], and a readable one is
+/// [`invalid_vpc_id_not_found`].
+///
+/// The ONE place that choice is made for a `VpcId`, so every surface that draws the
+/// distinction asks the two questions in the same order and words each half once.
+pub fn unresolvable_vpc_id<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    vpc_id: &str,
+) -> Scaffolded<E> {
+    if store.vpc_id_is_readable(vpc_id) {
+        invalid_vpc_id_not_found(vpc_id)
+    } else {
+        vpc_id_is_malformed(vpc_id)
+    }
 }
 
 impl ComAmazonawsEc2Amazonec2State {

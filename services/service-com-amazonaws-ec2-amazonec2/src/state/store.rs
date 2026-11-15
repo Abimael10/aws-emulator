@@ -889,7 +889,7 @@ pub const INVALID_VPC_ID_NOT_FOUND: &str = "InvalidVpcID.NotFound";
 ///
 /// A surface answers this one BEFORE it looks an id up, so a caller can tell "not an id of
 /// this kind" from "no such VPC" ([`require_well_formed_id`], the one place that ordering
-/// lives). [`INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED`] is the RECORDED EXCEPTION: the
+/// lives). [`INVALID_VPC_ID_MALFORMED_ONE_CODE`] is the RECORDED EXCEPTION: the
 /// surfaces recorded answering that spelling (`InvalidVpcId.Malformed`, with an `Id`) ask ONE
 /// question of the member and keep their own wording, so a surface that draws the
 /// malformed/not-found distinction reaches for this constant and the ones recorded otherwise

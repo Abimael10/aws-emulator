@@ -711,6 +711,33 @@ impl ComAmazonawsEc2Amazonec2State {
                 .and_then(|suffix| u64::from_str_radix(suffix, 16).ok())
                 .is_some_and(|named| named <= self.id_counter)
     }
+
+    /// Whether `id` carries a LONG-form identifier this service has issued to NOTHING —
+    /// a value it cannot decode back to any resource.
+    ///
+    /// EC2's long id form is an OBFUSCATED identifier rather than free text a caller may
+    /// compose: the service decodes it before it resolves anything, and a value it cannot
+    /// decode is no id of the kind the member names, however well the printed form reads.
+    /// The identifiers this store has handed out are the ones its mint has counted
+    /// ([`ComAmazonawsEc2Amazonec2State::next_id`], which writes
+    /// `<prefix>-{counter:017x}`), so an identifier ABOVE that counter was never issued to
+    /// anything and names no resource that could ever have existed — the
+    /// `0123456789abcdef0` shape documentation examples and hand-written probes reach for.
+    /// An identifier at or below it is one this service could have issued, so it is looked
+    /// up and reported absent if nothing holds it.
+    ///
+    /// The SHORT form carries no identifier to decode (EC2 reads it without unobfuscating,
+    /// which is why a short-form id naming nothing is reported absent rather than
+    /// unreadable), and neither does a value outside the printed long form, so this answers
+    /// `false` for both: it adds the decode clause to an id reader rather than replacing the
+    /// reader's own question about the printed form.
+    ///
+    /// The ONE definition of that clause, shared by every id kind whose screen asks it, the
+    /// way [`Self::id_was_issued`] is the one definition of the stricter question that also
+    /// holds the printed form to the issued long form.
+    pub fn long_form_id_was_never_issued(&self, id: &str) -> bool {
+        long_form_identifier(id).is_some_and(|identifier| identifier > u128::from(self.id_counter))
+    }
 }
 
 /// Whether `id` is a well-formed VPC ENDPOINT id, as opposed to an id of one of the two

@@ -302,7 +302,7 @@ impl ComAmazonawsEc2Amazonec2State {
 }
 
 /// Refuse a `VpcId` that is no VPC id at all on the surfaces that word it this way: HTTP 400
-/// [`INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED`] (`InvalidVpcId.Malformed`) with the sentence
+/// [`INVALID_VPC_ID_MALFORMED_ONE_CODE`] (`InvalidVpcId.Malformed`) with the sentence
 /// `<value> is not a valid VPC id`, built from the value the REQUEST sent and bounded by
 /// [`MAX_ECHOED_VPC_ID_CHARS`] the way every other echoed VPC id is.
 ///
@@ -316,7 +316,7 @@ impl ComAmazonawsEc2Amazonec2State {
 pub fn vpc_id_is_not_valid<E>(vpc_id: &str) -> Scaffolded<E> {
     let echoed: String = vpc_id.chars().take(MAX_ECHOED_VPC_ID_CHARS).collect();
     Scaffolded::service_error(
-        INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED,
+        INVALID_VPC_ID_MALFORMED_ONE_CODE,
         400,
         format!("{echoed} is not a valid VPC id"),
     )

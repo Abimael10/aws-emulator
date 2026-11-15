@@ -10,8 +10,8 @@
 //! alone, and a `CoipPoolId` that resolves to no pool of the account is refused — under
 //! `InvalidPoolID.NotFound` when the value is a well-formed pool id, under
 //! `InvalidParameterValue` when it reads as one but carries a digit count EC2 never mints,
-//! and under `InvalidPoolID.Malformed` when it is no pool id at all — rather than answered
-//! as a delete that did nothing.
+//! and under `InvalidIpv4PoolCoipId.Malformed` when it is no pool id at all — rather than
+//! answered as a delete that did nothing.
 //!
 //! Every table row is a distinct input along what that generalises over — which pool of the
 //! seeded set (so: how many address ranges, how many tags, which local gateway route table,
@@ -235,7 +235,8 @@ async fn deleting_the_same_pool_twice_refuses_the_second_call() {
 /// removed, and the CODE says HOW the value failed: a well-formed pool id nothing was
 /// created for is `InvalidPoolID.NotFound`, a value that READS as a pool id but carries a
 /// digit count EC2 never mints is `InvalidParameterValue`, and a value that is no pool id
-/// at all is `InvalidPoolID.Malformed`. The rows are each way a value can fail to resolve:
+/// at all is this surface's own `InvalidIpv4PoolCoipId.Malformed`, spelled from the id
+/// member's name. The rows are each way a value can fail to resolve:
 /// both published EC2 id suffix lengths with digits nothing was created for, then three
 /// hexadecimal suffixes of other lengths (one digit, between the two, far past the longer),
 /// an upper-case suffix, a non-hex suffix, another resource's id, free text, and the empty
@@ -244,7 +245,7 @@ async fn deleting_the_same_pool_twice_refuses_the_second_call() {
 async fn a_pool_id_that_resolves_to_no_pool_is_refused() {
     let prefix = ec2::state::COIP_POOL_ID_PREFIX;
     let bad_value = ec2::state::INVALID_PARAMETER_VALUE;
-    let malformed = ec2::state::INVALID_POOL_ID_MALFORMED;
+    let malformed = ec2::state::INVALID_IPV4_POOL_COIP_ID_MALFORMED;
     // The forms a pool id takes are `COIP_POOL_ID_PREFIX` plus 8 or 17 lowercase hex
     // digits, which `ec2::state::coip_pool_id_is_well_formed` is the one reader of.
     let cases = [
@@ -290,7 +291,10 @@ async fn a_pool_id_that_resolves_to_no_pool_is_refused() {
         // template this surface words a `CoipPoolId` it could not resolve with: the pool id
         // single-quoted, with that class's own verdict after it.
         let expected_message = if expected_code == malformed {
-            format!("The pool ID '{pool_id}' is invalid.")
+            format!(
+                "The {resource} ID '{pool_id}' is malformed",
+                resource = ec2::state::RESOURCE_TYPE_COIP_POOL
+            )
         } else {
             format!("The pool ID '{pool_id}' does not exist.")
         };

@@ -538,7 +538,13 @@ async fn refuses_what_it_cannot_report() {
         malformed("a value that is not an AMI id at all", "not-an-ami"),
         malformed("an id of another resource kind", "snap-0123456789abcdef0"),
         malformed("an AMI id whose suffix is not hexadecimal", "ami-zzzzzzzz"),
-        not_found("a long-form AMI id that names no image", UNKNOWN_IMAGE_ID),
+        // EC2's long id form is an obfuscated identifier: one this service never issued
+        // cannot be decoded, so it is no AMI id rather than an image that is missing.
+        malformed(
+            "a long-form AMI id whose identifier the mint never handed out",
+            UNKNOWN_IMAGE_ID,
+        ),
+        // The retired short form carries no identifier to decode, so it is looked up.
         not_found("a short-form AMI id that names no image", "ami-0abc1234"),
         not_found("another account's private image", &images.partner_private),
         Refusal {

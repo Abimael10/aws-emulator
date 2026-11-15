@@ -205,8 +205,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             TRANSITION_DELAY, VOLUME_ATTACHMENT_STATE_DETACHING, VolumeRecord,
             dry_run_operation, incorrect_state_of, instance_id_is_well_formed,
             invalid_attachment_not_found, invalid_volume_id_malformed,
-            invalid_volume_id_not_found, require_service_state, unsupported_operation,
-            volume_id_is_well_formed,
+            invalid_volume_id_not_found, require_readable_volume_id, require_service_state,
+            unsupported_operation, volume_id_is_well_formed,
         };
 
         // A volume carries its own Availability Zone, so nothing here depends on the Region
@@ -239,6 +239,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
         let now = ::std::time::Instant::now();
+
+        // The rest of the same FORM question, which only the store can answer: EC2 decodes a
+        // long-form id before it resolves anything, and the identifiers this service ever
+        // issued are the ones its mint has counted
+        // ([`crate::state::require_readable_volume_id`]), so a value it could never have
+        // issued is refused here rather than reported as a volume that is missing.
+        require_readable_volume_id(&store, &input.volume_id)?;
 
         let Some(record) = store.volumes.get_mut(&input.volume_id) else {
             return Err(invalid_volume_id_not_found(&input.volume_id));
