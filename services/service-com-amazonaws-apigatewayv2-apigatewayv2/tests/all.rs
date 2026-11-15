@@ -325,6 +325,8 @@ mod websocket_handshake_data_plane;
 mod websocket_lambda_routes;
 #[path = "all/websocket_stage_metrics.rs"]
 mod websocket_stage_metrics;
+#[path = "all/websocket_message_reassembly.rs"]
+mod websocket_message_reassembly;
 #[path = "all/websocket_message_refusals.rs"]
 mod websocket_message_refusals;
 #[path = "all/websocket_tls_transport.rs"]

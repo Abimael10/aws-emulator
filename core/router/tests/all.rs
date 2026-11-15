@@ -4860,3 +4860,12 @@ mod appended_notes;
 //! (`query_wire`, `eks_wire`, `cloudformation_stack_clock`) and some are empty probes;
 //! every file under `tests/all/` is declared, because a file no declaration names is
 //! compiled nowhere.
+//! Put a new suite at `tests/all/<name>.rs` and declare it below with one
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, keeping the list sorted: this file holds
+//! those pairs and nothing else, so a landing has one place to insert and nothing to keep
+//! consistent.
+//! A suite no `mod` names compiles nowhere and its tests never run; a suite left at the top
+//! level of `tests/` fails the build; and a suite declared twice is `E0428`, which fails every
+//! suite in this target. These header lines are the only place an inner doc comment (`//!`)
+//! may stand — past the first item one is `E0753` and compiles no suite of this target — so a
+//! note further down this file must be an ordinary `//` comment.
