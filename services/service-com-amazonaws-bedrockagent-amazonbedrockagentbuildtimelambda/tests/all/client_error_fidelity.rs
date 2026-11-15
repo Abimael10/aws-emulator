@@ -457,6 +457,13 @@ async fn ingestion_refuses_a_document_whose_type_is_not_the_data_sources_own_typ
     let knowledge_base_id = emulator
         .knowledge_base(vector_knowledge_base("fidelity-ingest-kb"))
         .await;
+    // The managed-connector kind of data source is the one a service-managed
+    // knowledge base supports, and the self-managed kinds are the ones a
+    // self-managed knowledge base supports, so each row is attached to the
+    // knowledge base whose own kind supports it.
+    let managed_knowledge_base_id = emulator
+        .knowledge_base(managed_knowledge_base("fidelity-ingest-managed-kb"))
+        .await;
 
     // Every value of the modelled `DataSourceType`
     // (`smithy_query(query="shape",shape="DataSourceType")`), each paired here
@@ -474,6 +481,11 @@ async fn ingestion_refuses_a_document_whose_type_is_not_the_data_sources_own_typ
     let content_types = ["CUSTOM", "S3"];
 
     for data_source_type in data_source_types {
+        let knowledge_base_id = if data_source_type == "MANAGED_KNOWLEDGE_BASE_CONNECTOR" {
+            managed_knowledge_base_id.clone()
+        } else {
+            knowledge_base_id.clone()
+        };
         let data_source_id = emulator
             .data_source(
                 &knowledge_base_id,

@@ -408,6 +408,21 @@ fn s3_data_source(name: &str, bucket: &str, data_deletion_policy: Option<&str>) 
     request
 }
 
+/// A `MANAGED_KNOWLEDGE_BASE_CONNECTOR` data source running the push-only
+/// `CUSTOM` connector: the kind of data source a service-managed knowledge base
+/// supports.
+fn managed_connector_data_source(name: &str) -> Value {
+    json!({
+        "name": name,
+        "dataSourceConfiguration": {
+            "type": "MANAGED_KNOWLEDGE_BASE_CONNECTOR",
+            "managedKnowledgeBaseConnectorConfiguration": {
+                "connectorParameters": { "type": "CUSTOM", "version": "1" },
+            },
+        },
+    })
+}
+
 /// A passthrough flow definition: an `Input` node wired straight to an `Output`
 /// node. The node types, the union keys and the IO data types are the modelled
 /// `FlowNodeType` / `FlowNodeConfiguration` / `FlowNodeIODataType` values.
@@ -557,7 +572,7 @@ async fn an_accepted_delete_makes_every_later_read_answer_the_modelled_not_found
     let managed_source = emulator
         .data_source_id(
             &managed_kb,
-            s3_data_source("delete-managed-source", "delete-slice-managed", None),
+            managed_connector_data_source("delete-managed-source"),
         )
         .await;
 

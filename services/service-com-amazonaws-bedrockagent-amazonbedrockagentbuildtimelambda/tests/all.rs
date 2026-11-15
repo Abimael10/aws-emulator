@@ -21,6 +21,8 @@ mod client_error_fidelity;
 mod data_source_lifecycle;
 #[path = "all/data_source_listing.rs"]
 mod data_source_listing;
+#[path = "all/data_source_preconditions.rs"]
+mod data_source_preconditions;
 #[path = "all/delete_removes_the_resource.rs"]
 mod delete_removes_the_resource;
 #[path = "all/document_delete_retires_the_document.rs"]

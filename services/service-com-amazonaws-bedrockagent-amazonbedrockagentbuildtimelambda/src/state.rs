@@ -1845,6 +1845,28 @@ impl DataSourceStatus {
             Self::Deleting => "DELETING",
         }
     }
+
+    /// Whether a data source in this status serves ingestion.
+    ///
+    /// The modelled `DataSource$status` documents exactly one value as the
+    /// status of a data source that "has been created and is ready for ingestion
+    /// into the knowledge base" — `AVAILABLE` — so in every other status the
+    /// data source is either not ready yet, being changed, failed or on its way
+    /// out, and nothing can be ingested from it.
+    pub fn serves_ingestion(self) -> bool {
+        matches!(self, Self::Available)
+    }
+}
+
+/// The `ConflictException` message a call that starts an ingestion job answers
+/// when the data source's own status does not serve ingestion: the data source's
+/// current `DataSourceStatus`, read from the stored record, fills the one
+/// variable part.
+pub fn ingestion_blocked_by_status_message(status: DataSourceStatus) -> String {
+    format!(
+        "You cannot start an ingestion job on a data source with status {}.",
+        status.as_wire()
+    )
 }
 
 /// The status a data source whose EFFECTIVE configuration is `configuration`
@@ -1865,6 +1887,37 @@ pub fn settled_data_source_status(configuration: &DataSourceConfiguration) -> Da
     } else {
         DataSourceStatus::Available
     }
+}
+
+/// Whether a knowledge base whose `knowledgeBaseConfiguration.type` is
+/// `knowledge_base_type` supports a data source whose
+/// `dataSourceConfiguration.type` is `data_source_type`.
+///
+/// The model splits `DataSourceConfiguration`'s connection members in two by the
+/// kind of knowledge base that runs them: the managed-connector configuration
+/// "connects a MANAGED knowledge base to a supported data source connector" and
+/// is the one to specify "when the data source type is
+/// MANAGED_KNOWLEDGE_BASE_CONNECTOR", while every sibling that carries its own
+/// connection details is documented as being for SELF-MANAGED knowledge bases,
+/// with managed knowledge bases directed to the managed-connector configuration
+/// instead
+/// (`smithy_query(query="shape",shape="DataSourceConfiguration")`). So a
+/// service-managed knowledge base supports the managed-connector kind and no
+/// other, and a self-managed one supports every other kind and not that one.
+pub fn knowledge_base_supports_data_source_type(
+    knowledge_base_type: &str,
+    data_source_type: &str,
+) -> bool {
+    (knowledge_base_type == MANAGED_KNOWLEDGE_BASE_TYPE)
+        == (data_source_type == MANAGED_CONNECTOR_DATA_SOURCE_TYPE)
+}
+
+/// The `ValidationException` message a call that stores a data source answers
+/// when the kind of data source it carries is not one the target knowledge
+/// base's kind supports: the knowledge base's own `KnowledgeBaseType`, read from
+/// the stored knowledge base, fills the one variable part.
+pub fn unsupported_data_source_type_message(knowledge_base_type: &str) -> String {
+    format!("Unsupported data source type for {knowledge_base_type} knowledge base type.")
 }
 
 /// One stored data source: the single source of truth for every data-source

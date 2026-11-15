@@ -234,6 +234,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let knowledge_base_type = knowledge_base.knowledge_base_configuration.r#type.clone();
 
+        // Which kinds of data source a knowledge base takes is decided by the
+        // knowledge base's OWN kind: the connector configurations are split
+        // between the one a service-managed knowledge base runs and the ones a
+        // self-managed knowledge base carries itself. A request naming a kind
+        // the target knowledge base does not support is a bad request, and the
+        // refusal names the knowledge base's kind rather than the data source's.
+        if !crate::state::knowledge_base_supports_data_source_type(
+            &knowledge_base_type,
+            &data_source_configuration.r#type,
+        ) {
+            return Err(CreateDataSourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::unsupported_data_source_type_message(
+                        &knowledge_base_type,
+                    )),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
         // `clientToken` is an @idempotencyToken: a repeat of the same request
         // returns the data source it already created rather than attaching a
         // second one.

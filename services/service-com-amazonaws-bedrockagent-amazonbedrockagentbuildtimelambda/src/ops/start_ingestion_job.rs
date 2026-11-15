@@ -224,6 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             };
             let data_source_configuration = data_source.data_source_configuration.clone();
+            let data_source_status = data_source.status;
 
             // `clientToken` is an @idempotencyToken: a repeat of the same
             // request returns the job it already started rather than starting a
@@ -244,6 +245,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Ok(StartIngestionJobOutput {
                     ingestion_job: existing.to_ingestion_job(),
                 });
+            }
+
+            // A data source serves ingestion only in the one status the model
+            // documents as ready for it: in any other it is not ready yet,
+            // being changed or failed, so a job over it would ingest nothing
+            // and the conflict this operation models is what the caller gets —
+            // naming the status the data source is actually in. Checked AFTER
+            // the idempotency replay above, so a retry of a start that was
+            // accepted while the data source was ready is still served.
+            if !data_source_status.serves_ingestion() {
+                return Err(StartIngestionJobErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(crate::state::ingestion_blocked_by_status_message(
+                            data_source_status,
+                        )),
+                    },
+                )
+                .into());
             }
 
             // A data source is ingested by one job at a time: while a job of

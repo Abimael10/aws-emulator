@@ -2450,3 +2450,15 @@ mod declaration_roots_are_canonical_and_complete;
 // build.
 // test it explains and cannot collide with a concurrent landing. A note about this file
 // itself belongs in `all/appended_notes.rs`.
+//! This file is a CANONICAL DECLARATION LIST: it holds this header and then one
+//! line. Put a new suite at `tests/all/<name>.rs` and insert its pair in sorted position.
+//! Three rules it lives by, each pinned by a suite of its own
+//! * an inner doc comment (`//!`) is legal only BEFORE the first item, so this header is the
+//!   only place one may stand; past the first declaration `//!` is `E0753` and compiles no
+//!   suite of this target;
+//!   `tests/` — which the layout check refuses. The `#[path]` is what points each declaration
+//!   into `tests/all/`.
+//! So what goes below is a declaration, never a note about one: what a suite covers, and why
+//! it belongs to this cross-service target rather than to one service crate's own, is stated
+//! in that suite's own module doc, where it is read beside the test it describes, and the
+//! notes successive landings had appended to this list live in `all/appended_notes.rs`.

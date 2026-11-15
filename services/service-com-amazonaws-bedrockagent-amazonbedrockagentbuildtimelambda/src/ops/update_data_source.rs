@@ -224,6 +224,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let knowledge_base_type = knowledge_base.knowledge_base_configuration.r#type.clone();
 
+        // The same cross-check `CreateDataSource` applies to the same member: a
+        // kind of data source the target knowledge base's own kind does not
+        // support cannot be stored for it by an update either.
+        if !crate::state::knowledge_base_supports_data_source_type(
+            &knowledge_base_type,
+            &data_source_configuration.r#type,
+        ) {
+            return Err(UpdateDataSourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::unsupported_data_source_type_message(
+                        &knowledge_base_type,
+                    )),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
         // A data source is identified by the knowledge base it belongs to as well
         // as its own id, so an id of another knowledge base's data source is as
         // absent here as one nothing holds — and so is one a delete has already
