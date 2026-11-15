@@ -22,7 +22,6 @@
 //! service crate's `tests/all.rs`, so check there rather than leaving a note here.
 //! Single integration-test target for the router: one `#[path = "all/<name>.rs"]` /
 //! `mod <name>;` pair per suite, sorted by name, and no other line.
-//!
 //! A suite no `mod` here names compiles nowhere and its tests never run; a suite left at the
 //! top level of `tests/` fails the build; and a suite declared twice is `E0428`, which fails
 //! every suite in this target. An inner doc comment (`//!`) is legal only BEFORE the first
@@ -1245,7 +1244,6 @@ mod zz_probe_whole_emulator;
 //! declaration list, and the rules stand here. A note about a landing belongs in the suite
 //! it is about, where it is read with the test it explains (`all/appended_notes.rs` keeps
 //! the ones this file had collected).
-//! `all/all_rs_declares_each_suite_once.rs`,
 //! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
 //! `all/all_rs_is_a_canonical_declaration_list.rs` check all three halves of that, for this
 //! file and for every service crate's `tests/all.rs`.
@@ -1272,7 +1270,6 @@ mod zz_probe_whole_emulator;
 //! The notes concurrent landings had appended to the tail of this file live in
 //! `all/appended_notes.rs`: appended as inner doc comments they were `E0753`, and they had
 //! grown this root past the project's file-length ceiling.
-//! Single integration-test target for the router: the declaration list, and nothing else.
 //! Put a new suite at `tests/all/<name>.rs` and add its `#[path = "all/<name>.rs"]` /
 //! `mod <name>;` pair below, in sorted position — one pair per suite and no other line,
 //! NOTHING after the last pair, so two branches landing at once insert two lines in two
@@ -1406,7 +1403,6 @@ mod zz_probe_whole_emulator;
 //! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of this
 //! file, which the layout check refuses: the `#[path]` is what points each module into
 //! `tests/all/`.
-//! Put a new suite at `tests/all/<name>.rs` and declare it below with a
 //! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted so the list stays sorted by
 //! name: one pair per suite and no other line, so two branches landing at once insert two
 //! lines in two places and have no prose to duplicate, re-word or mistype.
@@ -1611,7 +1607,6 @@ mod zz_probe_whole_emulator;
 //! ROOT, so a bare `mod` resolves to a SIBLING of this file, which the layout check
 //! refuses: the `#[path]` is what points the module into `tests/all/`.
 //! THIS BLOCK IS THE ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE: past
-//! the first item one is `E0753` and compiles no suite of this target. Below, add a
 //! declaration — not a note about one. `all/all_rs_declares_each_suite_once.rs` and
 //! for this file and for every service crate's `tests/all.rs`.
 //! this file and for every service crate's `tests/all.rs`, so check there rather than
@@ -1663,3 +1658,12 @@ mod zz_probe_whole_emulator;
 // test it explains. A note repeated here drifts from it, and notes appended here are
 // what grew this file past the project's file-length ceiling once already
 // (`all/appended_notes.rs` keeps the ones it had collected).
+//! The router's cross-service integration-test target: one declaration per suite.
+//! Put a new suite at `tests/all/<name>.rs` and insert its `#[path = "all/<name>.rs"]` /
+//! `mod <name>;` pair into the sorted list below. The list holds one pair per suite and no
+//! other line; what a suite covers belongs in that suite's own module header.
+//! The guard suites `all/all_rs_declares_each_suite_once.rs`,
+//! `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`
+//! check that, for this file and for every service crate's `tests/all.rs`.
+//! The `#[path]` is what points each declaration into `tests/all/`, and the build's layout
+//! check requires every file under `tests/all/` to be declared here.

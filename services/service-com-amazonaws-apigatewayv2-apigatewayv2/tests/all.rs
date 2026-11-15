@@ -123,6 +123,8 @@ mod http_api_jwt_scope_gate;
 mod http_api_lambda_invoke_permission;
 #[path = "all/http_api_payload_quota.rs"]
 mod http_api_payload_quota;
+#[path = "all/http_api_published_endpoint_authorized_cors.rs"]
+mod http_api_published_endpoint_authorized_cors;
 #[path = "all/http_api_published_endpoint_reporters.rs"]
 mod http_api_published_endpoint_reporters;
 #[path = "all/http_api_published_invoke_address.rs"]
