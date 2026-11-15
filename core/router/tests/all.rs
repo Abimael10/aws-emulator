@@ -1932,3 +1932,12 @@ mod cognito_user_pool_replica_over_a_multi_region_key;
 // An inner attribute, like a module doc comment, is legal only before the first item, so
 // An inner attribute is legal only before the first item of the file, which is why this one
 // stands here rather than among the declarations below.
+// EVERY comment in this file is an ordinary one, this header included. A doc comment for the
+// module is accepted only ahead of the first item, so one left below the list compiles no
+// suite of this target; with none anywhere in the file, no appended or merged copy of a line
+// of it can be one. A suite file no declaration names is compiled nowhere, and a name
+// declared twice compiles neither copy. `tests/all.rs` is a test-target CRATE ROOT, so a bare
+// `mod` would resolve to a sibling under `tests/`, which the layout check refuses: the
+// A header paragraph wraps without the indentation `clippy::doc_lazy_continuation` asks of a
+// doc list item, so the lint is allowed for the whole target here. An inner attribute is
+// legal only ahead of the first item, so it stands with this header.

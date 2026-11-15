@@ -165,6 +165,8 @@ mod tool_resource_statuses_and_name_conflicts;
 mod validation_message_rendering;
 #[path = "all/workload_identity_arn_region.rs"]
 mod workload_identity_arn_region;
+#[path = "all/workload_identity_delete_constraints.rs"]
+mod workload_identity_delete_constraints;
 #[path = "all/workload_identity_lifecycle.rs"]
 mod workload_identity_lifecycle;
 #[path = "all/workload_identity_mutation.rs"]
