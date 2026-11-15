@@ -66,13 +66,17 @@ const INACTIVE_MESSAGE: &str = "Token is inactive";
 /// This service beside the Amazon Cognito user pools service on ONE shared engine: the id
 /// token a login presents is minted by `cognito-idp`, and the user it stands for is that
 /// service's own record.
-struct Emulator {
+///
+/// `pub(crate)` so a sibling suite in this test target that needs the same three services on
+/// one engine — a login whose token `cognito-idp` really minted — drives them through this
+/// harness rather than a second copy of it.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -158,7 +162,7 @@ impl Emulator {
     }
 
     /// One call to THIS service (cognito-identity).
-    async fn identity(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn identity(&self, operation: &str, body: &Value) -> (u16, Value) {
         self.call(
             &format!("cognito-identity.{REGION}.amazonaws.com"),
             &format!("AWSCognitoIdentityService.{operation}"),
@@ -168,7 +172,7 @@ impl Emulator {
     }
 
     /// One call to this service that must succeed.
-    async fn identity_ok(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn identity_ok(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.identity(operation, body).await;
         assert_eq!(
             status, 200,
@@ -178,7 +182,7 @@ impl Emulator {
     }
 
     /// One call to the user pools service (cognito-idp) that must succeed.
-    async fn user_pools_ok(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn user_pools_ok(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self
             .call(
                 &format!("cognito-idp.{REGION}.amazonaws.com"),
@@ -245,17 +249,29 @@ impl Emulator {
 
 /// A user pool with one app client, as the fixture of every row: the provider name an
 /// identity pool fronts it by, and the app client its tokens are issued for.
-struct UserPool {
-    provider_name: String,
-    user_pool_id: String,
-    client_id: String,
+pub(crate) struct UserPool {
+    pub(crate) provider_name: String,
+    pub(crate) user_pool_id: String,
+    pub(crate) client_id: String,
 }
 
 /// Create a user pool and an app client that serves the administrative password sign-in.
-async fn user_pool(emulator: &Emulator, name: &str) -> UserPool {
-    let created = emulator
-        .user_pools_ok("CreateUserPool", &json!({"PoolName": name}))
-        .await;
+pub(crate) async fn user_pool(emulator: &Emulator, name: &str) -> UserPool {
+    user_pool_with_schema(emulator, name, Vec::new()).await
+}
+
+/// The same fixture, with `schema` declared as the pool's `Schema` — the custom attributes a
+/// user of it may hold, which its identity tokens then claim under the `custom:` prefix.
+pub(crate) async fn user_pool_with_schema(
+    emulator: &Emulator,
+    name: &str,
+    schema: Vec<Value>,
+) -> UserPool {
+    let mut request = json!({"PoolName": name});
+    if let (false, Some(members)) = (schema.is_empty(), request.as_object_mut()) {
+        members.insert("Schema".to_string(), json!(schema));
+    }
+    let created = emulator.user_pools_ok("CreateUserPool", &request).await;
     let user_pool_id = created["UserPool"]["Id"]
         .as_str()
         .unwrap_or_else(|| panic!("CreateUserPool answers the pool's Id: {created}"))
@@ -287,13 +303,33 @@ async fn user_pool(emulator: &Emulator, name: &str) -> UserPool {
 
 /// One confirmed user of `pool`, signed in: answers the ID TOKEN of that sign-in, the login
 /// a client then presents to an identity pool.
-async fn signed_in_user(emulator: &Emulator, pool: &UserPool, username: &str) -> String {
-    emulator
-        .user_pools_ok(
-            "AdminCreateUser",
-            &json!({"UserPoolId": &pool.user_pool_id, "Username": username}),
-        )
-        .await;
+pub(crate) async fn signed_in_user(
+    emulator: &Emulator,
+    pool: &UserPool,
+    username: &str,
+) -> String {
+    signed_in_user_with_attributes(emulator, pool, username, Vec::new()).await
+}
+
+/// The same user, created holding `attributes` — each a `{"Name", "Value"}` pair of the
+/// pool's schema — so the id token its sign-in mints claims them.
+pub(crate) async fn signed_in_user_with_attributes(
+    emulator: &Emulator,
+    pool: &UserPool,
+    username: &str,
+    attributes: Vec<Value>,
+) -> String {
+    let mut created = json!({"UserPoolId": &pool.user_pool_id, "Username": username});
+    if let (false, Some(members)) = (attributes.is_empty(), created.as_object_mut()) {
+        members.insert("UserAttributes".to_string(), json!(attributes));
+    }
+    emulator.user_pools_ok("AdminCreateUser", &created).await;
+    signed_in(emulator, pool, username).await
+}
+
+/// One administrative password sign-in of an EXISTING user of `pool`: answers the id token of
+/// that sign-in, so a suite can mint a second token for the same user.
+pub(crate) async fn signed_in(emulator: &Emulator, pool: &UserPool, username: &str) -> String {
     emulator
         .user_pools_ok(
             "AdminSetUserPassword",
@@ -323,7 +359,7 @@ async fn signed_in_user(emulator: &Emulator, pool: &UserPool, username: &str) ->
 }
 
 /// The `Logins` map presenting `id_token` under the user pool's provider name.
-fn logins(pool: &UserPool, id_token: &str) -> Value {
+pub(crate) fn logins(pool: &UserPool, id_token: &str) -> Value {
     json!({&pool.provider_name: id_token})
 }
 
@@ -910,4 +946,156 @@ async fn a_checked_pools_vend_follows_the_role_its_configuration_names() {
         body.get("Credentials").is_none(),
         "a refused vend carries no credential, got {body}"
     );
+}
+
+/// RULE, the SCOPE of the refusal: the check decides the TOKEN presented, so a login the
+/// integrated user pool no longer stands behind is refused the vend while everything the
+/// identity pool itself holds is left standing — `DescribeIdentity` still resolves the
+/// identity and still lists the provider among its `Logins`, the twin pool asking for no
+/// check still vends for the very same token, and a token a FRESH sign-in of the same user
+/// mints vends on the checked pool again.
+///
+/// The rows differ along what took the outstanding token's validity away, among the calls
+/// that leave the user able to sign in again: a global sign-out of every device, and a
+/// deactivation the caller has since reversed.
+#[tokio::test]
+async fn a_refused_login_leaves_the_identity_standing_and_a_fresh_token_vends_again() {
+    let emulator = Emulator::new();
+    let pool = user_pool(&emulator, "sstc-revocation").await;
+    let checked = emulator
+        .identity_pool(
+            "sstc-revocation-checked",
+            &pool.provider_name,
+            &pool.client_id,
+            Some(true),
+        )
+        .await;
+    let unchecked = emulator
+        .identity_pool(
+            "sstc-revocation-twin",
+            &pool.provider_name,
+            &pool.client_id,
+            Some(false),
+        )
+        .await;
+
+    let rows: [(&str, &[&str]); 2] = [
+        (
+            "the user signed out of every device",
+            &["AdminUserGlobalSignOut"],
+        ),
+        (
+            "the user deactivated and then reactivated",
+            &["AdminDisableUser", "AdminEnableUser"],
+        ),
+    ];
+
+    for (index, (case, calls)) in rows.iter().enumerate() {
+        // One user and one sign-in per row, so what a row does cannot reach another's token.
+        let username = format!("revoked-user-{index}");
+        let id_token = signed_in_user(&emulator, &pool, &username).await;
+        let presented = logins(&pool, &id_token);
+
+        let mut identities: Vec<(&str, String)> = Vec::new();
+        for (pool_kind, identity_pool_id) in [("checked", &checked), ("unchecked", &unchecked)] {
+            let got = emulator
+                .identity_ok(
+                    "GetId",
+                    &json!({"IdentityPoolId": identity_pool_id, "Logins": &presented}),
+                )
+                .await;
+            let identity_id = got["IdentityId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: GetId answers an IdentityId: {got}"))
+                .to_string();
+            let (status, body) = emulator
+                .identity(
+                    "GetCredentialsForIdentity",
+                    &json!({"IdentityId": &identity_id, "Logins": &presented}),
+                )
+                .await;
+            assert_vended(case, pool_kind, &identity_id, status, &body);
+            identities.push((pool_kind, identity_id));
+        }
+
+        for operation in *calls {
+            emulator
+                .user_pools_ok(
+                    operation,
+                    &json!({"UserPoolId": &pool.user_pool_id, "Username": &username}),
+                )
+                .await;
+        }
+
+        let checked_identity = identities
+            .iter()
+            .find_map(|(kind, identity_id)| (*kind == "checked").then_some(identity_id.clone()))
+            .expect("the checked pool minted an identity");
+        let unchecked_identity = identities
+            .iter()
+            .find_map(|(kind, identity_id)| (*kind == "unchecked").then_some(identity_id.clone()))
+            .expect("the unchecked pool minted an identity");
+
+        let (status, body) = emulator
+            .identity(
+                "GetCredentialsForIdentity",
+                &json!({"IdentityId": &checked_identity, "Logins": &presented}),
+            )
+            .await;
+        assert_refused_inactive(case, "the checked pool's vend", status, &body);
+
+        // The refusal is a refusal to VEND: the identity and the login linked to it are the
+        // identity pool's own records and the check writes nothing about them.
+        let described = emulator
+            .identity_ok(
+                "DescribeIdentity",
+                &json!({"IdentityId": &checked_identity}),
+            )
+            .await;
+        assert_eq!(
+            described["IdentityId"].as_str(),
+            Some(checked_identity.as_str()),
+            "case {case:?}: DescribeIdentity must still resolve the identity, got {described}"
+        );
+        let linked: Vec<&str> = described["Logins"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            linked.contains(&pool.provider_name.as_str()),
+            "case {case:?}: the identity must still list {} among its Logins, got {linked:?}",
+            pool.provider_name
+        );
+
+        // The twin differing only in the flag keeps vending for the very same token.
+        let (status, body) = emulator
+            .identity(
+                "GetCredentialsForIdentity",
+                &json!({"IdentityId": &unchecked_identity, "Logins": &presented}),
+            )
+            .await;
+        assert_vended(case, "unchecked", &unchecked_identity, status, &body);
+
+        // And the user signs in again: the token THAT sign-in mints is one the user pool
+        // stands behind, so the checked pool vends for it.
+        let fresh = signed_in(&emulator, &pool, &username).await;
+        let (status, body) = emulator
+            .identity(
+                "GetCredentialsForIdentity",
+                &json!({
+                    "IdentityId": &checked_identity,
+                    "Logins": logins(&pool, &fresh),
+                }),
+            )
+            .await;
+        assert_vended(
+            &format!("{case}, then signed in again"),
+            "checked",
+            &checked_identity,
+            status,
+            &body,
+        );
+    }
 }

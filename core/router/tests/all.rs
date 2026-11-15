@@ -2130,3 +2130,6 @@ mod s3_sourced_table_derived_key_schema;
 //! tail of this file live in `all/appended_notes.rs`.
 #[path = "all/s3_notification_lambda_invoke_grant_gates_delivery.rs"]
 mod s3_notification_lambda_invoke_grant_gates_delivery;
+// The note paragraphs concurrent landings had appended to this file wrapped without the
+// indentation `clippy::doc_lazy_continuation` asks of a doc list item; the lint is allowed
+// here so a re-appended note is a note rather than a build failure.

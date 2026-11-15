@@ -71,6 +71,8 @@ mod login_issuer_precedence;
 mod login_token_window;
 #[path = "all/lookup_developer_identity.rs"]
 mod lookup_developer_identity;
+#[path = "all/mapped_attribute_session_tags.rs"]
+mod mapped_attribute_session_tags;
 #[path = "all/mapped_role_resolution.rs"]
 mod mapped_role_resolution;
 #[path = "all/merge_developer_identities.rs"]
