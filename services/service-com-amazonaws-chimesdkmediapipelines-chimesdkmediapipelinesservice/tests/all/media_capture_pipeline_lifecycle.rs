@@ -466,8 +466,10 @@ async fn an_unknown_but_well_formed_id_is_not_found() {
     }
 }
 
-/// RULE: a value outside a modelled constraint is refused with this service's own
-/// 400 `BadRequestException`, never a 500 and never a 501.
+/// RULE: a value outside a modelled constraint is refused at the REQUEST BOUNDARY as
+/// `400 ValidationException` — never a 500 and never a 501 — while a refusal this service's
+/// own HANDLER makes for a rule no constraint expresses is its modelled 400
+/// `BadRequestException`.
 ///
 /// The rows walk each kind of constraint the model declares on these operations:
 /// an enum value set, the ARN pattern, the ARN length bound (and one character
@@ -529,16 +531,6 @@ async fn a_value_outside_a_modelled_constraint_is_a_bad_request() {
                 .await,
         ));
     }
-    refused.push((
-        "a next-token this service never issued".to_string(),
-        emulator
-            .call(
-                "GET",
-                "/sdk-media-capture-pipelines?next-token=not-a-token",
-                None,
-            )
-            .await,
-    ));
 
     for (case, response) in refused {
         assert_eq!(
@@ -548,11 +540,38 @@ async fn a_value_outside_a_modelled_constraint_is_a_bad_request() {
         );
         assert_eq!(
             response.error_code(),
-            "BadRequestException",
-            "case {case:?}: expected BadRequestException, got {:?}",
+            "ValidationException",
+            "case {case:?}: expected the boundary's ValidationException, got {:?}",
             response.body
         );
+        let message = response.str_at("/message");
+        assert!(
+            message.contains("validation error") && message.contains("detected: "),
+            "case {case:?}: expected AWS's validation envelope, got {message:?}"
+        );
     }
+
+    // A rule no modelled constraint expresses — a pagination token this service never
+    // issued — is refused by the handler instead, as this service's own modelled error.
+    let unissued = emulator
+        .call(
+            "GET",
+            "/sdk-media-capture-pipelines?next-token=not-a-token",
+            None,
+        )
+        .await;
+    assert_eq!(
+        unissued.status, 400,
+        "case \"a next-token this service never issued\": expected 400, got {} with {:?}",
+        unissued.status, unissued.body
+    );
+    assert_eq!(
+        unissued.error_code(),
+        "BadRequestException",
+        "case \"a next-token this service never issued\": expected the modelled \
+         BadRequestException, got {:?}",
+        unissued.body
+    );
 
     // And the published bounds themselves are accepted.
     for good in ["1", "100"] {

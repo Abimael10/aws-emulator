@@ -16,14 +16,14 @@
 //!   page, whatever the page size, and resuming from that token continues after the page;
 //! * a `NextToken` this service never issued is the modelled 400 `BadRequestException`;
 //! * `MaxResults` is served across its whole modelled 1..100 range and refused one past
-//!   either published bound;
+//!   either published bound, by the request boundary's `ValidationException`;
 //! * the listing is a REPORT: two listings in a row answer alike, and a create or a delete
 //!   is what changes the answer.
 
 use serde_json::{json, Value};
 
 use crate::media_insights_pipeline_configuration_lifecycle::{
-    Emulator, Response, BAD_REQUEST_EXCEPTION, ROLE_ARN,
+    Emulator, Response, BAD_REQUEST_EXCEPTION, ROLE_ARN, VALIDATION_EXCEPTION,
 };
 
 /// The listing's own path space, as the model binds it
@@ -342,9 +342,10 @@ async fn the_listing_pages_at_max_results_in_creation_order() {
     }
 }
 
-/// RULE: `MaxResults` is served across its whole modelled 1..100 range and refused one past
-/// either published bound; a `NextToken` this service never issued is the modelled 400
-/// `BadRequestException`.
+/// RULE: `MaxResults` is served across its whole modelled 1..100 range; one past either
+/// published bound is refused by the REQUEST BOUNDARY as `400 ValidationException`, while a
+/// `NextToken` this service never issued — a rule no constraint expresses, so the HANDLER
+/// refuses it — is this service's modelled 400 `BadRequestException`.
 #[tokio::test]
 async fn the_listing_refuses_an_unissued_token_and_an_out_of_range_page_size() {
     let emulator = Emulator::new();
@@ -365,21 +366,24 @@ async fn the_listing_refuses_an_unissued_token_and_an_out_of_range_page_size() {
     }
 
     let refusals = [
-        format!("{LIST_PATH}?max-results=0"),
-        format!("{LIST_PATH}?max-results=101"),
-        format!("{LIST_PATH}?next-token=not-a-token-this-service-issued"),
+        (format!("{LIST_PATH}?max-results=0"), VALIDATION_EXCEPTION),
+        (format!("{LIST_PATH}?max-results=101"), VALIDATION_EXCEPTION),
+        (
+            format!("{LIST_PATH}?next-token=not-a-token-this-service-issued"),
+            BAD_REQUEST_EXCEPTION,
+        ),
     ];
-    for query in refusals {
+    for (query, expected_code) in refusals {
         let refused = emulator.call("GET", &query, None).await;
         assert_eq!(
             refused.status, 400,
-            "case {query:?}: expected the modelled 400, got {} body {:?}",
+            "case {query:?}: expected 400, got {} body {:?}",
             refused.status, refused.body
         );
         assert_eq!(
             refused.error_code(),
-            BAD_REQUEST_EXCEPTION,
-            "case {query:?}: expected the modelled error shape, got {:?}",
+            expected_code,
+            "case {query:?}: expected {expected_code}, got {:?}",
             refused.body
         );
     }

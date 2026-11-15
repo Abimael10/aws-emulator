@@ -11,6 +11,12 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/boundary_constraint_refusal.rs"]
+mod boundary_constraint_refusal;
+#[path = "all/identity_authorization.rs"]
+mod identity_authorization;
+#[path = "all/insights_configuration_element_rules.rs"]
+mod insights_configuration_element_rules;
 #[path = "all/kinesis_video_stream_pool_lifecycle.rs"]
 mod kinesis_video_stream_pool_lifecycle;
 #[path = "all/media_capture_pipeline_lifecycle.rs"]
@@ -27,6 +33,8 @@ mod media_insights_pipeline_status;
 mod name_in_use_refusal;
 #[path = "all/not_found_message.rs"]
 mod not_found_message;
+#[path = "all/resource_access_role_resolution.rs"]
+mod resource_access_role_resolution;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/service_claim.rs"]

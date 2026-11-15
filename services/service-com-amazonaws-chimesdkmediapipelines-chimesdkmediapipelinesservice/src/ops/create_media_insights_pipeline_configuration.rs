@@ -192,6 +192,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The ELEMENT-SET rule the list shape cannot express either: one media insights
+        // pipeline transcribes one audio stream, so it runs at most ONE transcription
+        // processor — a second `AmazonTranscribeProcessor` or
+        // `AmazonTranscribeCallAnalyticsProcessor` element duplicates it, whichever of the
+        // two types repeats. Refused before the record is built, so nothing is stored and
+        // the name stays free.
+        if crate::state::duplicate_transcribe_processors(&input.elements) {
+            return Err(
+                CreateMediaInsightsPipelineConfigurationErrorModeled::BadRequestException(
+                    crate::state::bad_request(
+                        crate::state::DUPLICATE_TRANSCRIBE_PROCESSORS_MESSAGE,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // The role the service will take on to reach Transcribe and the sinks on the
+        // caller's behalf has to BE a role of this account: the member's modelled
+        // `@pattern` only says the value is ARN-shaped, so a well-formed ARN naming no such
+        // role is resolved here, against the account's own IAM state, and refused as the
+        // modelled `ForbiddenException` — the service reports what it cannot assume as a
+        // permissions failure rather than as an absent resource. Asked before anything is
+        // written, so a refused create stores nothing.
+        let region = crate::state::request_region(ctx.parts());
+        if ::service_common::iam_role::role_is_absent(ctx, &region, &input.resource_access_role_arn)
+            .await
+        {
+            return Err(
+                CreateMediaInsightsPipelineConfigurationErrorModeled::ForbiddenException(
+                    crate::state::forbidden(crate::state::role_not_invocable_message(
+                        &input.resource_access_role_arn,
+                    )),
+                )
+                .into(),
+            );
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 CreateMediaInsightsPipelineConfigurationErrorModeled::ServiceFailureException(
@@ -234,7 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // create-time tag can never be written under a different ARN than the one the
         // configuration carries — nor be dropped for want of one.
         let configuration_arn = crate::state::media_insights_pipeline_configuration_arn(
-            &crate::state::request_region(ctx.parts()),
+            &region,
             &configuration_name,
         );
         let configuration = crate::state::InsightsConfiguration {

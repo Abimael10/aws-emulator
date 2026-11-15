@@ -41,9 +41,12 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Operation, Refusal, Refused, Service,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
+
+pub mod authorization;
 
 /// This service's own `aws.api#service$endpointPrefix`, the name that identifies it
 /// among the six services that sign as `chime`.
@@ -61,6 +64,12 @@ const OWN_ENDPOINT_PREFIX: &str = "media-pipelines-chime";
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// One [`authorization::Gated`] per operation this service publishes, keyed by the
+    /// routing key the model names that operation by ([`Operation::NAME`], the same key the
+    /// generated routing table uses). Built once here, never per request; each entry carries
+    /// the operation's TYPE and a handle on the one shared engine, so this is a table of
+    /// names rather than a second set of operations.
+    gated: HashMap<&'static str, Box<dyn ErasedOperation>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -69,9 +78,72 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
+            gated: gated_table::<Eng>(&engine),
             entry: crate::ServiceDefinition::new(engine),
         }
     }
+}
+
+/// The [`authorization::Gated`] wrapper for every operation this service publishes
+/// (`smithy_query(query="list_operations")`, all 31 of them).
+///
+/// Authorization is a property of the request's identity, the action it names and the
+/// resource it addresses rather than of what a handler goes on to do, so it is taken here
+/// for all of them at once — implemented or still scaffolded, and whatever error set the
+/// operation itself declares. A stub answers 501 for a request whose caller IAM permits and
+/// the refusal otherwise, which is the order the real service evaluates them in; leaving an
+/// operation out would serve an unauthorized caller, the very divergence this removes.
+fn gated_table<Eng: Send + Sync + 'static>(
+    engine: &Arc<Eng>,
+) -> HashMap<&'static str, Box<dyn ErasedOperation>> {
+    let mut wrappers: HashMap<&'static str, Box<dyn ErasedOperation>> = HashMap::new();
+    macro_rules! register {
+        ($($module:ident :: $operation:ident),+ $(,)?) => {
+            $(
+                wrappers.insert(
+                    <crate::ops::$module::$operation<Eng> as Operation>::NAME,
+                    Box::new(authorization::Gated::<
+                        crate::ops::$module::$operation<Eng>,
+                        Eng,
+                    >::new(Arc::clone(engine))) as Box<dyn ErasedOperation>,
+                );
+            )+
+        };
+    }
+    register!(
+        create_media_capture_pipeline::CreateMediaCapturePipeline,
+        create_media_concatenation_pipeline::CreateMediaConcatenationPipeline,
+        create_media_insights_pipeline::CreateMediaInsightsPipeline,
+        create_media_insights_pipeline_configuration::CreateMediaInsightsPipelineConfiguration,
+        create_media_live_connector_pipeline::CreateMediaLiveConnectorPipeline,
+        create_media_pipeline_kinesis_video_stream_pool::CreateMediaPipelineKinesisVideoStreamPool,
+        create_media_stream_pipeline::CreateMediaStreamPipeline,
+        delete_media_capture_pipeline::DeleteMediaCapturePipeline,
+        delete_media_insights_pipeline_configuration::DeleteMediaInsightsPipelineConfiguration,
+        delete_media_pipeline::DeleteMediaPipeline,
+        delete_media_pipeline_kinesis_video_stream_pool::DeleteMediaPipelineKinesisVideoStreamPool,
+        get_media_capture_pipeline::GetMediaCapturePipeline,
+        get_media_insights_pipeline_configuration::GetMediaInsightsPipelineConfiguration,
+        get_media_pipeline::GetMediaPipeline,
+        get_media_pipeline_kinesis_video_stream_pool::GetMediaPipelineKinesisVideoStreamPool,
+        get_speaker_search_task::GetSpeakerSearchTask,
+        get_voice_tone_analysis_task::GetVoiceToneAnalysisTask,
+        list_media_capture_pipelines::ListMediaCapturePipelines,
+        list_media_insights_pipeline_configurations::ListMediaInsightsPipelineConfigurations,
+        list_media_pipeline_kinesis_video_stream_pools::ListMediaPipelineKinesisVideoStreamPools,
+        list_media_pipelines::ListMediaPipelines,
+        list_tags_for_resource::ListTagsForResource,
+        start_speaker_search_task::StartSpeakerSearchTask,
+        start_voice_tone_analysis_task::StartVoiceToneAnalysisTask,
+        stop_speaker_search_task::StopSpeakerSearchTask,
+        stop_voice_tone_analysis_task::StopVoiceToneAnalysisTask,
+        tag_resource::TagResource,
+        untag_resource::UntagResource,
+        update_media_insights_pipeline_configuration::UpdateMediaInsightsPipelineConfiguration,
+        update_media_insights_pipeline_status::UpdateMediaInsightsPipelineStatus,
+        update_media_pipeline_kinesis_video_stream_pool::UpdateMediaPipelineKinesisVideoStreamPool,
+    );
+    wrappers
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -115,44 +187,45 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: the key is the one the generated table's own protocol resolves,
+        // and the operation it names is the one served — wrapped in
+        // [`authorization::Gated`] so IAM's decision about the action is taken BEFORE the
+        // handler runs, as AWS takes it ahead of the service. Every operation this service
+        // publishes is in that table; a key the model does not name resolves to `None`
+        // here, so the router's routing-error path is untouched.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.gated.get(key).map(::std::convert::AsRef::as_ref)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // This service does not word a modelled-constraint failure as the
-        // framework's generic `ValidationException`: every operation it exposes
-        // declares `BadRequestException` ("The input parameters don't match the
-        // service's restrictions.", HTTP 400) for exactly that, so a caller
-        // branching on the error code must see that code whether the value was
-        // refused at the boundary or inside a handler. The status (400) and the
-        // envelope stay with the protocol; only the code and the message change.
+        // A value one of this model's own constraints does not admit is refused at the
+        // REQUEST BOUNDARY, ahead of any handler, and that layer is not this service: it is
+        // the common front end AWS puts in front of a restJson1 service, which answers
+        // `400 ValidationException` carrying the envelope
+        // `N validation error(s) detected: <clause>; <clause>` over one clause per
+        // violation. So a boundary refusal is NOT reworded into one of this service's own
+        // modelled errors: `BadRequestException` is what a HANDLER of this service answers
+        // for a rule the model cannot express, and the two stay distinguishable for a
+        // client that branches on the code.
         //
-        // An authentication refusal is left alone: the framework's wording for it
-        // is not a modelled-input failure and is not this service's to restate.
-        match refusal {
-            Refusal::Invalid(violations) => Some(Refused {
-                code: "BadRequestException".to_string(),
-                message: match violations.as_slice() {
-                    [] => "The input parameters don't match the service's restrictions."
-                        .to_string(),
-                    [only] => only.message(),
-                    many => format!(
-                        "{} validation errors detected: {}",
-                        many.len(),
-                        many.iter()
-                            .map(smithy_server_runtime::Violation::message)
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    ),
-                },
-            }),
-            _ => None,
-        }
+        // Only the `@pattern` RENDERING is chosen here, and this service's dialect keeps the
+        // expression's OPENING `^` and drops the `$` that closes it: a Smithy `@pattern` is
+        // a find, so the trailing anchor is how the model makes the match total at that end
+        // rather than part of the grammar a caller has to satisfy, while everything else the
+        // model wrote is quoted as declared. That is the rendering this service's refusals
+        // are recorded stating, and the shared home owns the rule
+        // (`service_common::validation::unanchored_at_the_close`); the CHECK still runs the
+        // model's pattern as written. Everything else — which refusals are restated, the
+        // code, the envelope, the member paths and every other requirement — is the shared
+        // `service_common::validation_message::aws_validation_refusal_with`'s and the
+        // framework's, so this service cannot word one of them differently.
+        //
+        // An authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure and is not this service's to restate.
+        ::service_common::validation_message::aws_validation_refusal_with(
+            refusal,
+            ::service_common::validation::unanchored_at_the_close,
+        )
     }
 
     fn override_routing_error(
@@ -181,5 +254,32 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RULE: the operations REGISTERED behind the authorization gate are exactly the ones
+    /// [`authorization::GATED_OPERATIONS`] names — which this crate's own suite holds to the
+    /// set the MODEL binds to the service shape.
+    ///
+    /// Without this, the `register!` list above could drop an operation while the constant
+    /// still said it was judged, and that operation would serve an unauthorized caller. The
+    /// table is built over a stand-in engine type carrying no state: this asserts which KEYS
+    /// are registered, and no request is served.
+    #[test]
+    fn every_gated_operation_is_registered_behind_the_authorization_gate() {
+        let registered = gated_table::<()>(&Arc::new(()));
+        let mut keys: Vec<&str> = registered.keys().copied().collect();
+        keys.sort_unstable();
+        let mut gated: Vec<&str> = authorization::GATED_OPERATIONS.to_vec();
+        gated.sort_unstable();
+        assert_eq!(
+            keys, gated,
+            "case \"the registered table\": expected exactly the gated operations, got \
+             {keys:?} against {gated:?}"
+        );
     }
 }

@@ -11,6 +11,12 @@ engine = { workspace = true }
 # `chime_family`: the request-claim rule for the six services that share the `chime`
 # SigV4 signing name, stated once rather than inlined in this service's `can_handle`.
 service-common = { path = "../common" }
+# The two stores the authorization gate (`src/service/authorization.rs`) reads: the SESSION a
+# credential speaks for lives in STS's store while the identity-based POLICIES in force on
+# that principal live in IAM's. Only their `state` accessors are used; the DECISION itself is
+# `service-common`'s one shared evaluation.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

@@ -71,6 +71,12 @@ const ELEMENT_TYPES: [&str; 9] = [
     "VoiceEnhancementSink",
 ];
 
+/// The one declared type the "every type" row below leaves OUT: a configuration runs at most
+/// ONE transcription processor, so the two Transcribe processor types of [`ELEMENT_TYPES`]
+/// cannot both appear in one `Elements` list. The refusal of a list carrying both is pinned
+/// by [`crate::insights_configuration_element_rules`].
+const SECOND_TRANSCRIBE_PROCESSOR: &str = "AmazonTranscribeProcessor";
+
 async fn create(emulator: &Emulator, input: Value) -> Response {
     emulator.call("POST", CONFIGURATIONS, Some(input)).await
 }
@@ -195,11 +201,13 @@ fn update_rows() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "one element of every type the model declares, no alert configuration",
+            "one element of every type the model declares that may appear together, no alert \
+             configuration",
             json!({
                 "ResourceAccessRoleArn": UPDATED_ROLE_ARN,
                 "Elements": ELEMENT_TYPES
                     .iter()
+                    .filter(|element_type| **element_type != SECOND_TRANSCRIBE_PROCESSOR)
                     .map(|element_type| json!({ "Type": element_type }))
                     .collect::<Vec<Value>>(),
             }),

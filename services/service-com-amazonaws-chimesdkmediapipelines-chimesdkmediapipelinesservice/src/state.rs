@@ -559,6 +559,62 @@ pub fn too_many_elements_message(count: usize) -> String {
     )
 }
 
+/// The `MediaInsightsPipelineConfigurationElementType` values that name a TRANSCRIPTION
+/// processor: the two Amazon Transcribe processors a media insights pipeline can run.
+///
+/// Source: `smithy_query(query="shape",
+/// shape="MediaInsightsPipelineConfigurationElementType")` — `AmazonTranscribeProcessor`
+/// and `AmazonTranscribeCallAnalyticsProcessor` of
+/// `AmazonTranscribeCallAnalyticsProcessor | VoiceAnalyticsProcessor |
+/// AmazonTranscribeProcessor | KinesisDataStreamSink | LambdaFunctionSink | SqsQueueSink |
+/// SnsTopicSink | S3RecordingSink | VoiceEnhancementSink`.
+pub const TRANSCRIBE_PROCESSOR_TYPES: [&str; 2] = [
+    "AmazonTranscribeProcessor",
+    "AmazonTranscribeCallAnalyticsProcessor",
+];
+
+/// How many TRANSCRIBE processors one configuration's `Elements` may carry: one audio
+/// stream is transcribed by one transcription processor, so a second one — of either type —
+/// duplicates it.
+pub const MAX_TRANSCRIBE_PROCESSORS: usize = 1;
+
+/// The `message` a configuration carrying more than [`MAX_TRANSCRIBE_PROCESSORS`]
+/// transcription processors is refused with.
+///
+/// The list shape carries no constraint expressing the rule, so this is RECORDED
+/// behaviour: a fixed string with no variable parts — it names neither the types that
+/// collided nor their positions.
+pub const DUPLICATE_TRANSCRIBE_PROCESSORS_MESSAGE: &str =
+    "Duplicate Transcribe processors are not allowed";
+
+/// Whether `elements` carries more transcription processors than one configuration may run
+/// ([`MAX_TRANSCRIBE_PROCESSORS`]).
+///
+/// Counted over the element's `Type` — the member that names what an element IS — so the
+/// rule holds however the elements are ordered and whichever of the two processor types
+/// repeat, and so an element carrying a processor's configuration under another type is
+/// judged as the type it declares.
+pub fn duplicate_transcribe_processors(
+    elements: &[MediaInsightsPipelineConfigurationElement],
+) -> bool {
+    elements
+        .iter()
+        .filter(|element| TRANSCRIBE_PROCESSOR_TYPES.contains(&element.r#type.as_str()))
+        .count()
+        > MAX_TRANSCRIBE_PROCESSORS
+}
+
+/// The `message` a configuration naming a role this account's IAM holds nothing under is
+/// refused with; `role_arn` is the value the request carried.
+///
+/// The service takes the role on to reach Transcribe and the sinks on the caller's behalf,
+/// so a role it cannot assume is a PERMISSIONS failure rather than an absent resource. The
+/// model states no text for it, so this is RECORDED behaviour: fixed text followed by the
+/// role ARN the request carried, which is what tells a caller WHICH role it misnamed.
+pub fn role_not_invocable_message(role_arn: &str) -> String {
+    format!("Service does not have permission to invoke role: {role_arn}")
+}
+
 /// Encode the page cursor — the creation sequence of the last item returned — as
 /// the opaque token a caller echoes back in `next-token`.
 ///

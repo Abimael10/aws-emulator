@@ -63,6 +63,12 @@ const NOT_FOUND_EXCEPTION: &str = "NotFoundException";
 const ERROR_CODE_BAD_REQUEST: &str = "BadRequest";
 pub(crate) const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
 
+/// The wire error code the REQUEST BOUNDARY refuses a value outside a modelled constraint
+/// with, ahead of any handler of this service: `ValidationException`, carrying AWS's
+/// `N validation error(s) detected: …` envelope. A refusal a HANDLER of this service makes
+/// is [`BAD_REQUEST_EXCEPTION`] instead, and the two are deliberately distinguishable.
+pub(crate) const VALIDATION_EXCEPTION: &str = "ValidationException";
+
 /// One request/response round trip through the router. `pub(crate)` because the sibling
 /// suite `media_insights_pipeline_configuration_listing` drives the same wire surface and
 /// must not build a second copy of it.

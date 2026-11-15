@@ -169,11 +169,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // Modelled constraints — the `Identifier` label's `\S` and 0..1024, the role
         // ARN's pattern and 1..1024, and the alert configuration's `Rules` 1..3 — are
-        // refused BEFORE this handler runs, and `service.rs` words that refusal as this
-        // service's 400 `BadRequestException`.
+        // refused BEFORE this handler runs, at the request boundary.
+        //
+        // The two rules the model cannot express hold for an update exactly as they do for
+        // a create, and are stated by the same helpers: a configuration runs at most ONE
+        // transcription processor, and the role it will be run under has to be a role this
+        // account's IAM holds. Both are asked before the stored record is touched, so a
+        // refused update leaves the configuration as it was.
+        if crate::state::duplicate_transcribe_processors(&input.elements) {
+            return Err(
+                UpdateMediaInsightsPipelineConfigurationErrorModeled::BadRequestException(
+                    crate::state::bad_request(
+                        crate::state::DUPLICATE_TRANSCRIBE_PROCESSORS_MESSAGE,
+                    ),
+                )
+                .into(),
+            );
+        }
+        let region = crate::state::request_region(ctx.parts());
+        if ::service_common::iam_role::role_is_absent(ctx, &region, &input.resource_access_role_arn)
+            .await
+        {
+            return Err(
+                UpdateMediaInsightsPipelineConfigurationErrorModeled::ForbiddenException(
+                    crate::state::forbidden(crate::state::role_not_invocable_message(
+                        &input.resource_access_role_arn,
+                    )),
+                )
+                .into(),
+            );
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 UpdateMediaInsightsPipelineConfigurationErrorModeled::ServiceFailureException(
