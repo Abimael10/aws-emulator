@@ -48,18 +48,18 @@ use super::domain_lifecycle::{
 /// capability, use ai-capability" (`RegisterCapabilityRequest$capabilityName`'s own
 /// documentation). Every other value inside `capabilityName`'s published constraints is
 /// refused by [`a_name_that_is_not_the_registrable_capability_is_refused`].
-const CAPABILITY: &str = "ai-capability";
+pub(crate) const CAPABILITY: &str = "ai-capability";
 
 /// The only configuration branch `CapabilityBaseRequestConfig` declares — the AI settings
 /// of an application's capability (`smithy_query(query="shape",shape="CapabilityBaseRequestConfig")`),
 /// whose target `AIConfig` declares no member of its own.
-fn ai_config() -> Value {
+pub(crate) fn ai_config() -> Value {
     json!({ "aiConfig": {} })
 }
 
 /// `RegisterCapability`:
 /// `POST /2021-01-01/opensearch/application/{applicationId}/capability/register`.
-async fn register(
+pub(crate) async fn register(
     emulator: &Emulator,
     application_id: &str,
     capability_name: &str,
@@ -79,7 +79,11 @@ async fn register(
 
 /// `GetCapability`:
 /// `GET /2021-01-01/opensearch/application/{applicationId}/capability/{capabilityName}`.
-async fn get_capability(emulator: &Emulator, application_id: &str, capability_name: &str) -> Answer {
+pub(crate) async fn get_capability(
+    emulator: &Emulator,
+    application_id: &str,
+    capability_name: &str,
+) -> Answer {
     emulator
         .call(
             "GET",
@@ -109,7 +113,7 @@ async fn deregister(emulator: &Emulator, application_id: &str, capability_name: 
 /// The capability names this application holds a record for, read out of the store the
 /// handlers write — the evidence a register persisted a capability rather than only
 /// answering about one, and that a repeat added no second record.
-fn held_capabilities(emulator: &Emulator, application_id: &str) -> Vec<String> {
+pub(crate) fn held_capabilities(emulator: &Emulator, application_id: &str) -> Vec<String> {
     let store = emulator.store();
     let store = store.lock();
     store
@@ -120,7 +124,7 @@ fn held_capabilities(emulator: &Emulator, application_id: &str) -> Vec<String> {
 }
 
 /// Assert a success and answer the body, naming the case on failure.
-fn served(answer: &Answer, case: &str) -> Value {
+pub(crate) fn served(answer: &Answer, case: &str) -> Value {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected 200, got {} with {:?}",
@@ -130,7 +134,7 @@ fn served(answer: &Answer, case: &str) -> Value {
 }
 
 /// Assert a refusal: the recorded missing-resource status, the error code and the message.
-fn refused(answer: &Answer, case: &str, status: u16, code: &str, message: &str) {
+pub(crate) fn refused(answer: &Answer, case: &str, status: u16, code: &str, message: &str) {
     assert_eq!(
         answer.status, status,
         "case {case:?}: expected HTTP {status}, got {} with {:?}",
