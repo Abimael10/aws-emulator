@@ -117,6 +117,8 @@ mod email_identity_not_found_message;
 mod email_identity_policies;
 #[path = "all/email_identity_policies_read.rs"]
 mod email_identity_policies_read;
+#[path = "all/email_identity_policy_update.rs"]
+mod email_identity_policy_update;
 #[path = "all/email_identity_verification_info.rs"]
 mod email_identity_verification_info;
 #[path = "all/email_template_listing.rs"]

@@ -1500,3 +1500,7 @@ mod cloudformation_provisions_bedrock_flows;
 // doc list item; the lint is allowed for this target so a header line is a header line rather
 #[path = "all/bedrock_evaluation_job_saves_its_results_in_s3.rs"]
 mod bedrock_evaluation_job_saves_its_results_in_s3;
+// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs`, for this file and
+// for every service crate's own `tests/all.rs`. What a suite covers belongs in that suite's own
+// module header, and a note about THIS file in `all/appended_notes.rs`, declared below like any
+// other file.

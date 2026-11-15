@@ -54,6 +54,10 @@ mod export_file;
 /// The export-job plane's records: one export job, the status its run reports, and how a
 /// cancellation ends that run.
 mod export_job;
+/// The rules one sending-authorization policy of an email identity has to satisfy, and
+/// the sentences a policy write is refused with — shared by every operation that writes
+/// one.
+mod identity_policy_rules;
 /// The account's VDM metric series, which a metric query reports and a metrics export
 /// writes into its file.
 mod metric_series;
@@ -83,6 +87,7 @@ pub use dedicated_ips::*;
 pub use enum_value_sets::*;
 pub use export_file::*;
 pub use export_job::*;
+pub use identity_policy_rules::*;
 pub use metric_series::*;
 pub use minted_ids::*;
 pub use pricing::*;
@@ -4401,18 +4406,6 @@ pub fn domain_not_verified_for_dkim(identity: &str) -> String {
         "Domain {} is not verified for DKIM signing.",
         identity_domain(identity)
     )
-}
-
-/// How this service words `AlreadyExistsException` for a sending-authorization policy
-/// name an identity already carries.
-///
-/// This surface is RECORDED answering a duplicate `CreateEmailIdentityPolicy` with the
-/// fixed text `Policy <` + `> already exists` — the policy name QUOTED in angle
-/// brackets, no trailing period — and the `PolicyName` the request spelled is its only
-/// variable part: the identity the policy hangs off is not named, because the name the
-/// caller has to change is the policy's.
-pub fn identity_policy_already_exists(policy_name: &str) -> String {
-    format!("Policy <{policy_name}> already exists")
 }
 
 /// The key an identity is stored and looked up under.

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEmailIdentityPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEmailIdentityPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEmailIdentityPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPLACES the document stored under one sending-authorization policy name of the
+//! email identity this account holds; `GetEmailIdentityPolicies` and `GetEmailIdentity`
+//! then report the document this call wrote, and a policy name the identity carries
+//! none under is refused. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -111,6 +106,16 @@ impl From<UpdateEmailIdentityPolicyErrorModeled> for UpdateEmailIdentityPolicyEr
     }
 }
 
+/// Refuse the request with this operation's input error: `BadRequestException` is
+/// documented as "the input you provided is invalid", which is what a document or a
+/// policy name that breaks a documented rule is.
+fn bad_request(message: impl Into<String>) -> UpdateEmailIdentityPolicyError {
+    UpdateEmailIdentityPolicyErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
 /// The `UpdateEmailIdentityPolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -147,18 +152,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEmailIdentityPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEmailIdentityPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEmailIdentityPolicy"))
+        // Request metadata is not needed: the identity is keyed by name within the
+        // one emulated account.
+        let _ = ctx;
+
+        // What a policy name and a policy document have to be is the POLICY's rule
+        // rather than this operation's, so it is read from `crate::state` — the same
+        // rule, in the same words, that the create reads — and refused here as the
+        // invalid input the model binds `BadRequestException` for, before anything is
+        // written over the document that stands.
+        if let Some(defect) =
+            crate::state::identity_policy_write_defect(&input.policy_name, &input.policy)
+        {
+            return Err(bad_request(defect));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateEmailIdentityPolicy without the shared emulator state",
+            ));
+        };
+
+        let mut store = state.lock();
+        // A read of the table reports settled statuses; do the same here so this
+        // write lands on the same record a read would have reported.
+        store.settle(::std::time::SystemTime::now());
+
+        // "This API is for the identity owner only. If you have not verified the
+        // identity, this API will return an error": the policy hangs off an identity
+        // this account holds, so a name it holds none for is the modelled 404 rather
+        // than a new record — worded the way the identity WRITES word it. Holding the
+        // identity is what the rule turns on, not the status of the verification it
+        // started, which is the reading `CreateEmailIdentityPolicy` takes too.
+        let Some(record) = store
+            .identities
+            .get_mut(&crate::state::identity_key(&input.email_identity))
+        else {
+            return Err(UpdateEmailIdentityPolicyErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::email_identity_not_found_unquoted(
+                        &input.email_identity,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "UPDATES the specified sending authorization policy": the call REPLACES the
+        // document the identity holds under this name, which is why the model binds no
+        // `AlreadyExistsException` here and why a replacement never grows the
+        // identity's bounded policy map. A name the identity carries NO policy under
+        // addresses a policy that does not exist, and that is the modelled 404 — the
+        // one place this surface departs from the operation's own documentation ("this
+        // API returns successfully even if a policy with the specified name does not
+        // exist"), because the recorded response for such a call is that refusal, and
+        // what the service does is what the recording shows. Creating a policy is
+        // `CreateEmailIdentityPolicy`'s job, and nothing is written for the refusal.
+        let Some(document) = record.policies.get_mut(&input.policy_name) else {
+            return Err(UpdateEmailIdentityPolicyErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::identity_policy_not_found(&input.policy_name)),
+                },
+            )
+            .into());
+        };
+
+        // Stored as the service REPORTS it: the document's own tokens byte for byte —
+        // member order, number spellings and every string literal as they were
+        // submitted — with the insignificant whitespace BETWEEN those tokens dropped,
+        // which is the one minification `::service_common::json_document` states for
+        // every service that takes a JSON document as an opaque member and reports it
+        // back. The same normalisation the create applies, so one document stored by a
+        // replacement and by a first write reads back identically. Only the entry this
+        // name keys changes: every other policy the identity carries, and everything
+        // else on the record, is left exactly as it was.
+        *document = ::service_common::json_document::minified(&input.policy);
+
+        // Which principals may send through an identity is a fact about the ACCOUNT's
+        // identity, not about this API, so the account's identity registry takes the
+        // replaced set too and every other API over those identities reports it.
+        // Published after this service's own store is released, which keeps this
+        // service's lock order (its store, then the registry).
+        drop(store);
+        crate::state::publish_identity(&*self.engine, &input.email_identity);
+
+        // `UpdateEmailIdentityPolicyResponse` has no members: what the call produced
+        // is the state it wrote, which the identity's reads report.
+        Ok(UpdateEmailIdentityPolicyOutput {})
     }
 }

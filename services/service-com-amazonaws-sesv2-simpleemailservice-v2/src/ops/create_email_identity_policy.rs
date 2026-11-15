@@ -111,44 +111,11 @@ impl From<CreateEmailIdentityPolicyErrorModeled> for CreateEmailIdentityPolicyEr
     }
 }
 
-/// What SES answers for a document that is not a sending authorization policy.
-///
-/// The service reports ONE opaque phrase for that whole class — it does not name
-/// the clause of the policy grammar the document broke — so a document that is not
-/// JSON and one that is JSON but carries no statement are refused in the same
-/// words.
-const NOT_A_POLICY: &str = "Unable to parse policy.";
-
-/// What the service answers for a policy whose resource element names something that
-/// is not an ARN.
-///
-/// A sending authorization policy authorizes sending THROUGH one identity, and an
-/// identity is named by its ARN, so the service reads the element as one and reports
-/// the value it could not read as an ARN: the trailing token is that value, copied
-/// from the document that was submitted.
-fn invalid_resource_arn(value: &str) -> String {
-    format!("Invalid ARN: ARNs must start with 'arn:': {value}")
-}
-
-/// The bytes one sending-authorization policy document may carry.
-///
-/// `CreateEmailIdentityPolicyRequest$Policy` states the ceiling: "The text of the
-/// policy in JSON format. The policy cannot exceed 4 KB." The model carries only
-/// the member's lower bound (`length 1..`), so the documented ceiling is this
-/// handler's to enforce — and it is also what bounds one entry of the identity's
-/// policy map.
-pub const MAX_POLICY_BYTES: usize = 4 * 1024;
-
-/// The sending-authorization policies ONE identity may hold at once, and so the
-/// ceiling this operation keeps on an identity's policy map.
-///
-/// A CHOSEN bound, informed by what `GetEmailIdentityPolicies` documents — it
-/// returns the identity's policies and "you can retrieve a maximum of 20 policies
-/// at a time", so 20 is the whole set a caller can read back in one call — rather
-/// than a quota AWS states for the collection itself. A create past it is refused
-/// with the `LimitExceededException` the model binds, so caller input cannot grow
-/// the store without end.
-pub const MAX_IDENTITY_POLICIES: usize = 20;
+/// The rules one sending-authorization policy document and its name have to satisfy,
+/// and the set one identity may hold, as `crate::state` states them for every
+/// operation that writes a policy: re-exported here so a caller of this operation
+/// names them where the operation does.
+pub use crate::state::{MAX_IDENTITY_POLICIES, MAX_POLICY_BYTES};
 
 /// Refuse the request with this operation's input error: `BadRequestException` is
 /// documented as "the input you provided is invalid", which is what a document or a
@@ -158,18 +125,6 @@ fn bad_request(message: impl Into<String>) -> CreateEmailIdentityPolicyError {
         message: Some(message.into()),
     })
     .into()
-}
-
-/// The characters `PolicyName` admits, from its own documentation: "The name of the
-/// policy. The policy name cannot exceed 64 characters and can only include
-/// alphanumeric characters, dashes, and underscores." The length is modeled
-/// (`length 1..64`) and so already refused at the boundary; the character set is
-/// not, so this handler reads it.
-fn is_policy_name(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
 /// The `CreateEmailIdentityPolicy` operation.
@@ -212,39 +167,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one emulated account.
         let _ = ctx;
 
-        if !is_policy_name(&input.policy_name) {
-            return Err(bad_request(format!(
-                "The policy name {} can only include alphanumeric characters, dashes, \
-                 and underscores.",
-                input.policy_name
-            )));
-        }
-
-        // The document's ceiling: "The policy cannot exceed 4 KB." The model bounds
-        // `Policy` only below, so a longer document reaches this handler. Its own
-        // message, because the size rule is not the parse rule.
-        if input.policy.len() > MAX_POLICY_BYTES {
-            return Err(bad_request(format!(
-                "Policy exceeds the maximum size of {MAX_POLICY_BYTES} bytes."
-            )));
-        }
-
-        // A sending authorization policy IS an IAM resource-based policy document —
-        // each statement names the `Principal` it authorizes to send through the
-        // identity — so whether the text is a policy at all is read through the ONE
-        // shared grammar rather than by asking `serde_json` whether it parses, which
-        // would accept `5`, `"hello"` and `{}` as policies and store them.
-        if ::service_common::iam_policy::resource_policy_defect(&input.policy).is_some() {
-            return Err(bad_request(NOT_A_POLICY));
-        }
-
-        // The resource a sending authorization policy names is the IDENTITY it
-        // authorizes sending through, and an identity is named by its ARN. The IAM
-        // grammar above admits a bare wildcard as a resource; this service does not,
-        // so a resource element that is not an ARN is refused here — before anything
-        // is written — and the refusal names the value that is not one.
-        if let Some(value) = ::service_common::iam_policy::non_arn_resource(&input.policy) {
-            return Err(bad_request(invalid_resource_arn(&value)));
+        // What a policy name and a policy document have to be is the POLICY's rule
+        // rather than this operation's, so it is read from `crate::state` — the same
+        // rule, in the same words, that the update reads — and refused here as the
+        // invalid input the model binds `BadRequestException` for, before anything is
+        // written.
+        if let Some(defect) =
+            crate::state::identity_policy_write_defect(&input.policy_name, &input.policy)
+        {
+            return Err(bad_request(defect));
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
