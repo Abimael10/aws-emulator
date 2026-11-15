@@ -216,6 +216,22 @@ impl TargetProbe {
     pub fn is_failing(&self) -> bool {
         self.verdict.is_none() && self.failures > 0
     }
+
+    /// Whether the checks since the last one that agreed with this registration's verdict
+    /// DISAGREE with it, and the threshold that would change it is not reached yet — a
+    /// registration part-way between two verdicts, in either direction.
+    ///
+    /// A verdict is a number of CHECKS away, never a span: `UnhealthyThresholdCount`
+    /// consecutive failures take a healthy registration to `unhealthy`, and
+    /// `HealthyThresholdCount` consecutive successes take an unhealthy one back, so what
+    /// decides how long such a registration sits on its old verdict is how fast the next
+    /// checks come ([`super::host_counts`] runs them closer together while this holds). A
+    /// registration whose checks agree with its verdict, and one no check has observed
+    /// anything about, are not this.
+    pub fn is_transitioning(&self) -> bool {
+        (self.failures > 0 && self.verdict != Some(false))
+            || (self.passes > 0 && self.verdict != Some(true))
+    }
 }
 
 /// The ports the workload behind a registration SERVES, as inclusive ranges of port

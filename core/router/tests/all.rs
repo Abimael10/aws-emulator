@@ -7257,3 +7257,15 @@ mod zz_glue_job_source_permission_probe;
 //! belongs there. What a suite covers, and why it lives in this cross-service target rather
 //! than in one service crate's own, is stated in that suite's own module doc, where it is
 //! read beside the test it explains.
+//! `mod` names compiles nowhere and its tests never run; a suite left at the top level of
+//! `tests/` fails the build; and a second `mod` for one name is `E0428`, which fails every
+//! suite in this target. THIS HEADER IS THE ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY
+//! STAND IN THIS FILE: past the first item one is `E0753` and compiles no suite of this
+//! target. Below, add a DECLARATION — not a note about one, and never a copy of these
+//! lines: a note that belongs in this target rather than in a suite's own module doc goes
+//! in `all/appended_notes.rs`. `all/all_rs_declares_each_suite_once.rs` and
+//! rather than to one service crate's own is stated in that suite's own module doc, which is
+//! where it stays readable and where it moves with the suite.
+//! The `#[path]` is what points each module into `tests/all/`: this file is a test-target
+//! CRATE ROOT, so a bare `mod` would resolve to a SIBLING of it, which the layout check
+//! refuses.

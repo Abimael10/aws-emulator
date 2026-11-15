@@ -150,3 +150,7 @@ mod zonal_shift_registration;
 // `alb` target group names.
 #[path = "all/network_load_balancer_pass_on.rs"]
 mod network_load_balancer_pass_on;
+// Declared after the sorted list for the same reason the suite above is. What a registered
+// target's own security groups decide about the health check of it.
+#[path = "all/target_security_group_health_check.rs"]
+mod target_security_group_health_check;

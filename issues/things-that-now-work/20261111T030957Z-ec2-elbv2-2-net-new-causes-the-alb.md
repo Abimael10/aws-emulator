@@ -39,3 +39,22 @@ Cause 2 — Error: Check timed out after 60.0s, with no assertion reached. Expec
 1. Clone the repo and run the behavioral suite so the emulator is serving.
 2. Cause 1: create an internet-facing ALB with a security group, an HTTP:80 listener and a registered target; read DNSName from DescribeLoadBalancers and connect to it — the announced host:port is not the emulator's endpoint and the connection is refused. Then RevokeSecurityGroupIngress on the ALB's SG and observe that the client-connection behaviour cannot be exercised at all.
 3. Cause 2: register an HTTP-serving instance into a target group behind an ALB listener, wait for 'healthy', RevokeSecurityGroupIngress for the ALB SG on the target's health-check port and poll DescribeTargetHealth — no transition to 'unhealthy'/'Target.Timeout' ever occurs; re-authorize and observe no transition back either.
+
+## Resolution
+
+* Cause 2 (FIXED) — the security groups governing a registered target are now read off the
+  network interfaces of the resource the registration NAMES, so a registration naming an
+  instance is governed by the groups of the interfaces attached to that instance (it was
+  looked up by address only, which an instance id never matches, so such a target's checks
+  were never subject to any rule). Revoking the inbound rule that admits the load balancer on
+  the health-check port now takes the target to `unhealthy` / `Target.Timeout`, and
+  authorizing it again brings it back to `healthy`; a registration part-way between two
+  verdicts is re-checked at the accelerated spacing in BOTH directions, so the return is
+  observable within a client's budget.
+* Cause 1 (BLOCKED, vendor) — `DNSName` can only be a bare host once a load balancer can
+  answer on the ports its listeners declare, and the core owns the socket, the interface and
+  the port: `vendor/server/src/listeners.rs`'s `tcp_plaintext` takes no requested port and
+  `bind_std` / `bind_tokio` take it from the operator's `EMULATOR_LISTENER_PORT_RANGE`.
+  `vendor/` cannot be changed from a service crate. Needed there: a listener API that accepts
+  a requested port or a per-resource loopback address. Until then the published address keeps
+  the `host:port` the socket really answers on, which is reachable but is not a DNS name.
