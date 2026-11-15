@@ -21,6 +21,15 @@ pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
+/// What an anonymous FETCH of a URL this emulator published answered: a client holding such
+/// a URL follows it with no credential and no target header at all, exactly as a browser
+/// does.
+pub(crate) struct Fetched {
+    pub(crate) status: u16,
+    pub(crate) content_type: String,
+    pub(crate) body: String,
+}
+
 /// What a call answered: the HTTP status, the parsed body (`Value::Null` for an empty
 /// one) and the wire error code when the answer was a failure.
 pub(crate) struct Answer {
@@ -43,12 +52,57 @@ impl Answer {
 
 impl Emulator {
     pub(crate) fn new() -> Self {
+        Self::served_at(smithy_server_runtime::UNSERVED_URL_BASE)
+    }
+
+    /// One emulator whose own endpoint is `base`: the base URL
+    /// `OperationContext::endpoint` reports, which is what the data port publishes when the
+    /// emulator is served on one and what every URL a handler hands out therefore names.
+    pub(crate) fn served_at(base: &str) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(
             service_com_amazonaws_datazone_datazone::EmulatedService::new(engine),
         );
+        router.set_url_base(
+            smithy_server_runtime::EndpointUrl::parse(base)
+                .unwrap_or_else(|| panic!("{base:?} is a usable endpoint base")),
+        );
         Self { router }
+    }
+
+    /// Follow `url` the way a client that was handed it does: the address as published,
+    /// carrying no credential, no target header and no body.
+    pub(crate) async fn fetch(&self, method: &str, url: &str) -> Fetched {
+        let parsed: http::Uri = url.parse().expect("a published URL parses as a URI");
+        let authority = parsed
+            .authority()
+            .map(|authority| authority.as_str().to_string())
+            .unwrap_or_default();
+        let target = parsed
+            .path_and_query()
+            .map(|path| path.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let request = http::Request::builder()
+            .method(method)
+            .uri(target)
+            .header("host", authority)
+            .body(bytes::Bytes::new())
+            .expect("a valid request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = String::from_utf8_lossy(&response.into_body()).to_string();
+        Fetched {
+            status,
+            content_type,
+            body,
+        }
     }
 
     /// Send one request. The `Authorization` header carries a SigV4 credential scope,

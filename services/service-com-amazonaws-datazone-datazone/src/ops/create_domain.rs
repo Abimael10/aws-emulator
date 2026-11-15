@@ -279,9 +279,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = format!("dzd_{}", store.mint_id(now));
         let mut domain = Domain {
             arn: ::engine::emulator_arn("datazone", &region, &format!("domain/{id}")),
-            // The data portal the real service stands up for the domain is addressed
-            // by the domain id, in the region the domain lives in.
-            portal_url: Some(format!("https://{id}.datazone.{region}.on.aws")),
+            // The data portal this emulator stands up for the domain is addressed on the
+            // endpoint the caller is already talking to, with the domain's own id naming
+            // which portal it is: a URL a client is told to follow has to lead back here,
+            // and `crate::service` serves that address from this stored record.
+            portal_url: Some(crate::state::data_portal_url(ctx.endpoint().as_str(), &id)),
             root_domain_unit_id: store.mint_id(now),
             managed_account_id: ::engine::emulator_account_id().to_string(),
             name: input.name,

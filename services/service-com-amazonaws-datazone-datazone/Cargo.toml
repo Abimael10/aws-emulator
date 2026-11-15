@@ -23,6 +23,11 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Renders a pagination cursor as an opaque, round-trippable token.
 hex = { workspace = true }
+# `data_plane_addressing`: the shared reading of how a client addresses a plane this
+# emulator serves at its own endpoint, which a domain's published portal URL is built from.
+service-common = { path = "../common" }
+# Escapes the stored strings written into the data portal page this service serves.
+html-escape = "0.2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

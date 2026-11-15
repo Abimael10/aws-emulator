@@ -23,6 +23,13 @@ use std::collections::{BTreeMap, VecDeque};
 mod subscription_requests;
 pub use subscription_requests::*;
 
+/// A domain's data portal: where this emulator publishes it, and the page served there. A
+/// concern of its own, so it lives in its own module beside this one; everything it declares
+/// is re-exported here, so a handler reaches it as `crate::state::…` like the rest of the
+/// store.
+mod data_portal;
+pub use data_portal::*;
+
 /// The span the emulator takes to finish a domain lifecycle step AWS reports as
 /// in-progress (`CREATING` -> `AVAILABLE`, `DELETING` -> gone).
 ///

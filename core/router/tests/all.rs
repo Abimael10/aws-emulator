@@ -2,6 +2,23 @@
 
 //! Single integration-test target for the router.
 //!
+//! Put a new suite at `tests/all/<name>.rs` and declare it below with a `#[path]` / `mod`
+//! pair, keeping the list sorted: one pair per suite and nothing else, so a landing has one
+//! place to insert and nothing to keep consistent.
+//!
+//! A suite that is not declared here compiles nowhere and its tests never run, and a suite
+//! left at the top level of `tests/` fails the build. Declare each suite exactly ONCE: this
+//! is one crate root, so a second `mod` for the same name is `E0428`. THIS HEADER IS THE
+//! ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE: past the first item one
+//! is `E0753`. Either fails every suite in this target, so below add a declaration — not a
+//! note about one. `all/all_rs_declares_each_suite_once.rs` and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of that, for
+//! this file and for every service crate's `tests/all.rs`.
+//!
+//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
+//! (`tests/boot_serve.rs`) — which the layout check refuses. The `#[path]` above each `mod`
+//! is what points it into `tests/all/`.
+
 //! Put a new suite at `tests/all/<name>.rs` and declare it below with a `#[path]`/`mod`
 //! pair, keeping the list sorted: one pair per suite and nothing else, so a landing has
 //! one place to insert and nothing to keep consistent.

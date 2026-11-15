@@ -31,6 +31,8 @@ mod asset_types;
 mod create_project_domain_resolution;
 #[path = "all/delete_asset_denied_scope.rs"]
 mod delete_asset_denied_scope;
+#[path = "all/domain_data_portal.rs"]
+mod domain_data_portal;
 #[path = "all/domain_name_conflict_and_not_found.rs"]
 mod domain_name_conflict_and_not_found;
 #[path = "all/domain_project_lifecycle.rs"]

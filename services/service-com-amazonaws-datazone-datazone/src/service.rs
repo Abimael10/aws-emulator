@@ -57,6 +57,10 @@ use std::sync::Arc;
 /// `restJson1` renderer this service takes.
 pub mod rest_json_error_body;
 
+/// The route that answers at the data portal address a domain reports, which this emulator
+/// publishes on its own endpoint.
+pub mod data_portal;
+
 /// The `com-amazonaws-datazone-datazone` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -67,6 +71,9 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// This service's wire protocol, built ONCE here because
     /// [`Service::override_protocol`] hands back a borrow of it.
     protocol: rest_json_error_body::DataZoneRestJson,
+    /// The shared engine, for the ONE answer this file serves itself rather than through an
+    /// operation: the data portal page of a stored domain ([`data_portal`]).
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -75,8 +82,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             protocol: rest_json_error_body::DataZoneRestJson::new(),
+            engine,
         }
     }
 }
@@ -90,8 +98,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
+        // The data portal a domain reports (`portalUrl`) is opened by whatever browser,
+        // probe or test holds that URL: anonymously, with no credential scope and no target
+        // header naming this service — only the path this service itself minted, under the
+        // plane segment that is this service's alone. A fetch of exactly that path is
+        // therefore claimed whatever host the client addressed, so the portal is reachable at
+        // the address the domain advertised; the key a signed request resolves names no
+        // service for an endpoint reached by address, which is the only address a client on
+        // this machine can reach.
+        if data_portal::claimed(parts) {
+            return true;
+        }
+        // Every other request: claim it when its resolved route key is this service's
+        // signing name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
         match smithy_server_runtime::resolve_route_key(parts) {
             Some(key) => key == self.entry.identity().signing_name(),
@@ -133,12 +152,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it.
         //
-        // The STATUS, the headers and the wording stay the generated entry's: this
-        // service states nothing of its own about a request it does not serve. Only the
-        // BODY is this service's, and by the same rule every other failure of it follows
-        // ([`rest_json_error_body`]): a `restJson1` failure names its error shape in
-        // `x-amzn-errortype`, so its body carries the shape's own members and no
-        // discriminator. The shared pre-dispatch renderer writes one for every service it
+        // The ONE address this service serves that the Smithy model does not describe: the
+        // data portal of a stored domain, which `portalUrl` publishes for a client to
+        // follow. It is answered here because the router consults this seam before it
+        // authenticates anything, which is how AWS serves its own portal host —
+        // unauthenticated, and as a web page rather than a modelled API call.
+        if let Some(served) = data_portal::answer(&*self.engine, req) {
+            return Some(served);
+        }
+        //
+        // For every OTHER unrouted request the STATUS, the headers and the wording stay the
+        // generated entry's: this service states nothing of its own about a request it does
+        // not serve. Only the BODY is this service's, and by the same rule every other
+        // failure of it follows ([`rest_json_error_body`]): a `restJson1` failure names its
+        // error shape in `x-amzn-errortype`, so its body carries the shape's own members and
+        // no discriminator. The shared pre-dispatch renderer writes one for every service it
         // serves, and this is the seam that owns a routing failure's answer here.
         Some(rest_json_error_body::with_served_error_body(
             smithy_server_runtime::ErasedServiceDefinition::routing_error_response(
