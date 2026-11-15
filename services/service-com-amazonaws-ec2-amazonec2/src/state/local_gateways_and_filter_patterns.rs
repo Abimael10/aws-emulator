@@ -1103,20 +1103,22 @@ pub fn coip_pool_id_is_invalid_message(pool_id: &str) -> String {
 /// the refusals of a `CoipPoolId` name the resource the same way.
 pub const RESOURCE_TYPE_COIP_POOL: &str = "coip-pool";
 
-/// `InvalidIpv4PoolCoipId.Malformed` (HTTP 400): the code the `DeleteCoipPool` surface
-/// answers for a value that is no customer-owned address pool id AT ALL, so there is nothing
-/// to look up.
+/// `InvalidIpv4PoolCoipId.Malformed` (HTTP 400): the code the operations that act on the ONE
+/// pool their `CoipPoolId` names answer for a value that is no customer-owned address pool id
+/// AT ALL, so there is nothing to look up.
 ///
-/// Spelled from the id MEMBER's own name (`Ipv4PoolCoipId`) rather than from the resource,
-/// which is what the recorded refusal of that operation carries — where the same surface's
-/// `DescribeCoipPools` is recorded answering [`INVALID_POOL_ID_MALFORMED`]
-/// (`InvalidPoolID.Malformed`) for the same class of value. WHICH code an operation answers
-/// is a fact of that operation, recorded by its caller; what is one rule is that the class
-/// is decided BEFORE any lookup.
+/// Spelled from the SHAPE those members target (`Ipv4PoolCoipId`, the target of
+/// `DeleteCoipCidrRequest$CoipPoolId`, `CreateCoipCidrRequest$CoipPoolId`,
+/// `DeleteCoipPoolRequest$CoipPoolId` and `GetCoipPoolUsageRequest$PoolId`) rather than from
+/// the resource, which is what the recorded refusals of that surface carry — where the same
+/// surface's `DescribeCoipPools`, whose `PoolIds` is a `CoipPoolIdSet` SELECTOR list, is
+/// recorded answering [`INVALID_POOL_ID_MALFORMED`] (`InvalidPoolID.Malformed`) for the same
+/// class of value. WHICH code an operation answers is a fact of the member it resolves;
+/// what is one rule is that the class is decided BEFORE any lookup.
 pub const INVALID_IPV4_POOL_COIP_ID_MALFORMED: &str = "InvalidIpv4PoolCoipId.Malformed";
 
-/// Refuse a value that is no customer-owned address pool id at all on the surface recorded
-/// answering this code: HTTP 400 [`INVALID_IPV4_POOL_COIP_ID_MALFORMED`], with the sentence
+/// Refuse a value that is no customer-owned address pool id at all where a member naming ONE
+/// pool expects one: HTTP 400 [`INVALID_IPV4_POOL_COIP_ID_MALFORMED`], with the sentence
 /// EC2 words a malformed id of this resource with — `The coip-pool ID '<id>' is malformed`,
 /// the resource named as [`RESOURCE_TYPE_COIP_POOL`] spells it and the id taken from the
 /// REQUEST (bounded by [`MAX_ECHOED_COIP_POOL_ID_CHARS`], as every echo of this id is).
@@ -1146,42 +1148,38 @@ pub fn invalid_pool_id_not_found<E>(pool_id: &str) -> crate::scaffolded::Scaffol
 /// the way the operations that act on the ONE pool their `CoipPoolId` names do: HTTP 400,
 /// with a CODE that says HOW the value failed — which is what a client branches on.
 ///
-/// Three outcomes, in the order EC2 decides them, each taken from a recorded refusal of
-/// this surface:
+/// Two outcomes, decided by the FORM of the value and nothing else:
 ///
-/// * the value IS a pool id ([`coip_pool_id_is_well_formed`]) and names no pool of the
-///   account: `InvalidPoolID.NotFound` with [`coip_pool_does_not_exist_message`] — the code
-///   recorded for `CreateCoipCidr` and `GetCoipPoolUsage` given a well-formed 17-digit id
-///   nothing was created for;
-/// * the value READS as a pool id ([`coip_pool_id_reads_as_one`]) but carries a digit count
-///   EC2 never mints, so the pool it names can never exist: the surface refuses the request
-///   PARAMETER with `InvalidParameterValue`, carrying that same sentence — the code recorded
-///   for `DeleteCoipPool` given an id whose hexadecimal suffix is neither of EC2's published
-///   lengths;
+/// * the value READS as a pool id ([`coip_pool_id_reads_as_one`]) — the prefix followed by
+///   hexadecimal digits, however many of them — and names no pool of the account:
+///   `InvalidPoolID.NotFound` with [`coip_pool_does_not_exist_message`]. The digit count is
+///   not what decides the answer: EC2 reports such a value absent whether its suffix carries
+///   one of the two lengths a mint issues ([`coip_pool_id_is_well_formed`]) or any other, so
+///   a caller reading the code can always tell a missing pool from an unreadable value;
 /// * the value is no address-pool id at all — another prefix, none, or a suffix that is not
-///   hexadecimal: there is nothing to look up, which is [`invalid_pool_id_malformed`]'s
-///   `InvalidPoolID.Malformed`, the code recorded for the same surface's `DescribeCoipPools`
-///   given a value carrying another prefix.
+///   hexadecimal: there is nothing to look up, which is [`coip_pool_id_is_malformed`]'s
+///   `InvalidIpv4PoolCoipId.Malformed`, the class keyed to the shape the members naming ONE
+///   pool target (`Ipv4PoolCoipId`).
 ///
-/// `DescribeCoipPools` resolves `PoolIds` as a SELECTOR list and answers that member's own
-/// [`invalid_pool_id_malformed`] for every value that is not a well-formed pool id, the
-/// per-operation distinction [`invalid_id_parameter_value`] records.
+/// `DescribeCoipPools` resolves `PoolIds` as a SELECTOR list of `CoipPoolIdSet` and answers
+/// that member's own [`invalid_pool_id_malformed`] for every value that is not a well-formed
+/// pool id, the per-operation distinction [`invalid_id_parameter_value`] records.
 pub fn coip_pool_id_does_not_exist<E>(pool_id: &str) -> crate::scaffolded::Scaffolded<E> {
-    if coip_pool_id_is_well_formed(pool_id) {
+    if coip_pool_id_reads_as_one(pool_id) {
         invalid_pool_id_not_found(pool_id)
-    } else if coip_pool_id_reads_as_one(pool_id) {
-        invalid_parameter_value(coip_pool_does_not_exist_message(pool_id))
     } else {
-        invalid_pool_id_malformed(pool_id)
+        coip_pool_id_is_malformed(pool_id)
     }
 }
 
-/// Refuse a request that named something that is not a customer-owned address pool id at
-/// all: HTTP 400 `InvalidPoolID.Malformed`, which EC2 answers BEFORE it looks the id up, so
-/// "not a pool id" never reads as "no such pool".
+/// Refuse one entry of the `DescribeCoipPools` pool-id SELECTOR list that is not a
+/// customer-owned address pool id at all: HTTP 400 `InvalidPoolID.Malformed`, which EC2
+/// answers BEFORE it looks the id up, so "not a pool id" never reads as "no such pool".
 ///
 /// The form itself is [`coip_pool_id_is_well_formed`], so the one reader of the id decides
-/// what a pool id is and this function only words the refusal.
+/// what a pool id is and this function only words the refusal. A member naming the ONE pool
+/// a call acts on targets `Ipv4PoolCoipId` and is refused that shape's own
+/// [`coip_pool_id_is_malformed`] instead.
 ///
 /// An address pool is one of the kinds this service words with a sentence of its OWN rather
 /// than out of the shared [`invalid_id_message`] template — the surface's

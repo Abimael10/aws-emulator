@@ -759,22 +759,21 @@ async fn a_request_at_each_filtering_ceiling_is_answered_and_past_it_refused() {
 // ---------------------------------------------------------------------------
 
 /// A `PoolId` that resolves to no pool of the account is refused, and the CODE says HOW the
-/// value failed: a well-formed pool id nothing was created for is `InvalidPoolID.NotFound`,
-/// a value that READS as a pool id but carries a digit count EC2 never mints is
-/// `InvalidParameterValue`, and a value that is no pool id at all is
-/// `InvalidPoolID.Malformed` — the one reading of a `CoipPoolId` this whole surface shares.
+/// value failed: a value OF the pool-id form that names no pool is `InvalidPoolID.NotFound`,
+/// whatever digit count it carries, while a value that is no pool id at all is refused under
+/// the shape this member targets (`Ipv4PoolCoipId`) with `InvalidIpv4PoolCoipId.Malformed` —
+/// the one reading of a `CoipPoolId` this whole surface shares.
 /// The rows are each way a value can fail to resolve.
 #[tokio::test]
 async fn a_pool_id_that_resolves_to_no_pool_is_refused() {
     let prefix = ec2::state::COIP_POOL_ID_PREFIX;
     let not_found = ec2::state::INVALID_POOL_ID_NOT_FOUND;
-    let bad_value = ec2::state::INVALID_PARAMETER_VALUE;
-    let malformed = ec2::state::INVALID_POOL_ID_MALFORMED;
+    let malformed = ec2::state::INVALID_IPV4_POOL_COIP_ID_MALFORMED;
     let cases = [
         ("the long form", format!("{prefix}00000000000000000"), not_found),
         ("the short form", format!("{prefix}00000000"), not_found),
-        ("one digit", format!("{prefix}0"), bad_value),
-        ("neither length", format!("{prefix}0000000000000000"), bad_value),
+        ("one digit", format!("{prefix}0"), not_found),
+        ("neither length", format!("{prefix}0000000000000000"), not_found),
         ("an upper-case suffix", format!("{prefix}0ABCDEF01"), malformed),
         ("a non-hex suffix", format!("{prefix}zzzzzzzz"), malformed),
         (
@@ -800,13 +799,16 @@ async fn a_pool_id_that_resolves_to_no_pool_is_refused() {
             expected_code,
             "case {case:?}: expected {expected_code:?}, got {body}"
         );
-        if expected_code != malformed {
-            assert_eq!(
-                error_message(&body),
-                format!("The pool ID '{pool_id}' does not exist."),
-                "case {case:?}: expected the surface's one sentence, got {body}"
-            );
-        }
+        let expected_message = if expected_code == malformed {
+            format!("The coip-pool ID '{pool_id}' is malformed")
+        } else {
+            format!("The pool ID '{pool_id}' does not exist.")
+        };
+        assert_eq!(
+            error_message(&body),
+            expected_message,
+            "case {case:?}: expected {expected_message:?}, got {body}"
+        );
     }
 }
 

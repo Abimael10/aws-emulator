@@ -185,7 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             } else {
                 // A value that is no pool id at all is refused BEFORE anything is looked up,
                 // with the code and sentence this surface is recorded answering for that
-                // class ([`crate::state::coip_pool_id_is_malformed`]).
+                // class ([`crate::state::coip_pool_id_is_malformed`]): the
+                // `InvalidIpv4PoolCoipId.Malformed` family keyed to the shape this member
+                // targets.
                 crate::state::coip_pool_id_is_malformed(pool_id)
             }
         })?;

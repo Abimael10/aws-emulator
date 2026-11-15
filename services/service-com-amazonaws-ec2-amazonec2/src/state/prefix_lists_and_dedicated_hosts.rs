@@ -108,6 +108,37 @@ pub fn invalid_prefix_list_id_not_found<E>(prefix_list_id: &str) -> Scaffolded<E
     )
 }
 
+/// Refuse a request that named a prefix list id nothing the caller can see has, the way EC2
+/// words that refusal for the operations that RESOLVE one managed prefix list: HTTP 400
+/// [`INVALID_PREFIX_LIST_ID_NOT_FOUND`] with `The prefix list (<id>) does not exist.` — the
+/// id in parentheses, with the terminating full stop.
+///
+/// The ONE place that sentence lives, for every operation recorded answering it: the delete
+/// of a list, the read of its entries, the describe that reports it, and the transit gateway
+/// reference that points at it. The id is the one the REQUEST named and nothing else is in
+/// the text.
+///
+/// EC2 does NOT word this code one way everywhere, so an operation recorded answering another
+/// sentence keeps it rather than being moved here:
+/// `ModifyManagedPrefixList`, which REVISES the list, answers
+/// `managed_prefix_list_entries::prefix_list_not_found`'s `Prefix List <id> not found.`, and
+/// the operations that reference a list from another resource's request answer
+/// [`invalid_prefix_list_id_not_found`]'s `The <kind> '<id>' does not exist`.
+///
+/// `PrefixListResourceId` is a bare string in the model, so the id is named through
+/// [`echoed_resource_id`] — the one ceiling every refusal of this crate quotes a caller's id
+/// to — rather than repeated back at whatever length the request carried.
+pub fn prefix_list_does_not_exist<E>(prefix_list_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PREFIX_LIST_ID_NOT_FOUND,
+        400,
+        format!(
+            "The prefix list ({echoed}) does not exist.",
+            echoed = echoed_resource_id(prefix_list_id),
+        ),
+    )
+}
+
 /// Refuse a create that would take the store past [`MAX_MANAGED_PREFIX_LISTS`]: HTTP 400
 /// [`PREFIX_LIST_LIMIT_EXCEEDED`].
 pub fn prefix_list_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {

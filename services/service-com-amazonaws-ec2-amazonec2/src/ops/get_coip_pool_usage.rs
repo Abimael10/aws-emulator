@@ -13,8 +13,8 @@
 //! `InvalidPaginationToken`, a filter name this operation does not document is
 //! `InvalidParameterValue`, a `DryRun` request a caller holds the permissions for is
 //! `DryRunOperation`, and a `PoolId` that resolves to no pool of the account is refused the
-//! way the whole customer-owned-IP surface refuses one — `InvalidPoolID.NotFound` for a
-//! well-formed pool id nothing was created for.
+//! way the whole customer-owned-IP surface refuses one — `InvalidPoolID.NotFound` for a value
+//! of the pool-id form nothing was created for.
 //!
 //! ## Shape of an operation
 //!

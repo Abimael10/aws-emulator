@@ -68,19 +68,16 @@ use crate::state::{
 };
 
 /// Refuse a request that named an id no prefix list the caller can see carries: HTTP 400
-/// [`INVALID_PREFIX_LIST_ID_NOT_FOUND`], worded the way EC2 words THIS class — `Prefix List
-/// <id> not found.`
+/// [`INVALID_PREFIX_LIST_ID_NOT_FOUND`], worded the way EC2 words that code for the operation
+/// that REVISES a prefix list — `Prefix List <id> not found.`
 ///
-/// The wording of that refusal every operation that REPORTS or REVISES a prefix list answers
-/// with, so two reports of one unresolvable id cannot say different things. It is a wording of
-/// its own rather than the generic `The <kind> ID '<id>' does not exist`
-/// ([`crate::state::id_not_found`]) because EC2 words a prefix list's not-found that way and
-/// not the generic way — the same reason the Client VPN, IPAM and transit gateway surfaces of
-/// this crate each keep their own.
-///
-/// `DeleteManagedPrefixList` is NOT one of its callers: EC2 words the same code differently for
-/// that operation (`The prefix list (<id>) does not exist.`), which is the recorded contract of
-/// the delete, so that wording lives with the handler that answers it.
+/// `ModifyManagedPrefixList`'s own sentence, which is why it lives in that operation's
+/// module: EC2 does not word this code one way everywhere, and the operations that resolve a
+/// list TO REPORT ON OR REMOVE IT answer [`crate::state::prefix_list_does_not_exist`]'s `The
+/// prefix list (<id>) does not exist.` instead. The operations that merely REFERENCE a list
+/// from another resource's request and have no recorded sentence of their own (`CreateRoute`,
+/// `CreateIpamPrefixListResolverTarget`) answer this one too. The id is the one the request
+/// named and nothing else is in the text.
 pub fn prefix_list_not_found<E>(prefix_list_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_PREFIX_LIST_ID_NOT_FOUND,

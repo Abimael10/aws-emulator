@@ -946,6 +946,11 @@ pub const INVALID_POOL_ID_NOT_FOUND: &str = "InvalidPoolID.NotFound";
 /// EC2's error code for a value that is not an address-pool id at all, answered BEFORE the
 /// id is looked up — the customer-owned-IP surface's own `.Malformed`, the same ordering
 /// [`require_well_formed_id`] keeps for every other resource named by one id.
+///
+/// The code of the LIST selector `DescribeCoipPoolsRequest$PoolIds` (a `CoipPoolIdSet`), as
+/// recorded for a value of that list carrying another prefix. A member naming the ONE pool a
+/// call acts on targets `Ipv4PoolCoipId` instead, and is refused under that shape's own
+/// [`INVALID_IPV4_POOL_COIP_ID_MALFORMED`].
 pub const INVALID_POOL_ID_MALFORMED: &str = "InvalidPoolID.Malformed";
 
 /// EC2's error code for a pagination token this service did not issue.

@@ -142,9 +142,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::ops::modify_managed_prefix_list::managed_prefix_list_entries::{
-            prefix_list_not_found, require_prefix_list_versions,
-        };
+        use crate::ops::modify_managed_prefix_list::managed_prefix_list_entries::require_prefix_list_versions;
         use crate::state;
 
         // The request's own FORM first, before anything is resolved: "not a prefix list id at
@@ -207,8 +205,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .lock()
             .visible_prefix_list_entries(&region, &input.prefix_list_id);
         // A prefix list nothing the caller can see carries is an error, not an empty entry
-        // set — an empty entry set is what a list holding no entry reports.
-        let found = found.ok_or_else(|| prefix_list_not_found(&input.prefix_list_id))?;
+        // set — an empty entry set is what a list holding no entry reports. The refusal is
+        // the crate's one wording of that class for an operation that RESOLVES one list
+        // (`state::prefix_list_does_not_exist`), the sentence the delete of the same list
+        // answers, rather than the one `ModifyManagedPrefixList` answers when it revises it.
+        let found = found.ok_or_else(|| state::prefix_list_does_not_exist(&input.prefix_list_id))?;
 
         // "The version of the prefix list for which to return the entries. The default is
         // the current version" (`$TargetVersion`): a request naming no version is answered

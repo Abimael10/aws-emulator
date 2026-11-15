@@ -232,11 +232,12 @@ async fn deleting_the_same_pool_twice_refuses_the_second_call() {
 // ---------------------------------------------------------------------------
 
 /// A `CoipPoolId` that resolves to no pool of the account is refused and nothing is
-/// removed, and the CODE says HOW the value failed: a well-formed pool id nothing was
-/// created for is `InvalidPoolID.NotFound`, a value that READS as a pool id but carries a
-/// digit count EC2 never mints is `InvalidParameterValue`, and a value that is no pool id
-/// at all is this surface's own `InvalidIpv4PoolCoipId.Malformed`, spelled from the id
-/// member's name. The rows are each way a value can fail to resolve:
+/// removed, and the CODE says HOW the value failed: a value in a form this service MINTS,
+/// and any other value that READS as a pool id, is one this delete cannot act on
+/// (`InvalidParameterValue`, the recorded refusal of THIS operation), while a value that is
+/// no pool id at all is refused under the shape the member targets (`Ipv4PoolCoipId`) with
+/// this surface's own `InvalidIpv4PoolCoipId.Malformed`. The rows are each way a value can
+/// fail to resolve:
 /// both published EC2 id suffix lengths with digits nothing was created for, then three
 /// hexadecimal suffixes of other lengths (one digit, between the two, far past the longer),
 /// an upper-case suffix, a non-hex suffix, another resource's id, free text, and the empty
@@ -246,8 +247,8 @@ async fn a_pool_id_that_resolves_to_no_pool_is_refused() {
     let prefix = ec2::state::COIP_POOL_ID_PREFIX;
     let bad_value = ec2::state::INVALID_PARAMETER_VALUE;
     let malformed = ec2::state::INVALID_IPV4_POOL_COIP_ID_MALFORMED;
-    // The forms a pool id takes are `COIP_POOL_ID_PREFIX` plus 8 or 17 lowercase hex
-    // digits, which `ec2::state::coip_pool_id_is_well_formed` is the one reader of.
+    // A value READS as a pool id when it carries `COIP_POOL_ID_PREFIX` followed by lowercase
+    // hexadecimal digits, which `ec2::state::coip_pool_id_reads_as_one` is the one reader of.
     let cases = [
         // An id in a form this service MINTS but holds no pool for is a value this delete
         // cannot act on: the recorded refusal of THIS operation names the pool and answers
@@ -255,9 +256,9 @@ async fn a_pool_id_that_resolves_to_no_pool_is_refused() {
         // `InvalidPoolID.NotFound`.
         ("the long form", format!("{prefix}00000000000000000"), bad_value),
         ("the short form", format!("{prefix}00000000"), bad_value),
-        // The middle class is about the digit COUNT, not about any one value: a hexadecimal
-        // suffix one digit long, one between the two mintable lengths, and one far past the
-        // longer of them.
+        // The same answer for a readable id of any other digit COUNT, which is not what this
+        // refusal reads: a hexadecimal suffix one digit long, one between the two mintable
+        // lengths, and one far past the longer of them.
         ("one digit", format!("{prefix}0"), bad_value),
         ("neither length", format!("{prefix}0000000000000000"), bad_value),
         ("far too many digits", format!("{prefix}{}", "a".repeat(32)), bad_value),
@@ -287,9 +288,9 @@ async fn a_pool_id_that_resolves_to_no_pool_is_refused() {
             "case {case:?}: expected {expected_code:?}, got {body}"
         );
         let message = error_message(&body);
-        // Either refusal names the value the request sent, in the quoting of the ONE
-        // template this surface words a `CoipPoolId` it could not resolve with: the pool id
-        // single-quoted, with that class's own verdict after it.
+        // Either refusal names the value the request sent, single-quoted: the surface's own
+        // sentence for a `CoipPoolId` it could not resolve, or the crate's one template for a
+        // value that is no resource id of that kind at all.
         let expected_message = if expected_code == malformed {
             format!(
                 "The {resource} ID '{pool_id}' is malformed",

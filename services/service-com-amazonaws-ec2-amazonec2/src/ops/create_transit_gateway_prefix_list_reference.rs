@@ -225,19 +225,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .any(|published| published.prefix_list_id == input.prefix_list_id);
         if !visible_prefix_list {
-            return Err(Scaffolded::service_error(
-                state::INVALID_PREFIX_LIST_ID_NOT_FOUND,
-                400,
-                // The sentence this operation words that code with, which names the prefix
-                // list in parentheses rather than quoting an id — the wording of a recorded
-                // refusal of THIS operation, not of the prefix list surface's own
-                // ([`crate::state::invalid_prefix_list_id_not_found`], whose sentence other
-                // operations are recorded answering).
-                format!(
-                    "The prefix list ({prefix_list_id}) does not exist.",
-                    prefix_list_id = input.prefix_list_id,
-                ),
-            ));
+            // The sentence EC2 words this code with for an operation that RESOLVES one
+            // managed prefix list, which names the list in parentheses rather than quoting
+            // an id: the crate's one wording of it
+            // ([`crate::state::prefix_list_does_not_exist`]), shared with the delete of a
+            // list and the read of its entries.
+            return Err(state::prefix_list_does_not_exist(&input.prefix_list_id));
         }
 
         // "Information about the transit gateway attachment"

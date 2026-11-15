@@ -170,13 +170,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::ops::modify_managed_prefix_list::managed_prefix_list_entries::prefix_list_not_found;
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
             MAX_FILTERS, MAX_PAGE_SIZE, MAX_RESOURCE_IDS, MatchBudget, ServicePrefixList,
-            decode_page_token, encode_page_token, invalid_pagination_token_for, request_region,
-            service_prefix_lists_in_region,
+            decode_page_token, encode_page_token, invalid_pagination_token_for,
+            prefix_list_does_not_exist, request_region, service_prefix_lists_in_region,
         };
 
         // A Region's prefix lists are derived, not stored, so this operation never
@@ -281,13 +280,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let published = service_prefix_lists_in_region(&region);
 
         // An id that names none of the Region's prefix lists is an error, not an absent
-        // row — the same answer `DescribeVpcs` gives for an unknown VPC id.
+        // row — the same answer `DescribeVpcs` gives for an unknown VPC id. Worded the way
+        // EC2 words this class for the operations that resolve a prefix list to report on it
+        // (`crate::state::prefix_list_does_not_exist`).
         if let Some(unknown) = requested_ids.iter().find(|id| {
             !published
                 .iter()
                 .any(|list| list.prefix_list_id == id.as_str())
         }) {
-            return Err(prefix_list_not_found(unknown));
+            return Err(prefix_list_does_not_exist(unknown));
         }
 
         // "The default is to describe all your prefix lists": `PrefixListIds` narrows

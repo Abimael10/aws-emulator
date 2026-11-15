@@ -19,9 +19,6 @@
 // address carries no public DNS name. Declared beside `prefix_lists` for the reason the note
 // above gives: the sorted neighbourhood and the tail of this file are where every new ec2
 // suite inserts its lines.
-// An account's EGRESS-ONLY internet gateways: the create that mints one for a VPC and attaches
-// it, the report that selects and pages over them, the delete that takes one away, and what
-// each of the three refuses. Declared FIRST for the reason the note above gives: the sorted
 // `DescribeSnapshotAttribute`: the one attribute a read reports of a snapshot of each side of
 // the account-visible inventory — who may create a volume from it and the Marketplace codes it
 // is billed through — plus what it refuses. Declared beside `prefix_lists` for the reason the
@@ -39,8 +36,13 @@ mod snapshot_attributes;
 // and through `DescribeTags`, and an id that names nothing is refused in its kind's words.
 // Declared beside `prefix_lists` for the reason the note above gives: the sorted
 // neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
-#[path = "all/egress_only_internet_gateways.rs"]
-mod egress_only_internet_gateways;
+// What a refusal SAYS about the value it could not use: a customer-owned address pool id
+// answered by the FORM of the value, the one sentence every read of a prefix list words its
+// not-found with, and the LEAF member a rule missing a required port range or ICMP pair names.
+// Declared beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood
+// and the tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/refusal_names_the_shape_and_the_missing_leaf.rs"]
+mod refusal_names_the_shape_and_the_missing_leaf;
 #[path = "all/read_optional_members.rs"]
 mod read_optional_members;
 #[path = "all/prefix_lists.rs"]
@@ -49,8 +51,6 @@ mod prefix_lists;
 // figures, the attachment limit, the local devices, the network performance, the processor's
 // sustained frequency, the core counts and the host features of each one, served from that
 // type's own published catalog row rather than scaled from the size multiplier in its name.
-// Declared beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood
-// and the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/published_nvme_compute_catalog_rows.rs"]
 mod published_nvme_compute_catalog_rows;
 // `ModifyInstanceAttribute`: the one attribute a modify writes onto the stored instance, read
@@ -832,6 +832,10 @@ mod capacity_manager_attributes;
 // concurrent ec2 landings insert their lines.
 #[path = "all/accept_capacity_reservation_billing_ownership.rs"]
 mod accept_capacity_reservation_billing_ownership;
+// What `AssociateCapacityReservationBillingOwner` writes: the pending billing assignment
+// request a Capacity Reservation owner initiates for a consumer account, and what it refuses.
+#[path = "all/associate_capacity_reservation_billing_owner.rs"]
+mod associate_capacity_reservation_billing_owner;
 #[path = "all/capacity_reservation_billing_requests.rs"]
 mod capacity_reservation_billing_requests;
 // Which Region `CreateCapacityReservationCancellationQuote` resolves the reservation it
@@ -2414,10 +2418,6 @@ mod taggable_resource_kinds;
 // declared range, and the enum value it reads without regard to case.
 #[path = "all/parameter_refusal_codes.rs"]
 mod parameter_refusal_codes;
-// What `AssociateCapacityReservationBillingOwner` writes: the pending billing assignment
-// request a Capacity Reservation owner initiates for a consumer account, and what it refuses.
-#[path = "all/associate_capacity_reservation_billing_owner.rs"]
-mod associate_capacity_reservation_billing_owner;
 // What `DeleteIpam` records: the stored IPAM written into the transient delete state of its own
 // catalog with the clock owing its removal, answered with every other member unchanged, read back
 // through `DescribeIpams` and then gone with the scopes it contained and the pools created in them
@@ -2441,6 +2441,11 @@ mod purchase_reserved_instances_offering;
 // anything. Declared at the tail of this file, which is where every new ec2 suite lands.
 #[path = "all/delete_transit_gateway_metering_policy_entry.rs"]
 mod delete_transit_gateway_metering_policy_entry;
+// An account's EGRESS-ONLY internet gateways: the create that mints one for a VPC and attaches
+// it, the report that selects and pages over them, the delete that takes one away, and what
+// each of the three refuses. Declared FIRST for the reason the note above gives: the sorted
+#[path = "all/egress_only_internet_gateways.rs"]
+mod egress_only_internet_gateways;
 // The per-instance-type rows the catalog publishes for a network optimized compute family —
 // its memory, EBS, network, processor, core-count and host-feature members, beside two sizes
 // of two other compute families — and the whole member set each of them carries. Declared

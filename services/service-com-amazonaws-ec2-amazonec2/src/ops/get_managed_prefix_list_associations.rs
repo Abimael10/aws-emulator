@@ -209,12 +209,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A prefix list nothing the caller can see carries is an error, not an empty
         // association set — an empty set is what a list nothing references reports. The
         // visibility asked is the one the entry report asks, so an id names the same list
-        // whichever of the two is called.
+        // whichever of the two is called, and so is the WORDING of that refusal: the
+        // sentence EC2 words this class with for the operations that resolve one managed
+        // prefix list to report on it (`crate::state::prefix_list_does_not_exist`).
         if store
             .visible_prefix_list_entries(&region, &input.prefix_list_id)
             .is_none()
         {
-            return Err(state::invalid_prefix_list_id_not_found(&input.prefix_list_id));
+            return Err(state::prefix_list_does_not_exist(&input.prefix_list_id));
         }
         let associations = prefix_list_associations(&store, &input.prefix_list_id);
         // The store's lock is not held across the paging below: every row is owned by now, and

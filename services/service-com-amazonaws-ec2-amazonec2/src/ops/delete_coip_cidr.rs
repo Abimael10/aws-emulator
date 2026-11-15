@@ -162,10 +162,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "no such pool" from "that pool holds no such range". An id that resolves to no pool
         // of the account is refused through the crate's one reader of that failure,
         // `state::coip_pool_id_does_not_exist`, which is what decides HOW the value failed —
-        // `InvalidPoolID.Malformed` for a value that is no pool id at all,
-        // `InvalidParameterValue` for one whose digit count EC2 never mints, and
-        // `InvalidPoolID.NotFound` for a well-formed id naming no pool — so this operation
-        // answers a bad `CoipPoolId` exactly as `DeleteCoipPool` and `GetCoipPoolUsage` do.
+        // `InvalidIpv4PoolCoipId.Malformed` for a value that is no pool id at all (the class
+        // keyed to the shape this member targets), and `InvalidPoolID.NotFound` for a value
+        // of that form naming no pool — so this operation answers a bad `CoipPoolId` exactly
+        // as `CreateCoipCidr` and `GetCoipPoolUsage` do.
         let pool_id = input.coip_pool_id.as_str();
         let pool = store
             .coip_pools

@@ -320,25 +320,26 @@ async fn a_range_is_named_by_the_addresses_it_covers() {
 // ---------------------------------------------------------------------------
 
 /// A `CoipPoolId` that resolves to no pool of the account is refused and nothing is removed,
-/// and the CODE says HOW the value failed: a well-formed pool id nothing was created for is
-/// `InvalidPoolID.NotFound`, a value that READS as a pool id but carries a digit count EC2
-/// never mints is `InvalidParameterValue`, and a value that is no pool id at all is
-/// `InvalidPoolID.Malformed`. The pool is resolved BEFORE the range, so the answer does not
-/// depend on the `Cidr` the request sent. The rows are each way a value can fail to resolve.
+/// and the CODE says HOW the value failed: a value OF the pool-id form that names no pool is
+/// `InvalidPoolID.NotFound`, whatever digit count it carries, while a value that is no pool
+/// id at all is refused under the shape this member targets (`Ipv4PoolCoipId`) with
+/// `InvalidIpv4PoolCoipId.Malformed`. The pool is resolved BEFORE the range, so the answer
+/// does not depend on the `Cidr` the request sent. The rows are each way a value can fail to
+/// resolve.
 #[tokio::test]
 async fn a_pool_id_that_resolves_to_no_pool_is_refused() {
     let prefix = ec2::state::COIP_POOL_ID_PREFIX;
     let not_found = ec2::state::INVALID_POOL_ID_NOT_FOUND;
-    let bad_value = ec2::state::INVALID_PARAMETER_VALUE;
-    let malformed = ec2::state::INVALID_POOL_ID_MALFORMED;
-    // The forms a pool id takes are `COIP_POOL_ID_PREFIX` plus 8 or 17 lowercase hex digits,
-    // which `ec2::state::coip_pool_id_is_well_formed` is the one reader of.
+    let malformed = ec2::state::INVALID_IPV4_POOL_COIP_ID_MALFORMED;
+    // A value READS as a pool id when it carries `COIP_POOL_ID_PREFIX` followed by lowercase
+    // hexadecimal digits, which `ec2::state::coip_pool_id_reads_as_one` is the one reader of;
+    // the two lengths a mint issues (8 and 17) are not what decides this refusal.
     let cases = [
         ("the long form", format!("{prefix}00000000000000000"), not_found),
         ("the short form", format!("{prefix}00000000"), not_found),
-        ("one digit", format!("{prefix}0"), bad_value),
-        ("neither length", format!("{prefix}0000000000000000"), bad_value),
-        ("far too many digits", format!("{prefix}{}", "a".repeat(32)), bad_value),
+        ("one digit", format!("{prefix}0"), not_found),
+        ("neither length", format!("{prefix}0000000000000000"), not_found),
+        ("far too many digits", format!("{prefix}{}", "a".repeat(32)), not_found),
         ("an upper-case suffix", format!("{prefix}0ABCDEF01"), malformed),
         ("a non-hex suffix", format!("{prefix}zzzzzzzz"), malformed),
         (
@@ -372,14 +373,18 @@ async fn a_pool_id_that_resolves_to_no_pool_is_refused() {
             expected_code,
             "case {case:?}: expected {expected_code:?}, got {body}"
         );
-        if expected_code != malformed {
-            let message = error_message(&body);
-            assert_eq!(
-                message,
-                format!("The pool ID '{pool_id}' does not exist."),
-                "case {case:?}: expected the surface's one sentence, got {message:?}"
-            );
-        }
+        let message = error_message(&body);
+        let expected_message = if expected_code == malformed {
+            // The crate's one template for a malformed resource id, naming the pool by the
+            // token the modelled `ResourceType` catalog spells it with.
+            format!("The coip-pool ID '{pool_id}' is malformed")
+        } else {
+            format!("The pool ID '{pool_id}' does not exist.")
+        };
+        assert_eq!(
+            message, expected_message,
+            "case {case:?}: expected {expected_message:?}, got {message:?}"
+        );
         let after = snapshot(&router, case, &seeded).await;
         assert_eq!(
             after, before,

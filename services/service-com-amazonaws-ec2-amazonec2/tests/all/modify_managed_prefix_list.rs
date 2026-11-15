@@ -923,9 +923,10 @@ async fn a_dry_run_changes_nothing_and_the_revision_after_it_does() {
 }
 
 /// Rule 5, the WORDING of one refusal class: an id no prefix list the caller can see carries
-/// is refused `Prefix List <id> not found.` — the fixed text EC2 words
-/// `InvalidPrefixListID.NotFound` with, carrying only the id the request named, and the same
-/// from every operation that resolves a prefix list id.
+/// is refused HTTP 400 `InvalidPrefixListID.NotFound`, and EC2 does not word that code one
+/// way for every operation — the operations that resolve a list TO REPORT ON it answer `The
+/// prefix list (<id>) does not exist.`, while THIS operation, which revises the list, answers
+/// `Prefix List <id> not found.` Each sentence carries only the id the request named.
 #[tokio::test]
 async fn an_unresolvable_prefix_list_id_is_refused_with_one_wording() {
     let (router, _engine) = super::ec2_query::emulator();
@@ -933,29 +934,44 @@ async fn an_unresolvable_prefix_list_id_is_refused_with_one_wording() {
     // Both id forms EC2 mints for a prefix list — the short one and the long one — neither of
     // which this emulator holds a list under.
     for unknown in ["pl-0a1b2c3d", "pl-00000000000000000"] {
-        let expected = format!("Prefix List {unknown} not found.");
-        let calls: Vec<(&str, Vec<Field>)> = vec![
+        let revised = format!("Prefix List {unknown} not found.");
+        let reported = format!("The prefix list ({unknown}) does not exist.");
+        let calls: Vec<(&str, Vec<Field>, &String)> = vec![
             (
                 "ModifyManagedPrefixList",
                 vec![
                     param("PrefixListId", unknown),
                     param("PrefixListName", "renamed"),
                 ],
+                &revised,
             ),
             (
                 "GetManagedPrefixListEntries",
                 vec![param("PrefixListId", unknown)],
+                &reported,
+            ),
+            (
+                "GetManagedPrefixListAssociations",
+                vec![param("PrefixListId", unknown)],
+                &reported,
             ),
             (
                 "DescribeManagedPrefixLists",
                 vec![param("PrefixListId.1", unknown)],
+                &reported,
             ),
             (
                 "DescribePrefixLists",
                 vec![param("PrefixListId.1", unknown)],
+                &reported,
+            ),
+            (
+                "DeleteManagedPrefixList",
+                vec![param("PrefixListId", unknown)],
+                &reported,
             ),
         ];
-        for (action, params) in &calls {
+        for (action, params, expected) in &calls {
             let (status, body) = super::ec2_query::call(&router, REGION, action, params).await;
             assert_eq!(
                 status, 400,
@@ -969,8 +985,8 @@ async fn an_unresolvable_prefix_list_id_is_refused_with_one_wording() {
                  {body}"
             );
             assert_eq!(
-                error_message(&body),
-                expected,
+                &error_message(&body),
+                *expected,
                 "case {action:?} with {unknown:?}: expected the message {expected:?}, got {actual:?}",
                 actual = error_message(&body)
             );

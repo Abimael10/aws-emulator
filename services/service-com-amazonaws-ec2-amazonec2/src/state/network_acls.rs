@@ -383,15 +383,15 @@ pub fn validated_network_acl_entry<E>(
         protocol_number,
         Some(NETWORK_ACL_PROTOCOL_TCP) | Some(NETWORK_ACL_PROTOCOL_UDP)
     );
-    if needs_port_range && port_range.is_none() {
-        return Err(missing_parameter(format!(
-            "The request must contain the parameter portRange for protocol {protocol}"
-        )));
-    }
-    if let Some(range) = port_range.as_ref() {
-        // A range is both of its ports: a request that sends one of them has not named a
-        // range at all, which is the member that is missing rather than a range whose ports
-        // are in the wrong order.
+    if needs_port_range || port_range.is_some() {
+        // A range is both of its ports, so a request that named neither of them has not
+        // named a range any more than one that named only the first has: what is missing
+        // from such a request is a LEAF of the member — `portRange.from` before
+        // `portRange.to` — and that leaf is what the refusal names, because the member the
+        // caller has to fill in is the one AWS's sentence for this class carries. Nothing is
+        // added to that sentence: which protocol made the range necessary is already in the
+        // request the caller sent.
+        let range = port_range.clone().unwrap_or_default();
         let (Some(from), Some(to)) = (range.from, range.to) else {
             return Err(missing_parameter(format!(
                 "The request must contain the parameter portRange.{half}",
@@ -420,9 +420,13 @@ pub fn validated_network_acl_entry<E>(
     let needs_icmp_type_code = protocol_number == Some(NETWORK_ACL_PROTOCOL_ICMP)
         || (protocol_number == Some(NETWORK_ACL_PROTOCOL_ICMPV6) && ipv6_cidr_block.is_some());
     if needs_icmp_type_code && requested.icmp_type_code.is_none() {
-        return Err(missing_parameter(format!(
-            "The request must contain the parameter icmpTypeCode for protocol {protocol}"
-        )));
+        // The leaf the caller has to fill in, the way a required port range names
+        // `portRange.from`: a type and code is both of its numbers, so the first of them is
+        // what a request that carries neither is missing. Nothing is added to the sentence —
+        // which protocol made the member necessary is already in the request.
+        return Err(missing_parameter(
+            "The request must contain the parameter icmpTypeCode.type",
+        ));
     }
     // A type and code that ARE given have to be an ICMP type and code, whatever the
     // protocol, the way a port range that is given has to be a range of ports: each is one

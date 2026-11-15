@@ -94,21 +94,14 @@ impl From<DeleteManagedPrefixListErrorModeled> for DeleteManagedPrefixListError 
     }
 }
 
-/// Refuse a delete that named an id no prefix list of the account carries: HTTP 400
-/// [`crate::state::INVALID_PREFIX_LIST_ID_NOT_FOUND`], worded the way EC2 words that code FOR
-/// THIS OPERATION — `The prefix list (<id>) does not exist.`
-///
-/// A wording of its own rather than a second caller of the crate's shared one
-/// (`managed_prefix_list_entries::prefix_list_not_found`, `Prefix List <id> not found.`): the
-/// operations that REPORT or REVISE a prefix list word the code that way and the delete words it
-/// this way, so each answers the message its own caller is told. The id is the one the request
-/// named and nothing else is in the text.
+/// The refusal a delete that named an id no prefix list of the account carries answers: the
+/// crate's one wording of HTTP 400 [`crate::state::INVALID_PREFIX_LIST_ID_NOT_FOUND`] for an
+/// operation that RESOLVES one managed prefix list
+/// ([`crate::state::prefix_list_does_not_exist`], `The prefix list (<id>) does not exist.`),
+/// shared with the read of a list's entries and the describe that reports it rather than
+/// written out again here.
 fn prefix_list_does_not_exist(prefix_list_id: &str) -> DeleteManagedPrefixListError {
-    crate::scaffolded::Scaffolded::service_error(
-        crate::state::INVALID_PREFIX_LIST_ID_NOT_FOUND,
-        400,
-        format!("The prefix list ({prefix_list_id}) does not exist."),
-    )
+    crate::state::prefix_list_does_not_exist(prefix_list_id)
 }
 
 /// The `DeleteManagedPrefixList` operation.
