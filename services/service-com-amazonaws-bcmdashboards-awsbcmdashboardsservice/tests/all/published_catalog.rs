@@ -35,11 +35,11 @@ use super::resource_not_found::assert_not_found;
 
 /// When the catalog was published, as seconds since the Unix epoch: the `createdAt` every
 /// published entry carries, from the recorded listing.
-const PUBLISHED_AT: f64 = 1_786_644_000.0;
+pub(crate) const PUBLISHED_AT: f64 = 1_786_644_000.0;
 
 /// When the catalog was last revised, as seconds since the Unix epoch: the `updatedAt` of
 /// every entry revised since publication, from the recorded listing.
-const REVISED_AT: f64 = 1_787_079_600.0;
+pub(crate) const REVISED_AT: f64 = 1_787_079_600.0;
 
 /// The published catalog: one row per entry, as
 /// `(resource id, name, description, updatedAt)`.
@@ -48,7 +48,7 @@ const REVISED_AT: f64 = 1_787_079_600.0;
 /// `GetDashboard` of each of these ARNs — the catalog's own ids, text and instants, which
 /// every account holds alike. The `Reservations` entry has not been revised since the
 /// catalog was published, so its `updatedAt` is the publication instant itself.
-const PUBLISHED_CATALOG: [(&str, &str, &str, f64); 5] = [
+pub(crate) const PUBLISHED_CATALOG: [(&str, &str, &str, f64); 5] = [
     (
         "4dc5619130f2463687fc45e003e4b930",
         "Cost Overview and Trends",
@@ -97,7 +97,7 @@ const COST_OVERVIEW_WIDGET_IDS: [&str; 9] = [
 
 /// The ARN the catalog publishes for the entry under `resource_id`:
 /// `DashboardArn`'s modelled form with the catalog's `managed-` resource-id prefix.
-fn published_arn(resource_id: &str) -> String {
+pub(crate) fn published_arn(resource_id: &str) -> String {
     engine::emulator_arn(
         "bcm-dashboards",
         "",

@@ -47,6 +47,8 @@ mod delete_scheduled_report;
 mod error_message_length_bound;
 #[path = "all/execution_token_scope.rs"]
 mod execution_token_scope;
+#[path = "all/list_dashboards_published_membership.rs"]
+mod list_dashboards_published_membership;
 #[path = "all/listing_pagination.rs"]
 mod listing_pagination;
 #[path = "all/managed_dashboard_catalog.rs"]
