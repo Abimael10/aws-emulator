@@ -2214,3 +2214,15 @@ mod zz_probe_whole_emulator;
 // declaration names is compiled nowhere. The `all_rs_*` suites,
 // `all/declaration_roots_are_canonical_and_complete.rs` check all of that, for this file
 // This file is a test-target CRATE ROOT, where a bare `mod` would resolve to a SIBLING of
+// name, and no other line. Put a new suite at `tests/all/<name>.rs` and insert its pair into
+// the sorted list below; what that suite covers, and why it drives the assembled router rather
+// than one service crate, belongs in that suite's own module header, where it is read beside
+// the test it explains, and the notes earlier landings appended to this file live in
+// comment is legal only before the first item, so a re-typed copy of one appended past the
+// list is `E0753` and compiles no suite of this target. A name declared twice is `E0428`, and
+// a suite file no declaration names is compiled nowhere. The `all_rs_*` suites and
+// `all/every_suite_file_is_declared.rs` pin those rules, so a note about them belongs there
+// rather than here.
+// `tests/all.rs` is a test-target CRATE ROOT, where a bare `mod` resolves to a SIBLING under
+// `tests/` that the layout check refuses: the `#[path]` above each declaration is what points
+// it into `tests/all/`.

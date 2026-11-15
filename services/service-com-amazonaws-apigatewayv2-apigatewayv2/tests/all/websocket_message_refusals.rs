@@ -52,12 +52,12 @@ const STAGE: &str = "prod";
 /// the 128 KiB API Gateway publishes as a WebSocket api's message payload quota, which is also
 /// the maximum the push the other way is modelled at (`PostToConnection$Data`,
 /// `@length(max: 131072)`, of the `@connections` management API).
-const MESSAGE_CEILING_BYTES: usize = 131_072;
+pub(crate) const MESSAGE_CEILING_BYTES: usize = 131_072;
 
 /// The largest payload ONE frame of a client's message carries, in bytes: the 32 KiB API
 /// Gateway publishes as a WebSocket api's frame quota, so a message at
 /// [`MESSAGE_CEILING_BYTES`] arrives as several frames.
-const FRAGMENT_BYTES: usize = 32 * 1024;
+pub(crate) const FRAGMENT_BYTES: usize = 32 * 1024;
 
 /// The RFC 6455 §7.4.1 status codes a refused message is closed with: 1003 for "data within a
 /// message that it does not understand", 1009 for "a message that is too big for it to
@@ -77,11 +77,11 @@ fn close_past_frame_quota(bound_bytes: usize) -> Answer {
 /// The 1009 close of a MESSAGE whose assembled payload passes the per-message ceiling: the
 /// fixed text API Gateway words that class with, which names no bound — every frame of such a
 /// message was inside the frame quota.
-const CLOSE_MESSAGE_TOO_BIG: (u16, &str) = (1009, "Message too big");
+pub(crate) const CLOSE_MESSAGE_TOO_BIG: (u16, &str) = (1009, "Message too big");
 
 /// What the `$default` route's MOCK integration renders for a message it serves, so a served
 /// message is observable by the frame it is answered with.
-const SERVED_REPLY: &str = r#"{"served":"yes"}"#;
+pub(crate) const SERVED_REPLY: &str = r#"{"served":"yes"}"#;
 
 /// How long a case waits for the frame its message is answered with before failing: generous
 /// for a loaded test machine, and bounded so a case that will never be answered fails instead
@@ -90,7 +90,7 @@ const FRAME_DEADLINE: Duration = Duration::from_secs(30);
 
 /// What a client reads back after sending one message.
 #[derive(Debug, PartialEq, Eq)]
-enum Answer {
+pub(crate) enum Answer {
     /// The payload the serving route's integration response rendered.
     Reply(String),
     /// A CLOSE frame: the status code it carried (`None` for a close carrying none) and the
@@ -102,13 +102,17 @@ enum Answer {
 }
 
 /// The answer a refusal is: the close it states, as a row spells that refusal out.
-fn closed((code, reason): (u16, &str)) -> Answer {
+pub(crate) fn closed((code, reason): (u16, &str)) -> Answer {
     Answer::Close(Some(code), reason.to_string())
 }
 
 /// A WEBSOCKET api deployed with a TWO-WAY `$default` route over a MOCK integration that
 /// renders [`SERVED_REPLY`], whatever the message's own body is.
-async fn deployed_api(emulator: &MultiServiceRouter, case: &str, name: &str) -> Api {
+pub(crate) async fn deployed_api(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> Api {
     let api = create_api(emulator, case, name).await;
     let integration = create_integration(
         emulator,
@@ -137,7 +141,7 @@ async fn deployed_api(emulator: &MultiServiceRouter, case: &str, name: &str) -> 
 }
 
 /// Open one connection of `api`'s own socket.
-async fn connect(case: &str, api: &Api) -> ClientSocket {
+pub(crate) async fn connect(case: &str, api: &Api) -> ClientSocket {
     handshake_at(case, &api.authority, &format!("/{STAGE}"))
         .await
         .unwrap_or_else(|status| panic!("case {case:?}: the handshake must complete, got {status}"))
@@ -148,7 +152,11 @@ async fn connect(case: &str, api: &Api) -> ClientSocket {
 /// A write that fails is not a failure of the case: a connection the api has already refused
 /// and closed is one the rest of a message cannot be written to, and what the api answered is
 /// read from the frames it wrote before that.
-async fn answer(case: &str, socket: &mut ClientSocket, frames: Vec<Message>) -> Answer {
+pub(crate) async fn answer(
+    case: &str,
+    socket: &mut ClientSocket,
+    frames: Vec<Message>,
+) -> Answer {
     for frame in frames {
         if socket.send(frame).await.is_err() {
             break;
@@ -175,7 +183,7 @@ async fn answer(case: &str, socket: &mut ClientSocket, frames: Vec<Message>) -> 
 
 /// After a refusal the connection is over: whatever the transport reports next, it is never
 /// another frame of the api — in particular never the reply a served message gets.
-async fn ended(case: &str, socket: &mut ClientSocket) {
+pub(crate) async fn ended(case: &str, socket: &mut ClientSocket) {
     match tokio::time::timeout(FRAME_DEADLINE, socket.next()).await {
         Ok(None) | Ok(Some(Err(_))) => {}
         Ok(Some(Ok(frame))) => panic!(
@@ -188,29 +196,43 @@ async fn ended(case: &str, socket: &mut ClientSocket) {
 }
 
 /// `count` bytes of text, as a message of that size.
-fn text_of(count: usize) -> String {
+pub(crate) fn text_of(count: usize) -> String {
     "a".repeat(count)
 }
 
-/// One text message of `count` bytes, written as fragments of at most [`FRAGMENT_BYTES`]: the
-/// first frame carries the text opcode and is not final, every later frame continues it, and
-/// the last one ends the message (RFC 6455 §5.4).
+/// One text message of `count` bytes, written as fragments of at most [`FRAGMENT_BYTES`].
 fn fragments(count: usize) -> Vec<Message> {
-    let payload = text_of(count).into_bytes();
-    let chunks: Vec<&[u8]> = payload.chunks(FRAGMENT_BYTES).collect();
-    let last = chunks.len().saturating_sub(1);
-    chunks
+    let whole = count / FRAGMENT_BYTES;
+    let rest = count % FRAGMENT_BYTES;
+    let mut sizes = vec![FRAGMENT_BYTES; whole];
+    if rest > 0 || sizes.is_empty() {
+        sizes.push(rest);
+    }
+    fragments_of(&sizes)
+}
+
+/// One text message of `sizes.iter().sum()` bytes, written as the fragments `sizes` names, in
+/// bytes: the first frame carries the text opcode and is not final, every later frame continues
+/// it, and the last one ends the message (RFC 6455 §5.4). A single size is therefore one
+/// ordinary text frame.
+pub(crate) fn fragments_of(sizes: &[usize]) -> Vec<Message> {
+    let payload = text_of(sizes.iter().sum()).into_bytes();
+    let last = sizes.len().saturating_sub(1);
+    let mut at = 0usize;
+    sizes
         .iter()
         .enumerate()
-        .map(|(at, chunk)| {
-            let opcode = match at {
+        .map(|(index, size)| {
+            let chunk = &payload[at..at + size];
+            at += size;
+            let opcode = match index {
                 0 => OpCode::Data(Data::Text),
                 _ => OpCode::Data(Data::Continue),
             };
             Message::Frame(Frame::message(
                 Bytes::copy_from_slice(chunk),
                 opcode,
-                at == last,
+                index == last,
             ))
         })
         .collect()
