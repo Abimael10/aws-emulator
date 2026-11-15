@@ -18,15 +18,21 @@
 //!   callback transport, which hands it to this process's router; no host name the guest
 //!   supplies is resolved and no socket is opened, so no call can leave the process. The
 //!   framework's own callback recursion limit bounds a chain of self-invocations.
-//! * The guest never sees a credential. The signature is put on the request by host code
-//!   with the credential the invocation was given — the session of the function's own
-//!   EXECUTION ROLE ([`super::execution_role_session`]), or the credential the framework
+//! * The guest never sees the INVOCATION's credential. The signature is put on the request by
+//!   host code with the credential the invocation was given — the session of the function's
+//!   own EXECUTION ROLE ([`super::execution_role_session`]), or the credential the framework
 //!   hands this emulator's handlers where no session could be minted — exactly as every
 //!   other in-process call between two emulated services is signed
-//!   ([`::service_common::in_process_sigv4`]); nothing of it is returned to the guest, and
-//!   the guest cannot ask for a call to be signed as anything else. So the service that
+//!   ([`::service_common::in_process_sigv4`]); nothing of it is returned to the guest, and the
+//!   guest can neither read it nor ask for a call to be signed as it. So the service that
 //!   SERVES the call judges it against the policies in force on that role, which is what
 //!   "the function runs as its execution role" means on the wire.
+//! * A call made through an SDK client the handler built WITH CREDENTIALS OF ITS OWN is signed
+//!   with those instead ([`CallerIdentity::supplied`]), because that is what every AWS SDK
+//!   does with the credentials its client holds — a handler that assumed another role calls
+//!   the next service as that session, and the serving service judges it on the policies in
+//!   force on THAT identity. Nothing is minted here and nothing is taken on trust: a
+//!   credential this emulator did not vend verifies nowhere.
 //! * Only the services in [`APIS`] are reachable, and only the operations their own models
 //!   bind. A token that is not in that table is REFUSED rather than guessed at: the guest
 //!   is told the service is unknown, and nothing is sent.
@@ -165,6 +171,10 @@ pub enum Protocol {
     /// SNS client this crate holds ([`super::aws_sns`]) rather than by either JSON path
     /// above.
     SnsQuery,
+    /// The security token service's `awsQuery`: the same binding, for the service a handler
+    /// assumes another role through, built by the client this crate holds for it
+    /// ([`super::aws_sts`]).
+    StsQuery,
 }
 
 impl Api {
@@ -182,7 +192,8 @@ impl Api {
             Protocol::RestJson(_)
             | Protocol::S3Rest
             | Protocol::CloudFrontRest
-            | Protocol::SnsQuery => "application/json".to_string(),
+            | Protocol::SnsQuery
+            | Protocol::StsQuery => "application/json".to_string(),
         }
     }
 }
@@ -235,6 +246,29 @@ pub const APIS: &[Api] = &[
         // The answer of such a call is read by that client out of the XML the service sent,
         // and the document this seam hands the guest is built from the output members it
         // reported ([`super::aws_sns`]); none of them carries bytes.
+        answer_model: None,
+    },
+    // `services/service-com-amazonaws-sts-awssecuritytokenservicev20110615/smithy-model/
+    // com-amazonaws-sts-awssecuritytokenservicev20110615.json`: awsQuery, sigv4Name `sts`,
+    // endpointPrefix `sts`, sdkId `STS`. Its operations carry their input as the parameters of
+    // a form-encoded `Action` and answer an XML document, so the request is built by
+    // [`super::aws_sts`].
+    //
+    // ASSUMING ANOTHER ROLE is the shape AWS documents for a function that reaches a resource
+    // of another account, or that narrows what one of its own calls may do: the handler calls
+    // `AssumeRole` as its own execution role and then calls the next service with the session
+    // it was vended. Reading back WHICH identity the function runs as is the other call every
+    // handler that logs or audits its own calls makes. A handler that cannot reach this
+    // service can do neither.
+    Api {
+        sdk_token: "sts",
+        signing_name: "sts",
+        endpoint_prefix: "sts",
+        model: Some(STS_MODEL),
+        protocol: Protocol::StsQuery,
+        // The answer of such a call is read by that client out of the XML the service sent,
+        // and the document this seam hands the guest is built from the output members it
+        // reported ([`super::aws_sts`]); none of them carries bytes.
         answer_model: None,
     },
     // `services/service-com-amazonaws-eventbridge-awsevents/smithy-model/
@@ -897,6 +931,10 @@ pub(super) const SNS_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-sns-amazonsimplenotificationservice/smithy-model/\
      com-amazonaws-sns-amazonsimplenotificationservice.json"
 );
+pub(super) const STS_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-sts-awssecuritytokenservicev20110615/smithy-model/\
+     com-amazonaws-sts-awssecuritytokenservicev20110615.json"
+);
 pub(super) const EVENTBRIDGE_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-eventbridge-awsevents/smithy-model/\
      com-amazonaws-eventbridge-awsevents.json"
@@ -1261,6 +1299,59 @@ impl ::std::fmt::Debug for CallerIdentity {
     }
 }
 
+impl CallerIdentity {
+    /// The credentials an SDK CLIENT THE GUEST BUILT was given, read from the document that
+    /// client hands over with each of its calls — `Ok(None)` for a client built with none,
+    /// which signs as the identity the invocation itself was given.
+    ///
+    /// Every AWS SDK signs a call with the credentials the client was built with: a handler
+    /// that was vended a session by the token service and builds a client with it is calling
+    /// AS that session, and the service serving the call judges it against the policies in
+    /// force on THAT identity. So the values are read here and put on the request's signature
+    /// and session-token headers exactly as the invocation's own are; nothing is minted and
+    /// nothing is trusted — a credential this emulator did not vend verifies nowhere, which is
+    /// the answer the serving service gives it.
+    ///
+    /// `Err` for a document that is not a credential at all, so a call the guest asked to be
+    /// signed as something this seam could not read is not quietly signed as the invocation's
+    /// own identity.
+    pub fn supplied(document: &str) -> Result<Option<Self>, String> {
+        if document.trim().is_empty() {
+            return Ok(None);
+        }
+        let read: ::serde_json::Value = ::serde_json::from_str(document)
+            .map_err(|error| format!("the client's credentials are not a document: {error}"))?;
+        let text = |name: &str| {
+            read.get(name)
+                .and_then(::serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let access_key_id = text("accessKeyId");
+        let secret_access_key = text("secretAccessKey");
+        if access_key_id.is_empty() || secret_access_key.is_empty() {
+            return Err(
+                "the client was built with an access key id and a secret access key together, \
+                 or with neither"
+                    .to_string(),
+            );
+        }
+        Ok(Some(Self {
+            access_key_id,
+            secret_access_key,
+            session_token: text("sessionToken"),
+        }))
+    }
+
+    /// The SESSION TOKEN this credential travels with, or `None` for a long-term credential,
+    /// which has none: the header a temporary credential is served with is put on a request
+    /// only where there is a token to put in it.
+    #[must_use]
+    pub fn token(&self) -> Option<&str> {
+        (!self.session_token.is_empty()).then_some(self.session_token.as_str())
+    }
+}
+
 /// What a running handler reaches the rest of this emulator through.
 ///
 /// Built from the operation context of the call that started the run, so the callback it
@@ -1496,6 +1587,16 @@ impl AwsAccess {
             }
             Protocol::SnsQuery => {
                 super::aws_sns::call(
+                    &self.callback,
+                    self.identity.as_ref(),
+                    region,
+                    operation,
+                    body,
+                )
+                .await
+            }
+            Protocol::StsQuery => {
+                super::aws_sts::call(
                     &self.callback,
                     self.identity.as_ref(),
                     region,
@@ -1746,7 +1847,7 @@ async fn sent(
         // CloudFront's by the one [`super::aws_cloudfront`] holds and Amazon SNS's by the one
         // [`super::aws_sns`] holds, which is where a call to each is dispatched
         // ([`AwsAccess::dispatched`]): no request to them is built here.
-        Protocol::S3Rest | Protocol::CloudFrontRest | Protocol::SnsQuery => {
+        Protocol::S3Rest | Protocol::CloudFrontRest | Protocol::SnsQuery | Protocol::StsQuery => {
             return Err(Sent::NotMade(format!(
                 "{} binds its requests with its own protocol rather than with a JSON one",
                 api.sdk_token
@@ -1873,11 +1974,14 @@ pub(super) async fn signed(
         )
         .await;
     };
-    request.headers_mut().insert(
-        SESSION_TOKEN_HEADER,
-        ::http::HeaderValue::from_str(&identity.session_token)
-            .map_err(|error| error.to_string())?,
-    );
+    // The header a TEMPORARY credential is served with, put on only where there is a token to
+    // put in it: a long-term credential a handler built its client with carries none.
+    if let Some(token) = identity.token() {
+        request.headers_mut().insert(
+            SESSION_TOKEN_HEADER,
+            ::http::HeaderValue::from_str(token).map_err(|error| error.to_string())?,
+        );
+    }
     ::service_common::in_process_sigv4::sign_in_process_request_as(
         request,
         signing_name,
@@ -2101,6 +2205,13 @@ mod tests {
                 super::Protocol::SnsQuery => assert_eq!(
                     api.signing_name, "sns",
                     "case {:?}: expected Amazon SNS's own signing name on its protocol entry",
+                    api.sdk_token
+                ),
+                // The token service's `awsQuery`, the same way, in `super::super::aws_sts`.
+                super::Protocol::StsQuery => assert_eq!(
+                    api.signing_name, "sts",
+                    "case {:?}: expected the token service's own signing name on its protocol \
+                     entry",
                     api.sdk_token
                 ),
             }

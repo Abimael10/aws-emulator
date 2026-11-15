@@ -132,6 +132,10 @@ mod aws_cloudfront;
 /// the input and output documents a JSON protocol carries.
 mod aws_sns;
 
+/// The SECURITY TOKEN half of it, for the same reason: that service's model declares
+/// `awsQuery` too, and it is what a handler that chains roles assumes one through.
+mod aws_sts;
+
 /// What every half of that seam bound by an AWS SDK CLIENT shares: how a call's input document
 /// is read, what the answer carried, and how a refusal is handed back.
 mod sdk_call;

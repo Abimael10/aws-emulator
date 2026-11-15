@@ -71,7 +71,7 @@ use rquickjs::function::Func;
 use rquickjs::loader::{ImportAttributes, Loader, Resolver};
 use rquickjs::{CatchResultExt, Context, Ctx, Function, Module, Object, Runtime, Value};
 
-use super::aws_api::{Answer, AwsAccess, Refusal, MAX_CALLS_PER_RUN};
+use super::aws_api::{Answer, AwsAccess, CallerIdentity, Refusal, MAX_CALLS_PER_RUN};
 use super::outcome::{captured, Capture};
 use super::package::PackageModule;
 use super::run_memory::Held;
@@ -641,7 +641,11 @@ fn install_host(
         .set(
             "__hostAwsCall",
             Func::from(
-                move |service: String, operation: String, region: String, body: String| {
+                move |service: String,
+                      operation: String,
+                      region: String,
+                      body: String,
+                      credentials: String| {
                     // A run whose budget is already spent makes no further call: the
                     // latched stop is its answer, so work it starts afterwards is work
                     // nothing will report.
@@ -667,6 +671,17 @@ fn install_host(
                     if remaining.is_zero() {
                         return refusal_answer("timed_out", "");
                     }
+                    // Signed as the credentials the SDK client this call was made through was
+                    // built with, where it was built with any, and otherwise as the identity
+                    // the invocation was given.
+                    let signing = match CallerIdentity::supplied(&credentials) {
+                        Ok(supplied) => supplied,
+                        Err(detail) => return refusal_answer("not_made", &detail),
+                    };
+                    let access = match signing {
+                        Some(identity) => access.clone().signing_as(Some(identity)),
+                        None => access.clone(),
+                    };
                     call_answer(&access.call(&service, &operation, &region, &body, remaining))
                 },
             ),

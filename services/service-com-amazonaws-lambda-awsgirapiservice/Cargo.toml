@@ -147,6 +147,14 @@ aws-sdk-cloudfront = { version = "1", default-features = false }
 # what it just handled, or SUBSCRIBES a queue to the topic it publishes to, is the shape that
 # needs it. Only the generated client is needed: the emulator supplies the transport.
 aws-sdk-sns = { version = "1", default-features = false }
+# The security token service's model declares `awsQuery` too, so a handler's
+# `boto3.client("sts")` call is built, signed and parsed by this client
+# (`state::execution::aws_sts`), over the same in-process callback. A function that ASSUMES
+# ANOTHER ROLE and then calls a service with the session it was vended — the role-chaining
+# shape AWS documents for a function that reaches across accounts or narrows its own grants
+# — is the shape that needs it. Only the generated client is needed: the emulator supplies
+# the transport.
+aws-sdk-sts = { version = "1", default-features = false }
 # A function whose environment variables are encrypted with a customer managed key can
 # only be invoked while that key can decrypt them, and the key's state belongs to the key
 # service: it is asked over the same in-process callback

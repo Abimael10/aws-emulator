@@ -44,6 +44,7 @@ use ::serde_json::{Map, Value};
 use ::smithy_server_runtime::EmbeddedEmulator;
 
 use super::aws_api::{Answer, CallerIdentity, Refusal, MAX_RESPONSE_BYTES};
+use super::sdk_call::{insert_number, insert_text, insert_timestamp};
 
 /// The provider name the signing identity carries: it names this runtime rather than any
 /// AWS credential source, and never travels on the wire.
@@ -124,7 +125,7 @@ fn client(
             ::aws_sdk_cloudfront::config::Credentials::new(
                 identity.access_key_id.clone(),
                 identity.secret_access_key.clone(),
-                Some(identity.session_token.clone()),
+                identity.token().map(str::to_string),
                 None,
                 PROVIDER_NAME,
             ),
@@ -550,33 +551,6 @@ fn refused<E: ProvideErrorMetadata>(
         streams: Vec::new(),
         blobs: Vec::new(),
     })
-}
-
-/// Put a string member on the answer's document, where the answer carried one.
-fn insert_text(document: &mut Map<String, Value>, name: &str, value: Option<&str>) {
-    if let Some(value) = value {
-        document.insert(name.to_string(), Value::String(value.to_string()));
-    }
-}
-
-/// Put a numeric member on it, the same way.
-fn insert_number(document: &mut Map<String, Value>, name: &str, value: Option<i64>) {
-    if let Some(value) = value {
-        document.insert(name.to_string(), Value::Number(value.into()));
-    }
-}
-
-/// Put a timestamp member on it, as the epoch seconds an AWS JSON protocol carries a
-/// timestamp as — which is the form this seam hands every other service's timestamps over
-/// in.
-fn insert_timestamp(
-    document: &mut Map<String, Value>,
-    name: &str,
-    value: Option<&::aws_smithy_types::DateTime>,
-) {
-    if let Some(value) = value {
-        document.insert(name.to_string(), Value::Number(value.secs().into()));
-    }
 }
 
 #[cfg(test)]

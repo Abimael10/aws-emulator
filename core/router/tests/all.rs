@@ -1228,3 +1228,20 @@ mod cloudformation_rest_api_redeployment;
 //! every service crate's `tests/all.rs`. `tests/all.rs` is a test-target CRATE ROOT, so a
 //! bare `mod` resolves to a SIBLING (`tests/<name>.rs`) — which the layout check refuses:
 //! the `#[path]` is what points each declaration into `tests/all/`.
+//! Single integration-test target for the router: the declaration list of every
+//! cross-service suite, and nothing else.
+//! Put a new suite at `tests/all/<name>.rs` and declare it below with its `#[path]`/`mod`
+//! place to insert and nothing to keep consistent. `tests/all.rs` is a test-target CRATE
+//! ROOT, so a bare `mod` resolves to a SIBLING of this file, which the layout check refuses:
+//! the `#[path]` is what points a module into `tests/all/`.
+//! at the top level of `tests/` fails the build; and a suite declared twice is `E0428`, which
+//! fails every suite in this target. THESE HEADER LINES ARE THE ONLY PLACE AN INNER DOC
+//! COMMENT (`//!`) MAY STAND IN THIS FILE: past the first item one is `E0753` and compiles no
+//! suite of this target, so add a DECLARATION below — never a note about one.
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check those halves, for this file and for
+//! every service crate's `tests/all.rs`, so check there rather than leaving a note here.
+//! WHY a suite lives in this target rather than in one service crate's own — it drives more
+//! than one service over the assembled router — is stated in that suite's OWN module doc,
+//! which is where it stays current and is read beside the test it explains.
+#[path = "all/lambda_in_function_assumed_role_session.rs"]
+mod lambda_in_function_assumed_role_session;

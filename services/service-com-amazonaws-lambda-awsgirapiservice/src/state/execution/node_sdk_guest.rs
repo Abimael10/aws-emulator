@@ -489,11 +489,49 @@ function Client(configuration) {
     var held = configuration === undefined || configuration === null ? {} : configuration;
     this.config = {
         region: held.region === undefined ? globalThis.process.env.AWS_REGION : held.region,
+        credentials: held.credentials,
         serviceId: SERVICE
     };
 }
 
 Object.defineProperty(Client, 'name', { value: '__CLIENT_NAME__' });
+
+// WHICH CREDENTIALS a client's calls are signed with, as the document the runtime signs with:
+// the ones the client was built with (`new Client({ credentials: { accessKeyId,
+// secretAccessKey, sessionToken } })`), which is how a handler calls a service with a session
+// it was vended, and the empty document for a client built with none — whose calls are signed
+// as the identity the invocation was given. Part of a credential is not a credential, and the
+// SDK says so rather than signing as something else. A credentials PROVIDER — the function
+// form the SDK also takes — is reported as a call this runtime does not make, naming it,
+// rather than signed as the invocation's own identity.
+function signedWith(credentials) {
+    if (credentials === undefined || credentials === null) {
+        return '';
+    }
+    if (typeof credentials === 'function') {
+        var refused = new Error('This emulator makes no call with a credentials provider'
+            + ' function; build the client with credentials: { accessKeyId, secretAccessKey,'
+            + ' sessionToken }');
+        refused.name = 'NotImplemented';
+        refused.$metadata = {};
+        throw refused;
+    }
+    if (typeof credentials !== 'object') {
+        throw new TypeError('Credentials must carry an accessKeyId and a secretAccessKey');
+    }
+    var keyId = credentials.accessKeyId;
+    var secret = credentials.secretAccessKey;
+    if (typeof keyId !== 'string' || typeof secret !== 'string') {
+        throw new TypeError('Credentials must carry an accessKeyId and a secretAccessKey');
+    }
+    return JSON.stringify({
+        accessKeyId: keyId,
+        secretAccessKey: secret,
+        sessionToken: typeof credentials.sessionToken === 'string'
+            ? credentials.sessionToken
+            : ''
+    });
+}
 
 Client.prototype.send = function (command) {
     var self = this;
@@ -510,7 +548,8 @@ Client.prototype.send = function (command) {
                 SERVICE,
                 operation,
                 region,
-                JSON.stringify(sentInput(command.input === undefined ? {} : command.input))
+                JSON.stringify(sentInput(command.input === undefined ? {} : command.input)),
+                signedWith(self.config.credentials)
             ));
         } catch (error) {
             reject(error);

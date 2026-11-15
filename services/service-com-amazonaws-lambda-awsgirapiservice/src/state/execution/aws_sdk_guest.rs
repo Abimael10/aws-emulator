@@ -48,6 +48,14 @@
 //!   carries, whose options and defaults are the SDK's: the Region it names is the one the
 //!   client's calls are made in, and an option name the SDK does not have is refused the way
 //!   the SDK refuses it.
+//! * A client built with CREDENTIALS of its own — `boto3.client(…, aws_access_key_id=…,
+//!   aws_secret_access_key=…, aws_session_token=…)`, or a `boto3.Session` built with them —
+//!   has its calls signed with those, which is how a handler calls a service with a session
+//!   it was vended; a client built with neither the key nor its secret is signed as the
+//!   identity the invocation was given. Part of that pair is not a credential, and is refused
+//!   as the SDK refuses it (`PartialCredentialsError`). The signature itself is still host
+//!   code's ([`super::aws_api`]): what the guest hands over is the key it holds, never the
+//!   invocation's own.
 //! * A member of an ANSWER that carries an object's own bytes — `GetObject`'s `Body` — is
 //!   handed over as `botocore.response.StreamingBody`, the stream the SDK's own client
 //!   answers with, so a handler reads it with `read()`; which members those are is named by
@@ -180,6 +188,12 @@ class UnknownServiceError(DataNotFoundError):
 
 class ParamValidationError(BotoCoreError):
     fmt = "Parameter validation failed:\n{report}"
+
+
+class PartialCredentialsError(BotoCoreError):
+    """A client was built with part of a credential, which is not a credential at all."""
+
+    fmt = "Partial credentials found in {provider}, missing: {cred_var}"
 
 
 class PaginationError(BotoCoreError):
@@ -585,6 +599,7 @@ from botocore.exceptions import (
     ClientError,
     OperationNotPageableError,
     ParamValidationError,
+    PartialCredentialsError,
     ReadTimeoutError,
     SdkCallNotMade,
     UnknownServiceError,
@@ -612,6 +627,48 @@ _BLOB_PARAMETERS = {
 def _operation_name(method):
     """The operation a client method names: `send_message` -> `SendMessage`."""
     return "".join(part[:1].upper() + part[1:] for part in method.split("_") if part)
+
+
+# The provider a partial-credential refusal names, which is the one botocore names for
+# credentials given to the client itself rather than read from a profile or the environment.
+_EXPLICIT_PROVIDER = "explicit"
+
+
+def _supplied_credentials(access_key_id, secret_access_key, session_token):
+    """The credentials a client was built with, as the runtime signs that client's calls with.
+
+    An SDK signs a call with the credentials its own client holds: a client built with none
+    signs as the identity the invocation was given — the session of the function's execution
+    role — and one built with an access key and its secret signs as THAT credential, which is
+    how a handler calls a service with a session it was vended. The values travel to the
+    runtime, which puts the signature on; the empty document is a client that was given none.
+
+    The explicit pair is the KEY and its SECRET: a client given neither falls through to the
+    invocation's own credentials whatever else it was passed, and one given a key without its
+    secret, or a secret without its key, holds no credential at all — which the SDK says
+    rather than signing as something else.
+    """
+    if access_key_id is None and secret_access_key is None:
+        return ""
+    missing = [
+        name
+        for name, value in (
+            ("aws_access_key_id", access_key_id),
+            ("aws_secret_access_key", secret_access_key),
+        )
+        if value is None
+    ]
+    if missing:
+        raise PartialCredentialsError(
+            provider=_EXPLICIT_PROVIDER, cred_var=", ".join(missing)
+        )
+    return json.dumps(
+        {
+            "accessKeyId": str(access_key_id),
+            "secretAccessKey": str(secret_access_key),
+            "sessionToken": "" if session_token is None else str(session_token),
+        }
+    )
 
 
 def _epoch_seconds(value):
@@ -784,7 +841,16 @@ class _ServiceModel:
 class Client:
     """A client for one service in one Region."""
 
-    def __init__(self, service_name, region_name=None, config=None, **_ignored):
+    def __init__(
+        self,
+        service_name,
+        region_name=None,
+        config=None,
+        aws_access_key_id=None,
+        aws_secret_access_key=None,
+        aws_session_token=None,
+        **_ignored
+    ):
         import os
 
         self._service_name = service_name
@@ -798,6 +864,11 @@ class Client:
             or os.environ.get("AWS_REGION")
             or os.environ.get("AWS_DEFAULT_REGION")
             or ""
+        )
+        # WHICH CREDENTIALS this client's calls are signed with: the ones it was built with,
+        # else the invocation's own ([`_supplied_credentials`]).
+        self._credentials = _supplied_credentials(
+            aws_access_key_id, aws_secret_access_key, aws_session_token
         )
         self._endpoint_url = "https://%s.%s.amazonaws.com" % (
             service_name,
@@ -848,6 +919,7 @@ class Client:
                 int(Port),
                 str(DBUsername),
                 Region or self._region_name,
+                self._credentials,
             )
         )
         refused = answered.get("refused")
@@ -902,6 +974,7 @@ class Client:
                 self._region_name,
                 json.dumps(Params or {}, default=_encoded),
                 expires,
+                self._credentials,
             )
         )
         refused = answered.get("refused")
@@ -929,6 +1002,7 @@ class Client:
                 operation_name,
                 self._region_name,
                 json.dumps(self._sent(parameters), default=_encoded),
+                self._credentials,
             )
         )
         refused = answered.get("refused")
@@ -1040,7 +1114,14 @@ _RESOURCE_SERVICES = ("dynamodb",)
 
 
 class Session:
-    def __init__(self, region_name=None, **_ignored):
+    def __init__(
+        self,
+        aws_access_key_id=None,
+        aws_secret_access_key=None,
+        aws_session_token=None,
+        region_name=None,
+        **_ignored
+    ):
         import os
 
         self.region_name = (
@@ -1049,6 +1130,14 @@ class Session:
             or os.environ.get("AWS_DEFAULT_REGION")
             or None
         )
+        # The credentials every client this session builds is given, unless the call that
+        # builds one names credentials of its own: a session built with a vended session is
+        # how a handler reaches a service as the identity it assumed.
+        self._credentials = {
+            "aws_access_key_id": aws_access_key_id,
+            "aws_secret_access_key": aws_secret_access_key,
+            "aws_session_token": aws_session_token,
+        }
 
     def client(self, service_name, region_name=None, **kwargs):
         # The Region a client calls in, in the order the SDK resolves it: the one this call
@@ -1057,17 +1146,32 @@ class Session:
         return Client(
             service_name,
             region_name=region_name or configured or self.region_name,
-            **kwargs,
+            **self._client_credentials(kwargs),
         )
 
+    def _client_credentials(self, kwargs):
+        """The client's keyword arguments with this session's credentials filled in.
+
+        A call that names credentials of its own is left exactly as it asked; otherwise the
+        client is built with the session's, which is the order the SDK resolves them in.
+        """
+        if any(name in kwargs for name in self._credentials):
+            return kwargs
+        return dict(kwargs, **self._credentials)
+
     def get_credentials(self):
-        """The handle on this invocation's credentials.
+        """The handle on the credentials this session's clients are built with.
 
         A handler asks for these to sign a request of its own
-        (`botocore.auth.SigV4Auth`); the signature is the runtime's, so the handle carries
-        no key, secret or token of the invocation.
+        (`botocore.auth.SigV4Auth`); the signature of a client's call is the runtime's, so
+        the handle carries only what the session itself was built with — nothing of the
+        invocation's own credential, which the runtime holds.
         """
-        return Credentials()
+        return Credentials(
+            access_key=self._credentials["aws_access_key_id"],
+            secret_key=self._credentials["aws_secret_access_key"],
+            token=self._credentials["aws_session_token"],
+        )
 
     def resource(self, service_name, region_name=None, **kwargs):
         if service_name in _RESOURCE_SERVICES:

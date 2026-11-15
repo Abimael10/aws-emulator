@@ -90,7 +90,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
-use rustpython_vm::function::FuncArgs;
+use rustpython_vm::function::{FuncArgs, OptionalArg};
 use rustpython_vm::builtins::PyModule;
 use rustpython_vm::{AsObject, Interpreter, PyObjectRef, PyRef, PyResult, Settings, VirtualMachine};
 
@@ -103,7 +103,7 @@ pub use super::outcome::{Budget, Completion, Finished, Stop};
 // the host buried inside each check.
 pub use super::run_clock::Clock;
 
-use super::aws_api::{AwsAccess, Refusal, MAX_CALLS_PER_RUN};
+use super::aws_api::{AwsAccess, CallerIdentity, Refusal, MAX_CALLS_PER_RUN};
 use super::outcome::{captured, Capture};
 use super::package::PackageModule;
 use super::run_memory::{faulted_bytes, Held};
@@ -1477,8 +1477,13 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
         &module,
         "aws",
         move |args: FuncArgs, vm: &VirtualMachine| {
-            let (service, operation, region, body): (String, String, String, String) =
-                args.bind(vm)?;
+            let (service, operation, region, body, credentials): (
+                String,
+                String,
+                String,
+                String,
+                OptionalArg<String>,
+            ) = args.bind(vm)?;
             let call_bounds = calling.bounds();
             // A run whose budget is already spent makes no further call: the latched stop
             // is its answer, so work it starts afterwards is work nothing will report.
@@ -1502,6 +1507,15 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
                     ))
                     .into());
             };
+            // Signed as the credentials the SDK CLIENT this call was made through was built
+            // with, where it was built with any, and otherwise as the invocation's own
+            // identity ([`signing_as_client`]).
+            let access = match signing_as_client(access, credentials.as_ref().map(String::as_str).into()) {
+                Ok(access) => access,
+                Err(detail) => {
+                    return Ok(vm.ctx.new_str(refusal_answer("not_made", &detail)).into())
+                }
+            };
             let remaining = call_bounds.remaining();
             if remaining.is_zero() {
                 return Err(vm.new_runtime_error(Stop::Deadline.reason().to_owned()));
@@ -1522,7 +1536,13 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
         &module,
         "db_auth_token",
         move |args: FuncArgs, vm: &VirtualMachine| {
-            let (host, port, user, region): (String, u16, String, String) = args.bind(vm)?;
+            let (host, port, user, region, credentials): (
+                String,
+                u16,
+                String,
+                String,
+                OptionalArg<String>,
+            ) = args.bind(vm)?;
             if let Some(stop) = minting.bounds().stopped() {
                 return Err(vm.new_runtime_error(stop.reason().to_owned()));
             }
@@ -1540,6 +1560,12 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
                          token was minted",
                     ))
                     .into());
+            };
+            let access = match signing_as_client(access, credentials.as_ref().map(String::as_str).into()) {
+                Ok(access) => access,
+                Err(detail) => {
+                    return Ok(vm.ctx.new_str(refusal_answer("not_made", &detail)).into())
+                }
             };
             let answer = match access.db_auth_token(&host, port, &user, &region) {
                 Ok(token) => ::serde_json::json!({ "token": token }).to_string(),
@@ -1608,12 +1634,13 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
         &module,
         "presign",
         move |args: FuncArgs, vm: &VirtualMachine| {
-            let (service, operation, region, body, expires): (
+            let (service, operation, region, body, expires, credentials): (
                 String,
                 String,
                 String,
                 String,
                 u64,
+                OptionalArg<String>,
             ) = args.bind(vm)?;
             let Some(access) = presigning.aws() else {
                 return Ok(vm
@@ -1623,6 +1650,12 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
                         "this invocation was given no AWS SDK seam, so no URL was signed",
                     ))
                     .into());
+            };
+            let access = match signing_as_client(access, credentials.as_ref().map(String::as_str).into()) {
+                Ok(access) => access,
+                Err(detail) => {
+                    return Ok(vm.ctx.new_str(refusal_answer("not_made", &detail)).into())
+                }
             };
             let signed = access.presigned(
                 &service,
@@ -1735,6 +1768,22 @@ fn refusal_answer_for(refused: &Refusal) -> String {
 /// The answer for a call that was not made, naming which refusal it was.
 fn refusal_answer(refused: &str, detail: &str) -> String {
     ::serde_json::json!({ "refused": refused, "detail": detail }).to_string()
+}
+
+/// The access ONE call of an SDK client the guest built is made with: the seam the invocation
+/// was given, signing as the credentials THAT CLIENT was built with where it was built with
+/// any, and otherwise as the identity the invocation itself was given.
+///
+/// Every AWS SDK signs a call with the credentials its client holds, so a handler that was
+/// vended a session — by assuming another role, for instance — and built a client with it is
+/// calling as that session and is judged on the policies in force on it
+/// ([`CallerIdentity::supplied`]). `Err` carries why a document that is not a credential at
+/// all made no call, so such a call is never quietly signed as the invocation's own identity.
+fn signing_as_client(access: AwsAccess, credentials: Option<&str>) -> Result<AwsAccess, String> {
+    match CallerIdentity::supplied(credentials.unwrap_or_default())? {
+        Some(identity) => Ok(access.signing_as(Some(identity))),
+        None => Ok(access),
+    }
 }
 
 /// The names Python's `os` looks for on the module it is built on, every one of which

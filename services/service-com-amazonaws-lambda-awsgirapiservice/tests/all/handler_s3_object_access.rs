@@ -180,7 +180,10 @@ impl Emulator {
     }
 
     /// One awsQuery call that must be served.
-    async fn query(
+    ///
+    /// `pub(crate)`: a suite that writes a role whose trust policy is not the Lambda one
+    /// reaches this one caller rather than carrying a second copy of it.
+    pub(crate) async fn query(
         &self,
         case: &str,
         signing_name: &str,

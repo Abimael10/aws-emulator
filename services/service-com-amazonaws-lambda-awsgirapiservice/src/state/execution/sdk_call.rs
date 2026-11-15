@@ -114,6 +114,27 @@ impl Input {
         }
     }
 
+    /// An INTEGER member, as the model's own `integer` shape carries it: a value outside what
+    /// that shape can hold stops the call rather than being sent truncated.
+    pub(super) fn integer(&self, name: &str) -> Result<Option<i32>, Refusal> {
+        match self.members.get(name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Number(number)) => number
+                .as_i64()
+                .and_then(|held| i32::try_from(held).ok())
+                .map(Some)
+                .ok_or_else(|| {
+                    Refusal::NotMade(format!(
+                        "the call's {name} is not a whole number this operation can carry, got \
+                         {number}"
+                    ))
+                }),
+            Some(other) => Err(Refusal::NotMade(format!(
+                "the call's {name} must be a number, got {other}"
+            ))),
+        }
+    }
+
     /// A member whose shape is a LIST OF STRINGS, read as the values it holds; an empty list
     /// where the document carries the member as none at all.
     pub(super) fn text_list(&self, name: &str) -> Result<Vec<String>, Refusal> {
@@ -412,6 +433,25 @@ pub(super) fn insert_text(document: &mut Map<String, Value>, name: &str, value: 
 pub(super) fn insert_flag(document: &mut Map<String, Value>, name: &str, value: Option<bool>) {
     if let Some(value) = value {
         document.insert(name.to_string(), Value::Bool(value));
+    }
+}
+
+/// Put a NUMERIC member on it, the same way.
+pub(super) fn insert_number(document: &mut Map<String, Value>, name: &str, value: Option<i64>) {
+    if let Some(value) = value {
+        document.insert(name.to_string(), Value::Number(value.into()));
+    }
+}
+
+/// Put a TIMESTAMP member on it, as the epoch seconds an AWS JSON protocol carries a timestamp
+/// as — which is the form this seam hands every service's timestamps over in.
+pub(super) fn insert_timestamp(
+    document: &mut Map<String, Value>,
+    name: &str,
+    value: Option<&::aws_smithy_types::DateTime>,
+) {
+    if let Some(value) = value {
+        document.insert(name.to_string(), Value::Number(value.secs().into()));
     }
 }
 

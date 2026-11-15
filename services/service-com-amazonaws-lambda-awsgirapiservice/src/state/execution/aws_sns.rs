@@ -155,7 +155,7 @@ fn client(
             config.credentials_provider(::aws_sdk_sns::config::Credentials::new(
                 identity.access_key_id.clone(),
                 identity.secret_access_key.clone(),
-                Some(identity.session_token.clone()),
+                identity.token().map(str::to_string),
                 None,
                 PROVIDER_NAME,
             ))

@@ -277,6 +277,8 @@ mod functions_by_code_signing_config;
 mod handler_appconfig_execution_role;
 #[path = "all/handler_appconfig_sdk.rs"]
 mod handler_appconfig_sdk;
+#[path = "all/handler_assumed_role_session.rs"]
+mod handler_assumed_role_session;
 #[path = "all/handler_aws_sdk.rs"]
 mod handler_aws_sdk;
 #[path = "all/handler_bedrock_agent_sdk.rs"]
