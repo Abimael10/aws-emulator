@@ -78,16 +78,25 @@ pub(crate) async fn given_topic(
     element(&sns(emulator, "CreateTopic", &params).await, "TopicArn")
 }
 
-/// What one `Publish` answered: its HTTP status, the awsQuery error code (`""` on a success
-/// envelope) and the sentence the answer carries — the message id of an accepted publish, or
-/// the message of a refused one, with the envelope's XML entities decoded.
+/// What one `Publish` of `body` to `topic`, addressed through the `TopicArn` member, answered.
+///
+/// The ONE decoder of a `Publish` answer this suite and its siblings share
+/// ([`publish_through`]), so no two of them can read the same envelope differently.
 async fn publish(emulator: &Emulator, topic: &str, body: &str) -> (u16, String, String) {
-    let (status, text) = sns_call(
-        emulator,
-        "Publish",
-        &[("TopicArn", topic), ("Message", body)],
-    )
-    .await;
+    publish_through(emulator, "TopicArn", topic, body).await
+}
+
+/// What one `Publish` answered, with `member` naming the request member the topic's ARN is
+/// carried by: its HTTP status, the awsQuery error code (`""` on a success envelope) and the
+/// sentence the answer carries — the message id of an accepted publish, or the message of a
+/// refused one, with the envelope's XML entities decoded.
+pub(crate) async fn publish_through(
+    emulator: &Emulator,
+    member: &str,
+    topic: &str,
+    body: &str,
+) -> (u16, String, String) {
+    let (status, text) = sns_call(emulator, "Publish", &[(member, topic), ("Message", body)]).await;
     let tag = if status == 200 { "MessageId" } else { "Code" };
     let code = if status == 200 {
         String::new()
