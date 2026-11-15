@@ -1874,3 +1874,25 @@ mod zz_probe_whole_emulator;
 // there. A second pair for one name is `E0428`, and a suite file no pair names compiles
 // nowhere. Five suites pin all of that rather than restating it here:
 // `all/every_suite_file_is_declared.rs`.
+// Single integration-test target for the router: the CANONICAL DECLARATION LIST of every
+// Put a new suite at `tests/all/<name>.rs` and insert ONE
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair below, in the place its name sorts to.
+// Past this header the file holds those pairs and no other line — no prose between them, no
+// blank line, nothing after the last one — so two branches landing at once insert two lines
+// deliberate: an inner doc comment (`//!`) and an inner attribute are legal only BEFORE the
+// first item, so one that lands past the declarations is `E0753` and compiles no suite of
+// this target at all. With no inner doc comment anywhere in the file, no appended, re-typed
+// or merged copy of one of its lines can be one.
+// above each `mod` is what points the declaration into `tests/all/`. Declare each suite
+// exactly ONCE — a second `mod` for one name is `E0428` — and declare EVERY file under
+// `tests/all/`, since one no declaration names is compiled nowhere and this crate's build
+// script refuses it. Some of those files are shared harnesses (`query_wire`, `eks_wire`,
+// `cloudformation_stack_clock`) or probes rather than suites; each is declared like any
+// other.
+// explains. The suites whose names begin `all_rs_`, plus
+// `all/every_suite_file_is_declared.rs`, check the rules above — for this root and for
+// every service crate's `tests/all.rs` — rather than restating them here.
+// The lint allowed below is for the suite files this root compiles: a module header may
+// wrap a list item without the indentation `clippy::doc_lazy_continuation` asks for, which
+// is a note rather than a build failure. An inner attribute, like an inner doc comment, is
+// legal only before the first item, so it stands here rather than in the list.

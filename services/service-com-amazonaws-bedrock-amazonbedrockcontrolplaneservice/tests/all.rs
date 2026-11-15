@@ -77,6 +77,8 @@ mod enforced_guardrail_configuration;
 mod enforced_guardrail_configuration_not_found_message;
 #[path = "all/enforced_guardrail_inference.rs"]
 mod enforced_guardrail_inference;
+#[path = "all/enforced_guardrail_withdrawal_surfaces.rs"]
+mod enforced_guardrail_withdrawal_surfaces;
 #[path = "all/enum_value_set_listing.rs"]
 mod enum_value_set_listing;
 #[path = "all/enum_value_set_order.rs"]
