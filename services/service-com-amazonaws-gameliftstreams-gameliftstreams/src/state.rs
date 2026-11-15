@@ -831,6 +831,59 @@ impl LocationSlot {
         scalable.max(self.maximum_capacity.unwrap_or(0).max(0))
     }
 
+    /// The stream capacity this location most recently REQUESTED of the service.
+    ///
+    /// The capacity a location asks the service to be able to hold for it: the
+    /// always-on capacity its configuration names ("this setting, if non-zero,
+    /// indicates minimum streaming capacity which is allocated to you" —
+    /// `LocationConfiguration::AlwaysOnCapacity`) or, where it names none, the
+    /// bound it asks the service to be able to allocate instead — "the maximum
+    /// capacity that the service can allocate for you" (`MaximumCapacity`), or the
+    /// `OnDemandCapacity` that member deprecates ("this field is deprecated, use
+    /// `MaximumCapacity` instead"), which describe the same elastic capacity. A
+    /// configuration that names an always-on capacity of its own is answered with
+    /// that one, whatever bound it names beside it: that is the always-on capacity
+    /// it requested.
+    ///
+    /// A configuration that names no capacity at all requests none, which is the
+    /// one case `LocationConfiguration` itself rules out ("when configuring a
+    /// location for the first time, you must specify a numeric value for at least
+    /// one of the two capacity types").
+    pub fn requested_capacity(&self) -> i32 {
+        self.always_on_capacity
+            .or(self.maximum_capacity)
+            .or(self.on_demand_capacity)
+            .unwrap_or(0)
+            .max(0)
+    }
+
+    /// The stream capacity the service has PROVISIONED for this location while
+    /// `running` of its stream sessions are streaming.
+    ///
+    /// "The stream capacity that Amazon GameLift Streams has provisioned in a
+    /// stream group that can respond immediately to stream requests. It includes
+    /// resources that are currently streaming and resources that are idle"
+    /// (`LocationState::AllocatedCapacity`). Two settings keep capacity standing
+    /// by: the always-on capacity, which "is allocated to you and is never
+    /// released back to the service", and the target-idle capacity, "idle capacity
+    /// which the service pre-allocates and holds for you in anticipation of future
+    /// activity" — so the service holds the always-on capacity at all times, and
+    /// enough beside the sessions that are streaming to leave that idle target
+    /// free. A bound on what the service MAY allocate (`MaximumCapacity`, or the
+    /// `OnDemandCapacity` it deprecates) provisions nothing by itself — "capacity
+    /// is released back to the service when idle" — it only caps what this
+    /// location can hold at once ([`LocationSlot::stream_capacity`]).
+    pub fn allocated_capacity(&self, running: i32) -> i32 {
+        let always_on = self.always_on_capacity.unwrap_or(0).max(0);
+        let target_idle = self.target_idle_capacity.unwrap_or(0).max(0);
+        // Saturating, not checked: the capacities come from the request, so
+        // the arithmetic must not be able to overflow whatever a caller sent.
+        let scaled = running
+            .saturating_add(target_idle)
+            .min(self.stream_capacity());
+        always_on.max(scaled)
+    }
+
     /// Is this location still working towards a status of its own?
     ///
     /// `REMOVING` counts as well as `ACTIVATING` — "REMOVING: Amazon GameLift
@@ -888,6 +941,28 @@ pub fn unstorable_location_configuration(configuration: &LocationConfiguration) 
         }
     }
     None
+}
+
+/// The capacity a stream group reports for ITSELF, aggregated over its locations.
+///
+/// Capacity is configured and provisioned per location, and the group reports the
+/// roll-up of its locations beside their individual `LocationStates`: how much
+/// capacity its locations have been asked to hold (`DesiredCapacity`), how much the
+/// service has provisioned for them (`ActiveCapacity`) and how much of that
+/// provisioned capacity is not streaming (`IdleCapacity`). The three members are
+/// recorded behaviour: this service's on-disk model declares them on no shape, so
+/// they are DECLARED on the stream-group outputs of
+/// `smithy-model/com-amazonaws-gameliftstreams-gameliftstreams.json` — see
+/// [`crate::ops::get_stream_group`] — and every value here is computed from the
+/// stored locations ([`StreamGroup::location_state`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CapacitySummary {
+    /// The capacity the group's locations have most recently requested.
+    pub desired: i32,
+    /// The capacity the service has provisioned across those locations.
+    pub active: i32,
+    /// How much of that provisioned capacity is not streaming right now.
+    pub idle: i32,
 }
 
 /// A persisted stream group, together with the stream sessions it hosts.
@@ -1021,20 +1096,26 @@ impl StreamGroup {
     /// One location's `LocationState`: the capacity the request configured, the
     /// location's own status, and what is allocated to it and idle in it right now.
     ///
-    /// Every capacity SETTING is reported as a number, including the ones the
+    /// Every capacity member is reported as a number, including the settings the
     /// configuration left out: an unconfigured setting holds the service's default
     /// of zero ("Default is 0 when creating a stream group or adding a location" —
-    /// `LocationConfiguration::OnDemandCapacity`), and a zero is what says the
-    /// setting is off ("This setting, if non-zero, indicates minimum streaming
-    /// capacity ..." — `AlwaysOnCapacity`). An absent member would instead say the
-    /// service has nothing to report for it.
+    /// `LocationConfiguration::OnDemandCapacity`), and a zero is what says that
+    /// setting is off. An absent member would instead say the service has nothing
+    /// to report for it.
     ///
-    /// `AllocatedCapacity` is the always-on capacity the location holds once it is
-    /// `ACTIVE` (always-on capacity "is allocated to you and is never released back
-    /// to the service" — `CreateStreamGroup` documentation), and `IdleCapacity` is
-    /// that allocation less the stream sessions the location is currently running.
-    /// `InternalVpcIpv4CidrBlock` is the block of the service VPC this location's
-    /// capacity runs in ([`SERVICE_VPC_IPV4_CIDR_BLOCK`]).
+    /// The capacity the location REQUESTED ([`LocationSlot::requested_capacity`])
+    /// is what it reports as both `RequestedCapacity` — "the always-on capacity
+    /// that you most recently requested for a stream group" — and the always-on
+    /// capacity it holds, so a location configured through any one of the capacity
+    /// settings reports the capacity that configuration asked for rather than a
+    /// zero.
+    ///
+    /// `AllocatedCapacity` is what the service has actually provisioned here
+    /// ([`LocationSlot::allocated_capacity`]), and `IdleCapacity` is "the amount
+    /// of allocated capacity that is not currently streaming", i.e. that
+    /// allocation less the sessions this location is running.
+    /// `InternalVpcIpv4CidrBlock` is the block of the service VPC this
+    /// location's capacity runs in ([`SERVICE_VPC_IPV4_CIDR_BLOCK`]).
     ///
     /// The group's own status wins where it says what every location is doing: a
     /// `DELETING` group is releasing all of them, and an `EXPIRED` group's capacity
@@ -1046,12 +1127,7 @@ impl StreamGroup {
             STREAM_GROUP_EXPIRED => LOCATION_ERROR,
             _ => slot.status.as_str(),
         };
-        let requested = slot.always_on_capacity.unwrap_or(0).max(0);
-        let allocated = if location_status == LOCATION_ACTIVE {
-            requested
-        } else {
-            0
-        };
+        let requested = slot.requested_capacity();
         let running = i32::try_from(
             self.sessions
                 .values()
@@ -1059,10 +1135,18 @@ impl StreamGroup {
                 .count(),
         )
         .unwrap_or(i32::MAX);
+        // Only a provisioned location holds anything: "ACTIVATING: Amazon GameLift
+        // Streams is preparing the location. You cannot stream from ... this
+        // location yet."
+        let allocated = if location_status == LOCATION_ACTIVE {
+            slot.allocated_capacity(running)
+        } else {
+            0
+        };
         LocationState {
             location_name: Some(slot.name.clone()),
             status: Some(location_status.to_string()),
-            always_on_capacity: Some(slot.always_on_capacity.unwrap_or(0).max(0)),
+            always_on_capacity: Some(requested),
             on_demand_capacity: Some(slot.on_demand_capacity.unwrap_or(0).max(0)),
             target_idle_capacity: Some(slot.target_idle_capacity.unwrap_or(0).max(0)),
             maximum_capacity: Some(slot.maximum_capacity.unwrap_or(0).max(0)),
@@ -1075,6 +1159,25 @@ impl StreamGroup {
             internal_vpc_ipv4_cidr_block: Some(SERVICE_VPC_IPV4_CIDR_BLOCK.to_string()),
             vpc_transit_configuration: None,
         }
+    }
+
+    /// The capacity summary this group reports beside its `LocationStates`:
+    /// [`CapacitySummary`], aggregated over every location it holds.
+    pub fn capacity_summary(&self) -> CapacitySummary {
+        let mut summary = CapacitySummary::default();
+        for state in self.location_states() {
+            // Saturating, not checked: the capacities come from the requests that
+            // configured the locations, so the arithmetic must not be able to
+            // overflow whatever a caller sent.
+            summary.desired = summary
+                .desired
+                .saturating_add(state.requested_capacity.unwrap_or(0));
+            summary.active = summary
+                .active
+                .saturating_add(state.allocated_capacity.unwrap_or(0));
+            summary.idle = summary.idle.saturating_add(state.idle_capacity.unwrap_or(0));
+        }
+        summary
     }
 
     /// `LocationStates` for every location this group holds, in the order the

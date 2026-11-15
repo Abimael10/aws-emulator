@@ -44,15 +44,16 @@ fn names(states: &Value) -> Vec<String> {
         .collect()
 }
 
-/// The capacity members `LocationConfiguration` carries and `LocationState`
-/// echoes back (`smithy_query(query="shape", shape="LocationConfiguration")`).
+/// The capacity settings `LocationConfiguration` carries and `LocationState` echoes
+/// back unchanged (`smithy_query(query="shape", shape="LocationConfiguration")`).
 ///
 /// A setting the configuration left out is echoed at its default of 0 ("Default is 0
 /// when creating a stream group or adding a location" —
 /// `LocationConfiguration::OnDemandCapacity`), so these members are always numbers on
-/// a reported location state.
-const CAPACITY_MEMBERS: [&str; 4] = [
-    "AlwaysOnCapacity",
+/// a reported location state. `AlwaysOnCapacity` is not among them: a location reports
+/// as its always-on capacity the capacity it REQUESTS, which a configuration naming no
+/// always-on capacity of its own still asks for through the bound it does name.
+const CAPACITY_MEMBERS: [&str; 3] = [
     "OnDemandCapacity",
     "TargetIdleCapacity",
     "MaximumCapacity",
@@ -62,6 +63,19 @@ const CAPACITY_MEMBERS: [&str; 4] = [
 /// default of 0 when it carries none.
 fn configured(configuration: &Value, member: &str) -> Value {
     json!(configuration[member].as_i64().unwrap_or(0))
+}
+
+/// The capacity a `LocationConfiguration` REQUESTS of the service: the always-on
+/// capacity it names, or, where it names none, the bound it asks the service to be
+/// able to allocate instead (`MaximumCapacity`, or the `OnDemandCapacity` that member
+/// deprecates).
+fn requested(configuration: &Value) -> i64 {
+    for member in ["AlwaysOnCapacity", "MaximumCapacity", "OnDemandCapacity"] {
+        if let Some(capacity) = configuration[member].as_i64() {
+            return capacity;
+        }
+    }
+    0
 }
 
 /// The location set of a group is the union of what its requests configured, and
@@ -156,11 +170,17 @@ async fn adding_locations_persists_exactly_the_locations_the_call_configures() {
                     configured(configuration, member)
                 );
             }
-            let requested = configuration["AlwaysOnCapacity"].as_i64().unwrap_or(0);
+            let requested = requested(configuration);
+            assert_eq!(
+                state["AlwaysOnCapacity"],
+                json!(requested),
+                "case {case:?}: AlwaysOnCapacity is the capacity the location requests, \
+                 got {state}"
+            );
             assert_eq!(
                 state["RequestedCapacity"],
                 json!(requested),
-                "case {case:?}: RequestedCapacity is the always-on capacity asked for, \
+                "case {case:?}: RequestedCapacity is the capacity the location requests, \
                  got {state}"
             );
             assert_eq!(
@@ -198,9 +218,12 @@ async fn adding_locations_persists_exactly_the_locations_the_call_configures() {
             "case {case:?}: the locations already provisioned stay ACTIVE, got {got}"
         );
 
-        // The clock owes each new location its capacity, and the group ACTIVE again.
-        std::thread::sleep(PAST_TRANSITION);
-        let (_, got) = call(&router, "GET", &path, None).await;
+        // The clock owes each new location its capacity, and the group ACTIVE again:
+        // polled for as a CONDITION rather than waited on for a fixed time.
+        let got = crate::application_read_projection::stream_group_fully_active(
+            &router, &group_id, case,
+        )
+        .await;
         assert_eq!(
             got["Status"], "ACTIVE",
             "case {case:?}: the clock owed ACTIVE by now, got {got}"
@@ -213,10 +236,10 @@ async fn adding_locations_persists_exactly_the_locations_the_call_configures() {
                 json!("ACTIVE"),
                 "case {case:?}: location {name} is provisioned by now, got {got}"
             );
-            let requested = configuration["AlwaysOnCapacity"].as_i64().unwrap_or(0);
+            let always_on = configuration["AlwaysOnCapacity"].as_i64().unwrap_or(0);
             assert_eq!(
                 state["AllocatedCapacity"],
-                json!(requested),
+                json!(always_on),
                 "case {case:?}: an ACTIVE location holds its always-on capacity, got {state}"
             );
         }

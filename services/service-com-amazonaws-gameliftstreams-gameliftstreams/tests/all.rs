@@ -33,6 +33,8 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/stream_group_capacity.rs"]
 mod stream_group_capacity;
+#[path = "all/stream_group_capacity_summary.rs"]
+mod stream_group_capacity_summary;
 #[path = "all/stream_group_locations.rs"]
 mod stream_group_locations;
 #[path = "all/stream_session_admin_shell.rs"]

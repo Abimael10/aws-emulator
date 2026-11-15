@@ -4,23 +4,30 @@
 //! reports the group is associated with.
 //!
 //! The rule under test: a stream group reports, for EVERY location it holds, the
-//! whole capacity projection of that location — each capacity SETTING as a number
-//! (the value its configuration asked for, or the service's default of 0 for one no
-//! configuration named: "Default is 0 when creating a stream group or adding a
-//! location", `LocationConfiguration::OnDemandCapacity`), the always-on capacity most
-//! recently requested, what is allocated to the location and idle in it right now,
-//! and the CIDR block of the service VPC that location's capacity runs in
-//! (`LocationState::InternalVpcIpv4CidrBlock`: "The CIDR block of the service VPC for
-//! this location") — and it reports the same projection through every operation that
-//! answers with `LocationStates`.
+//! whole capacity projection of that location — the capacity that location REQUESTS
+//! of the service (the always-on capacity its configuration names, or, where it names
+//! none, the bound it asks the service to be able to allocate instead: the
+//! `MaximumCapacity`, or the `OnDemandCapacity` that member deprecates), reported as
+//! both its `RequestedCapacity` and the always-on capacity it holds; each capacity
+//! SETTING as a number (the value its configuration asked for, or the service's
+//! default of 0 for one no configuration named: "Default is 0 when creating a stream
+//! group or adding a location", `LocationConfiguration::OnDemandCapacity`); what the
+//! service has PROVISIONED for it and how much of that is idle (the always-on
+//! capacity it holds at all times, plus enough beside the sessions streaming to leave
+//! the target-idle capacity free, and nothing for a bound that "is released back to
+//! the service when idle"); and the CIDR block of the service VPC that location's
+//! capacity runs in (`LocationState::InternalVpcIpv4CidrBlock`: "The CIDR block of
+//! the service VPC for this location") — and it reports the same projection through
+//! every operation that answers with `LocationStates`.
 //!
 //! The tables below span that class: they differ in WHICH capacity settings a
 //! location's configuration carries, in their values (including the published lower
 //! bound of each and a value far above the recorded one), in how many locations one
-//! group holds, and in whether a session is running in a location. The second table
-//! is the other half of a group's read projection — the applications it is associated
-//! with and the default among them — over groups that do and do not get a default
-//! application at creation, named by both identifier forms.
+//! group holds, and in whether a session is running in a location. Each row writes
+//! out the capacity it expects rather than recomputing it, so the row pins the rule.
+//! The second table is the other half of a group's read projection — the applications
+//! it is associated with and the default among them — over groups that do and do not
+//! get a default application at creation, named by both identifier forms.
 //!
 //! Every assertion reads a RESPONSE BODY, and every mutation is read back through
 //! `GetStreamGroup`, so a handler that answered 2xx without persisting anything fails
@@ -29,15 +36,16 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::stream_workflow::{
-    as_label, call, emulator, ready_application, text, PAST_TRANSITION, REGION,
-};
+use super::application_read_projection::{poll_until, stream_group_fully_active};
+use super::stream_workflow::{as_label, call, emulator, ready_application, text, REGION};
 
 /// The capacity SETTINGS a `LocationConfiguration` carries and a `LocationState`
-/// reports back, from `smithy_query(query="shape", shape="LocationConfiguration")`:
-/// four optional integers, each `@range(min: 0)`.
-const CAPACITY_SETTINGS: [&str; 4] = [
-    "AlwaysOnCapacity",
+/// echoes back unchanged, from `smithy_query(query="shape",
+/// shape="LocationConfiguration")`: optional integers, each `@range(min: 0)`.
+/// `AlwaysOnCapacity` is NOT among them: a location reports as its always-on
+/// capacity the capacity it requests, which a configuration naming no always-on
+/// capacity of its own still asks for through the bound it does name.
+const CAPACITY_SETTINGS: [&str; 3] = [
     "OnDemandCapacity",
     "TargetIdleCapacity",
     "MaximumCapacity",
@@ -45,11 +53,30 @@ const CAPACITY_SETTINGS: [&str; 4] = [
 
 /// The capacities a `LocationState` DERIVES from those settings and the location's
 /// own state, from `smithy_query(query="shape", shape="LocationState")`.
-const DERIVED_CAPACITIES: [&str; 3] = [
+const DERIVED_CAPACITIES: [&str; 4] = [
+    "AlwaysOnCapacity",
     "RequestedCapacity",
     "AllocatedCapacity",
     "IdleCapacity",
 ];
+
+/// The `StreamSessionStatus` values a session that is PLACED on a location's capacity
+/// holds, from `smithy_query(query="shape", shape="StreamSessionStatus")`: the ones a
+/// stream occupies capacity in.
+///
+/// `pub(crate)` so another suite in this target waits for the same condition through
+/// one list rather than a second copy of it.
+pub(crate) const PLACED_SESSION_STATUSES: [&str; 4] = [
+    "ACTIVE",
+    "CONNECTED",
+    "PENDING_CLIENT_RECONNECTION",
+    "RECONNECTING",
+];
+
+/// The `StreamSessionStatus` values a session that has given its capacity back holds:
+/// one on its way out, and the two it can never leave.
+pub(crate) const TERMINATED_SESSION_STATUSES: [&str; 3] =
+    ["TERMINATING", "TERMINATED", "ERROR"];
 
 /// Create a stream group with exactly `configurations` as its locations and answer
 /// its id, ARN and the create response. The group is `ACTIVATING` on return.
@@ -116,12 +143,24 @@ fn is_ipv4_cidr_block(value: &str) -> bool {
 }
 
 /// Assert the whole capacity projection of one location, against the configuration
-/// that asked for it: every setting is the number it asked for (0 by default), the
-/// requested capacity is the always-on capacity it asked for, an `ACTIVE` location
-/// holds that always-on capacity (it "is allocated to you and is never released back
-/// to the service") while one still being prepared holds nothing, `running` sessions
-/// are not idle, and the location reports the service VPC it runs in.
-fn assert_projection(state: &Value, configuration: &Value, active: bool, running: i64, case: &str) {
+/// that asked for it and the capacity the row expects: every setting is echoed as the
+/// number it asked for (0 by default), the location reports `requested` as both its
+/// always-on capacity and the capacity it most recently requested, an `ACTIVE`
+/// location holds `provisioned` of it while one still being prepared holds nothing,
+/// `running` sessions are not idle, and the location reports the service VPC it runs
+/// in.
+fn assert_projection(
+    state: &Value,
+    configuration: &Value,
+    expectation: Expectation,
+    case: &str,
+) {
+    let Expectation {
+        requested,
+        provisioned,
+        active,
+        running,
+    } = expectation;
     for setting in CAPACITY_SETTINGS {
         assert_eq!(
             state[setting].as_i64(),
@@ -137,14 +176,15 @@ fn assert_projection(state: &Value, configuration: &Value, active: bool, running
             "case {case:?}: {derived} must be reported as a number, got {state}"
         );
     }
-    let requested = asked_for(configuration, "AlwaysOnCapacity");
-    let allocated = if active { requested } else { 0 };
-    assert_eq!(
-        state["RequestedCapacity"].as_i64(),
-        Some(requested),
-        "case {case:?}: RequestedCapacity is the always-on capacity requested \
-         ({requested}), got {state}"
-    );
+    let allocated = if active { provisioned } else { 0 };
+    for member in ["AlwaysOnCapacity", "RequestedCapacity"] {
+        assert_eq!(
+            state[member].as_i64(),
+            Some(requested),
+            "case {case:?}: {member} is the capacity the location requests \
+             ({requested}), got {state}"
+        );
+    }
     assert_eq!(
         state["AllocatedCapacity"].as_i64(),
         Some(allocated),
@@ -165,61 +205,109 @@ fn assert_projection(state: &Value, configuration: &Value, active: bool, running
     );
 }
 
-/// One row of the capacity table: the case, and the `LocationConfigurations` the
-/// group is created with.
-type CapacityCase<'a> = (&'a str, Vec<Value>);
+/// What one location is expected to report: the capacity it requests, the capacity
+/// the service has provisioned for it once it is `ACTIVE`, whether it is `ACTIVE`
+/// yet, and how many of its sessions are streaming.
+#[derive(Debug, Clone, Copy)]
+struct Expectation {
+    requested: i64,
+    provisioned: i64,
+    active: bool,
+    running: i64,
+}
+
+/// One row of the capacity table: the case, the `LocationConfigurations` the group is
+/// created with, and for each of them the capacity it requests and the capacity the
+/// service provisions for it once it is `ACTIVE` with nothing streaming — written
+/// out, so a row states the rule rather than recomputing it.
+struct CapacityCase<'a> {
+    case: &'a str,
+    configurations: Vec<Value>,
+    expected: Vec<(i64, i64)>,
+}
 
 #[tokio::test]
 async fn a_stream_group_read_reports_the_whole_capacity_projection_of_every_location() {
     let router = emulator();
     let (_, app_arn) = ready_application(&router, "capacity-app").await;
 
-    let cases: [CapacityCase; 7] = [
-        (
-            "always-on capacity alone",
-            vec![json!({"LocationName": REGION, "AlwaysOnCapacity": 2})],
-        ),
-        (
-            "on-demand capacity alone",
-            vec![json!({"LocationName": REGION, "OnDemandCapacity": 3})],
-        ),
-        (
-            "a maximum with a target idle level",
-            vec![json!({
+    let cases: [CapacityCase; 9] = [
+        CapacityCase {
+            case: "always-on capacity alone",
+            configurations: vec![json!({"LocationName": REGION, "AlwaysOnCapacity": 2})],
+            expected: vec![(2, 2)],
+        },
+        CapacityCase {
+            // The deprecated elastic bound: "this field is deprecated. Use
+            // MaximumCapacity instead" — capacity the service allocates in
+            // response to stream requests, so none of it stands provisioned.
+            case: "on-demand capacity alone",
+            configurations: vec![json!({"LocationName": REGION, "OnDemandCapacity": 3})],
+            expected: vec![(3, 0)],
+        },
+        CapacityCase {
+            case: "a maximum alone",
+            configurations: vec![json!({"LocationName": REGION, "MaximumCapacity": 2})],
+            expected: vec![(2, 0)],
+        },
+        CapacityCase {
+            case: "a maximum with a target idle level",
+            configurations: vec![json!({
                 "LocationName": REGION,
                 "MaximumCapacity": 5,
                 "TargetIdleCapacity": 1,
             })],
-        ),
-        (
-            "every setting at the published lower bound",
-            vec![json!({
+            expected: vec![(5, 1)],
+        },
+        CapacityCase {
+            // An always-on minimum under a maximum: the always-on capacity is the
+            // one the location requested, whatever bound stands over it.
+            case: "an always-on minimum under a maximum",
+            configurations: vec![json!({
+                "LocationName": REGION,
+                "AlwaysOnCapacity": 1,
+                "MaximumCapacity": 4,
+            })],
+            expected: vec![(1, 1)],
+        },
+        CapacityCase {
+            case: "every setting at the published lower bound",
+            configurations: vec![json!({
                 "LocationName": REGION,
                 "AlwaysOnCapacity": 0,
                 "OnDemandCapacity": 0,
                 "TargetIdleCapacity": 0,
                 "MaximumCapacity": 0,
             })],
-        ),
-        (
-            "no capacity setting at all",
-            vec![json!({"LocationName": REGION})],
-        ),
-        (
-            "an always-on capacity far above the usual one",
-            vec![json!({"LocationName": REGION, "AlwaysOnCapacity": 50})],
-        ),
-        (
-            "two locations, each with its own capacity",
-            vec![
+            expected: vec![(0, 0)],
+        },
+        CapacityCase {
+            case: "no capacity setting at all",
+            configurations: vec![json!({"LocationName": REGION})],
+            expected: vec![(0, 0)],
+        },
+        CapacityCase {
+            case: "an always-on capacity far above the usual one",
+            configurations: vec![json!({"LocationName": REGION, "AlwaysOnCapacity": 50})],
+            expected: vec![(50, 50)],
+        },
+        CapacityCase {
+            case: "two locations, each with its own capacity",
+            configurations: vec![
                 json!({"LocationName": REGION, "AlwaysOnCapacity": 1}),
                 json!({"LocationName": "us-east-1", "MaximumCapacity": 4,
                        "TargetIdleCapacity": 2}),
             ],
-        ),
+            expected: vec![(1, 1), (4, 2)],
+        },
     ];
 
-    for (index, (case, configurations)) in cases.into_iter().enumerate() {
+    for (index, row) in cases.into_iter().enumerate() {
+        let CapacityCase {
+            case,
+            configurations,
+            expected,
+        } = row;
         // `Description` is modelled `pattern ^[a-zA-Z0-9-_.!+@/][a-zA-Z0-9-_.!+@/ ]*$`,
         // so the row's index names the group rather than its prose label.
         let (group_id, group_arn, created) = group_with_locations(
@@ -232,24 +320,41 @@ async fn a_stream_group_read_reports_the_whole_capacity_projection_of_every_loca
 
         // The create answers the same projection it will read back: nothing is
         // provisioned yet, so the locations hold nothing.
-        for configuration in &configurations {
+        for (configuration, (requested, provisioned)) in configurations.iter().zip(&expected) {
             let name = configuration["LocationName"].as_str().unwrap();
             let state = location(&created["LocationStates"], name, case);
-            assert_projection(&state, configuration, false, 0, case);
+            assert_projection(
+                &state,
+                configuration,
+                Expectation {
+                    requested: *requested,
+                    provisioned: *provisioned,
+                    active: false,
+                    running: 0,
+                },
+                case,
+            );
         }
 
-        // The clock provisions the locations one transition later; the read reports
-        // the same projection, now with the always-on capacity allocated.
-        std::thread::sleep(PAST_TRANSITION);
-        let (status, group) = call(&router, "GET", &format!("/streamgroups/{group_id}"), None).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected GetStreamGroup 200, got {status} {group}"
-        );
-        for configuration in &configurations {
+        // The clock provisions the locations one transition later; once every one of
+        // them is `ACTIVE` the read reports the same projection, now with the capacity
+        // the location holds allocated. Polled for that CONDITION rather than waited
+        // on for a fixed time.
+        let group = stream_group_fully_active(&router, &group_id, case).await;
+        for (configuration, (requested, provisioned)) in configurations.iter().zip(&expected) {
             let name = configuration["LocationName"].as_str().unwrap();
             let state = location(&group["LocationStates"], name, case);
-            assert_projection(&state, configuration, true, 0, case);
+            assert_projection(
+                &state,
+                configuration,
+                Expectation {
+                    requested: *requested,
+                    provisioned: *provisioned,
+                    active: true,
+                    running: 0,
+                },
+                case,
+            );
         }
 
         // Naming the group by its ARN reads the same resource, so it reports the
@@ -285,16 +390,21 @@ async fn a_running_session_is_subtracted_from_the_idle_capacity_of_its_location(
         std::slice::from_ref(&configuration),
     )
     .await;
-    std::thread::sleep(PAST_TRANSITION);
+    // Wait for the CONDITION the capacity depends on — every location provisioned —
+    // rather than for a fixed time.
+    stream_group_fully_active(&router, &group_id, "idle-capacity-group").await;
     let path = format!("/streamgroups/{group_id}");
 
+    // "NO_CLIENT_CONNECTION ... will create a session without needing any browser
+    // request or Web SDK integration", so the session is placed on the location's
+    // capacity and stays there until it is terminated.
     let (status, session) = call(
         &router,
         "POST",
         &format!("/streamgroups/{group_id}/streamsessions"),
         Some(json!({
             "Protocol": "WebRTC",
-            "SignalRequest": "offer",
+            "SignalRequest": "NO_CLIENT_CONNECTION",
             "ApplicationIdentifier": app_id,
             "Locations": [REGION],
         })),
@@ -305,21 +415,62 @@ async fn a_running_session_is_subtracted_from_the_idle_capacity_of_its_location(
         "case \"a session placed in the location\": expected StartStreamSession 201, got \
          {status} {session}"
     );
+    let session_id = text(&session, "/Arn", "a session placed in the location")
+        .rsplit('/')
+        .next()
+        .expect("a stream session ARN ends in the session id")
+        .to_string();
+    let session_path = format!("/streamgroups/{group_id}/streamsessions/{session_id}");
 
-    // The session is live, so one of the location's two allocated streams is in use
-    // and only one is idle. Read straight away: the allocation itself is unchanged —
-    // always-on capacity "is allocated to you and is never released back to the
-    // service" — it is the IDLE half of the projection that moves.
+    // Once the placement has resolved, one of the location's two allocated streams is
+    // in use and only one is idle: the allocation itself is unchanged — always-on
+    // capacity "is allocated to you and is never released back to the service" — it is
+    // the IDLE half of the projection that moves.
     let case = "a session placed in the location";
+    poll_until(&router, &session_path, case, |body| {
+        PLACED_SESSION_STATUSES
+            .iter()
+            .any(|status| body["Status"] == json!(status))
+    })
+    .await;
     let (_, group) = call(&router, "GET", &path, None).await;
-    assert_projection(&location(&group["LocationStates"], REGION, case), &configuration, true, 1, case);
+    assert_projection(
+        &location(&group["LocationStates"], REGION, case),
+        &configuration,
+        Expectation {
+            requested: 2,
+            provisioned: 2,
+            active: true,
+            running: 1,
+        },
+        case,
+    );
 
-    // Once the clock has taken that session to a terminal status it occupies nothing,
-    // so the whole allocation is idle again.
-    std::thread::sleep(PAST_TRANSITION);
-    let case = "the session has reached a terminal status";
+    // A terminated session occupies nothing, so the whole allocation is idle again.
+    let case = "the session has been terminated";
+    let (status, terminated) = call(&router, "DELETE", &session_path, None).await;
+    assert_eq!(
+        status, 204,
+        "case {case:?}: expected TerminateStreamSession 204, got {status} {terminated}"
+    );
+    poll_until(&router, &session_path, case, |body| {
+        TERMINATED_SESSION_STATUSES
+            .iter()
+            .any(|status| body["Status"] == json!(status))
+    })
+    .await;
     let (_, group) = call(&router, "GET", &path, None).await;
-    assert_projection(&location(&group["LocationStates"], REGION, case), &configuration, true, 0, case);
+    assert_projection(
+        &location(&group["LocationStates"], REGION, case),
+        &configuration,
+        Expectation {
+            requested: 2,
+            provisioned: 2,
+            active: true,
+            running: 0,
+        },
+        case,
+    );
 }
 
 /// One row of the association table: the case, whether the group is created with a
@@ -373,8 +524,9 @@ async fn a_stream_group_read_reports_the_applications_it_is_associated_with() {
             "case {case:?}: expected CreateStreamGroup 201, got {status} {created}"
         );
         let group_id = text(&created, "/Id", case);
-        // "The stream group must be in ACTIVE status" (`AssociateApplications`).
-        std::thread::sleep(PAST_TRANSITION);
+        // "The stream group must be in ACTIVE status" (`AssociateApplications`), which
+        // is the CONDITION this waits for.
+        stream_group_fully_active(&router, &group_id, case).await;
 
         let identifiers: Vec<String> = linked
             .iter()

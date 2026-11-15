@@ -4,6 +4,22 @@
 //! Answers from the stored stream group record, which an `Identifier` names by
 //! bare id or by ARN.
 //!
+//! ## `DesiredCapacity`, `ActiveCapacity` and `IdleCapacity`, members added to this
+//! service's model
+//!
+//! The shipped model declares the stream-group outputs without a group-level
+//! capacity summary, while the recorded AWS responses in corpus
+//! `simparity-wire-aws-v1` report one on every stream-group read: how much capacity
+//! the group's locations have been asked to hold, how much the service has
+//! provisioned for them, and how much of that is idle. A schema-driven serializer
+//! cannot emit a member the model does not declare, so `DesiredCapacity`,
+//! `ActiveCapacity` and `IdleCapacity` were ADDED to `GetStreamGroupOutput`,
+//! `CreateStreamGroupOutput` and `UpdateStreamGroupOutput` in
+//! `smithy-model/com-amazonaws-gameliftstreams-gameliftstreams.json`. No value is
+//! invented for them: each is the roll-up of the group's stored locations
+//! ([`crate::state::StreamGroup::capacity_summary`]), which is the same projection
+//! `LocationStates` is reported from.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -57,6 +73,9 @@
 //!
 //! ## Output
 //!
+//! * `ActiveCapacity` (CapacityValue, min 0) — a member ADDED to this service's model
+//!   (see above): the stream capacity the service has provisioned across this group's
+//!   locations.
 //! * `Arn` (Identifier, len 1..128, pattern ^(^[a-zA-Z0-9-]+$)|(^arn:aws:gameliftstreams:([^:
 //!   ]*):([0-9]{12}):([^: ]*)$)$) **required** — The Amazon Resource Name (ARN) that is
 //!   assigned to the stream group resource and that uniquely identifies the group across all
@@ -74,12 +93,17 @@
 //!   application that is associated with this stream group.
 //! * `Description` (Description, len 1..80, pattern ^[a-zA-Z0-9-_.!+@/][a-zA-Z0-9-_.!+@/ ]*$)
 //!   — A descriptive label for the stream group.
+//! * `DesiredCapacity` (CapacityValue, min 0) — a member ADDED to this service's model
+//!   (see above): the stream capacity this group's locations have most recently
+//!   requested.
 //! * `ExpiresAt` (Timestamp) — The time at which this stream group expires. Timestamps are
 //!   expressed using in ISO8601 format, such as: 2022-12-27T22:29:40+00:00 (UTC). After this
 //!   time, you will no longer be able to update this stream group or use it to start stream
 //!   sessions. Only Get and Delete operations will work on an expired stream group.
 //! * `Id` (Id, len 1..32, pattern ^[a-zA-Z0-9-]+$) — A unique ID value that is assigned to
 //!   the resource when it's created. Format example: sg-1AB2C3De4.
+//! * `IdleCapacity` (CapacityValue, min 0) — a member ADDED to this service's model (see
+//!   above): how much of the provisioned capacity is not streaming right now.
 //! * `LastUpdatedAt` (Timestamp) — A timestamp that indicates when this resource was last
 //!   updated. Timestamps are expressed using in ISO8601 format, such as:
 //!   2022-12-27T22:29:40+00:00 (UTC).
@@ -250,6 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let summary = group.capacity_summary();
         Ok(GetStreamGroupOutput {
             arn: group.arn.clone(),
             description: Some(group.description.clone()),
@@ -263,6 +288,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: Some(crate::state::timestamp(group.created_at)),
             expires_at: Some(crate::state::timestamp(group.expires_at)),
             associated_applications: Some(group.associated_applications.clone()),
+            desired_capacity: Some(summary.desired),
+            active_capacity: Some(summary.active),
+            idle_capacity: Some(summary.idle),
         })
     }
 }

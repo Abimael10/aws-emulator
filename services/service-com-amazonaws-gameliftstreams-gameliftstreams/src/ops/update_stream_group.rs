@@ -91,6 +91,10 @@
 //!
 //! ## Output
 //!
+//! * `ActiveCapacity`, `DesiredCapacity` and `IdleCapacity` (CapacityValue, min 0) —
+//!   three members ADDED to this service's model: the group's own capacity summary, as
+//!   `GetStreamGroup` reports it (see the module docs of
+//!   [`crate::ops::get_stream_group`]).
 //! * `Arn` (Identifier, len 1..128, pattern ^(^[a-zA-Z0-9-]+$)|(^arn:aws:gameliftstreams:([^:
 //!   ]*):([0-9]{12}):([^: ]*)$)$) **required** — The Amazon Resource Name (ARN) that is
 //!   assigned to the stream group resource and that uniquely identifies the group across all
@@ -543,6 +547,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .stream_groups
             .get(&group_id)
             .expect("the stream group was just updated under this id");
+        let summary = group.capacity_summary();
         Ok(UpdateStreamGroupOutput {
             arn: group.arn.clone(),
             description: Some(group.description.clone()),
@@ -556,6 +561,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: Some(crate::state::timestamp(group.created_at)),
             expires_at: Some(crate::state::timestamp(group.expires_at)),
             associated_applications: Some(group.associated_applications.clone()),
+            desired_capacity: Some(summary.desired),
+            active_capacity: Some(summary.active),
+            idle_capacity: Some(summary.idle),
         })
     }
 }

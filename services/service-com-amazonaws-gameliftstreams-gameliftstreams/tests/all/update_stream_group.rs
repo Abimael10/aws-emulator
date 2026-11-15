@@ -33,10 +33,11 @@ use super::stream_workflow::{
     PAST_TRANSITION,
 };
 
-/// The capacity members of `LocationConfiguration`, from `smithy_query(query="shape",
-/// shape="LocationConfiguration")`: each one is an optional integer `@range(min: 0)`.
-const CAPACITY_MEMBERS: [&str; 4] = [
-    "AlwaysOnCapacity",
+/// The capacity settings of `LocationConfiguration` a `LocationState` echoes back
+/// unchanged, from `smithy_query(query="shape", shape="LocationConfiguration")`: each
+/// one an optional integer `@range(min: 0)`. `AlwaysOnCapacity` is reported from the
+/// capacity the location REQUESTS instead (see [`assert_capacities`]).
+const CAPACITY_MEMBERS: [&str; 3] = [
     "OnDemandCapacity",
     "TargetIdleCapacity",
     "MaximumCapacity",
@@ -53,10 +54,14 @@ fn location_state(value: &Value, location: &str, case: &str) -> Value {
         .unwrap_or_else(|| panic!("case {case:?}: no state for location {location} in {value}"))
 }
 
-/// Assert one location reports exactly the capacities `expected` holds, and the derived
-/// capacities that follow from its always-on capacity in an `ACTIVE` group: allocated
-/// always-on capacity "is allocated to you and is never released back to the service",
-/// and nothing is streaming, so all of it is idle.
+/// Assert one location reports exactly the capacities `expected` holds, and the
+/// capacities that follow from them in an `ACTIVE` group with nothing streaming: the
+/// capacity the location requests of the service — the always-on capacity it was left
+/// with, or the bound it asks the service to be able to allocate where it has no
+/// always-on capacity of its own — reported as both its `AlwaysOnCapacity` and its
+/// `RequestedCapacity`; the capacity the service provisions for it, which is its
+/// always-on capacity and never less than the target-idle capacity it holds free; and
+/// all of that provisioned capacity idle, since nothing is streaming.
 ///
 /// A capacity setting no configuration ever named is reported at its default of 0
 /// ("Default is 0 when creating a stream group or adding a location" —
@@ -72,11 +77,22 @@ fn assert_capacities(state: &Value, expected: &BTreeMap<&str, i64>, location: &s
         );
     }
     let always_on = expected.get("AlwaysOnCapacity").copied().unwrap_or(0);
-    for member in ["RequestedCapacity", "AllocatedCapacity", "IdleCapacity"] {
+    let target_idle = expected.get("TargetIdleCapacity").copied().unwrap_or(0);
+    let requested = ["AlwaysOnCapacity", "MaximumCapacity", "OnDemandCapacity"]
+        .into_iter()
+        .find_map(|member| expected.get(member).copied())
+        .unwrap_or(0);
+    let allocated = always_on.max(target_idle);
+    for (member, wanted) in [
+        ("AlwaysOnCapacity", requested),
+        ("RequestedCapacity", requested),
+        ("AllocatedCapacity", allocated),
+        ("IdleCapacity", allocated),
+    ] {
         assert_eq!(
             state[member].as_i64(),
-            Some(always_on),
-            "case {case:?}: location {location} {member}: expected {always_on}, got {state}"
+            Some(wanted),
+            "case {case:?}: location {location} {member}: expected {wanted}, got {state}"
         );
     }
     assert_eq!(

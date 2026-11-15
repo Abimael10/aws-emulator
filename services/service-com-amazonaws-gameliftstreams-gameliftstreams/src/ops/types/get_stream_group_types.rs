@@ -32,5 +32,12 @@ pub struct GetStreamGroupOutput {
     pub created_at: Option<::aws_smithy_types::DateTime>,
     pub expires_at: Option<::aws_smithy_types::DateTime>,
     pub associated_applications: Option<Vec<String>>,
+    /// The capacity the group's locations have most recently requested, the
+    /// capacity the service has provisioned for them, and how much of that is
+    /// idle. Three members the on-disk model did not declare and this service's
+    /// model now does — see [`crate::ops::get_stream_group`].
+    pub desired_capacity: Option<i32>,
+    pub active_capacity: Option<i32>,
+    pub idle_capacity: Option<i32>,
 }
 
