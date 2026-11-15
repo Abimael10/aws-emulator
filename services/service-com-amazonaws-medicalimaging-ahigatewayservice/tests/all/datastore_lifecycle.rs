@@ -98,10 +98,12 @@ impl Answer {
 /// The emulator under test: one shared engine behind the production router.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
-    /// The SAME engine the router handed every operation. Held so a suite can seed a
-    /// resource this service's implemented operations cannot yet mint themselves (an
-    /// image set, which only a DICOM import creates) and then drive the real HTTP
-    /// surface over it. No case asserts THROUGH this handle — assertions read the wire.
+    /// The SAME engine the router handed every operation. Held so a suite can seed the
+    /// image sets a DICOM import is to materialise: an import is the only call that brings
+    /// one into existence, and it READS its input prefix out of Amazon S3, which is
+    /// mounted beside this service only in `aws_emulator_router`'s
+    /// `medical_imaging_dicom_import` suite. No case asserts THROUGH this handle —
+    /// assertions read the wire.
     engine: Arc<engine::InMemoryEngine>,
 }
 

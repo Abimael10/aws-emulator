@@ -25,12 +25,13 @@
 //!
 //! ## Why a seeded image set
 //!
-//! In AWS pixel data enters a data store through a DICOM import, and this emulator's
-//! import job does not create image sets yet — that is
-//! `issues/things-that-do-not-work/20261024T002353Z-medical-imaging-startdicomimportjob-event-propagation.md`.
-//! So the image set a case reads frames from is seeded through the crate's public
-//! `state` module, with the same `ImageSet::new` / `ImageFrame` the handlers use, and
-//! everything each case then asserts goes over HTTP.
+//! In AWS pixel data enters a data store through a DICOM import, and so it does here
+//! (`crate::import_job_image_set_delivery` drives the frames an import delivers). An import
+//! READS its input prefix out of Amazon S3, which is mounted beside this service only in
+//! `aws_emulator_router`'s `medical_imaging_dicom_import` suite, so the image set a case
+//! here reads frames from is seeded through the crate's public `state` module, with the
+//! same `ImageSet::new` / `ImageFrame` the handlers use, and everything each case then
+//! asserts goes over HTTP.
 
 use std::time::SystemTime;
 

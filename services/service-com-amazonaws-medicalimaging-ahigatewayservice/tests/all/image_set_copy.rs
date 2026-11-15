@@ -34,12 +34,13 @@
 //!
 //! ## Why a seeded source
 //!
-//! In AWS an image set comes into existence through a DICOM import, and this emulator's
-//! import job does not create image sets yet — that is
-//! `issues/things-that-do-not-work/20261024T002353Z-medical-imaging-startdicomimportjob-event-propagation.md`.
-//! So the SOURCE of a copy is seeded through the crate's public `state` module, with
-//! `ImageSet::new` — the one constructor the handler itself mints image sets with — and
-//! everything each case then asserts goes over HTTP.
+//! In AWS an image set comes into existence through a DICOM import, and so it does here
+//! (`crate::import_job_image_set_delivery`, and `crate::imported_image_set_copy_journey`
+//! for a copy taken from what an import delivered). An import READS its input prefix out
+//! of Amazon S3, which is mounted beside this service only in `aws_emulator_router`'s
+//! `medical_imaging_dicom_import` suite, so the SOURCE of a copy is seeded here through the
+//! crate's public `state` module, with `ImageSet::new` — the one constructor the handler
+//! itself mints image sets with — and everything each case then asserts goes over HTTP.
 
 use std::time::{Instant, SystemTime};
 

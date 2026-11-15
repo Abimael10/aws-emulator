@@ -77,6 +77,8 @@ mod import_job_image_set_delivery;
 mod import_job_listing;
 #[path = "all/import_job_output_manifest.rs"]
 mod import_job_output_manifest;
+#[path = "all/imported_image_set_copy_journey.rs"]
+mod imported_image_set_copy_journey;
 #[path = "all/imported_instance_metadata.rs"]
 mod imported_instance_metadata;
 #[path = "all/list_element_refusal_paths.rs"]

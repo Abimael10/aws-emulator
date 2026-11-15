@@ -63,7 +63,7 @@ fn data_access_role_arn() -> String {
 
 /// One DICOM instance an import read: where it sits in the study / series / instance
 /// hierarchy, the attributes its file carried, and its pixel data.
-struct Instance {
+pub(crate) struct Instance {
     study_instance_uid: &'static str,
     series_instance_uid: &'static str,
     sop_instance_uid: &'static str,
@@ -77,7 +77,11 @@ struct Instance {
 
 impl Instance {
     /// This instance as the crate's own import reading holds it.
-    fn imported(&self) -> ImportedInstance {
+    ///
+    /// `pub(crate)` because `crate::imported_image_set_copy_journey` drives the SAME
+    /// delivery and then copies what it delivered, which is that suite's rule rather than
+    /// this one's; one description of an imported instance, not one per suite.
+    pub(crate) fn imported(&self) -> ImportedInstance {
         ImportedInstance {
             // The key of the object this instance was read out of.
             source_key: Some(format!("in/{}.dcm", self.sop_instance_uid)),
@@ -106,14 +110,14 @@ impl Instance {
 
 /// Pixel data of `len` bytes that no two instances share: a frame's blob must come back
 /// byte for byte, so each instance's payload has to be distinguishable from every other's.
-fn pixels(seed: u8, len: usize) -> Vec<u8> {
+pub(crate) fn pixels(seed: u8, len: usize) -> Vec<u8> {
     (0..len)
         .map(|index| seed.wrapping_add((index % 251) as u8))
         .collect()
 }
 
 /// One instance of `study` / `series`, carrying pixel data unless `pixel_data` is `None`.
-fn instance(
+pub(crate) fn instance(
     study_instance_uid: &'static str,
     series_instance_uid: &'static str,
     sop_instance_uid: &'static str,
@@ -327,10 +331,10 @@ fn import_cases() -> Vec<ImportCase> {
 
 /// One image set an import put in flight: the identifier it came into existence under, and
 /// the image frames its completion is to deliver, by the SOP instance each belongs to.
-struct InFlight {
-    image_set_id: String,
+pub(crate) struct InFlight {
+    pub(crate) image_set_id: String,
     /// SOP Instance UID -> (image frame id, the pixel data the frame is to serve).
-    frames: BTreeMap<String, (String, Vec<u8>)>,
+    pub(crate) frames: BTreeMap<String, (String, Vec<u8>)>,
 }
 
 /// Put the image sets `instances` describe in flight in the data store, exactly as the
@@ -344,7 +348,7 @@ struct InFlight {
 /// `medical_imaging_dicom_import` suite, which is the only place Amazon S3 is mounted beside
 /// this service; what the rows here pin is what the DELIVERY of such a record makes
 /// observable, and when.
-fn put_import_in_flight(
+pub(crate) fn put_import_in_flight(
     emulator: &Emulator,
     datastore_id: &str,
     job_id: &str,
@@ -415,7 +419,12 @@ fn put_import_in_flight(
 /// The only write a case makes into the state struct, and it moves no status: it moves the
 /// DUE instants, so the landing can be observed without racing the import's spans —
 /// `crate::image_set_deletion::move_due_instant` does the same for a deletion.
-fn make_import_due(emulator: &Emulator, case: &str, datastore_id: &str, job_id: &str) {
+pub(crate) fn make_import_due(
+    emulator: &Emulator,
+    case: &str,
+    datastore_id: &str,
+    job_id: &str,
+) {
     let now = SystemTime::now();
     let state = service_state(emulator.engine()).expect("the medical-imaging state store");
     let mut store = state.lock();
@@ -437,7 +446,12 @@ fn make_import_due(emulator: &Emulator, case: &str, datastore_id: &str, job_id: 
 }
 
 /// Submit one import over the production front door and answer the job it minted.
-async fn start_import(emulator: &Emulator, case: &str, datastore_id: &str, token: &str) -> String {
+pub(crate) async fn start_import(
+    emulator: &Emulator,
+    case: &str,
+    datastore_id: &str,
+    token: &str,
+) -> String {
     let started = emulator
         .start_import_job(
             datastore_id,
@@ -462,7 +476,12 @@ async fn start_import(emulator: &Emulator, case: &str, datastore_id: &str, token
 }
 
 /// The `jobStatus` `GetDICOMImportJob` reports for `job_id`.
-async fn job_status(emulator: &Emulator, case: &str, datastore_id: &str, job_id: &str) -> String {
+pub(crate) async fn job_status(
+    emulator: &Emulator,
+    case: &str,
+    datastore_id: &str,
+    job_id: &str,
+) -> String {
     let read = emulator.get_import_job(datastore_id, job_id).await;
     assert_eq!(
         read.status, 200,

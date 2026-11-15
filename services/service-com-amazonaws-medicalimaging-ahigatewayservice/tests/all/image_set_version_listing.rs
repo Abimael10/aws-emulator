@@ -478,18 +478,24 @@ async fn listing_versions_changes_nothing_a_later_caller_sees() {
     }
 }
 
-/// Poll `GetImageSet` until the copy the CLOCK owed has landed: the image set back in
-/// `ACTIVE`, at the version the copy was to leave it on.
+/// Poll `GetImageSet` until the write the CLOCK owed has landed: the image set back in
+/// `ACTIVE`, at the version that write was to leave it on, and — when `workflow_status` names
+/// one — reporting that `imageSetWorkflowStatus`.
 ///
 /// Waits for the CONDITION rather than for the span the copy is promised in
 /// ([`IMAGE_SET_COPY_DELAY`]), so a loaded host only makes a case slower, never red.
 /// Panics past [`POLL_DEADLINE`], which bounds a hung emulator.
-async fn poll_until_landed(
+///
+/// `pub(crate)` because `crate::imported_image_set_copy_journey` waits for the same landing
+/// of a copy taken from an image set an import delivered; one poll of this condition, not one
+/// per suite.
+pub(crate) async fn poll_until_landed(
     emulator: &Emulator,
     case: &str,
     datastore_id: &str,
     image_set_id: &str,
     version_id: &str,
+    workflow_status: Option<&str>,
 ) {
     let deadline = Instant::now() + POLL_DEADLINE;
     loop {
@@ -497,13 +503,16 @@ async fn poll_until_landed(
         if read.status == 200
             && read.string(&["imageSetState"]) == "ACTIVE"
             && read.string(&["versionId"]) == version_id
+            && workflow_status
+                .is_none_or(|status| read.string(&["imageSetWorkflowStatus"]) == status)
         {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "case {case:?}: the copy never landed ACTIVE at version {version_id} (the copy span \
-             is {IMAGE_SET_COPY_DELAY:?}), last answer {read:?}"
+            "case {case:?}: the write never landed ACTIVE at version {version_id} \
+             (workflow status {workflow_status:?}; the copy span is {IMAGE_SET_COPY_DELAY:?}), \
+             last answer {read:?}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -540,6 +549,7 @@ async fn poll_until_landed(
         &datastore_id,
         &destination_id,
         "1",
+        None,
     )
     .await;
 
@@ -563,6 +573,7 @@ async fn poll_until_landed(
         &datastore_id,
         &destination_id,
         "2",
+        None,
     )
     .await;
 
