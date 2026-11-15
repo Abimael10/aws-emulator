@@ -35,6 +35,8 @@ mod list_tags_for_resource;
 mod list_tables_summary_members;
 #[path = "all/metrics_configuration_not_found_message.rs"]
 mod metrics_configuration_not_found_message;
+#[path = "all/minted_value_forms.rs"]
+mod minted_value_forms;
 #[path = "all/namespace_and_table_lifecycle.rs"]
 mod namespace_and_table_lifecycle;
 #[path = "all/name_lookups.rs"]

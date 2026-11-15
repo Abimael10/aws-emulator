@@ -1393,3 +1393,10 @@ mod lambda_in_function_assumed_role_session;
 // The list below is DECLARATIONS ONLY. What a suite covers, and why it belongs to this
 // cross-service target rather than to one service crate's own, is stated in that suite's own
 // module header, where it is read beside the test it explains — not here.
+// Single integration-test target for the router: a canonical declaration list.
+// pair, keeping the list sorted: one pair per suite and NO other line, so two branches
+// landing at once insert two lines in two places and have no prose to duplicate.
+// level of `tests/` fails the build; and a suite declared twice is `E0428`, which fails
+// every suite in this target.
+// `all/all_rs_is_a_canonical_declaration_list.rs` check those rules, for this file and for
+// every service crate's `tests/all.rs`, so check there rather than leaving a note here.

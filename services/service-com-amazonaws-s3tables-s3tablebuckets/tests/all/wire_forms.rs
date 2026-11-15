@@ -77,7 +77,7 @@ const FIXTURES: &[Fixture] = &[
 ];
 
 /// `CreateTable`'s request body for `table`.
-fn create_table_request(table: &str, metadata: bool) -> Value {
+pub(crate) fn create_table_request(table: &str, metadata: bool) -> Value {
     let mut request = json!({
         "name": table,
         // `format` is required and `ICEBERG` is the only value the modelled
