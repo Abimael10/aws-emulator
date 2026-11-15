@@ -7,7 +7,9 @@
 //! clock has already completed — with the modelled `ResourceNotFound`. The
 //! input `NextToken` resumes the list of features, and one response here carries every
 //! `FeatureDefinition` a group can hold, so the only token this operation issues — and
-//! the only one it accepts — is the empty one. This is the ONLY file to touch for this
+//! the only one it accepts — is the empty one. A group that keeps an online store also
+//! reports the three online-store members the recorded service carries beside the modelled
+//! ones (`super::types::recorded_read_members`). This is the ONLY file to touch for this
 //! operation.
 //!
 //! ## Shape of an operation
@@ -123,6 +125,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The mode an online store this account both reads and WRITES records to through the
+/// Feature Store runtime plane is in, as `OnlineStoreReadWriteType` spells it.
+///
+/// The other mode is a store that is only read — one that MIRRORS another store rather than
+/// taking writes of its own. Nothing in `OnlineStoreConfig`
+/// (`smithy_query(query="shape",shape="OnlineStoreConfig")`: a security configuration, the
+/// enable flag, a TTL and a storage tier) configures such a mirror, so every online store a
+/// group here keeps is written through its own `PutRecord`.
+const ONLINE_STORE_READ_WRITE: &str = "ReadWrite";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -178,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for DescribeFeatureGroup<Eng>
 {
     type Input = DescribeFeatureGroupInput;
-    type Output = DescribeFeatureGroupOutput;
+    type Output = DescribeFeatureGroupRecordedOutput;
     type Error = DescribeFeatureGroupError;
 
     const NAME: &'static str = "DescribeFeatureGroup";
@@ -214,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The store guard is taken for this read and released with this block, before the
         // offline-store status below is asked of IAM: no guard is ever held across an await.
-        let (output, group_arn, settled) = {
+        let (output, group_arn, settled, online_store) = {
         let mut store = state.lock();
         let Some(group) = store.feature_group_mut(name) else {
             // Never a 200 with empty fields: a caller cannot tell that from a group that
@@ -231,6 +243,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // owed. It was due at the stored instant whether or not anybody described the
         // group, so a waiter terminates and no caller's read changes the outcome.
         let settled = group.settle_status(::std::time::SystemTime::now());
+
+        // Whether the group KEEPS an online store, which is what every online-store member
+        // below is reported on.
+        let online_store = group.online_store_enabled();
 
         let output = DescribeFeatureGroupOutput {
             feature_group_arn: group.arn.clone(),
@@ -270,24 +286,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // group with no OnlineStore has no size to report at all. The records
             // themselves live in the Feature Store RUNTIME service, which owns them; this
             // control plane holds none, so there is no quantity it could overstate.
-            online_store_total_size_bytes: group.online_store_enabled().then_some(0),
+            online_store_total_size_bytes: online_store.then_some(0),
         };
         let group_arn = group.arn.clone();
         drop(store);
-        (output, group_arn, settled)
+        (output, group_arn, settled, online_store)
         };
 
         // The offline store's status is the permission in force on the group's role, which
         // is IAM's answer rather than this store's: asked with no guard held, and answered
         // by the one reader both planes of the Feature Store share.
-        let mut output = output;
-        output.offline_store_status = crate::state::offline_store_status(
+        let mut output = DescribeFeatureGroupRecordedOutput::new(output);
+        output.modelled.offline_store_status = crate::state::offline_store_status(
             ctx.callback(),
             &crate::state::request_region(ctx),
-            output.offline_store_config.as_ref(),
-            output.role_arn.as_deref(),
+            output.modelled.offline_store_config.as_ref(),
+            output.modelled.role_arn.as_deref(),
         )
         .await;
+
+        // The three online-store members the recorded service carries beside the modelled
+        // ones (`super::types::recorded_read_members` for how a member the on-disk model
+        // does not declare reaches the wire). Each is a fact about the store the group
+        // KEEPS, so a group that keeps none reports none of them — the same split the
+        // modelled `OnlineStoreTotalSizeBytes` above is reported on.
+        if online_store {
+            output.online_store_read_write_type = Some(ONLINE_STORE_READ_WRITE.to_string());
+            // The stores that MIRROR this one. Nothing in `OnlineStoreConfig` configures a
+            // replica, so a group here keeps none — reported as the empty list it is,
+            // rather than left out, because a reader distinguishes "no replica" from "this
+            // group has no online store at all".
+            output.online_store_replicas = Some(Vec::new());
+            // How many items the online store holds, which is none until records are
+            // written to it. The records live in the Feature Store RUNTIME service, which
+            // owns them; this control plane holds none, so there is no quantity it could
+            // overstate — the same reasoning as `OnlineStoreTotalSizeBytes`.
+            output.online_store_total_item_count = Some(0);
+        }
 
         if settled {
             // The transition is a state change, so it leaves the same record a create

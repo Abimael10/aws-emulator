@@ -13,6 +13,13 @@
 //! reported yet has none of them. The debugger and profiler rule evaluations stay absent:
 //! no rule container is evaluated against the run.
 //!
+//! Beside the modelled members, the response carries the ones the recorded service answers
+//! that this service's on-disk model does not declare — the job's `DisableEFA`, each input
+//! channel's `EnableFFM`, its output configuration's `DisableModelUpload` and
+//! `RemoveJobNameFromS3OutputPath`, and its resource configuration's
+//! `UseReservedCapacity`. See `super::types::recorded_read_members` for how such a member
+//! reaches the wire, and the block at the end of `handle` for what each one is read off.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -227,6 +234,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `TrainingInputMode` whose data is streamed from Amazon S3 with file system access to
+/// it, as that modelled enum spells it
+/// (`smithy_query(query="shape",shape="TrainingInputMode")`: `Pipe` | `File` | `FastFile`).
+const FAST_FILE_INPUT_MODE: &str = "FastFile";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -282,7 +294,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for DescribeTrainingJob<Eng>
 {
     type Input = DescribeTrainingJobInput;
-    type Output = DescribeTrainingJobOutput;
+    type Output = DescribeTrainingJobRecordedOutput;
     type Error = DescribeTrainingJobError;
 
     const NAME: &'static str = "DescribeTrainingJob";
@@ -398,6 +410,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let job_arn = job.arn.clone();
         drop(store);
+
+        // The members the recorded service carries beside the modelled ones
+        // (`super::types::recorded_read_members` for how a member the on-disk model does
+        // not declare reaches the wire). None of them is echoed from a request member —
+        // the model declares none — so each is read off the job's own stored configuration
+        // and the run this emulator performs for it.
+        let mut output = DescribeTrainingJobRecordedOutput::new(output);
+        // "DisableEFA": the Elastic Fabric Adapter is not switched off for the compute this
+        // job runs on — nothing here provisions a cluster with it disabled.
+        output.disable_efa = Some(false);
+        // The mode the job's algorithm specification reads its data in, which is the mode a
+        // channel that overrides it with none runs in.
+        let training_input_mode = output
+            .modelled
+            .algorithm_specification
+            .as_ref()
+            .map(|specification| specification.training_input_mode.clone());
+        for channel in output.input_data_config.iter_mut().flatten() {
+            // "EnableFFM": whether the channel's data is read in FastFile mode —
+            // "SageMaker streams data directly from S3 to the container … and provides file
+            // system access to the data" (`TrainingInputMode`) — which is exactly the mode
+            // the channel runs in: its own `InputMode` when it states one, and otherwise the
+            // specification's ("If you don't set a value for InputMode, SageMaker uses the
+            // value set for TrainingInputMode", `Channel$InputMode`).
+            let mode = channel
+                .modelled
+                .input_mode
+                .clone()
+                .or_else(|| training_input_mode.clone());
+            channel.enable_ffm = Some(mode.as_deref() == Some(FAST_FILE_INPUT_MODE));
+        }
+        if let Some(config) = output.output_data_config.as_mut() {
+            // The run UPLOADS the model it fitted, as the archive `ModelArtifacts`
+            // documents, to the location this configuration names
+            // (`crate::state::run_training_job`), so the upload is not disabled — and it
+            // writes that archive under `<S3OutputPath>/<TrainingJobName>/output/`, so the
+            // job's name is not removed from the output path either.
+            config.disable_model_upload = Some(false);
+            config.remove_job_name_from_s3_output_path = Some(false);
+        }
+        if let Some(config) = output.resource_config.as_mut() {
+            // "UseReservedCapacity": whether the job runs on capacity reserved ahead of it
+            // rather than on-demand. A training plan IS that reservation
+            // (`ResourceConfig$TrainingPlanArn`: "the training plan to use for this resource
+            // configuration"), so the job reserves capacity exactly when it names one.
+            config.use_reserved_capacity = Some(config.modelled.training_plan_arn.is_some());
+        }
 
         if settled {
             // The transition is a state change, so it leaves the same record a create

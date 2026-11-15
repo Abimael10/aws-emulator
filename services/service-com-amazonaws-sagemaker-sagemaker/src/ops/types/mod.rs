@@ -343,6 +343,8 @@ pub mod list_workforces_types;
 pub mod list_workteams_types;
 pub mod put_model_package_group_policy_types;
 pub mod query_lineage_types;
+/// The members a read answers with that the on-disk model does not declare.
+pub mod recorded_read_members;
 pub mod register_devices_types;
 pub mod render_ui_template_types;
 pub mod retry_pipeline_execution_types;
@@ -1083,6 +1085,8 @@ pub use list_workteams_types::*;
 pub use put_model_package_group_policy_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use query_lineage_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use recorded_read_members::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use register_devices_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

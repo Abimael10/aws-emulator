@@ -203,16 +203,18 @@ async fn an_accepted_training_job_reads_back_through_describe() {
         }
         // Every request member the describe models is replayed from the store. The
         // members the SERVICE supplies on top of the request (the channel and output
-        // defaults, the switches, the profiling status, the status history) are pinned in
-        // `service_resolved_members`, so this suite compares only what the request sent.
-        for member in ["RoleArn", "ResourceConfig", "StoppingCondition"] {
+        // defaults, the switches, the profiling status, the status history, and the members
+        // the recorded service carries that the model does not declare) are pinned in
+        // `service_resolved_members` and `recorded_read_members`, so this suite compares
+        // only what the request sent — member by member for a structure the service adds to.
+        for member in ["RoleArn", "StoppingCondition"] {
             assert_eq!(
                 described.get(member),
                 body.get(member),
                 "case {case:?}: {member} must be replayed as stored, got {described}"
             );
         }
-        for member in ["AlgorithmSpecification", "OutputDataConfig"] {
+        for member in ["AlgorithmSpecification", "OutputDataConfig", "ResourceConfig"] {
             let sent = body
                 .get(member)
                 .and_then(Value::as_object)

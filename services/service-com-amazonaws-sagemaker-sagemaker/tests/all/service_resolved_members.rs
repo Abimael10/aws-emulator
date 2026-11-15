@@ -979,7 +979,11 @@ async fn training_job_reads_report_the_configuration_the_service_resolves() {
             );
             assert_eq!(
                 reported.get("RecordWrapperType").and_then(Value::as_str),
-                sent.get("RecordWrapperType").and_then(Value::as_str),
+                Some(
+                    sent.get("RecordWrapperType")
+                        .and_then(Value::as_str)
+                        .unwrap_or("None")
+                ),
                 "case {case} channel {index}: RecordWrapperType, got {reported:?}"
             );
             assert_eq!(
