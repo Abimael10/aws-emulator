@@ -336,9 +336,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(PutFileErrorModeled::EncryptionKeyDisabledException(disabled).into());
         }
 
-        // Resolve the parent commit. A branch that already has a tip can only be
-        // written through that tip, so the caller must name it; an empty repository
-        // has no tip and the branch is created by this call.
+        // Resolve the parent commit. A `parentCommitId` is a git object name, so its
+        // FORM is checked before anything is looked up: a value that is not one
+        // could name no commit of any repository, which is what keeps the malformed
+        // case (`InvalidParentCommitIdException`) apart from the existence case
+        // below. A branch that already has a tip can only be written through that
+        // tip, so the caller must name it; an empty repository has no tip and the
+        // branch is created by this call.
+        if let Some(parent) = input.parent_commit_id.as_deref() {
+            if let Err(problem) = crate::state::checked_parent_commit_id(parent) {
+                return Err(PutFileErrorModeled::InvalidParentCommitIdException(
+                    InvalidParentCommitIdException {
+                        message: Some(
+                            crate::state::invalid_parent_commit_id_message(problem).to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
         let tip = repository
             .branches
             .get(&input.branch_name)
@@ -355,16 +371,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             (Some(tip), Some(parent)) => {
-                if !crate::state::is_object_id(parent) {
-                    return Err(PutFileErrorModeled::InvalidParentCommitIdException(
-                        InvalidParentCommitIdException {
-                            message: Some(format!(
-                                "the parent commit id {parent} is not valid"
-                            )),
-                        },
-                    )
-                    .into());
-                }
                 if parent != tip {
                     return if repository.commits.contains_key(parent) {
                         Err(PutFileErrorModeled::ParentCommitIdOutdatedException(

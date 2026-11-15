@@ -610,6 +610,16 @@ pub const PULL_REQUEST_STATUS_REQUIRED_MESSAGE: &str =
 pub const REPOSITORY_NAME_REQUIRED_MESSAGE: &str =
     "A repository name is required, but was not specified.";
 
+/// `BranchNameRequiredException`'s message: a FIXED sentence pair — the
+/// requirement, then that a name carrying no character does not satisfy it —
+/// naming nothing from the request.
+///
+/// Worded here once for the request boundary (`crate::service`) and for the
+/// handlers that require a branch name the model leaves optional
+/// (`crate::ops::get_branch`), so no operation words the code differently.
+pub const BRANCH_NAME_REQUIRED_MESSAGE: &str =
+    "You must provide a branch name. The branch name cannot be empty.";
+
 /// The message AWS returns with `RepositoryDoesNotExistException`: the requested
 /// repository name, then `" for "`, then the account the lookup ran in.
 ///
@@ -888,6 +898,58 @@ pub const PARENT_COMMIT_ID_REQUIRED_MESSAGE: &str =
     "A parent commit ID is required. Either use GetBranch to retrieve the latest commit ID for \
      the branch, or use a Git command such as git pull or git log, and then try again.";
 
+/// `InvalidParentCommitIdException`'s message for a `parentCommitId` whose WIDTH
+/// is not a git object name's — the case an id carrying no character at all falls
+/// into too ("The commit ID cannot be empty", as the error shape documents).
+///
+/// FIXED text: neither the rejected id nor the repository or branch it was offered
+/// for reaches the wire, exactly as [`PARENT_COMMIT_DOES_NOT_EXIST_MESSAGE`] names
+/// nothing. The first sentence states the class, the second which git rule the
+/// value broke.
+pub const INVALID_PARENT_COMMIT_ID_LENGTH_MESSAGE: &str = "The parent commit ID is not valid. The \
+                                                           commit ID is not a valid length for \
+                                                           commit IDs in Git.";
+
+/// `InvalidParentCommitIdException`'s message for a `parentCommitId` of the right
+/// width that is not written in the hexadecimal alphabet a git object name is
+/// written in — the other way a value can fail the form check, worded like its
+/// sibling above: the class sentence, then the git rule broken, and nothing of the
+/// request.
+pub const INVALID_PARENT_COMMIT_ID_ALPHABET_MESSAGE: &str =
+    "The parent commit ID is not valid. The commit ID is not a valid Git object ID.";
+
+/// Why a `parentCommitId` a write request carries cannot name a commit at all:
+/// one of [`git_object::ObjectIdProblem`]'s two rules, named for this member so
+/// the message below can be read off it.
+pub type ParentCommitIdProblem = git_object::ObjectIdProblem;
+
+/// What `InvalidParentCommitIdException` says for a `parentCommitId` that broke
+/// `problem` — the one place this crate words that code for a malformed id, so
+/// `PutFile`, `CreateCommit` and `DeleteFile` cannot word it differently.
+pub fn invalid_parent_commit_id_message(problem: ParentCommitIdProblem) -> &'static str {
+    match problem {
+        ParentCommitIdProblem::Length => INVALID_PARENT_COMMIT_ID_LENGTH_MESSAGE,
+        ParentCommitIdProblem::Alphabet => INVALID_PARENT_COMMIT_ID_ALPHABET_MESSAGE,
+    }
+}
+
+/// Does this `parentCommitId` have the FORM of a git object name?
+///
+/// The model types the member as an unconstrained string, so its form is the
+/// handler's to check — and it is checked before anything is looked up: a value
+/// that is not a git object name could never name a commit of any repository, so
+/// it is malformed rather than absent, which is what keeps
+/// `InvalidParentCommitIdException` (a form rejection) apart from
+/// `ParentCommitDoesNotExistException` (a well-formed id no commit here carries).
+/// What that form IS comes from [`git_object::object_id_problem`], the one
+/// definition of it in this crate.
+pub fn checked_parent_commit_id(parent_commit_id: &str) -> Result<(), ParentCommitIdProblem> {
+    match git_object::object_id_problem(parent_commit_id) {
+        None => Ok(()),
+        Some(problem) => Err(problem),
+    }
+}
+
 /// `NoChangeException`'s message: a FIXED sentence group that states the rule and
 /// then the only way to make the commit the caller asked for (a git client, which
 /// is the only thing that writes an empty commit). It names no file, branch or
@@ -896,6 +958,19 @@ pub const NO_CHANGE_MESSAGE: &str =
     "Cannot create the commit. At least one change is required to create a commit, but the files \
      in the commit are exactly the same as the files in the parent commit. If you want to create \
      an empty commit, use a Git client.";
+
+/// `FileEntryRequiredException`'s message: a FIXED sentence pair stating that the
+/// commit changes nothing and then the rule that makes it a refusal, carrying
+/// nothing from the request — not how the caller spelled the empty change, and not
+/// the repository or branch it was offered for.
+///
+/// The sibling of [`NO_CHANGE_MESSAGE`] on the way IN: that code is for a request
+/// whose entries reproduce the parent's tree, this one for a request that names no
+/// entry at all (no `putFiles`, `deleteFiles` or `setFileModes`), which is the
+/// condition the error shape documents. The one place this crate words that code.
+pub const FILE_ENTRY_REQUIRED_MESSAGE: &str =
+    "A commit cannot be created because there are no changed files included in the commit. A \
+     commit requires at least one change.";
 
 /// `SameFileContentException`'s message: a FIXED sentence pair that states the
 /// rule and then what did NOT happen, carrying nothing from the request.
@@ -1102,9 +1177,21 @@ pub fn invalid_continuation_token_message(token: &str) -> String {
 pub const COMMIT_ID_REQUIRED_MESSAGE: &str =
     "A commit ID is required, but no commit ID was specified.";
 
-/// `InvalidCommitIdException`'s message: likewise the shape's own documented
-/// sentence, worded here once for every operation that raises the code.
-pub const INVALID_COMMIT_ID_MESSAGE: &str = "The specified commit ID is not valid.";
+/// `InvalidCommitIdException`'s message for a commit id that is PRESENT and does
+/// not name a git object, built from the value that was rejected.
+///
+/// A member the model types `CommitId`/`ObjectId` is a git object NAME rather than
+/// a reference to resolve, so the refusal states the rule the value broke — it is
+/// not a git object id — and names the value, which is the only way a caller that
+/// passed a branch name, a shortened id, or one of two ids in the same request
+/// learns which value was at fault and why. Neither type carries a modelled
+/// constraint, so the form of a commit id is checked by the handler that reads it
+/// rather than at the request boundary, and this is what that check says. A commit
+/// id supplied as nothing at all is the sibling case, worded by
+/// [`COMMIT_ID_REQUIRED_MESSAGE`].
+pub fn invalid_commit_id_message(commit_id: &str) -> String {
+    format!("The specified commit ID is not a valid Git object ID: {commit_id}")
+}
 
 /// The longest `clientRequestToken` CodeCommit accepts, in characters — the upper
 /// bound the service's own `InvalidClientRequestTokenException` text states for the
@@ -1154,13 +1241,13 @@ pub enum CommitIdProblem {
 
 impl CommitIdProblem {
     /// What the refusal says. Each sentence is the one this crate words that code
-    /// with ([`COMMIT_ID_REQUIRED_MESSAGE`], [`INVALID_COMMIT_ID_MESSAGE`]), which
-    /// `crate::service` also uses when the request boundary refuses the member:
-    /// one code, one message, and nothing naming the emulator's own validator.
-    pub fn message(self) -> &'static str {
+    /// with ([`COMMIT_ID_REQUIRED_MESSAGE`], [`invalid_commit_id_message`]): one
+    /// code, one message, and nothing naming the emulator's own validator. A
+    /// malformed id is named by the text, an absent one has nothing to name.
+    pub fn message(self, commit_id: &str) -> String {
         match self {
-            Self::Missing => COMMIT_ID_REQUIRED_MESSAGE,
-            Self::Invalid => INVALID_COMMIT_ID_MESSAGE,
+            Self::Missing => COMMIT_ID_REQUIRED_MESSAGE.to_string(),
+            Self::Invalid => invalid_commit_id_message(commit_id),
         }
     }
 }

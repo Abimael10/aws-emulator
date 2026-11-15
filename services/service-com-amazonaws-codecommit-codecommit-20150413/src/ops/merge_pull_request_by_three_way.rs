@@ -447,17 +447,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // all addresses no commit — and the only commit-id failure this operation
         // models is the invalid one.
         let requested_source_tip = input.source_commit_id.as_deref();
-        if requested_source_tip
-            .is_some_and(|commit_id| crate::state::checked_commit_id(commit_id).is_err())
-        {
-            return Err(
-                MergePullRequestByThreeWayErrorModeled::InvalidCommitIdException(
-                    InvalidCommitIdException {
-                        message: Some(crate::state::INVALID_COMMIT_ID_MESSAGE.to_string()),
-                    },
-                )
-                .into(),
-            );
+        if let Some(commit_id) = requested_source_tip {
+            if let Err(problem) = crate::state::checked_commit_id(commit_id) {
+                return Err(
+                    MergePullRequestByThreeWayErrorModeled::InvalidCommitIdException(
+                        InvalidCommitIdException {
+                            message: Some(problem.message(commit_id)),
+                        },
+                    )
+                    .into(),
+                );
+            }
         }
 
         // "If unspecified, the default FILE_LEVEL is used" and the default

@@ -266,16 +266,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The parent commit ID is not valid. The commit ID cannot be empty, and must
         // match the head commit ID for the branch of the repository": the form is
-        // checked here, the "is the head" half once the branch is resolved below.
-        // `parentCommitId` is `@required`, so an ABSENT one is refused at the boundary
-        // as `ParentCommitIdRequiredException`.
-        if !crate::state::is_object_id(&input.parent_commit_id) {
+        // checked here, before anything is looked up, and the "is the head" half once
+        // the branch is resolved below. `parentCommitId` is `@required`, so an ABSENT
+        // one is refused at the boundary as `ParentCommitIdRequiredException`.
+        if let Err(problem) = crate::state::checked_parent_commit_id(&input.parent_commit_id) {
             return Err(DeleteFileErrorModeled::InvalidParentCommitIdException(
                 InvalidParentCommitIdException {
-                    message: Some(format!(
-                        "the parent commit id {} is not valid",
-                        input.parent_commit_id
-                    )),
+                    message: Some(
+                        crate::state::invalid_parent_commit_id_message(problem).to_string(),
+                    ),
                 },
             )
             .into());

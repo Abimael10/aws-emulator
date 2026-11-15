@@ -206,7 +206,7 @@ impl From<PostCommentForPullRequestErrorModeled> for PostCommentForPullRequestEr
 /// about it and about the message each refusal carries.
 fn checked_commit_id(commit_id: &str) -> Result<(), PostCommentForPullRequestError> {
     crate::state::checked_commit_id(commit_id).map_err(|problem| {
-        let message = Some(problem.message().to_string());
+        let message = Some(problem.message(commit_id));
         match problem {
             crate::state::CommitIdProblem::Missing => {
                 PostCommentForPullRequestErrorModeled::CommitIdRequiredException(

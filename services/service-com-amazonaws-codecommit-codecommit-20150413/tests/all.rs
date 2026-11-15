@@ -89,6 +89,8 @@ mod commit_date_identity;
 mod commit_file_entry_bound;
 #[path = "all/commit_folder_and_diff_members.rs"]
 mod commit_folder_and_diff_members;
+#[path = "all/commit_id_form_refusal_text.rs"]
+mod commit_id_form_refusal_text;
 #[path = "all/commit_identity_from_caller.rs"]
 mod commit_identity_from_caller;
 #[path = "all/commit_reads.rs"]
@@ -213,6 +215,8 @@ mod repository_name_and_system_tag_message_text;
 mod repository_rename;
 #[path = "all/repository_triggers.rs"]
 mod repository_triggers;
+#[path = "all/required_member_refusal_text.rs"]
+mod required_member_refusal_text;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/rule_content_sha256_precondition_message.rs"]

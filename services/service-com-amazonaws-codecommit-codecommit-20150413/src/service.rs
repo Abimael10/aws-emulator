@@ -253,7 +253,7 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         // branch errors: `defaultBranchName` is `UpdateDefaultBranch`'s name for one.
         ("branchName" | "defaultBranchName", _) if missing => (
             "BranchNameRequiredException",
-            "A branch name is required, but was not specified.",
+            crate::state::BRANCH_NAME_REQUIRED_MESSAGE,
         ),
         // A `branchName` that is PRESENT but empty is refused by `BranchName`'s
         // `@length min 1`, and CodeCommit words that case with its own sentence
@@ -296,21 +296,24 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
             "InvalidFileModeException",
             "The specified file mode permission is not valid.",
         ),
+        // A `parentCommitId` carries a `CommitId`, which the model leaves
+        // unconstrained, so only its ABSENCE reaches this seam: a value that is not a
+        // git object name is refused by the handler that reads it, which is also where
+        // the two ways its form can fail are told apart
+        // (`crate::state::checked_parent_commit_id`).
         ("parentCommitId", _) if missing => (
             "ParentCommitIdRequiredException",
-            "A parent commit ID is required.",
+            crate::state::PARENT_COMMIT_ID_REQUIRED_MESSAGE,
         ),
-        ("parentCommitId", _) => (
-            "InvalidParentCommitIdException",
-            "The parent commit ID is not valid.",
-        ),
+        // Every member that carries a raw git object id naming a commit takes the
+        // commit id errors. Only the ABSENCE of one is refused here: `CommitId` and
+        // `ObjectId` carry no modelled constraint, so a value that names no git
+        // object reaches the handler, which refuses it as `InvalidCommitIdException`
+        // naming the rejected id (`crate::state::invalid_commit_id_message`) — which
+        // this seam cannot do, because it words a refusal with a fixed sentence.
         ("commitId" | "afterCommitId" | "beforeCommitId", _) if missing => (
             "CommitIdRequiredException",
             crate::state::COMMIT_ID_REQUIRED_MESSAGE,
-        ),
-        ("commitId" | "afterCommitId" | "beforeCommitId", _) => (
-            "InvalidCommitIdException",
-            crate::state::INVALID_COMMIT_ID_MESSAGE,
         ),
         // Every member that carries a `CommentId` names a comment, so each takes the
         // comment id errors: `inReplyTo` is `PostCommentReply`'s name for one, and it

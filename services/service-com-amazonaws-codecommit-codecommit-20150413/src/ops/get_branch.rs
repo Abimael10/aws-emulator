@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if repository_name.is_empty() {
             return Err(GetBranchErrorModeled::RepositoryNameRequiredException(
                 RepositoryNameRequiredException {
-                    message: Some("a repository name is required".to_string()),
+                    message: Some(crate::state::REPOSITORY_NAME_REQUIRED_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if branch_name.is_empty() {
             return Err(GetBranchErrorModeled::BranchNameRequiredException(
                 BranchNameRequiredException {
-                    message: Some("a branch name is required".to_string()),
+                    message: Some(crate::state::BRANCH_NAME_REQUIRED_MESSAGE.to_string()),
                 },
             )
             .into());

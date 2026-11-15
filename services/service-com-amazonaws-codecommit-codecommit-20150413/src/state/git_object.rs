@@ -122,9 +122,37 @@ pub fn sha1_digest(data: &[u8]) -> [u8; OBJECT_ID_BYTES] {
     digest
 }
 
+/// Which rule of a git object name a candidate breaks: the WIDTH of one, or the
+/// hexadecimal ALPHABET it is written in. `None` from [`object_id_problem`] is an
+/// object name.
+///
+/// The two are reported apart because a caller that supplied a reference name
+/// rather than an object id broke the width rule, which is a different thing to
+/// say than that a value of the right width is not hexadecimal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectIdProblem {
+    /// Not as many characters as an object name carries.
+    Length,
+    /// The right width, but not hexadecimal.
+    Alphabet,
+}
+
+/// Why this is not a syntactically valid object name (40 hex characters), or
+/// `None` when it is one. The ONE definition of that form in this crate —
+/// [`is_object_id`] is this answer with the reason dropped.
+pub fn object_id_problem(candidate: &str) -> Option<ObjectIdProblem> {
+    if candidate.len() != 2 * OBJECT_ID_BYTES {
+        return Some(ObjectIdProblem::Length);
+    }
+    if !candidate.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Some(ObjectIdProblem::Alphabet);
+    }
+    None
+}
+
 /// Is this a syntactically valid object name (40 hex characters)?
 pub fn is_object_id(candidate: &str) -> bool {
-    candidate.len() == 2 * OBJECT_ID_BYTES && candidate.bytes().all(|b| b.is_ascii_hexdigit())
+    object_id_problem(candidate).is_none()
 }
 
 /// Is this the all-zero object name?

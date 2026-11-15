@@ -216,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !crate::state::is_object_id(&input.commit_id) {
             return Err(CreateBranchErrorModeled::InvalidCommitIdException(
                 InvalidCommitIdException {
-                    message: Some(crate::state::INVALID_COMMIT_ID_MESSAGE.to_string()),
+                    message: Some(crate::state::invalid_commit_id_message(&input.commit_id)),
                 },
             )
             .into());

@@ -329,10 +329,7 @@ fn normalized_entries(input: &CreateCommitInput) -> Result<Entries, CreateCommit
     if entry_count == 0 {
         return Err(CreateCommitErrorModeled::FileEntryRequiredException(
             FileEntryRequiredException {
-                message: Some(
-                    "the commit cannot be created because no file entries were specified"
-                        .to_string(),
-                ),
+                message: Some(crate::state::FILE_ENTRY_REQUIRED_MESSAGE.to_string()),
             },
         )
         .into());
@@ -444,6 +441,22 @@ fn resolve_parent(
     branch_name: &str,
     parent_commit_id: Option<&str>,
 ) -> Result<Option<String>, CreateCommitError> {
+    // A `parentCommitId` is a git object name, so its FORM is checked before
+    // anything is looked up: a value that is not one could name no commit of any
+    // repository, which is what keeps the malformed case
+    // (`InvalidParentCommitIdException`) apart from the existence case below.
+    if let Some(parent) = parent_commit_id {
+        if let Err(problem) = crate::state::checked_parent_commit_id(parent) {
+            return Err(CreateCommitErrorModeled::InvalidParentCommitIdException(
+                InvalidParentCommitIdException {
+                    message: Some(
+                        crate::state::invalid_parent_commit_id_message(problem).to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+    }
     let tip = repository
         .branches
         .get(branch_name)
@@ -456,14 +469,6 @@ fn resolve_parent(
         )
         .into()),
         (Some(tip), Some(parent)) => {
-            if !crate::state::is_object_id(parent) {
-                return Err(CreateCommitErrorModeled::InvalidParentCommitIdException(
-                    InvalidParentCommitIdException {
-                        message: Some(format!("the parent commit id {parent} is not valid")),
-                    },
-                )
-                .into());
-            }
             if parent != tip {
                 return if repository.commits.contains_key(parent) {
                     Err(CreateCommitErrorModeled::ParentCommitIdOutdatedException(

@@ -427,7 +427,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 BatchDescribeMergeConflictsErrorModeled::RepositoryNameRequiredException(
                     RepositoryNameRequiredException {
-                        message: Some("a repository name is required".to_string()),
+                        message: Some(crate::state::REPOSITORY_NAME_REQUIRED_MESSAGE.to_string()),
                     },
                 )
                 .into(),
