@@ -222,7 +222,7 @@ impl Owner {
         match self {
             Self::Builtin(provisioner) => {
                 // Boxed for the reason [`Self::create`]'s arm records.
-                Box::pin(provisioner.readiness(ctx, region, physical_resource_id)).await
+                Box::pin(provisioner.readiness(ctx, region, physical_resource_id, declared)).await
             }
             Self::DynamodbTable => {
                 Ok(dynamodb_table::readiness(ctx, region, physical_resource_id, declared).await)

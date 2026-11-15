@@ -159,6 +159,11 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
             "OpenIdConnectIssuerUrl",
         ],
         EKS_POD_IDENTITY_ASSOCIATION => &["AssociationArn", "AssociationId"],
+        // An add-on and a node group each publish the ARN Amazon EKS minted for the
+        // resource (`Addon$addonArn`, `Nodegroup$nodegroupArn`), which is the one value only
+        // that service can produce: it carries an identifier that service draws per
+        // resource, so it is read off the resource it created rather than computed here.
+        EKS_ADDON | EKS_NODEGROUP => &["Arn"],
         SSM_ASSOCIATION => &[SSM_ASSOCIATION_ID_ATTRIBUTE],
         BATCH_COMPUTE_ENVIRONMENT => &["ComputeEnvironmentArn"],
         BATCH_JOB_QUEUE => &["JobQueueArn"],

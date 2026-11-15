@@ -888,6 +888,26 @@ pub const EKS_CLUSTER: &str = "AWS::EKS::Cluster";
 /// ([`identity_is_service_assigned`]).
 pub const EKS_POD_IDENTITY_ASSOCIATION: &str = "AWS::EKS::PodIdentityAssociation";
 
+/// The type of an Amazon EKS ADD-ON: one piece of operational software installed on a
+/// cluster, which `CreateAddon` installs under the add-on's own published name and
+/// `DeleteAddon` removes (same model).
+///
+/// An add-on lives INSIDE a cluster: every operation of that service on one addresses it by
+/// the cluster and the add-on name, which are that operation's two `@httpLabel`s. The
+/// add-on's name is the `AddonName` the declaration states, which is also the physical
+/// resource id the naming rules compute for the type, so what the stack publishes for the
+/// resource is the name Amazon EKS knows it by.
+pub const EKS_ADDON: &str = "AWS::EKS::Addon";
+
+/// The type of an Amazon EKS managed NODE GROUP: the Auto Scaling group of Amazon EC2
+/// instances that joins a cluster as its nodes, which `CreateNodegroup` creates and
+/// `DeleteNodegroup` removes (same model).
+///
+/// Another resource inside a cluster, addressed by the cluster and the node group's own
+/// name — that operation's two `@httpLabel`s — with the name the `NodegroupName` the
+/// declaration states or the one CloudFormation computed for it.
+pub const EKS_NODEGROUP: &str = "AWS::EKS::Nodegroup";
+
 /// The `AWS::<cloudFormationName>::<Resource>` types of the AWS AppConfig resources a
 /// configuration estate declares. The middle segment is that model's own
 /// `awsService.cloudFormationName` (`AppConfig`).

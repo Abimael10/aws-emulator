@@ -199,6 +199,8 @@ mod ecs_elbv2_stack_identifiers;
 // the next change to touch this directory should delete both lines and the file.
 #[path = "all/ecs_elbv2_stack_outputs.rs"]
 mod ecs_elbv2_stack_outputs;
+#[path = "all/eks_cluster_workload_provisioning.rs"]
+mod eks_cluster_workload_provisioning;
 #[path = "all/elbv2_resource_provisioning.rs"]
 mod elbv2_resource_provisioning;
 #[path = "all/elbv2_rule_priority_collision.rs"]

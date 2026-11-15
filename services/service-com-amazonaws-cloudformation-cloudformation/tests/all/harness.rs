@@ -268,6 +268,13 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             Arc::clone(&engine),
         ),
     );
+    // Amazon EKS, for the `AWS::EKS::Cluster` a stack really creates there and for the
+    // `AWS::EKS::Addon` and `AWS::EKS::Nodegroup` it installs ON that cluster, so a suite that
+    // deploys one reads the add-on and the node group back through that service's own wire, by
+    // the cluster and the name the stack publishes.
+    router.register_service(
+        service_com_amazonaws_eks_awswesleyfrontend::EmulatedService::new(Arc::clone(&engine)),
+    );
     (router, engine)
 }
 

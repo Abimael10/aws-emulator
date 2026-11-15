@@ -1263,3 +1263,23 @@ mod zz_probe_whole_emulator;
 //! layout check refuses.
 #[path = "all/cloudtrail_iam_credential_write_audit.rs"]
 mod cloudtrail_iam_credential_write_audit;
+// Put a new suite at `tests/all/<name>.rs` and add its `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair below, in sorted position. What a suite covers, and why it lives in
+// this cross-service target rather than in one service crate's own, belongs in that
+// suite's own module header, where it is read beside the test it explains.
+// EVERY comment in this file is an ordinary `//` one, this header included, and that is
+// deliberate: an inner doc comment (`//!`) is legal only before the first item, so one
+// that lands past the declarations is `E0753` and compiles no suite of this target.
+// Three suites pin the rules rather than restating them here:
+// `all/all_rs_declares_each_suite_once.rs` (a second `mod` for one name is `E0428`, and
+// every declaration names a file that exists),
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
+// `all/all_rs_is_a_canonical_declaration_list.rs` (one pair per suite, sorted, no other
+// line) — for this file and for every service crate's `tests/all.rs`. The build-time
+// layout check fails the build for a suite file no `mod` names, and for a suite left at
+// the top level of `tests/`. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod`
+// resolves to a SIBLING of this file: the `#[path]` is what points each declaration into
+// `tests/all/`.
+// A note a landing appends here wraps without the indentation
+// `clippy::doc_lazy_continuation` asks of a doc list item, so the lint is allowed below:
+// a re-appended note is then a note rather than a build failure.

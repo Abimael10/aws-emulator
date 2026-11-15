@@ -491,7 +491,9 @@ use super::template::{
     EC2_SUBNET,
     EC2_VOLUME, EC2_VPC,
     ECR_PUBLIC_REPOSITORY, ECR_REPOSITORY, ECS_CLUSTER, ECS_SERVICE, EKS_ACCESS_ENTRY,
+    EKS_ADDON,
     EKS_CLUSTER,
+    EKS_NODEGROUP,
     EKS_POD_IDENTITY_ASSOCIATION,
     EMR_CLUSTER, EVENTS_EVENT_BUS, EVENTS_EVENT_BUS_POLICY, EVENTS_RULE,
     FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
@@ -950,6 +952,14 @@ pub(super) enum Provisioner {
     /// so the resource's creation is held open until Amazon EKS reports the cluster
     /// `ACTIVE`.
     EksCluster,
+    /// `AWS::EKS::Addon`: the Amazon EKS add-on `CreateAddon` installs ON a cluster and
+    /// `DeleteAddon` removes. That install is asynchronous, so the resource's creation is
+    /// held open until Amazon EKS reports the add-on `ACTIVE`.
+    EksAddon,
+    /// `AWS::EKS::Nodegroup`: the managed node group `CreateNodegroup` creates on a cluster
+    /// and `DeleteNodegroup` removes. That create is asynchronous too, so the resource's
+    /// creation is held open until Amazon EKS reports the group `ACTIVE`.
+    EksNodegroup,
     /// `AWS::EKS::PodIdentityAssociation`: the IAM role one Kubernetes service account
     /// assumes, which `CreatePodIdentityAssociation` makes and
     /// `DeletePodIdentityAssociation` removes.
@@ -1224,6 +1234,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         BATCH_SERVICE_ENVIRONMENT => Some(Provisioner::BatchServiceEnvironment),
         EKS_ACCESS_ENTRY => Some(Provisioner::EksAccessEntry),
         EKS_CLUSTER => Some(Provisioner::EksCluster),
+        EKS_ADDON => Some(Provisioner::EksAddon),
+        EKS_NODEGROUP => Some(Provisioner::EksNodegroup),
         EKS_POD_IDENTITY_ASSOCIATION => Some(Provisioner::EksPodIdentityAssociation),
         APIGATEWAY_DOMAIN_NAME => Some(Provisioner::ApiGatewayDomainName),
         APIGATEWAY_BASE_PATH_MAPPING => Some(Provisioner::ApiGatewayBasePathMapping),
@@ -1731,6 +1743,11 @@ impl Provisioner {
             }
             Self::EksAccessEntry => create_access_entry(ctx, region, resource, propagated).await,
             Self::EksCluster => create_eks_cluster(ctx, region, resource, propagated).await,
+            // An add-on and a node group are taggable types whose create takes the tag set
+            // as its own member, so the tags CloudFormation gives the resource reach Amazon
+            // EKS on the call that makes it.
+            Self::EksAddon => create_eks_addon(ctx, region, resource, propagated).await,
+            Self::EksNodegroup => create_eks_nodegroup(ctx, region, resource, propagated).await,
             Self::EksPodIdentityAssociation => {
                 create_pod_identity_association(ctx, region, resource, propagated).await
             }
@@ -2143,11 +2160,19 @@ impl Provisioner {
     ///
     /// `Err` is the owning service's own refusal of the READ, which says nothing about the
     /// resource: the caller decides what an unanswered read means.
+    ///
+    /// `declared` is the properties the resource was declared with, where the caller knows
+    /// them: a CHILD resource is read back by its parent and its own name, and the parent is
+    /// a property of the declaration rather than part of the physical id (an Amazon EKS
+    /// add-on's and node group's cluster). An arm that needs none of them ignores it, and
+    /// `None` is a declaration the caller does not hold, which such an arm reports as the
+    /// refused read it is.
     pub(super) async fn readiness(
         self,
         ctx: &smithy_server_runtime::OperationContext<'_>,
         region: &str,
         physical_resource_id: &str,
+        declared: Option<&Value>,
     ) -> Result<Readiness, Refusal> {
         match self {
             // "A certificate enters status PENDING_VALIDATION upon being requested"
@@ -2234,6 +2259,19 @@ impl Provisioner {
             // you can … add nodes" (`CreateCluster` / `Cluster$status`), so the resource's
             // creation is finished once that service reports it `ACTIVE`.
             Self::EksCluster => eks_cluster_readiness(ctx, region, physical_resource_id).await,
+            // An add-on is reported `CREATING` while Amazon EKS applies its Kubernetes
+            // resources to the cluster and a node group while that service brings its
+            // instances up, so in neither does the resource the declaration asked for serve
+            // the cluster yet: each is held open until that service reports it `ACTIVE`,
+            // read by the cluster the declaration names and the resource's own name.
+            Self::EksAddon => {
+                let identity = eks_child_identity(EKS_ADDON, declared, physical_resource_id)?;
+                eks_addon_readiness(ctx, region, &identity).await
+            }
+            Self::EksNodegroup => {
+                let identity = eks_child_identity(EKS_NODEGROUP, declared, physical_resource_id)?;
+                eks_nodegroup_readiness(ctx, region, &identity).await
+            }
             // `CreateKnowledgeBase` answers 202 with the knowledge base `CREATING` — "the
             // knowledge base is being created", in which it cannot be queried — so the
             // resource's creation is finished once Amazon Bedrock Agent reports it `ACTIVE`.
@@ -3417,6 +3455,10 @@ impl Provisioner {
             // halves of which are on the resource's own declaration.
             Self::EksAccessEntry => delete_access_entry(ctx, region, resource).await,
             Self::EksCluster => delete_eks_cluster(ctx, region, physical_resource_id).await,
+            // Each addressed by the cluster that holds it and its own name, the cluster half
+            // of which is on the resource's own declaration.
+            Self::EksAddon => delete_eks_addon(ctx, region, resource).await,
+            Self::EksNodegroup => delete_eks_nodegroup(ctx, region, resource).await,
             // The delete addresses the association by the cluster that holds it and the id
             // Amazon EKS assigned it, both of which are on the resource's own record.
             Self::EksPodIdentityAssociation => {
@@ -3967,6 +4009,9 @@ impl Provisioner {
             // Read back by the same cluster-and-principal pair the delete uses.
             Self::EksAccessEntry => describe_access_entry(ctx, region, resource).await,
             Self::EksCluster => describe_eks_cluster(ctx, region, physical_resource_id).await,
+            // Read back by the same cluster-and-name pair the delete uses.
+            Self::EksAddon => describe_eks_addon(ctx, region, resource).await,
+            Self::EksNodegroup => describe_eks_nodegroup(ctx, region, resource).await,
             Self::EksPodIdentityAssociation => {
                 describe_pod_identity_association(ctx, region, resource).await
             }
@@ -4189,6 +4234,11 @@ mod route53_policies;
 /// ([`super::provisioning::instance_signals`]).
 pub(super) mod compute_fleet;
 mod network_and_delivery;
+/// The Amazon EKS arms of the two types a stack declares ON a cluster — the add-on and the
+/// managed node group — beside the cluster's own arms in [`network_and_delivery`]: each is a
+/// child resource addressed by the cluster that holds it and its own name, which is a
+/// concern of its own.
+mod eks_cluster_workloads;
 /// The Amazon S3 Tables arms: the table bucket a stack creates in that service, which is
 /// keyed by its own ARN rather than by a name.
 mod s3_table_buckets;
@@ -4224,6 +4274,7 @@ use ssm_documents::*;
 use resource_groups::*;
 use compute_fleet::*;
 pub(crate) use network_and_delivery::*;
+use eks_cluster_workloads::*;
 use s3_table_buckets::*;
 use platform_services::*;
 use xray_groups::*;

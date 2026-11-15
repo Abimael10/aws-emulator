@@ -851,6 +851,19 @@ pub(crate) fn return_values(
             }
             (name.to_string(), attributes)
         }
+        // "Ref returns the add-on name" / the node group's name; Fn::GetAtt: Arn. Both are
+        // types `super::provisioning` creates in Amazon EKS itself, on the cluster the
+        // declaration names, and the ARN each publishes carries an identifier only that
+        // service draws (`addon/<cluster>/<add-on>/<id>`,
+        // `nodegroup/<cluster>/<group>/<id>`), so it stands in until the create reports what
+        // EKS really answered.
+        EKS_ADDON | EKS_NODEGROUP => {
+            attributes.insert(
+                "Arn".to_string(),
+                service_assigned_document(name, "Arn"),
+            );
+            (name.to_string(), attributes)
+        }
         // "Ref returns the association ARN"; Fn::GetAtt: AssociationArn, AssociationId.
         // Amazon EKS ASSIGNS both — `CreatePodIdentityAssociation` takes the cluster, the
         // namespace, the service account and the role and answers the association it minted
