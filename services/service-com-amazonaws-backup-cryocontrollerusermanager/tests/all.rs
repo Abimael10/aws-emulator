@@ -59,6 +59,8 @@ mod legal_hold_coverage;
 mod legal_hold_date_range;
 #[path = "all/legal_hold_lifecycle.rs"]
 mod legal_hold_lifecycle;
+#[path = "all/legal_hold_refusal_identity.rs"]
+mod legal_hold_refusal_identity;
 #[path = "all/legal_hold_vault_selection.rs"]
 mod legal_hold_vault_selection;
 #[path = "all/logically_air_gapped_vault.rs"]

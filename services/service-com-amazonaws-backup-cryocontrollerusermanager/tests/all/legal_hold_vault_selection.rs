@@ -49,9 +49,13 @@ const STATUS_CREATING: &str = "CREATING";
 /// The error shape, `Code` and sentence AWS answers a legal hold id the account
 /// does not hold with (`crate::state`'s `ERROR_CODE_LEGAL_HOLD_NOT_FOUND` /
 /// `MESSAGE_LEGAL_HOLD_NOT_FOUND`).
-const INVALID_PARAMETER: &str = "InvalidParameterValueException";
-const LEGAL_HOLD_NOT_FOUND_CODE: &str = "ERROR_4218";
-const LEGAL_HOLD_NOT_FOUND_MESSAGE: &str = "Can not find Legal Hold ARN.";
+///
+/// Shared with the sibling suite that reads the rest of this condition's
+/// identity (`legal_hold_refusal_identity.rs`), so the service's one wording for
+/// it is spelled once in this test binary too.
+pub(crate) const INVALID_PARAMETER: &str = "InvalidParameterValueException";
+pub(crate) const LEGAL_HOLD_NOT_FOUND_CODE: &str = "ERROR_4218";
+pub(crate) const LEGAL_HOLD_NOT_FOUND_MESSAGE: &str = "Can not find Legal Hold ARN.";
 
 /// The same three for a copy job id the account does not hold
 /// (`crate::state`'s `ERROR_CODE_COPY_JOB_NOT_FOUND` /
