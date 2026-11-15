@@ -37,6 +37,8 @@ mod api_key_update;
 mod api_keys_across_api_families;
 #[path = "all/association_refusal_messages.rs"]
 mod association_refusal_messages;
+#[path = "all/channel_namespace_identity_authorization.rs"]
+mod channel_namespace_identity_authorization;
 #[path = "all/channel_namespaces.rs"]
 mod channel_namespaces;
 #[path = "all/code_definition_refusals.rs"]

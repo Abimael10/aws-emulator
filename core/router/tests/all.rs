@@ -1558,3 +1558,23 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 // which compiles no suite of this target.
 // past the declarations is `E0753` and compiles no suite of this target. With no inner doc
 // comment anywhere, no merge of two landings can put one past the first item.
+// This file is a LIST: one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted
+// by name, and no other line. A landing inserts its two lines into the sorted list and has no
+// prose here to duplicate, re-word or mistype.
+// Three rules it lives by, each checked by a suite of its own
+// `all/all_rs_is_a_canonical_declaration_list.rs`, which check this file and every service
+// crate's `tests/all.rs`):
+// - Declare each suite EXACTLY once: this is one crate root, so a second `mod` for the same
+//   name is `E0428` and takes every suite of this target down with it.
+// - EVERY comment here is an ORDINARY `//` one, this header included. An inner doc comment
+//   (`//!`) is legal only before the first item, so one that lands past the declarations —
+//   which is what concurrent landings appending to this file kept producing — is `E0753` and
+//   compiles no suite of this target. With no `//!` and no `#![…]` anywhere, no merge of two
+//   landings can put one past the first item.
+// - What a suite covers, and why it has to live in THIS target rather than in one service
+//   crate's own, belongs in that suite's own module header, where it is read beside the test
+//   it explains. The notes landings had appended to the end of this file live in
+//   `all/appended_notes.rs`.
+// (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` above each `mod` is what
+// points it into `tests/all/`. A suite file no `mod` here names fails the build, and a suite
+// left at the top level of `tests/` is a test target of its own, which fails it too.
