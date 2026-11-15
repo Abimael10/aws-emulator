@@ -71,6 +71,8 @@ mod just_in_time_node_access;
 mod maintenance_windows;
 #[path = "all/managed_node_filter_validation.rs"]
 mod managed_node_filter_validation;
+#[path = "all/managed_node_iam_role.rs"]
+mod managed_node_iam_role;
 #[path = "all/managed_node_information.rs"]
 mod managed_node_information;
 #[path = "all/node_inventory.rs"]

@@ -27,7 +27,14 @@
 //!    grants). The documents come from IAM's own collection
 //!    (`principal_policies`) and the decision from the tree's one evaluation of an IAM
 //!    document ([`::service_common::iam_authorization`]), so this service and IAM's own
-//!    authorizer cannot disagree about what a role allows.
+//!    authorizer cannot disagree about what a role allows. That role is also WHAT THE NODE
+//!    REPORTS as its `IamRole`: "the role assigned to an Amazon EC2 instance configured with
+//!    a Systems Manager Quick Setup host management configuration or the role assigned to an
+//!    on-premises managed node … This call doesn't return the IAM role for *unmanaged*
+//!    Amazon EC2 instances" (`InstanceInformation$IamRole`) — an instance that registered is
+//!    a managed one, so the role whose credentials its agent registered with is reported,
+//!    under the name IAM holds it by, which is the form a hybrid activation's node reports
+//!    too (`CreateActivationRequest$IamRole` is a role NAME).
 //!
 //! An instance whose role's policies this emulator cannot READ — an attachment of AWS's own
 //! catalog whose document IAM holds nothing for — registers: refusing on evidence this
@@ -178,14 +185,20 @@ fn registered_nodes<Eng: Send + Sync + 'static>(
     let Some(iam_state) = iam::service_state(engine) else {
         // No IAM store on this engine is no record of what a profile's role may do, and a
         // grant this emulator cannot read is not evidence against the registration (see
-        // the module docs), so every profile-bearing instance registers.
-        return candidates.into_iter().map(ManagedInstance::node).collect();
+        // the module docs), so every profile-bearing instance registers — reporting no role,
+        // because which role the profile carries is a fact only IAM holds.
+        return candidates
+            .into_iter()
+            .map(|candidate| candidate.node(None))
+            .collect();
     };
     let iam_store = iam_state.lock();
     candidates
         .into_iter()
-        .filter(|candidate| profile_registers_a_node(&iam_store, &candidate.profile_arn))
-        .map(ManagedInstance::node)
+        .filter_map(|candidate| {
+            let role = registration_role(&iam_store, &candidate.profile_arn)?;
+            Some(candidate.node(Some(role)))
+        })
         .collect()
 }
 
@@ -250,11 +263,12 @@ impl ManagedInstance {
     /// operating system's own name and version (`PlatformName`, `PlatformVersion`) — are
     /// left unset rather than invented, and so are the ones Systems Manager fills in for a
     /// node of another kind: the `ActivationId` and `Name` of a hybrid activation's node,
-    /// the `SourceId`/`SourceType`/`SourceLocation` of one in another cloud, and the
-    /// `IamRole` the model documents as "the role assigned to an Amazon EC2 instance
-    /// configured with a Systems Manager Quick Setup host management configuration or the
-    /// role assigned to an on-premises managed node", which this instance is neither.
-    fn node(self) -> ManagedNodeRecord {
+    /// and the `SourceId`/`SourceType`/`SourceLocation` of one in another cloud.
+    ///
+    /// `iam_role` is the name of the role the instance's instance profile carries, which is
+    /// the role the node registered as and so what it reports as its own `IamRole`
+    /// ([`registration_role`]); `None` only where which role that is cannot be read at all.
+    fn node(self, iam_role: Option<String>) -> ManagedNodeRecord {
         let mut node =
             ManagedNodeRecord::registering(self.id, RESOURCE_TYPE_EC2_INSTANCE, self.registered_at);
         node.registered_from_instance = true;
@@ -263,6 +277,7 @@ impl ManagedInstance {
         node.is_latest_version = Some(true);
         let reported = &mut node.properties;
         reported.agent_version = Some(SSM_AGENT_VERSION.to_string());
+        reported.iam_role = iam_role;
         reported.platform_type = Some(self.platform_type.to_string());
         reported.ip_address = Some(self.ip_address);
         reported.computer_name = Some(self.computer_name);
@@ -324,9 +339,14 @@ fn platform_type(
     }
 }
 
-/// Whether the instance profile `profile_arn` names lets the agent on the instance register
-/// the node: IAM holds the profile, it carries a role Amazon EC2 may act as, and that role's
-/// identity-based policies allow [`REGISTRATION_ACTION`].
+/// The NAME of the role an agent on an instance running as the instance profile
+/// `profile_arn` names registers its node as — IAM holds the profile, it carries a role
+/// Amazon EC2 may act as, and that role's identity-based policies allow
+/// [`REGISTRATION_ACTION`] — or `None` when that profile lets the agent register no node at
+/// all.
+///
+/// The name is the one IAM holds the role by rather than its ARN or its path: that is what a
+/// managed node reports in `IamRole`, and what a filter on that key is matched against.
 ///
 /// The collection of a role's documents is IAM's own
 /// (`principal_policies`) and the decision over them is the tree's one evaluation of an IAM
@@ -334,25 +354,18 @@ fn platform_type(
 /// an explicit `Deny` in a document that CAN be read withholds the registration whatever
 /// else the role carries; otherwise a grant is needed, which a role carrying an attachment
 /// this emulator holds no document for has by definition (see the module docs).
-fn profile_registers_a_node(
+fn registration_role(
     store: &iam::ComAmazonawsIamAwsidentitymanagementv20100508State,
     profile_arn: &str,
-) -> bool {
-    let Some(name) = ::service_common::iam_role::instance_profile_name(profile_arn) else {
-        return false;
-    };
-    let Some(profile) = store.instance_profiles.get(&iam::name_key(name)) else {
-        // A profile IAM holds no record of carries no role, so nothing says the agent may
-        // register — the same position an instance with no profile at all is in.
-        return false;
-    };
-    let Some(role) = profile
+) -> Option<String> {
+    let name = ::service_common::iam_role::instance_profile_name(profile_arn)?;
+    // A profile IAM holds no record of carries no role, so nothing says the agent may
+    // register — the same position an instance with no profile at all is in.
+    let profile = store.instance_profiles.get(&iam::name_key(name))?;
+    let role = profile
         .role_keys
         .first()
-        .and_then(|role_key| store.roles.get(role_key))
-    else {
-        return false;
-    };
+        .and_then(|role_key| store.roles.get(role_key))?;
     // "An instance profile can contain only one role" (`AddRoleToInstanceProfile`), so the
     // role above is the one the instance runs as.
     let admits_ec2 = role
@@ -368,21 +381,20 @@ fn profile_registers_a_node(
         // act as the role, the same reading the grants below take of an unreadable one.
         .is_none_or(|admits| admits);
     if !admits_ec2 {
-        return false;
+        return None;
     }
-    let Some(policies) = store.principal_policies(&role.arn) else {
-        return false;
-    };
+    let policies = store.principal_policies(&role.arn)?;
     let request = authorization::Request::new(
         REGISTRATION_ACTION,
         super::identity_authorization::ANY_RESOURCE,
         &[],
     );
-    match authorization::identity_decision(&policies.documents, &request) {
+    let registers = match authorization::identity_decision(&policies.documents, &request) {
         Decision::Allowed => true,
         Decision::Denied => false,
         // An attachment the collection resolved no document for is an entry of AWS's own
         // catalog this emulator does not carry: a grant it cannot read.
         Decision::NotStated => !policies.uncarried.is_empty(),
-    }
+    };
+    registers.then(|| role.role_name.clone())
 }

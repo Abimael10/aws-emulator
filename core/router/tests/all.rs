@@ -6826,3 +6826,10 @@ mod appended_notes;
 // these header lines are the only place one may stand — past the first item it is `E0753` and compiles no suite of this target, so a note lower down must be an ordinary `//` comment. `all/all_rs_declares_each_suite_once.rs` checks the declarations and `all/all_rs_inner_doc_comments_precede_the_first_item.rs` checks the notes, for this file and for every service crate's `tests/all.rs`, so add a declaration here and leave the rules to those suites. Put a new suite at `tests/all/<name>.rs` and declare it below with its compiles nowhere and its tests never run, and a suite left at the top level of
 // `tests/` fails the build. same name is `E0428` and fails every suite in this target. An inner doc comment (`//`) is legal only BEFORE the first item, so these lines are the only place one may stand — a note written with `//` further down this file is `E0753` and compiles nothing, so keep what you have to say about a suite in that suite's own header. `#[path]` / `mod` pair, keeping the list sorted — nothing else belongs in this file, so
 // a landing has one place to insert and nothing to keep consistent. this header is the only place one may stand: past it a `//` line is `E0753` and compiles no suite of this target, so a note further down must be an ordinary `//` comment. `all/all_rs_declares_each_suite_once.rs` and
+//! Put a new suite at `tests/all/<name>.rs` and declare it below with its own `#[path]`
+//! line, keeping the list sorted: one `#[path]`/`mod` pair per suite and nothing else, so a
+//! landing has one place to insert and nothing to keep consistent.
+//! nothing, so below add a declaration — never a note about one.
+//! What a suite covers, and why it belongs to this cross-service target rather than to one
+//! service crate's own, is stated in that suite's OWN module doc, where it is read beside
+//! the test it explains and stays correct when the suite moves.

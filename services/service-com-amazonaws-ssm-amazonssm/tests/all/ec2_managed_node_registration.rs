@@ -61,7 +61,7 @@ const WINDOWS_PARAMETER: &str =
 /// register. Its document is AWS's, not the account's, so this emulator holds none for it:
 /// a role carrying it carries a grant that cannot be read, which is not evidence against
 /// the registration.
-const SSM_CORE_POLICY: &str = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore";
+pub(crate) const SSM_CORE_POLICY: &str = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore";
 
 /// The inventory type every managed node has by being registered.
 const INVENTORY_TYPE: &str = "AWS:InstanceInformation";
@@ -157,7 +157,7 @@ async fn iam(
 }
 
 /// One IAM action that must succeed.
-async fn iam_ok(
+pub(crate) async fn iam_ok(
     router: &MultiServiceRouter,
     case: &str,
     action: &str,
@@ -181,7 +181,7 @@ fn element(body: &str, tag: &str) -> Option<String> {
 
 /// A trust policy admitting `principal` and nothing else, written compactly and with no
 /// `&`, `=`, `+` or `%`, so it travels in a form body as written.
-fn trust_policy(principal: &str) -> String {
+pub(crate) fn trust_policy(principal: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
          \"Principal\":{{\"Service\":\"{principal}\"}},\"Action\":\"sts:AssumeRole\"}}]}}"
@@ -213,7 +213,7 @@ pub(crate) struct Profile {
 }
 
 /// The inline document granting exactly the call the agent registers with.
-const GRANTS_REGISTRATION: &str = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\
+pub(crate) const GRANTS_REGISTRATION: &str = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\
     \"Allow\",\"Action\":\"ssm:UpdateInstanceInformation\",\"Resource\":\"*\"}]}";
 
 /// The inline document granting every action of this service.
@@ -225,6 +225,10 @@ const GRANTS_EVERY_ACTION: &str = "{\"Version\":\"2012-10-17\",\"Statement\":[{\
 const DENIES_REGISTRATION: &str = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\
     \"Allow\",\"Action\":\"ssm:*\",\"Resource\":\"*\"},{\"Effect\":\"Deny\",\"Action\":\
     \"ssm:UpdateInstanceInformation\",\"Resource\":\"*\"}]}";
+
+/// The service principal an instance profile's role has to admit for Amazon EC2 to act as
+/// it on an instance's behalf.
+pub(crate) const EC2_PRINCIPAL: &str = "ec2.amazonaws.com";
 
 /// Build one instance profile the way a client builds one — `CreateRole`, the grant, then
 /// `CreateInstanceProfile` and `AddRoleToInstanceProfile` — and read it back through IAM's
