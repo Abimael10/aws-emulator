@@ -23,9 +23,16 @@
 //! `smithy_query(query="shape",shape="ServiceId,ListenerId,ServiceNetworkId,TargetGroupId,RuleId")`),
 //! so this form satisfies each of them while a base-36 suffix, or a hex suffix with
 //! another leading character, is a value the real service never hands out.
+//!
+//! A RULE id has its own suite below, because a listener's rules are reported by four
+//! operations and one of them is minted without any request naming it: the implicit
+//! default rule a listener is created with, and a created rule, both as `CreateRule`,
+//! `GetRule`, `UpdateRule` and `ListRules` report their `id` and their nested `arn`.
 
-use crate::listeners::{create_listener, listener_kind};
-use crate::rules::{create_rule, fixed_response_rule, rule_kind};
+use crate::default_rule_and_rule_update::update_rule;
+use crate::list_rules::{default_rule_id, items_of, list_page};
+use crate::listeners::{a_service, create_listener, listener_kind, target_group};
+use crate::rules::{create_rule, fixed_response_rule, get_rule, rule_kind};
 use crate::target_groups::create_target_group;
 use crate::vpclattice_service_slice::{expected_arn, Answer, Lattice};
 use service_com_amazonaws_vpclattice_mercurycontrolplane::state;
@@ -509,5 +516,285 @@ async fn the_minted_suffix_travels_into_reads_listings_deletes_and_conflicts() {
         expected_arn(state::KIND_SERVICE, doomed),
         "case the service delete: expected the deleted service's ARN, got {}",
         deleted.body
+    );
+}
+
+/// A rule body a row of the rule table asks for, and the update it then sends.
+type RuleRow = (&'static str, serde_json::Value, serde_json::Value);
+
+/// The rules each listener of the table below gets, differing in the match form, the
+/// action kind and the priority — at each published bound of `RulePriority`'s
+/// `@range(1, 2000)` and in between — plus the update each one then takes. Every row is a
+/// fresh mint of a rule id, and the update is a member that must NOT disturb the id the
+/// create minted.
+fn rule_rows() -> Vec<RuleRow> {
+    vec![
+        (
+            "exact path, fixed response, priority 1 (the range floor)",
+            serde_json::json!({
+                "name": "form-exact-path",
+                "priority": 1,
+                "match": {
+                    "httpMatch": {
+                        "pathMatch": { "match": { "exact": "/orders" }, "caseSensitive": true },
+                    },
+                },
+                "action": { "fixedResponse": { "statusCode": 404 } },
+            }),
+            // A priority no other rule of the listener holds, so the update is served.
+            serde_json::json!({ "priority": 5 }),
+        ),
+        (
+            "method and prefix path, forward to one target group, priority 1000",
+            serde_json::json!({
+                "name": "form-prefix-path",
+                "priority": 1000,
+                "match": {
+                    "httpMatch": { "method": "GET", "pathMatch": { "match": { "prefix": "/api/" } } },
+                },
+                "action": {
+                    "forward": { "targetGroups": [{ "targetGroupIdentifier": target_group("1") }] },
+                },
+            }),
+            serde_json::json!({ "action": { "fixedResponse": { "statusCode": 500 } } }),
+        ),
+        (
+            "header matches, two weighted target groups, priority 2000 (the range ceiling)",
+            serde_json::json!({
+                "name": "form-header-matches",
+                "priority": 2000,
+                "match": {
+                    "httpMatch": {
+                        "headerMatches": [
+                            { "name": "x-version", "match": { "exact": "v2" } },
+                            { "name": "x-tenant", "match": { "prefix": "acme" }, "caseSensitive": false },
+                        ],
+                    },
+                },
+                "action": {
+                    "forward": {
+                        "targetGroups": [
+                            { "targetGroupIdentifier": target_group("2"), "weight": 30 },
+                            { "targetGroupIdentifier": target_group("3"), "weight": 70 },
+                        ],
+                    },
+                },
+            }),
+            serde_json::json!({
+                "match": { "httpMatch": { "pathMatch": { "match": { "prefix": "/v2/" } } } },
+            }),
+        ),
+        (
+            "an httpMatch with no member, fixed response, priority 999",
+            serde_json::json!({
+                "name": "form-match-anything",
+                "priority": 999,
+                "match": { "httpMatch": {} },
+                "action": { "fixedResponse": { "statusCode": 404 } },
+            }),
+            // An update supplying no member at all still answers with the stored rule.
+            serde_json::json!({}),
+        ),
+    ]
+}
+
+/// The summary `ListRules` reports for one rule of a listener.
+///
+/// The page asks for `maxResults` at the ceiling of its modelled `@range(1, 100)`
+/// (`smithy_query(query="operation",operation="ListRules")`), so one page carries every rule
+/// a listener of this suite holds and a rule the listing does not report is a missing rule
+/// rather than a rule on a later page.
+async fn listed_summary(
+    lattice: &Lattice,
+    case: &str,
+    service_id: &str,
+    listener_id: &str,
+    rule_id: &str,
+) -> serde_json::Value {
+    let listed = list_page(
+        lattice,
+        service_id,
+        listener_id,
+        &[("maxResults", "100".to_string())],
+    )
+    .await;
+    served(case, 200, &listed);
+    items_of(case, &listed)
+        .into_iter()
+        .find(|item| item["id"] == serde_json::json!(rule_id))
+        .unwrap_or_else(|| {
+            panic!("case {case}: the listing reports no rule {rule_id:?}: {}", listed.body)
+        })
+}
+
+/// A RULE id keeps the minted suffix through every operation that reports one.
+///
+/// Two kinds of rule id are under test: the implicit DEFAULT rule's, minted when a
+/// listener is created, and a created rule's. Each is then read back through `GetRule`,
+/// acknowledged by `UpdateRule` and reported by `ListRules`, and in each place both the
+/// bare `id` and the `arn` that nests it under the listener and the service must carry
+/// exactly the suffix the mint produced.
+///
+/// The rows span the listener the rules hang off (protocol, whether a port is sent, the
+/// kind of default action) and, under each, the rules of [`rule_rows`] — so one run mints
+/// a dozen rule ids rather than one, which no leading character could satisfy by luck.
+///
+/// What this adds over [`every_minted_id_and_arn_carries_a_lowercase_hex_suffix`], which
+/// already asserts the suffix form of a created rule: the DEFAULT rule, whose id no request
+/// names because the listener create mints it, and the three operations that report a stored
+/// rule id back — `GetRule`, `UpdateRule` and the `ListRules` summary — each with the ARN
+/// that nests the id under its listener and its service.
+#[tokio::test]
+async fn every_rule_operation_reports_the_minted_rule_suffix() {
+    let lattice = Lattice::new();
+    // A fixture name carrying no id prefix of this service, so the walker that checks
+    // every embedded id cannot mistake a name for one.
+    let (service_id, _) = a_service(&lattice, "idform-host").await;
+
+    // Each row is a listener whose create materialises a default rule: a different
+    // protocol (`state`'s LISTENER_PROTOCOL_VALUES: HTTP | HTTPS | TLS_PASSTHROUGH), a
+    // different port, and a different kind of default action.
+    let listeners: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "HTTP on its documented default port, fixed response",
+            serde_json::json!({
+                "name": "idform-http",
+                "protocol": "HTTP",
+                "defaultAction": { "fixedResponse": { "statusCode": 404 } },
+            }),
+        ),
+        (
+            "HTTPS on an explicit port, fixed response",
+            serde_json::json!({
+                "name": "idform-https",
+                "protocol": "HTTPS",
+                "port": 8443,
+                "defaultAction": { "fixedResponse": { "statusCode": 500 } },
+            }),
+        ),
+        (
+            "TLS_PASSTHROUGH forwarding to one target group",
+            serde_json::json!({
+                "name": "idform-passthrough",
+                "protocol": "TLS_PASSTHROUGH",
+                "port": 9443,
+                "defaultAction": {
+                    "forward": {
+                        "targetGroups": [{ "targetGroupIdentifier": target_group("1") }],
+                    },
+                },
+            }),
+        ),
+    ];
+
+    let mut minted: Vec<String> = Vec::new();
+    for (listener_case, listener_body) in listeners {
+        let created = create_listener(&lattice, &service_id, listener_body).await;
+        served(listener_case, 201, &created);
+        let listener_id = created.str_field("id");
+        assert_hex_id(listener_case, &listener_id, state::PREFIX_LISTENER);
+        assert_eq!(
+            created.str_field("arn"),
+            expected_arn(&listener_kind(&service_id), &listener_id),
+            "case {listener_case}: the listener ARN must embed the minted id {listener_id:?}, \
+             got {}",
+            created.body
+        );
+        let kind = rule_kind(&service_id, &listener_id);
+
+        // The DEFAULT rule, minted by the listener create and never by a rule request: the
+        // listing reports it, and `GetRule` reads it back under the same id and ARN.
+        let case = format!("{listener_case}, the default rule");
+        let default_id = default_rule_id(&lattice, &service_id, &listener_id).await;
+        assert_hex_id(&case, &default_id, state::PREFIX_RULE);
+        let default_arn = expected_arn(&kind, &default_id);
+        let summary = listed_summary(&lattice, &case, &service_id, &listener_id, &default_id).await;
+        assert_eq!(
+            summary["arn"].as_str(),
+            Some(default_arn.as_str()),
+            "case {case}: the summary must embed the minted id {default_id:?}, got {summary}"
+        );
+        let read = get_rule(&lattice, &service_id, &listener_id, &default_id).await;
+        served(&case, 200, &read);
+        for (member, expected) in [("id", default_id.clone()), ("arn", default_arn.clone())] {
+            assert_eq!(
+                read.str_field(member),
+                expected,
+                "case {case}, member {member}: expected {expected:?}, got {}",
+                read.body
+            );
+        }
+        minted.push(default_id);
+
+        for (rule_case, body, update) in rule_rows() {
+            let case = format!("{listener_case}, {rule_case}");
+            let created = create_rule(&lattice, &service_id, &listener_id, body).await;
+            served(&case, 201, &created);
+            let rule_id = created.str_field("id");
+            assert_hex_id(&case, &rule_id, state::PREFIX_RULE);
+            let rule_arn = expected_arn(&kind, &rule_id);
+            assert_eq!(
+                created.str_field("arn"),
+                rule_arn,
+                "case {case}: the rule ARN must nest under its listener and embed {rule_id:?}, \
+                 got {}",
+                created.body
+            );
+
+            // The read, the update acknowledgement and the listing all report the id the
+            // create minted, and the ARN built from it.
+            let read = get_rule(&lattice, &service_id, &listener_id, &rule_id).await;
+            served(&format!("{case}, read back"), 200, &read);
+            let updated =
+                update_rule(&lattice, &service_id, &listener_id, &rule_id, update).await;
+            served(&format!("{case}, updated"), 200, &updated);
+            let summary =
+                listed_summary(&lattice, &case, &service_id, &listener_id, &rule_id).await;
+            for (reported, from) in [
+                (read.str_field("id"), "GetRule id"),
+                (updated.str_field("id"), "UpdateRule id"),
+            ] {
+                assert_eq!(
+                    reported, rule_id,
+                    "case {case}: {from} must be the minted id {rule_id:?}, got {reported:?}"
+                );
+            }
+            for (reported, from) in [
+                (read.str_field("arn"), "GetRule arn"),
+                (updated.str_field("arn"), "UpdateRule arn"),
+                (
+                    summary["arn"]
+                        .as_str()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "case {case}: the ListRules summary of {rule_id:?} must carry \
+                                 the required arn member, got {summary}"
+                            )
+                        })
+                        .to_string(),
+                    "the ListRules summary arn",
+                ),
+            ] {
+                assert_eq!(
+                    reported, rule_arn,
+                    "case {case}: {from} must embed the minted id {rule_id:?}, \
+                     expected {rule_arn:?}, got {reported:?}"
+                );
+            }
+            minted.push(rule_id);
+        }
+    }
+
+    // Every mint of the run is distinct: the suffix is a fresh value behind the fixed
+    // leading character, not a constant.
+    let mut distinct = minted.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        minted.len(),
+        "expected {} distinct rule ids, got {:?}",
+        minted.len(),
+        minted
     );
 }

@@ -58,7 +58,7 @@ use crate::vpclattice_service_slice::{
 use service_com_amazonaws_vpclattice_mercurycontrolplane::state;
 
 /// `PATCH /services/{serviceIdentifier}/listeners/{listenerIdentifier}/rules/{ruleIdentifier}`.
-async fn update_rule(
+pub(crate) async fn update_rule(
     lattice: &Lattice,
     service_identifier: &str,
     listener_identifier: &str,
