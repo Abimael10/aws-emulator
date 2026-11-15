@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Updates supported fields of the specified job": a PARTIAL update (`PATCH
+//! /jobs/{jobId}`) of the job the request names in the SHARED jobs store every creator
+//! of an IoT job records one in — so the member this call writes is the member every
+//! later reader of that job reports (`DescribeJob`, `ListJobs`, and the identity echo
+//! `CancelJob` answers with). A member the request omits names no change, and a `jobId`
+//! the account does not hold is the modelled 404, on which nothing is written.
+//!
+//! The fields it keeps are the ones the stored job carries: `description`, and
+//! `timeoutConfig.inProgressTimeoutInMinutes` — "the amount of time each device has to
+//! finish its execution of the job", whose "timer is started when the job execution
+//! status is set to IN_PROGRESS", so the new value is also carried onto the job's
+//! executions that NO device has started yet (they have no running timer), while one
+//! already running keeps the deadline it was started with.
+//!
+//! `presignedUrlConfig`, `jobExecutionsRolloutConfig`, `abortConfig` and
+//! `jobExecutionsRetryConfig` shape the RATE of a rollout, its abort criteria and its
+//! retries rather than whether an execution exists — every target of a job here is
+//! given its execution at once, which is the end state of a completed rollout — so they
+//! are accepted and not retained, exactly as `CreateJob` documents: the stored job
+//! promises no reader data it does not hold. `namespaceId` selects the MQTT topics job
+//! notifications are published on, which this emulator does not publish, so it is
+//! accepted and not retained for the same reason.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +196,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateJob"))
+        // This operation addresses the job by its path label; it needs no other
+        // request metadata.
+        let _ = ctx;
+        let unavailable = || -> UpdateJobError {
+            UpdateJobErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+            .into()
+        };
+        // The job lives in the SHARED jobs store every creator of an IoT job records one
+        // in, so this update writes the very record the create wrote and every reader of
+        // that job then reports.
+        let Some(jobs) = crate::state::job_store(&*self.engine) else {
+            return Err(unavailable());
+        };
+        // The executions the job created are the device-facing records the IoT Jobs data
+        // plane serves, and the in-progress timeout is what each of them arms its timer
+        // from, so a write of that member reaches into their store too.
+        let Some(executions) = crate::state::job_execution_store(&*self.engine) else {
+            return Err(unavailable());
+        };
+
+        let now = ::service_common::iot_job_executions::now_epoch_seconds();
+
+        // LOCK ORDER: the shared jobs store first, the shared execution store second, as
+        // `crate::state::job_store` documents.
+        let mut registry = jobs.lock();
+        let Some(job) = registry.job_mut(&input.job_id) else {
+            // A `jobId` no creator recorded names no job: the modelled 404, and the
+            // refusal writes nothing.
+            return Err(UpdateJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::missing_job_message(&input.job_id)),
+                },
+            )
+            .into());
+        };
+
+        // Each member the request carries is written as supplied; one it omits names no
+        // change, which is what makes this a partial update (`PATCH /jobs/{jobId}`)
+        // rather than a replace.
+        if let Some(description) = input.description.clone() {
+            job.description = Some(description);
+        }
+        // Naming `timeoutConfig` REPLACES the job's timeout with what that structure
+        // states, so a config carrying no `inProgressTimeoutInMinutes` clears it: the
+        // job then gives its devices no deadline, which is what a reader reports.
+        let timeout_named = input.timeout_config.is_some();
+        if let Some(timeout_config) = input.timeout_config.as_ref() {
+            job.in_progress_timeout_minutes = timeout_config.in_progress_timeout_in_minutes;
+        }
+        let in_progress_timeout_minutes = job.in_progress_timeout_minutes;
+        // `Job$lastUpdatedAt` is "the time … when the job was last updated": this call is
+        // that write, whichever members it moved.
+        job.last_updated_at = now;
+
+        // An execution no device has started yet has no running timer, so it takes the
+        // job's current timeout; one that is already running keeps the deadline its start
+        // armed. Only a request that NAMED the member re-arms anything.
+        if timeout_named {
+            executions
+                .lock()
+                .set_in_progress_timeout_of_job(&input.job_id, in_progress_timeout_minutes);
+        }
+        Ok(UpdateJobOutput)
     }
 }

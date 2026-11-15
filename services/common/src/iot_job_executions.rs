@@ -1062,6 +1062,26 @@ impl JobExecutionStore {
         moved
     }
 
+    /// Carry the job's in-progress timeout onto the executions of `job_id` that NO
+    /// device has started yet, and answer how many took it.
+    ///
+    /// `timeoutConfig.inProgressTimeoutInMinutes` is "the amount of time each device has
+    /// to finish its execution of the job", and "the timer is started when the job
+    /// execution status is set to IN_PROGRESS" — so an execution nobody has started has
+    /// no running timer and takes whatever the job currently states, while one that is
+    /// already running keeps the deadline its start armed. `None` leaves those
+    /// executions with no deadline at all, which is a job that gives its devices none.
+    pub fn set_in_progress_timeout_of_job(&mut self, job_id: &str, minutes: Option<i64>) -> usize {
+        let mut carried = 0usize;
+        for record in self.things.values_mut().flatten() {
+            if record.job_id == job_id && record.started_at.is_none() && !record.is_terminal() {
+                record.in_progress_timeout_minutes = minutes;
+                carried += 1;
+            }
+        }
+        carried
+    }
+
     /// Cancel the executions of `job_id` that a cancel of the JOB reaches, and answer
     /// how many moved.
     ///

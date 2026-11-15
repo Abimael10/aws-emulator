@@ -69,6 +69,8 @@ mod job_execution_listing_for_thing;
 mod job_execution_read;
 #[path = "all/job_targeting.rs"]
 mod job_targeting;
+#[path = "all/job_update.rs"]
+mod job_update;
 #[path = "all/logging_options.rs"]
 mod logging_options;
 #[path = "all/managed_job_templates.rs"]
