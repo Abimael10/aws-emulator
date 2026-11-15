@@ -249,12 +249,27 @@ pub const SEQUENCE_STORE_NOT_FOUND_MESSAGE: &str = "The specified sequence store
 pub const MULTIPART_READ_SET_UPLOAD_NOT_FOUND_MESSAGE: &str =
     "The specified upload does not exist.";
 
-/// What `CreateShare` answers when the resource the request offers is not one this
-/// emulator holds.
+/// What an operation that resolves a CALLER-SUPPLIED resource ARN answers when the ARN
+/// names no resource this emulator holds.
 ///
-/// The variable part is the resource ARN the REQUEST carried.
-pub fn shared_resource_not_found_message(resource_arn: &str) -> String {
+/// The variable part is the resource ARN the REQUEST carried. One sentence for the whole
+/// condition, so `CreateShare` (the resource it is offered) and the tagging operations
+/// (the resource whose tags were addressed) state it identically.
+pub fn resource_arn_not_found_message(resource_arn: &str) -> String {
     format!("Resource {resource_arn} not found")
+}
+
+/// What a tagging call answers when the tags it would add take the resource past
+/// [`MAX_TAGS`].
+///
+/// The variable parts are how many tags the resource would then carry and the ceiling
+/// itself, so the sentence states the quota that was exceeded and nothing else of the
+/// request.
+pub fn tags_past_quota_message(would_carry: usize) -> String {
+    format!(
+        "tagging this resource would leave it carrying {would_carry} tags, more than the \
+         {MAX_TAGS} tags one resource may have"
+    )
 }
 
 /// What `DeleteWorkflow` answers when the workflow still holds versions.
@@ -328,6 +343,20 @@ pub const VARIANT_STORE_RESOURCE_TYPE: &str = "variantStore";
 
 /// The resource type an annotation store ARN names.
 pub const ANNOTATION_STORE_RESOURCE_TYPE: &str = "annotationStore";
+
+/// The resource type a run ARN names: what [`RUN_ARN_RESOURCE_PREFIX`] carries before its
+/// separator, named on its own for the same reason [`WORKFLOW_RESOURCE_TYPE`] is — a
+/// CALLER-supplied ARN is read by resource type, not by prefix.
+pub const RUN_RESOURCE_TYPE: &str = "run";
+
+/// The resource type a run group ARN names.
+pub const RUN_GROUP_RESOURCE_TYPE: &str = "runGroup";
+
+/// The resource type a run cache ARN names.
+pub const RUN_CACHE_RESOURCE_TYPE: &str = "runCache";
+
+/// The resource type a sequence store ARN names.
+pub const SEQUENCE_STORE_RESOURCE_TYPE: &str = "sequenceStore";
 
 /// How long after the call that starts it a status transition this emulator owes to
 /// the clock becomes due.
@@ -1006,6 +1035,70 @@ pub fn shareable_resource(resource_arn: &str) -> Option<(&'static str, &str)> {
     (!id.is_empty()).then_some((*resource_type, id))
 }
 
+/// Which resource a CALLER-supplied tagging `resourceArn` addresses: the store to look
+/// in and the key inside it.
+///
+/// A version is named inside its workflow's resource path (see
+/// [`WORKFLOW_VERSION_ARN_INFIX`]), so one ARN names the pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggedResource<'a> {
+    /// A private workflow, by its `WorkflowId`.
+    Workflow(&'a str),
+    /// One version of that workflow, by the workflow's id and the version's name.
+    WorkflowVersion {
+        workflow_id: &'a str,
+        version_name: &'a str,
+    },
+    /// A run, by its `RunId`.
+    Run(&'a str),
+    /// A run group, by its `RunGroupId`.
+    RunGroup(&'a str),
+    /// A run cache, by its `RunCacheId`.
+    RunCache(&'a str),
+    /// A sequence store, by its `SequenceStoreId`.
+    SequenceStore(&'a str),
+    /// A resource of this service that no store here holds: an ARN naming a resource
+    /// kind this emulator does not mint. It addresses nothing, so a call against it is
+    /// answered "not found" rather than refused as a bad value.
+    Unheld,
+}
+
+/// Which resource `resource_arn` names, or `None` when the value is no ARN of a resource
+/// this service's API can address at all.
+///
+/// The ARN is read through the ONE parse, `service_common::arn::parse_of`, against this
+/// service's own namespace: a well-formed ARN of another vendor, or one naming no
+/// resource id, addresses nothing in this API and is a bad REQUEST rather than a missing
+/// resource. Every tagging operation resolves an ARN here, so the three cannot disagree
+/// about which record one names.
+pub fn tagged_resource(resource_arn: &str) -> Option<TaggedResource<'_>> {
+    let arn = ::service_common::arn::parse_of(resource_arn, ARN_SERVICE)?;
+    let resource_type = arn.resource_type();
+    let id = ::service_common::arn::resource_id_of_type(resource_arn, resource_type)
+        .filter(|id| !id.is_empty())?;
+    Some(match resource_type {
+        WORKFLOW_RESOURCE_TYPE => match id.split_once(WORKFLOW_VERSION_ARN_INFIX) {
+            Some((workflow_id, version_name))
+                if !workflow_id.is_empty() && !version_name.is_empty() =>
+            {
+                TaggedResource::WorkflowVersion {
+                    workflow_id,
+                    version_name,
+                }
+            }
+            // A workflow id carrying anything else after it names no workflow and no
+            // version of one.
+            Some(_) => TaggedResource::Unheld,
+            None => TaggedResource::Workflow(id),
+        },
+        RUN_RESOURCE_TYPE => TaggedResource::Run(id),
+        RUN_GROUP_RESOURCE_TYPE => TaggedResource::RunGroup(id),
+        RUN_CACHE_RESOURCE_TYPE => TaggedResource::RunCache(id),
+        SEQUENCE_STORE_RESOURCE_TYPE => TaggedResource::SequenceStore(id),
+        _ => TaggedResource::Unheld,
+    })
+}
+
 /// Whether `status` is one a run stays in until something other than the clock moves
 /// it, from [`TERMINAL_RUN_STATUSES`].
 pub fn is_terminal_run_status(status: &str) -> bool {
@@ -1112,9 +1205,21 @@ impl ComAmazonawsOmicsOmicsState {
         self.runs.get(&numeric_id(id)?)
     }
 
+    /// The same record, for an operation that CHANGES the run. One lookup rule for both,
+    /// so a read and a write cannot disagree about which run an id names.
+    pub fn run_mut(&mut self, id: &str) -> Option<&mut Run> {
+        self.runs.get_mut(&numeric_id(id)?)
+    }
+
     /// The sequence store the modelled `SequenceStoreId` `id` names, or `None`.
     pub fn sequence_store(&self, id: &str) -> Option<&SequenceStore> {
         self.sequence_stores.get(&numeric_id(id)?)
+    }
+
+    /// The same record, for an operation that CHANGES the store, resolved by the same
+    /// rule.
+    pub fn sequence_store_mut(&mut self, id: &str) -> Option<&mut SequenceStore> {
+        self.sequence_stores.get_mut(&numeric_id(id)?)
     }
 
     /// Remove the sequence store the modelled `SequenceStoreId` `id` names, together
@@ -1183,9 +1288,21 @@ impl ComAmazonawsOmicsOmicsState {
         self.run_caches.get(&numeric_id(id)?)
     }
 
+    /// The same record, for an operation that CHANGES the cache, resolved by the same
+    /// rule.
+    pub fn run_cache_mut(&mut self, id: &str) -> Option<&mut RunCache> {
+        self.run_caches.get_mut(&numeric_id(id)?)
+    }
+
     /// The run group the modelled `RunGroupId` `id` names, or `None`.
     pub fn run_group(&self, id: &str) -> Option<&RunGroup> {
         self.run_groups.get(&numeric_id(id)?)
+    }
+
+    /// The same record, for an operation that CHANGES the group, resolved by the same
+    /// rule.
+    pub fn run_group_mut(&mut self, id: &str) -> Option<&mut RunGroup> {
+        self.run_groups.get_mut(&numeric_id(id)?)
     }
 
     /// The share the modelled `shareId` `id` names, or `None`.
@@ -1213,6 +1330,89 @@ impl ComAmazonawsOmicsOmicsState {
                 && share.principal_subscriber == principal_subscriber
                 && share.offer_stands()
         })
+    }
+
+    /// The tags of the resource `resource_arn` names, or `None` when this emulator holds
+    /// no resource under that ARN.
+    ///
+    /// Tags live ON the resource they belong to — every record that carries them is read
+    /// back by its own `Get`, and a resource's tags are reclaimed with it — so a tagging
+    /// call reaches the one record rather than a directory beside it. The ARN is matched
+    /// against the record's OWN ARN, so one carrying a held id in another Region or
+    /// account names nothing here, which is what the modelled `ResourceNotFoundException`
+    /// states ("not found in the current Region").
+    pub fn resource_tags(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
+        match tagged_resource(resource_arn)? {
+            TaggedResource::Workflow(id) => {
+                let workflow = self.workflow(id)?;
+                (workflow.arn == resource_arn).then_some(&workflow.tags)
+            }
+            TaggedResource::WorkflowVersion {
+                workflow_id,
+                version_name,
+            } => {
+                let version = self.workflow(workflow_id)?.versions.get(version_name)?;
+                (version.arn == resource_arn).then_some(&version.tags)
+            }
+            TaggedResource::Run(id) => {
+                let run = self.run(id)?;
+                (run.arn == resource_arn).then_some(&run.tags)
+            }
+            TaggedResource::RunGroup(id) => {
+                let group = self.run_group(id)?;
+                (group.arn == resource_arn).then_some(&group.tags)
+            }
+            TaggedResource::RunCache(id) => {
+                let cache = self.run_cache(id)?;
+                (cache.arn == resource_arn).then_some(&cache.tags)
+            }
+            TaggedResource::SequenceStore(id) => {
+                let store = self.sequence_store(id)?;
+                (store.arn == resource_arn).then_some(&store.tags)
+            }
+            TaggedResource::Unheld => None,
+        }
+    }
+
+    /// The same tags, for a tagging call that CHANGES them. One resolution rule for both,
+    /// so a write and a read cannot disagree about which record an ARN names.
+    pub fn resource_tags_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        match tagged_resource(resource_arn)? {
+            TaggedResource::Workflow(id) => {
+                let workflow = self.workflow_mut(id)?;
+                (workflow.arn == resource_arn).then_some(&mut workflow.tags)
+            }
+            TaggedResource::WorkflowVersion {
+                workflow_id,
+                version_name,
+            } => {
+                let version = self
+                    .workflow_mut(workflow_id)?
+                    .versions
+                    .get_mut(version_name)?;
+                (version.arn == resource_arn).then_some(&mut version.tags)
+            }
+            TaggedResource::Run(id) => {
+                let run = self.run_mut(id)?;
+                (run.arn == resource_arn).then_some(&mut run.tags)
+            }
+            TaggedResource::RunGroup(id) => {
+                let group = self.run_group_mut(id)?;
+                (group.arn == resource_arn).then_some(&mut group.tags)
+            }
+            TaggedResource::RunCache(id) => {
+                let cache = self.run_cache_mut(id)?;
+                (cache.arn == resource_arn).then_some(&mut cache.tags)
+            }
+            TaggedResource::SequenceStore(id) => {
+                let store = self.sequence_store_mut(id)?;
+                (store.arn == resource_arn).then_some(&mut store.tags)
+            }
+            TaggedResource::Unheld => None,
+        }
     }
 
     /// Mint the next share store key, which is the creation order the map is read in.
@@ -1741,6 +1941,10 @@ pub enum AuditOutcome {
     ShareCreated,
     /// A stored share was asked to go away, and carries the status that move leaves it in.
     ShareDeleted,
+    /// Tags were written onto a stored resource.
+    ResourceTagged,
+    /// Tags were removed from a stored resource.
+    ResourceUntagged,
     /// A replayed `@idempotencyToken` changed nothing and answered with the resource the
     /// first call created.
     NoChange,
@@ -1779,6 +1983,8 @@ impl AuditOutcome {
             Self::RunGroupCreated => "run-group-created",
             Self::ShareCreated => "share-created",
             Self::ShareDeleted => "share-deleted",
+            Self::ResourceTagged => "resource-tagged",
+            Self::ResourceUntagged => "resource-untagged",
             Self::NoChange => "no-change",
             Self::Reported => "reported",
             Self::ValidationRefused => "validation-refused",

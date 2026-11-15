@@ -21,6 +21,8 @@ mod read_set_upload_parts;
 mod response_member_wire_form;
 #[path = "all/resource_shares.rs"]
 mod resource_shares;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/run_caches.rs"]
 mod run_caches;
 #[path = "all/run_groups.rs"]

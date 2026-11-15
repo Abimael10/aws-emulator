@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Writes the request's tags onto the resource its `resourceArn` names, in
+//! [`crate::state`] — the one record every other reader of that resource answers from,
+//! so a tag written here is reported by the resource's own `Get` and by
+//! `ListTagsForResource` alike. The tags are MERGED: a key the resource already carries
+//! takes the new value and every other key it carries stays, which is what a tagging
+//! call does to a resource that is already tagged.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An ARN that names no resource of this service is refused as invalid; one that names a
+//! resource this emulator does not hold is the modelled `ResourceNotFoundException`; and
+//! a merge that would take the resource past the documented tags-per-resource ceiling is
+//! refused with the modelled `ServiceQuotaExceededException`, leaving the resource's tags
+//! as they were.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +153,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics resource store is unavailable".to_string(),
+            })
+        })?;
+
+        // `resourceArn`'s 1..150 length and `^arn:.+$` pattern, and the `tags` map's
+        // 0..50 size with its keys' and values' lengths, are modelled constraints the
+        // centralized walk has already refused anything outside of. What is left to this
+        // handler is WHICH resource the ARN names.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // A value that is no ARN of a resource of this service — another vendor's ARN, or
+        // one naming no resource id — addresses nothing this API could resolve, so it is
+        // refused on the input rather than reported as a resource that happens to be
+        // missing.
+        if crate::state::tagged_resource(&input.resource_arn).is_none() {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::ValidationRefused,
+                None,
+            );
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "resourceArn {} is not the ARN of a HealthOmics resource",
+                    input.resource_arn
+                ),
+            })
+            .into());
+        }
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut store = state.lock();
+        store.settle(now_ms);
+
+        let Some(tags) = store.resource_tags_mut(&input.resource_arn) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.resource_arn),
+            );
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::resource_arn_not_found_message(&input.resource_arn),
+                },
+            )
+            .into());
+        };
+
+        // The tags one resource carries are bounded, so the merged total is checked
+        // BEFORE anything is written: a request past the ceiling leaves the resource's
+        // tags exactly as they were instead of growing the record past it. A key the
+        // resource already carries is a replacement and costs no room.
+        let would_carry = tags.len()
+            + input
+                .tags
+                .keys()
+                .filter(|key| !tags.contains_key(*key))
+                .count();
+        if would_carry > crate::state::MAX_TAGS {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::QuotaExceeded,
+                Some(&input.resource_arn),
+            );
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: crate::state::tags_past_quota_message(would_carry),
+                },
+            )
+            .into());
+        }
+
+        for (key, value) in input.tags {
+            tags.insert(key, value);
+        }
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::ResourceTagged,
+            Some(&input.resource_arn),
+        );
+
+        Ok(TagResourceOutput {})
     }
 }

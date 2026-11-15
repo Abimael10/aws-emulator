@@ -29,6 +29,11 @@ sha2 = { workspace = true }
 # Hex for the `WorkflowDigest`, the UUID groups and the opaque page tokens.
 hex = { workspace = true }
 
+[dev-dependencies]
+# Percent-encoding for the `@httpLabel` and `@httpQuery` values this crate's tagging
+# suite puts in a request path, so no test hand-rolls RFC 3986 escaping.
+percent-encoding = "2.3"
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
