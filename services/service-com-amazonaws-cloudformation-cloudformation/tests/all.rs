@@ -603,6 +603,8 @@ mod stack_resource_read_contracts;
 mod stack_resources;
 #[path = "all/stack_role_trust.rs"]
 mod stack_role_trust;
+#[path = "all/stack_secret_describe_metadata.rs"]
+mod stack_secret_describe_metadata;
 #[path = "all/stack_service_role_stickiness.rs"]
 mod stack_service_role_stickiness;
 #[path = "all/stack_set_drift_lifecycle.rs"]
