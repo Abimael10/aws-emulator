@@ -26,6 +26,10 @@
 //! session, no destination or no S3 answer records nothing and is logged for an
 //! operator, and a failure records the error code and message the storage answered.
 //!
+//! A file this module delivers is stored with the provenance of the SESSION that
+//! delivered it ([`sftp_target::Session::stored_object_metadata`]), so a client reading
+//! the object back learns what wrote it and over which user's session on which server.
+//!
 //! Nothing here LEAVES the process either. The endpoint a transfer runs against is
 //! resolved to a server this emulator itself holds before anything is attempted — a
 //! connector whose `Url` names anything else is not connected to at all — and every
@@ -236,6 +240,7 @@ pub async fn deliver(
         let outcome = transfer_one(
             callback,
             &outbound.region,
+            &session,
             &(source_bucket, source_key),
             &(bucket.clone(), key.clone()),
         )
@@ -285,11 +290,17 @@ pub async fn deliver(
 /// Transfer ONE file: read it from `source` and write it to `destination`, both in
 /// this emulator's own storage, and answer the `ETag` the write reported.
 ///
+/// The write stores the file with the PROVENANCE of the session it arrived over
+/// ([`sftp_target::Session::stored_object_metadata`]), as user metadata of the object —
+/// so a later read of the delivered object reports what wrote it and which session
+/// delivered it, which is the audit trail an inbound transfer leaves behind.
+///
 /// `Err` carries the outcome of an attempt that FAILED, with the error code and message
 /// the storage answered — never one this service worded for itself.
 async fn transfer_one(
     callback: &::smithy_server_runtime::EmbeddedEmulator,
     region: &str,
+    session: &sftp_target::Session,
     source: &(String, String),
     destination: &(String, String),
 ) -> Result<Option<String>, st::ConnectorFileOutcome> {
@@ -323,6 +334,11 @@ async fn transfer_one(
         .bucket(&destination.0)
         .key(&destination.1)
         .body(::aws_sdk_s3::primitives::ByteStream::from(body))
+        // The file arrived on the server over this session, so that is what the stored
+        // object's user metadata records: what wrote it and whose session delivered it.
+        .set_metadata(Some(
+            session.stored_object_metadata().into_iter().collect(),
+        ))
         .send()
         .await
         .map_err(|error| failure(&error))?;
@@ -625,6 +641,12 @@ async fn invoke_custom_step(
 /// An Amazon S3 client over the IN-PROCESS callback into this same emulator: the
 /// storage a transfer reads from and writes to is this emulator's own, so the transfer
 /// never leaves the process. Same client policy as [`lambda_client`].
+///
+/// The client declares NO checksum algorithm of its own on an upload
+/// (`WhenRequired`): a file this service delivers is stored the way Transfer Family
+/// stores it, under the full-object checksum algorithm S3 itself applies to a write
+/// that names none, rather than under the one an SDK client would compute for every
+/// upload it makes.
 pub(crate) fn s3_client(
     callback: &::smithy_server_runtime::EmbeddedEmulator,
     region: &str,
@@ -634,6 +656,9 @@ pub(crate) fn s3_client(
         .region(::aws_sdk_s3::config::Region::new(region.to_string()))
         .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
         .force_path_style(true)
+        .request_checksum_calculation(
+            ::aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+        )
         .credentials_provider(callback.aws_credentials_provider())
         .http_client(callback.http_client())
         .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())

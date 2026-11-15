@@ -27,6 +27,10 @@
 //! [`probe`] is the one place that whole walk lives: `TestConnection` reports it, and
 //! [`super::connector_delivery`] uses it to decide whether an accepted transfer has a
 //! session to run over.
+//!
+//! An established [`Session`] is also the PROVENANCE of every file that arrives on the
+//! server over it ([`Session::stored_object_metadata`]), which is what a later read of
+//! the stored object reports about who delivered it.
 
 use ::std::time::Instant;
 
@@ -76,6 +80,23 @@ const SERVER_ENDPOINT_PREFIX: &str = "server.transfer.";
 /// The DNS suffix every endpoint host of this partition ends in.
 const ENDPOINT_SUFFIX: &str = ".amazonaws.com";
 
+/// The `Metadata` key of the provenance entry naming WHAT stored an object in a
+/// Transfer Family server's Amazon S3 domain.
+///
+/// A key of S3's `Metadata` map, which `GetObject`/`HeadObject` bind with
+/// `@httpPrefixHeaders("x-amz-meta-")`, so the stored entry is served back on the
+/// header `x-amz-meta-user-agent`.
+pub const UPLOAD_AGENT_METADATA_KEY: &str = "user-agent";
+
+/// The value of [`UPLOAD_AGENT_METADATA_KEY`]: the fixed text Transfer Family stamps on
+/// a file it stored in the server's storage on a client's behalf, which is what lets a
+/// later reader of the object tell that this service wrote it.
+pub const UPLOAD_AGENT: &str = "AWSTransfer";
+
+/// The `Metadata` key of the provenance entry naming WHICH session stored the object —
+/// served back on the header `x-amz-meta-user-agent-id`.
+pub const UPLOAD_AGENT_ID_METADATA_KEY: &str = "user-agent-id";
+
 /// The session one connector would run its transfers over, once a connection to the
 /// endpoint its `Url` names has been established and authenticated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +106,38 @@ pub struct Session {
     /// The user of that server the session authenticated as — whose home directory
     /// every remote path of this session resolves within.
     pub user_name: String,
+}
+
+impl Session {
+    /// WHICH session this is, as the provenance of an object it stored names it: the
+    /// user the session authenticated as and the server it is a session on, joined by
+    /// `@` — both read off the session itself, never off a request.
+    pub fn upload_agent_id(&self) -> String {
+        format!("{}@{}", self.user_name, self.server_id)
+    }
+
+    /// The user metadata an object this session delivers into the server's Amazon S3
+    /// domain is stored with: the provenance of the delivery, as the two entries
+    /// [`UPLOAD_AGENT_METADATA_KEY`] and [`UPLOAD_AGENT_ID_METADATA_KEY`] name — what
+    /// wrote the file and which session it arrived over.
+    ///
+    /// ONE place for it, so every path that stores a file arriving on a server stamps
+    /// the same provenance, and a later `GetObject` or `HeadObject` of any such object
+    /// serves the same two `x-amz-meta-*` headers. Nothing of the SOURCE object is
+    /// carried with it: a transfer moves a file's BYTES over SFTP, which carries no
+    /// user metadata of its own, so what the delivered object holds is this provenance.
+    pub fn stored_object_metadata(&self) -> Vec<(String, String)> {
+        vec![
+            (
+                UPLOAD_AGENT_METADATA_KEY.to_string(),
+                UPLOAD_AGENT.to_string(),
+            ),
+            (
+                UPLOAD_AGENT_ID_METADATA_KEY.to_string(),
+                self.upload_agent_id(),
+            ),
+        ]
+    }
 }
 
 /// What a connection attempt on one connector's SFTP configuration answered.

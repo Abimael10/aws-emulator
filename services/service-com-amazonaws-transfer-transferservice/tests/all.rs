@@ -217,3 +217,7 @@ mod agreement_update_write_scope;
 // agreement request that configures both directory configurations reports.
 #[path = "all/agreement_directory_conflict_message.rs"]
 mod agreement_directory_conflict_message;
+// `delivered_object_provenance`, likewise appended: what a file a session delivers onto
+// a server's S3 domain is stored with.
+#[path = "all/delivered_object_provenance.rs"]
+mod delivered_object_provenance;

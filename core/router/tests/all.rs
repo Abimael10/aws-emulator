@@ -1764,3 +1764,19 @@ mod lambda_sqs_event_source_attempt_reservation;
 // `all/all_rs_is_a_canonical_declaration_list.rs` check these rules — the first three for this
 // file and for every service crate's `tests/all.rs` — and `all/appended_notes.rs` keeps the
 // notes earlier landings had appended here.
+// This file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file under
+// `tests/all/`, sorted by name, and no other line — so two branches landing at once insert
+// two lines in two places and have no prose to duplicate, re-word or mistype. Put a new
+// suite at `tests/all/<name>.rs` and insert its pair below, in order. What a suite covers,
+// and why it belongs to this cross-service target rather than to one service crate's own,
+// is stated in that suite's OWN module doc, where it is read beside the test it explains.
+// EVERY comment here is an ORDINARY `//` one, this block included, and that is deliberate:
+// an inner doc comment (`//!`) is legal only before the first item, so one that lands past
+// the declarations — which is what concurrent landings appending to this file kept
+// The other two rules: a suite no `mod` here names is compiled nowhere and its tests never
+// run (this crate's `build.rs` refuses it), a suite left at the top level of `tests/` fails
+// the build, and a second `mod` for one name is `E0428`, which fails every suite in this
+// target. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a
+// SIBLING of this file, which the layout check refuses: the `#[path]` is what points each
+// `all/all_rs_is_a_canonical_declaration_list.rs` check these rules, for this file and for
+// every service crate's `tests/all.rs`, so check there rather than leaving a note here.

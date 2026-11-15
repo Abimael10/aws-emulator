@@ -176,9 +176,30 @@ pub(crate) struct Target {
     pub(crate) user_key: KeyPair,
 }
 
+/// The `UserName` of the server user a target stands up when a suite names none; it
+/// satisfies `UserName`'s modelled pattern `^[\w][\w@.-]{2,99}$`.
+pub(crate) const DEFAULT_SESSION_USER: &str = "partner-user";
+
 impl Target {
     /// Stand the target up: bucket, server (waited `ONLINE`), user.
     async fn stand_up(home_directory_type: &str, home_directory: &str, mappings: Value) -> Self {
+        Self::stand_up_as(
+            DEFAULT_SESSION_USER,
+            home_directory_type,
+            home_directory,
+            mappings,
+        )
+        .await
+    }
+
+    /// Stand the target up with a NAMED user of the server, for a suite whose rows
+    /// differ along WHICH user's session a transfer runs over.
+    pub(crate) async fn stand_up_as(
+        user_name: &str,
+        home_directory_type: &str,
+        home_directory: &str,
+        mappings: Value,
+    ) -> Self {
         let emulator = Emulator::with_connector_peers();
         let bucket = "transfer-connector-bucket".to_string();
         s3(&emulator)
@@ -200,7 +221,7 @@ impl Target {
         tokio::time::sleep(PAST_START_SPAN).await;
 
         let user_key = key_pair();
-        let user_name = "partner-user".to_string();
+        let user_name = user_name.to_string();
         let mut request = json!({
             "ServerId": &server_id,
             "UserName": &user_name,
