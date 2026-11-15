@@ -29,6 +29,12 @@ service-common = { path = "../common" }
 # (`src/state/scoring.rs`): SHA-256 as a stable mixing function, hex for the id.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The INGESTION store the inference plane reads beside its own registry
+# (`src/state/ingested.rs`): the interactions and the item/action records a caller streams
+# in through Amazon Personalize Events are part of what a campaign's inference sees, and
+# both services share one engine, so this is a path dependency on the crate that owns that
+# store's type.
+service-com-amazonaws-personalizeevents-amazonpersonalizeevents = { workspace = true }
 # The two stores the authorization gate reads (`src/state/authorization.rs`): AWS decides
 # whether the caller may make an inference call before any resource it names is looked up —
 # the SESSION a credential speaks for lives in STS's store while the POLICIES in force on
@@ -43,6 +49,12 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The ingestion data plane, mounted beside this one in the event-propagation suite: the
+# interactions and item records an inference call reads are put through ITS operations, so
+# the propagation is driven end to end over the wire. It is also a normal dependency of
+# this crate (the inference plane reads its store); this entry only states that the harness
+# mounts it.
+service-com-amazonaws-personalizeevents-amazonpersonalizeevents = { workspace = true }
 # IAM and the token service, mounted beside this one in the authorization suite: the policies
 # an inference call is authorized against are IAM's and the identity a credential speaks for
 # is STS's, so the gate is driven end to end against the services that own them. They are

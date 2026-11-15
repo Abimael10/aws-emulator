@@ -20,12 +20,17 @@ use engine::InMemoryEngine;
 use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_personalizeevents_amazonpersonalizeevents as ingestion;
 use service_com_amazonaws_personalizeruntime_amazonpersonalizeruntime as runtime;
 use runtime::state::{Action, Item};
 
 /// The endpoint host an Amazon Personalize Runtime caller addresses
 /// (`endpointPrefix: personalize-runtime`).
 pub const HOST: &str = "personalize-runtime.us-east-1.amazonaws.com";
+
+/// The endpoint host an Amazon Personalize Events caller addresses
+/// (`endpointPrefix: personalize-events`), for a suite that drives ingestion too.
+pub const INGESTION_HOST: &str = "personalize-events.us-east-1.amazonaws.com";
 
 /// The account every suite's campaigns, recommenders and filters live in: the one this
 /// emulator serves.
@@ -65,6 +70,9 @@ pub const CHANNELS: [&str; 2] = ["App", "Email"];
 /// One emulator: a single shared engine with this one service mounted on it.
 pub struct Emulator {
     pub engine: Arc<InMemoryEngine>,
+    /// Whether the Amazon Personalize Events INGESTION data plane is mounted beside this
+    /// service, for a suite that drives ingestion over the wire too.
+    ingestion: bool,
 }
 
 impl Emulator {
@@ -72,30 +80,74 @@ impl Emulator {
     pub fn new() -> Self {
         Self {
             engine: Arc::new(InMemoryEngine::new()),
+            ingestion: false,
         }
     }
 
-    /// A router serving only this service over the shared engine. Built per call on
-    /// purpose: every router shares the one engine, so anything a later call observes
-    /// came from engine state and not from a handle held across calls.
+    /// A fresh emulator with the Amazon Personalize Events data plane mounted beside this
+    /// service on the SAME engine, the way the production router mounts both.
+    ///
+    /// For a suite whose subject is what ingestion changes about an inference response:
+    /// the interactions and the item records are put through that service's own
+    /// operations, over the wire, rather than written into a store by hand.
+    pub fn with_ingestion() -> Self {
+        Self {
+            engine: Arc::new(InMemoryEngine::new()),
+            ingestion: true,
+        }
+    }
+
+    /// A router serving this service over the shared engine — and the ingestion data
+    /// plane as well when the emulator was built [`with_ingestion`](Self::with_ingestion).
+    /// Built per call on purpose: every router shares the one engine, so anything a later
+    /// call observes came from engine state and not from a handle held across calls.
     fn router(&self) -> MultiServiceRouter {
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(runtime::EmulatedService::new(Arc::clone(&self.engine)));
+        if self.ingestion {
+            router.register_service(ingestion::EmulatedService::new(Arc::clone(&self.engine)));
+        }
         router
     }
 
     /// Dispatch one request and return the raw HTTP response, headers included.
     async fn dispatch(&self, route: &str, body: &Value) -> ::http::Response<Bytes> {
+        self.dispatch_to(HOST, route, body).await
+    }
+
+    /// [`dispatch`](Self::dispatch) against a named endpoint host, for a call to the
+    /// ingestion data plane (whose endpoint prefix is `personalize-events`).
+    async fn dispatch_to(
+        &self,
+        host: &str,
+        route: &str,
+        body: &Value,
+    ) -> ::http::Response<Bytes> {
         let request = ::http::Request::builder()
             .method("POST")
-            .uri(format!("https://{HOST}{route}"))
-            .header("host", HOST)
+            .uri(format!("https://{host}{route}"))
+            .header("host", host)
             .header("content-type", "application/json")
             .header("authorization", SIGV4_HEADER)
             .body(Bytes::from(body.to_string()))
             .expect("the test request is well formed");
         self.router().dispatch(request).await
+    }
+
+    /// Dispatch one INGESTION call (Amazon Personalize Events) that must succeed.
+    ///
+    /// Its modelled output is `Unit`, so there is nothing to read back but the status:
+    /// what the call produced is what it persisted, which an inference call then reads.
+    pub async fn ingest(&self, route: &str, body: Value) {
+        let response = self.dispatch_to(INGESTION_HOST, route, &body).await;
+        let status = response.status().as_u16();
+        assert_eq!(
+            status,
+            200,
+            "case {route} {body}: expected HTTP 200, got {status} with {}",
+            String::from_utf8_lossy(response.body())
+        );
     }
 
     /// Dispatch one request and return `(http status, parsed body)`.

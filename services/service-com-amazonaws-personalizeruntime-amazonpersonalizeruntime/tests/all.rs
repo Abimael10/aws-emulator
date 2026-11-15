@@ -21,6 +21,8 @@ mod arn_resource_type;
 mod comparison_operands;
 #[path = "all/empty_string_member_constraints.rs"]
 mod empty_string_member_constraints;
+#[path = "all/event_propagation.rs"]
+mod event_propagation;
 #[path = "all/filter_subject.rs"]
 mod filter_subject;
 #[path = "all/filter_value_quoting.rs"]

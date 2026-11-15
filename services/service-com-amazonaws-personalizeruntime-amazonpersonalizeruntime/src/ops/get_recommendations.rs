@@ -28,26 +28,33 @@
 //! 3. **Check the personalization input the resolved resource needs** — "USER_PERSONALIZATION
 //!    - userId required, itemId not used RELATED_ITEMS - itemId required, userId not
 //!    used", and for a recommender the input its domain use case requires.
-//! 4. **Filter.** `filterArn` is resolved against the registry (400 when unknown) and
-//!    its expression, bound to `filterValues`, decides which stored catalog entries
-//!    come back — not what any of them scores.
-//! 5. **Score and order.** Each candidate's score is [`crate::state::scoring::Seed::relevance`]
-//!    of its STORED `base_score`, the request's `context` and only the ONE
+//! 4. **Read the catalog.** The resolved resource's stored catalog is what its solution
+//!    version was FITTED to; the INGESTION data plane holds what the same dataset group
+//!    has taken since — items put into its Items dataset, and the interactions its event
+//!    trackers recorded — so the catalog this call recommends from is the two together
+//!    (see [`crate::state::ingested`]).
+//! 5. **Filter.** `filterArn` is resolved against the registry (400 when unknown) and
+//!    its expression, bound to `filterValues`, decides which catalog entries
+//!    come back — not what any of them scores. A clause over the `Interactions` dataset
+//!    reads the interactions THIS user recorded for the entry.
+//! 6. **Score and order.** Each candidate's score is [`crate::state::scoring::Seed::relevance`]
+//!    of its `base_score`, the request's `context` and only the ONE
 //!    personalization input the resolved resource uses (see
 //!    [`crate::state::RequiredInput::personalization`]), so an identical request
 //!    returns an identical ordering (the operation is `@idempotent`) and the input the
 //!    resource does not use is ignored. The list is reported "sorted in descending
-//!    order by prediction score". The scores are normalized across the whole stored catalog BEFORE the
+//!    order by prediction score". The scores are normalized across the whole catalog BEFORE the
 //!    request's filter, `numResults` and any promotion decide which candidates come
 //!    back, so one item's score is the same whatever the request asked for.
-//! 6. **Promote.** A `promotions` entry takes `percentPromotedItems` of the returned
+//! 7. **Promote.** A `promotions` entry takes `percentPromotedItems` of the returned
 //!    slots from the entries its own filter selects; each such item carries
 //!    `promotionName` and the documented `reason` "Promoted item". The share is taken
 //!    of the entries the response actually REPORTS — `numResults` is what the caller
 //!    asked for, and a catalog or filter that leaves fewer candidates reports fewer —
 //!    so the promoted fraction of the list is the one the request named whatever the
 //!    response's length turns out to be.
-//! 7. **Metadata.** `metadataColumns` is served from the stored item attributes; with
+//! 8. **Metadata.** `metadataColumns` is served from the item's attributes — the fitted
+//!    ones and the columns of the record last put for it; with
 //!    no `metadataColumns` the `metadata` member is omitted entirely.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
@@ -279,17 +286,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             _ => {}
         }
 
-        // 4. Which metadata columns come back, validated against the RESOLVED resource
+        // 4. The catalog this call recommends from, and the interactions a filter clause
+        //    over the Interactions dataset reads: the resolved resource's stored catalog
+        //    is what its solution version was FITTED to, while the ingestion data plane
+        //    holds what the same dataset group has taken since — items put into its Items
+        //    dataset and interactions its trackers recorded (see
+        //    [`crate::state::ingested`]). The two are read together here so everything
+        //    below (metadata columns, filtering, scoring) sees one catalog.
+        let ingested = registry::ingested::live_view(
+            &*self.engine,
+            resolved.dataset_group_arn.as_deref(),
+            resolved.fitted_at,
+        );
+        let catalog = ingested.items(&resolved.items);
+        let recorded = ingested.interactions_of(user_id);
+
+        // 5. Which metadata columns come back, validated against the RESOLVED resource
         //    and its catalog — the parts of `metadataColumns` that need it; the map key
         //    and the column cap were already settled in step 1, from the request.
         let metadata_columns = registry::metadata_columns_in_catalog(
             requested_metadata,
             resolved.metadata_enabled,
-            &registry::catalog_columns(&resolved.items),
+            &registry::catalog_columns(&catalog),
         )
         .map_err(deny)?;
 
-        // 5. The request's filter, and the registry-bound filter of the promotion step
+        // 6. The request's filter, and the registry-bound filter of the promotion step
         //    1 already read off the request.
         let request_filter = guard
             .bind_filter(
@@ -300,7 +322,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(deny)?;
         let promotion = bind_promotion(&guard, requested_promotion)?;
 
-        // 6. Score the resolved resource's WHOLE stored catalog and settle each entry's
+        // 7. Score the resolved resource's WHOLE catalog and settle each entry's
         //    share of the certainty over it. `RELATED_ITEMS` recommends items related
         //    to `itemId`, never the queried item itself, so that item is no candidate
         //    at all — `itemId` is a personalization input, not a selection member.
@@ -317,8 +339,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             personalization,
             input.context.as_ref(),
         );
-        let mut candidates: Vec<(usize, f64)> = resolved
-            .items
+        let mut candidates: Vec<(usize, f64)> = catalog
             .iter()
             .enumerate()
             .filter(|(_, item)| {
@@ -336,18 +357,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "a filter you created to include items or exclude items from recommendations"
         // — it decides WHICH candidates come back, never what one of them scores.
         candidates.retain(|(index, _)| {
-            request_filter
-                .as_ref()
-                .is_none_or(|filter| filter.retains(&resolved.items[*index].attributes))
+            request_filter.as_ref().is_none_or(|filter| {
+                let item = &catalog[*index];
+                filter.retains(recorded.facts(&item.item_id, &item.attributes))
+            })
         });
         candidates.sort_by(|(left, left_score), (right, right_score)| {
             scoring::by_score_desc(
-                (&resolved.items[*left].item_id, *left_score),
-                (&resolved.items[*right].item_id, *right_score),
+                (&catalog[*left].item_id, *left_score),
+                (&catalog[*right].item_id, *right_score),
             )
         });
 
-        // 7. Fill the returned slots: the promotion's share first, then the rest of
+        // 8. Fill the returned slots: the promotion's share first, then the rest of
         //    the ranking. Both are drawn in descending-score order, and the chosen
         //    positions are re-sorted so the response stays in that order.
         //
@@ -365,7 +387,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if chosen.len() >= slots {
                     break;
                 }
-                if promotion.filter.retains(&resolved.items[*index].attributes) {
+                let item = &catalog[*index];
+                if promotion
+                    .filter
+                    .retains(recorded.facts(&item.item_id, &item.attributes))
+                {
                     chosen.push((position, true));
                 }
             }
@@ -385,7 +411,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .map(|(position, promoted)| {
                 let (index, score) = candidates[*position];
-                let item = &resolved.items[index];
+                let item = &catalog[index];
                 PredictedItem {
                     item_id: Some(item.item_id.clone()),
                     score: Some(score),
@@ -461,6 +487,11 @@ struct Resolved {
     metadata_enabled: bool,
     /// The personalization input it needs in the request.
     required_input: RequiredInput,
+    /// The dataset group whose live ingestion data it reads beside that stored catalog,
+    /// when it was fitted to one.
+    dataset_group_arn: Option<String>,
+    /// The instant its stored catalog was fitted to that group's data.
+    fitted_at: Option<SystemTime>,
 }
 
 /// Resolve the request's `campaignArn` or `recommenderArn` against the registry.
@@ -503,6 +534,8 @@ fn resolve(
                 items: campaign.items.clone(),
                 metadata_enabled: campaign.metadata_enabled,
                 required_input: campaign.required_input(),
+                dataset_group_arn: campaign.dataset_group_arn.clone(),
+                fitted_at: campaign.fitted_at,
             })
         }
         (None, Some(arn)) => {
@@ -513,6 +546,8 @@ fn resolve(
                 items: recommender.items.clone(),
                 metadata_enabled: recommender.metadata_enabled,
                 required_input: recommender.required_input(),
+                dataset_group_arn: recommender.dataset_group_arn.clone(),
+                fitted_at: recommender.fitted_at,
             })
         }
     }

@@ -255,6 +255,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let solution_arn = version.solution_arn.clone();
         let version_active_at = version.active_at;
         let trained = version.trained.clone();
+        // WHICH dataset group the deployed model was fitted to, and WHEN: the group keeps
+        // taking records after that training run, and Personalize's real-time data plane
+        // takes them into account, so the inference registry is told both and reads the
+        // group's live records beside the catalog (`runtime::Campaign::fitted_to`).
+        let fitted_group_arn = version.dataset_group_arn.clone();
+        let fitted_at = version.creation_date_time;
 
         // The campaign is minted in the region of the pipeline it deploys, so every
         // resource of one pipeline carries one region whichever region this request was
@@ -304,7 +310,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // runtime serves.
         let mut campaign = runtime::Campaign::new(&arn, &input.name, served_by, trained.items);
         campaign.actions = trained.actions;
-        let mut campaign = campaign.deployed(&input.solution_version_arn, active_at);
+        let mut campaign = campaign
+            .deployed(&input.solution_version_arn, active_at)
+            .fitted_to(&fitted_group_arn, fitted_at);
         if metadata_enabled {
             campaign = campaign.with_metadata_enabled();
         }

@@ -233,7 +233,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // 4. The request's filter, over the Actions dataset.
+        // 4. The catalog this call recommends from, and the request's filter over the
+        //    Actions dataset. The campaign's stored Actions catalog is what its solution
+        //    version was FITTED to, and the ingestion data plane holds what the same
+        //    dataset group has taken since — actions put into its Actions dataset and the
+        //    action interactions its trackers recorded (see [`crate::state::ingested`]).
+        let ingested = registry::ingested::live_view(
+            &*self.engine,
+            campaign.dataset_group_arn.as_deref(),
+            campaign.fitted_at,
+        );
+        let catalog = ingested.actions(&campaign.actions);
+        let recorded = ingested.action_interactions_of(user_id);
         let request_filter = guard
             .bind_filter(
                 registry::present(input.filter_arn.as_deref()),
@@ -242,14 +253,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .map_err(deny)?;
 
-        // 5. Score every stored action, settle each one's share of the certainty over
-        //    the whole stored Actions catalog, then let the request's filter and
+        // 5. Score every action of that catalog, settle each one's share of the
+        //    certainty over the whole scored catalog, then let the request's filter and
         //    `numResults` decide which of them come back. The seed is composed by the
         //    same shared helper the sibling operations score through, without the
         //    `context` member this operation's model does not carry.
         let seed = scoring::Seed::without_context(&campaign.arn, user_id);
-        let mut ranked: Vec<(&Action, f64)> = campaign
-            .actions
+        let mut ranked: Vec<(&Action, f64)> = catalog
             .iter()
             .map(|action| {
                 let score = seed.relevance(action.base_score, &action.action_id);
@@ -266,9 +276,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "the filter to apply to the returned recommendations" — it decides WHICH
         // actions come back, never what one of them scores.
         ranked.retain(|(action, _)| {
-            request_filter
-                .as_ref()
-                .is_none_or(|filter| filter.retains(&action.attributes))
+            request_filter.as_ref().is_none_or(|filter| {
+                filter.retains(recorded.facts(&action.action_id, &action.attributes))
+            })
         });
         ranked.sort_by(|(left, left_score), (right, right_score)| {
             scoring::by_score_desc(

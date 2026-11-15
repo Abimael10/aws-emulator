@@ -24,15 +24,27 @@
 //!
 //! # What the expression is evaluated against
 //!
-//! A clause names a dataset (`Items.GENRE`) and this emulator stores exactly the
-//! Items and Actions attributes a registered catalog carries, so
-//! [`parse`] accepts only those two datasets: an expression over `Interactions` would
-//! have to be evaluated against interaction history this emulator does not store, and
-//! silently ignoring it would make the filter claim to filter when it does not.
+//! A clause names a dataset. Two kinds of dataset describe a candidate entry, and a
+//! clause over either is applied:
 //!
-//! The expression's SUBJECT states which of the two the expression selects — `ItemID`
-//! for Items entries, `ActionID` for Actions ones — so [`parse`] accepts those two
-//! identifiers and nothing else, and [`bind`] requires the subject to name the entity
+//! * the ENTITY dataset — `Items.GENRE`, `Actions.CHANNEL` — whose columns are the
+//!   entry's own metadata, read from the catalog entry;
+//! * the INTERACTION dataset — `Interactions.EVENT_TYPE`,
+//!   `Action_Interactions.EVENT_TYPE` — whose columns are the columns of an interaction
+//!   RECORDED for that entry by the user the request personalizes for, which is what the
+//!   published "exclude what this user already interacted with" filter reads. A clause
+//!   over it holds when ANY of that user's interactions with the entry satisfies it, so
+//!   an entry the user never interacted with satisfies no such clause.
+//!
+//! [`parse`] accepts those four dataset names and no others, and [`bind`] pairs each
+//! clause with the entity it is applied to: the Items entity admits `Items` and
+//! `Interactions` clauses, the Actions entity `Actions` and `Action_Interactions` ones,
+//! and a clause over the other entity's datasets describes nothing this operation
+//! recommends.
+//!
+//! The expression's SUBJECT states which of the two entities the expression selects —
+//! `ItemID` for Items entries, `ActionID` for Actions ones — so [`parse`] accepts those
+//! two identifiers and nothing else, and [`bind`] requires the subject to name the entity
 //! the operation applying the filter recommends ([`Entity`]).
 //!
 //! A categorical attribute may hold several values separated by `|`, the separator
@@ -52,11 +64,12 @@
 //! expression, and at [`bind`] for a `$placeholder` the request binds — never by
 //! applying a clause nothing can satisfy.
 //!
-//! A clause is evaluated against the value the entry STORES for its column, so an entry
-//! that stores none satisfies no clause of any predicate — `NOT IN` included — and such
-//! an entry is therefore kept by an `EXCLUDE` expression and dropped by an `INCLUDE`
-//! one, whatever shape the predicates take. The clause evaluator is where that is
-//! decided.
+//! A clause is evaluated against the value the row it reads STORES for its column — the
+//! entry's own metadata, or one recorded interaction's columns — so a row that stores none
+//! satisfies no clause of any predicate, `NOT IN` included. An entry with no value for an
+//! entity column, and one no interaction of this user mentions at all, is therefore kept
+//! by an `EXCLUDE` expression and dropped by an `INCLUDE` one, whatever shape the
+//! predicates take. The clause evaluator is where that is decided.
 //!
 //! # What a request binds a `$placeholder` to
 //!
@@ -76,23 +89,34 @@ pub enum FilterKind {
     Exclude,
 }
 
-/// The kind of catalog entry a filter is applied to, and therefore both the subject an
-/// expression that selects it names and the only dataset name whose clauses can be
-/// evaluated for it.
+/// The kind of catalog entry a filter is applied to, and therefore the subject an
+/// expression that selects it names, the dataset whose columns describe it and the
+/// interaction dataset whose records are its interactions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entity {
-    /// An Items-dataset entry, filtered by `Items.<COLUMN>` clauses.
+    /// An Items-dataset entry, filtered by `Items.<COLUMN>` and
+    /// `Interactions.<COLUMN>` clauses.
     Items,
-    /// An Actions-dataset entry, filtered by `Actions.<COLUMN>` clauses.
+    /// An Actions-dataset entry, filtered by `Actions.<COLUMN>` and
+    /// `Action_Interactions.<COLUMN>` clauses.
     Actions,
 }
 
 impl Entity {
-    /// The dataset name whose clauses apply to this entity.
+    /// The dataset name whose clauses read this entity's own metadata columns.
     pub fn dataset(self) -> &'static str {
         match self {
             Self::Items => DATASET_ITEMS,
             Self::Actions => DATASET_ACTIONS,
+        }
+    }
+
+    /// The dataset name whose clauses read the interactions RECORDED for an entry of this
+    /// kind: the Item interactions of an item, the Action interactions of an action.
+    pub fn interaction_dataset(self) -> &'static str {
+        match self {
+            Self::Items => DATASET_INTERACTIONS,
+            Self::Actions => DATASET_ACTION_INTERACTIONS,
         }
     }
 
@@ -122,6 +146,19 @@ impl Entity {
 pub const DATASET_ITEMS: &str = "Items";
 /// The Actions dataset name, as a filter expression spells it.
 pub const DATASET_ACTIONS: &str = "Actions";
+/// The Item interactions dataset name, as a filter expression spells it.
+pub const DATASET_INTERACTIONS: &str = "Interactions";
+/// The Action interactions dataset name, as a filter expression spells it — the spelling
+/// the control plane's own dataset types use (`Action_Interactions`).
+pub const DATASET_ACTION_INTERACTIONS: &str = "Action_Interactions";
+
+/// Every dataset a clause may read, in the order a refusal naming them lists them.
+pub const CLAUSE_DATASETS: [&str; 4] = [
+    DATASET_ITEMS,
+    DATASET_ACTIONS,
+    DATASET_INTERACTIONS,
+    DATASET_ACTION_INTERACTIONS,
+];
 
 /// The subject an expression selecting Items-dataset entries names.
 pub const SUBJECT_ITEM_ID: &str = "ItemID";
@@ -419,10 +456,11 @@ impl Parser {
         let (dataset, column) = qualified.split_once('.').ok_or_else(|| {
             format!("filter expression expected a <Dataset>.<COLUMN> reference, found '{qualified}'")
         })?;
-        if dataset != DATASET_ITEMS && dataset != DATASET_ACTIONS {
+        if !CLAUSE_DATASETS.contains(&dataset) {
             return Err(format!(
-                "filter expression references the {dataset} dataset; this emulator evaluates \
-                 filter expressions over {DATASET_ITEMS} and {DATASET_ACTIONS} only"
+                "filter expression references the {dataset} dataset; a filter expression reads \
+                 the {} datasets",
+                CLAUSE_DATASETS.join(", ")
             ));
         }
         if column.is_empty() {
@@ -637,8 +675,24 @@ pub fn parse(expression: &str) -> Result<FilterExpression, String> {
 /// A clause whose `$placeholders` are already bound to the request's `filterValues`.
 #[derive(Debug, Clone)]
 struct BoundClause {
+    /// Which rows of a candidate entry the clause reads.
+    source: ClauseSource,
     column: String,
     predicate: BoundPredicate,
+}
+
+/// Which rows describing a candidate entry a bound clause is evaluated against: the
+/// entry's own dataset columns, or the interactions recorded for it.
+///
+/// Decided once, where the clause's dataset is paired with the entity being filtered
+/// ([`bind`]), so the evaluator never re-reads a dataset name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClauseSource {
+    /// The entity dataset: the entry's own metadata columns.
+    Entity,
+    /// The interaction dataset: one row per interaction the request's user recorded for
+    /// the entry.
+    Interactions,
 }
 
 /// A predicate with every operand resolved to a concrete value.
@@ -670,11 +724,40 @@ enum BoundPredicate {
 ///
 /// Binding happens ONCE per request, so a parameter the request failed to bind is
 /// reported once — not once per catalog entry — and the per-entry decision is a pure
-/// function of the entry's stored attributes.
+/// function of the facts the entry carries ([`EntryFacts`]).
 #[derive(Debug, Clone)]
 pub struct BoundFilter {
     kind: FilterKind,
     clauses: Vec<(Combinator, BoundClause)>,
+}
+
+/// Everything a bound clause reads about ONE candidate catalog entry.
+///
+/// The two halves are the two kinds of dataset a clause can name: the entry's own
+/// metadata columns, and the interactions the user this request personalizes for recorded
+/// for that entry. Held as borrows, so deciding one entry allocates nothing.
+#[derive(Debug, Clone, Copy)]
+pub struct EntryFacts<'a> {
+    /// The entry's stored dataset columns, keyed by column name.
+    attributes: &'a BTreeMap<String, String>,
+    /// One map per interaction this request's user recorded for the entry, each keyed by
+    /// the interaction dataset's column names. Empty for an entry that user never
+    /// interacted with, and for a request that personalizes for no user at all.
+    interactions: &'a [BTreeMap<String, String>],
+}
+
+impl<'a> EntryFacts<'a> {
+    /// The facts about an entry carrying `attributes` for which this request's user
+    /// recorded `interactions`.
+    pub fn new(
+        attributes: &'a BTreeMap<String, String>,
+        interactions: &'a [BTreeMap<String, String>],
+    ) -> Self {
+        Self {
+            attributes,
+            interactions,
+        }
+    }
 }
 
 /// Bind `expression` to a request's `filter_values` for entries of kind `entity`.
@@ -692,9 +775,9 @@ pub struct BoundFilter {
 /// which requests reach it.
 ///
 /// A filter whose SUBJECT names the other entity does not select what this operation
-/// recommends, and a clause over the other dataset cannot be evaluated against this
-/// entity's stored attributes at all; either is an error for either kind: the caller
-/// applied an Items filter to action recommendations, or the reverse. So is a value the request DID
+/// recommends, and a clause over a dataset that describes neither this entity nor its
+/// interactions cannot be evaluated for it at all; either is an error for either kind: the
+/// caller applied an Items filter to action recommendations, or the reverse. So is a value the request DID
 /// supply that the clause cannot compare — an ordering operator against text: the
 /// asymmetry above is about a value the request OMITS, and a supplied value the clause
 /// cannot apply is reported here rather than filtering nothing.
@@ -712,14 +795,21 @@ pub fn bind(
     }
     let mut clauses: Vec<(Combinator, BoundClause)> = Vec::new();
     for (combinator, clause) in &expression.clauses {
-        if clause.dataset != entity.dataset() {
+        // WHICH rows the clause reads: the entity's own dataset describes the entry, its
+        // interaction dataset describes what the request's user did with the entry, and
+        // any other dataset describes neither.
+        let source = if clause.dataset == entity.dataset() {
+            ClauseSource::Entity
+        } else if clause.dataset == entity.interaction_dataset() {
+            ClauseSource::Interactions
+        } else {
             return Err(format!(
                 "the filter applies to the {} dataset, which does not describe the {} this \
                  operation recommends",
                 clause.dataset,
                 entity.dataset()
             ));
-        }
+        };
         let bound = match &clause.predicate {
             Predicate::In { values, negated } => {
                 let mut bound_values: Vec<String> = Vec::new();
@@ -767,6 +857,7 @@ pub fn bind(
         clauses.push((
             *combinator,
             BoundClause {
+                source,
                 column: clause.column.clone(),
                 predicate: bound,
             },
@@ -932,28 +1023,28 @@ fn quote_width(chars: &[char], at: usize) -> usize {
 }
 
 impl BoundFilter {
-    /// Whether an entry carrying `attributes` survives this filter.
-    pub fn retains(&self, attributes: &BTreeMap<String, String>) -> bool {
-        let matched = self.matches(attributes);
+    /// Whether an entry carrying `facts` survives this filter.
+    pub fn retains(&self, facts: EntryFacts<'_>) -> bool {
+        let matched = self.matches(facts);
         match self.kind {
             FilterKind::Include => matched,
             FilterKind::Exclude => !matched,
         }
     }
 
-    /// Whether the expression's clauses match an entry carrying `attributes`.
+    /// Whether the expression's clauses match an entry carrying `facts`.
     ///
     /// No clauses left to evaluate means nothing matches — reachable only for an
     /// `EXCLUDE` expression whose every clause the request left unbound, which the
     /// documentation says removes nothing.
-    fn matches(&self, attributes: &BTreeMap<String, String>) -> bool {
+    fn matches(&self, facts: EntryFacts<'_>) -> bool {
         let mut clauses = self.clauses.iter();
         let Some((_, first)) = clauses.next() else {
             return false;
         };
-        let mut holds = evaluate(first, attributes);
+        let mut holds = evaluate(first, facts);
         for (combinator, clause) in clauses {
-            let next = evaluate(clause, attributes);
+            let next = evaluate(clause, facts);
             holds = match combinator {
                 Combinator::And => holds && next,
                 Combinator::Or => holds || next,
@@ -969,21 +1060,39 @@ impl BoundFilter {
     }
 }
 
-/// Whether one bound clause holds for an entry carrying `attributes`.
+/// Whether one bound clause holds for an entry carrying `facts`.
 ///
-/// A clause asserts something about the value the entry STORES for its column, so an
-/// entry that stores no value for that column satisfies it under NO predicate: there is
+/// A clause over the ENTITY dataset asserts something about the entry itself, so it reads
+/// the entry's own columns. A clause over the INTERACTION dataset asserts something about
+/// what the request's user DID with the entry, so it holds when any one of the recorded
+/// interactions satisfies it — and an entry that user never interacted with has no row to
+/// satisfy it, exactly as an entry storing no value for a column has nothing to compare.
+fn evaluate(clause: &BoundClause, facts: EntryFacts<'_>) -> bool {
+    match clause.source {
+        ClauseSource::Entity => holds_for(clause, facts.attributes),
+        ClauseSource::Interactions => facts
+            .interactions
+            .iter()
+            .any(|recorded| holds_for(clause, recorded)),
+    }
+}
+
+/// Whether one bound clause holds for ONE row of columns — a catalog entry's metadata, or
+/// one recorded interaction.
+///
+/// A clause asserts something about the value the row STORES for its column, so a row that
+/// stores no value for that column satisfies it under NO predicate: there is
 /// nothing to compare, and negating the comparison does not turn an absent value into a
 /// match any more than it does in SQL, where a predicate over a missing value is
 /// unknown rather than true. That is decided here, once, before the predicate is read —
-/// so `NOT IN`, `IN` and every comparison answer an attribute-less entry the same way,
-/// and an entry is kept or removed only by the attributes it actually holds.
+/// so `NOT IN`, `IN` and every comparison answer a row without the column the same way,
+/// and an entry is kept or removed only by the values its rows actually hold.
 ///
-/// A column may hold SEVERAL values, so every predicate reads the ones the entry holds
+/// A column may hold SEVERAL values, so every predicate reads the ones the row holds
 /// the same way: the clause holds when any of them satisfies it, and a negated one when
 /// none does.
-fn evaluate(clause: &BoundClause, attributes: &BTreeMap<String, String>) -> bool {
-    let Some(stored) = attributes.get(&clause.column) else {
+fn holds_for(clause: &BoundClause, columns: &BTreeMap<String, String>) -> bool {
+    let Some(stored) = columns.get(&clause.column) else {
         return false;
     };
     let held = || stored.split('|').map(str::trim);

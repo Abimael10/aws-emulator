@@ -251,13 +251,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // 3. Metadata, validated against the resolved campaign and its catalog — the
-        //    parts of `metadataColumns` that need it; its map key and column cap were
-        //    already settled in step 1, from the request.
+        // 3. The catalog this call ranks over: the campaign's stored catalog is what its
+        //    solution version was FITTED to, and the ingestion data plane holds what the
+        //    same dataset group has taken since (see [`crate::state::ingested`]). Metadata
+        //    is then validated against the resolved campaign and that catalog — the parts
+        //    of `metadataColumns` that need it; its map key and column cap were already
+        //    settled in step 1, from the request.
+        let ingested = registry::ingested::live_view(
+            &*self.engine,
+            campaign.dataset_group_arn.as_deref(),
+            campaign.fitted_at,
+        );
+        let catalog = ingested.items(&campaign.items);
+        let recorded = ingested.interactions_of(&input.user_id);
         let metadata_columns = registry::metadata_columns_in_catalog(
             requested_metadata,
             campaign.metadata_enabled,
-            &registry::catalog_columns(&campaign.items),
+            &registry::catalog_columns(&catalog),
         )
         .map_err(deny)?;
 
@@ -269,7 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .map_err(deny)?;
 
-        // 4. Score the WHOLE stored catalog for this request, and settle each entry's
+        // 4. Score the WHOLE catalog for this request, and settle each entry's
         //    share of the certainty over it. The reported score of an item is the
         //    model's certainty for the (campaign, userId, context, item) tuple, so the
         //    denominator is the catalog — never the entries this `inputList` happened
@@ -281,8 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.user_id,
             input.context.as_ref(),
         );
-        let mut catalog_shares: Vec<f64> = campaign
-            .items
+        let mut catalog_shares: Vec<f64> = catalog
             .iter()
             .map(|item| seed.relevance(item.base_score, &item.item_id))
             .collect();
@@ -307,26 +316,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !reported.insert(item_id.as_str()) {
                 continue;
             }
-            match campaign
-                .items
-                .iter()
-                .position(|item| &item.item_id == item_id)
-            {
+            match catalog.iter().position(|item| &item.item_id == item_id) {
                 Some(index) => {
-                    let item = &campaign.items[index];
-                    if request_filter
-                        .as_ref()
-                        .is_some_and(|filter| !filter.retains(&item.attributes))
-                    {
+                    let item = &catalog[index];
+                    if request_filter.as_ref().is_some_and(|filter| {
+                        !filter.retains(recorded.facts(&item.item_id, &item.attributes))
+                    }) {
                         continue;
                     }
                     ranked.push((index, catalog_shares[index], position));
                 }
                 None => {
-                    if request_filter
-                        .as_ref()
-                        .is_some_and(|filter| !filter.retains(&no_attributes))
-                    {
+                    if request_filter.as_ref().is_some_and(|filter| {
+                        !filter.retains(recorded.facts(item_id, &no_attributes))
+                    }) {
                         continue;
                     }
                     appended.push(item_id.clone());
@@ -341,7 +344,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut personalized_ranking: Vec<PredictedItem> = ranked
             .iter()
             .map(|(index, score, _)| {
-                let item = &campaign.items[*index];
+                let item = &catalog[*index];
                 PredictedItem {
                     item_id: Some(item.item_id.clone()),
                     score: Some(*score),

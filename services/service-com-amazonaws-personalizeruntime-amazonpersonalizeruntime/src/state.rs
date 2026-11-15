@@ -56,8 +56,10 @@
 //!   created, which is the one answer the real service never gives.
 //! * The item and action catalogs are stored with the campaign or recommender that
 //!   serves them, because that is what the resolved resource's solution version was
-//!   trained on. Every item id, action id, score and metadata value a response
-//!   carries is read from those stored catalogs.
+//!   trained on — and a resource fitted to a dataset group also reads what the INGESTION
+//!   data plane holds for that group, because real-time ingestion keeps changing it
+//!   ([`ingested`]). Every item id, action id, score and metadata value a response
+//!   carries is read from those two.
 //! * A filter's expression is validated when the filter is REGISTERED, exactly as
 //!   `CreateFilter` validates it, so a stored filter is always one the runtime can
 //!   apply. What a REQUEST binds its placeholders to is a fact about the request, so a
@@ -72,13 +74,15 @@
 
 pub mod authorization;
 pub mod filter;
+pub mod ingested;
 pub mod scoring;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use authorization::authorization_refusal;
-pub use filter::{BoundFilter, Entity, FilterExpression, FilterKind};
+pub use filter::{BoundFilter, Entity, EntryFacts, FilterExpression, FilterKind};
+pub use ingested::{Ingested, RecordedInteractions};
 
 /// The only `metadataColumns` map key the service accepts: "The map key is
 /// `ITEMS`" (`GetRecommendationsRequest$metadataColumns` /
@@ -329,6 +333,20 @@ pub struct Campaign {
     /// A campaign registered as READY (the seam's default) carries the instant it was
     /// registered at.
     pub active_at: SystemTime,
+    /// The dataset group whose LIVE ingestion data this campaign's inference reads
+    /// beside its stored catalog, when the seam that registered it named one.
+    ///
+    /// A campaign deploys a solution version trained on one dataset group's data, and
+    /// that group keeps taking records after the training run: an interaction recorded
+    /// through the ingestion data plane and an item put into the group's Items dataset
+    /// change what this campaign returns (see [`ingested`]). `None` means this campaign
+    /// was registered without a group, so its stored catalog is its whole input.
+    pub dataset_group_arn: Option<String>,
+    /// The instant this campaign's stored catalog was FITTED to that group's data.
+    ///
+    /// What separates the interactions the stored popularity already counts from the ones
+    /// recorded since, so neither is weighed twice (see [`ingested`]).
+    pub fitted_at: Option<SystemTime>,
 }
 
 impl Campaign {
@@ -351,6 +369,11 @@ impl Campaign {
             // Ready as registered; a caller whose campaign is still being created says
             // so with [`Campaign::active_from`].
             active_at: SystemTime::now(),
+            // Fitted to no dataset group until the seam names one: a campaign the
+            // control plane deployed carries the group its solution version was trained
+            // on ([`Campaign::fitted_to`]).
+            dataset_group_arn: None,
+            fitted_at: None,
         }
     }
 
@@ -387,6 +410,22 @@ impl Campaign {
         self
     }
 
+    /// The same campaign fitted to the dataset group `dataset_group_arn`, at the instant
+    /// `fitted_at` its catalog was read from that group's data.
+    ///
+    /// For the control-plane seam: a campaign deploys a solution version trained on one
+    /// dataset group, and the group keeps taking records after that training run, so the
+    /// inference plane reads the group's live records beside the stored catalog.
+    pub fn fitted_to(
+        mut self,
+        dataset_group_arn: impl Into<String>,
+        fitted_at: SystemTime,
+    ) -> Self {
+        self.dataset_group_arn = Some(dataset_group_arn.into());
+        self.fitted_at = Some(fitted_at);
+        self
+    }
+
     /// Whether the inference plane serves this campaign at `now`: a campaign is served
     /// once its create is complete, and refused as "not active yet" before then.
     pub fn is_active(&self, now: SystemTime) -> bool {
@@ -420,6 +459,12 @@ pub struct Recommender {
     pub metadata_enabled: bool,
     /// The Items catalog it recommends from.
     pub items: Vec<Item>,
+    /// The dataset group whose LIVE ingestion data this recommender's inference reads
+    /// beside its stored catalog, as [`Campaign::dataset_group_arn`] does.
+    pub dataset_group_arn: Option<String>,
+    /// The instant its stored catalog was fitted to that group's data, as
+    /// [`Campaign::fitted_at`] is.
+    pub fitted_at: Option<SystemTime>,
 }
 
 impl Recommender {
@@ -436,7 +481,21 @@ impl Recommender {
             use_case: use_case.into(),
             metadata_enabled: false,
             items,
+            dataset_group_arn: None,
+            fitted_at: None,
         }
+    }
+
+    /// The same recommender fitted to the dataset group `dataset_group_arn` at the
+    /// instant `fitted_at`, as [`Campaign::fitted_to`] states it for a campaign.
+    pub fn fitted_to(
+        mut self,
+        dataset_group_arn: impl Into<String>,
+        fitted_at: SystemTime,
+    ) -> Self {
+        self.dataset_group_arn = Some(dataset_group_arn.into());
+        self.fitted_at = Some(fitted_at);
+        self
     }
 
     /// The same recommender with metadata in recommendations enabled.

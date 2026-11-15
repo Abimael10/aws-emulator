@@ -1646,6 +1646,10 @@ fn the_filter_seam_refuses_an_expression_the_runtime_cannot_apply() {
         "EXCLUDE ItemID WHERE Items.GENRE IN ($GENRE)",
         "INCLUDE ItemID WHERE Items.YEAR >= 2010 AND Items.GENRE NOT IN (\"Drama\")",
         "INCLUDE ActionID WHERE Actions.CHANNEL IN (\"App\", \"Email\")",
+        // A clause may read the INTERACTION dataset of the entity it selects: the
+        // published "exclude what this user already interacted with" filter.
+        "EXCLUDE ItemID WHERE Interactions.EVENT_TYPE IN (\"purchase\")",
+        "EXCLUDE ActionID WHERE Action_Interactions.EVENT_TYPE IN (\"Taken\")",
     ];
     for (index, expression) in accepted.iter().enumerate() {
         let arn = format!("arn:aws:personalize:us-east-1:000000000000:filter/ok-{index}");
@@ -1662,8 +1666,8 @@ fn the_filter_seam_refuses_an_expression_the_runtime_cannot_apply() {
         ("no predicate", "INCLUDE ItemID WHERE Items.GENRE"),
         ("an unqualified column", "INCLUDE ItemID WHERE GENRE IN (\"Comedy\")"),
         (
-            "a dataset this emulator does not store",
-            "INCLUDE ItemID WHERE Interactions.EVENT_TYPE IN (\"click\")",
+            "a dataset that describes neither an entry nor its interactions",
+            "INCLUDE ItemID WHERE Users.AGE IN (\"30\")",
         ),
         ("an empty value set", "INCLUDE ItemID WHERE Items.GENRE IN ()"),
         (
