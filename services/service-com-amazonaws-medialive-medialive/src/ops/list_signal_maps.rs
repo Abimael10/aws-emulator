@@ -159,6 +159,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // A `NextToken` is the id the next page starts at, so only a value
+        // spelled the way this service mints an id continues a walk it handed
+        // out: anything else is refused by the shared minted-token rule
+        // ([`crate::state::minted_id_token`]) rather than resuming the scan
+        // wherever that value happens to sort.
+        let resume = crate::state::minted_id_token(input.next_token.as_deref()).map_err(|message| {
+            ListSignalMapsErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message.to_string()),
+            })
+        })?;
+
         let mut state = state.lock();
         // Reporting only: `settle` materialises transitions the clock already made
         // due, so a signal map whose discovery has come due is listed as
@@ -205,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // order in the `BTreeMap`, so resuming is a range scan from that id. A
         // token naming a signal map deleted since the previous page simply
         // resumes at the next surviving id instead of failing.
-        let first = match input.next_token.as_deref() {
+        let first = match resume {
             Some(token) => ::std::ops::Bound::Included(token),
             None => ::std::ops::Bound::Unbounded,
         };

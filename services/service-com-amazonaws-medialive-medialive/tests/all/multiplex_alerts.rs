@@ -731,9 +731,9 @@ async fn alerts_are_filtered_by_state_and_paged_in_the_order_they_were_raised() 
         ("no filter, page of one", None, Some(1)),
         ("no filter, page of two", None, Some(2)),
         (
-            "no filter, page size past the ceiling",
+            "no filter, page size at the published ceiling",
             None,
-            Some(MAX_LIST_PAGE_SIZE as i32 + 500),
+            Some(MAX_LIST_PAGE_SIZE as i32),
         ),
         ("all, no page size", Some(MULTIPLEX_ALERT_STATE_FILTER_ALL), None),
         ("all, page of two", Some(MULTIPLEX_ALERT_STATE_FILTER_ALL), Some(2)),

@@ -174,6 +174,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ceiling, every other listing of this service applies.
         let page_size = crate::state::list_page_size(input.max_results).map_err(bad_request)?;
 
+        // A `NextToken` is the id the next page starts at, so only a value
+        // spelled the way this service mints an id continues a walk it handed
+        // out: anything else is refused by the shared minted-token rule
+        // ([`crate::state::minted_id_token`]) rather than resuming the scan
+        // wherever that value happens to sort.
+        crate::state::minted_id_token(input.next_token.as_deref())
+            .map_err(|message| bad_request(message.to_string()))?;
+
         // The filters this request carries are the members of the reserved
         // configuration, each checked against the value set its own member
         // accepts by the shared check every operation carrying these filters

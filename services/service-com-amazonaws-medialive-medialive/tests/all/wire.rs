@@ -121,6 +121,7 @@ pub async fn call_raw(
     body: Option<Value>,
     request_headers: &[(&str, &str)],
 ) -> (u16, Vec<u8>, Vec<(String, String)>) {
+    let body = with_idempotency_token(method, uri, body);
     let payload = body.map_or_else(Bytes::new, |value| {
         Bytes::from(serde_json::to_vec(&value).expect("serialize the request body"))
     });
@@ -148,6 +149,61 @@ pub async fn call_raw(
         })
         .collect();
     (status, response.into_body().to_vec(), headers)
+}
+
+/// The requests whose body carries an `@idempotencyToken` `RequestId` that
+/// MediaLive requires: the creates of a channel, of an input, and of an input's
+/// partner.
+///
+/// `path` is the URI path with no query string.
+fn mints_from_a_request_id(method: &str, path: &str) -> bool {
+    method == "POST"
+        && (path == "/prod/channels"
+            || path == "/prod/inputs"
+            || (path.starts_with("/prod/inputs/") && path.ends_with("/partners")))
+}
+
+/// `body` with the idempotency token an AWS SDK would have put on it.
+///
+/// `RequestId` is `@idempotencyToken`, and an AWS SDK fills such a member with a
+/// value of its own when the caller supplied none — so a client never sends one
+/// of these creates without a token, and the harness sends them the way a client
+/// does. Every suite therefore says only what ITS rule is about, and a suite
+/// that wants a particular token still names it: a token the body already
+/// carries, including an empty one, is left exactly as it is.
+///
+/// A suite whose rule IS the absent token says so with an explicit JSON `null`,
+/// which is dropped here so the request truly carries no member.
+fn with_idempotency_token(method: &str, uri: &str, body: Option<Value>) -> Option<Value> {
+    let path = uri.split('?').next().unwrap_or(uri);
+    if !mints_from_a_request_id(method, path) {
+        return body;
+    }
+    let mut object = match body {
+        Some(Value::Object(members)) => members,
+        // A create of one of these resources always carries a body, because the
+        // token travels in it.
+        None => serde_json::Map::new(),
+        other => return other,
+    };
+    match object.get("requestId") {
+        Some(Value::Null) => {
+            object.remove("requestId");
+        }
+        Some(_) => {}
+        None => {
+            object.insert("requestId".to_string(), Value::from(fresh_token()));
+        }
+    }
+    Some(Value::Object(object))
+}
+
+/// A token no other request of this process uses, so two creates the harness
+/// filled are never read as a retry of one another.
+fn fresh_token() -> String {
+    static MINTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let minted = MINTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("harness-token-{minted}")
 }
 
 /// One response header, read as a client reads it (header names are

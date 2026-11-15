@@ -443,9 +443,11 @@ async fn an_unresolvable_discovery_entry_point_creates_no_signal_map() {
 ///
 /// The rows span every operation of this service that resolves an identifier of
 /// its own (the four channel operations, `DescribeInput`, `GetSignalMap`) and a
-/// set of identifiers differing in length and character class, because the rule
-/// generalises over both. The issue's recorded case is the `describe` row of
-/// `999999999`.
+/// set of identifiers differing in length, because the rule generalises over
+/// both. The issue's recorded case is the `describe` row of `999999999`. Every
+/// identifier here is of the shape this service mints a channel and an input id
+/// in: one outside that shape never reaches the lookup
+/// (`crate::request_validation_refusals`).
 #[tokio::test]
 async fn a_not_found_message_names_the_resource_type_then_the_identifier() {
     // (case, resource type in the message, method, uri) — every implemented
@@ -457,7 +459,7 @@ async fn a_not_found_message_names_the_resource_type_then_the_identifier() {
         ("delete channel", "Channel", "DELETE", "/prod/channels/{id}"),
         ("describe input", "Input", "GET", "/prod/inputs/{id}"),
     ];
-    let identifiers = ["999999999", "0000000", "1234567", "no-such-resource"];
+    let identifiers = ["999999999", "0000000", "1234567", "12345678901234567890"];
 
     let router = medialive();
     for id in identifiers {

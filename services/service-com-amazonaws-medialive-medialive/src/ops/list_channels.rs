@@ -157,6 +157,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // `NextToken` is the id the next page starts at, and ids sort in mint
+        // order in the `BTreeMap`, so resuming is a range scan from that id. A
+        // token spelled any other way than this service mints an id continues no
+        // walk it handed out, so it is refused by the shared minted-token rule
+        // ([`crate::state::minted_id_token`]) rather than resuming the scan
+        // wherever that value happens to sort. A token naming a channel deleted
+        // since the previous page simply resumes at the next surviving id
+        // instead of failing.
+        let resume = crate::state::minted_id_token(input.next_token.as_deref()).map_err(|message| {
+            ListChannelsErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message.to_string()),
+            })
+        })?;
+
         let mut state = state.lock();
         // Reporting only: `settle` materialises transitions the clock already made
         // due, so a channel whose delete has come due is not listed.
@@ -168,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // order in the `BTreeMap`, so resuming is a range scan from that id. A
         // token naming a channel deleted since the previous page simply resumes at
         // the next surviving id instead of failing.
-        let first = match input.next_token.as_deref() {
+        let first = match resume {
             Some(token) => ::std::ops::Bound::Included(token),
             None => ::std::ops::Bound::Unbounded,
         };

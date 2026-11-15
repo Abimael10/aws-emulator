@@ -157,6 +157,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // The id the path label carries is judged by the shared id grammar
+        // ([`crate::state::numeric_id`]) before the lookup: a value outside the
+        // decimal-digit form this service mints channel ids in names no channel
+        // and could never come to, so it is a MALFORMED request rather than a
+        // request for something absent.
+        crate::state::numeric_id(&input.channel_id).map_err(bad_request)?;
+
         // The page size this listing cuts at is the service's shared page-size
         // rule ([`crate::state::list_page_size`]), whose refusal this operation
         // answers as its own modelled client error.

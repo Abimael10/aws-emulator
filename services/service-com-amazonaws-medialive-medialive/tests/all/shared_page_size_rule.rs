@@ -3,17 +3,18 @@
 //! The ONE page-size rule every paginated operation of this service applies,
 //! driven end to end through each of those operations.
 //!
-//! The rule: a request's `MaxResults` is the page size verbatim up to the upper
-//! bound of the range the service publishes, which is also the size a request
-//! naming no `MaxResults` is served at, and a `MaxResults` below one asks for no
-//! items at all and is refused with the modelled 400 naming the member and the
-//! value that broke the floor. It is the SERVICE's rule, not one listing's, so
-//! the table below spans the OPERATION: every operation that cuts a page runs
-//! every row.
+//! The rule: a request's `MaxResults` is the page size verbatim while it falls
+//! inside the range the service publishes (1 to 1000); a request naming no
+//! `MaxResults` is served at that range's upper bound; and a `MaxResults`
+//! OUTSIDE the range is refused with the modelled 400 — below the floor it asks
+//! for no items at all, above the ceiling it asks for more than one response
+//! carries, and each end has its own fixed wording. It is the SERVICE's rule, not
+//! one listing's, so the table below spans the OPERATION: every operation that
+//! cuts a page runs every row.
 //!
 //! `tests/all/list_page_size.rs` pins what a page CARRIES over a table of sizes
 //! against filled collections; this suite pins that each paginated operation
-//! reaches the same rule — the floor, its wording and the ceiling — whichever
+//! reaches the same rule — both bounds, their wording and the ceiling — whichever
 //! operation a client asks.
 //!
 //! Every test drives the service the way a client does, through
@@ -22,7 +23,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_medialive_medialive::state::{
-    input_device_transfer_type, MAX_LIST_PAGE_SIZE,
+    input_device_transfer_type, max_results_above_ceiling_message, MAX_LIST_PAGE_SIZE,
+    MAX_RESULTS_BELOW_FLOOR_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -322,16 +324,16 @@ fn uri_of(row: &Paginated, owner: &str, asked_for: Option<i64>) -> String {
 }
 
 /// Rule: the page size is the SERVICE's, so every paginated operation reads its
-/// `MaxResults` by the same rule — a size below one asks for no items and is
-/// refused with the modelled 400 naming the member and that value, any other
-/// size is the page size verbatim up to the published ceiling, and a request
-/// naming no size is served at that ceiling.
+/// `MaxResults` by the same rule — a size outside the published range is refused
+/// with the modelled 400 and that end's own fixed wording, any size inside it is
+/// the page size verbatim, and a request naming no size is served at the
+/// ceiling.
 ///
 /// The rows span the OPERATION — all 23 paginated operations of this service,
 /// across collections whose stores, owners, identifiers and summaries are
 /// unrelated — and, within each, the size asked for: below the floor (zero, one
-/// below it and a largely negative one), at the floor, at the published ceiling,
-/// past it, and no size at all.
+/// below it and a largely negative one), above the ceiling (one past it and far
+/// past it), at the floor, at the ceiling, and no size at all.
 #[tokio::test]
 async fn one_page_size_rule_for_every_paginated_operation() {
     let ceiling = i64::try_from(MAX_LIST_PAGE_SIZE).expect("the page ceiling fits an i64");
@@ -342,15 +344,28 @@ async fn one_page_size_rule_for_every_paginated_operation() {
         let router = medialive();
         let owner = owner_id(&router, row.op, row.owner).await;
 
-        // Below the floor: refused, with the one wording the shared rule states.
-        for asked_for in [0, -1, -4321] {
+        // Outside the published range at either end: refused, each with the one
+        // wording the shared rule states for that end.
+        for (asked_for, expected) in [
+            (0, MAX_RESULTS_BELOW_FLOOR_MESSAGE.to_string()),
+            (-1, MAX_RESULTS_BELOW_FLOOR_MESSAGE.to_string()),
+            (-4321, MAX_RESULTS_BELOW_FLOOR_MESSAGE.to_string()),
+            (
+                ceiling + 1,
+                max_results_above_ceiling_message(MAX_LIST_PAGE_SIZE),
+            ),
+            (
+                ceiling * 7,
+                max_results_above_ceiling_message(MAX_LIST_PAGE_SIZE),
+            ),
+        ] {
             let case = format!("{} maxResults={asked_for}", row.op);
             let uri = uri_of(&row, &owner, Some(asked_for));
             let (status, body) = call(&router, "GET", &uri, None).await;
             assert_eq!(
                 status, 400,
-                "case {case:?}: expected GET {uri} to refuse a page size below the floor, got \
-                 {status}: {body}"
+                "case {case:?}: expected GET {uri} to refuse a page size outside the published \
+                 range, got {status}: {body}"
             );
             assert_eq!(
                 error_code(status, &body),
@@ -359,7 +374,7 @@ async fn one_page_size_rule_for_every_paginated_operation() {
             );
             assert_eq!(
                 error_message(&body),
-                format!("maxResults must be at least 1, got {asked_for}"),
+                expected,
                 "case {case:?}: expected the shared page-size refusal wording, got {:?}",
                 error_message(&body)
             );
@@ -370,9 +385,9 @@ async fn one_page_size_rule_for_every_paginated_operation() {
             );
         }
 
-        // At the floor, at the ceiling, past it, and no size at all: served, and
-        // the page is never longer than the size the rule cuts it at.
-        for asked_for in [Some(1), Some(ceiling), Some(ceiling + 500), None] {
+        // At the floor, at the ceiling, and no size at all: served, and the page
+        // is never longer than the size the rule cuts it at.
+        for asked_for in [Some(1), Some(ceiling), None] {
             let case = format!("{} maxResults={asked_for:?}", row.op);
             let uri = uri_of(&row, &owner, asked_for);
             let (status, body) = call(&router, "GET", &uri, None).await;
@@ -380,7 +395,7 @@ async fn one_page_size_rule_for_every_paginated_operation() {
                 status, 200,
                 "case {case:?}: expected GET {uri} to be served, got {status}: {body}"
             );
-            let cut_at = asked_for.unwrap_or(ceiling).min(ceiling);
+            let cut_at = asked_for.unwrap_or(ceiling);
             let page = reported(&case, &body, row.member);
             assert!(
                 i64::try_from(page.len()).expect("a page length fits an i64") <= cut_at,
@@ -406,9 +421,9 @@ async fn one_page_size_rule_for_every_paginated_operation() {
 /// Rule: the same shared page size, observed against a collection that is not
 /// empty — the offering catalog this service serves without a create. A size
 /// within the published range cuts the page exactly there and leaves a token for
-/// what is left over; the published ceiling, every size past it and a request
-/// naming no size at all are one and the same page, because the rule clamps to
-/// that ceiling and serves an absent member at it.
+/// what is left over; the published ceiling and a request naming no size at all
+/// are one and the same page, because an absent member is served at that
+/// ceiling, while every size past it is refused rather than clamped.
 #[tokio::test]
 async fn the_shared_page_size_cuts_a_non_empty_collection_where_it_was_asked_to() {
     let router = medialive();
@@ -451,8 +466,8 @@ async fn the_shared_page_size_cuts_a_non_empty_collection_where_it_was_asked_to(
         );
     }
 
-    // The ceiling is where the rule clamps, and the size an absent member is
-    // served at, so these three requests are one and the same page.
+    // The ceiling is the largest page the rule serves, and the size an absent
+    // member is served at, so these two requests are one and the same page.
     let (at_ceiling, ceiling_token) =
         catalog_page(&router, "at the ceiling", &format!("?maxResults={ceiling}")).await;
     assert_eq!(
@@ -461,17 +476,32 @@ async fn the_shared_page_size_cuts_a_non_empty_collection_where_it_was_asked_to(
         "case \"at the ceiling\": expected the catalog to fill a page of {ceiling}, got {}",
         at_ceiling.len()
     );
-    for asked_for in [Some(ceiling + 1), Some(ceiling * 7), None] {
-        let case = format!("maxResults={asked_for:?}");
-        let query = asked_for.map_or_else(String::new, |size| format!("?maxResults={size}"));
-        let (page, token) = catalog_page(&router, &case, &query).await;
+    let (page, token) = catalog_page(&router, "no maxResults", "").await;
+    assert_eq!(
+        page, at_ceiling,
+        "case \"no maxResults\": expected the same page the ceiling is served at"
+    );
+    assert_eq!(
+        token, ceiling_token,
+        "case \"no maxResults\": expected the same continuation the ceiling is served with"
+    );
+
+    // Past the ceiling is a refusal, not a clamp: the catalog is not a page size
+    // a client may ask for more than the ceiling of.
+    for asked_for in [ceiling + 1, ceiling * 7] {
+        let case = format!("maxResults={asked_for}");
+        let uri = format!("{OFFERINGS}?maxResults={asked_for}");
+        let (status, body) = call(&router, "GET", &uri, None).await;
         assert_eq!(
-            page, at_ceiling,
-            "case {case:?}: expected the same page the ceiling is served at"
+            status, 400,
+            "case {case:?}: expected a page size past the ceiling to be refused, got {status}: \
+             {body}"
         );
         assert_eq!(
-            token, ceiling_token,
-            "case {case:?}: expected the same continuation the ceiling is served with"
+            error_message(&body),
+            max_results_above_ceiling_message(MAX_LIST_PAGE_SIZE),
+            "case {case:?}: expected the shared ceiling wording, got {:?}",
+            error_message(&body)
         );
     }
 }

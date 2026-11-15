@@ -17,6 +17,10 @@ hex = { workspace = true }
 # SHA-256: mixes a per-process counter and the current instant into that request id.
 sha2 = { workspace = true }
 smithy-macros = { workspace = true }
+# Resolves the `RoleArn` a channel write names against this account's IAM, over
+# the emulator's own in-process transport, before the channel is stored
+# (`src/ops/create_channel.rs`, `src/ops/update_channel.rs`).
+service-common = { path = "../common" }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
 smithy-server-runtime = { workspace = true }
@@ -36,6 +40,11 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 # `time` for the one case that lets the clock move between two failures.
 tokio = { workspace = true, features = ["time"] }
+# The role suite mounts IAM beside MediaLive on one engine, because a channel
+# create resolves its `RoleArn` by calling IAM, and drives IAM through its own
+# SDK client over the router's in-process callback.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+aws-sdk-iam = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # The same calendar arithmetic the reservation slice uses, so a test computes a
 # lease's window and its end with the library rather than its own month table.
 chrono = { version = "0.4", default-features = false, features = ["std"] }

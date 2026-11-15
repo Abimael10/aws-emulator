@@ -649,7 +649,7 @@ async fn the_store_is_bounded_and_a_full_store_fits_one_page() {
     // The page the whole store fits in: the ceiling is the published `MaxResults`
     // bound, above what the store can hold, so no channel is left over and no
     // token is handed out — with no maxResults, with one at the store's size and
-    // with one past the ceiling alike.
+    // with one at the published ceiling alike.
     const {
         assert!(
             MAX_CHANNELS <= MAX_LIST_PAGE_SIZE,
@@ -659,7 +659,7 @@ async fn the_store_is_bounded_and_a_full_store_fits_one_page() {
     for case in [
         String::new(),
         format!("?maxResults={MAX_CHANNELS}"),
-        format!("?maxResults={}", MAX_LIST_PAGE_SIZE + 500),
+        format!("?maxResults={MAX_LIST_PAGE_SIZE}"),
     ] {
         let (status, page) = call(&router, "GET", &format!("/prod/channels{case}"), None).await;
         assert_eq!(status, 200, "case {case:?}: ListChannels: got {status}: {page}");

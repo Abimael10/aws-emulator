@@ -199,9 +199,9 @@ async fn list_multiplex_programs_pages_through_every_program_in_name_order() {
             page_size: None,
         },
         Paging {
-            case: "three programs, page size past the ceiling",
+            case: "three programs, page size at the published ceiling",
             programs: 3,
-            page_size: Some(MAX_LIST_PAGE_SIZE as i32 + 500),
+            page_size: Some(MAX_LIST_PAGE_SIZE as i32),
         },
         Paging {
             // A collection far larger than any page a caller would ask for by

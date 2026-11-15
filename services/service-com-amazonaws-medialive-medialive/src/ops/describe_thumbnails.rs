@@ -140,6 +140,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
 
+        // The id the path label carries is judged by the shared id grammar
+        // ([`crate::state::numeric_id`]) before the lookup: a value outside the
+        // decimal-digit form this service mints channel ids in names no channel
+        // and could never come to, so it is a MALFORMED request rather than a
+        // request for something absent.
+        crate::state::numeric_id(&input.channel_id).map_err(bad_request)?;
+
         let mut state = state.lock();
         // Reporting only: `settle` materialises what the clock already made due,
         // so the channel this read resolves is the one whose start, stop, restart

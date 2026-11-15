@@ -197,9 +197,9 @@ async fn list_input_security_groups_pages_through_every_stored_group_in_mint_ord
             page_size: None,
         },
         Paging {
-            case: "three groups, page size past the ceiling",
+            case: "three groups, page size at the published ceiling",
             groups: 3,
-            page_size: Some(MAX_LIST_PAGE_SIZE as i32 + 500),
+            page_size: Some(MAX_LIST_PAGE_SIZE as i32),
         },
         Paging {
             // A collection far larger than any page a caller would ask for by

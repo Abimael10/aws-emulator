@@ -307,9 +307,9 @@ async fn listing_pages_through_every_stored_template_in_mint_order() {
             page_size: None,
         },
         Paging {
-            case: "three templates, page size past the ceiling",
+            case: "three templates, page size at the published ceiling",
             templates: 3,
-            page_size: Some(MAX_LIST_PAGE_SIZE as i32 + 500),
+            page_size: Some(MAX_LIST_PAGE_SIZE as i32),
         },
     ];
 

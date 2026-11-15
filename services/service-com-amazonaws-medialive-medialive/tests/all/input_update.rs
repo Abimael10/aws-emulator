@@ -403,7 +403,7 @@ async fn updating_an_unknown_input_is_not_found() {
     let created = baseline_input(&router).await;
     let id = created["id"].as_str().unwrap_or_default().to_string();
 
-    for unknown in ["0000000", "nope", "1000001"] {
+    for unknown in ["0000000", "9999999", "1000001"] {
         let (status, body) = update_input(
             &router,
             unknown,

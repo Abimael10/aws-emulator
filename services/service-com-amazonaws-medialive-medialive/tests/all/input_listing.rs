@@ -249,9 +249,9 @@ async fn list_inputs_pages_through_every_stored_input_in_mint_order() {
             page_size: None,
         },
         Paging {
-            case: "three inputs, page size past the ceiling",
+            case: "three inputs, page size at the published ceiling",
             inputs: 3,
-            page_size: Some(MAX_LIST_PAGE_SIZE as i32 + 500),
+            page_size: Some(MAX_LIST_PAGE_SIZE as i32),
         },
         Paging {
             // A collection far larger than any page a caller would ask for by

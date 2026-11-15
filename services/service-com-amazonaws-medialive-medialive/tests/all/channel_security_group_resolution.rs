@@ -168,7 +168,7 @@ fn assert_unprocessable(case: &str, status: u16, body: &Value, expected: &[Probl
 fn unresolvable_group(index: usize, id: &str) -> Problem {
     (
         format!("channelSecurityGroups/{index}"),
-        unknown_reference_message("channelSecurityGroups", "input security group", id),
+        unknown_reference_message("InputSecurityGroup", id),
     )
 }
 
@@ -187,7 +187,7 @@ fn nameless_group(index: usize) -> Problem {
 fn unresolvable_attachment(index: usize, id: &str) -> Problem {
     (
         format!("inputAttachments/{index}/inputId"),
-        unknown_reference_message("inputAttachments", "input", id),
+        unknown_reference_message("Input", id),
     )
 }
 

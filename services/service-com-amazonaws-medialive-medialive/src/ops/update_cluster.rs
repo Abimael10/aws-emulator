@@ -298,7 +298,7 @@ fn refused(
         }
         Refusal::UnknownMappedNetwork { index, network_id } => {
             UpdateClusterErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::unknown_reference_message(
+                message: Some(crate::state::unresolved_mapping_message(
                     &crate::state::mapped_network_member(index),
                     "Network",
                     &network_id,

@@ -182,6 +182,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
+
+        // The id the path label carries is judged by the shared id grammar
+        // ([`crate::state::numeric_id`]) before the lookup: a value outside the
+        // decimal-digit form this service mints channel ids in names no channel
+        // and could never come to, so it is a MALFORMED request rather than a
+        // request for something absent.
+        crate::state::numeric_id(&input.channel_id).map_err(bad_request)?;
         let now = ::std::time::SystemTime::now();
 
         let mut state = state.lock();
@@ -226,6 +233,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             channel
         ))
     }
+}
+
+/// A request this operation refuses before the lookup, as its own modelled
+/// client error.
+fn bad_request(message: &str) -> StartChannelError {
+    StartChannelErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
 
 /// The engine this operation was built from is not the shared in-memory engine,

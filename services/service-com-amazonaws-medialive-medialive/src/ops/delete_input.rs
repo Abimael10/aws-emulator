@@ -161,6 +161,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
         let now = ::std::time::SystemTime::now();
 
+        // The id the path label carries is judged by the shared id grammar
+        // ([`crate::state::numeric_id`]) before the lookup: a value outside the
+        // decimal-digit form this service mints input ids in names no input and
+        // could never come to, so it is a MALFORMED request rather than a
+        // request for something absent.
+        crate::state::numeric_id(&input.input_id).map_err(bad_request)?;
+
         let mut state = state.lock();
         state.settle(now);
 
@@ -213,6 +220,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deleted
         ))
     }
+}
+
+/// A request this operation refuses before the lookup, as its own modelled
+/// client error.
+fn bad_request(message: &str) -> DeleteInputError {
+    DeleteInputErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
 
 /// The engine this operation was built from is not the shared in-memory engine,

@@ -429,7 +429,6 @@ async fn a_page_carries_as_many_reservations_as_the_request_asks_for() {
         Some(held),
         Some(held + 1),
         Some(MAX_LIST_PAGE_SIZE),
-        Some(MAX_LIST_PAGE_SIZE + 500),
     ] {
         let case = format!("maxResults={max_results:?}");
         let cut_at = max_results

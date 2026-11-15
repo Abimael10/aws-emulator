@@ -105,17 +105,19 @@ const ENCODER_SETTINGS: &str = "encoderSettings";
 /// The member a channel's input attachments arrive in, as the wire spells it.
 const INPUT_ATTACHMENTS: &str = "inputAttachments";
 
-/// What an `InputAttachment`'s `InputId` names, for the refusal that reports an
-/// id this account holds no such resource for.
-const INPUT: &str = "input";
+/// The family label an `InputAttachment`'s `InputId` names, as every refusal
+/// about that family reports it ([`super::not_found_message`]).
+const INPUT: &str = "Input";
 
 /// The member a channel's input security groups arrive in, as the wire spells
 /// it.
 const CHANNEL_SECURITY_GROUPS: &str = "channelSecurityGroups";
 
-/// What a `ChannelSecurityGroups` entry names, worded as the input side words
-/// the same reference ([`super::ComAmazonawsMedialiveMedialiveState::input_configuration_error`]).
-const INPUT_SECURITY_GROUP: &str = "input security group";
+/// The family label a `ChannelSecurityGroups` entry names, as every refusal
+/// about that family reports it — the input side words the same reference the
+/// same way
+/// ([`super::ComAmazonawsMedialiveMedialiveState::input_configuration_error`]).
+const INPUT_SECURITY_GROUP: &str = "InputSecurityGroup";
 
 /// The member a channel's Elemental Anywhere placement arrives in, as the wire
 /// spells it — the prefix of the element path each of its two ids is reported
@@ -126,17 +128,17 @@ const ANYWHERE_SETTINGS: &str = "anywhereSettings";
 /// wire spells it.
 const CLUSTER_ID: &str = "clusterId";
 
-/// What `AnywhereSettings$ClusterId` names, for the refusal that reports an id
-/// this account holds no such resource for.
-const CLUSTER: &str = "cluster";
+/// The family label `AnywhereSettings$ClusterId` names, as every refusal about
+/// that family reports it.
+const CLUSTER: &str = "Cluster";
 
 /// The `AnywhereSettings` member naming the group the channel is placed in, as
 /// the wire spells it.
 const CHANNEL_PLACEMENT_GROUP_ID: &str = "channelPlacementGroupId";
 
-/// What `AnywhereSettings$ChannelPlacementGroupId` names, worded as the group
-/// side words the same resource.
-const CHANNEL_PLACEMENT_GROUP: &str = "channel placement group";
+/// The family label `AnywhereSettings$ChannelPlacementGroupId` names, as every
+/// refusal about that family reports it.
+const CHANNEL_PLACEMENT_GROUP: &str = "ChannelPlacementGroup";
 
 impl ComAmazonawsMedialiveMedialiveState {
     /// Every problem `configuration` carries, in the order the configuration
@@ -183,7 +185,7 @@ impl ComAmazonawsMedialiveMedialiveState {
                 Some(id) if self.live_input(id).is_none() && !configuration.holds_input(id) => {
                     problems.push(validation_problem(
                         &path,
-                        &unknown_reference_message(INPUT_ATTACHMENTS, INPUT, id),
+                        &unknown_reference_message(INPUT, id),
                     ));
                 }
                 Some(_) => {}
@@ -202,11 +204,7 @@ impl ComAmazonawsMedialiveMedialiveState {
             {
                 problems.push(validation_problem(
                     &path,
-                    &unknown_reference_message(
-                        CHANNEL_SECURITY_GROUPS,
-                        INPUT_SECURITY_GROUP,
-                        group,
-                    ),
+                    &unknown_reference_message(INPUT_SECURITY_GROUP, group),
                 ));
             }
         }
@@ -269,7 +267,7 @@ impl ComAmazonawsMedialiveMedialiveState {
             Some(id) if self.live_cluster(id).is_none() && !holds_cluster(id) => {
                 problems.push(validation_problem(
                     &cluster_path,
-                    &unknown_reference_message(CLUSTER_ID, CLUSTER, id),
+                    &unknown_reference_message(CLUSTER, id),
                 ));
                 None
             }
@@ -297,11 +295,7 @@ impl ComAmazonawsMedialiveMedialiveState {
         {
             problems.push(validation_problem(
                 &group_path,
-                &unknown_reference_message(
-                    CHANNEL_PLACEMENT_GROUP_ID,
-                    CHANNEL_PLACEMENT_GROUP,
-                    group_id,
-                ),
+                &unknown_reference_message(CHANNEL_PLACEMENT_GROUP, group_id),
             ));
         }
     }

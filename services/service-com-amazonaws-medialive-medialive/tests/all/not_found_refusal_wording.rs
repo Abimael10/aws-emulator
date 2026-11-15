@@ -70,6 +70,12 @@ struct Family {
     label: &'static str,
     collection: &'static str,
     methods: &'static [&'static str],
+    /// Whether this family's id has a recorded GRAMMAR of its own: a channel id
+    /// and an input id are decimal strings, and an identifier that is not one is
+    /// a MALFORMED request (400) rather than an absent resource
+    /// (`crate::request_validation_refusals` pins that half). Nothing records a
+    /// grammar for the other families, so every identifier reaches their lookup.
+    numeric_ids: bool,
 }
 
 /// The label catalog: one entry per family whose own operations resolve an
@@ -84,6 +90,7 @@ const FAMILIES: [Family; 6] = [
         label: "InputSecurityGroup",
         collection: "/prod/inputSecurityGroups",
         methods: &["GET", "PUT", "DELETE"],
+        numeric_ids: false,
     },
     // The English-phrase spelling, for the resource whose shape is `SdiSource`
     // (GET /prod/sdiSources/{SdiSourceId}).
@@ -91,26 +98,31 @@ const FAMILIES: [Family; 6] = [
         label: "SDI source",
         collection: "/prod/sdiSources",
         methods: &["GET", "PUT", "DELETE"],
+        numeric_ids: false,
     },
     Family {
         label: "Channel",
         collection: "/prod/channels",
         methods: &["GET", "DELETE"],
+        numeric_ids: true,
     },
     Family {
         label: "Input",
         collection: "/prod/inputs",
         methods: &["GET", "DELETE"],
+        numeric_ids: true,
     },
     Family {
         label: "Multiplex",
         collection: "/prod/multiplexes",
         methods: &["GET", "DELETE"],
+        numeric_ids: false,
     },
     Family {
         label: "Network",
         collection: "/prod/networks",
         methods: &["GET", "DELETE"],
+        numeric_ids: false,
     },
 ];
 
@@ -134,7 +146,10 @@ fn body_for(family: &Family, method: &str) -> Option<Value> {
 /// The rows are the label catalog crossed with the forms an identifier can take
 /// — the numeric shape this service mints, a non-numeric one, and one carrying a
 /// character an `@httpLabel` must percent-encode, which the message reports
-/// decoded because it is composed from the request's own label value.
+/// decoded because it is composed from the request's own label value. A family
+/// whose ids have a recorded grammar ([`Family::numeric_ids`]) refuses the two
+/// identifiers outside it as malformed requests instead, so only the identifiers
+/// that reach a lookup are asserted here.
 #[tokio::test]
 async fn a_not_found_names_its_resource_family_with_that_familys_own_label() {
     let identifiers: [(&str, &str); 3] = [
@@ -147,6 +162,11 @@ async fn a_not_found_names_its_resource_family_with_that_familys_own_label() {
     for family in &FAMILIES {
         for method in family.methods {
             for (identifier_case, identifier) in identifiers {
+                if family.numeric_ids
+                    && !identifier.bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    continue;
+                }
                 let case = format!(
                     "{method} {} with {identifier_case}",
                     family.collection

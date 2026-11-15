@@ -183,9 +183,9 @@ async fn list_signal_maps_pages_through_every_stored_map_in_mint_order() {
             page_size: None,
         },
         Paging {
-            case: "three maps, page size past the ceiling",
+            case: "three maps, page size at the published ceiling",
             maps: 3,
-            page_size: Some(MAX_LIST_PAGE_SIZE as i32 + 500),
+            page_size: Some(MAX_LIST_PAGE_SIZE as i32),
         },
     ];
 

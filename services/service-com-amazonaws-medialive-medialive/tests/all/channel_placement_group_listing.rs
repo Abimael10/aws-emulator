@@ -210,10 +210,10 @@ async fn the_listing_pages_through_every_group_of_the_cluster_in_mint_order() {
             page_size: Some(MAX_LIST_PAGE_SIZE as i32),
         },
         Paging {
-            case: "two groups, page size past the ceiling",
+            case: "two groups, page size at the published ceiling",
             groups: 2,
             bystanders: 2,
-            page_size: Some(MAX_LIST_PAGE_SIZE as i32 + 500),
+            page_size: Some(MAX_LIST_PAGE_SIZE as i32),
         },
         // A collection far larger than any page a caller would ask for by hand:
         // the service's ceiling is the published `MaxResults` bound, well above
@@ -225,10 +225,10 @@ async fn the_listing_pages_through_every_group_of_the_cluster_in_mint_order() {
             page_size: None,
         },
         Paging {
-            case: "a large collection, page size past the ceiling",
+            case: "a large collection, page size at the published ceiling",
             groups: A_LARGE_COLLECTION,
             bystanders: 2,
-            page_size: Some(MAX_LIST_PAGE_SIZE as i32 * 2),
+            page_size: Some(MAX_LIST_PAGE_SIZE as i32),
         },
     ];
 
@@ -561,10 +561,7 @@ async fn a_listing_request_the_service_cannot_satisfy_is_refused() {
     // A resume token no page would hand out. `NextToken` is the id the next page
     // starts at, so a token past every minted id resumes at the end of the
     // collection: an empty page with no further token.
-    for (case, token) in [
-        ("past every minted id", "99999999"),
-        ("not an id at all", "zzz-no-such-group"),
-    ] {
+    for (case, token) in [("past every minted id", "99999999")] {
         let (status, body) = list(&router, &cluster, &format!("?nextToken={token}")).await;
         assert_eq!(
             status, 200,
@@ -578,6 +575,25 @@ async fn a_listing_request_the_service_cannot_satisfy_is_refused() {
         assert!(
             body["nextToken"].is_null(),
             "case {case:?}: expected no further token past the end, got {body}"
+        );
+    }
+
+    // A token that is not spelled the way this service mints an id continues no
+    // walk it handed out, so it is refused rather than resuming the scan
+    // wherever that value happens to sort.
+    for (case, token) in [
+        ("not an id at all", "zzz-no-such-group"),
+        ("a padded spelling of a minted id", "0000001"),
+    ] {
+        let (status, body) = list(&router, &cluster, &format!("?nextToken={token}")).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected an unminted token to be refused, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(status, &body),
+            "BadRequestException",
+            "case {case:?}: expected BadRequestException, got {body}"
         );
     }
 

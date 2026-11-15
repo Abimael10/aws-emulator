@@ -262,7 +262,11 @@ fn refused(refusal: crate::state::NodeUpdateRefusal, node_id: &str) -> UpdateNod
             bad_request(crate::state::card_number_out_of_range_message(card_number))
         }
         Refusal::UnknownSdiSource(sdi_source) => bad_request(
-            crate::state::unknown_reference_message("sdiSourceMappings", "SdiSource", &sdi_source),
+            crate::state::unresolved_mapping_message(
+                "sdiSourceMappings",
+                "SdiSource",
+                &sdi_source,
+            ),
         ),
     }
     .into()

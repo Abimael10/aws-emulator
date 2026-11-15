@@ -650,10 +650,10 @@ async fn the_listing_pages_through_every_pending_transfer_in_device_id_order() {
             page_size: None,
         },
         Paging {
-            case: "three transfers, page size past the ceiling",
+            case: "three transfers, page size at the published ceiling",
             transferring: 3,
             idle: 1,
-            page_size: Some(MAX_LIST_PAGE_SIZE as i32 + 500),
+            page_size: Some(MAX_LIST_PAGE_SIZE as i32),
         },
         Paging {
             // A collection far larger than any page a caller would ask for by

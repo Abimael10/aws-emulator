@@ -579,9 +579,11 @@ async fn updating_a_channel_that_cannot_be_resolved_is_a_bad_request() {
     let router = medialive();
     let id = idle_channel(&router, "live", baseline_body()).await;
 
-    // An id no channel has: one before the minted range, a non-numeric one, and
-    // one past the channels this store minted.
-    for unknown in ["999999", "nope", "1000009"] {
+    // An id no channel has: one before the minted range and one past the
+    // channels this store minted. (An id outside the grammar this service mints
+    // channel ids in is a malformed request instead, which
+    // `crate::request_validation_refusals` pins.)
+    for unknown in ["999999", "1000009"] {
         let (status, body) = update_channel(
             &router,
             unknown,

@@ -266,7 +266,7 @@ async fn list_offerings_reports_every_reservable_configuration_once() {
 
     for (case, page_size) in [
         ("default page size", None),
-        ("page size past the ceiling", Some(MAX_LIST_PAGE_SIZE as i32 + 500)),
+        ("page size at the published ceiling", Some(MAX_LIST_PAGE_SIZE as i32)),
         ("page of 37", Some(37)),
     ] {
         let offerings = every_page(&router, case, DEFAULT_REGION, "", page_size).await;

@@ -177,6 +177,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
 
+        // The REQUEST itself is judged first, before anything of this account's
+        // state is read: a request that names no channel, or that does not
+        // identify itself, is refused whatever else about it is wrong, so the
+        // caller is told about the member it has to supply rather than about the
+        // first reference the service happened to resolve. The shared request
+        // rules ([`crate::state::request_validation`]) word both refusals, and
+        // this operation answers them as its own modelled client error.
+        let family = crate::state::request_family::CHANNEL;
+        let name = crate::state::request_validation::resource_name(family, input.name.as_deref())
+            .map_err(|message| bad_request(&message))?;
+        let request_id =
+            crate::state::request_validation::request_id(family, input.request_id.as_deref())
+                .map_err(|message| bad_request(&message))?;
+
         // A tag key in the reserved namespace names a system tag, which is not
         // the caller's to set, so a request carrying one is refused before
         // anything is stored rather than creating a resource that claims it.
@@ -234,25 +248,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so it is never itself a reason to refuse the request.
         let dry_run = input.dry_run == Some(true);
 
-        let mut state = state.lock();
-        state.settle(now);
-
         // A retried create (same `@idempotencyToken` `RequestId`) must return the
         // channel the first one created, not a second channel. A validate-only
         // request creates nothing and so records no token: it is never such a
-        // retry, and is answered by the dry-run arm below instead.
-        let retried = input
-            .request_id
-            .as_deref()
-            .filter(|_| !dry_run)
-            .and_then(|token| state.channel_for_token(token))
-            .map(str::to_string);
-        if let Some(existing) = retried {
-            let channel = state.channel_description(&existing).ok_or_else(unavailable)?;
+        // retry, and is answered by the dry-run arm below instead. Answered in a
+        // scope of its own so the store is not held while the role below is
+        // resolved.
+        let retried = {
+            let mut state = state.lock();
+            state.settle(now);
+            let existing = (!dry_run)
+                .then(|| state.channel_for_token(&request_id))
+                .flatten()
+                .map(str::to_string);
+            match existing {
+                Some(existing) => {
+                    Some(state.channel_description(&existing).ok_or_else(unavailable)?)
+                }
+                None => None,
+            }
+        };
+        if let Some(channel) = retried {
             return Ok(CreateChannelOutput {
                 channel: Some(channel),
             });
         }
+
+        // `RoleArn` is "the role to assume when running the Channel", so a
+        // channel can only run under a role this account holds and this service
+        // is trusted to assume. The member is judged in two steps, which are two
+        // different refusals: a value that is not the ARN of an IAM role at all
+        // names no role and is a MALFORMED member, the operation's modelled 400;
+        // one that IS such an ARN is then resolved against this account's IAM
+        // and, where IAM answers that it does not name a role this service may
+        // assume, reported as a problem at the member the request spelled it in,
+        // in the operation's modelled 422. Both are answered BEFORE the channel
+        // is stored, and the resolution is asked with no store held, because it
+        // is a call into this emulator's own IAM.
+        let named_role = input.role_arn.as_deref().filter(|arn| !arn.is_empty());
+        if let Some(role_arn) = named_role {
+            crate::state::role_arn_syntax(role_arn).map_err(|message| bad_request(&message))?;
+        }
+        let role_problem = match named_role {
+            Some(role_arn)
+                if ::service_common::iam_role::role_is_unassumable(
+                    ctx,
+                    &region,
+                    role_arn,
+                    crate::state::CHANNEL_SERVICE_PRINCIPAL,
+                )
+                .await =>
+            {
+                Some(crate::state::role_not_assumable_problem(role_arn))
+            }
+            _ => None,
+        };
+        if let Some(problem) = role_problem {
+            return Err(unprocessable_problem(problem));
+        }
+
+        let mut state = state.lock();
+        state.settle(now);
 
         // The whole channel configuration is validated BEFORE anything is
         // stored, so a request that does not describe a channel this service
@@ -327,7 +383,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Everything the request supplied is stored verbatim; the response is
         // then read back out of the stored record, never from `input`.
-        channel.name = input.name;
+        channel.name = Some(name);
         channel.cdi_input_specification = input.cdi_input_specification;
         channel.destinations = input.destinations.unwrap_or_default();
         channel.encoder_settings = input.encoder_settings;
@@ -373,11 +429,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // spent here, after the acknowledgement above and before any later read
         // of the channel — a write, done here rather than by any such read.
         state.allocate_channel_egress_addresses(&id);
-        if let Some(token) = input.request_id {
-            // Bounded, evicting write: a caller-chosen token can neither
-            // accumulate past the cap nor outlive the channel it created.
-            state.record_idempotency_token(token, &id);
-        }
+        // Bounded, evicting write: a caller-chosen token can neither accumulate
+        // past the cap nor outlive the channel it created.
+        state.record_idempotency_token(request_id, &id);
 
         Ok(CreateChannelOutput {
             channel: Some(created),
@@ -395,6 +449,27 @@ fn unprocessable(problems: Vec<ValidationError>) -> CreateChannelError {
     CreateChannelErrorModeled::UnprocessableEntityException(UnprocessableEntityException {
         message: Some(crate::state::CHANNEL_CONTAINS_ERRORS_MESSAGE.to_string()),
         validation_errors: Some(problems),
+    })
+    .into()
+}
+
+/// The refusal ONE problem with a member of the request itself earns: the same
+/// modelled 422, carrying that one `ValidationErrors` entry, with the `message`
+/// read out of it ([`crate::state::problem_message`]) — the element path, then
+/// what to fix — so the message and the entry cannot say two different things.
+fn unprocessable_problem(problem: ValidationError) -> CreateChannelError {
+    CreateChannelErrorModeled::UnprocessableEntityException(UnprocessableEntityException {
+        message: Some(crate::state::problem_message(&problem)),
+        validation_errors: Some(vec![problem]),
+    })
+    .into()
+}
+
+/// A request this operation refuses before it reads or writes anything, as its
+/// own modelled client error.
+fn bad_request(message: &str) -> CreateChannelError {
+    CreateChannelErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
     })
     .into()
 }

@@ -719,17 +719,30 @@ async fn an_unknown_cluster_is_not_found() {
 ///
 /// The rows span the three members a request can get wrong: a `StateFilter`
 /// outside the documented SET | CLEARED | ALL set (including one that differs
-/// only in case), a `MaxResults` below the 1 a page size must be, and a
-/// `NextToken` that is not a position in the log.
+/// only in case), a `MaxResults` outside the published page-size range at either
+/// end, and a `NextToken` that is not a position in the log.
 #[tokio::test]
 async fn list_cluster_alerts_refuses_a_request_it_cannot_read() {
     // (case, the query the request carried, the text its message must name)
-    let table: [(&str, &str, &str); 7] = [
+    let table: [(&str, &str, &str); 8] = [
         ("an unknown state", "?stateFilter=OPEN", "OPEN"),
         ("a lowercase state", "?stateFilter=set", "set"),
         ("two states at once", "?stateFilter=SET,CLEARED", "SET,CLEARED"),
-        ("a zero page size", "?maxResults=0", "0"),
-        ("a negative page size", "?maxResults=-3", "-3"),
+        (
+            "a zero page size",
+            "?maxResults=0",
+            "The maximum number of results must be greater than 0.",
+        ),
+        (
+            "a negative page size",
+            "?maxResults=-3",
+            "The maximum number of results must be greater than 0.",
+        ),
+        (
+            "a page size past the published ceiling",
+            "?maxResults=1001",
+            "The maximum number of results you can request at once is 1000.",
+        ),
         ("a token that is not a position", "?nextToken=later", "later"),
         (
             "a negative position",

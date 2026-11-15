@@ -511,11 +511,13 @@ async fn a_vpc_input_requires_a_role_and_refuses_input_security_groups() {
     }
 }
 
-/// Rule: `DescribeInput` on an id no input has answers `NotFoundException` (404).
+/// Rule: `DescribeInput` on an id of the shape this service mints that no input
+/// has answers `NotFoundException` (404). An id outside that shape is a
+/// malformed request instead, which `request_validation_refusals` pins.
 #[tokio::test]
 async fn describing_an_unknown_input_is_not_found() {
     let router = medialive();
-    for id in ["0000000", "nope", "1000001"] {
+    for id in ["0000000", "9999999", "1000001"] {
         let (status, body) = describe_input(&router, id).await;
         assert_eq!(
             status, 404,

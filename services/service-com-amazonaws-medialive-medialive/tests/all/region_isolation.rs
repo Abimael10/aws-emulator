@@ -548,11 +548,7 @@ async fn a_reference_resolves_in_the_region_the_request_was_signed_for() {
     );
     assert_eq!(
         problems[0]["errorMessage"],
-        json!(unknown_reference_message(
-            "inputAttachments",
-            "input",
-            &input_id
-        )),
+        json!(unknown_reference_message("Input", &input_id)),
         "case {case:?}: expected the unresolved-reference message, got {:?}",
         problems[0]
     );

@@ -17,6 +17,7 @@
 //! shared ones, reused rather than copied.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_medialive_medialive::state::ONE_SECURITY_GROUP_PER_INPUT_MESSAGE;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
@@ -105,6 +106,9 @@ struct ReferenceRow {
     case: &'static str,
     /// The member as the wire spells it.
     member: &'static str,
+    /// The family label a refusal about the resource that member names reports
+    /// it by — the same label a READ of that resource reports it by.
+    label: &'static str,
     /// The `InputType` whose ingest that list is.
     input_type: &'static str,
     /// Whether the entry the row puts in that list names a resource this account
@@ -149,14 +153,16 @@ async fn reference_entries(
 /// `InputSecurityGroups`, `SdiSources` and `InputDevices` has to resolve to a
 /// live input security group, SdiSource or claimed input device — so a create
 /// naming one that does not is refused with this operation's modelled
-/// `BadRequestException` (400) and stores nothing, while one that resolves is
-/// created and is reported BY the resource it names.
+/// `BadRequestException` (400), stating the resource the way a READ of it states
+/// it absent, and stores nothing; while one that resolves is created and is
+/// reported BY the resource it names.
 #[tokio::test]
 async fn an_input_may_only_name_resources_the_account_holds() {
     let table: [ReferenceRow; 6] = [
         ReferenceRow {
             case: "an input security group the account holds",
             member: "inputSecurityGroups",
+            label: "InputSecurityGroup",
             input_type: "RTP_PUSH",
             held: true,
             expected_status: 201,
@@ -164,6 +170,7 @@ async fn an_input_may_only_name_resources_the_account_holds() {
         ReferenceRow {
             case: "an input security group id nothing minted",
             member: "inputSecurityGroups",
+            label: "InputSecurityGroup",
             input_type: "RTP_PUSH",
             held: false,
             expected_status: 400,
@@ -171,6 +178,7 @@ async fn an_input_may_only_name_resources_the_account_holds() {
         ReferenceRow {
             case: "an SdiSource the account holds",
             member: "sdiSources",
+            label: "SDI source",
             input_type: "SDI",
             held: true,
             expected_status: 201,
@@ -178,6 +186,7 @@ async fn an_input_may_only_name_resources_the_account_holds() {
         ReferenceRow {
             case: "an SdiSource id nothing minted",
             member: "sdiSources",
+            label: "SDI source",
             input_type: "SDI",
             held: false,
             expected_status: 400,
@@ -185,6 +194,7 @@ async fn an_input_may_only_name_resources_the_account_holds() {
         ReferenceRow {
             case: "a device the account has claimed",
             member: "inputDevices",
+            label: "InputDevice",
             input_type: "INPUT_DEVICE",
             held: true,
             expected_status: 201,
@@ -192,6 +202,7 @@ async fn an_input_may_only_name_resources_the_account_holds() {
         ReferenceRow {
             case: "a device the account has not claimed",
             member: "inputDevices",
+            label: "InputDevice",
             input_type: "INPUT_DEVICE",
             held: false,
             expected_status: 400,
@@ -220,9 +231,9 @@ async fn an_input_may_only_name_resources_the_account_holds() {
             );
             let message = error_message(&response);
             assert!(
-                message.contains(row.member),
-                "case {case:?}: expected the message to name the member {:?}, got {message:?}",
-                row.member
+                message.starts_with(row.label) && message.ends_with(" not found"),
+                "case {case:?}: expected a {:?} not-found sentence, got {message:?}",
+                row.label
             );
             // A refused create stored nothing: the next input gets the first
             // minted id.
@@ -285,6 +296,8 @@ async fn an_update_may_only_name_resources_the_account_holds() {
         let row = ReferenceRow {
             case,
             member,
+            // Not read on this path: the update suite asserts the status alone.
+            label: "",
             input_type: "URL_PULL",
             held,
             expected_status,
@@ -411,7 +424,7 @@ async fn a_deleted_resource_is_not_one_an_input_may_name() {
 }
 
 /// Rule: an input an upstream system PUSHES to is reached through the whitelist
-/// that admits that system, so one of those types needs at least one
+/// that admits that system, so one of those types needs EXACTLY ONE
 /// `InputSecurityGroups` entry — unless its ingest addresses are not this
 /// service's public ones, which is the case for a VPC input ("the input
 /// destination addresses will be created in a VPC rather than with public
@@ -522,9 +535,10 @@ async fn a_pushed_to_input_needs_the_whitelist_that_admits_it() {
                 "BadRequestException",
                 "case {case:?}: expected the operation's own BadRequestException, got {response}"
             );
-            assert!(
-                error_message(&response).contains("inputSecurityGroups"),
-                "case {case:?}: expected the message to name the missing member, got {:?}",
+            assert_eq!(
+                error_message(&response),
+                ONE_SECURITY_GROUP_PER_INPUT_MESSAGE,
+                "case {case:?}: expected the whitelist-count wording, got {:?}",
                 error_message(&response)
             );
         } else {

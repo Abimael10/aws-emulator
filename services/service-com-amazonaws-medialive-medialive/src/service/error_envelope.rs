@@ -369,7 +369,26 @@ impl ErasedOperation for ErrorEnvelopeOperation {
                 .ok()
                 .and_then(|key| definition.routing_table().get(key));
             match modeled {
-                Some(op) => with_request_id_and_envelope(op.run(svc, req, ctx).await),
+                Some(op) => {
+                    // A value outside a modelled enum is refused in MediaLive's
+                    // OWN wording rather than the shared constraint
+                    // validator's, which names an error type this service does
+                    // not model (see
+                    // [`crate::service::request_validation`]). Asked here
+                    // because the wording needs the operation and the request
+                    // body, neither of which the refusal seam is handed; every
+                    // other refusal of the walk below is untouched.
+                    if let Some(chosen) =
+                        crate::service::request_validation::enum_refusal(definition, req)
+                    {
+                        return with_request_id_and_envelope(
+                            crate::service::request_validation::refusal_response(
+                                definition, req, chosen,
+                            ),
+                        );
+                    }
+                    with_request_id_and_envelope(op.run(svc, req, ctx).await)
+                }
                 // Unreachable through `Service::override_operation`, which claims a
                 // request only when the routing table holds its key; answered as the
                 // framework answers an unroutable request rather than guessed at.

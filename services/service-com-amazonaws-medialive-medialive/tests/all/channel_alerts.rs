@@ -647,7 +647,7 @@ async fn pagination_reports_every_selected_alert_once_in_set_order() {
         Some(3),
         Some(7),
         Some(8),
-        Some(MAX_LIST_PAGE_SIZE as i32 + 1),
+        Some(MAX_LIST_PAGE_SIZE as i32),
         None,
     ];
     // (filter, the alerts it selects, in set order)
@@ -808,6 +808,11 @@ async fn a_channel_with_no_observed_alert_reports_an_empty_list() {
 /// Rule: `ChannelId` is "The unique ID of the channel", so an id that names no
 /// channel of this account is the operation's modelled 404 `NotFoundException`,
 /// worded the way every other not-found refusal of this service is.
+///
+/// The rows are ids OF THE SHAPE this service mints — decimal digits — that no
+/// channel of this account carries; an id outside that grammar is a malformed
+/// request rather than an absent channel, which `request_validation_refusals`
+/// pins.
 #[tokio::test]
 async fn an_id_that_names_no_channel_is_a_not_found() {
     let (router, engine) = medialive_with_engine();
@@ -816,7 +821,7 @@ async fn an_id_that_names_no_channel_is_a_not_found() {
     let channel_id = channel(&router, "present-channel", None).await;
     raise(&engine, &channel_id, "InputNotDetected", None, Some(0), at(0));
 
-    for absent in ["0", "9999999", "not-a-channel", "1000000000000"] {
+    for absent in ["0", "9999999", "1000000000000"] {
         assert_ne!(
             absent, channel_id,
             "setup: the absent id {absent:?} must not be the created channel"

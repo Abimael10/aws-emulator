@@ -169,6 +169,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::list_page_size(input.max_results)
             .map_err(|message| bad_request(&message))?;
 
+        // A `NextToken` is the id the next page starts at, so only a value
+        // spelled the way this service mints an id continues a walk it handed
+        // out: anything else is refused by the shared minted-token rule
+        // ([`crate::state::minted_id_token`]) rather than resuming the scan
+        // wherever that value happens to sort.
+        let resume = crate::state::minted_id_token(input.next_token.as_deref()).map_err(bad_request)?;
+
         let mut state = state.lock();
         // Reporting only: `settle` materialises the transitions the clock had
         // already made due — a cluster's `CREATING` -> `ACTIVE` step among them —
@@ -181,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // order in the `BTreeMap`, so resuming is a range scan from that id. A
         // token naming a cluster gone since the previous page simply resumes at
         // the next surviving id instead of failing.
-        let first = match input.next_token.as_deref() {
+        let first = match resume {
             Some(token) => ::std::ops::Bound::Included(token),
             None => ::std::ops::Bound::Unbounded,
         };

@@ -386,6 +386,9 @@ mod region_isolation;
 #[path = "all/rejection_messages.rs"]
 mod rejection_messages;
 
+#[path = "all/request_validation_refusals.rs"]
+mod request_validation_refusals;
+
 #[path = "all/reservation_deletion.rs"]
 mod reservation_deletion;
 

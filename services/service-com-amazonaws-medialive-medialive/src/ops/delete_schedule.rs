@@ -151,6 +151,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let now = ::std::time::SystemTime::now();
 
+        // The id the path label carries is judged by the shared id grammar
+        // ([`crate::state::numeric_id`]) before the lookup: a value outside the
+        // decimal-digit form this service mints channel ids in names no channel
+        // and could never come to, so it is a MALFORMED request rather than a
+        // request for something absent.
+        crate::state::numeric_id(&input.channel_id).map_err(bad_request)?;
+
         let mut state = state.lock();
         state.settle(now);
 
@@ -172,4 +179,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(DeleteScheduleOutput {})
     }
+}
+
+/// A request this operation refuses before the lookup, as its own modelled
+/// client error.
+fn bad_request(message: &str) -> DeleteScheduleError {
+    DeleteScheduleErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

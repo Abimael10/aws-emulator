@@ -164,7 +164,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // Reporting only: a template carries no clock-owed member of its own, so
+        // A `NextToken` is the id the next page starts at, so only a value
+        // spelled the way this service mints an id continues a walk it handed
+        // out: anything else is refused by the shared minted-token rule
+        // ([`crate::state::minted_id_token`]) rather than resuming the scan
+        // wherever that value happens to sort.
+        crate::state::minted_id_token(input.next_token.as_deref()).map_err(|message| {
+            ListEventBridgeRuleTemplatesErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message.to_string()),
+            })
+        })?;
+
         // nothing here writes one. `settle` first all the same, as every
         // operation of this service does: it materialises only the transitions
         // the clock had already made due — the signal map deployments this

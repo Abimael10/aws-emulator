@@ -130,8 +130,10 @@ async fn created(router: &MultiServiceRouter, case: &str, uri: &str, body: Value
 ///
 /// The rows differ along the asked-for page size relative to both what the store
 /// holds and the published bound — none at all, the smallest, several sizes below
-/// the stored count, the stored count exactly, one past it, the published bound
-/// and a size past that bound — because that is what the rule generalises over.
+/// the stored count, the stored count exactly, one past it and the published
+/// bound itself — because that is what the rule generalises over. A size PAST the
+/// bound is not a page size at all but a refusal, which
+/// `shared_page_size_rule` asserts for every paginated operation.
 #[tokio::test]
 async fn a_page_carries_as_many_channels_as_the_request_asks_for() {
     assert_eq!(
@@ -152,7 +154,6 @@ async fn a_page_carries_as_many_channels_as_the_request_asks_for() {
         Some(STORED_CHANNELS),
         Some(STORED_CHANNELS + 1),
         Some(PUBLISHED_MAX_RESULTS),
-        Some(PUBLISHED_MAX_RESULTS + 500),
     ];
 
     let router = medialive();
@@ -241,9 +242,9 @@ struct Listing {
 ///
 /// The rows differ along the OPERATION — three collections whose stores,
 /// identifiers and summaries are unrelated — because the rule is the service's
-/// and not one listing's, and each row asks for its collection's size exactly, a
-/// size past the published bound, no size at all and one item short of the
-/// collection, which is where the cut and the token are observable.
+/// and not one listing's, and each row asks for its collection's size exactly,
+/// the published bound and no size at all, plus one item short of the collection,
+/// which is where the cut and the token are observable.
 #[tokio::test]
 async fn every_listing_of_the_service_honours_the_asked_for_page_size() {
     let table = [
@@ -295,12 +296,11 @@ async fn every_listing_of_the_service_honours_the_asked_for_page_size() {
             created(&router, case, uri, body(index)).await;
         }
 
-        // A size that admits the whole collection — asked for exactly, past the
+        // A size that admits the whole collection — asked for exactly, at the
         // published bound, or not asked for at all — reports it in ONE page.
         for asked_for in [
             Some(STORED_PER_OPERATION),
             Some(PUBLISHED_MAX_RESULTS),
-            Some(PUBLISHED_MAX_RESULTS + 500),
             None,
         ] {
             let row = format!("{case} maxResults={asked_for:?}");

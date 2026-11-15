@@ -220,6 +220,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
 
+        // The id the path label carries is judged by the shared id grammar
+        // ([`crate::state::numeric_id`]) before the lookup: a value outside the
+        // decimal-digit form this service mints channel ids in names no channel
+        // and could never come to, so it is a MALFORMED request rather than a
+        // request for something absent.
+        crate::state::numeric_id(&input.channel_id).map_err(bad_request)?;
+
         // `DryRun` asks for the request to be CHECKED, not performed: every
         // refusal the real update would answer is answered below just the same,
         // and only the writes are skipped. It is a member the operation defines,
@@ -251,6 +258,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+
+        // The role the channel RUNS AS is judged by the same two steps
+        // `CreateChannel` judges it by: a value that is not the ARN of an IAM
+        // role at all is the operation's modelled 400, and an ARN IAM answers
+        // does not name a role this account holds and this service is trusted to
+        // assume is reported as a problem at the member the request spelled it
+        // in, in the operation's modelled 422. Both before anything is written,
+        // so the channel keeps the role it had; the resolution is asked with no
+        // store held, because it is a call into this emulator's own IAM.
+        let region = crate::state::request_region(ctx.parts());
+        let named_role = input.role_arn.as_deref().filter(|arn| !arn.is_empty());
+        if let Some(role_arn) = named_role {
+            crate::state::role_arn_syntax(role_arn).map_err(|message| bad_request(&message))?;
+        }
+        let role_problem = match named_role {
+            Some(role_arn)
+                if ::service_common::iam_role::role_is_unassumable(
+                    ctx,
+                    &region,
+                    role_arn,
+                    crate::state::CHANNEL_SERVICE_PRINCIPAL,
+                )
+                .await =>
+            {
+                Some(crate::state::role_not_assumable_problem(role_arn))
+            }
+            _ => None,
+        };
+        if let Some(problem) = role_problem {
+            return Err(UpdateChannelErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some(crate::state::problem_message(&problem)),
+                    validation_errors: Some(vec![problem]),
+                },
+            )
+            .into());
+        }
+
         let mut state = state.lock();
         // The channel transitions the clock had already made due decide whether
         // this channel has stopped, so materialise them first: each was owed at

@@ -170,6 +170,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The id the path label carries is judged by the shared id grammar
+        // ([`crate::state::numeric_id`]) before the lookup: a value outside the
+        // decimal-digit form this service mints channel ids in names no channel
+        // and could never come to, so it is a MALFORMED request rather than a
+        // request for something absent.
+        crate::state::numeric_id(&input.channel_id).map_err(bad_request)?;
+
         // `StateFilter` "Specifies the set of alerts to return based on their
         // state. SET - Return only alerts with SET state. CLEARED - Return only
         // alerts with CLEARED state. ALL - Return all alerts." The member targets

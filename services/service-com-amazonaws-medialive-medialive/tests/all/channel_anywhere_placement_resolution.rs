@@ -207,7 +207,7 @@ fn assert_unprocessable(case: &str, status: u16, body: &Value, expected: &[Probl
 fn unresolvable_cluster(id: &str) -> Problem {
     (
         "anywhereSettings/clusterId".to_string(),
-        unknown_reference_message("clusterId", "cluster", id),
+        unknown_reference_message("Cluster", id),
     )
 }
 
@@ -223,7 +223,7 @@ fn no_cluster() -> Problem {
 fn unresolvable_group(id: &str) -> Problem {
     (
         "anywhereSettings/channelPlacementGroupId".to_string(),
-        unknown_reference_message("channelPlacementGroupId", "channel placement group", id),
+        unknown_reference_message("ChannelPlacementGroup", id),
     )
 }
 
@@ -241,7 +241,7 @@ fn no_group() -> Problem {
 fn unresolvable_attachment(index: usize, id: &str) -> Problem {
     (
         format!("inputAttachments/{index}/inputId"),
-        unknown_reference_message("inputAttachments", "input", id),
+        unknown_reference_message("Input", id),
     )
 }
 

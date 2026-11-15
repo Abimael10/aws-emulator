@@ -325,7 +325,7 @@ async fn deleting_an_unknown_input_is_not_found() {
     .await;
     let existing = created["id"].as_str().unwrap_or_default().to_string();
 
-    for id in ["0000000", "999999999", "1000001", "no-such-input"] {
+    for id in ["0000000", "999999999", "1000001"] {
         let (status, body) = delete_input(&router, id).await;
         assert_eq!(
             status, 404,

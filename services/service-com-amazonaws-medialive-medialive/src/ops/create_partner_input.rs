@@ -143,6 +143,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
 
+        // The REQUEST itself is judged first, before anything of this account's
+        // state is read, by the same rule `CreateInput` judges its own request
+        // by: a create of an input that does not identify itself cannot be
+        // retried safely, so it is refused whatever else about it is wrong. The
+        // path label is judged with it, since an id outside the grammar this
+        // service mints ids in names no input and could never come to.
+        let request_id = crate::state::request_validation::request_id(
+            crate::state::request_family::INPUT,
+            input.request_id.as_deref(),
+        )
+        .map_err(|message| bad_request(&message))?;
+        crate::state::numeric_id(&input.input_id).map_err(bad_request)?;
+
         // A tag key in the reserved namespace names a system tag, which is not
         // the caller's to set, so a request carrying one is refused before
         // anything is stored rather than creating a resource that claims it.
@@ -213,10 +226,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // would report a resource the request did not ask to exist. A partner
         // whose own delete this service has accepted is no longer such an
         // answer either, which is why the lookup resolves only a LIVE input.
-        if let Some(existing) = input
-            .request_id
-            .as_deref()
-            .and_then(|token| state.input_for_token(Some(&input.input_id), token))
+        if let Some(existing) = state
+            .input_for_token(Some(&input.input_id), &request_id)
             .map(str::to_string)
         {
             let created = state.input_description(&existing).ok_or_else(unavailable)?;
@@ -251,11 +262,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         state.inputs.insert(id.clone(), record);
-        if let Some(token) = input.request_id {
-            // Bounded, evicting write: a caller-chosen token can neither
-            // accumulate past the cap nor outlive the input it created.
-            state.record_input_idempotency_token(Some(&input.input_id), &token, &id);
-        }
+        // Bounded, evicting write: a caller-chosen token can neither accumulate
+        // past the cap nor outlive the input it created.
+        state.record_input_idempotency_token(Some(&input.input_id), &request_id, &id);
 
         // The partner's OWN ingest endpoints are allocated here, where its
         // destinations are written, not on the read path.

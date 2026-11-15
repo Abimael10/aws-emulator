@@ -49,6 +49,7 @@
 //! status, `__type` and `message` all stay with the framework.
 
 pub mod error_envelope;
+pub mod request_validation;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,

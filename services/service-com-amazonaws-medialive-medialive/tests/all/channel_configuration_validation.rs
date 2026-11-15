@@ -142,7 +142,7 @@ fn missing_encoder_settings() -> Problem {
 fn unresolvable_attachment(index: usize, id: &str) -> Problem {
     (
         format!("inputAttachments/{index}/inputId"),
-        unknown_reference_message("inputAttachments", "input", id),
+        unknown_reference_message("Input", id),
     )
 }
 
@@ -158,11 +158,13 @@ fn nameless_attachment(index: usize) -> Problem {
 /// one `ValidationErrors` entry per problem, and creates NO channel.
 ///
 /// The table spans what makes a configuration unrunnable and how many problems
-/// one request carries: the empty body, a body that names only members outside
-/// the configuration, a missing reference at each position of the attachment
-/// list, an attachment that names no input at all, and a request carrying both
-/// classes of problem at once (whose entries come in the order the configuration
-/// declares its members).
+/// one request carries: a body with no configuration member, a body that names
+/// only members outside the configuration, a missing reference at each position
+/// of the attachment list, an attachment that names no input at all, and a
+/// request carrying both classes of problem at once (whose entries come in the
+/// order the configuration declares its members). Every row names the channel,
+/// because a create with no name is refused for THAT before any configuration is
+/// read (`crate::request_validation_refusals`).
 #[tokio::test]
 async fn a_create_refuses_a_configuration_it_could_not_run() {
     // Rows are built against one input this account really holds, so a row can
@@ -171,7 +173,11 @@ async fn a_create_refuses_a_configuration_it_could_not_run() {
     let held = attachable_input(&router, "held").await;
 
     let table: Vec<RefusalRow> = vec![
-        ("no member at all", json!({}), vec![missing_encoder_settings()]),
+        (
+            "no configuration member at all",
+            json!({ "name": "no-configuration" }),
+            vec![missing_encoder_settings()],
+        ),
         (
             "only members outside the configuration",
             json!({ "name": "nameless-configuration", "logLevel": "INFO", "tags": { "a": "b" } }),
@@ -180,6 +186,7 @@ async fn a_create_refuses_a_configuration_it_could_not_run() {
         (
             "an attachment naming an id nothing minted",
             json!({
+                "name": "unminted-attachment",
                 "encoderSettings": channel_encoder_settings(),
                 "inputAttachments": [attachment("a", Some(UNMINTED_INPUT_ID))],
             }),
@@ -188,6 +195,7 @@ async fn a_create_refuses_a_configuration_it_could_not_run() {
         (
             "a resolvable attachment and an unresolvable one after it",
             json!({
+                "name": "one-of-each",
                 "encoderSettings": channel_encoder_settings(),
                 "inputAttachments": [
                     attachment("held", Some(&held)),
@@ -199,6 +207,7 @@ async fn a_create_refuses_a_configuration_it_could_not_run() {
         (
             "two unresolvable attachments",
             json!({
+                "name": "two-ghosts",
                 "encoderSettings": channel_encoder_settings(),
                 "inputAttachments": [
                     attachment("ghost", Some(UNMINTED_INPUT_ID)),
@@ -213,6 +222,7 @@ async fn a_create_refuses_a_configuration_it_could_not_run() {
         (
             "an attachment naming no input at all",
             json!({
+                "name": "nameless-attachment",
                 "encoderSettings": channel_encoder_settings(),
                 "inputAttachments": [attachment("a", None)],
             }),
@@ -220,7 +230,10 @@ async fn a_create_refuses_a_configuration_it_could_not_run() {
         ),
         (
             "no encoder settings and an unresolvable attachment",
-            json!({ "inputAttachments": [attachment("a", Some(UNMINTED_INPUT_ID))] }),
+            json!({
+                "name": "two-problems",
+                "inputAttachments": [attachment("a", Some(UNMINTED_INPUT_ID))],
+            }),
             vec![
                 missing_encoder_settings(),
                 unresolvable_attachment(0, UNMINTED_INPUT_ID),

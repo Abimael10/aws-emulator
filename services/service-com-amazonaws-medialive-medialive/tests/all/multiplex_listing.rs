@@ -180,9 +180,9 @@ async fn list_multiplexes_pages_through_every_multiplex_in_id_order() {
             page_size: None,
         },
         Paging {
-            case: "three multiplexes, page size past the ceiling",
+            case: "three multiplexes, page size at the published ceiling",
             multiplexes: 3,
-            page_size: Some(MAX_LIST_PAGE_SIZE as i32 + 500),
+            page_size: Some(MAX_LIST_PAGE_SIZE as i32),
         },
         Paging {
             // A collection far larger than any page a caller would ask for by
@@ -728,13 +728,18 @@ async fn a_multiplex_listing_reports_only_multiplexes() {
 
     // (case, the nextToken the request carries, the ids expected back)
     //
-    // The two tokens that are not ids are DERIVED from the minted ones rather
-    // than written out, so the rows keep meaning what they say if the id format
-    // changes: a suffix on an id sorts immediately after it (and before the next
-    // id, whose differing digit decides the comparison first), and a suffix on
-    // the LAST id sorts after every id the store holds.
-    let last = minted.last().expect("a minted multiplex id").clone();
-    let rows: [(&str, Option<String>, Vec<String>); 5] = [
+    // Every token here is spelled the way this service mints an id — plain
+    // decimal digits — because that is the only spelling a listing hands out;
+    // the refusal of every other spelling is asserted after the table. The
+    // numeric neighbours are DERIVED from the minted ids rather than written
+    // out, so the rows keep meaning what they say if the id format changes.
+    let first_number: u64 = minted[0].parse().expect("a minted multiplex id is a number");
+    let last_number: u64 = minted
+        .last()
+        .expect("a minted multiplex id")
+        .parse()
+        .expect("a minted multiplex id is a number");
+    let rows: [(&str, Option<String>, Vec<String>); 4] = [
         ("no token", None, minted.clone()),
         (
             "a token below every minted id",
@@ -743,17 +748,12 @@ async fn a_multiplex_listing_reports_only_multiplexes() {
         ),
         (
             "a token between two minted ids",
-            Some(format!("{}x", minted[0])),
+            Some((first_number + 1).to_string()),
             minted[1..].to_vec(),
         ),
         (
             "a token past every minted id",
-            Some(format!("{last}x")),
-            Vec::new(),
-        ),
-        (
-            "a token that is not an id at all",
-            Some("not-an-id".to_string()),
+            Some((last_number + 1).to_string()),
             Vec::new(),
         ),
     ];
@@ -777,6 +777,22 @@ async fn a_multiplex_listing_reports_only_multiplexes() {
             body["nextToken"],
             Value::Null,
             "case {case:?}: expected no nextToken when nothing is left over, got {body}"
+        );
+    }
+
+    // A token this listing could not have handed out continues no walk, so it is
+    // refused rather than resuming the scan wherever that value happens to sort.
+    for (case, token) in [
+        ("a token that is not an id at all", "not-an-id".to_string()),
+        (
+            "a padded spelling of a minted id",
+            format!("0{}", minted[0]),
+        ),
+    ] {
+        let (status, body) = list(&router, &format!("?nextToken={token}")).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected an unminted token to be refused, got {status}: {body}"
         );
     }
 }

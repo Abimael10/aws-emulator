@@ -286,7 +286,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // with, and no cluster is stored.
             Err(crate::state::ClusterRefusal::UnknownMappedNetwork { index, network_id }) => {
                 return Err(CreateClusterErrorModeled::BadRequestException(BadRequestException {
-                    message: Some(crate::state::unknown_reference_message(
+                    message: Some(crate::state::unresolved_mapping_message(
                         &crate::state::mapped_network_member(index),
                         "Network",
                         &network_id,

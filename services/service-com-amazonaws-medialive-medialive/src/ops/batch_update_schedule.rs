@@ -160,6 +160,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
         let now = ::std::time::SystemTime::now();
 
+        // The id the path label carries is judged by the shared id grammar
+        // ([`crate::state::numeric_id`]) before the lookup: a value outside the
+        // decimal-digit form this service mints channel ids in names no channel
+        // and could never come to, so it is a MALFORMED request rather than a
+        // request for something absent.
+        crate::state::numeric_id(&input.channel_id).map_err(bad_request)?;
+
         // Which side of the update the request asked for: each response member is
         // "actions that have been created/deleted in the schedule", so a request
         // that only deletes gets only the deletes member back.
@@ -241,6 +248,15 @@ fn refused(refusal: crate::state::ScheduleRefusal) -> BatchUpdateScheduleError {
             })
         }
     }
+    .into()
+}
+
+/// A request this operation refuses before the lookup, as its own modelled
+/// client error.
+fn bad_request(message: &str) -> BatchUpdateScheduleError {
+    BatchUpdateScheduleErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
     .into()
 }
 

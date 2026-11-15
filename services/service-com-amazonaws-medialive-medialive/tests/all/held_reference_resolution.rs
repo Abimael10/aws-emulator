@@ -35,7 +35,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_medialive_medialive::state::{
-    required_for_input_type_message, unknown_reference_message, CHANNEL_CONTAINS_ERRORS_MESSAGE,
+    unknown_reference_message, CHANNEL_CONTAINS_ERRORS_MESSAGE,
+    ONE_SECURITY_GROUP_PER_INPUT_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -209,10 +210,12 @@ async fn an_input_update_resolves_only_the_security_groups_it_adds() {
             case: "a second group added beside the seeded one",
             input_type: "RTMP_PUSH",
             patch: |gone, held| json!({ "inputSecurityGroups": [gone, held] }),
-            status: 200,
-            groups: |gone, held| json!([gone, held]),
+            status: 400,
+            groups: |gone, _| json!([gone]),
             name: SEEDED_NAME,
-            message: None,
+            // Exactly one input security group admits one input, so an update
+            // that would leave two is refused whichever of them it resolved.
+            message: Some(|_, _| ONE_SECURITY_GROUP_PER_INPUT_MESSAGE.to_string()),
         },
         InputRow {
             case: "the seeded group replaced by another one",
@@ -258,11 +261,7 @@ async fn an_input_update_resolves_only_the_security_groups_it_adds() {
             groups: |gone, _| json!([gone]),
             name: SEEDED_NAME,
             message: Some(|_, _| {
-                unknown_reference_message(
-                    "inputSecurityGroups",
-                    "input security group",
-                    UNMINTED_GROUP_ID,
-                )
+                unknown_reference_message("InputSecurityGroup", UNMINTED_GROUP_ID)
             }),
         },
         InputRow {
@@ -275,11 +274,7 @@ async fn an_input_update_resolves_only_the_security_groups_it_adds() {
             groups: |gone, _| json!([gone]),
             name: SEEDED_NAME,
             message: Some(|_, _| {
-                unknown_reference_message(
-                    "inputSecurityGroups",
-                    "input security group",
-                    UNMINTED_GROUP_ID,
-                )
+                unknown_reference_message("InputSecurityGroup", UNMINTED_GROUP_ID)
             }),
         },
         // The ingest-list rule is untouched by the resolution: a pushed-to input
@@ -293,9 +288,7 @@ async fn an_input_update_resolves_only_the_security_groups_it_adds() {
             status: 400,
             groups: |gone, _| json!([gone]),
             name: SEEDED_NAME,
-            message: Some(|_, _| {
-                required_for_input_type_message("inputSecurityGroups", "RTMP_PUSH")
-            }),
+            message: Some(|_, _| ONE_SECURITY_GROUP_PER_INPUT_MESSAGE.to_string()),
         },
     ];
 
@@ -480,11 +473,7 @@ async fn a_channel_update_resolves_only_the_security_groups_it_adds() {
             problems: |_, _| {
                 vec![(
                     "channelSecurityGroups/1".to_string(),
-                    unknown_reference_message(
-                        "channelSecurityGroups",
-                        "input security group",
-                        UNMINTED_GROUP_ID,
-                    ),
+                    unknown_reference_message("InputSecurityGroup", UNMINTED_GROUP_ID),
                 )]
             },
         },

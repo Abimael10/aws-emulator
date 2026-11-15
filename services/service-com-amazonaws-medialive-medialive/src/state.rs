@@ -241,6 +241,20 @@ pub mod alarm_template_groups;
 /// goes away with the channel that owns it.
 pub mod schedules;
 
+/// The REQUEST-validation slice: the checks this service makes on a request
+/// before it reads or writes anything — a create's idempotency token and name,
+/// the grammar of a resource id a path label carries, the IAM role a channel is
+/// asked to run as, and a paginated request's page size — plus the words each
+/// refusal carries.
+pub mod request_validation;
+
+pub use request_validation::{
+    invalid_role_arn_message, max_results_above_ceiling_message, minted_id_token,
+    non_empty_name_message, non_empty_request_id_message, numeric_id, problem_message,
+    request_family, role_arn_syntax, role_not_assumable_problem, CHANNEL_SERVICE_PRINCIPAL,
+    INVALID_NEXT_TOKEN_MESSAGE, MAX_RESULTS_BELOW_FLOOR_MESSAGE, NON_NUMERIC_ID_MESSAGE,
+};
+
 /// The channel CONFIGURATION slice: the one rule the operations that WRITE a
 /// channel's configuration (`CreateChannel`, `UpdateChannel`) validate it
 /// against before anything is stored, and the per-element problems a
@@ -1169,34 +1183,44 @@ pub fn at_least_one(member: &str, value: Option<i32>) -> Result<(), String> {
 /// `DescribeSchedule`, …) answers with: the upper bound of the `MaxResults`
 /// range AWS publishes for this service's list operations (1 to 1000). A
 /// `MaxResults` within that range is the page size verbatim, a larger one is
-/// clamped here, and a request that names none uses this bound — so a caller
-/// that asks for more items than this emulator's stores can hold is never
-/// handed a short page plus a continuation token. Finite, so one request cannot
-/// ask the service to project an unbounded number of resources in one response.
+/// REFUSED rather than clamped, and a request that names none uses this bound.
+/// Finite, so one request cannot ask the service to project an unbounded number
+/// of resources in one response.
 pub const MAX_LIST_PAGE_SIZE: usize = 1000;
 
 /// The page size one paginated request is served at, from the `MaxResults` it
-/// carried — or the message its refusal carries when that member asks for no
-/// items at all.
+/// carried — or the message its refusal carries when that member asks for a page
+/// this service does not serve.
 ///
 /// ONE copy of this page-size rule and of its wording, for the reason
 /// [`bounded_length`] states: every paginated operation of this service cuts its
 /// page by the same rule, so none of them can drift into its own reading of the
-/// floor, of the ceiling or of what an absent member asks for. A `MaxResults`
-/// below one asks for nothing and is refused by the floor [`at_least_one`]
-/// states for a count; a larger one is the page size verbatim up to
-/// [`MAX_LIST_PAGE_SIZE`], which is also what a request naming no `MaxResults`
-/// is served at — so no single request can ask the service to project an
+/// floor, of the ceiling or of what an absent member asks for.
+///
+/// The published range is 1 to [`MAX_LIST_PAGE_SIZE`], and a `MaxResults`
+/// OUTSIDE it is refused at both ends: a size below the floor asks for no items
+/// at all, and a size above the ceiling asks for more than one response of this
+/// service carries. Neither is silently reinterpreted — a caller probing the
+/// page size it may use has to be told the answer, or it builds pagination on a
+/// size the service does not serve. A request naming no `MaxResults` is served
+/// at the ceiling, so no single request can ask the service to project an
 /// unbounded number of resources in one response.
 ///
 /// The caller maps the message onto the modelled client error its own operation
 /// declares, exactly as the operations wrapping [`bounded_length`] and
 /// [`at_least_one`] do.
 pub fn list_page_size(max_results: Option<i32>) -> Result<usize, String> {
-    at_least_one("maxResults", max_results)?;
-    Ok(max_results.map_or(MAX_LIST_PAGE_SIZE, |asked_for| {
-        (asked_for as usize).min(MAX_LIST_PAGE_SIZE)
-    }))
+    let Some(asked_for) = max_results else {
+        return Ok(MAX_LIST_PAGE_SIZE);
+    };
+    if asked_for < 1 {
+        return Err(MAX_RESULTS_BELOW_FLOOR_MESSAGE.to_string());
+    }
+    let asked_for = asked_for as usize;
+    if asked_for > MAX_LIST_PAGE_SIZE {
+        return Err(max_results_above_ceiling_message(MAX_LIST_PAGE_SIZE));
+    }
+    Ok(asked_for)
 }
 
 /// The number a value spells when it is written the ONE way this service renders
@@ -2961,11 +2985,7 @@ impl ComAmazonawsMedialiveMedialiveState {
                 continue;
             }
             if self.live_input_security_group(group).is_none() {
-                return Some(unknown_reference_message(
-                    "inputSecurityGroups",
-                    "input security group",
-                    group,
-                ));
+                return Some(unknown_reference_message("InputSecurityGroup", group));
             }
         }
         let held_sdi_sources: &[String] = held.map_or(&[], |held| &held.sdi_sources);
@@ -2978,7 +2998,7 @@ impl ComAmazonawsMedialiveMedialiveState {
                 .get(source)
                 .is_none_or(SdiSourceRecord::is_deleted)
             {
-                return Some(unknown_reference_message("sdiSources", "SdiSource", source));
+                return Some(unknown_reference_message("SDI source", source));
             }
         }
         for device in &input.input_devices {
@@ -2994,15 +3014,18 @@ impl ComAmazonawsMedialiveMedialiveState {
                 continue;
             }
             if self.input_device(id).is_none() {
-                return Some(unknown_reference_message("inputDevices", "input device", id));
+                return Some(unknown_reference_message("InputDevice", id));
             }
         }
         let input_type = input.input_type.as_deref().unwrap_or_default();
-        if input.needs_input_whitelist() && input.security_groups.is_empty() {
-            return Some(required_for_input_type_message(
-                "inputSecurityGroups",
-                input_type,
-            ));
+        // An input an upstream system PUSHES to is admitted by the input
+        // security group attached to it, and exactly ONE group admits one input:
+        // an input of such a type that names none would admit nobody, and one
+        // that names several would be admitted by more than one whitelist. The
+        // refusal is about the COUNT, so it states that requirement and echoes
+        // nothing of the request.
+        if input.needs_input_whitelist() && input.security_groups.len() != 1 {
+            return Some(ONE_SECURITY_GROUP_PER_INPUT_MESSAGE.to_string());
         }
         if pulls_from_sources(input.input_type.as_deref()) && input.sources.is_empty() {
             return Some(required_for_input_type_message("sources", input_type));
@@ -3526,14 +3549,38 @@ pub fn not_found_message(resource_type: &str, identifier: &str) -> String {
 }
 
 /// The message a write refused because the configuration it carries references
-/// a resource this account does not hold: the member as the wire spells it, the
-/// kind of resource the entry names, and the id it named.
+/// a resource this account does not hold: the FAMILY LABEL of the resource the
+/// entry names, the id it named, then `not found`.
 ///
-/// Composed from the REQUEST, so it names what the caller must change. One
-/// helper for every reference list an input configuration carries
-/// (`InputSecurityGroups`, `SdiSources`, `InputDevices`), so the refusals cannot
-/// be worded three ways.
-pub fn unknown_reference_message(member: &str, resource_type: &str, identifier: &str) -> String {
+/// It is [`not_found_message`] — the same sentence a READ of that resource
+/// answers with — because the fact being reported is the same one: this account
+/// holds no such resource. A caller that looked the id up and a caller that
+/// named it in a write are told the same thing about it, so the two cannot drift
+/// into two wordings for one fact. Composed from the REQUEST, so it names the id
+/// the caller must change; WHERE in the request it was found is reported beside
+/// it, by the `ValidationErrors` entry's element path where the refusal carries
+/// one.
+///
+/// One helper for every reference list a configuration carries
+/// (`InputSecurityGroups`, `SdiSources`, `InputDevices`, a channel's
+/// `InputAttachments` and `ChannelSecurityGroups`, a cluster's networks), so the
+/// refusals cannot be worded one way per list.
+pub fn unknown_reference_message(resource_type: &str, identifier: &str) -> String {
+    not_found_message(resource_type, identifier)
+}
+
+/// The message a write refused because one ENTRY of a mapping list names a
+/// resource this account does not hold carries: the member and the position the
+/// entry sits at, then the resource and the id it named.
+///
+/// The sibling of [`unknown_reference_message`] for the refusals that carry NO
+/// element path of their own — a cluster's `InterfaceMappings` and a node's
+/// `SdiSourceMappings` are refused with one flat `BadRequestException`, so the
+/// place in the request has to travel in the sentence or not at all, and a
+/// caller rewriting a list of several entries needs to know which one to change.
+/// Where the refusal does carry the place (a `ValidationErrors` entry's element
+/// path, [`validation_problem`]), the sentence states the fact alone.
+pub fn unresolved_mapping_message(member: &str, resource_type: &str, identifier: &str) -> String {
     format!("{member} references {resource_type} {identifier}, which this account does not hold")
 }
 
@@ -3587,6 +3634,14 @@ pub fn validation_problem(element_path: &str, error_message: &str) -> Validation
 pub fn required_for_input_type_message(member: &str, input_type: &str) -> String {
     format!("{member} is required for an input of type {input_type}")
 }
+
+/// The message a write refused because the input it would leave behind is
+/// admitted by a number of input security groups other than one carries.
+///
+/// FIXED text: the refusal states how many groups admit one input, and neither
+/// the count the request carried nor the ids in it change what has to be true.
+pub const ONE_SECURITY_GROUP_PER_INPUT_MESSAGE: &str =
+    "Must specify exactly one security group per input.";
 
 /// The message a write refused for a private-VPC input that also attaches input
 /// security groups carries: `Vpc` is "not compatible with the

@@ -176,6 +176,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
 
+        // The REQUEST itself is judged first, before anything of this account's
+        // state is read: a create that does not identify itself cannot be
+        // retried safely, so it is refused whatever else about it is wrong —
+        // otherwise the caller is sent to fix the first reference the service
+        // happened to resolve and the request still fails afterwards, for a
+        // reason the first refusal never mentioned. The shared request rule
+        // ([`crate::state::request_validation`]) words it, and this operation
+        // answers it as its own modelled client error.
+        let request_id = crate::state::request_validation::request_id(
+            crate::state::request_family::INPUT,
+            input.request_id.as_deref(),
+        )
+        .map_err(|message| bad_request(&message))?;
+
         // A tag key in the reserved namespace names a system tag, which is not
         // the caller's to set, so a request carrying one is refused before
         // anything is stored rather than creating a resource that claims it.
@@ -208,10 +222,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // input this call was not asked for, and answering with it would report
         // a resource the request did not ask to exist while never creating the
         // input this request describes.
-        if let Some(existing) = input
-            .request_id
-            .as_deref()
-            .and_then(|token| state.input_for_token(None, token))
+        if let Some(existing) = state
+            .input_for_token(None, &request_id)
             .map(str::to_string)
         {
             let created = state.input_description(&existing).ok_or_else(unavailable)?;
@@ -275,11 +287,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.arn = ::engine::emulator_arn("medialive", &region, &format!("input:{id}"));
 
         state.inputs.insert(id.clone(), record);
-        if let Some(token) = input.request_id {
-            // Bounded, evicting write: a caller-chosen token can neither
-            // accumulate past the cap nor outlive the input it created.
-            state.record_input_idempotency_token(None, &token, &id);
-        }
+        // Bounded, evicting write: a caller-chosen token can neither accumulate
+        // past the cap nor outlive the input it created.
+        state.record_input_idempotency_token(None, &request_id, &id);
 
         // A push input's ingest endpoint is allocated here, where the
         // destinations are written, not on the read path.
