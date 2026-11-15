@@ -21,12 +21,21 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `query_error_envelope`: the shared report of the request id a response names the
+# request it answers by, so this service's restJson1 envelope carries it the way every
+# other emulated service's does. `iam_authorization`: the one evaluation of IAM policy
+# documents against an action on a resource, which decides every call of this service.
+service-common = { path = "../common" }
+# The STS store, for the identity an access key id speaks for: the principal
+# `sts:GetCallerIdentity` answers for the credentials a request signed with.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The IAM store, for the identity-based policy documents in force on that principal,
+# which decide whether the caller may perform the action an operation asks for.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
-# NO dependency is added by this service. Everything it needs — the `@pattern`
-# sub-checks, the `@idempotencyToken` mint and the test's audit capture — is built on
-# the standard library and on `tracing`, which the scaffold already declares. A new
-# entry here would also change the workspace `Cargo.lock`, the one file every other
-# service's change rewrites, which keeps the serialized squash-merge from resolving.
+# Everything else this service needs — the `@pattern` sub-checks, the
+# `@idempotencyToken` mint and the test's audit capture — is built on the standard
+# library and on `tracing`, which the scaffold already declares.
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

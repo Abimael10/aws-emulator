@@ -13,15 +13,18 @@
 //!
 //! * [`refuse_preferences`] — the modeled constraints on
 //!   `ConnectionRecordingPreferences` that the framework's boundary validator cannot
-//!   enforce (see that function's own docs), reported in the same
-//!   `ValidationException` envelope the boundary uses.
-//! * [`constraint_message`] — how THIS service words a `@length` bound the boundary
+//!   enforce (see that function's own docs), worded through the same
+//!   [`constraint_message`] the boundary's own refusals are.
+//! * [`constraint_message`] — how THIS service words a modeled constraint the boundary
 //!   validator refused, which is not the framework's aggregated envelope.
 //! * [`resource_not_found_message`] — the one template every path reports the absent
 //!   singleton with.
 //! * the account-level just-in-time node access gate
 //!   ([`ComAmazonawsSsmguiconnectSsmguiconnectState::just_in_time_node_access_enabled`]),
 //!   which `UpdateConnectionRecordingPreferences` is refused by.
+//! * [`authorization`] — whether the CALLER's own identity-based IAM policies allow the
+//!   action an operation asks for, which every operation is refused by before it reads
+//!   or writes anything, and before the account gate above.
 //! * [`mint_client_token`] — the service-provided value for an `@idempotencyToken`
 //!   member the caller left unset.
 //! * [`audit`] — the structured access record every operation emits, so a call to this
@@ -30,9 +33,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::SystemTime;
 
-use aws_smithy_schema_server::constraints::{envelope, path, Violation, ViolationKind};
+use aws_smithy_schema_server::constraints::{path, Violation, ViolationKind};
 
 use crate::ops::types::{ConnectionRecordingPreferences, RecordingDestinations, S3Bucket};
+
+/// Whether the CALLER's own IAM policies let a request perform the action it asks for
+/// — the decision every operation of this service takes before it reads or writes
+/// anything. See that module's docs.
+pub mod authorization;
 
 /// Most idempotency outcomes retained at once, after which the OLDEST is evicted.
 ///
@@ -320,22 +328,54 @@ const LENGTH_BOUNDED_MEMBERS: &[(&str, BoundedKind)] = &[
     ),
 ];
 
-/// How THIS service words a boundary `@length` refusal, or `None` when it words the
+/// How THIS service words a boundary constraint refusal, or `None` when it words the
 /// refusal the way the framework does.
 ///
-/// SSM GuiConnect states a constraint violation as ONE sentence naming the member
-/// path and the bound it broke — no `N validation error(s) detected` prefix, and no
-/// echo of the offending value, which it withholds. The sentence is built from the
-/// request (the member the caller sent and the bound the model declares for it), so
-/// it carries no text keyed to any particular request.
+/// SSM GuiConnect states a constraint violation as ONE sentence — no `N validation
+/// error(s) detected` prefix, and no echo of the offending value, which it withholds —
+/// in one of two forms, each keyed to the constraint that was broken:
+///
+/// * a `@length` bound: the member path and the bound it broke
+///   ([`length_bound_sentence`]);
+/// * a `@pattern`: the member path alone ([`invalid_value_sentence`]), since the
+///   requirement is a regular expression the server holds and this service states
+///   neither it nor the value that failed it.
+///
+/// Both sentences are built from the request (the member the caller sent and the bound
+/// the model declares for it), so neither carries text keyed to any particular request.
 ///
 /// With several violations the first one this service words is stated, because the
 /// form is a single sentence rather than an envelope of clauses. A violation of
-/// anything other than a `@length` bound (a `@pattern`, an absent `@required` member)
-/// keeps the framework's wording: those are not the two forms recorded for this
-/// service, so inventing a third would be guessing.
+/// anything else (an absent `@required` member, a `@range` bound) keeps the framework's
+/// wording: those are not the forms recorded for this service, so inventing another
+/// would be guessing.
 pub fn constraint_message(violations: &[Violation]) -> Option<String> {
-    violations.iter().find_map(length_bound_sentence)
+    violations.iter().find_map(violation_sentence)
+}
+
+/// The sentence for ONE violation, or `None` when this service does not word that
+/// violation itself.
+fn violation_sentence(violation: &Violation) -> Option<String> {
+    match &violation.kind {
+        // The pattern is a requirement the server holds and the value is the caller's:
+        // the sentence names neither, so EVERY `@pattern` member of this service's input
+        // shapes is worded from its path alone and nothing has to be tabulated per
+        // member.
+        ViolationKind::Pattern(_) => {
+            Some(invalid_value_sentence(&model_member_path(&violation.path)))
+        }
+        _ => length_bound_sentence(violation),
+    }
+}
+
+/// How this service states that a member held a value the model does not admit for it:
+/// the member, by its MODEL path, and nothing else.
+///
+/// `member` is the dotted model member path ([`model_member_path`]) — the only variable
+/// part of the sentence, and the only place a refusal names WHICH member was wrong, so a
+/// client parses it from here.
+pub fn invalid_value_sentence(member: &str) -> String {
+    format!("The value provided for {member} isn't valid.")
 }
 
 /// The sentence for one `@length` violation, or `None` when this service does not
@@ -378,23 +418,42 @@ fn values(count: i64) -> &'static str {
 
 /// A violation path as the MODEL spells the members it names:
 /// `connectionRecordingPreferences.recordingDestinations.s3Buckets` ->
-/// `ConnectionRecordingPreferences.RecordingDestinations.S3Buckets`.
+/// `ConnectionRecordingPreferences.RecordingDestinations.S3Buckets`, and
+/// `connectionRecordingPreferences.recordingDestinations.s3Buckets.1.member.bucketName`
+/// -> `ConnectionRecordingPreferences.RecordingDestinations.S3Buckets.BucketName`.
 ///
 /// The framework builds a path segment by lowercasing a member name's FIRST character
 /// (`path::member`), so uppercasing it back recovers the model's own name exactly —
 /// including `S3Buckets` and `KMSKeyArn`, whose later characters it never touched.
+///
+/// A step from a collection into one of its values is spelled `<position-or-key>.member`
+/// by that same builder (`path::element` / `path::entry`), and BOTH of those segments are
+/// dropped: the model names a collection's values through the collection member itself,
+/// so a model member path carries no index — and a position or a map key is a value of
+/// the particular request rather than a member of the model.
 fn model_member_path(path: &str) -> String {
-    path.split('.')
-        .map(|segment| {
-            let mut chars = segment.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<String>>()
-        .join(".")
+    let segments: Vec<&str> = path.split('.').collect();
+    let mut named: Vec<String> = Vec::with_capacity(segments.len());
+    let mut at = 0;
+    while at < segments.len() {
+        if segments.get(at + 1).copied() == Some(COLLECTION_STEP) {
+            at += 2;
+            continue;
+        }
+        let mut characters = segments[at].chars();
+        named.push(match characters.next() {
+            Some(first) => first.to_uppercase().chain(characters).collect::<String>(),
+            None => String::new(),
+        });
+        at += 1;
+    }
+    named.join(".")
 }
+
+/// The segment the framework's path builder marks a step from a collection into one of
+/// its values with (`aws_smithy_schema_server::constraints::path`'s collection step),
+/// which [`model_member_path`] drops together with the position or key before it.
+const COLLECTION_STEP: &str = "member";
 
 /// AWS's denial text for an account that is not enrolled in just-in-time node access.
 ///
@@ -440,14 +499,18 @@ fn bucket_name_labels_are_well_formed(name: &str) -> bool {
     })
 }
 
-/// Longest value echoed back in a refusal message, the same bound the framework's own
-/// constraint walk applies: the value is caller-controlled, so an unelided echo would
-/// amplify a request into an arbitrarily long response.
+/// Longest value a refusal's own `Violation` record carries, the same bound the
+/// framework's constraint walk applies to one it builds: the value is caller-controlled,
+/// so an unbounded one would let a request grow what the refusal path holds.
 const MAX_ECHOED_VALUE: usize = 256;
 
-/// The refused value as it should appear in a MESSAGE: itself when short, otherwise a
-/// character-boundary-safe prefix plus the elision the framework's own renderer
-/// appends, so a long value reads the same whichever layer refused it.
+/// The refused value as the `Violation` record carries it: itself when short, otherwise a
+/// character-boundary-safe prefix plus the elision the framework's own renderer appends,
+/// so a value this service records reads the same as one the boundary walk recorded.
+///
+/// This service's own wording WITHHOLDS the value ([`constraint_message`]); the record
+/// still carries it bounded, because that is what a `Violation` is and what the framework
+/// would have put in it.
 ///
 /// Rendering only — the ORIGINAL value is what the check above runs on. Eliding before
 /// the check would compare text the caller never sent.
@@ -493,9 +556,10 @@ pub fn bucket_name_matches_model_pattern(name: &str) -> bool {
 /// `KMSKeyArn`'s `@length(1, 2048)`, and every `@required` member) compiles and is
 /// already refused before a handler runs, so duplicating it here would be dead code.
 ///
-/// The message is built from the request — the member path, the value it held and the
-/// requirement it failed — through the framework's own `Violation` renderer, so a
-/// refusal from here is worded like one from the boundary.
+/// The message is built from the request alone — the member path that failed, worded
+/// through [`constraint_message`], the SAME renderer `service.rs`'s `override_refusal`
+/// words a boundary refusal with — so a refusal from here and a refusal from the
+/// boundary are one sentence and cannot drift apart.
 pub fn refuse_preferences(prefs: &ConnectionRecordingPreferences) -> Option<String> {
     let violations: Vec<Violation> = prefs
         .recording_destinations
@@ -504,6 +568,9 @@ pub fn refuse_preferences(prefs: &ConnectionRecordingPreferences) -> Option<Stri
         .enumerate()
         .filter(|(_, bucket)| !bucket_name_matches_model_pattern(&bucket.bucket_name))
         .map(|(index, bucket)| Violation {
+            // Spelled by the framework's own path builder, position included, so the
+            // violation names the member exactly as the boundary walk would have — and
+            // `constraint_message` maps that one spelling to the model's dotted path.
             path: path::join(&[
                 path::member("ConnectionRecordingPreferences"),
                 path::member("RecordingDestinations"),
@@ -516,7 +583,7 @@ pub fn refuse_preferences(prefs: &ConnectionRecordingPreferences) -> Option<Stri
             sensitive: false,
         })
         .collect();
-    envelope(&violations)
+    constraint_message(&violations)
 }
 
 /// The service-provided value for an `@idempotencyToken` member the caller left
@@ -626,8 +693,8 @@ pub enum AuditOutcome {
     IdempotentReplay,
     /// The request was refused as invalid (400).
     ValidationRefused,
-    /// The caller was refused by the account-level just-in-time node access gate
-    /// (403).
+    /// The caller was refused 403: either by its own IAM policies
+    /// ([`authorization`]) or by the account-level just-in-time node access gate.
     AccessDenied,
     /// There was no configured singleton to report or remove (404).
     NotFound,

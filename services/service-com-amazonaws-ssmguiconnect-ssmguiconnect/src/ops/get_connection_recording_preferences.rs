@@ -11,6 +11,11 @@
 //! resource to report, which is `ResourceNotFoundException` (HTTP 404), never an
 //! empty 200.
 //!
+//! AUTHORIZED FIRST: a caller whose identity-based IAM policies do not allow this
+//! action is refused with the modeled `AccessDeniedException` (403) before the
+//! singleton is looked up, so the refusal tells an unauthorized caller nothing about
+//! whether the resource exists ([`crate::state::authorization`]).
+//!
 //! Hand-authored rather than scaffolded: the op-stub generator declined this
 //! operation because its input is `smithy.api#Unit` (recorded in
 //! `src/ops/SKIPPED_STUBS.md`), so it had no handler file and no entry in the
@@ -144,6 +149,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The input is `smithy.api#Unit`, so there is nothing to read from it. Every
         // branch below records its outcome through `crate::state::audit`.
         let _ = &input;
+
+        // IAM FIRST: the caller's own identity-based policies decide this call before
+        // anything of this service's state is read, so an unauthorized caller is told it
+        // is not authorized rather than told whether the singleton exists.
+        if let Some(message) =
+            crate::state::authorization::refusal(&*self.engine, ctx, Self::NAME)
+        {
+            audit(Self::NAME, ctx, AuditOutcome::AccessDenied);
+            return Err(GetConnectionRecordingPreferencesErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             audit(Self::NAME, ctx, AuditOutcome::StoreUnavailable);

@@ -15,6 +15,11 @@
 //! refused with the modeled `AccessDeniedException` (403) — after the request-shape
 //! validation AWS performs first, and before anything the request names is looked up.
 //!
+//! GATED on the CALLER too, and ahead of that: a principal whose identity-based IAM
+//! policies do not allow this action is refused with the same modeled error and its own
+//! sentence ([`crate::state::authorization`]), so the two denial causes — a missing IAM
+//! grant and the account's enrollment — never share a message.
+//!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request.
@@ -171,6 +176,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ValidationException { message },
             )
             .into());
+        }
+
+        // THE CALLER's OWN PERMISSIONS, ahead of the account-level gate below: a
+        // principal whose identity-based policies do not allow this action is refused
+        // whatever the account is enrolled in, and with its own sentence, so the two
+        // denial causes stay distinguishable. After the request-shape validation above,
+        // which AWS performs first for every caller.
+        if let Some(message) =
+            crate::state::authorization::refusal(&*self.engine, ctx, Self::NAME)
+        {
+            audit(Self::NAME, ctx, AuditOutcome::AccessDenied);
+            return Err(
+                UpdateConnectionRecordingPreferencesErrorModeled::AccessDeniedException(
+                    AccessDeniedException { message },
+                )
+                .into(),
+            );
         }
 
         let mut store = state.lock();

@@ -16,6 +16,11 @@
 //! also not gated by just-in-time node access — unlike
 //! `UpdateConnectionRecordingPreferences`.
 //!
+//! AUTHORIZED FIRST: a caller whose identity-based IAM policies do not allow this
+//! action is refused with the modeled `AccessDeniedException` (403) before anything is
+//! read or removed, so a refused call changes nothing
+//! ([`crate::state::authorization`]).
+//!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request.
@@ -137,6 +142,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // Every branch below records its outcome through `crate::state::audit`, so a
         // call that removes the singleton leaves an attributable trail.
+
+        // IAM FIRST: the caller's own identity-based policies decide this call before
+        // anything is read or removed, so a refused call changes nothing.
+        if let Some(message) =
+            crate::state::authorization::refusal(&*self.engine, ctx, Self::NAME)
+        {
+            audit(Self::NAME, ctx, AuditOutcome::AccessDenied);
+            return Err(
+                DeleteConnectionRecordingPreferencesErrorModeled::AccessDeniedException(
+                    AccessDeniedException { message },
+                )
+                .into(),
+            );
+        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             audit(Self::NAME, ctx, AuditOutcome::StoreUnavailable);
