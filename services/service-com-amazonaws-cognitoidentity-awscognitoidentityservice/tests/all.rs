@@ -23,6 +23,8 @@ mod basic_flow_gate;
 mod constraint_refusal_wording;
 #[path = "all/control_plane_audit.rs"]
 mod control_plane_audit;
+#[path = "all/custom_role_arn_claim_membership.rs"]
+mod custom_role_arn_claim_membership;
 #[path = "all/custom_role_arn_from_token_roles.rs"]
 mod custom_role_arn_from_token_roles;
 #[path = "all/delete_identities.rs"]

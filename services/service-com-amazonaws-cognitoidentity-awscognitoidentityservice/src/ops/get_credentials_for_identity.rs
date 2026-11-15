@@ -8,15 +8,15 @@
 //!
 //! The credentials a real identity pool vends are a session of the ROLE the pool's own
 //! configuration resolves for the request, written through `SetIdentityPoolRoles`, and
-//! `CustomRoleArn` picks one of the roles the pool names instead. Where the pool carries a
-//! `RoleMappings` entry for the identity provider the presented login was made under, that
-//! mapping is what resolves the role — for a rules mapping, the role the first rule to
-//! match the presented token's claims names, and for a token mapping the role the token's
-//! own group claims name — and a mapping that resolves none states, in its
-//! `AmbiguousRoleResolution`, what becomes of that exchange: the pool's authenticated role,
-//! or a refusal that vends nothing at all. The pool-wide authenticated or unauthenticated
-//! role is the fallback for an exchange no mapping of the pool's decides. This handler
-//! resolves that role and assumes it: the session it mints is
+//! `CustomRoleArn` picks one of the roles the exchange's identity provider offered instead.
+//! Where the pool carries a `RoleMappings` entry for the identity provider the presented
+//! login was made under, that mapping is what resolves the role — for a rules mapping, the
+//! role the first rule to match the presented token's claims names, and for a token mapping
+//! the role the token's own group claims name — and a mapping that resolves none states, in
+//! its `AmbiguousRoleResolution`, what becomes of that exchange: the pool's authenticated
+//! role, or a refusal that vends nothing at all. The pool-wide authenticated or
+//! unauthenticated role is the fallback for an exchange no mapping of the pool's decides.
+//! This handler resolves that role and assumes it: the session it mints is
 //! recorded in the STS session registry in the same engine, so
 //! `sts:GetCallerIdentity` under the vended credential answers
 //! `arn:<partition>:sts::<account>:assumed-role/<role>/CognitoIdentityCredentials`, and the
@@ -36,7 +36,10 @@
 //! vend is answered the same configuration refusal. A role mapping that DENIES the exchange
 //! is a different refusal: the pool's configuration is not at fault, the token presented is
 //! simply not authorized to receive a credential, so that one is the modelled
-//! `NotAuthorizedException` (HTTP 403).
+//! `NotAuthorizedException` (HTTP 403). A `CustomRoleArn` naming a role the exchange's own
+//! identity provider did not offer — a role absent from the presented token's role claims,
+//! the pool's own default roles among them — is that same authorization refusal, and it
+//! names the role the request asked for.
 //!
 //! `Logins` selects WHICH flow the exchange is: a request that presents a login is an
 //! authenticated one, and the pool's `authenticated` role is the one assumed where no
@@ -466,13 +469,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
             let requested_tags = store.requested_session_tags(&identity_pool_id, &logins);
 
             // Which role this vend assumes: the `CustomRoleArn` the request names, which
-            // can only be honoured against the roles this exchange could itself have
-            // resolved — the roles the pool has stored, and the roles the presented token
-            // carries — or, for a request that names none, the role the pool's own
-            // configuration resolves for this exchange. A `RoleMappings` entry for the
-            // identity provider the login was made under is what resolves it there, and the
-            // pool-wide role for the flow the request is in is the fallback when no mapping
-            // of the pool's resolves one.
+            // can only be honoured among the roles this exchange's own identity provider
+            // OFFERED it — the roles a presented token states, and, where no token states
+            // any, the roles the pool has stored — or, for a request that names none, the
+            // role the pool's own configuration resolves for this exchange. A `RoleMappings`
+            // entry for the identity provider the login was made under is what resolves it
+            // there, and the pool-wide role for the flow the request is in is the fallback
+            // when no mapping of the pool's resolves one.
             // A mapping that DECIDES the exchange without resolving a role is the case its
             // `AmbiguousRoleResolution` states the outcome of: `AuthenticatedRole` names the
             // pool's own authenticated role, while `Deny` is a decision to vend NOTHING —
@@ -501,13 +504,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
                 )
                 .into());
             }
-            let role_arn = match &input.custom_role_arn {
-                Some(custom_role_arn) => configured
-                    .filter(|configured| {
-                        configured.admits_custom_role_arn(&logins, custom_role_arn)
-                    })
-                    .map(|_| custom_role_arn.clone()),
-                None => {
+            let role_arn = match (&input.custom_role_arn, configured) {
+                // A role the exchange's own identity provider did not offer it is a role
+                // this caller may not assume, which is an authorization decision about the
+                // token presented rather than a fault of the pool's configuration: the
+                // refusal is `NotAuthorizedException` (HTTP 403) and it NAMES the role the
+                // request asked for, so a caller holding several candidates is told which
+                // one was refused
+                // ([`crate::state::IdentityPoolRoles::admits_custom_role_arn`]). It is
+                // decided before the pool's `RoleMappings` are consulted: a request that
+                // names a role asks for THAT role, so what a mapping would have resolved —
+                // and what its `AmbiguousRoleResolution` states for resolving none — is not
+                // what such a request is answered about.
+                // A pool that stores NO role configuration at all is the other case
+                // entirely: it has no role for any exchange, which is what
+                // `InvalidIdentityPoolConfigurationException` states, so such a request
+                // falls to that refusal below rather than being told about this one's
+                // claim.
+                (Some(_), None) => None,
+                (Some(custom_role_arn), Some(offer)) => {
+                    if !offer.admits_custom_role_arn(&logins, custom_role_arn) {
+                        return Err(GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
+                            NotAuthorizedException {
+                                message: Some(
+                                    crate::state::custom_role_arn_not_in_token_message(
+                                        custom_role_arn,
+                                    ),
+                                ),
+                            },
+                        )
+                        .into());
+                    }
+                    Some(custom_role_arn.clone())
+                }
+                (None, _) => {
                     let mapped = configured
                         .zip(store.identity_pools.get(&identity_pool_id))
                         .map(|(configured, pool)| configured.mapped_role(pool, &logins))

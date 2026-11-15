@@ -1502,8 +1502,10 @@ impl IdentityPoolRoles {
     }
 
     /// Whether this configuration names `role_arn` — as one of the pool's two roles, or
-    /// as the role a mapping rule resolves to. This is the set of roles the pool can vend
-    /// credentials for, which is what a `CustomRoleArn` has to be drawn from.
+    /// as the role a mapping rule resolves to. This is the set of roles the pool itself can
+    /// resolve for an exchange, which is the offer a `CustomRoleArn` is drawn from where no
+    /// presented token states one of its own ([`IdentityPoolRoles::admits_custom_role_arn`],
+    /// whose two cases this reader is the second of).
     pub fn names_role_arn(&self, role_arn: &str) -> bool {
         self.roles.values().any(|arn| arn == role_arn)
             || self.role_mappings.iter().flatten().any(|(_, mapping)| {
@@ -1521,22 +1523,50 @@ impl IdentityPoolRoles {
     /// MULTIPLE ROLES WERE RECEIVED IN THE TOKEN from the identity provider"
     /// (`GetCredentialsForIdentityInput$CustomRoleArn`, this service's model).
     ///
-    /// So the roles such a request may pick from are the roles the pool's own configuration
-    /// names ([`IdentityPoolRoles::names_role_arn`]) TOGETHER WITH the roles the presented
-    /// tokens themselves carry ([`token_claimed_role_arns`]) — the latter being the very
-    /// several-roles-in-one-token case the member exists for, which no stored rule of the
-    /// pool need name. Anything else is a role this exchange could not have resolved, so it
-    /// is not one a request may substitute.
+    /// So the roles such a request may pick from are the roles the identity provider's own
+    /// answer OFFERED this exchange. Where a presented token states them itself — the
+    /// `cognito:roles` and `cognito:preferred_role` claims a Cognito identity-provider token
+    /// carries its roles in ([`token_claimed_role_arns`]) — that offer is exactly those
+    /// roles, and nothing else the pool happens to store is one the request may substitute:
+    /// a pool's own `authenticated` or `unauthenticated` role is not a role the token
+    /// received either. Where no presented token states a role at all — a SAML assertion's
+    /// roles, and an opaque provider credential, are decided by their issuer, which this
+    /// emulator does not reach — the roles the pool's own configuration names
+    /// ([`IdentityPoolRoles::names_role_arn`]) are the offer this emulator can see, so those
+    /// are the roles such an exchange may pick from.
+    ///
+    /// Anything else is a role this exchange could not have resolved, which is an
+    /// authorization decision about the token presented rather than a fault of the pool's
+    /// configuration ([`custom_role_arn_not_in_token_message`]).
     pub fn admits_custom_role_arn(
         &self,
         logins: &HashMap<String, String>,
         role_arn: &str,
     ) -> bool {
-        self.names_role_arn(role_arn)
-            || token_claimed_role_arns(logins)
-                .iter()
-                .any(|claimed| claimed == role_arn)
+        let claimed = token_claimed_role_arns(logins);
+        if claimed.is_empty() {
+            return self.names_role_arn(role_arn);
+        }
+        claimed.iter().any(|offered| offered == role_arn)
     }
+}
+
+/// How AWS words the refusal of a `CustomRoleArn` naming a role the exchange's own identity
+/// provider did not offer it ([`IdentityPoolRoles::admits_custom_role_arn`]).
+///
+/// This is an AUTHORIZATION refusal — `NotAuthorizedException`, "thrown when a user is not
+/// authorized to access the requested resource" (that error's own doc, this service's model)
+/// — and not the pool-configuration one: the pool may well configure a usable role for the
+/// flow the request is in, as the same exchange naming a role the token DID receive shows by
+/// vending credentials. `InvalidIdentityPoolConfigurationException` stays for a pool that
+/// "has no authenticated role configured, or STS returned an error response" (that error's
+/// own doc), which is the operator's problem rather than this caller's.
+///
+/// Fixed text, around the ONE variable part: the role ARN the request named, taken verbatim
+/// from its `CustomRoleArn`, so a caller offering several candidates is told which of them
+/// was refused.
+pub fn custom_role_arn_not_in_token_message(role_arn: &str) -> String {
+    format!("CustomRoleARN: {role_arn} is not present in the token in the cognito:roles claim")
 }
 
 /// Whether an exchange presenting `logins` against `pool`, configured with `roles`, may name

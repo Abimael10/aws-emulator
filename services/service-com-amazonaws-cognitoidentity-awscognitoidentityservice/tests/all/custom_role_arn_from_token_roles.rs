@@ -5,17 +5,17 @@
 //! RULE: `CustomRoleArn` is "the Amazon Resource Name (ARN) of the role to be assumed when
 //! MULTIPLE ROLES WERE RECEIVED IN THE TOKEN from the identity provider"
 //! (`GetCredentialsForIdentityInput$CustomRoleArn`, this service's model), so the roles such
-//! a request may pick from are the roles the pool's own configuration names TOGETHER WITH
-//! the roles the presented token itself carries — the `cognito:roles` and
-//! `cognito:preferred_role` claims a Cognito identity-provider token maps groups to roles
-//! through (`RoleMapping$Type`) — and the session vended is a session of exactly the role
-//! named. A role neither the pool nor the presented token names is a role this exchange
-//! could not have resolved, so it vends nothing.
+//! a request may pick from are the roles the presented token itself states — the
+//! `cognito:roles` and `cognito:preferred_role` claims a Cognito identity-provider token
+//! maps groups to roles through (`RoleMapping$Type`) — and the session vended is a session
+//! of exactly the role named. A role the presented token does not state, the pool's own two
+//! roles included, is a role this exchange could not have resolved, so it vends nothing (the
+//! sibling suite `custom_role_arn_claim_membership` asserts how that refusal is worded).
 //!
-//! The rows differ along what the rule generalises over: WHERE the named role comes from
-//! (the pool's `authenticated` role, its `unauthenticated` role, a single-valued group
-//! claim, one of several values of a group claim, the preference claim), the COUNT of roles
-//! the token carries (one, two, three), and a role no side names.
+//! The rows differ along what the rule generalises over: WHERE the named role comes from (a
+//! single-valued group claim, one of several values of a group claim, the preference claim,
+//! the pool's `authenticated` role, its `unauthenticated` role), the COUNT of roles the
+//! token carries (one, two, three), and a role no side names.
 //!
 //! The fixture is `mapped_role_resolution`'s, driven through `vended_role_session`'s
 //! harness: this service and STS on ONE shared engine behind the same `MultiServiceRouter`
@@ -33,7 +33,9 @@ use crate::vended_role_session::{element, expected_session_arn, vended, Emulator
 /// and `cognito:preferred_role` claims from the Cognito identity provider token to map
 /// groups to roles" (`RoleMapping$Type`, this service's model). Stating
 /// `AuthenticatedRole` so a row whose claims name no ONE role is still decided, which keeps
-/// every row below about the `CustomRoleArn` and not about the resolution.
+/// every row below about the `CustomRoleArn` and not about the resolution. The pool's own
+/// authenticated role is what that resolution falls back to, which is not the same as a
+/// request being allowed to NAME it.
 fn token_mapping() -> Value {
     json!({
         USER_POOL_PROVIDER: {"Type": "Token", "AmbiguousRoleResolution": "AuthenticatedRole"},
@@ -44,7 +46,8 @@ fn token_mapping() -> Value {
 enum Outcome<'a> {
     /// A session of this role is vended.
     Session(&'a Role),
-    /// Nothing is vended: the named role is one this exchange could not have resolved.
+    /// Nothing is vended: the named role is one the presented token did not state, so it is
+    /// one this exchange could not have resolved.
     Nothing,
 }
 
@@ -111,16 +114,16 @@ async fn a_custom_role_arn_is_honoured_for_a_role_the_pool_or_the_token_names() 
             outcome: Outcome::Session(group_c),
         },
         Row {
-            case: "the pool's own authenticated role, beside the token's roles",
+            case: "the pool's own authenticated role, which the token does not state",
             claims: json!({"cognito:roles": [&group_a.arn, &group_b.arn]}),
             custom_role_arn: &authenticated.arn,
-            outcome: Outcome::Session(authenticated),
+            outcome: Outcome::Nothing,
         },
         Row {
-            case: "the pool's own unauthenticated role, beside the token's roles",
+            case: "the pool's own unauthenticated role, which the token does not state",
             claims: json!({"cognito:roles": [&group_a.arn, &group_b.arn]}),
             custom_role_arn: &unauthenticated.arn,
-            outcome: Outcome::Session(unauthenticated),
+            outcome: Outcome::Nothing,
         },
         Row {
             case: "a role neither the pool nor the token names",
@@ -168,8 +171,8 @@ async fn a_custom_role_arn_is_honoured_for_a_role_the_pool_or_the_token_names() 
             Outcome::Nothing => {
                 assert_ne!(
                     status, 200,
-                    "case {case:?}: a role neither side names vends nothing, got {status} \
-                     with {body}"
+                    "case {case:?}: a role the token does not state vends nothing, got \
+                     {status} with {body}"
                 );
                 assert!(
                     body.get("Credentials").is_none(),

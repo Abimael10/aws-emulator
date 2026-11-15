@@ -536,10 +536,11 @@ async fn a_roles_key_that_is_not_a_role_kind_is_refused() {
     }
 }
 
-/// RULE: a `CustomRoleArn` is resolved against the roles the pool has STORED — a role the
-/// pool names, as one of its two roles or as a role one of its mapping rules resolves to,
-/// is accepted; one the pool does not name is refused with the modelled
-/// `InvalidIdentityPoolConfigurationException` (HTTP 400).
+/// RULE: where no presented token states which roles the identity provider offered the
+/// exchange, a `CustomRoleArn` is resolved against the roles the pool has STORED — a role the
+/// pool names, as one of its two roles or as a role one of its mapping rules resolves to, is
+/// accepted; one the exchange could not have resolved at all is a role this caller may not
+/// assume, which is the modelled `NotAuthorizedException`.
 #[tokio::test]
 async fn a_custom_role_arn_is_resolved_against_the_pools_stored_roles() {
     let emulator = Emulator::new();
@@ -627,8 +628,8 @@ async fn a_custom_role_arn_is_resolved_against_the_pools_stored_roles() {
             "case {case:?}: expected HTTP 400, got {status} with {body}"
         );
         assert!(
-            error_code(&body).contains("InvalidIdentityPoolConfigurationException"),
-            "case {case:?}: expected InvalidIdentityPoolConfigurationException, got {body}"
+            error_code(&body).contains("NotAuthorizedException"),
+            "case {case:?}: expected NotAuthorizedException, got {body}"
         );
     }
 }
