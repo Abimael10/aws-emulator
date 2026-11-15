@@ -77,6 +77,8 @@ mod definition_validation;
 mod describe_state_machine_for_execution;
 #[path = "all/distributed_map_children.rs"]
 mod distributed_map_children;
+#[path = "all/encrypted_execution_observability.rs"]
+mod encrypted_execution_observability;
 #[path = "all/encrypted_execution_writes.rs"]
 mod encrypted_execution_writes;
 #[path = "all/encrypted_resource_key_configuration.rs"]

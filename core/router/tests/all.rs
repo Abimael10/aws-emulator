@@ -1686,3 +1686,11 @@ mod zz_probe_whole_emulator;
 //! the test it explains; `all/appended_notes.rs` keeps the notes landings had appended here.
 #[path = "all/lambda_sqs_event_source_attempt_reservation.rs"]
 mod lambda_sqs_event_source_attempt_reservation;
+// `all/every_suite_file_is_declared.rs`, for this file and for every service crate's
+// `tests/all.rs`): one declaration per suite (a second is `E0428`), every comment an
+// ORDINARY `//` one (an inner `//!` past the first item is `E0753`), nothing in the list
+// but declaration pairs, and a pair for every suite file the directory holds. Each failure
+// compiles or runs no suite of this target at all, so the list below holds pairs only, and
+// the notes landings had appended to this file's tail live in `all/appended_notes.rs`.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of this
+// file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what points
