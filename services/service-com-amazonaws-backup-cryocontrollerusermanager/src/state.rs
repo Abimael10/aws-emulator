@@ -852,6 +852,11 @@ pub fn mpa_approval_team_arn_parts(value: &str) -> Option<(&str, &str)> {
 pub const MESSAGE_UNSUPPORTED_VAULT_TYPE: &str =
     "Operation not supported for the provided vault type";
 
+/// `Code` for that condition — its own token, distinct from the one the call
+/// only a logically air-gapped vault answers states
+/// ([`ERROR_CODE_VAULT_TYPE_INVALID`]).
+pub const ERROR_CODE_UNSUPPORTED_VAULT_TYPE: &str = "ERROR_3935";
+
 /// `Code` AWS fills in for "a member of the request carries a value this
 /// service cannot accept". ONE token for the whole class: which member was
 /// rejected is reported in `Context`, not in the token.
@@ -1150,8 +1155,13 @@ pub const AGGREGATION_PERIODS: [&str; 3] = ["ONE_DAY", "SEVEN_DAYS", "FOURTEEN_D
 /// ([`MESSAGE_RECOVERY_POINT_NOT_FOUND`]): it names no part of the request, so
 /// the id asked about does not appear in it. It answers every call that
 /// addresses a restore job by id — the read, the metadata read and the
-/// validation result. No `Code`: this condition has no observed token.
+/// validation result. Its token is [`ERROR_CODE_RESTORE_JOB_NOT_FOUND`].
 pub const MESSAGE_RESTORE_JOB_NOT_FOUND: &str = "Cannot find restore job";
+
+/// `Code` for "the restore job asked about is not one this account holds" — one
+/// token for the condition, stated the same way by every call that addresses a
+/// restore job by id.
+pub const ERROR_CODE_RESTORE_JOB_NOT_FOUND: &str = "ERROR_2801";
 
 /// The sentence AWS states for "the restore testing plan asked about is not one
 /// this account holds" — fixed, and worded as the not-found conditions above
@@ -1173,14 +1183,25 @@ pub const MESSAGE_RESTORE_TESTING_PLAN_ALREADY_EXISTS: &str =
 /// The sentence AWS states for "the tiering configuration asked about is not
 /// one this account holds" — fixed, and worded as the conditions above are: it
 /// names no part of the request, so the name asked about does not appear in it.
-/// No `Code`: this condition has no observed token.
+/// Its token is [`ERROR_CODE_TIERING_CONFIGURATION_NOT_FOUND`].
 pub const MESSAGE_TIERING_CONFIGURATION_NOT_FOUND: &str = "Cannot find tiering configuration";
+
+/// `Code` for "the tiering configuration asked about is not one this account
+/// holds" — one token for the condition, stated the same way by every call that
+/// addresses a tiering configuration by name.
+pub const ERROR_CODE_TIERING_CONFIGURATION_NOT_FOUND: &str = "ERROR_2C01";
 
 /// The sentence AWS states for "a tiering configuration of this name already
 /// exists", worded as this service words the same condition for a vault
-/// ([`MESSAGE_VAULT_ALREADY_EXISTS`]) — fixed, and with no observed `Code`.
+/// ([`MESSAGE_VAULT_ALREADY_EXISTS`]) — fixed; its token is
+/// [`ERROR_CODE_TIERING_CONFIGURATION_ALREADY_EXISTS`].
 pub const MESSAGE_TIERING_CONFIGURATION_ALREADY_EXISTS: &str =
     "Tiering configuration with the same name already exists";
+
+/// `Code` for "a tiering configuration of this name already exists" — the
+/// create conflict's own token, as the vault's create conflict has its own
+/// ([`ERROR_CODE_VAULT_ALREADY_EXISTS`]).
+pub const ERROR_CODE_TIERING_CONFIGURATION_ALREADY_EXISTS: &str = "ERROR_1C01";
 
 /// The FIXED text AWS states for "the vault named carries no resource policy to
 /// report", up to and after the one variable part: the ARN of the vault the
@@ -1228,7 +1249,8 @@ pub fn vault_already_exists() -> AlreadyExistsException {
 
 /// The modelled refusal for a multi-party approval call whose named vault is of
 /// a type that supports none — see [`MESSAGE_UNSUPPORTED_VAULT_TYPE`] for which
-/// call states it and why. No `Code`: this condition has no observed token.
+/// call states it and why, with the condition's own token
+/// ([`ERROR_CODE_UNSUPPORTED_VAULT_TYPE`]).
 ///
 /// A vault-type precondition whose token AWS states builds its own exception
 /// instead — the source vault of a restore access create
@@ -1237,6 +1259,7 @@ pub fn vault_already_exists() -> AlreadyExistsException {
 /// condition carries its own token and its own sentence.
 pub fn unsupported_vault_type() -> InvalidParameterValueException {
     InvalidParameterValueException {
+        code: Some(ERROR_CODE_UNSUPPORTED_VAULT_TYPE.to_string()),
         message: Some(MESSAGE_UNSUPPORTED_VAULT_TYPE.to_string()),
         ..Default::default()
     }
@@ -1556,9 +1579,11 @@ pub fn recovery_point_not_found_value() -> InvalidParameterValueException {
 }
 
 /// The modelled refusal for a `RestoreJobId` this account holds no restore job
-/// under — see [`MESSAGE_RESTORE_JOB_NOT_FOUND`].
+/// under — see [`MESSAGE_RESTORE_JOB_NOT_FOUND`], with the condition's own
+/// token.
 pub fn restore_job_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
+        code: Some(ERROR_CODE_RESTORE_JOB_NOT_FOUND.to_string()),
         message: Some(MESSAGE_RESTORE_JOB_NOT_FOUND.to_string()),
         ..Default::default()
     }
@@ -1588,21 +1613,23 @@ pub fn restore_testing_plan_already_exists() -> AlreadyExistsException {
 
 /// The modelled refusal for a `TieringConfigurationName` this account holds no
 /// tiering configuration under — see
-/// [`MESSAGE_TIERING_CONFIGURATION_NOT_FOUND`].
+/// [`MESSAGE_TIERING_CONFIGURATION_NOT_FOUND`], with the condition's own token.
 pub fn tiering_configuration_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
+        code: Some(ERROR_CODE_TIERING_CONFIGURATION_NOT_FOUND.to_string()),
         message: Some(MESSAGE_TIERING_CONFIGURATION_NOT_FOUND.to_string()),
         ..Default::default()
     }
 }
 
 /// The modelled refusal for a create naming a tiering configuration that
-/// already exists.
+/// already exists, with the condition's own token.
 ///
 /// `Arn` and `CreatorRequestId` are left UNSET for the reason given on
 /// [`vault_already_exists`].
 pub fn tiering_configuration_already_exists() -> AlreadyExistsException {
     AlreadyExistsException {
+        code: Some(ERROR_CODE_TIERING_CONFIGURATION_ALREADY_EXISTS.to_string()),
         message: Some(MESSAGE_TIERING_CONFIGURATION_ALREADY_EXISTS.to_string()),
         ..Default::default()
     }

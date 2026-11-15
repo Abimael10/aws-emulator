@@ -4850,3 +4850,13 @@ mod appended_notes;
 //! needs the whole mounted service set belong in that suite's own module doc, where they
 //! stay next to the test they describe instead of growing this root past the project's
 //! file-length limit.
+//! `#[path]`/`mod` pair, keeping the list sorted. A suite that is not declared here
+//! compiles nowhere and its tests never run; a suite left at the top level of
+//! `tests/` fails the build; and a suite declared twice is `E0428`, which fails every
+//! THIS BLOCK IS THE ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE:
+//! further down must be an ordinary `//` comment. Below, add a declaration — not a note
+//! this file, which the layout check refuses: the `#[path]` is what points each module
+//! into `tests/all/`. Some of the files below are shared harnesses rather than suites
+//! (`query_wire`, `eks_wire`, `cloudformation_stack_clock`) and some are empty probes;
+//! every file under `tests/all/` is declared, because a file no declaration names is
+//! compiled nowhere.

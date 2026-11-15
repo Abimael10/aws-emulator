@@ -73,6 +73,8 @@ mod recovery_point_deletion;
 mod recovery_point_denial_sentence;
 #[path = "all/recovery_point_read.rs"]
 mod recovery_point_read;
+#[path = "all/refusal_error_codes.rs"]
+mod refusal_error_codes;
 #[path = "all/refused_job_start_publishes_no_event.rs"]
 mod refused_job_start_publishes_no_event;
 #[path = "all/refused_vault_create_tag_side_effects.rs"]
