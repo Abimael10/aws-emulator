@@ -74,7 +74,7 @@ const QUIET_BUDGET: Duration = AWSVPC_START.saturating_add(Duration::from_secs(1
 /// A router carrying Amazon ECS, EventBridge and Amazon SQS over ONE shared engine — the
 /// three services a published task event travels through, mounted the way the production
 /// router mounts them.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     // The tasks of this suite are placed in an `awsvpc` subnet, which a placement is
     // resolved against ([`crate::ecs_wire::seed_awsvpc_subnets`]).
@@ -139,18 +139,26 @@ async fn rpc(
 }
 
 /// One EventBridge call.
-async fn events(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn events(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     rpc(router, "events", "AWSEvents", "1.1", operation, body).await
 }
 
 /// One Amazon SQS call.
-async fn sqs(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn sqs(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
     rpc(router, "sqs", "AmazonSQS", "1.0", operation, body).await
 }
 
 /// An SQS queue called `name`, created through Amazon SQS itself; answers its url and the
 /// ARN a rule names it by.
-async fn given_queue(router: &MultiServiceRouter, case: &str, name: &str) -> (String, String) {
+pub(crate) async fn given_queue(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> (String, String) {
     let (status, body) = sqs(router, "CreateQueue", json!({ "QueueName": name })).await;
     assert_eq!(
         status, 200,
@@ -181,7 +189,12 @@ async fn given_queue(router: &MultiServiceRouter, case: &str, name: &str) -> (St
 /// `url` — EventBridge makes that call as its own service principal and relies on the
 /// queue's resource-based policy for it, so a queue that has granted it nothing receives
 /// nothing.
-async fn grant_delivery(router: &MultiServiceRouter, case: &str, url: &str, queue_arn: &str) {
+pub(crate) async fn grant_delivery(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+    queue_arn: &str,
+) {
     let policy = json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -205,7 +218,7 @@ async fn grant_delivery(router: &MultiServiceRouter, case: &str, url: &str, queu
 }
 
 /// Put the rule `name` with `pattern` and point it at the SQS queue `queue_arn`.
-async fn given_rule(
+pub(crate) async fn given_rule(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -242,7 +255,7 @@ async fn given_rule(
 }
 
 /// Every message waiting on the queue at `url` right now, as parsed event envelopes.
-async fn drain(router: &MultiServiceRouter, case: &str, url: &str) -> Vec<Value> {
+pub(crate) async fn drain(router: &MultiServiceRouter, case: &str, url: &str) -> Vec<Value> {
     let (status, body) = sqs(
         router,
         "ReceiveMessage",

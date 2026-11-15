@@ -287,6 +287,11 @@ pub use classic_load_balancers::*;
 mod task_events;
 pub use task_events::*;
 
+/// The `ECS Service Action` events this service publishes as its SERVICE scheduler acts —
+/// the steady state a rollout settles into, and the one a task set reaches.
+mod service_action_events;
+pub use service_action_events::*;
+
 /// What a container's `command` DOES: the session one container's program runs in, and the
 /// output and exit status running it produces.
 mod container_shell;
@@ -4204,6 +4209,9 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// The task state changes this store has observed and not published to EventBridge
     /// yet, oldest first — see [`task_events`].
     pending_task_events: VecDeque<TaskStateChange>,
+    /// The service actions this store's scheduler has taken and not published to
+    /// EventBridge yet, oldest first — see [`service_action_events`].
+    pending_service_action_events: VecDeque<ServiceActionEvent>,
     /// `taskArn` -> the `(lastStatus, desiredStatus)` pair last published for that task, so
     /// a transition is recognised once however it was written and published exactly once
     /// ([`Self::record_task_state_changes`]).

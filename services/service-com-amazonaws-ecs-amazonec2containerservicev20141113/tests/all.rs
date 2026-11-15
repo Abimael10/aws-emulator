@@ -173,6 +173,8 @@ mod resource_scoping_and_agent_plane;
 mod resource_tags;
 #[path = "all/rolling_update_bounds.rs"]
 mod rolling_update_bounds;
+#[path = "all/service_action_events.rs"]
+mod service_action_events;
 #[path = "all/service_delete_drain.rs"]
 mod service_delete_drain;
 #[path = "all/service_deployment_lifecycle_hooks.rs"]

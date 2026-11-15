@@ -196,10 +196,26 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         // The scheduler's confirmation that a task set has reached a steady state, owed at
         // the instant the write that touched it put on the record: once it is due the task
         // set is stable whether or not anybody called to look.
+        let stabilised: Vec<(String, String, SystemTime)> = self
+            .task_sets
+            .values()
+            .filter_map(|task_set| {
+                task_set
+                    .stable_due_at
+                    .filter(|due| *due <= now)
+                    .map(|due| (task_set.arn.clone(), task_set.cluster_arn.clone(), due))
+            })
+            .collect();
         for task_set in self.task_sets.values_mut() {
             if task_set.stable_due_at.is_some_and(|due| due <= now) {
                 task_set.stable_due_at = None;
             }
+        }
+        // That confirmation is an ACTION of the scheduler, so it is published onto the
+        // account's event bus as well as reported to a caller that reads the task set
+        // ([`super::service_action_events`]).
+        for (task_set_arn, cluster_arn, due) in stabilised {
+            self.record_service_action(&task_set_arn, &cluster_arn, TASKSET_STEADY_STATE, due);
         }
         // The drain a `DeleteTaskSet` started: once it is due the task set it was draining
         // away is gone, whether or not anybody called to look.
@@ -427,6 +443,22 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 self.task_sets.retain(|(cluster, service, _), _| {
                     (cluster, service) != (&key.0, &key.1)
                 });
+            }
+            // The steady state this pass just settled is an ACTION of the scheduler, so it
+            // is published onto the account's event bus beside the entry it writes on the
+            // service's own event stream: a client that watches the bus observes the
+            // scheduler without calling Amazon ECS again
+            // ([`super::service_action_events`]). Queued here, where the action was
+            // materialised, so it is queued exactly once however the pass was reached.
+            if let Some(due) = settled {
+                // What the action NAMES: the service itself, and the cluster the scheduler
+                // acted in — read off the record here, in the pass that settled it, rather
+                // than for every service of every pass.
+                let (service_arn, cluster_arn) = match self.services.get(&key) {
+                    Some(service) => (service.arn.clone(), service.cluster_arn.clone()),
+                    None => continue,
+                };
+                self.record_service_action(&service_arn, &cluster_arn, SERVICE_STEADY_STATE, due);
             }
         }
     }

@@ -7040,3 +7040,15 @@ mod all_rs_is_a_canonical_declaration_list;
 //! for its rule to hold — is stated in that suite's OWN module docs, which is the one place
 //! it cannot drift from the code it describes; the notes landings had appended to the tail
 //! of this file are kept in `all/appended_notes.rs` instead.
+//! of it, which the layout check refuses: the `#[path]` above each `mod` is what points the
+//! This file is ONE crate root, and two rules follow from that. Declare each suite exactly
+//! ONCE: a second `mod` for the same name is `E0428`. Keep every inner doc comment (`//!`)
+//! in THIS header: past the first item one is `E0753`. Either fails every suite in this
+//! target at once, so `all/all_rs_declares_each_suite_once.rs` and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves, for this
+//! WHAT THIS FILE HOLDS: this header, and one `#[path]`/`mod` pair per suite. Nothing else
+//! — a note about what a suite covers, or about why it lives here rather than in a service
+//! crate, belongs in the module doc of that suite's OWN file, where it is next to the code
+//! it describes and cannot collide with another landing's note. A landing that appends prose
+//! here instead grows a file every suite in the target depends on, and this crate root has
+//! the project's 5000-line ceiling to stay under.

@@ -248,16 +248,24 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         now: SystemTime,
         generation: u64,
     ) -> Option<SystemTime> {
-        if !self.pending_task_events.is_empty() {
+        if !self.pending_task_events.is_empty() || self.has_pending_service_actions() {
             return Some(now);
         }
         // The service scheduler's own next step is an instant the pump waits for too: a
         // rolling update takes one step per span ([`super::rolling_update`]), and the step
         // after this one is owed whether or not anybody calls again.
-        let next = [self.next_task_due_at(), self.next_scheduler_step_due_at(now)]
-            .into_iter()
-            .flatten()
-            .min();
+        let next = [
+            self.next_task_due_at(),
+            self.next_scheduler_step_due_at(now),
+            // So is the SERVICE-level transition the clock owes — the steady state a
+            // rollout settles into above all, which is an action a client watching the bus
+            // is waiting on and which no reader may be there to materialise
+            // ([`super::service_action_events`]).
+            self.next_service_transition_due_at(now),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         match next {
             Some(due) => Some(due),
             None => {
@@ -337,7 +345,7 @@ fn epoch_millis(at: SystemTime) -> i64 {
 
 /// The date-time text a timestamp is reported as inside an event's `detail`: RFC 3339 in
 /// UTC, which is the form every AWS event body carries an instant in.
-fn date_time_text(at: DateTime) -> Option<String> {
+pub(super) fn date_time_text(at: DateTime) -> Option<String> {
     at.fmt(::aws_smithy_types::date_time::Format::DateTime).ok()
 }
 
@@ -568,46 +576,72 @@ async fn publish_pending<Eng: Send + Sync + 'static>(
     };
     let client = ::service_common::eventbridge_client::eventbridge_client(callback, region);
     loop {
-        let changes = {
+        let (changes, actions) = {
             let mut store = state.lock();
             store.record_task_state_changes(SystemTime::now());
-            store.take_task_state_changes(MAX_PUBLISHED_PER_DRAIN)
+            (
+                store.take_task_state_changes(MAX_PUBLISHED_PER_DRAIN),
+                // The actions this store's SERVICE scheduler has taken travel the same hop
+                // as a task's moves, and are drained in the same critical section, so one
+                // pump publishes everything this service owes the bus
+                // ([`super::service_action_events`]).
+                store.take_service_action_events(MAX_PUBLISHED_PER_DRAIN),
+            )
         };
-        if changes.is_empty() {
+        if changes.is_empty() && actions.is_empty() {
             return;
         }
         publish_batch(&client, &changes).await;
+        super::service_action_events::publish_service_actions(&client, &actions).await;
     }
 }
 
-/// Publish one drain, in `PutEvents` requests of at most [`MAX_PUT_EVENTS_ENTRIES`]
-/// entries.
+/// Publish one drain of task state changes.
 async fn publish_batch(client: &::aws_sdk_eventbridge::Client, changes: &[TaskStateChange]) {
-    for window in changes.chunks(MAX_PUT_EVENTS_ENTRIES) {
+    let entries: Vec<(&str, SystemTime, &::serde_json::Value)> = changes
+        .iter()
+        // The event names the resource it is about, which is what a rule filtering on
+        // `resources` reads.
+        .map(|change| (change.task_arn.as_str(), change.at, &change.detail))
+        .collect();
+    publish_events(client, TASK_STATE_CHANGE_DETAIL_TYPE, &entries).await;
+}
+
+/// Publish `entries` under ONE `detail-type`, in `PutEvents` requests of at most
+/// [`MAX_PUT_EVENTS_ENTRIES`] entries.
+///
+/// The one place this service builds an event envelope: whatever moved — a task or the
+/// service scheduler — the event is published onto the account's default event bus
+/// ([`DEFAULT_EVENT_BUS`]) under this service's own `source` ([`EVENT_SOURCE`]), naming the
+/// resource it is about in `resources` and the instant it happened at in `time`.
+pub(super) async fn publish_events(
+    client: &::aws_sdk_eventbridge::Client,
+    detail_type: &str,
+    entries: &[(&str, SystemTime, &::serde_json::Value)],
+) {
+    for window in entries.chunks(MAX_PUT_EVENTS_ENTRIES) {
         let mut request = client.put_events();
-        for change in window {
+        for (resource_arn, at, detail) in window {
             let entry = ::aws_sdk_eventbridge::types::PutEventsRequestEntry::builder()
                 .event_bus_name(DEFAULT_EVENT_BUS)
                 .source(EVENT_SOURCE)
-                .detail_type(TASK_STATE_CHANGE_DETAIL_TYPE)
-                // The event's `time` is WHEN the task moved, not when the queue was
-                // drained: `PutEventsRequestEntry$Time` is "the time stamp of the event,
-                // per RFC3339. If no time stamp is provided, the time stamp of the
-                // PutEvents call is used."
+                .detail_type(detail_type)
+                // The event's `time` is WHEN it happened, not when the queue was drained:
+                // `PutEventsRequestEntry$Time` is "the time stamp of the event, per RFC3339.
+                // If no time stamp is provided, the time stamp of the PutEvents call is
+                // used."
                 .time(::aws_sdk_eventbridge::primitives::DateTime::from_millis(
-                    epoch_millis(change.at),
+                    epoch_millis(*at),
                 ))
-                // The event names the resource it is about, which is what a rule filtering
-                // on `resources` reads.
-                .resources(&change.task_arn)
-                .detail(change.detail.to_string())
+                .resources(*resource_arn)
+                .detail(detail.to_string())
                 .build();
             request = request.entries(entry);
         }
         if let Err(error) = request.send().await {
             ::tracing::warn!(
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "an ECS task state change could not be published to EventBridge"
+                "an ECS {detail_type} event could not be published to EventBridge"
             );
         }
     }
