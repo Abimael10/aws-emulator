@@ -157,6 +157,8 @@ mod json_filter_pattern_value_types;
 mod kms_key_resolution;
 #[path = "all/list_anomalies.rs"]
 mod list_anomalies;
+#[path = "all/live_tail_filter_pattern_terms.rs"]
+mod live_tail_filter_pattern_terms;
 #[path = "all/live_tail_sessions.rs"]
 mod live_tail_sessions;
 #[path = "all/live_tail_wire_delivery.rs"]
