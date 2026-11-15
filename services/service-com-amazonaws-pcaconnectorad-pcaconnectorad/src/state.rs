@@ -17,6 +17,18 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{TemplateDefinition, TemplateRevision, VpcInformation};
 
+/// WHO may perform an action on a resource of this service: the identity-based decision
+/// every handler takes before it reads or writes anything.
+mod authorization;
+/// The tag map of a resource addressed by ARN, which the tagging endpoints read and write.
+mod tagging;
+/// The resource-tagging layer's own refusal classes, which this model declares nowhere.
+mod tagging_refusal;
+
+pub use authorization::{any_connector, any_directory_registration, authorize, ACTION_PREFIX};
+pub use tagging::{parses_as_arn, Taggable};
+pub use tagging_refusal::TaggingError;
+
 /// This service's ARN namespace and SigV4 signing name (`OPERATIONS.md`, "Wire
 /// protocol"). Every ARN this service mints carries it.
 pub const ARN_NAMESPACE: &str = "pca-connector-ad";

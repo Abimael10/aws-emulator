@@ -156,7 +156,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // IAM decides before anything is read. A listing addresses no registration of its
+        // own, so it is judged against the COLLECTION it reads over, in the Region the
+        // request was signed for — the ARN this service names such a request's subject by.
+        if let Some(message) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::any_directory_registration(ctx),
+        ) {
+            return Err(ListDirectoryRegistrationsErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 ListDirectoryRegistrationsErrorModeled::InternalServerException(

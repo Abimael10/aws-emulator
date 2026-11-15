@@ -82,11 +82,27 @@ pub fn encode_label(value: &str) -> String {
         .collect()
 }
 
+/// The access key id every call signs with unless a suite names another: a key neither STS
+/// nor IAM holds a record for, which is the position AWS account root credentials are in.
+pub const ACCOUNT_KEY_ID: &str = "AKIDEXAMPLE";
+
 /// One request through the same `MultiServiceRouter::dispatch` the production front
 /// door uses: the HTTP status, the modelled error code (empty on success) and the
 /// parsed body (`Value::Null` when there was none).
 pub async fn call(
     router: &MultiServiceRouter,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&Value>,
+) -> (u16, String, Value) {
+    call_as(router, ACCOUNT_KEY_ID, method, path_and_query, body).await
+}
+
+/// [`call`] signed with `access_key_id`, which is what names the principal the request
+/// speaks for — the one thing a suite about WHO may call this service has to vary.
+pub async fn call_as(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
     method: &str,
     path_and_query: &str,
     body: Option<&Value>,
@@ -105,7 +121,7 @@ pub async fn call(
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/pca-connector-ad/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/pca-connector-ad/aws4_request, \
                  SignedHeaders=host, Signature=0123456789abcdef"
             ),
         )

@@ -189,7 +189,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // IAM decides before anything is read or written. The call is judged against the
+        // directory registration it creates the name under — the parent resource the
+        // request addresses, since a service principal name has no ARN of its own; a
+        // refused call persists nothing.
+        if let Some(message) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.directory_registration_arn,
+        ) {
+            return Err(CreateServicePrincipalNameErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 CreateServicePrincipalNameErrorModeled::InternalServerException(

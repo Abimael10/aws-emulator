@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the named tag keys from the resource the request addresses by ARN, and answers
+//! the modelled 204 with no body.
+//!
+//! Two refusals of this endpoint are the resource-tagging LAYER's rather than this
+//! service's, and both are taken before anything is removed
+//! ([`crate::state::TaggingError`]): a `ResourceArn` that is not an ARN at all is refused
+//! with that layer's bad-request class, before any lookup, and an ARN it holds no resource
+//! under with that layer's not-found class. Neither is this service's
+//! `ResourceNotFoundException`, because neither refusal comes from this service.
 //!
 //! ## Shape of an operation
 //!
@@ -125,9 +126,12 @@ pub enum UntagResourceErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::untag_resource::UntagResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type UntagResourceError = crate::scaffolded::Scaffolded<UntagResourceErrorModeled>;
+/// (`crate::ops::untag_resource::UntagResourceError`). This is a tagging endpoint, so the
+/// channel is the shared [`crate::state::TaggingError`]: the scaffold wrapper (this
+/// operation's modelled errors, plus the `ValidationException` a handler needs for a
+/// refusal its model cannot express) and the tagging layer's own two refusals, which this
+/// model declares on no shape.
+pub type UntagResourceError = crate::state::TaggingError<UntagResourceErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
@@ -135,7 +139,7 @@ pub type UntagResourceError = crate::scaffolded::Scaffolded<UntagResourceErrorMo
 /// this operation is implemented.
 impl From<UntagResourceErrorModeled> for UntagResourceError {
     fn from(modeled: UntagResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Scaffolded(crate::scaffolded::Scaffolded::Modeled(modeled))
     }
 }
 
@@ -175,18 +179,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // IAM decides first, so a caller its policies do not allow is told it is not
+        // authorized rather than told anything about the ARN it addressed, and nothing is
+        // removed. The resource is the one the request NAMES.
+        if let Some(message) =
+            crate::state::authorize(&*self.engine, ctx, Self::NAME, &input.resource_arn)
+        {
+            return Err(UntagResourceErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
+
+        // `ResourceArn` is parsed BEFORE anything is looked up — before the store is even
+        // reached — so a value that is not an ARN at all is refused by the layer that
+        // parses it rather than reported as a resource this service does not hold. The
+        // member is a bare `String` with no `@pattern` and no `@length`
+        // (`smithy_query(query="operation",operation="UntagResource")`), so nothing is
+        // refused for it at the request boundary and this is the only place the check can
+        // live.
+        if !crate::state::parses_as_arn(&input.resource_arn) {
+            return Err(UntagResourceError::malformed_resource_arn());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the pca-connector-ad state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Every move the clock already owes is materialised before the lookup, so a
+        // registration whose removal has come due no longer carries tags to remove.
+        store.settle(now);
+
+        // The removal's own lookup, taken mutably: it lands on the very map
+        // `ListTagsForResource` reads, and it is also what answers a `ResourceArn` this
+        // service holds no resource under.
+        let Some(mut target) = store.taggable_mut(&input.resource_arn) else {
+            return Err(UntagResourceError::not_found());
+        };
+        target.remove_tags(input.tag_keys.iter().map(String::as_str), now);
+
+        // `UntagResource` models no output members (its output shape is `Unit`): the
+        // modelled 204 and an empty body are the whole answer, and what the resource is
+        // left carrying is read back through `ListTagsForResource`.
+        Ok(UntagResourceOutput)
     }
 }

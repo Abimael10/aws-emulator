@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: the canonical DECLARATION LIST of every
+// cross-service suite under `tests/all/`, and nothing else.
+//
 // Single integration-test target for the router: a declaration list, and nothing else.
 //
 // Past this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
@@ -90,6 +93,8 @@
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
 // `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs` and
 // `all/declaration_roots_are_canonical_and_complete.rs` check all of the above, for this file
+// and for every service crate's `tests/all.rs`, so check there rather than leaving a note
+// here.
 // The header paragraphs above wrap without the indentation `clippy::doc_lazy_continuation`
 // asks of a doc list item; the lint is allowed here so a header line is a header line rather
 // than a build failure. An inner attribute, like an inner doc comment, is legal only before

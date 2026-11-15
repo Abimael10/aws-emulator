@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_pattern_refusal_clauses.rs"]
 mod arn_pattern_refusal_clauses;
+#[path = "all/body_schema_findings.rs"]
+mod body_schema_findings;
 #[path = "all/connector_lifecycle.rs"]
 mod connector_lifecycle;
 #[path = "all/connector_prerequisites.rs"]
@@ -25,12 +27,16 @@ mod directory_registration_lifecycle;
 // router, the request builder, the `@httpLabel` encoding and the error-code read.
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/identity_authorization.rs"]
+mod identity_authorization;
 #[path = "all/pagination_token_refusals.rs"]
 mod pagination_token_refusals;
 #[path = "all/pattern_refusal_messages.rs"]
 mod pattern_refusal_messages;
 #[path = "all/resource_not_found_messages.rs"]
 mod resource_not_found_messages;
+#[path = "all/resource_tag_removal.rs"]
+mod resource_tag_removal;
 #[path = "all/service_principal_name_lifecycle.rs"]
 mod service_principal_name_lifecycle;
 #[path = "all/state_roundtrip.rs"]

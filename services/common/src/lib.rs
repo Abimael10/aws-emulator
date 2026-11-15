@@ -654,6 +654,9 @@ pub mod submitted_collections;
 /// The ONE list of SQL functions caller SQL may call, for every data plane that runs it on
 /// the in-process SQLite engine.
 pub mod sqlite_confinement;
+/// The ONE home for the two refusals the resource-tagging layer in front of a service
+/// answers with, for every service whose recordings show that layer's own error classes.
+pub mod tagging_refusal;
 /// The ONE token bucket an emulated service meters a caller-driven request rate with, for
 /// every service whose model publishes a rate-and-burst pair.
 pub mod token_bucket;

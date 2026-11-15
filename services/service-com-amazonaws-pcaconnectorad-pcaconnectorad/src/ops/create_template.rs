@@ -180,7 +180,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // Modelled input validation runs BEFORE any resource is resolved, so a
         // request whose own values are outside what the model admits is refused for
         // that whatever it names: `Name` and every `SupersededTemplates` entry of
@@ -195,6 +194,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         if let Some(report) = crate::state::template_name_report(submitted_names) {
             return Err(crate::scaffolded::Scaffolded::validation(report));
+        }
+
+        // IAM decides before any resource is resolved, but AFTER the modelled input
+        // validation above: that check stands in for the validating layer in FRONT of this
+        // service (`crate::service`'s own door), which refuses a request that is invalid in
+        // itself before IAM is asked at all. A refused call persists nothing.
+        if let Some(message) =
+            crate::state::authorize(&*self.engine, ctx, Self::NAME, &input.connector_arn)
+        {
+            return Err(CreateTemplateErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {

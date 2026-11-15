@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags the resource the request addresses by ARN carries — the very map
+//! `UntagResource` removes keys from, so the two cannot disagree.
+//!
+//! Its two refusals are the resource-tagging LAYER's, as they are for the removal: a
+//! `ResourceArn` that is not an ARN at all is refused before any lookup, and an ARN this
+//! service holds no resource under with that layer's not-found class
+//! ([`crate::state::TaggingError`]).
 //!
 //! ## Shape of an operation
 //!
@@ -103,9 +102,12 @@ pub enum ListTagsForResourceErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type ListTagsForResourceError = crate::scaffolded::Scaffolded<ListTagsForResourceErrorModeled>;
+/// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`). This is a tagging
+/// endpoint, so the channel is the shared [`crate::state::TaggingError`]: the scaffold
+/// wrapper (this operation's modelled errors, plus the `ValidationException` a handler
+/// needs for a refusal its model cannot express) and the tagging layer's own two refusals,
+/// which this model declares on no shape.
+pub type ListTagsForResourceError = crate::state::TaggingError<ListTagsForResourceErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
@@ -113,7 +115,7 @@ pub type ListTagsForResourceError = crate::scaffolded::Scaffolded<ListTagsForRes
 /// this operation is implemented.
 impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     fn from(modeled: ListTagsForResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Scaffolded(crate::scaffolded::Scaffolded::Modeled(modeled))
     }
 }
 
@@ -153,18 +155,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // IAM decides first, so a caller its policies do not allow is told it is not
+        // authorized rather than told what the ARN it addressed carries. The resource is
+        // the one the request NAMES.
+        if let Some(message) =
+            crate::state::authorize(&*self.engine, ctx, Self::NAME, &input.resource_arn)
+        {
+            return Err(ListTagsForResourceErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
+
+        // The ARN is parsed before anything is looked up, exactly as it is for the removal:
+        // the member is a bare `String` with no `@pattern`, so nothing is refused for it at
+        // the request boundary.
+        if !crate::state::parses_as_arn(&input.resource_arn) {
+            return Err(ListTagsForResourceError::malformed_resource_arn());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the pca-connector-ad state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising the moves the clock already
+        // owed, each of which was due whether or not anybody called — including the removal
+        // of a registration whose delete has come due, which carries its tags away with it.
+        store.settle(::std::time::SystemTime::now());
+
+        let Some(tags) = store.tags_of(&input.resource_arn) else {
+            return Err(ListTagsForResourceError::not_found());
+        };
+
+        // `Tags` is optional on the wire; a resource carrying none reports an empty map
+        // rather than omitting the member, so a caller reads the same shape either way.
+        Ok(ListTagsForResourceOutput {
+            tags: Some(tags.clone()),
+        })
     }
 }

@@ -147,7 +147,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // IAM decides before anything is read: a caller whose policies do not allow this
+        // action is told it is not authorized rather than told anything about the
+        // connector the request named — including whether it exists.
+        if let Some(message) =
+            crate::state::authorize(&*self.engine, ctx, Self::NAME, &input.connector_arn)
+        {
+            return Err(GetConnectorErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetConnectorErrorModeled::InternalServerException(
                 InternalServerException {

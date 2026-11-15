@@ -41,10 +41,16 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use service_common::front_door::FrontDoorTable;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// How this service words a request BODY it refused for a modelled constraint: the
+/// findings the validating layer in front of it states, which are not the clauses the
+/// framework writes for a value bound to the request URI.
+mod schema_findings;
 
 /// The `com-amazonaws-pcaconnectorad-pcaconnectorad` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -53,6 +59,13 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The same modelled operations the generated table holds, each served behind this
+    /// service's front door, so a request BODY that breaks a modelled constraint is
+    /// refused in that layer's words ([`schema_findings`]) before the operation runs.
+    /// Keyed by the routing key the protocol resolves — the key the generated table uses
+    /// — and built from the SAME shared engine, so a wrapped operation reads and writes
+    /// the one store.
+    front_door: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,8 +73,79 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut front_door = FrontDoorTable::worded(schema_findings::body_findings);
+        // EVERY modelled operation, so the rule is applied by ONE code path rather than
+        // per operation: an operation that binds nothing to the body (`GetConnector`,
+        // whose only member is its URI label) simply never has a body violation to find,
+        // which the door reads off its own input schema. Each is keyed by its own
+        // modelled name, which `FrontDoorTable` reads off the operation.
+        front_door
+            .serve(crate::ops::create_connector::CreateConnector::new(Arc::clone(&engine)))
+            .serve(crate::ops::create_directory_registration::CreateDirectoryRegistration::new(
+                Arc::clone(&engine),
+            ))
+            .serve(crate::ops::create_service_principal_name::CreateServicePrincipalName::new(
+                Arc::clone(&engine),
+            ))
+            .serve(crate::ops::create_template::CreateTemplate::new(Arc::clone(&engine)))
+            .serve(
+                crate::ops::create_template_group_access_control_entry::CreateTemplateGroupAccessControlEntry::new(
+                    Arc::clone(&engine),
+                ),
+            )
+            .serve(crate::ops::delete_connector::DeleteConnector::new(Arc::clone(&engine)))
+            .serve(crate::ops::delete_directory_registration::DeleteDirectoryRegistration::new(
+                Arc::clone(&engine),
+            ))
+            .serve(crate::ops::delete_service_principal_name::DeleteServicePrincipalName::new(
+                Arc::clone(&engine),
+            ))
+            .serve(crate::ops::delete_template::DeleteTemplate::new(Arc::clone(&engine)))
+            .serve(
+                crate::ops::delete_template_group_access_control_entry::DeleteTemplateGroupAccessControlEntry::new(
+                    Arc::clone(&engine),
+                ),
+            )
+            .serve(crate::ops::get_connector::GetConnector::new(Arc::clone(&engine)))
+            .serve(crate::ops::get_directory_registration::GetDirectoryRegistration::new(
+                Arc::clone(&engine),
+            ))
+            .serve(crate::ops::get_service_principal_name::GetServicePrincipalName::new(
+                Arc::clone(&engine),
+            ))
+            .serve(crate::ops::get_template::GetTemplate::new(Arc::clone(&engine)))
+            .serve(
+                crate::ops::get_template_group_access_control_entry::GetTemplateGroupAccessControlEntry::new(
+                    Arc::clone(&engine),
+                ),
+            )
+            .serve(crate::ops::list_connectors::ListConnectors::new(Arc::clone(&engine)))
+            .serve(crate::ops::list_directory_registrations::ListDirectoryRegistrations::new(
+                Arc::clone(&engine),
+            ))
+            .serve(crate::ops::list_service_principal_names::ListServicePrincipalNames::new(
+                Arc::clone(&engine),
+            ))
+            .serve(crate::ops::list_tags_for_resource::ListTagsForResource::new(Arc::clone(
+                &engine,
+            )))
+            .serve(
+                crate::ops::list_template_group_access_control_entries::ListTemplateGroupAccessControlEntries::new(
+                    Arc::clone(&engine),
+                ),
+            )
+            .serve(crate::ops::list_templates::ListTemplates::new(Arc::clone(&engine)))
+            .serve(crate::ops::tag_resource::TagResource::new(Arc::clone(&engine)))
+            .serve(crate::ops::untag_resource::UntagResource::new(Arc::clone(&engine)))
+            .serve(crate::ops::update_template::UpdateTemplate::new(Arc::clone(&engine)))
+            .serve(
+                crate::ops::update_template_group_access_control_entry::UpdateTemplateGroupAccessControlEntry::new(
+                    Arc::clone(&engine),
+                ),
+            );
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            front_door: front_door.finish(),
         }
     }
 }
@@ -88,12 +172,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: the key is the one the generated table's own protocol
+        // resolves, and the operation it names is the one served — behind this
+        // service's front door, so a request BODY outside a modelled constraint is
+        // refused in that layer's words ([`schema_findings`]) before the operation
+        // runs. A key the model does not name resolves to `None` here exactly as it
+        // does in the generated table, so the router's routing-error path is unchanged.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.front_door.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -116,6 +202,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // answers restJson1), so it lives in `service-common` rather than being
         // spelled here, and it reaches every member of every operation this service
         // models rather than the one `@pattern` a recording happened to break.
+        //
+        // What reaches here is the refusal of a value the request carries OUTSIDE its
+        // body: a BODY member's violation is answered by the front door above, in the
+        // words the validating layer in front of this service states
+        // ([`schema_findings`]), which this seam cannot do — it is handed the
+        // violations alone, with no operation, so it cannot tell the two halves apart.
         ::service_common::validation_message::aws_validation_refusal(refusal)
     }
 
@@ -145,5 +237,72 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The one thing about the wiring above that a wire test cannot see: that the
+    //! hand-maintained `serve` list is the WHOLE surface.
+
+    use super::*;
+
+    /// This service's Smithy model, as it ships beside this crate. Read at test time rather
+    /// than embedded: it is JSON that no non-test build needs.
+    const MODEL_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/smithy-model/com-amazonaws-pcaconnectorad-pcaconnectorad.json"
+    );
+
+    /// How many operations this service's model declares, as a second, independent
+    /// statement of its surface (`smithy_query(query="list_operations")`): a model that
+    /// grows or shrinks fails here rather than quietly leaving the new operation out of the
+    /// front door.
+    const MODELLED_OPERATIONS: usize = 25;
+
+    /// RULE applied to the whole surface: every operation the model declares is served
+    /// behind this service's front door, under the same key the generated routing table is
+    /// keyed by.
+    ///
+    /// The names come from the MODEL rather than from a second hand list, so an operation
+    /// added to the model and not to the `serve` list fails here instead of silently
+    /// answering a body-constraint refusal in the framework's wording — and a key spelled
+    /// differently from the generated table's fails here instead of silently never being
+    /// reached by `override_operation`.
+    #[test]
+    fn every_modelled_operation_is_served_behind_the_front_door() {
+        let model = std::fs::read_to_string(MODEL_PATH)
+            .expect("the model that generated this crate ships beside it");
+        let model: serde_json::Value =
+            serde_json::from_str(&model).expect("the model that generated this crate is JSON");
+        let shapes = model["shapes"]
+            .as_object()
+            .expect("a Smithy model declares shapes");
+        let operations: Vec<&str> = shapes
+            .iter()
+            .filter(|(_, shape)| shape["type"] == "operation")
+            .filter_map(|(id, _)| id.rsplit('#').next())
+            .collect();
+        assert_eq!(
+            operations.len(),
+            MODELLED_OPERATIONS,
+            "case the model's surface: expected this service's {MODELLED_OPERATIONS} \
+             operations, got {operations:?}"
+        );
+
+        let service = EmulatedService::new(Arc::new(engine::InMemoryEngine::new()));
+        for operation in operations {
+            assert!(
+                service.entry.routing_table().get(operation).is_some(),
+                "case {operation}: the generated table keys an operation by its shape name; \
+                 this one resolved to nothing, so the front door's key spelling is wrong"
+            );
+            assert!(
+                service.front_door.get(operation).is_some(),
+                "case {operation}: every modelled operation is served behind the front door; \
+                 this one is missing from the `serve` list, so a body that breaks a modelled \
+                 constraint is refused in the framework's wording instead of this service's"
+            );
+        }
     }
 }

@@ -167,6 +167,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides before anything is read or written. A create addresses no
+        // registration of its own, so it is judged against the COLLECTION it adds to, in
+        // the Region the request was signed for; a refused call persists nothing.
+        if let Some(message) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::any_directory_registration(ctx),
+        ) {
+            return Err(
+                CreateDirectoryRegistrationErrorModeled::AccessDeniedException(
+                    AccessDeniedException { message },
+                )
+                .into(),
+            );
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 CreateDirectoryRegistrationErrorModeled::InternalServerException(
