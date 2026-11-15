@@ -14,6 +14,7 @@
 //!   member that was stored — over both values of `AutoCreateTasks`, both presence
 //!   states of each optional member, and both ends of the published `SigKeyCrc` range
 //!   and `Name` length;
+//! * a create that omits the `Update` payload the service requires is refused;
 //! * a minted `Id` is a fresh uuid and its ARN carries the region the request names;
 //! * an `Id` nothing holds is a 404, and one outside the published pattern is a 400;
 //! * an `@idempotencyToken` replay with the same parameters returns the first call's
@@ -91,7 +92,8 @@ struct Case {
     /// the model marks required, so only the refusal table does that.
     auto_create_tasks: Option<bool>,
     name: Option<String>,
-    /// The `Update` member the create carries, if any.
+    /// The `Update` member the create carries, if any. The service requires it, so only
+    /// the refusal table leaves it out.
     update: Option<Value>,
     tags: Option<Value>,
 }
@@ -154,12 +156,14 @@ fn cases() -> Vec<Case> {
             })),
             tags: Some(json!([])),
         },
-        // No name and no update: the definition is just its own identity.
+        // No name: the definition is just its own identity and the update it carries.
         Case {
-            case: "no-name-no-update",
+            case: "no-name",
             auto_create_tasks: Some(true),
             name: None,
-            update: None,
+            update: Some(json!({
+                "UpdateDataRole": "arn:aws:iam::000000000000:role/iotwireless-no-name",
+            })),
             tags: Some(json!([
                 { "Key": "owner", "Value": "fleet-a" },
                 { "Key": "stage", "Value": "prod" },
@@ -323,7 +327,11 @@ async fn a_minted_task_definition_arn_carries_the_region_the_request_names() {
             scope_region,
             Method::POST,
             "/wireless-gateway-task-definitions",
-            Some(json!({ "AutoCreateTasks": false, "Name": "region-case" })),
+            Some(json!({
+                "AutoCreateTasks": false,
+                "Name": "region-case",
+                "Update": { "UpdateDataSource": "s3://gateway-firmware/region-case.bin" },
+            })),
         )
         .await;
         assert_eq!(
@@ -369,8 +377,15 @@ async fn a_minted_task_definition_arn_carries_the_region_the_request_names() {
 #[tokio::test]
 async fn a_task_definition_id_nothing_holds_is_not_found() {
     let router = router();
-    let (status, created) =
-        create_definition(&router, json!({ "AutoCreateTasks": true, "Name": "held" })).await;
+    let (status, created) = create_definition(
+        &router,
+        json!({
+            "AutoCreateTasks": true,
+            "Name": "held",
+            "Update": { "UpdateDataSource": "s3://gateway-firmware/held.bin" },
+        }),
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::CREATED,
@@ -512,22 +527,34 @@ async fn a_value_outside_a_published_constraint_is_refused() {
     let cases: Vec<(&str, Value, bool)> = vec![
         (
             "Name at its floor",
-            json!({ "AutoCreateTasks": false, "Name": "x".repeat(NAME_MIN_LEN) }),
+            json!({
+                "AutoCreateTasks": false,
+                "Name": "x".repeat(NAME_MIN_LEN),
+                "Update": {},
+            }),
             true,
         ),
         (
             "Name at its ceiling",
-            json!({ "AutoCreateTasks": true, "Name": "x".repeat(NAME_MAX_LEN) }),
+            json!({
+                "AutoCreateTasks": true,
+                "Name": "x".repeat(NAME_MAX_LEN),
+                "Update": {},
+            }),
             true,
         ),
         (
             "Name below its floor",
-            json!({ "AutoCreateTasks": false, "Name": "" }),
+            json!({ "AutoCreateTasks": false, "Name": "", "Update": {} }),
             false,
         ),
         (
             "Name past its ceiling",
-            json!({ "AutoCreateTasks": false, "Name": "x".repeat(NAME_MAX_LEN + 1) }),
+            json!({
+                "AutoCreateTasks": false,
+                "Name": "x".repeat(NAME_MAX_LEN + 1),
+                "Update": {},
+            }),
             false,
         ),
         (
@@ -587,7 +614,11 @@ async fn a_value_outside_a_published_constraint_is_refused() {
         ),
         (
             "ClientRequestToken outside its pattern",
-            json!({ "AutoCreateTasks": false, "ClientRequestToken": "not a token!" }),
+            json!({
+                "AutoCreateTasks": false,
+                "ClientRequestToken": "not a token!",
+                "Update": {},
+            }),
             false,
         ),
         (
@@ -595,6 +626,7 @@ async fn a_value_outside_a_published_constraint_is_refused() {
             json!({
                 "AutoCreateTasks": false,
                 "ClientRequestToken": "token_for-the-pattern-case",
+                "Update": {},
             }),
             true,
         ),
@@ -602,7 +634,15 @@ async fn a_value_outside_a_published_constraint_is_refused() {
         // refused before it reaches the store.
         (
             "AutoCreateTasks left out",
-            json!({ "Name": "no-auto-create-tasks" }),
+            json!({ "Name": "no-auto-create-tasks", "Update": {} }),
+            false,
+        ),
+        // `Update` is required by the service, so a request that leaves it out is
+        // refused as well — the sentence it answers with is pinned in the
+        // required-member suite.
+        (
+            "Update left out",
+            json!({ "AutoCreateTasks": false, "Name": "no-update" }),
             false,
         ),
     ];
@@ -652,7 +692,11 @@ async fn the_task_definition_store_is_bounded() {
     for index in 0..MAX_WIRELESS_GATEWAY_TASK_DEFINITIONS {
         let (status, body) = create_definition(
             &router,
-            json!({ "AutoCreateTasks": index % 2 == 0, "Name": format!("definition-{index}") }),
+            json!({
+                "AutoCreateTasks": index % 2 == 0,
+                "Name": format!("definition-{index}"),
+                "Update": { "UpdateDataSource": format!("s3://gateway-firmware/{index}.bin") },
+            }),
         )
         .await;
         assert_eq!(
@@ -665,7 +709,7 @@ async fn the_task_definition_store_is_bounded() {
 
     let (status, body) = create_definition(
         &router,
-        json!({ "AutoCreateTasks": false, "Name": "one-too-many" }),
+        json!({ "AutoCreateTasks": false, "Name": "one-too-many", "Update": {} }),
     )
     .await;
     assert_eq!(

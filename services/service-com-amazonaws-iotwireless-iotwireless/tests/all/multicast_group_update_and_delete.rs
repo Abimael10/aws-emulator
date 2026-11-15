@@ -90,14 +90,14 @@ const REGION_DOWNLINK_CHANNEL: &[(&str, i64, i64)] = &[
 
 /// One answer from the router: the status, the `x-amzn-errortype` header the wire
 /// protocol names an error shape in, and the parsed body.
-struct Answer {
-    status: StatusCode,
-    error_type: String,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: StatusCode,
+    pub(crate) error_type: String,
+    pub(crate) body: Value,
 }
 
 /// Dispatch one call and keep its headers as well as its body, which [`call`] does not.
-async fn call_with_headers(
+pub(crate) async fn call_with_headers(
     router: &MultiServiceRouter,
     method: Method,
     uri: &str,

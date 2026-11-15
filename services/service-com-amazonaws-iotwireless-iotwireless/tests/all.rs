@@ -59,5 +59,7 @@ mod wireless_device_reported_members;
 mod wireless_gateway_lifecycle;
 #[path = "all/wireless_gateway_task_definition_lifecycle.rs"]
 mod wireless_gateway_task_definition_lifecycle;
+#[path = "all/wireless_gateway_task_definition_required_update_and_deletion.rs"]
+mod wireless_gateway_task_definition_required_update_and_deletion;
 #[path = "all/wireless_gateway_task_lifecycle.rs"]
 mod wireless_gateway_task_lifecycle;

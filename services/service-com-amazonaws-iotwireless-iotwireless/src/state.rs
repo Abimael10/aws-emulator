@@ -1013,6 +1013,19 @@ pub fn resource_not_found(resource_type: &str, resource_id: &str) -> ResourceNot
     }
 }
 
+/// The `ValidationException` body for a request that left out a member this service
+/// requires, whatever the model marks `@required`: the sentence the service words for
+/// this error class, whose only variable part is the name of the omitted member as the
+/// model spells it.
+///
+/// One function, so every operation that requires a member the model leaves optional
+/// refuses its absence with the same sentence.
+pub fn missing_parameter(member: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!("Parameter {member} is required.")),
+    }
+}
+
 /// The `ResourceNotFoundException` body for a wireless gateway task definition the
 /// account does not hold.
 ///
@@ -1846,10 +1859,11 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
 /// The cap cannot bind in practice, which is why evicting the oldest entry is a safe
 /// last resort rather than a behaviour change: at most one token is recorded per stored
 /// resource, a resource's tokens are dropped with it where its delete is implemented
-/// (`forget_*_tokens_for`, which the destination, wireless-device and multicast-group
-/// deletes call — the device-profile and wireless-gateway deletes are still
-/// scaffolded, so those two
-/// maps release a token only when the whole store is dropped), and each
+/// (`forget_*_tokens_for`, which the destination, wireless-device, device-profile,
+/// service-profile, multicast-group, FUOTA-task and wireless-gateway-task-definition
+/// deletes call — the wireless-gateway and network-analyzer-configuration deletes are
+/// still scaffolded, so those two maps release a token only when the whole store is
+/// dropped), and each
 /// token cap equals its resource ceiling — so the map can only reach `cap` when every
 /// entry in it names a resource the store accepted and the resource store is itself
 /// full, which the create already refuses before it gets here. Eviction exists so the
@@ -2043,6 +2057,16 @@ impl ComAmazonawsIotwirelessIotwirelessState {
             MAX_WIRELESS_GATEWAY_TASK_DEFINITION_TOKENS,
             token,
             record,
+        );
+    }
+
+    /// Drop every `CreateWirelessGatewayTaskDefinition` token that minted task definition
+    /// `id`, so a token never outlives the resource it names.
+    pub fn forget_wireless_gateway_task_definition_tokens_for(&mut self, id: &str) {
+        forget_tokens_for(
+            &mut self.wireless_gateway_task_definition_tokens,
+            &mut self.wireless_gateway_task_definition_token_order,
+            id,
         );
     }
 

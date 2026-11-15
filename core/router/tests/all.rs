@@ -7246,3 +7246,13 @@ mod events_lambda_target_permission_granted_after_the_rule;
 //! suite declared twice is `E0428`, which fails every suite in this target.
 //! (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is what points it
 //! into `tests/all/`.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, keeping the list sorted: this file
+//! holds those pairs and nothing else, so a landing has one place to insert and nothing
+//! to keep consistent. Why a suite belongs to this cross-service target rather than to
+//! one service crate's own is stated in that suite's own module doc, where it is read
+//! beside the test it describes.
+//! A suite no `mod` names compiles nowhere and its tests never run; a suite left at the
+//! top level of `tests/` fails the build; and a suite declared twice is `E0428`, which
+//! comment may stand in this file: past the first item one is `E0753` and compiles no
+//! suite of this target, so a note further down must be an ordinary comment — better
+//! still, add a declaration rather than a note about one.

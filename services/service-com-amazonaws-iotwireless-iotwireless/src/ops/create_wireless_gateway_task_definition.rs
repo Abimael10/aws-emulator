@@ -2,7 +2,8 @@
 
 //! @op CreateWirelessGatewayTaskDefinition
 //! IMPLEMENTED: stores a wireless gateway task definition in this service's store,
-//! minting its `Id` and ARN. This is the ONLY file to touch for this operation.
+//! minting its `Id` and ARN, and refuses a request that omits the `Update` payload the
+//! definition exists to describe. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,6 +169,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
+
+        // `Update` carries the firmware transfer a task definition exists to describe, so
+        // the service requires it even though the model leaves it optional: a request
+        // that omits it is refused before anything is stored or any token is replayed,
+        // naming the member it left out.
+        if input.update.is_none() {
+            return Err(
+                CreateWirelessGatewayTaskDefinitionErrorModeled::ValidationException(
+                    crate::state::missing_parameter("Update"),
+                )
+                .into(),
+            );
+        }
 
         let region = crate::state::request_region(ctx.parts());
         let fingerprint = fingerprint(&input);

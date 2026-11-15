@@ -53,6 +53,16 @@ const WIRELESS_GATEWAY_TASK_STATUSES: &[&str] =
 /// `CreateWirelessGatewayTask`'s `Status` is "the status of the request".
 const CREATED_TASK_STATUS: &str = "PENDING";
 
+/// A `CreateWirelessGatewayTaskDefinition` body every seed can send: the service
+/// requires the `Update` payload the definition describes, so a seed carries it even
+/// when the case under test is about something else.
+fn seed_definition_body() -> Value {
+    json!({
+        "AutoCreateTasks": false,
+        "Update": { "UpdateDataSource": "s3://gateway-firmware/station-2.0.6.bin" },
+    })
+}
+
 /// Ids the published `WirelessGatewayTaskDefinitionId` / `WirelessGatewayId` forms admit
 /// but no create in this suite ever minted.
 const UNMINTED_DEFINITION_ID: &str = "11111111-2222-3333-4444-555555555555";
@@ -163,7 +173,7 @@ struct Case {
 }
 
 /// The cases spanning the class: every definition shape a create can carry (both values
-/// of `AutoCreateTasks`, the `Update` member present, partial and absent) against
+/// of `AutoCreateTasks`, the required `Update` member in full and in part) against
 /// gateways that differ in the members they carry.
 fn cases() -> Vec<Case> {
     vec![
@@ -202,7 +212,7 @@ fn cases() -> Vec<Case> {
         Case {
             case: "bare-definition-named-gateway",
             gateway: json!({ "Name": "task-gateway-bare", "LoRaWAN": {} }),
-            definition: json!({ "AutoCreateTasks": false }),
+            definition: json!({ "AutoCreateTasks": false, "Update": {} }),
         },
         Case {
             case: "unnamed-gateway-tagged-definition",
@@ -210,6 +220,7 @@ fn cases() -> Vec<Case> {
             definition: json!({
                 "AutoCreateTasks": true,
                 "Name": "tagged",
+                "Update": { "LoRaWAN": { "UpdateVersion": { "Station": "2.0.6" } } },
                 "Tags": [{ "Key": "stage", "Value": "test" }],
             }),
         },
@@ -386,7 +397,7 @@ async fn a_task_round_trips_through_get_for_every_case() {
 #[tokio::test]
 async fn a_create_naming_a_resource_nothing_holds_is_not_found() {
     let router = router();
-    let held_definition = seed_definition(&router, json!({ "AutoCreateTasks": false })).await;
+    let held_definition = seed_definition(&router, seed_definition_body()).await;
 
     /// How the gateway the create addresses is obtained.
     enum Gateway {
@@ -578,7 +589,11 @@ async fn a_gateway_holds_at_most_one_task() {
         .await;
         let first = seed_definition(
             &router,
-            json!({ "AutoCreateTasks": false, "Name": format!("first-{index}") }),
+            json!({
+                "AutoCreateTasks": false,
+                "Name": format!("first-{index}"),
+                "Update": { "UpdateDataSource": "s3://gateway-firmware/station-2.0.6.bin" },
+            }),
         )
         .await;
         let second = if case == "the same definition" {
@@ -586,7 +601,11 @@ async fn a_gateway_holds_at_most_one_task() {
         } else {
             seed_definition(
                 &router,
-                json!({ "AutoCreateTasks": true, "Name": format!("second-{index}") }),
+                json!({
+                    "AutoCreateTasks": true,
+                    "Name": format!("second-{index}"),
+                    "Update": { "UpdateDataSource": "s3://gateway-firmware/station-2.0.7.bin" },
+                }),
             )
             .await
         };
@@ -664,7 +683,7 @@ async fn reading_a_task_no_gateway_holds_reports_none() {
 #[tokio::test]
 async fn a_create_outside_a_published_constraint_is_refused() {
     let router = router();
-    let definition = seed_definition(&router, json!({ "AutoCreateTasks": false })).await;
+    let definition = seed_definition(&router, seed_definition_body()).await;
 
     // (case, the create body, whether the service accepts it)
     let rows: Vec<(&str, Value, bool)> = vec![
