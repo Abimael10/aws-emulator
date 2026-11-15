@@ -25,23 +25,16 @@
 //! into the store the handlers read (`harness::seed_sync_job`), while the rule
 //! under test is about the jobs the workspace holds, whatever wrote them.
 
-use std::thread::sleep;
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use service_com_amazonaws_iottwinmaker_awsiottwinmaker::ops::types::SYNC_JOB_STATE_VALUES;
 use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
-    workspace_not_found_message, SYNC_JOB_NOT_FOUND_MESSAGE, SYNC_JOB_SETTLE_SPAN,
+    workspace_not_found_message, SYNC_JOB_NOT_FOUND_MESSAGE, SYNC_JOB_STATE_ACTIVE,
     SYNC_JOB_STATE_DELETING, SYNC_SOURCE_SITEWISE,
 };
 
-use crate::harness::{seed_sync_job, sync_job_arn, Emulator, Resp, SYNC_ROLE, REGION};
-
-/// Block until the outcome an accepted job owes has fallen due, so a row that
-/// deletes a SETTLED job really is deleting one the clock has already moved.
-fn wait_until_settled() {
-    sleep(SYNC_JOB_SETTLE_SPAN + Duration::from_millis(100));
-}
+use crate::harness::{
+    seed_sync_job, sync_job_arn, sync_job_in_state, Emulator, Resp, SYNC_ROLE, REGION,
+};
 
 /// An emulator holding the workspaces `workspace_ids` names.
 async fn emulator_with_workspaces(workspace_ids: &[&str]) -> Emulator {
@@ -161,7 +154,15 @@ async fn deleting_a_sync_job_removes_it() {
             "case {case:?}: the job the delete removes must be created, got {created:?}"
         );
         if settle_first {
-            wait_until_settled();
+            // The row deletes a job the clock has already brought up, so it
+            // waits for that condition rather than for a span.
+            sync_job_in_state(
+                &emulator,
+                workspace_id,
+                SYNC_SOURCE_SITEWISE,
+                SYNC_JOB_STATE_ACTIVE,
+            )
+            .await;
         }
         let before = emulator
             .get_sync_job(Some(workspace_id), SYNC_SOURCE_SITEWISE)

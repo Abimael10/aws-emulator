@@ -9,9 +9,19 @@
 //! its identity inside the workspace and a workspace holds at most one job per
 //! source. This create therefore mints nothing but the job's ARN and its
 //! creation instant, and answers the non-terminal `CREATING` state the service
-//! accepts a job in — the clock owes the outcome, which
-//! [`crate::state::SyncJob::settle`] materialises and
-//! [`crate::state::SYNC_JOB_ERROR_CODE`] explains.
+//! accepts a job in.
+//!
+//! The SYNCHRONISATION the job stands for is performed here too, in the call
+//! that accepts the job: the IoT SiteWise store in the same engine is read and
+//! the component types and entities its asset models and assets describe are
+//! created in the workspace, each carrying this job's `syncSource`
+//! ([`crate::state::sitewise_projection`],
+//! [`crate::state::project_sync_source`]). What that run established is what the
+//! clock owes the job — `INITIALIZING` and then the standing `ACTIVE`
+//! ([`crate::state::SyncJob::settle`]), or the modelled failure state carrying
+//! [`crate::state::SYNC_JOB_ERROR_CODE`] for a resource the workspace would not
+//! take — so a caller reading the job back in the same breath still sees
+//! `CREATING` and nothing sleeps for a span.
 //!
 //! The refusals this handler owns:
 //!
@@ -230,6 +240,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The `syncSource` label is a plain `^[a-zA-Z_0-9]+$` string, so the
+        // model cannot refuse a source the service does not support; its own
+        // documentation can and does ("Currently the only supported syncSource
+        // is SITEWISE"), so a create naming any other source is refused with
+        // the `ValidationException` this operation models, naming the member
+        // and the value the service accepts. The model gives that label no
+        // `@length` at all, so the reason is stated within the maximum of the
+        // member it travels on ([`crate::state::clamped_message`]). Decided
+        // before the source is read, because a source the service does not
+        // support has nothing to read.
+        if input.sync_source != crate::state::SYNC_SOURCE_SITEWISE {
+            return Err(validation(format!(
+                "syncSource {} is not supported; the only supported syncSource is {}",
+                input.sync_source,
+                crate::state::SYNC_SOURCE_SITEWISE
+            ))
+            .into());
+        }
+
+        // The sync SOURCE's own resources, read BEFORE this service's store is
+        // locked: the source is another service's store in the same engine, so
+        // its guard is taken and released before this one's and no two orders
+        // of the same two locks exist (the same discipline the IAM read above
+        // follows). Reading it writes nothing: what the job projects is decided
+        // here and landed below, once the request has been accepted.
+        let sitewise = crate::state::sitewise_state(&*self.engine).ok_or_else(|| {
+            CreateSyncJobErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iotsitewise store is unavailable".to_string()),
+            })
+        })?;
+        let projection = crate::state::sitewise_projection(&sitewise.lock());
+
         // The Region this request is signed for picks the store it writes to,
         // and the Region the sync job's ARN carries: the workspace it is
         // created in is the one THIS Region holds under that id.
@@ -241,23 +283,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
         let state = state.region_mut(&region);
-
-        // The `syncSource` label is a plain `^[a-zA-Z_0-9]+$` string, so the
-        // model cannot refuse a source the service does not support; its own
-        // documentation can and does ("Currently the only supported syncSource
-        // is SITEWISE"), so a create naming any other source is refused with
-        // the `ValidationException` this operation models, naming the member
-        // and the value the service accepts. The model gives that label no
-        // `@length` at all, so the reason is stated within the maximum of the
-        // member it travels on ([`crate::state::clamped_message`]).
-        if input.sync_source != crate::state::SYNC_SOURCE_SITEWISE {
-            return Err(validation(format!(
-                "syncSource {} is not supported; the only supported syncSource is {}",
-                input.sync_source,
-                crate::state::SYNC_SOURCE_SITEWISE
-            ))
-            .into());
-        }
 
         // A sync job lives INSIDE a workspace
         // (`/workspaces/{workspaceId}/sync-jobs/{syncSource}`), so a create
@@ -323,6 +348,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 sync_source: input.sync_source.clone(),
             },
         );
+
+        // The job's own work: the resources the source describes are created in
+        // the workspace NOW, so what the job reports having synchronised is what
+        // the workspace holds afterwards. The run is recorded on the stored job
+        // — the resources it acted on, and the failure (if any) the clock then
+        // owes it — rather than reported from here: this call answers the state
+        // it accepted the job in, which is what the model declares for it.
+        let (sync_resources, failure) = crate::state::project_sync_source(
+            state,
+            &region,
+            &input.workspace_id,
+            &input.sync_source,
+            &projection,
+            now,
+        );
+        if let Some(job) = state
+            .workspaces
+            .get_mut(&input.workspace_id)
+            .and_then(|workspace| workspace.sync_jobs.get_mut(&input.sync_source))
+        {
+            job.record_sync(sync_resources, failure);
+        }
 
         Ok(CreateSyncJobOutput {
             arn,

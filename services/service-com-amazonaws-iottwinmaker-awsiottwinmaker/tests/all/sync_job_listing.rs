@@ -30,28 +30,20 @@
 //! the jobs the workspace holds, whatever wrote them.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::thread::sleep;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iottwinmaker_awsiottwinmaker::ops::list_sync_jobs::DEFAULT_PAGE_SIZE;
 use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
-    SYNC_JOB_ERROR_CODE, SYNC_JOB_ERROR_MESSAGE, SYNC_JOB_SETTLE_SPAN, SYNC_JOB_STATE_CREATING,
-    SYNC_JOB_STATE_ERROR, SYNC_SOURCE_SITEWISE, MAX_PAGE_SIZE,
+    SYNC_JOB_STATE_ACTIVE, SYNC_JOB_STATE_CREATING, SYNC_SOURCE_SITEWISE, MAX_PAGE_SIZE,
 };
 
-use crate::harness::{seed_sync_job, sync_job_arn, workspace_arn, Emulator, Resp, REGION};
+use crate::harness::{
+    seed_sync_job, sync_job_arn, sync_job_in_state, workspace_arn, Emulator, Resp, REGION,
+};
 
 /// The role every seeded job carries; the listing does not report it, but a
 /// stored job always has one.
 const SEEDED_ROLE: &str = crate::harness::SYNC_ROLE;
-
-/// Block until the outcome an accepted job owes has fallen due, so a case that
-/// compares a listing with a single read is comparing a job the clock can no
-/// longer move.
-fn wait_until_settled() {
-    sleep(SYNC_JOB_SETTLE_SPAN + Duration::from_millis(100));
-}
 
 /// An emulator holding the workspaces `workspace_ids` names.
 async fn emulator_with_workspaces(workspace_ids: &[&str]) -> Emulator {
@@ -192,9 +184,13 @@ async fn a_listing_reports_every_held_sync_job_as_the_single_read_does() {
     expected.push(SYNC_SOURCE_SITEWISE.to_string());
     expected.sort();
 
-    // Past the settle span, so the listing and the reads below are of jobs the
-    // clock can no longer move between the two calls.
-    wait_until_settled();
+    // Past every transition the clock owed, so the listing and the reads below
+    // are of jobs it can no longer move between the two calls: the wait is for
+    // that condition, job by job, and not for a span.
+    for sync_source in expected.iter() {
+        sync_job_in_state(&emulator, WORKSPACE, sync_source, SYNC_JOB_STATE_ACTIVE).await;
+    }
+    sync_job_in_state(&emulator, OTHER_WORKSPACE, "NEIGHBOUR", SYNC_JOB_STATE_ACTIVE).await;
 
     let case = "allHeld";
     let listed = emulator
@@ -579,9 +575,16 @@ async fn a_listing_reports_the_state_the_clock_owes_and_changes_nothing_else() {
         );
     }
 
-    wait_until_settled();
+    // Wait for the CONDITION the cases below are about: both held jobs of both
+    // workspaces have reached the standing state the clock owed them, whether
+    // or not anybody listed them while it was pending.
+    for workspace_id in [LISTED_EARLY, UNLISTED] {
+        for sync_source in [SYNC_SOURCE_SITEWISE, "SECOND_SRC"] {
+            sync_job_in_state(&emulator, workspace_id, sync_source, SYNC_JOB_STATE_ACTIVE).await;
+        }
+    }
 
-    // Past it: both workspaces report the outcome the clock owed, whether or not
+    // Past it: both workspaces report the state the clock owed, whether or not
     // anybody listed them while it was pending.
     for workspace_id in [LISTED_EARLY, UNLISTED] {
         let settled = emulator
@@ -597,16 +600,11 @@ async fn a_listing_reports_the_state_the_clock_owes_and_changes_nothing_else() {
             assert_eq!(
                 (
                     summary["status"]["state"].as_str(),
-                    summary["status"]["error"]["code"].as_str(),
-                    summary["status"]["error"]["message"].as_str(),
+                    &summary["status"]["error"],
                 ),
-                (
-                    Some(SYNC_JOB_STATE_ERROR),
-                    Some(SYNC_JOB_ERROR_CODE),
-                    Some(SYNC_JOB_ERROR_MESSAGE),
-                ),
-                "case {workspace_id:?}: the outcome has fallen due, and a failed job says why, \
-                 got {summary:?}"
+                (Some(SYNC_JOB_STATE_ACTIVE), &json!({})),
+                "case {workspace_id:?}: the transition has fallen due, and a job whose \
+                 synchronisation landed carries no error, got {summary:?}"
             );
             // The listing and the single read agree about the settled job.
             let sync_source = summary["syncSource"].as_str().unwrap_or_default();

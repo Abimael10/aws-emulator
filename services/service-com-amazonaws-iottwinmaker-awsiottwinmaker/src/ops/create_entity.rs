@@ -542,6 +542,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // instant one would fall due is this call's own. An UPDATE is what
             // opens a window (`crate::state::Entity::begin_update`).
             settles_at: now,
+            // An entity a CALLER created is not projected from a linked
+            // service: only a sync job's own run stamps a source on a record
+            // (`crate::state::sitewise_sync`).
+            sync_source: None,
         };
         let created_state = entity.state.clone();
 

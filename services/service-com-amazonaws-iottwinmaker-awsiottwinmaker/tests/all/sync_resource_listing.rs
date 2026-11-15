@@ -48,12 +48,11 @@ use service_com_amazonaws_iottwinmaker_awsiottwinmaker::ops::types::{
     ErrorDetails, SYNC_RESOURCE_STATE_VALUES, SYNC_RESOURCE_TYPE_VALUES,
 };
 use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
-    workspace_not_found_message, SyncResource, SYNC_JOB_ERROR_CODE, SYNC_JOB_NOT_FOUND_MESSAGE,
-    SYNC_JOB_SETTLE_SPAN, SYNC_JOB_STATE_CREATING, SYNC_JOB_STATE_ERROR, SYNC_SOURCE_SITEWISE,
-    MAX_PAGE_SIZE,
+    workspace_not_found_message, SyncResource, SYNC_JOB_NOT_FOUND_MESSAGE, SYNC_JOB_STATE_ACTIVE,
+    SYNC_JOB_STATE_CREATING, SYNC_SOURCE_SITEWISE, MAX_PAGE_SIZE,
 };
 
-use crate::harness::{seed_sync_job, Emulator, Resp, REGION, SYNC_ROLE};
+use crate::harness::{seed_sync_job, sync_job_in_state, Emulator, Resp, REGION, SYNC_ROLE};
 
 /// A second sync source, for the cases about a listing seeing only the job it
 /// addresses. The create path supports one source, so a job under any other is
@@ -1090,9 +1089,12 @@ async fn a_listing_reports_and_writes_nothing() {
     const OTHER_WORKSPACE: &str = "otherReportingWorkspace";
     let emulator = emulator_with_seeded_job(WORKSPACE, OTHER_WORKSPACE).await;
 
-    // Past the instant the job's own outcome fell due, so a call that settled it
-    // would be observable in the store.
-    std::thread::sleep(SYNC_JOB_SETTLE_SPAN + Duration::from_millis(100));
+    // Past the instant the job's own transition fell due, so a call that
+    // materialised it would be observable in the store. The wait is for that
+    // condition on ANOTHER job of the same workspace — the one read through the
+    // operation that does report a status — and never for a span.
+    sync_job_in_state(&emulator, OTHER_WORKSPACE, SYNC_SOURCE_SITEWISE, SYNC_JOB_STATE_ACTIVE)
+        .await;
 
     let before = emulator
         .list_sync_resources(
@@ -1140,8 +1142,8 @@ async fn a_listing_reports_and_writes_nothing() {
         .await;
     assert_eq!(
         read.member("status")["state"].as_str(),
-        Some(SYNC_JOB_STATE_ERROR),
-        "case \"readAfterListing\": the read reports the outcome the clock owed, got {read:?}"
+        Some(SYNC_JOB_STATE_ACTIVE),
+        "case \"readAfterListing\": the read reports the state the clock owed, got {read:?}"
     );
 }
 
@@ -1181,12 +1183,11 @@ async fn a_listing_is_answered_out_of_the_region_it_is_signed_for() {
     }
 }
 
-/// RULE: the resources a listing reports are the ones the job HOLDS — so the job
-/// this emulator's create path accepts, whose synchronisation reads nothing from
-/// the source and creates nothing in the workspace, lists a present but empty
-/// array and no token, whatever page or filter is asked for.
+/// RULE: the resources a listing reports are the ones the job HOLDS — so a job
+/// whose source held nothing to project synchronised nothing, and lists a
+/// present but empty array and no token, whatever page or filter is asked for.
 #[tokio::test]
-async fn a_created_job_that_has_synchronised_nothing_lists_an_empty_page() {
+async fn a_job_whose_source_held_nothing_lists_an_empty_page() {
     const WORKSPACE: &str = "createdJobWorkspace";
     let emulator = emulator_with_workspaces(&[WORKSPACE]).await;
     let created = emulator
@@ -1230,19 +1231,17 @@ async fn a_created_job_that_has_synchronised_nothing_lists_an_empty_page() {
         );
     }
 
-    // The empty page is what the job's own record says: its outcome, once the
-    // clock made it due, is the failure that says nothing was synchronised.
-    std::thread::sleep(SYNC_JOB_SETTLE_SPAN + Duration::from_millis(100));
-    let read = emulator
-        .get_sync_job(Some(WORKSPACE), SYNC_SOURCE_SITEWISE)
-        .await;
+    // The empty page is what the job's own record says: its source held nothing
+    // to project, so the link comes up with nothing synchronised under it.
+    let read =
+        sync_job_in_state(&emulator, WORKSPACE, SYNC_SOURCE_SITEWISE, SYNC_JOB_STATE_ACTIVE).await;
     assert_eq!(
         (
             read.member("status")["state"].as_str(),
-            read.member("status")["error"]["code"].as_str(),
+            &read.member("status")["error"],
         ),
-        (Some(SYNC_JOB_STATE_ERROR), Some(SYNC_JOB_ERROR_CODE)),
-        "the job's record must say its synchronisation never ran, got {read:?}"
+        (Some(SYNC_JOB_STATE_ACTIVE), &json!({})),
+        "the job's record must say its link came up with nothing to synchronise, got {read:?}"
     );
     let after = emulator
         .list_sync_resources(WORKSPACE, SYNC_SOURCE_SITEWISE, json!({}))

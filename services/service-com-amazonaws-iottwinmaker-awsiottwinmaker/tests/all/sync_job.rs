@@ -10,37 +10,66 @@
 //! The suites assert RULES over a table of inputs rather than one recorded
 //! case: what a `CreateSyncJob` persists is exactly what `GetSyncJob` reports,
 //! whatever role and tags the create carried; the create answers the
-//! non-terminal `CREATING` and the CLOCK — not a caller — settles the job's
-//! outcome; a sync job is identified inside its workspace by its sync source,
-//! so it is reachable only through that workspace and a second create for the
-//! same source conflicts; a source the service does not support is refused and
-//! stores nothing; and a workspace's `linkedServices` follows the sync jobs it
-//! holds.
+//! non-terminal `CREATING` and the CLOCK — not a caller — brings the link up
+//! through `INITIALIZING` to the standing `ACTIVE`; a sync job is identified
+//! inside its workspace by its sync source, so it is reachable only through that
+//! workspace and a second create for the same source conflicts; a source the
+//! service does not support is refused and stores nothing; and a workspace's
+//! `linkedServices` follows the sync jobs it holds.
 
-use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iottwinmaker_awsiottwinmaker::ops::types::SYNC_JOB_STATE_VALUES;
 use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
-    SYNC_JOB_ERROR_CODE, SYNC_JOB_ERROR_MESSAGE, SYNC_JOB_SETTLE_SPAN, SYNC_JOB_STATE_CREATING,
-    SYNC_JOB_STATE_ERROR, SYNC_SOURCE_SITEWISE,
+    SYNC_JOB_ACTIVE_SPAN, SYNC_JOB_SETTLE_SPAN, SYNC_JOB_STATE_ACTIVE, SYNC_JOB_STATE_CREATING,
+    SYNC_JOB_STATE_INITIALIZING, SYNC_SOURCE_SITEWISE,
 };
 
-use crate::harness::{sync_job_arn, Emulator, Resp, REGION};
-
-/// Block until the outcome an accepted job owes has fallen due.
-///
-/// The emulator stores the instant and never sleeps for it, so a test that
-/// wants to observe the settled job is the one that has to wait; the margin
-/// keeps the wait from racing the span's own boundary.
-fn wait_until_settled() {
-    sleep(SYNC_JOB_SETTLE_SPAN + Duration::from_millis(100));
-}
+use crate::harness::{sync_job_arn, sync_job_in_state, Emulator, Resp, REGION};
 
 /// The `status.state` a response reports for a job.
 fn reported_state(resp: &Resp) -> Option<&str> {
     resp.member("status")["state"].as_str()
+}
+
+/// Age the stored sync job `workspace_id`/`sync_source` by `elapsed`, as if that
+/// much time had passed since the create, and answer the creation instant it
+/// then carries.
+///
+/// The clock is what moves a job on, and the instants it owes are ON the record,
+/// so a case about the state a given amount of elapsed time makes due drives
+/// that time here rather than waiting for it: every instant the record carries
+/// moves back by `elapsed`, which is the same record a create that happened that
+/// long ago would have left. Reached through the seam a handler reads state by
+/// (`harness::Emulator::state`), so what the reads below report is what the one
+/// store holds.
+fn age_sync_job(
+    emulator: &Emulator,
+    workspace_id: &str,
+    sync_source: &str,
+    elapsed: Duration,
+) -> SystemTime {
+    let state = emulator.state();
+    let mut state = state.lock();
+    let job = state
+        .region_mut(REGION)
+        .workspaces
+        .get_mut(workspace_id)
+        .and_then(|workspace| workspace.sync_jobs.get_mut(sync_source))
+        .unwrap_or_else(|| panic!("the sync job {workspace_id:?}/{sync_source:?} must exist"));
+    job.creation_date_time -= elapsed;
+    job.update_date_time -= elapsed;
+    job.settles_at -= elapsed;
+    job.active_at -= elapsed;
+    job.creation_date_time
+}
+
+/// `at` as the epoch seconds a timestamp member carries it in.
+fn seconds_of(at: SystemTime) -> f64 {
+    at.duration_since(UNIX_EPOCH)
+        .expect("an instant after the epoch")
+        .as_secs_f64()
 }
 
 /// An emulator holding the workspaces `workspace_ids` names.
@@ -197,13 +226,13 @@ async fn a_sync_job_reads_back_exactly_what_was_created() {
 }
 
 /// RULE: an accepted job is reported in the non-terminal `CREATING` state until
-/// the instant its outcome falls due, and the CLOCK — not a caller's poll — then
-/// settles it in the modelled failure state carrying the reason nothing was
-/// synchronised; the settled job is stable across reads.
+/// the instant the next state of bringing its link up falls due, and the CLOCK —
+/// not a caller's poll — then brings it through `INITIALIZING` to the standing
+/// `ACTIVE`, with no error; the standing job is stable across reads.
 #[tokio::test]
-async fn an_accepted_sync_job_settles_in_the_outcome_the_clock_owes() {
-    // The rows differ in whether a reader observed the job during the settle
-    // span, because the transition is the clock's and not a read's.
+async fn an_accepted_sync_job_reaches_the_standing_state_the_clock_owes() {
+    // The rows differ in whether a reader observed the job during the first
+    // span, because the transitions are the clock's and not a read's.
     let rows = [
         ("polled", "polledWorkspace", true),
         ("unpolled", "unpolledWorkspace", false),
@@ -231,40 +260,35 @@ async fn an_accepted_sync_job_settles_in_the_outcome_the_clock_owes() {
             assert_eq!(
                 reported_state(&during),
                 Some(SYNC_JOB_STATE_CREATING),
-                "case {case:?}: a read inside the settle span still reports CREATING, \
+                "case {case:?}: a read in the same breath as the create still reports CREATING, \
                  got {during:?}"
             );
         }
     }
 
-    wait_until_settled();
-
     for (case, workspace_id, _) in rows {
-        let settled = emulator
-            .get_sync_job(Some(workspace_id), SYNC_SOURCE_SITEWISE)
-            .await;
+        // The standing state the clock owes, waited for as a CONDITION and
+        // never for a span.
+        let settled =
+            sync_job_in_state(&emulator, workspace_id, SYNC_SOURCE_SITEWISE, SYNC_JOB_STATE_ACTIVE)
+                .await;
         assert_eq!(
-            reported_state(&settled),
-            Some(SYNC_JOB_STATE_ERROR),
-            "case {case:?}: the outcome has fallen due, and this emulator synchronises nothing, \
-             got {settled:?}"
+            settled.member("status")["error"],
+            json!({}),
+            "case {case:?}: a job whose synchronisation landed carries no error, got {settled:?}"
         );
-        assert_eq!(
-            (
-                settled.member("status")["error"]["code"].as_str(),
-                settled.member("status")["error"]["message"].as_str(),
-            ),
-            (Some(SYNC_JOB_ERROR_CODE), Some(SYNC_JOB_ERROR_MESSAGE)),
-            "case {case:?}: a failed job must say why it failed, got {settled:?}"
+        assert!(
+            reported_state(&settled).is_some_and(|state| SYNC_JOB_STATE_VALUES.contains(&state)),
+            "case {case:?}: the reported state must be a modelled SyncJobState, got {settled:?}"
         );
-        // The outcome fell due at the stored instant, not when a caller asked,
-        // so two reads of a settled job report the same `updateDateTime` — and
-        // it is later than the creation instant.
+        // The transition fell due at the stored instant, not when a caller
+        // asked, so two reads of a settled job report the same `updateDateTime`
+        // — and it is later than the creation instant.
         let update_date_time = settled.member("updateDateTime").as_f64();
         assert!(
             update_date_time > settled.member("creationDateTime").as_f64(),
-            "case {case:?}: settling is an update, so updateDateTime moved past \
-             creationDateTime, got {settled:?}"
+            "case {case:?}: reaching the standing state is an update, so updateDateTime moved \
+             past creationDateTime, got {settled:?}"
         );
         let again = emulator
             .get_sync_job(Some(workspace_id), SYNC_SOURCE_SITEWISE)
@@ -274,8 +298,96 @@ async fn an_accepted_sync_job_settles_in_the_outcome_the_clock_owes() {
                 reported_state(&again),
                 again.member("updateDateTime").as_f64(),
             ),
-            (Some(SYNC_JOB_STATE_ERROR), update_date_time),
+            (Some(SYNC_JOB_STATE_ACTIVE), update_date_time),
             "case {case:?}: a read must not move a settled job again, got {again:?}"
+        );
+    }
+}
+
+/// RULE: a job bringing its link up passes through every state the model
+/// declares for it, in order — `CREATING` while nothing is due, `INITIALIZING`
+/// once the first transition is, and the standing `ACTIVE` once the second is —
+/// and each state is reported from the instant it fell due, never from the
+/// instant a caller asked.
+///
+/// The rows differ along HOW MUCH of the bring-up the clock has already owed the
+/// job, which is what the rule generalises over; time is driven by ageing the
+/// stored record ([`age_sync_job`]) rather than by waiting, so every row is
+/// decided by the rule and not by how fast the host runs.
+#[tokio::test]
+async fn a_sync_job_reports_each_state_from_the_instant_it_falls_due() {
+    const WORKSPACE: &str = "bringUpWorkspace";
+    // `(case, how long ago the create happened, the state that is then due)`.
+    let rows: Vec<(&str, Duration, &str)> = vec![
+        ("nothing due yet", Duration::ZERO, SYNC_JOB_STATE_CREATING),
+        (
+            "just short of the first transition",
+            SYNC_JOB_SETTLE_SPAN - Duration::from_millis(1),
+            SYNC_JOB_STATE_CREATING,
+        ),
+        (
+            "the first transition is due",
+            SYNC_JOB_SETTLE_SPAN,
+            SYNC_JOB_STATE_INITIALIZING,
+        ),
+        (
+            "just short of the standing state",
+            SYNC_JOB_ACTIVE_SPAN - Duration::from_millis(1),
+            SYNC_JOB_STATE_INITIALIZING,
+        ),
+        (
+            "the standing state is due",
+            SYNC_JOB_ACTIVE_SPAN,
+            SYNC_JOB_STATE_ACTIVE,
+        ),
+        (
+            "long past the standing state",
+            SYNC_JOB_ACTIVE_SPAN * 20,
+            SYNC_JOB_STATE_ACTIVE,
+        ),
+    ];
+    for (case, aged_by, expected) in rows {
+        let emulator = emulator_with_workspaces(&[WORKSPACE]).await;
+        assert_eq!(
+            emulator
+                .create_sync_job(
+                    WORKSPACE,
+                    SYNC_SOURCE_SITEWISE,
+                    json!({"syncRole": "arn:aws:iam::000000000000:role/TwinMakerSyncRole"}),
+                )
+                .await
+                .status,
+            200,
+            "case {case:?}: the job the read reports must be created"
+        );
+        let creation_date_time = age_sync_job(&emulator, WORKSPACE, SYNC_SOURCE_SITEWISE, aged_by);
+        let read = emulator
+            .get_sync_job(Some(WORKSPACE), SYNC_SOURCE_SITEWISE)
+            .await;
+        assert_eq!(
+            reported_state(&read),
+            Some(expected),
+            "case {case:?}: expected the state the clock owes, got {read:?}"
+        );
+        assert_eq!(
+            read.member("status")["error"],
+            json!({}),
+            "case {case:?}: a job whose synchronisation landed carries no error, got {read:?}"
+        );
+        // `updateDateTime` is the instant the state that is due fell due — the
+        // creation instant plus that state's span — and not the instant of this
+        // read, so two reads of one job report it identically.
+        let due_after = match expected {
+            SYNC_JOB_STATE_CREATING => Duration::ZERO,
+            SYNC_JOB_STATE_INITIALIZING => SYNC_JOB_SETTLE_SPAN,
+            _ => SYNC_JOB_ACTIVE_SPAN,
+        };
+        let expected_update = seconds_of(creation_date_time + due_after);
+        assert!(
+            read.member("updateDateTime")
+                .as_f64()
+                .is_some_and(|reported| (reported - expected_update).abs() < 0.001),
+            "case {case:?}: expected updateDateTime {expected_update}, got {read:?}"
         );
     }
 }
@@ -474,12 +586,10 @@ async fn reading_a_sync_job_changes_nothing_a_later_caller_sees() {
         200,
         "the sync job the reads report must exist"
     );
-    // Past the settle span, so the repeated reads are of a job the clock has
-    // already moved and cannot move again: what remains is the read itself.
-    wait_until_settled();
-
-    let first = emulator
-        .get_sync_job(Some(WORKSPACE), SYNC_SOURCE_SITEWISE)
+    // Past the states the clock owes, so the repeated reads are of a job the
+    // clock has already brought up and cannot move again: what remains is the
+    // read itself.
+    let first = sync_job_in_state(&emulator, WORKSPACE, SYNC_SOURCE_SITEWISE, SYNC_JOB_STATE_ACTIVE)
         .await;
     assert_eq!(
         first.status, 200,

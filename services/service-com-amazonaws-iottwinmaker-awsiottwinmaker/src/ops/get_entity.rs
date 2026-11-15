@@ -248,9 +248,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             has_child_entities: workspace.has_child_entities(&entity.entity_id),
             creation_date_time: crate::state::timestamp(entity.creation_date_time),
             update_date_time: crate::state::timestamp(entity.update_date_time),
-            // No sync source: an entity this service created is not projected
-            // from a linked service. The sync-job slice sets it.
-            sync_source: None,
+            // Where the entity came from: the `syncSource` of the sync job
+            // that projected it ("the syncSource of the sync job, if this
+            // entity was created by a sync job"), and absent for an entity a
+            // caller created directly.
+            sync_source: entity.sync_source.clone(),
             // "The maximum number of components returned is 30" — the flag's own
             // documentation. The map above is truncated to that, and the flag
             // reports whether it had to be.
@@ -278,6 +280,7 @@ fn components_response(
     entity: &crate::state::Entity,
     status: &Status,
 ) -> ::std::collections::HashMap<String, ComponentResponse> {
+    let sync_source = entity.sync_source.as_deref();
     entity
         .components
         .iter()
@@ -298,7 +301,7 @@ fn components_response(
                     .map(|composite| {
                         (
                             composite.component_name.clone(),
-                            composite_component_summary(workspace, composite, status),
+                            composite_component_summary(workspace, composite, status, sync_source),
                         )
                     })
                     .collect();
@@ -350,7 +353,11 @@ fn components_response(
                 defined_in: workspace.component_defined_in(Some(component_type_id)),
                 properties: Some(properties),
                 property_groups: Some(property_groups),
-                sync_source: None,
+                // "The syncSource of the sync job, if this entity was created
+                // by a sync job": a component belongs to its entity, so it
+                // reports the entity's own sync source — absent for one a
+                // caller created directly.
+                sync_source: sync_source.map(str::to_string),
                 // "The maximum number of properties returned is 800" — the
                 // flag's own documentation, applied to the map above.
                 are_all_properties_returned: Some(are_all_properties_returned),
@@ -383,6 +390,7 @@ fn composite_component_summary(
     workspace: &crate::state::Workspace,
     composite: &crate::state::CompositeComponentRecord,
     status: &Status,
+    sync_source: Option<&str>,
 ) -> ComponentSummary {
     ComponentSummary {
         component_name: composite.component_name.clone(),
@@ -395,7 +403,9 @@ fn composite_component_summary(
             &composite.property_groups,
         )),
         status: status.clone(),
-        sync_source: None,
+        // The holding entity's sync source, for the reason the component above
+        // reports it.
+        sync_source: sync_source.map(str::to_string),
         component_path: Some(composite.component_path.clone()),
     }
 }

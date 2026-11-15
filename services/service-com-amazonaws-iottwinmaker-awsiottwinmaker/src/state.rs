@@ -46,11 +46,12 @@
 //! `VALIDATING` state and carries the instant its outcome falls due
 //! (`MetadataTransferJob::settles_at`), the same way a component type carries
 //! its own — and so does a *sync job* (`SyncJob::settles_at`), which
-//! `CreateSyncJob` accepts in the non-terminal `CREATING` state. A sync job
+//! `CreateSyncJob` accepts in the non-terminal `CREATING` state and brings up
+//! through `INITIALIZING` to the standing `ACTIVE`. A sync job
 //! also OWNS the resources its synchronisation has acted on
 //! (`SyncJob::sync_resources`), keyed by their identity in the sync source, so
 //! they cannot outlive the job any more than the job can outlive its
-//! workspace — see [`SyncResource`] for what writes one.
+//! workspace — see [`SyncResource`] and [`sitewise_sync`] for what writes one.
 //!
 //! The account's *pricing plan* is the same shape of thing: a plan change the
 //! service bills from the start of the next cycle is held beside the plan in
@@ -77,6 +78,9 @@ mod workspace_rules;
 /// What a metadata transfer job READS, WRITES and REPORTS: the document its
 /// source describes and the run that lands it in its destination.
 mod metadata_transfer;
+/// What a SITEWISE sync job READS out of IoT SiteWise and PROJECTS into the
+/// workspace that holds it.
+mod sitewise_sync;
 /// Which workspaces a metadata transfer job NAMES, and which jobs still have a
 /// transfer outstanding against one.
 mod transfer_references;
@@ -85,6 +89,7 @@ pub use metadata_transfer::*;
 pub use page_tokens::*;
 pub use property_projection::*;
 pub use requested_schema::*;
+pub use sitewise_sync::*;
 pub use transfer_references::*;
 
 /// The `ParentEntityId` sentinel the service uses for an entity with no parent.
@@ -624,16 +629,20 @@ pub const TRANSFER_NOT_PERFORMED_MESSAGE: &str =
 
 /// Why a transfer with an IoT SiteWise end at either side transfers nothing.
 ///
-/// An IoT SiteWise source names asset models and assets to read, and an IoT
-/// SiteWise destination is where asset models would be written; both live in
-/// another service, and this emulator mounts no IoT SiteWise at all — so such a
-/// run has nothing to read and nowhere to write, and the job carries the
-/// modelled failure that says so rather than a `COMPLETED` nothing earned. The
-/// sentence is this emulator's, not AWS's: it states the emulator's limitation,
-/// which no AWS rule produces.
+/// An IoT SiteWise source names asset models and assets to read THROUGH THE
+/// JOB'S OWN FILTERS (`IotSiteWiseSourceConfigurationFilter`), and an IoT
+/// SiteWise destination is where asset models would be written; neither is work
+/// this slice performs — a bulk transfer selects what it moves, and nothing here
+/// resolves those filters or creates a resource in that service — so such a run
+/// has nothing to read and nowhere to write, and the job carries the modelled
+/// failure that says so rather than a `COMPLETED` nothing earned. A `SITEWISE`
+/// SYNC JOB is the other thing entirely: it reads that service's store in this
+/// same engine and projects the whole hierarchy into its workspace
+/// ([`sitewise_sync`]). The sentence is this emulator's, not AWS's: it states
+/// the emulator's limitation, which no AWS rule produces.
 pub const IOT_SITE_WISE_END_MESSAGE: &str =
-    "this emulator holds no IoT SiteWise asset models: a transfer with an IoT SiteWise end has \
-     nothing to read and nowhere to write";
+    "this emulator transfers no IoT SiteWise end: nothing was read from it and nothing was \
+     written to it";
 
 /// The resource portion of the ARN of the service-linked role a metadata
 /// transfer job runs under.
@@ -695,17 +704,25 @@ pub const METADATA_TRANSFER_JOB_CANCEL_SPAN: Duration = Duration::from_millis(50
 /// against a source nothing can sync from.
 pub const SYNC_SOURCE_SITEWISE: &str = "SITEWISE";
 
-/// The `SyncJobState` a sync job the service has just accepted is in, and the
-/// terminal state it reaches.
+/// The `SyncJobState` values a sync job moves through, from the state the create
+/// answers with to the standing state a working link settles in.
 ///
 /// `CREATING` is the state `CreateSyncJob` answers with: the job has been
-/// accepted and nothing has been synchronised yet, so it is non-terminal and the
-/// clock owes its outcome ([`SYNC_JOB_SETTLE_SPAN`]). `ERROR` is the modelled
-/// failure state that outcome is in this emulator — see [`SyncJob::settle`] —
-/// while `INITIALIZING` and `ACTIVE` belong to a synchronisation that really
-/// ran and `DELETING` to `DeleteSyncJob`, which owns it. The full value list is
+/// accepted and its synchronisation has not been reported yet, so it is
+/// non-terminal and the clock owes what follows ([`SYNC_JOB_SETTLE_SPAN`]).
+/// `INITIALIZING` is the link coming up — the source has been read and the
+/// resources it describes have been projected into the workspace — and `ACTIVE`
+/// is the standing link a job whose projection landed reaches and stays in.
+/// `ERROR` is the modelled failure state a job whose projection could not be
+/// landed settles in, carrying [`SYNC_JOB_ERROR_CODE`] and the reason the
+/// resource that could not be landed produced; `DELETING` belongs to
+/// `DeleteSyncJob`, which owns it. The full value list is
 /// `SYNC_JOB_STATE_VALUES` in `ops::types`.
 pub const SYNC_JOB_STATE_CREATING: &str = "CREATING";
+/// See [`SYNC_JOB_STATE_CREATING`].
+pub const SYNC_JOB_STATE_INITIALIZING: &str = "INITIALIZING";
+/// See [`SYNC_JOB_STATE_CREATING`].
+pub const SYNC_JOB_STATE_ACTIVE: &str = "ACTIVE";
 /// See [`SYNC_JOB_STATE_CREATING`].
 pub const SYNC_JOB_STATE_ERROR: &str = "ERROR";
 /// See [`SYNC_JOB_STATE_CREATING`]. The state `DeleteSyncJob` answers with for
@@ -713,38 +730,47 @@ pub const SYNC_JOB_STATE_ERROR: &str = "ERROR";
 /// the call reports the removal rather than a job's standing state.
 pub const SYNC_JOB_STATE_DELETING: &str = "DELETING";
 
+/// How long ONE phase of bringing a sync job up lasts, in milliseconds: the span
+/// [`SYNC_JOB_SETTLE_SPAN`] and [`SYNC_JOB_ACTIVE_SPAN`] are both built from, so
+/// the two cannot drift apart.
+const SYNC_JOB_PHASE_MILLIS: u64 = 500;
+
 /// How long a sync job stays in [`SYNC_JOB_STATE_CREATING`] before the clock
-/// makes its outcome due.
+/// makes the next state of bringing the link up due.
 ///
 /// AWS documents no duration for bringing a sync job up, so this span is CHOSEN
 /// by this emulator, the same way (and for the same reasons) as
 /// [`METADATA_TRANSFER_JOB_SETTLE_SPAN`]: deliberately non-zero, so a caller
 /// that reads the job back in the same breath as the create still observes the
 /// non-terminal state the create answered with, and deliberately short, so a
-/// client that polls reaches the terminal state without a long wait. Nothing
+/// client that polls reaches the standing state without a long wait. Nothing
 /// sleeps for it: the instant it is due is stored on the record
 /// ([`SyncJob::settles_at`]) and a reader materialises the transition the clock
 /// already owed.
-pub const SYNC_JOB_SETTLE_SPAN: Duration = Duration::from_millis(500);
+pub const SYNC_JOB_SETTLE_SPAN: Duration = Duration::from_millis(SYNC_JOB_PHASE_MILLIS);
 
-/// The `ErrorCode` a sync job that never synchronised anything carries
-/// (`ops::types::ERROR_CODE_VALUES`), and the message that says why.
+/// How long after the create a sync job reaches its standing state — `ACTIVE`
+/// for a projection that landed, `ERROR` for one that did not.
+///
+/// ONE phase per step the job goes through: it leaves `CREATING` for
+/// `INITIALIZING` after [`SYNC_JOB_SETTLE_SPAN`], and the link is up a phase
+/// later, so a caller that polls observes each state the model declares rather
+/// than jumping from the create's answer to the standing state. Stored on the
+/// record ([`SyncJob::active_at`]) and never slept for, exactly as
+/// [`SYNC_JOB_SETTLE_SPAN`] is.
+pub const SYNC_JOB_ACTIVE_SPAN: Duration = Duration::from_millis(2 * SYNC_JOB_PHASE_MILLIS);
+
+/// The `ErrorCode` a sync job whose synchronisation could not be landed carries
+/// (`ops::types::ERROR_CODE_VALUES`).
 ///
 /// Synchronising means reading the sync source — an IoT SiteWise asset model
-/// hierarchy — and creating, updating or deleting the corresponding entities
-/// and component types in the workspace, which is work this emulator does not
-/// perform: it holds no link to the source service. Nothing therefore runs for
-/// an accepted job, and a job nothing ran ends in the service's own modelled
-/// failure state with the reason that says so, rather than being reported
-/// `ACTIVE` for a synchronisation that is not happening. `SYNC_INITIALIZING_ERROR`
-/// is the code for a job that failed bringing the sync up, which is where this
-/// one stops. The message is this emulator's, not AWS's: it states the
-/// emulator's limitation, which no AWS rule produces.
+/// hierarchy — and creating the corresponding component types and entities in
+/// the workspace that holds the job ([`sitewise_sync`]). `SYNC_INITIALIZING_ERROR`
+/// is the code for a job that failed bringing that link up, so it is what a job
+/// carries when a resource the source described could not be landed in the
+/// workspace; the MESSAGE beside it is the reason the rule that refused that
+/// resource produced, never a sentence about this emulator.
 pub const SYNC_JOB_ERROR_CODE: &str = "SYNC_INITIALIZING_ERROR";
-/// See [`SYNC_JOB_ERROR_CODE`].
-pub const SYNC_JOB_ERROR_MESSAGE: &str =
-    "this emulator synchronises nothing: no resource was read from the sync source and none was \
-     created, updated or deleted in the workspace";
 
 /// This service's own principal, as an IAM trust policy names it: the principal
 /// a role this service has to act as must admit.
@@ -777,6 +803,25 @@ pub fn iam_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<IamState>> {
     ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::service_state(engine)
+}
+
+/// The IoT SiteWise store a `SITEWISE` sync job reads its source out of.
+///
+/// It is the IoT SiteWise service's OWN state struct, reached through the SAME
+/// shared engine this service's store lives in, so the asset models and assets a
+/// sync job projects are the very records `CreateAssetModel`, `CreateAsset` and
+/// `AssociateAssets` wrote rather than a second copy of them.
+pub type SiteWiseState =
+    ::service_com_amazonaws_iotsitewise_awsiotsitewise::ComAmazonawsIotsitewiseAwsiotsitewiseState;
+
+/// The IoT SiteWise store in the SAME shared engine, which is where the sync
+/// source's resources live. This is that service's OWN accessor, called rather
+/// than copied; `None` has the same meaning as for [`service_state`]: the engine
+/// carries no such store, which a handler reports as a server fault.
+pub fn sitewise_state<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<SiteWiseState>> {
+    ::service_com_amazonaws_iotsitewise_awsiotsitewise::state::service_state(engine)
 }
 
 /// The sentence this service words the refusal of a role it cannot assume with.
@@ -1349,13 +1394,15 @@ pub struct Scene {
 ///
 /// A sync job is a workspace's standing link to another service: its
 /// `syncSource` says which service's resources are synchronised into the
-/// workspace, and its `syncRole` is the role the synchronisation would run
-/// under. The source is the job's identity inside the workspace, so it is the
-/// key of [`Workspace::sync_jobs`] and is not repeated here.
+/// workspace, and its `syncRole` is the role the synchronisation runs under. The
+/// source is the job's identity inside the workspace, so it is the key of
+/// [`Workspace::sync_jobs`] and is not repeated here.
 ///
-/// Like a [`MetadataTransferJob`], the job is accepted in a non-terminal state
-/// and carries the instant its outcome falls due ([`settles_at`](Self::settles_at)),
-/// which a reader materialises rather than sleeps for.
+/// Like a [`MetadataTransferJob`], the job's own work is performed by the call
+/// that accepts it ([`sitewise_sync`]) and the job is accepted in a non-terminal
+/// state carrying the instants the states of bringing its link up fall due
+/// ([`settles_at`](Self::settles_at), [`active_at`](Self::active_at)), which a
+/// reader materialises rather than sleeps for.
 #[derive(Debug, Clone)]
 pub struct SyncJob {
     pub sync_source: String,
@@ -1373,23 +1420,44 @@ pub struct SyncJob {
     /// scene's.
     pub tags: BTreeMap<String, String>,
     pub creation_date_time: SystemTime,
-    /// When the job last changed — the create, until the clock settles its
-    /// outcome, which moves it to the instant that outcome fell due.
+    /// When the job last changed — the create, until the clock makes a state of
+    /// bringing its link up due, which moves it to the instant that state fell
+    /// due.
     pub update_date_time: SystemTime,
     /// The job's `SyncJobState`, as STORED: [`SYNC_JOB_STATE_CREATING`] from the
-    /// create until [`settles_at`](Self::settles_at) passes, then the terminal
-    /// state [`settle`](Self::settle) writes.
+    /// create, then each state [`settle`](Self::settle) writes as the clock
+    /// makes it due.
     pub state: String,
     /// Why the job is in a failed state, and `None` while nothing has failed.
     pub error: Option<crate::ops::types::ErrorDetails>,
+    /// The failure the job's own synchronisation established, which the clock
+    /// owes it — `None` for a projection that landed every resource its source
+    /// described, which is a job that reaches [`SYNC_JOB_STATE_ACTIVE`].
+    ///
+    /// Recorded by the call that accepted the job, from the run it performed
+    /// ([`sitewise_sync`]), the same way a metadata transfer job carries the
+    /// outcome of its own run ([`MetadataTransferJob::transfer`]): every part of
+    /// it is a measurement of ONE run, so nothing recomputes it per read.
+    pub failure: Option<crate::ops::types::ErrorDetails>,
     /// The instant the transition out of [`SYNC_JOB_STATE_CREATING`] falls due
     /// — the instant of the create plus [`SYNC_JOB_SETTLE_SPAN`]. Stored, never
     /// slept for, so a reader can materialise a transition the clock already
     /// owed without any caller having had to poll.
     pub settles_at: SystemTime,
+    /// The instant the job's standing state falls due — the instant of the
+    /// create plus [`SYNC_JOB_ACTIVE_SPAN`]. Stored and never slept for, as
+    /// [`settles_at`](Self::settles_at) is.
+    pub active_at: SystemTime,
     /// The resources this job's synchronisation has acted on, keyed by the
     /// `externalId` that identifies each in the sync SOURCE — see
     /// [`SyncResource`], which is also where what writes one is set out.
+    ///
+    /// Written ONCE, by the call that accepted the job ([`sitewise_sync`]):
+    /// that call is the one place holding both this store and the source's, so
+    /// the set a job holds is the set its source described when the link came
+    /// up. A resource created in the source AFTER that is not projected — a
+    /// read of this service reports what the job HOLDS and never re-reads the
+    /// source, because a read must change nothing a later caller sees.
     ///
     /// Keyed by the external id, so iterating the map is external-id order:
     /// two listings of one job report its resources in the same order and a
@@ -1399,8 +1467,9 @@ pub struct SyncJob {
 }
 
 impl SyncJob {
-    /// The job a `CreateSyncJob` call accepted at `now`: accepted, nothing
-    /// synchronised yet, and its outcome due [`SYNC_JOB_SETTLE_SPAN`] later.
+    /// The job a `CreateSyncJob` call accepted at `now`: accepted, with the
+    /// states of bringing its link up due [`SYNC_JOB_SETTLE_SPAN`] and
+    /// [`SYNC_JOB_ACTIVE_SPAN`] later.
     pub fn accepted(
         sync_source: String,
         arn: String,
@@ -1421,40 +1490,72 @@ impl SyncJob {
             update_date_time: now,
             state: SYNC_JOB_STATE_CREATING.to_string(),
             error: None,
+            // The run the accepting call performs records what it could not
+            // land; until it has, nothing has failed.
+            failure: None,
             settles_at: now + SYNC_JOB_SETTLE_SPAN,
-            // Nothing has been synchronised yet, so the job has acted on no
-            // resource of its source: an accepted job holds none.
+            active_at: now + SYNC_JOB_ACTIVE_SPAN,
+            // The resources the job's own synchronisation acted on, written by
+            // the run the accepting call performs ([`SyncResource`]).
             sync_resources: BTreeMap::new(),
         }
+    }
+
+    /// Record what the job's synchronisation came to: the resources it acted
+    /// on, keyed by their identity in the source, and the failure (if any) the
+    /// clock then owes the job.
+    ///
+    /// Called by the operation that accepted the job, right after storing it,
+    /// with the run it performed: the resources are in the workspace by then, so
+    /// what is recorded here is a measurement of that run rather than a promise
+    /// about it.
+    pub fn record_sync(
+        &mut self,
+        sync_resources: BTreeMap<String, SyncResource>,
+        failure: Option<crate::ops::types::ErrorDetails>,
+    ) {
+        self.sync_resources = sync_resources;
+        self.failure = failure;
     }
 
     /// Materialise the lifecycle transition the CLOCK has already made due.
     ///
     /// Called by a reader before it reports this job, exactly as
-    /// [`MetadataTransferJob::settle`] is: the outcome was owed at
-    /// [`settles_at`](Self::settles_at) whether or not anybody called, so
+    /// [`MetadataTransferJob::settle`] is: the transition was owed at
+    /// [`settles_at`](Self::settles_at) — and the standing state at
+    /// [`active_at`](Self::active_at) — whether or not anybody called, so
     /// writing it here makes the record say what was already true rather than
     /// changing anything a read caused.
     ///
-    /// The outcome is the modelled failure state: nothing was synchronised,
-    /// because this emulator synchronises nothing (see [`SYNC_JOB_ERROR_CODE`]),
-    /// so the job carries the error that says so instead of an `ACTIVE` nothing
-    /// earned. Idempotent, a no-op before the instant falls due, and a no-op on
-    /// a job some other operation has already moved out of the non-terminal
-    /// state.
+    /// The states are those of bringing the link up: `CREATING` ->
+    /// `INITIALIZING` -> `ACTIVE` for the synchronisation the accepting call
+    /// landed, and `CREATING` -> `ERROR` carrying [`SYNC_JOB_ERROR_CODE`] for
+    /// one it could not ([`failure`](Self::failure)) — a job that failed
+    /// bringing the link up never reports it initialised. Idempotent, a no-op
+    /// before the instant falls due, and a no-op on a job some other operation
+    /// has already moved out of the states this walks.
     pub fn settle(&mut self, now: SystemTime) {
-        if self.state != SYNC_JOB_STATE_CREATING || now < self.settles_at {
+        if self.state != SYNC_JOB_STATE_CREATING && self.state != SYNC_JOB_STATE_INITIALIZING {
             return;
         }
-        self.state = SYNC_JOB_STATE_ERROR.to_string();
-        self.error = Some(crate::ops::types::ErrorDetails {
-            code: Some(SYNC_JOB_ERROR_CODE.to_string()),
-            message: Some(SYNC_JOB_ERROR_MESSAGE.to_string()),
-        });
-        // The change fell due at `settles_at`, not at the instant a caller
-        // happened to ask, so that is when the job was last updated: two reads
-        // of a settled job report the same instant.
-        self.update_date_time = self.settles_at;
+        if let Some(failure) = &self.failure {
+            if now >= self.settles_at {
+                self.state = SYNC_JOB_STATE_ERROR.to_string();
+                self.error = Some(failure.clone());
+                self.update_date_time = self.settles_at;
+            }
+            return;
+        }
+        // The change fell due at the stored instant, not at the instant a
+        // caller happened to ask, so that is when the job was last updated: two
+        // reads of a settled job report the same instant.
+        if now >= self.active_at {
+            self.state = SYNC_JOB_STATE_ACTIVE.to_string();
+            self.update_date_time = self.active_at;
+        } else if now >= self.settles_at {
+            self.state = SYNC_JOB_STATE_INITIALIZING.to_string();
+            self.update_date_time = self.settles_at;
+        }
     }
 
     /// The job's modelled `SyncJobStatus`: its stored state and, when it has
@@ -1486,14 +1587,11 @@ impl SyncJob {
 /// job's (one resource can be in sync while another is still being processed or
 /// has failed).
 ///
-/// NOTHING in this emulator writes one: synchronising means reading the source
-/// service and creating, updating or deleting the corresponding resources in
-/// the workspace, which this emulator does not perform
-/// ([`SYNC_JOB_ERROR_CODE`]), so a job accepted here acts on no resource and
-/// holds none. The listing that reports them
-/// (`crate::ops::list_sync_resources`) therefore reports what the job HOLDS —
-/// an empty page for every job this emulator's create accepted — rather than
-/// rows it invents for a synchronisation that did not run.
+/// Written by the RUN the call that accepts a sync job performs
+/// ([`sitewise_sync`]): the run reads the source, lands what it describes in the
+/// workspace and records one of these per resource it acted on, so the listing
+/// that reports them (`crate::ops::list_sync_resources`) reports what the job
+/// HOLDS rather than rows it invents for a synchronisation that did not run.
 #[derive(Debug, Clone)]
 pub struct SyncResource {
     /// Which kind of workspace resource this is, from the modelled
@@ -1807,6 +1905,16 @@ pub struct Entity {
     /// already owed without any caller having had to poll. Irrelevant while the
     /// stored state is terminal, which is how a create leaves it.
     pub settles_at: SystemTime,
+    /// The `syncSource` of the sync job that projected this entity into the
+    /// workspace, and `None` for one a caller created directly.
+    ///
+    /// "The syncSource of the sync job, if this entity was created by a sync
+    /// job" — the member's own documentation on every response that carries it
+    /// (`GetEntityResponse$syncSource`, `ComponentResponse$syncSource`,
+    /// `ComponentSummary$syncSource`), which is why it is stored on the record
+    /// the projection wrote rather than derived at a reader: the resource
+    /// carries where it came from for as long as it exists.
+    pub sync_source: Option<String>,
 }
 
 impl Entity {
@@ -1931,6 +2039,11 @@ pub struct ComponentType {
     /// a reader can materialise a transition the clock already owed without any
     /// caller having had to poll.
     pub settles_at: SystemTime,
+    /// The `syncSource` of the sync job that projected this component type into
+    /// the workspace, and `None` for one a caller created directly — stored for
+    /// the reason [`Entity::sync_source`] is, and reported by
+    /// `GetComponentTypeResponse$syncSource`.
+    pub sync_source: Option<String>,
 }
 
 impl ComponentType {
@@ -2423,18 +2536,18 @@ const BUILT_IN_COMPONENT_TYPES: &[BuiltInComponentType] = &[
     // asset model the component reads its values from, so the connector itself
     // is never instantiated. Its two properties are those external ids.
     BuiltInComponentType {
-        component_type_id: "com.amazon.iotsitewise.connector",
+        component_type_id: SITEWISE_CONNECTOR_COMPONENT_TYPE_ID,
         is_abstract: true,
         property_definitions: &[
             BuiltInProperty {
-                name: "sitewiseAssetModelId",
+                name: SITEWISE_ASSET_MODEL_ID_PROPERTY,
                 data_type: TYPE_STRING,
                 nested_type: None,
                 is_external_id: true,
                 is_time_series: false,
             },
             BuiltInProperty {
-                name: "sitewiseAssetId",
+                name: SITEWISE_ASSET_ID_PROPERTY,
                 data_type: TYPE_STRING,
                 nested_type: None,
                 is_external_id: true,
@@ -2535,6 +2648,9 @@ pub fn built_in_component_types(
                     update_date_time: at,
                     state: STATE_ACTIVE.to_string(),
                     settles_at: at,
+                    // The service's own, provisioned with the workspace: no
+                    // sync job projected it from a linked service.
+                    sync_source: None,
                 },
             )
         })

@@ -281,9 +281,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Carries BOTH its modelled members: the stored state (settled
             // above) and the `error` structure every reported status carries.
             status: Some(component_type.status()),
-            // No sync source: a component type this service created is not
-            // projected from a linked service. The sync-job slice sets it.
-            sync_source: None,
+            // Where the component type came from: the `syncSource` of the sync
+            // job that projected it from its linked service, and absent for one
+            // a caller created directly.
+            sync_source: component_type.sync_source.clone(),
         })
     }
 }

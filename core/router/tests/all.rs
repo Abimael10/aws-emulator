@@ -1281,3 +1281,22 @@ mod zz_probe_whole_emulator;
 // `all/all_rs_declares_each_suite_once.rs`, `all/all_rs_carries_no_inner_doc_comment.rs`,
 // `all/declaration_roots_are_canonical_and_complete.rs` — state the rules, so they are not
 // restated here.
+// This file is the license line, this header, and then one `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair per suite file under `tests/all/`, sorted by name, and no other line.
+// Put a new suite at `tests/all/<name>.rs` and insert its pair into the sorted list below;
+// what that suite covers, and why it drives the assembled router rather than one service
+// crate, belongs in that suite's OWN module doc, where it is read beside the test it
+// explains, and a note about THIS file belongs in `all/appended_notes.rs`.
+// EVERY comment here is an ORDINARY `//` one, this header included, and that is the point:
+// an inner doc comment (`//!`) is legal only before the first item, so one appended or
+// merged past the declarations is `E0753` and compiles no suite of this target at all —
+// which is what repeatedly happened to this file's tail. With no `//!` line anywhere in the
+// file, there is none to copy, re-type or merge into that position.
+// A suite no `mod` names compiles nowhere and its tests never run; a suite left at the top
+// level of `tests/` fails the build; and a suite declared twice is `E0428`. Each of those
+// fails EVERY suite in this target. `tests/all.rs` is a test-target CRATE ROOT, so a bare
+// `mod` would resolve to a SIBLING of this file, which the layout check refuses: the
+// `#[path]` above each `mod` is what points the declaration into `tests/all/`.
+// Four suites of this target pin the shape above rather than restating it here:
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
+// `all/all_rs_is_a_canonical_declaration_list.rs`.

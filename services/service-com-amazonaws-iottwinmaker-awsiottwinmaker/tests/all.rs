@@ -245,6 +245,9 @@ mod scene_update;
 #[path = "all/scope_resolution_order.rs"]
 mod scope_resolution_order;
 
+#[path = "all/sitewise_sync.rs"]
+mod sitewise_sync;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

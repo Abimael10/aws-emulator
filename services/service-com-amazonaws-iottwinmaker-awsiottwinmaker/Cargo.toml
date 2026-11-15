@@ -44,6 +44,10 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", 
 # sync job's `syncRole`), to check the role's trust policy grants
 # iottwinmaker.amazonaws.com sts:AssumeRole before the resource is stored.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The IoT SiteWise store a SITEWISE sync job reads its source out of: the asset models
+# and assets that service's own creates wrote, which `src/state/sitewise_sync.rs`
+# projects into the workspace that holds the job.
+service-com-amazonaws-iotsitewise-awsiotsitewise = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -471,6 +471,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // its transition to ACTIVE falls due is stored beside it.
             state: crate::state::STATE_CREATING.to_string(),
             settles_at: now + crate::state::COMPONENT_TYPE_SETTLE_SPAN,
+            // A component type a CALLER created is not projected from a linked
+            // service: only a sync job's own run stamps a source on a record
+            // (`crate::state::sitewise_sync`).
+            sync_source: None,
         };
         // A property GROUP groups properties of the component type, so each
         // name it carries has to be one the new component type defines — its

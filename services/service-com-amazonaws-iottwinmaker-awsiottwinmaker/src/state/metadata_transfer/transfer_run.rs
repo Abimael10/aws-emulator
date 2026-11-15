@@ -158,10 +158,12 @@ async fn read_source<Eng: Send + Sync + 'static>(
             configuration.filters.as_deref().unwrap_or_default(),
         );
     }
-    // An IoT SiteWise source names asset models, which live in another service
-    // this emulator does not mount: there is nothing to read, and a run that
-    // read nothing reports the failure that says so rather than a transfer it
-    // did not perform.
+    // An IoT SiteWise source names asset models to read through the job's own
+    // filters, which this slice does not resolve: there is nothing to read, and
+    // a run that read nothing reports the failure that says so rather than a
+    // transfer it did not perform. (A `SITEWISE` SYNC JOB is the other path
+    // into a workspace from that service, and it does read it:
+    // `crate::state::sitewise_projection`.)
     Err(Failure::processing(IOT_SITE_WISE_END_MESSAGE.to_string()))
 }
 
@@ -260,7 +262,7 @@ async fn write_destination<Eng: Send + Sync + 'static>(
         .await;
     }
     // An IoT SiteWise destination would have to create asset models in that
-    // service, which this emulator does not mount.
+    // service, which nothing here does.
     Err(Failure::processing(IOT_SITE_WISE_END_MESSAGE.to_string()))
 }
 
@@ -285,6 +287,9 @@ fn write_into_workspace<Eng: Send + Sync + 'static>(
         &workspace_id,
         document,
         ::std::time::SystemTime::now(),
+        // No sync job asked for this write: a metadata transfer's entries are a
+        // document's, not a linked service's projection.
+        None,
     ))
 }
 

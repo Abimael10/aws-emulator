@@ -41,16 +41,22 @@ use super::*;
 /// non-terminal `CREATING` state its own create answers with and carries the
 /// instant its transition to `ACTIVE` falls due, exactly as one created
 /// directly does, and an entity lands `ACTIVE` as its own create leaves it.
+///
+/// `sync_source` is the `syncSource` of the sync job this write is the work of,
+/// stamped on every record it writes ([`Entity::sync_source`]) so a read reports
+/// where the resource came from, and `None` for a write no sync job asked for —
+/// which is every metadata transfer.
 pub fn write_document_into_workspace(
     state: &mut RegionalState,
     region: &str,
     workspace_id: &str,
     document: &MetadataDocument,
     now: SystemTime,
+    sync_source: Option<&str>,
 ) -> TransferReport {
     let mut report = TransferReport::default();
     for entry in &document.component_types {
-        write_component_type(state, region, workspace_id, entry, now, &mut report);
+        write_component_type(state, region, workspace_id, entry, now, sync_source, &mut report);
     }
     // The entities, parent before child: the document lists them in no
     // particular order, so an entry whose parent is not in the workspace yet is
@@ -80,7 +86,7 @@ pub fn write_document_into_workspace(
         for index in wave {
             let entry = &document.entities[index];
             decided[index] = true;
-            write_entity(state, region, workspace_id, entry, now, &mut report);
+            write_entity(state, region, workspace_id, entry, now, sync_source, &mut report);
             // The entries that were waiting for THIS entity: unblocked only if
             // the write just made left it in the workspace — an entry that
             // failed brings no parent in, and one skipped because the
@@ -148,6 +154,7 @@ fn write_component_type(
     workspace_id: &str,
     entry: &ComponentTypeEntry,
     now: SystemTime,
+    sync_source: Option<&str>,
     report: &mut TransferReport,
 ) {
     let component_type_id = entry.component_type_id.as_str();
@@ -259,6 +266,9 @@ fn write_component_type(
         // one its own create opens, and the clock closes it.
         state: STATE_CREATING.to_string(),
         settles_at: now + COMPONENT_TYPE_SETTLE_SPAN,
+        // Where the component type came from: the sync job whose work this
+        // write is, and nothing for a write no sync job asked for.
+        sync_source: sync_source.map(str::to_string),
     };
     if let Some(message) = property_groups_violation(workspace, &record) {
         report.failed(ENTRY_KIND_COMPONENT_TYPE, component_type_id, message);
@@ -294,6 +304,7 @@ fn write_entity(
     workspace_id: &str,
     entry: &EntityEntry,
     now: SystemTime,
+    sync_source: Option<&str>,
     report: &mut TransferReport,
 ) {
     let entity_id = entry.entity_id.as_str();
@@ -415,6 +426,8 @@ fn write_entity(
         // no transition.
         state: STATE_ACTIVE.to_string(),
         settles_at: now,
+        // Where the entity came from; see [`write_component_type`].
+        sync_source: sync_source.map(str::to_string),
     };
     if let Some(message) = entity_contents_over_ceiling(&record) {
         report.failed(ENTRY_KIND_ENTITY, entity_id, message);

@@ -328,7 +328,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut component_summaries = Vec::new();
         for listed in remaining.by_ref().take(page_size) {
-            component_summaries.push(listed.summary(workspace, &status));
+            component_summaries.push(listed.summary(workspace, &status, entity.sync_source.as_deref()));
         }
         // The token the next call resumes at: the first component this page left
         // over. Absent on the last page, which is how a caller knows to stop.
@@ -383,10 +383,18 @@ impl Listed<'_> {
     /// `componentTypeId` is what gives a component that type's groups, so a
     /// group the entity never restated is reported here too and marked
     /// `isInherited`, and `definedIn` names the component type the inherited
-    /// definition set came from. `syncSource` is absent for the reason
-    /// `GetEntity` omits it: an entity this service created is not projected
-    /// from a linked service.
-    fn summary(&self, workspace: &crate::state::Workspace, status: &Status) -> ComponentSummary {
+    /// definition set came from. `syncSource` is the holding entity's: a
+    /// component belongs to its entity, so it reports the sync source of the
+    /// job that projected that entity ("the syncSource of the sync job, if this
+    /// entity was created by a sync job"), and nothing for an entity a caller
+    /// created directly — the same answer `GetEntity` gives for the same
+    /// component.
+    fn summary(
+        &self,
+        workspace: &crate::state::Workspace,
+        status: &Status,
+        sync_source: Option<&str>,
+    ) -> ComponentSummary {
         match self {
             Self::Component(component) => ComponentSummary {
                 component_name: component.component_name.clone(),
@@ -407,7 +415,7 @@ impl Listed<'_> {
                     &component.property_groups,
                 )),
                 status: status.clone(),
-                sync_source: None,
+                sync_source: sync_source.map(str::to_string),
                 // Absent for a top-level component: `componentPath` is the path
                 // to a COMPOSITE component "starting from the top-level
                 // component", so it is what identifies one of those, while a
@@ -426,7 +434,7 @@ impl Listed<'_> {
                     &composite.property_groups,
                 )),
                 status: status.clone(),
-                sync_source: None,
+                sync_source: sync_source.map(str::to_string),
                 // The whole path that addresses this composite component,
                 // which is what a caller walks one level deeper with.
                 component_path: Some(composite.component_path.clone()),

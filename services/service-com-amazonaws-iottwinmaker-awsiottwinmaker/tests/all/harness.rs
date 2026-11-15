@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
@@ -102,6 +102,28 @@ impl Emulator {
         router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
             engine.clone(),
         ));
+        Self { router, engine }
+    }
+
+    /// One emulator carrying BOTH this service and IoT SiteWise over the SAME
+    /// engine — exactly as the assembled router mounts them.
+    ///
+    /// A `SITEWISE` sync job's source is the asset models and assets of that
+    /// service, so a suite about what a sync job READS out of the source and
+    /// PROJECTS into a workspace needs the owner of those records mounted beside
+    /// this service; what the job projects is then a hierarchy that service's own
+    /// creates really stored. Every other suite uses [`Emulator::new`], which
+    /// mounts this service alone and leaves the source empty.
+    pub(crate) fn with_sitewise() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(
+            service_com_amazonaws_iottwinmaker_awsiottwinmaker::EmulatedService::new(engine.clone()),
+        );
+        router.register_service(
+            service_com_amazonaws_iotsitewise_awsiotsitewise::EmulatedService::new(engine.clone()),
+        );
         Self { router, engine }
     }
 
@@ -208,6 +230,46 @@ impl Emulator {
         }
         let request = builder.body(payload).expect("build the request");
 
+        self.dispatch(request).await
+    }
+
+    /// One dispatched request to IoT SiteWise — the sync source — over the SAME
+    /// router this service's requests go through.
+    ///
+    /// Signed for that service and addressed at its own endpoint, because a
+    /// request routes by the service its credential scope names: this is how a
+    /// suite stages the source hierarchy a sync job projects, through IoT
+    /// SiteWise's OWN wire rather than by writing its store. Only meaningful on
+    /// an emulator built by [`Emulator::with_sitewise`].
+    pub(crate) async fn call_sitewise(&self, method: &str, path: &str, body: Option<Value>) -> Resp {
+        let payload = match &body {
+            Some(value) => {
+                bytes::Bytes::from(serde_json::to_vec(value).expect("serialize the request body"))
+            }
+            None => bytes::Bytes::new(),
+        };
+        let host = format!("api.iotsitewise.{REGION}.amazonaws.com");
+        let request = http::Request::builder()
+            .method(method)
+            .uri(format!("https://{host}{path}"))
+            .header("host", host)
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/iotsitewise/\
+                     aws4_request, SignedHeaders=host, Signature=0"
+                ),
+            )
+            .body(payload)
+            .expect("build the request");
+
+        self.dispatch(request).await
+    }
+
+    /// Dispatch one built request and read back the status, the error code and
+    /// the body every case asserts on.
+    async fn dispatch(&self, request: http::Request<bytes::Bytes>) -> Resp {
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
         let error_type = response
@@ -789,6 +851,8 @@ pub(crate) async fn seed_entities(emulator: &Emulator, count: usize) -> Vec<Stri
                 update_date_time: now,
                 state: STATE_ACTIVE.to_string(),
                 settles_at: now,
+                // Seeded as a caller's own entity: no sync job projected it.
+                sync_source: None,
             },
         );
         state.arn_index.insert(
@@ -837,6 +901,44 @@ pub(crate) fn seed_sync_job(emulator: &Emulator, workspace_id: &str, sync_source
             sync_source: sync_source.to_string(),
         },
     );
+}
+
+/// How long a suite waits for a transition the CLOCK owes before it gives up.
+///
+/// A generous deadline rather than a measurement: the emulator stores the
+/// instant a transition falls due and a reader materialises it, so a poll sees
+/// the new state as soon as the clock has passed that instant, however loaded
+/// the host is. Nothing here asserts on how long it took.
+pub(crate) const TRANSITION_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How often a poll looks again while it waits for one.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Read the sync job `workspace_id`/`sync_source` again until it reports
+/// `state`, and answer that read.
+///
+/// The wait is for the CONDITION, not for a span: a job's states are due at
+/// instants the record carries ([`SyncJob::settle`]), and this looks again
+/// until the one the case is about has been materialised or
+/// [`TRANSITION_DEADLINE`] has passed.
+pub(crate) async fn sync_job_in_state(
+    emulator: &Emulator,
+    workspace_id: &str,
+    sync_source: &str,
+    state: &str,
+) -> Resp {
+    let deadline = Instant::now() + TRANSITION_DEADLINE;
+    loop {
+        let read = emulator.get_sync_job(Some(workspace_id), sync_source).await;
+        if read.member("status")["state"].as_str() == Some(state) {
+            return read;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {workspace_id:?}/{sync_source:?}: the job must reach {state:?}, got {read:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 pub(crate) fn workspace_arn(workspace_id: &str) -> String {
