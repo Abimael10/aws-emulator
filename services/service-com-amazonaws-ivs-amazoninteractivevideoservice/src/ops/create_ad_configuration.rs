@@ -7,6 +7,11 @@
 //! `crate::state::ComAmazonawsIvsAmazoninteractivevideoserviceState::ad_configurations`,
 //! which is where `GetAdConfiguration` reads it back from.
 //!
+//! Every MediaTailor playback configuration the request REFERENCES is resolved first,
+//! where that resource lives (`crate::state::referenced_resources`): a reference
+//! MediaTailor answers it holds nothing for is refused with the modelled
+//! `ResourceNotFoundException` and nothing is persisted.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -175,6 +180,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let region = crate::state::request_region(ctx.parts());
+
+        // The reference each entry carries is resolved BEFORE anything is minted: a
+        // `MediaTailorPlaybackConfiguration`'s `playbackConfigurationArn` names "the
+        // customer-created EMT PlaybackConfiguration resource in the same region and
+        // account" (`smithy_query(query="shape",
+        // shape="MediaTailorPlaybackConfiguration")`), which is a resource MediaTailor
+        // owns — so MediaTailor is asked for it, and a reference it answers it holds
+        // nothing for is refused with the `ResourceNotFoundException` this operation
+        // models, leaving the store exactly as it was. The question is put before the
+        // store is locked, because it is a call to another service and no lock is held
+        // across one.
+        for entry in &input.media_tailor_playback_configurations {
+            let Some(reference) = entry.playback_configuration_arn.as_deref() else {
+                continue;
+            };
+            // A value that names no MediaTailor playback configuration at all leaves
+            // nothing to resolve: the modelled `@pattern` on the member is what refuses
+            // a malformed one, before this handler runs.
+            let Some((name, reference_region)) =
+                crate::state::media_tailor_playback_configuration_reference(reference, &region)
+            else {
+                continue;
+            };
+            if crate::state::media_tailor_playback_configuration_is_absent(
+                ctx.callback(),
+                reference_region,
+                name,
+            )
+            .await
+            {
+                return Err(crate::state::referenced_resource_not_found(
+                    CreateAdConfigurationErrorModeled::ResourceNotFoundException,
+                    crate::state::MEDIA_TAILOR_PLAYBACK_CONFIGURATION_KIND,
+                    name,
+                ));
+            }
+        }
 
         let mut store = state.lock();
         // One more entry per call, for the life of the process: past the cap the

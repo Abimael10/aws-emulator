@@ -44,6 +44,11 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 /// account id and the region the `AUTHORIZATION` scope above names.
 const ARN_PREFIX: &str = "arn:aws:ivs:us-east-1:000000000000:";
 
+/// The status the two tagging WRITES answer: their modelled output declares no member,
+/// and the recorded answer carries no content. Asserted here only as the status a write
+/// is accepted with; `no_content_tagging.rs` is the suite that states the rule.
+const NO_CONTENT: u16 = 204;
+
 /// One IVS emulator over one shared engine, reached the way the router reaches it.
 struct Ivs {
     router: MultiServiceRouter,
@@ -529,9 +534,11 @@ async fn tags_round_trip_through_the_tagging_surface_for_every_resource_type() {
             )
             .await;
         assert_eq!(
-            reply.status, 200,
-            "case {case:?}: TagResource must be accepted, got {} {}",
-            reply.status, reply.body
+            reply.status,
+            NO_CONTENT,
+            "case {case:?}: TagResource must be accepted with no content, got {} {}",
+            reply.status,
+            reply.body
         );
         let expected = HashMap::from([
             ("team".to_string(), "video".to_string()),
@@ -548,9 +555,12 @@ async fn tags_round_trip_through_the_tagging_surface_for_every_resource_type() {
         for round in 0..2 {
             let reply = ivs.tagging("DELETE", &arn, "?tagKeys=env", None).await;
             assert_eq!(
-                reply.status, 200,
-                "case {case:?} round {round}: UntagResource must be accepted, got {} {}",
-                reply.status, reply.body
+                reply.status,
+                NO_CONTENT,
+                "case {case:?} round {round}: UntagResource must be accepted with no \
+                 content, got {} {}",
+                reply.status,
+                reply.body
             );
             assert_eq!(
                 ivs.tags_of(&arn).await,
@@ -564,9 +574,12 @@ async fn tags_round_trip_through_the_tagging_surface_for_every_resource_type() {
             .tagging("DELETE", &arn, "?tagKeys=team&tagKeys=absent", None)
             .await;
         assert_eq!(
-            reply.status, 200,
-            "case {case:?}: removing several keys at once must be accepted, got {} {}",
-            reply.status, reply.body
+            reply.status,
+            NO_CONTENT,
+            "case {case:?}: removing several keys at once must be accepted with no \
+             content, got {} {}",
+            reply.status,
+            reply.body
         );
         assert_eq!(
             ivs.tags_of(&arn).await,

@@ -30,8 +30,14 @@ mod channel_endpoints;
 /// reaches it where it reaches the rest of this service's rules.
 mod ad_breaks;
 
+/// The resources of OTHER services an IVS create references — a MediaTailor playback
+/// configuration, an Amazon S3 bucket — and how this service resolves one before it
+/// mints anything that names it. One concern, one file, re-exported here.
+mod referenced_resources;
+
 pub use ad_breaks::*;
 pub use channel_endpoints::*;
+pub use referenced_resources::*;
 
 use crate::ops::types::{
     AdConfiguration, Channel, ChannelNotBroadcasting, ConflictException, InternalServerException,
@@ -213,32 +219,40 @@ pub fn arn_region(arn: &str) -> Option<&str> {
 
 /// A `ChannelArn`: `arn:aws:ivs:<region>:<account>:channel/<id>`.
 pub fn channel_arn(region: &str, id: &str) -> String {
-    ::engine::emulator_arn("ivs", region, &format!("channel/{id}"))
+    resource_arn(CHANNEL_RESOURCE_TYPE, region, id)
 }
 
 /// A `StreamKeyArn`: `arn:aws:ivs:<region>:<account>:stream-key/<id>`.
 pub fn stream_key_arn(region: &str, id: &str) -> String {
-    ::engine::emulator_arn("ivs", region, &format!("stream-key/{id}"))
+    resource_arn(STREAM_KEY_RESOURCE_TYPE, region, id)
 }
 
 /// A `PlaybackKeyPairArn`: `arn:aws:ivs:<region>:<account>:playback-key/<id>`, the
 /// form the modelled `PlaybackKeyPairArn` pattern
 /// `^arn:aws:ivs:[a-z0-9-]+:[0-9]+:playback-key/[a-zA-Z0-9-]+$` pins.
 pub fn playback_key_pair_arn(region: &str, id: &str) -> String {
-    ::engine::emulator_arn("ivs", region, &format!("playback-key/{id}"))
+    resource_arn(PLAYBACK_KEY_RESOURCE_TYPE, region, id)
 }
 
 /// An `AdConfigurationArn`: `arn:aws:ivs:<region>:<account>:ad-configuration/<id>`,
 /// the form the modelled `AdConfigurationArn` pattern
 /// `^arn:aws:ivs:[a-z0-9-]+:[0-9]+:ad-configuration/[a-zA-Z0-9-]+$` pins.
 pub fn ad_configuration_arn(region: &str, id: &str) -> String {
-    ::engine::emulator_arn("ivs", region, &format!("ad-configuration/{id}"))
+    resource_arn(AD_CONFIGURATION_RESOURCE_TYPE, region, id)
 }
 
 /// A `RecordingConfigurationArn`:
 /// `arn:aws:ivs:<region>:<account>:recording-configuration/<id>`.
 pub fn recording_configuration_arn(region: &str, id: &str) -> String {
-    ::engine::emulator_arn("ivs", region, &format!("recording-configuration/{id}"))
+    resource_arn(RECORDING_CONFIGURATION_RESOURCE_TYPE, region, id)
+}
+
+/// One ARN of this service, in the `<type>/<id>` resource form every ARN shape in this
+/// model pins — so a resource TYPE is spelled once, where
+/// [`CHANNEL_RESOURCE_TYPE`] and its siblings state it, and the ARN a create mints and
+/// the ARN the tagging surface resolves can never disagree about it.
+fn resource_arn(resource_type: &str, region: &str, id: &str) -> String {
+    ::engine::emulator_arn("ivs", region, &format!("{resource_type}/{id}"))
 }
 
 /// The state a recording configuration is minted in, from the modelled
@@ -906,7 +920,25 @@ pub fn page<'a, T>(
 /// `GetPlaybackKeyPair` and `StartViewerSessionRevocation`, which is what makes it a
 /// rule of the service rather than wording of one operation.
 pub fn resource_not_found_message(arn: &str) -> String {
-    format!("Resource: {arn} not found")
+    not_found_message(arn)
+}
+
+/// The same not-found sentence for a resource of ANOTHER service a request REFERENCED
+/// and that service does not hold: the kind of resource, and the name the referencing
+/// ARN named, in quotes.
+///
+/// Recorded for the MediaTailor playback configuration a `CreateAdConfiguration` entry
+/// names ("Resource: mediaTailorPlaybackConfiguration '<name>' not found"); the subject
+/// is what varies, so it is the parameter and the template is shared with
+/// [`resource_not_found_message`].
+pub fn referenced_resource_not_found_message(kind: &str, name: &str) -> String {
+    not_found_message(&format!("{kind} '{name}'"))
+}
+
+/// The one not-found template both rules above state: what the request named, and
+/// nothing else.
+fn not_found_message(subject: &str) -> String {
+    format!("Resource: {subject} not found")
 }
 
 /// How IVS states an operation on a channel that is not currently ingesting
@@ -1024,6 +1056,24 @@ pub fn resource_not_found<E>(
     arn: &str,
 ) -> Scaffolded<E> {
     let message = resource_not_found_message(arn);
+    Scaffolded::stated(
+        variant(ResourceNotFoundException {
+            exception_message: Some(message.clone()),
+            ..Default::default()
+        }),
+        message,
+    )
+}
+
+/// The `ResourceNotFoundException` (HTTP 404) this service answers when a request
+/// REFERENCED a resource of another service that does not exist. See
+/// [`referenced_resource_not_found_message`].
+pub fn referenced_resource_not_found<E>(
+    variant: fn(ResourceNotFoundException) -> E,
+    kind: &str,
+    name: &str,
+) -> Scaffolded<E> {
+    let message = referenced_resource_not_found_message(kind, name);
     Scaffolded::stated(
         variant(ResourceNotFoundException {
             exception_message: Some(message.clone()),
@@ -1707,6 +1757,21 @@ pub fn channel_exists(
 // Resources addressed by ARN: the tagging surface
 // =============================================================================
 
+/// The resource segment each ARN this service mints carries, one constant per kind, so
+/// the minting rules above and the ARN -> resource resolution below cannot spell a
+/// resource type two ways. Each is the segment the matching modelled `*Arn` pattern pins
+/// (`smithy_query(query="shape", shape="ChannelArn,StreamKeyArn,PlaybackKeyPairArn,\
+/// AdConfigurationArn,RecordingConfigurationArn")`).
+pub const CHANNEL_RESOURCE_TYPE: &str = "channel";
+/// See [`CHANNEL_RESOURCE_TYPE`].
+pub const STREAM_KEY_RESOURCE_TYPE: &str = "stream-key";
+/// See [`CHANNEL_RESOURCE_TYPE`].
+pub const PLAYBACK_KEY_RESOURCE_TYPE: &str = "playback-key";
+/// See [`CHANNEL_RESOURCE_TYPE`].
+pub const AD_CONFIGURATION_RESOURCE_TYPE: &str = "ad-configuration";
+/// See [`CHANNEL_RESOURCE_TYPE`].
+pub const RECORDING_CONFIGURATION_RESOURCE_TYPE: &str = "recording-configuration";
+
 /// The resource type an IVS ARN names (`channel`, `stream-key`, `playback-key`, …), or
 /// `None` when the string is not an IVS resource ARN at all.
 ///
@@ -1719,25 +1784,36 @@ pub fn arn_resource_type(arn: &str) -> Option<&str> {
 /// The tags attached to the resource `arn` names, or `None` when this store holds no
 /// such resource.
 ///
-/// Only the resource types this service can create are reachable: a channel
-/// (`CreateChannel`), a stream key (`CreateChannel` / `CreateStreamKey`) and a recording
-/// configuration (`CreateRecordingConfiguration`). Every other IVS resource type's
-/// create is still a scaffold stub, so this store holds none of them, and a well-formed
-/// ARN naming one is answered exactly as an ARN naming a deleted resource is — not found.
+/// EVERY resource type this service can create is reachable, because a tag set written
+/// when the resource was created has to be readable afterwards: a channel
+/// (`CreateChannel`), a stream key (`CreateChannel` / `CreateStreamKey`), a playback key
+/// pair (`ImportPlaybackKeyPair`), an ad configuration (`CreateAdConfiguration`) and a
+/// recording configuration (`CreateRecordingConfiguration`) — the five stores this state
+/// holds tagged resources in. A resource type whose create is still a scaffold stub (a
+/// playback restriction policy) is held by no store, so a well-formed ARN naming one is
+/// answered exactly as an ARN naming a deleted resource is — not found.
 pub fn resource_tags(
     state: &ComAmazonawsIvsAmazoninteractivevideoserviceState,
     arn: &str,
 ) -> Option<HashMap<String, String>> {
     match arn_resource_type(arn)? {
-        "channel" => state
+        CHANNEL_RESOURCE_TYPE => state
             .channels
             .get(arn)
             .map(|channel| channel.tags.clone().unwrap_or_default()),
-        "stream-key" => state
+        STREAM_KEY_RESOURCE_TYPE => state
             .stream_keys
             .get(arn)
             .map(|key| key.tags.clone().unwrap_or_default()),
-        "recording-configuration" => state
+        PLAYBACK_KEY_RESOURCE_TYPE => state
+            .playback_key_pairs
+            .get(arn)
+            .map(|pair| pair.tags.clone().unwrap_or_default()),
+        AD_CONFIGURATION_RESOURCE_TYPE => state
+            .ad_configurations
+            .get(arn)
+            .map(|configuration| configuration.tags.clone().unwrap_or_default()),
+        RECORDING_CONFIGURATION_RESOURCE_TYPE => state
             .recording_configurations
             .get(arn)
             .map(|record| record.configuration.tags.clone().unwrap_or_default()),
@@ -1757,9 +1833,17 @@ pub fn resource_tags_entry<'a>(
     arn: &str,
 ) -> Option<&'a mut Option<HashMap<String, String>>> {
     match arn_resource_type(arn)? {
-        "channel" => state.channels.get_mut(arn).map(|channel| &mut channel.tags),
-        "stream-key" => state.stream_keys.get_mut(arn).map(|key| &mut key.tags),
-        "recording-configuration" => state
+        CHANNEL_RESOURCE_TYPE => state.channels.get_mut(arn).map(|channel| &mut channel.tags),
+        STREAM_KEY_RESOURCE_TYPE => state.stream_keys.get_mut(arn).map(|key| &mut key.tags),
+        PLAYBACK_KEY_RESOURCE_TYPE => state
+            .playback_key_pairs
+            .get_mut(arn)
+            .map(|pair| &mut pair.tags),
+        AD_CONFIGURATION_RESOURCE_TYPE => state
+            .ad_configurations
+            .get_mut(arn)
+            .map(|configuration| &mut configuration.tags),
+        RECORDING_CONFIGURATION_RESOURCE_TYPE => state
             .recording_configurations
             .get_mut(arn)
             .map(|record| &mut record.configuration.tags),

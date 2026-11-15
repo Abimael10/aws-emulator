@@ -95,12 +95,19 @@
 //!
 //! A sixth seam, `override_protocol`, is one this service DOES take: the codec every
 //! modelled response is rendered through. It is the model's own `restJson1` in every
-//! respect but one — every channel object this service serves carries the
+//! respect but two. Every channel object this service serves carries the
 //! failover-slate configuration ARN the wire response carries and this model revision
-//! declares on neither channel shape. See [`channel_projection`] for that rule; it is
-//! applied here, at the one place every response of this service passes through, rather
-//! than per operation, because no handler can reach the rendering of its own output and
-//! no generated shape can carry a member its model does not declare.
+//! declares on neither channel shape — see [`channel_projection`] for that rule. And an
+//! answer at the no-content status carries no body and states the length it has
+//! (`content-length: 0`), which is what the recorded 204s of this service carry and what
+//! the protocol's serializer cannot do, rendering a members-less output structure as the
+//! empty JSON object `{}` whatever status it is sent at; the rule itself is the tree's
+//! one reading of it (`service_common::no_content_responses`). Both are applied here, at
+//! the one place every response of this service passes through, rather than per
+//! operation, because no handler can reach the rendering of its own output and no
+//! generated shape can carry a member its model does not declare. The HTTP/1.1 writer
+//! this emulator is served on removes `content-length` from a no-content answer again,
+//! which is below anything this crate decides.
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
@@ -772,13 +779,22 @@ impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
     ) -> Result<RtResponse, ProtocolError> {
         // The status, the headers and every modelled member stay the framework's: only a
         // channel object gains the configuration ARN its shape does not declare, from the
-        // record the handler already returned.
-        self.entry.protocol().serialize_output(
+        // record the handler already returned, and only an answer at the no-content
+        // status is REFRAMED — it carries no body and states the length it has, which is
+        // what the recorded `204`s of this service (the deletes, `PutMetadata` and the
+        // two tagging writes) carry. The rule is the tree's one reading of it
+        // (`service_common::no_content_responses`), applied here because the protocol's
+        // serializer renders a members-less output structure as `{}` whatever status it
+        // is sent at.
+        let rendered = self.entry.protocol().serialize_output(
             &ChannelProjection::new(output),
             output_schema,
             operation_name,
             success_status,
-        )
+        )?;
+        Ok(::service_common::no_content_responses::without_content(
+            rendered,
+        ))
     }
 
     fn serialize_error(

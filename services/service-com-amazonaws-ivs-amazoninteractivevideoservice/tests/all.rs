@@ -41,6 +41,8 @@ mod generated_ingest_secrets;
 mod list_channels_failover_projection;
 #[path = "all/live_stream_reads.rs"]
 mod live_stream_reads;
+#[path = "all/no_content_tagging.rs"]
+mod no_content_tagging;
 #[path = "all/not_found_envelope.rs"]
 mod not_found_envelope;
 #[path = "all/playback_key_pair_import.rs"]
@@ -53,6 +55,8 @@ mod recording_configuration_delete;
 mod recording_configuration_lifecycle;
 #[path = "all/recording_configuration_list.rs"]
 mod recording_configuration_list;
+#[path = "all/referenced_resource_admission.rs"]
+mod referenced_resource_admission;
 #[path = "all/request_id_token_form.rs"]
 mod request_id_token_form;
 #[path = "all/signing_name_routing.rs"]

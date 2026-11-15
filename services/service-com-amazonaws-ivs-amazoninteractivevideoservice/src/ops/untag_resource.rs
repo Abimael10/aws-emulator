@@ -134,7 +134,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    /// A tag removal leaves its caller nothing to parse — `UntagResourceResponse` is a
+    /// structure with NO member (`smithy_query(query="operation",
+    /// operation="UntagResource")`) — and the recorded answer is `204 No Content` with
+    /// an empty body, exactly as `TagResource`'s is. The protocol leaves the code
+    /// defaulted, so the status is the service's own to state, and the body is framed
+    /// for it where every response of this service is serialized (`crate::service`).
+    const SUCCESS_STATUS: u16 = ::service_common::no_content_responses::NO_CONTENT_STATUS;
 
     async fn handle(
         &self,

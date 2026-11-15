@@ -1648,6 +1648,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-mediatailor"
+version = "1.138.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a14ea6b5d0d9f37a676cf609784a68006b206ab2f171fa5535bfa970259c65a"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-organizations"
 version = "1.139.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15160,6 +15185,8 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-mediatailor",
+ "aws-sdk-s3",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -15171,6 +15198,8 @@ dependencies = [
  "rcgen",
  "regex",
  "serde_json",
+ "service-com-amazonaws-mediatailor-mediatailor",
+ "service-com-amazonaws-s3-amazons3",
  "service-common",
  "sha2 0.10.9",
  "spki 0.7.3",

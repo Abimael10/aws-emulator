@@ -38,8 +38,19 @@ md-5 = "0.10"
 # framework's own constraint walk uses, at the minor version that walk pins.
 regex = "1.12"
 # `service-common` carries the ONE reading of which address this emulator is reached at,
-# which the playback URL every channel projection announces is built on.
+# which the playback URL every channel projection announces is built on, the one
+# caller-supplied-ARN parse, the in-process Amazon S3 client, and the framing of a
+# response that carries no content.
 service-common = { path = "../common" }
+# The AWS SDK for Amazon S3, driven over the in-process callback
+# (`OperationContext::callback`): `CreateRecordingConfiguration` resolves the bucket its
+# destination names in THIS emulator's own object store before it mints a configuration.
+# Only the generated client is needed — the emulator supplies the transport, so the SDK's
+# own HTTPS stack and runtime are left out.
+aws-sdk-s3 = { version = "1", default-features = false }
+# The AWS SDK for AWS Elemental MediaTailor, over the same transport:
+# `CreateAdConfiguration` resolves each playback configuration its request references.
+aws-sdk-mediatailor = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -50,6 +61,13 @@ hex = { workspace = true }
 # Real key pairs for the playback-key-pair tests, so what they import is a genuine
 # public key rather than a hand-built byte string.
 rcgen = "0.13"
+# The bucket a recording configuration names and the playback configuration an ad
+# configuration references are resources of those two services, so the suite that drives
+# the admission checks mounts them beside this one on ONE engine: what a create resolves
+# is a real bucket of this object store and a real MediaTailor configuration, each
+# created and removed through its own API.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+service-com-amazonaws-mediatailor-mediatailor = { workspace = true }
 
 [lints]
 workspace = true

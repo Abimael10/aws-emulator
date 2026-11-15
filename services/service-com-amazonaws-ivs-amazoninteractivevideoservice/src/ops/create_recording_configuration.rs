@@ -11,6 +11,11 @@
 //! ([`crate::state::RECORDING_CONFIGURATION_ACTIVATION`]) and is materialised by
 //! whatever reports the resource next, not here.
 //!
+//! The bucket the destination names is resolved first, where that resource lives
+//! (`crate::state::referenced_resources`): a bucket the object store answers this
+//! account does not hold is refused with the modelled `ValidationException` and nothing
+//! is persisted.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -203,6 +208,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let thumbnail_configuration =
             crate::state::effective_thumbnail_configuration(input.thumbnail_configuration);
 
+        // The destination this configuration would record into is resolved BEFORE
+        // anything is minted: `destinationConfiguration.s3.bucketName` is the "Location
+        // (S3 bucket name) where recorded videos will be stored"
+        // (`smithy_query(query="shape", shape="S3DestinationConfiguration")`), a bucket
+        // Amazon S3 owns — so the object store is asked for it, and a bucket it answers
+        // this account does not hold is refused with the `ValidationException` this
+        // operation models, naming the member whose value cannot be satisfied. The
+        // question is put before the store is locked, because it is a call to another
+        // service and no lock is held across one.
+        if let Some(bucket) = input
+            .destination_configuration
+            .s3
+            .as_ref()
+            .map(|s3| s3.bucket_name.as_str())
+        {
+            if crate::state::s3_bucket_is_absent(ctx.callback(), &region, bucket).await {
+                return Err(crate::state::validation(
+                    CreateRecordingConfigurationErrorModeled::ValidationException,
+                    crate::state::member_constraint_message(
+                        S3_DESTINATION_MEMBER_PATH,
+                        &format!("{S3_DESTINATION_MEMBER_PATH} is invalid"),
+                    ),
+                ));
+            }
+        }
+
         let mut store = state.lock();
         // The store grows by one configuration per call and lives for the life of the
         // process, so the growth is capped; past the cap the service answers the
@@ -242,3 +273,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The member path the refusal above names: the dotted path to the destination whose
+/// value could not be satisfied, spelled as the WIRE spells it and qualified by the
+/// resource the request creates — the form IVS states a member constraint in (see
+/// [`crate::state::member_constraint_message`]).
+const S3_DESTINATION_MEMBER_PATH: &str = "recordingConfiguration.destinationConfiguration.s3";
