@@ -20,7 +20,10 @@ use service_com_amazonaws_schemas_schemas::state::{
     JsonNode, AWS_MANAGED_REGISTRY, CLOUD_TRAIL_EVENT_FAMILY,
 };
 
-use crate::registry_schema_lifecycle::{export_uri, schema_uri, Emulator};
+// The document readers and the harness every sibling suite of this target shares.
+use crate::registry_schema_lifecycle::{
+    at, export_uri, in_name_order, member_names, ordered_document, schema_uri, Emulator,
+};
 
 /// Every member the published document declares for a record's identity element, in the
 /// order the document writes them, each with the type it is declared as.
@@ -54,39 +57,6 @@ const PUBLISHED_IDENTITY_MEMBERS: &[(&str, &str)] = &[
 /// The `detail` of a CloudTrail-delivered event is the same record whichever source
 /// published it, so each row must declare the same identity.
 const PUBLISHING_SOURCES: &[&str] = &["aws.events", "aws.s3", "aws.amazon.connect", "aws.xray"];
-
-/// The names of an object's members, in the order the document writes them.
-fn member_names(node: &JsonNode) -> Vec<String> {
-    match node {
-        JsonNode::Object(members) => members.iter().map(|(name, _)| name.clone()).collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// `members` in the order the draft-04 export renders them: by name, without regard to
-/// case.
-fn in_name_order(members: &[&str]) -> Vec<String> {
-    let mut ordered: Vec<String> = members.iter().map(|member| (*member).to_string()).collect();
-    ordered.sort_by_key(|member| (member.to_lowercase(), member.clone()));
-    ordered
-}
-
-/// The node `path` names in `node`, or a panic naming the case and the path.
-fn at<'a>(case: &str, node: &'a JsonNode, path: &[&str]) -> &'a JsonNode {
-    let mut walked = node;
-    for step in path {
-        walked = walked.member(step).unwrap_or_else(|| {
-            panic!("case {case:?}: the document declares {path:?}, missing at {step:?}: {node:?}")
-        });
-    }
-    walked
-}
-
-/// The document `Content` carries, read with its member order kept.
-fn ordered_document(case: &str, content: &str) -> JsonNode {
-    JsonNode::parse(content)
-        .unwrap_or_else(|| panic!("case {case:?}: Content must be one JSON document: {content}"))
-}
 
 /// The identity member names a case expects, in the published order.
 fn expected_identity_members() -> Vec<String> {

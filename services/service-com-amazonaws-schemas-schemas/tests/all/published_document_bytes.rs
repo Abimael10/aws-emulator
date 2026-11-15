@@ -28,7 +28,10 @@ use service_com_amazonaws_schemas_schemas::state::{
     JSON_SCHEMA_DRAFT4_URI,
 };
 
-use crate::registry_schema_lifecycle::{export_uri, schema_uri, Emulator, OPENAPI_ONLY_KEYWORDS};
+use crate::registry_schema_lifecycle::{
+    at, export_uri, in_name_order, member_names, ordered_document, schema_uri, Emulator,
+    OPENAPI_ONLY_KEYWORDS,
+};
 
 /// The members the published document declares for a CloudTrail record, in the order it
 /// writes them.
@@ -69,6 +72,7 @@ const PUBLISHED_RECORD_MEMBERS: &[&str] = &[
     "tlsDetails",
     "userAgent",
     "userIdentity",
+    "vpcEndpointId",
 ];
 
 /// The record members the published document marks `nullable`: its four free-form
@@ -113,20 +117,6 @@ fn document_rows() -> Vec<ManagedEventType> {
                 .unwrap_or_else(|| panic!("case {name:?}: the catalogue must publish it"))
         })
         .collect()
-}
-
-/// The names of an object's members, in the order the document writes them.
-fn member_names(node: &JsonNode) -> Vec<String> {
-    match node {
-        JsonNode::Object(members) => members.iter().map(|(name, _)| name.clone()).collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// The document `answer`'s `Content` carries, read with its member order kept.
-fn ordered_document(case: &str, content: &str) -> JsonNode {
-    JsonNode::parse(content)
-        .unwrap_or_else(|| panic!("case {case:?}: Content must be one JSON document: {content}"))
 }
 
 /// The `components.schemas` of a published document, in document order.
@@ -742,33 +732,10 @@ const PUBLISHED_SESSION_STRUCTURES: &[(&str, &[&str])] = &[
     ("webIdFederationData", &["attributes", "federatedProvider"]),
 ];
 
-/// The node `path` names in `node`, or a panic naming the case and the path.
-fn at<'a>(case: &str, node: &'a JsonNode, path: &[&str]) -> &'a JsonNode {
-    let mut walked = node;
-    for step in path {
-        walked = walked.member(step).unwrap_or_else(|| {
-            panic!(
-                "case {case:?}: the document must declare {} (at {step:?}), got {:?}",
-                path.join("."),
-                member_names(walked)
-            )
-        });
-    }
-    walked
-}
-
 /// The `member_names` of `node`, as owned strings — the expectation an assertion compares
 /// a declared member list against.
 fn owned(members: &[&str]) -> Vec<String> {
     members.iter().map(|member| (*member).to_string()).collect()
-}
-
-/// `members` in the order the draft-04 export renders them: by name, without regard to
-/// case.
-fn in_name_order(members: &[&str]) -> Vec<String> {
-    let mut ordered = owned(members);
-    ordered.sort_by_key(|member| (member.to_lowercase(), member.clone()));
-    ordered
 }
 
 /// RULE: a nested structure of the record a published document describes is declared

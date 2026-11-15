@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_schemas_schemas::ops::types::TYPE_VALUES;
+use service_com_amazonaws_schemas_schemas::state::JsonNode;
 use service_com_amazonaws_schemas_schemas::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -248,6 +249,46 @@ pub(crate) const OPENAPI_ONLY_KEYWORDS: &[&str] = &[
 /// The `ListSchemaVersions` URI of one schema.
 pub(crate) fn versions_uri(registry: &str, schema: &str) -> String {
     format!("{}/versions", schema_uri(registry, schema))
+}
+
+/// The names of a document object's members, in the order the document writes them.
+///
+/// Shared with the sibling suites: a document this service serves is TEXT whose member
+/// order is part of it, so every case that asserts on that order reads it through this one
+/// reducer rather than through a map that would re-order it.
+pub(crate) fn member_names(node: &JsonNode) -> Vec<String> {
+    match node {
+        JsonNode::Object(members) => members.iter().map(|(name, _)| name.clone()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A served document, read with its member order kept, named by `case` in the panic.
+pub(crate) fn ordered_document(case: &str, content: &str) -> JsonNode {
+    JsonNode::parse(content)
+        .unwrap_or_else(|| panic!("case {case:?}: Content must be one JSON document: {content}"))
+}
+
+/// The node `path` names in `node`, or a panic naming the case and the path.
+pub(crate) fn at<'a>(case: &str, node: &'a JsonNode, path: &[&str]) -> &'a JsonNode {
+    let mut walked = node;
+    for step in path {
+        walked = walked.member(step).unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: the document must declare {} (at {step:?}), got {:?}",
+                path.join("."),
+                member_names(walked)
+            )
+        });
+    }
+    walked
+}
+
+/// `members` in the order a draft-04 export renders them: by name, without regard to case.
+pub(crate) fn in_name_order(members: &[&str]) -> Vec<String> {
+    let mut ordered: Vec<String> = members.iter().map(|member| (*member).to_string()).collect();
+    ordered.sort_by_key(|member| (member.to_lowercase(), member.clone()));
+    ordered
 }
 
 /// The version labels a `ListSchemaVersions` answer reports, as a set.

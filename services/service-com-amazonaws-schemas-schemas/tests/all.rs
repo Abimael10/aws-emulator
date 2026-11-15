@@ -87,6 +87,8 @@ mod published_catalogue_entries;
 mod published_document_bytes;
 #[path = "all/published_record_identity.rs"]
 mod published_record_identity;
+#[path = "all/published_record_request_path.rs"]
+mod published_record_request_path;
 #[path = "all/registry_schema_lifecycle.rs"]
 mod registry_schema_lifecycle;
 #[path = "all/registry_write_resolution.rs"]

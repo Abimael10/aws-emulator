@@ -57,3 +57,45 @@ Model cited: `DescribeSchema` http GET /v1/registries/name/{RegistryName}/schema
 5. The seed being served is `CLOUD_TRAIL_COMPONENTS` in `services/service-com-amazonaws-schemas-schemas/src/state.rs` (line 2339; `userIdentity` line 2390, `sessionContext` lines 2409-2440), rendered by `fn event_schema_document` (line 3022) and converted for export by `services/service-com-amazonaws-schemas-schemas/src/ops/export_schema.rs` (`to_json_schema_draft4` / `in_name_order` / `to_draft4`). Because one template is fanned out over the whole CloudTrail-delivered family and every source in the managed catalogue, a change there affects every such entry — check at least one other source after correcting it.
 6. After correcting the seed, re-replay BOTH steps: `task#3` converts the document `task#2` serves, so the correction has to be confirmed on the describe step AND on the export step separately.
 7. Both reproduce on every boot; nothing in either path reads the clock or mints an id, host, port or request id.
+
+## Resolution
+
+The rule both read paths owe: a published catalogue document declares its event's record
+WHOLE — every member the record's publisher states for the event, except the payload
+members only ONE kind of record carries — and writes those declarations in name order
+(compared without regard to case) at every depth, so a client that generates a binding,
+validates a delivered event, caches, diffs or hashes the text gets the publisher's
+declarations. For the CloudTrail-delivered family the record is the CloudTrail record,
+which states HOW a call reached the service as well as WHO made it: a call that arrived
+over a VPC endpoint is recorded with the endpoint it came in through (CloudTrail User
+Guide, "CloudTrail record contents").
+
+The seeded catalogue data — `CLOUD_TRAIL_COMPONENTS` in
+`services/service-com-amazonaws-schemas-schemas/src/state.rs` — ended the record's member
+list at `userIdentity`, so that member was declared nowhere, on either read path:
+`DescribeSchema` serves that one template for the whole family of every source and
+`ExportSchema` converts the document it serves. It is now declared, where the document's
+name order puts it. No handler and no serializer changed. What the document leaves out
+stays out: the Insights detail and the service-event detail are the payload of one kind of
+record, and the recorded prefix shows the published document declaring neither
+(`eventVersion` is followed by `managementEvent`, `responseElements` by
+`sessionCredentialFromConsole`); the endpoint's owning account, which later CloudTrail
+records also carry, is left out for the same reason the published text cannot be shown to
+carry it. `tests/all/published_record_request_path.rs` holds both read paths to the rule
+over a table (the whole CloudTrail-delivered family × four publishing sources, plus four
+non-CloudTrail entries that must declare it nowhere) and asserts the name-order invariant
+over every declaration of the served and the exported document;
+`tests/all/published_document_bytes.rs` carries the record's member set.
+
+RESIDUAL, DECLINED — and why this report is closed rather than re-filed. The replay key
+for each cause compares the WHOLE recorded `Content` string, and what the document SAYS is
+recorded behaviour only: the model states nothing about a document's text. Every replay
+detail ever filed for these two steps (this report and the three before it) clips the
+recorded document at or just past `userIdentity.properties.sessionContext`, and the replay
+tool now withholds recorded values altogether, so the one region in which a residual
+difference can lie has never been shown to anyone. The prefix that IS shown was re-checked
+against the served document for this change and agrees byte for byte, and the record is now
+declared as its publisher documents it. Both steps still report `$.Content: value_mismatch`
+after this change: that residual is DECLINED, because the only way left to close it is to
+fit the bytes of one withheld recording, which is neither a rule nor a fix. A later report
+of these two steps should be read against this note rather than as a new finding.

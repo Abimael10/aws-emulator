@@ -2332,10 +2332,21 @@ pub const CLOUD_TRAIL_EVENT_FAMILY: &[(&str, &str)] = &[
 ///   (`services/common`'s CloudTrail record writer), so a binding or validator built
 ///   from this document has to know them;
 /// * `eventTime` carries both the `date-time` format and the `yyyy-MM-dd'T'HH:mm:ss'Z'`
-///   pattern the record writes it in, which is what a generated binding parses it with.
+///   pattern the record writes it in, which is what a generated binding parses it with;
+/// * the record states HOW the call reached the service as well as WHO made it: a call
+///   that arrived over a VPC endpoint is recorded with the endpoint it came in through
+///   (CloudTrail User Guide, "CloudTrail record contents"), so the document declares it —
+///   a validator fed this document would otherwise reject a delivered event that names
+///   the endpoint, and a binding generated from it could not read the endpoint an auditor
+///   joins on;
+/// * what the document leaves out of the record is the payload of ONE kind of record —
+///   the Insights detail and the service-event detail, each of which only an event of
+///   that kind carries. Every other member of the record is a fact about the call
+///   itself, so every other member is declared.
 ///
-/// The members keep the order the published document writes them in: it is served as
-/// written (see [`JsonNode`]), not re-ordered by the map it passes through.
+/// The members keep the order the published document writes them in — by name, compared
+/// without regard to case, at every depth: it is served as written (see [`JsonNode`]),
+/// not re-ordered by the map it passes through.
 const CLOUD_TRAIL_COMPONENTS: &str = r##"{
   "{EventName}": {
     "type": "object",
@@ -2441,7 +2452,8 @@ const CLOUD_TRAIL_COMPONENTS: &str = r##"{
           "type": {"type": "string"},
           "userName": {"type": "string"}
         }
-      }
+      },
+      "vpcEndpointId": {"type": "string"}
     }
   }
 }"##;
