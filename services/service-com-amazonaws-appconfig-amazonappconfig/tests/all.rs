@@ -23,6 +23,8 @@ mod application_experiment_definition_gate;
 mod application_name_uniqueness;
 #[path = "all/authored_notification_action_points.rs"]
 mod authored_notification_action_points;
+#[path = "all/aws_authored_extension_catalog.rs"]
+mod aws_authored_extension_catalog;
 #[path = "all/aws_authored_extensions.rs"]
 mod aws_authored_extensions;
 #[path = "all/configuration_profile_deletion_protection.rs"]

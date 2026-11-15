@@ -42,8 +42,9 @@ use crate::resource_tags::{arn, pct};
 /// empty, because an authored extension is owned by no account and the model's `Arn`
 /// pattern makes that field optional. Built from the suite's own ARN helper, so the
 /// partition, the service namespace and the Region are the ones every other AppConfig ARN
-/// in these tests carries.
-fn authored_arn(extension_id: &str) -> String {
+/// in these tests carries. `pub(crate)` because the catalogue suite addresses the same
+/// published versions by the same ARNs.
+pub(crate) fn authored_arn(extension_id: &str) -> String {
     let owned = arn(&format!(
         "extension/{extension_id}/{AWS_AUTHORED_EXTENSION_VERSION}"
     ));
@@ -97,12 +98,12 @@ const PUBLISHED_NOTIFICATION_EXTENSIONS: &[(&str, &str, &[&str])] = &[
         &[],
     ),
     (
-        "AWS.AppConfig.DeploymentEventsToSns",
+        "AWS.AppConfig.DeploymentNotificationsToSns",
         "AppConfig deployment events to Amazon SNS",
         &["topicArn"],
     ),
     (
-        "AWS.AppConfig.DeploymentEventsToSqs",
+        "AWS.AppConfig.DeploymentNotificationsToSqs",
         "AppConfig deployment events to Amazon SQS",
         &["queueArn"],
     ),
@@ -212,11 +213,11 @@ async fn every_aws_authored_extension_is_listed_and_reads_back_the_same_record()
             ),
             "case {case:?}: expected an appconfig ARN owned by no account, got {expected_arn}"
         );
-        // A description is reported only when the catalogue publishes one for this
-        // extension; `Description` is optional on an `ExtensionSummary`.
+        // The published sentence for this extension, which the catalogue publishes for
+        // every authored entry.
         assert_eq!(
             summary.get("Description").and_then(Value::as_str),
-            authored.description,
+            Some(authored.description),
             "case {case:?}: expected the published description, got {summary}"
         );
 
@@ -367,8 +368,8 @@ async fn every_aws_authored_extension_is_listed_and_reads_back_the_same_record()
 /// rather than against the service's own catalogue constant.
 ///
 /// Rows: every published entry whose name this suite pins ([`PUBLISHED_EXTENSIONS`]), which
-/// differ along whether the name resembles the id at all, whether the entry carries a
-/// description, and which product the entry integrates.
+/// differ along whether the name resembles the id at all and which product the entry
+/// integrates.
 #[tokio::test]
 async fn the_published_entries_are_listed_under_their_published_ids_and_names() {
     let router = router();
@@ -538,7 +539,7 @@ async fn an_aws_authored_extension_is_not_this_accounts_to_create_or_delete() {
         let read = body_of(case, &get_extension(&router, authored.id, None).await);
         assert_eq!(
             read.get("Description").and_then(Value::as_str),
-            authored.description,
+            Some(authored.description),
             "case {case:?}: expected the published record after the refusals, got {read}"
         );
     }

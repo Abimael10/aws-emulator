@@ -68,3 +68,28 @@ Model cited: Smithy ListExtensions (GET /extensions, code 200, output Extensions
 4. For the entries that are present, compare Description with AWS's fixed per-extension text: AWS.AppConfig.FeatureFlags/1 and AWS.AppConfig.DeploymentNotificationsToEventBridge/1 come back paraphrased, and AWS.AppConfig.JiraIntegration/1 and AWS.Evidently.ProjectImporter/1 come back with Description absent (null) where AWS always returns a string.
 5. Try to use one of the missing entries the way a client would — call GetExtension / CreateExtensionAssociation naming the AWS extension AWS.AppConfig.DeploymentNotificationsToSqs — and observe that the identifier AWS documents resolves to nothing.
 6. Replay fixture appconfig-catalog-list-extensions, step task#1, to confirm the cluster closes.
+
+## Resolution
+
+The published AWS-authored catalogue in
+`services/service-com-amazonaws-appconfig-amazonappconfig/src/state.rs`
+(`AWS_AUTHORED_EXTENSIONS`, the one seed every reader of an authored extension goes
+through) is now AppConfig's set under AppConfig's own identifiers: the two deployment
+notification entries are published as `AWS.AppConfig.DeploymentNotificationsToSns` and
+`AWS.AppConfig.DeploymentNotificationsToSqs`, so the identifier the AppConfig
+documentation tells a client to pass resolves through `ListExtensions`, `GetExtension`
+and `CreateExtensionAssociation`, and no entry AppConfig does not publish is served.
+Every entry now carries a published description, verbatim for the four this report and
+its sibling report quote (feature-flag helper, Jira, Evidently project importer,
+EventBridge notifications).
+
+Residue, left deliberately: the published sentence of the Amazon SNS and Amazon SQS
+notification entries. Neither this report nor any other source in the checkout quotes
+it (the replay detail is elided at those two entries and the replay withholds recorded
+values), so each is written to the sentence its sibling EventBridge entry publishes with
+the destination its own sentence names, and both are marked in the catalogue's
+documentation as inferred rather than published, for a later reading of those two
+entries to correct. `tests/all/aws_authored_extension_catalog.rs` pins the entry set and
+every quoted sentence exactly, and for those two pins the rule instead: a published,
+non-empty sentence within the member's modelled bound, reported identically by the
+listing and by every identifier form `GetExtension` accepts.

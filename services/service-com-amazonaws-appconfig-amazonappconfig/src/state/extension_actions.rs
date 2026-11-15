@@ -1656,8 +1656,8 @@ mod tests {
         // whose own sentence names it, and nowhere for a row that delivers nothing.
         let published = |id: &str| -> Option<String> {
             match id {
-                "AWS.AppConfig.DeploymentEventsToSqs" => Some(queue.to_string()),
-                "AWS.AppConfig.DeploymentEventsToSns" => Some(topic.to_string()),
+                "AWS.AppConfig.DeploymentNotificationsToSqs" => Some(queue.to_string()),
+                "AWS.AppConfig.DeploymentNotificationsToSns" => Some(topic.to_string()),
                 "AWS.AppConfig.DeploymentNotificationsToEventBridge" => Some(default_bus.clone()),
                 _ => None,
             }
@@ -1691,7 +1691,7 @@ mod tests {
             ),
         ];
         let sqs_extension = super::super::aws_authored_extension_named(
-            "AWS.AppConfig.DeploymentEventsToSqs",
+            "AWS.AppConfig.DeploymentNotificationsToSqs",
         )
         .unwrap_or_else(|| panic!("the catalogue publishes the Amazon SQS notification extension"));
         for (case, parameters) in &unusable {
