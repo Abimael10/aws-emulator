@@ -83,7 +83,8 @@ use super::template::{
     DeclaredResource, Template, ACMPCA_CERTIFICATE, ACMPCA_CERTIFICATE_AUTHORITY,
     ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION, ACMPCA_PERMISSION, AMPLIFYUIBUILDER_COMPONENT,
     AMPLIFYUIBUILDER_FORM, AMPLIFYUIBUILDER_THEME, AMPLIFY_APP, APIGATEWAY_ACCOUNT,
-    APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME, BRAKET_SPENDING_LIMIT, MWAA_ENVIRONMENT,
+    APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME, BRAKET_SPENDING_LIMIT,
+    CUSTOMER_PROFILES_DOMAIN, MWAA_ENVIRONMENT,
 };
 
 /// The namespace Amazon Web Services' own resource types live under: a type spelled with
@@ -403,6 +404,12 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::Config::ConfigurationRecorder",
     "AWS::Config::ConformancePack",
     "AWS::Config::DeliveryChannel",
+    // Amazon Connect Customer Profiles. The DOMAIN is the container every other resource of
+    // that service hangs off, and it is created in the owning service
+    // (`super::provisioner`): `CreateDomain` POST /domains/{DomainName}. The namespace's
+    // other published types have no entry yet — a catalogued type with no provisioner deploys
+    // as declared-only, which would report a stack resource nothing created.
+    CUSTOMER_PROFILES_DOMAIN, // CreateDomain
     // AWS Glue DataBrew
     "AWS::DataBrew::Dataset",
     "AWS::DataBrew::Job",

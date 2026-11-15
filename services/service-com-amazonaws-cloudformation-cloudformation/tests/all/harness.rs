@@ -260,6 +260,14 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
     router.register_service(
         service_com_amazonaws_memorydb_amazonmemorydb::EmulatedService::new(Arc::clone(&engine)),
     );
+    // Amazon Connect Customer Profiles, for the `AWS::CustomerProfiles::Domain` a stack really
+    // creates there, so a suite that deploys one reads the domain back through that service's
+    // own wire by the name the stack publishes — and drives the data plane that domain serves.
+    router.register_service(
+        service_com_amazonaws_customerprofiles_customerprofiles_20200815::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
     (router, engine)
 }
 

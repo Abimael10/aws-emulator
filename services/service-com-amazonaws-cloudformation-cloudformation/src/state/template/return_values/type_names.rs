@@ -235,6 +235,36 @@ pub(super) const MWAA_ENVIRONMENT_ATTRIBUTES: &[&str] = &[
 /// than stand in for.
 pub(super) const MWAA_ENVIRONMENT_ARN_ATTRIBUTE: &str = "Arn";
 
+/// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Connect Customer Profiles
+/// DOMAIN: "a container for all customer data, such as customer profile attributes, object
+/// types, profile keys, and encryption keys" (`CreateDomain`), which that service's own
+/// `CreateDomain` makes. The middle segment is that model's own
+/// `awsService.cloudFormationName` (`CustomerProfiles`).
+///
+/// "Ref returns the DomainName", which is the name the owning service creates the domain under
+/// and the `@httpLabel` every operation on one takes — so a GENERATED one is held to that
+/// service's own rules for it ([`naming_rules`]) and the identity is not service-assigned.
+pub const CUSTOMER_PROFILES_DOMAIN: &str = "AWS::CustomerProfiles::Domain";
+
+/// Every `Fn::GetAtt` attribute an `AWS::CustomerProfiles::Domain` publishes, in the sorted
+/// order a resource's own attribute map holds them in.
+///
+/// Source: the type's own "Return values" section — the two instants the owning service
+/// recorded for the domain, the status its rule-based matching configuration is in, and the
+/// four usage statistics that service keeps over the domain's data, which that section spells
+/// `Stats.<count>`. Every one of them is a read-only value of that service's own: none is
+/// computable from a template, so each stands in ([`service_assigned_document`]) until
+/// [`crate::state::provisioner`] has reported what `GetDomain` really answered.
+pub(super) const CUSTOMER_PROFILES_DOMAIN_ATTRIBUTES: &[&str] = &[
+    "CreatedAt",
+    "LastUpdatedAt",
+    "RuleBasedMatching.Status",
+    "Stats.MeteringProfileCount",
+    "Stats.ObjectCount",
+    "Stats.ProfileCount",
+    "Stats.TotalSize",
+];
+
 /// The `AWS::<cloudFormationName>::<Resource>` types of the two OpenSearch Serverless
 /// resources a stack creates. The middle segment is that service's own
 /// `awsService.cloudFormationName` (`OpenSearchServerless`).

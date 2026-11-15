@@ -486,7 +486,7 @@ use super::template::{
     CODEBUILD_PROJECT,
     CODEBUILD_REPORT_GROUP, CODECOMMIT_REPOSITORY, CODEDEPLOY_APPLICATION,
     CODEDEPLOY_DEPLOYMENT_CONFIG, CODEDEPLOY_DEPLOYMENT_GROUP,
-    AUTOSCALING_GROUP,
+    AUTOSCALING_GROUP, CUSTOMER_PROFILES_DOMAIN,
     COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, EC2_LAUNCH_TEMPLATE, EC2_SECURITY_GROUP,
     EC2_SUBNET,
     EC2_VOLUME, EC2_VPC,
@@ -1059,6 +1059,14 @@ pub(super) enum Provisioner {
     /// `PutPermission` installs under the declaration's `StatementId` and `RemovePermission`
     /// revokes by that same id.
     EventsEventBusPolicy,
+    /// `AWS::CustomerProfiles::Domain`: the customer-data domain Amazon Connect Customer
+    /// Profiles' own `CreateDomain` makes under the name the template states, `UpdateDomain`
+    /// reconfigures and `DeleteDomain` removes. The name IS the handle every call on a domain
+    /// takes — it is the `@httpLabel` of each of those operations — so it is the physical id
+    /// the naming rules already compute for the type, and the values the type publishes (the
+    /// two instants that service recorded, the status of its rule-based matching configuration
+    /// and the usage statistics it counts) are read off its own report of the domain.
+    CustomerProfilesDomain,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -1233,6 +1241,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
             Some(Provisioner::MemoryDbGroup(memorydb_groups::Group::Parameter))
         }
         MEMORYDB_SUBNET_GROUP => Some(Provisioner::MemoryDbGroup(memorydb_groups::Group::Subnet)),
+        CUSTOMER_PROFILES_DOMAIN => Some(Provisioner::CustomerProfilesDomain),
         _ => None,
     }
 }
@@ -1860,6 +1869,12 @@ impl Provisioner {
             Self::MemoryDbGroup(group) => {
                 create_memorydb_group(ctx, region, group, resource, propagated).await
             }
+            // `AWS::CustomerProfiles::Domain` publishes `Tags`, and `CreateDomain` takes a
+            // `TagMap` of its own, so a domain a stack creates carries the tags CloudFormation
+            // gives it beside the ones the declaration asks for.
+            Self::CustomerProfilesDomain => {
+                create_customer_profiles_domain(ctx, region, resource, propagated).await
+            }
         }
     }
 
@@ -1999,6 +2014,12 @@ impl Provisioner {
                 // parameter group and a subnet group each carry the stack's own tags without
                 // the three.
                 | Self::MemoryDbGroup(_)
+                // Amazon Connect Customer Profiles refuses a tag key in the reserved namespace
+                // on every call that takes tags: its `TagKey` shape is modelled with the
+                // reserved prefix excluded (`^(?!aws:)…$`), which is the one check both
+                // `CreateDomain`'s `Tags` map and `UpdateDomain`'s run — so a domain carries
+                // the stack's own tags without the three.
+                | Self::CustomerProfilesDomain
         );
         propagated
             .iter()
@@ -2822,6 +2843,15 @@ impl Provisioner {
             Self::MemoryDbGroup(group) => {
                 update_memorydb_group(ctx, region, group, resource, declared).await
             }
+            // `UpdateDomain` reconfigures the domain the stack created, by the name Amazon
+            // Connect Customer Profiles knows it by, taking every property of the type but
+            // that name — so a changed declaration is applied to that domain rather than
+            // replacing it. Its tags travel separately ([`Self::retag`]).
+            Self::CustomerProfilesDomain => {
+                update_customer_profiles_domain(ctx, region, resource, declared)
+                    .await
+                    .map(Some)
+            }
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -2904,6 +2934,13 @@ impl Provisioner {
             // set an environment is to end up carrying is reconciled.
             Self::MwaaEnvironment => {
                 retag_mwaa_environment(ctx, region, resource, declared, propagated).await
+            }
+            // A domain's tag set is carried by `UpdateDomain`'s own `Tags` member, which
+            // REPLACES the map the domain holds: `CreateDomain`'s applies to the domain that
+            // call creates, and the configuration update leaves tags alone, so this is where
+            // the set a domain is to end up carrying is reconciled.
+            Self::CustomerProfilesDomain => {
+                retag_customer_profiles_domain(ctx, region, resource, declared, propagated).await
             }
             // Every other type's re-tagging is its own entry here, for the same reason its
             // create, update and delete are: the tag set is the same for every type, but the
@@ -3462,6 +3499,11 @@ impl Provisioner {
             Self::MemoryDbGroup(group) => {
                 delete_memorydb_group(ctx, region, group, physical_resource_id).await
             }
+            // The delete addresses the domain by the name Amazon Connect Customer Profiles
+            // keyed it by, which is this resource's physical id.
+            Self::CustomerProfilesDomain => {
+                delete_customer_profiles_domain(ctx, region, physical_resource_id).await
+            }
         }
     }
 
@@ -3991,6 +4033,11 @@ impl Provisioner {
             Self::MemoryDbGroup(group) => {
                 describe_memorydb_group(ctx, region, group, physical_resource_id).await
             }
+            // Amazon Connect Customer Profiles' own read of the domain, by the name it was
+            // created under.
+            Self::CustomerProfilesDomain => {
+                describe_customer_profiles_domain(ctx, region, physical_resource_id).await
+            }
         }
     }
 }
@@ -4028,6 +4075,10 @@ mod braket_spending_limits;
 mod amplify_ui_builder;
 mod amplify_apps;
 mod mwaa_environments;
+/// The Amazon Connect Customer Profiles DOMAIN arms: the customer-data domain an
+/// `AWS::CustomerProfiles::Domain` declares, created in the service that owns it so a client's
+/// own reads and the domain's data plane resolve the name the stack publishes.
+mod customer_profiles_domains;
 mod data_and_storage;
 mod iam_identities;
 mod application_services;
@@ -4090,6 +4141,7 @@ use braket_spending_limits::*;
 use amplify_ui_builder::*;
 use amplify_apps::*;
 use mwaa_environments::*;
+use customer_profiles_domains::*;
 use iam_identities::*;
 use data_and_storage::*;
 

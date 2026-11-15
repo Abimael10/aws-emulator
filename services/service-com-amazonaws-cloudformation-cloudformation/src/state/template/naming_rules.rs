@@ -379,6 +379,11 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // the hyphen are all admitted, and it starts with a letter because a stack name does
         // — but may be longer than.
         MWAA_ENVIRONMENT => rules(80, Characters::AsGenerated),
+        // Amazon Connect Customer Profiles `CreateDomain.DomainName`: `name`,
+        // `@length(min: 1, max: 64)` with pattern `^[a-zA-Z0-9_-]+$` (that service's own
+        // Smithy model), which a generated name is already inside — letters, digits and the
+        // hyphen are all admitted — but may be longer than.
+        CUSTOMER_PROFILES_DOMAIN => rules(64, Characters::AsGenerated),
         // Amplify UI Builder `CreateComponent.componentToCreate.name` (`ComponentName`),
         // `CreateForm.formToCreate.name` (`FormName`) and `CreateTheme.themeToCreate.name`
         // (`ThemeName`): each `@length(min: 1, max: 255)` with no pattern (that service's own

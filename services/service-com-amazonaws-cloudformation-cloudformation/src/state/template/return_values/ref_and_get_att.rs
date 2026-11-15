@@ -1545,6 +1545,24 @@ pub(crate) fn return_values(
             }
             (name.to_string(), attributes)
         }
+        // Amazon Connect Customer Profiles' own control plane: the domain an
+        // `AWS::CustomerProfiles::Domain` declares. "Ref returns the DomainName", which is the
+        // handle every operation on a domain takes, so the physical id is that name; Fn::GetAtt
+        // reads the seven values [`CUSTOMER_PROFILES_DOMAIN_ATTRIBUTES`] names, every one of
+        // which is a read-only value only that service produces — the instants it recorded, the
+        // status its rule-based matching configuration is in and the counts it keeps over the
+        // domain's data — so each stands in until `super::provisioning` has reported what that
+        // service really answered
+        // ([`super::provisioner::Provisioner::CustomerProfilesDomain`]).
+        CUSTOMER_PROFILES_DOMAIN => {
+            for attribute in CUSTOMER_PROFILES_DOMAIN_ATTRIBUTES {
+                attributes.insert(
+                    (*attribute).to_string(),
+                    service_assigned_document(name, attribute),
+                );
+            }
+            (name.to_string(), attributes)
+        }
         // "Ref returns the name"; Fn::GetAtt: Name, WorkloadIdentityArn. A workload
         // identity is named, not id'd: `CreateWorkloadIdentity` takes a `name`
         // (`^[A-Za-z0-9_.-]+$`) and answers that name plus the ARN, whose shape the model

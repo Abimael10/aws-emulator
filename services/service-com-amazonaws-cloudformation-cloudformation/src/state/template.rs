@@ -3109,6 +3109,9 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     CODEBUILD_PROJECT,
     CODEBUILD_REPORT_GROUP,
     COGNITO_USER_POOL,
+    // The Amazon Connect Customer Profiles domain, publishing the read-only values that
+    // service reports for it.
+    CUSTOMER_PROFILES_DOMAIN,
     "AWS::DynamoDB::Table",
     EC2_DHCP_OPTIONS,
     EC2_INTERNET_GATEWAY,

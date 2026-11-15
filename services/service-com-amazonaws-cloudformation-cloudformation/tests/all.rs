@@ -111,6 +111,10 @@ mod cross_stack_name_collision;
 mod custom_resource_providers;
 #[path = "all/custom_resource_response_identity.rs"]
 mod custom_resource_response_identity;
+#[path = "all/customerprofiles_domain_provisioning.rs"]
+mod customerprofiles_domain_provisioning;
+#[path = "all/customerprofiles_domain_resource_type.rs"]
+mod customerprofiles_domain_resource_type;
 #[path = "all/declared_alarm_is_readable_in_cloudwatch.rs"]
 mod declared_alarm_is_readable_in_cloudwatch;
 #[path = "all/declared_function_logs_on_first_invoke.rs"]

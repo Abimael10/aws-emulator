@@ -235,6 +235,12 @@ service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7 = { workspace
 # one must have its owning service mounted beside CloudFormation, or the create is refused
 # and the stack fails.
 service-com-amazonaws-memorydb-amazonmemorydb = { workspace = true }
+# Amazon Connect Customer Profiles, for the `AWS::CustomerProfiles::Domain` a stack really
+# creates there (`state::provisioner::customer_profiles_domains`): a suite that deploys one
+# must have its owning service mounted beside CloudFormation, or the create is refused and the
+# stack fails — and the domain the stack published is read back, and driven, through that
+# service's own wire.
+service-com-amazonaws-customerprofiles-customerprofiles-20200815 = { workspace = true }
 
 [lints]
 workspace = true

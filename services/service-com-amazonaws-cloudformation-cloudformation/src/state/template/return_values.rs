@@ -238,6 +238,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         AMPLIFYUIBUILDER_FORM => AMPLIFYUIBUILDER_ATTRIBUTES,
         AMPLIFY_APP => AMPLIFY_APP_ATTRIBUTES,
         MWAA_ENVIRONMENT => MWAA_ENVIRONMENT_ATTRIBUTES,
+        CUSTOMER_PROFILES_DOMAIN => CUSTOMER_PROFILES_DOMAIN_ATTRIBUTES,
         "AWS::BedrockAgentCore::Memory" => &["MemoryArn", "MemoryId"],
         "AWS::BedrockAgentCore::Runtime" => {
             &["AgentRuntimeArn", "AgentRuntimeId", "AgentRuntimeVersion"]
