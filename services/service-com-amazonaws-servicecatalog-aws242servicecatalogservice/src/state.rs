@@ -266,6 +266,10 @@ pub const ARN_PREFIX: &str = "arn:";
 /// The resource kind a provisioned product is, as its not-found names it.
 pub const KIND_PROVISIONED_PRODUCT: &str = "Provisioned product";
 
+/// The resource kind a provisioned product's CloudFormation stack is, as a refusal that
+/// cannot read it names it.
+pub const KIND_CLOUDFORMATION_STACK: &str = "CloudFormation stack";
+
 /// The resource kind a product version is, as its not-found names it.
 pub const KIND_PROVISIONING_ARTIFACT: &str = "Provisioning artifact";
 
@@ -730,6 +734,21 @@ pub struct ProvisionedProduct {
     /// exists no longer, which is the clock's doing and not any caller's
     /// ([`ProvisionedProduct::is_terminated`]).
     pub terminated_at: Option<SystemTime>,
+    /// The Region this provisioned product was provisioned in, which is where the
+    /// stack behind it lives: every later read of that stack looks for it there, and
+    /// the Region a later request is signed for does not move it.
+    pub region: String,
+    /// The id CloudFormation minted for the stack this provisioned product's launch
+    /// stood up, as that stack's own create answered it; `None` for a provisioned
+    /// product no launch has stood a stack up for — one a PLAN created, one of a
+    /// product type that is not CloudFormation-backed, or one whose stack
+    /// CloudFormation refused.
+    ///
+    /// The stack is CloudFormation's resource, not this service's: this is the handle
+    /// the launch was answered with, and what the stack holds — its status, its
+    /// resources, its outputs — is read from CloudFormation every time rather than
+    /// copied here.
+    pub stack_id: Option<String>,
     /// Whether a PLAN brought this provisioned product into existence, rather than a
     /// provisioning request.
     ///
@@ -755,6 +774,14 @@ impl ProvisionedProduct {
     /// its name is free for a later provisioning.
     pub fn is_terminated(&self, now: SystemTime) -> bool {
         self.terminated_at.is_some_and(|settled| now >= settled)
+    }
+
+    /// The stack this provisioned product's launch stood up, as CloudFormation addresses
+    /// it: the id that launch was answered with. `None` for a provisioned product no
+    /// launch has stood a stack up for, which therefore has no stack to read and no
+    /// resources behind it.
+    pub fn stack(&self) -> Option<&str> {
+        self.stack_id.as_deref()
     }
 }
 
@@ -978,9 +1005,14 @@ pub fn provisioned_product_type(product_type: &str) -> &'static str {
         "TERRAFORM_OPEN_SOURCE" => "TERRAFORM_OPEN_SOURCE",
         "TERRAFORM_CLOUD" => "TERRAFORM_CLOUD",
         "EXTERNAL" => "EXTERNAL",
-        _ => "CFN_STACK",
+        _ => PROVISIONED_PRODUCT_TYPE_CFN_STACK,
     }
 }
+
+/// The `ProvisionedProductType` of a provisioned product that IS one CloudFormation
+/// stack — what [`provisioned_product_type`] answers for either CloudFormation-backed
+/// product type, and so what tells a launch it has a stack to stand up.
+pub const PROVISIONED_PRODUCT_TYPE_CFN_STACK: &str = "CFN_STACK";
 
 impl Record {
     /// This record's `RecordStatus` at `now`: the non-terminal one until the clock
@@ -1724,6 +1756,24 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
             .rfind(|record| record.record_type == RECORD_TYPE_TERMINATE_PROVISIONED_PRODUCT)
     }
 
+    /// The record of the last provisioning of `provisioned` that SUCCEEDED at `now`, or
+    /// `None` when no provisioning of it has succeeded yet: its launch is still in
+    /// flight, or the store has evicted the record of the one that completed.
+    ///
+    /// The one derivation of "the last successful provisioning record" in this service,
+    /// so the record `ProvisionedProductDetail$LastSuccessfulProvisioningRecordId`
+    /// names is the same one the launch's outputs are reported for.
+    pub fn last_successful_provisioning_record<'a>(
+        &'a self,
+        provisioned: &'a ProvisionedProduct,
+        now: SystemTime,
+    ) -> Option<&'a Record> {
+        self.provisioned_product_records(provisioned)
+            .rfind(|record| {
+                record.is_provisioning() && record.status(now) == RECORD_STATUS_SUCCEEDED
+            })
+    }
+
     /// `provisioned`'s `ProvisionedProductStatus` at `now`: the transitive one while
     /// the operation its last record describes is still in flight, the stable one once
     /// the clock owes that record's completion.
@@ -1766,7 +1816,8 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
             id: Some(provisioned.id.clone()),
             status: Some(self.provisioned_product_status(provisioned, now).to_string()),
             // A status message reports what the resources behind the provisioned
-            // product last said, and nothing in this emulator has launched any, so
+            // product last said. Reporting one is the business of the failure path a
+            // launch that did not deploy settles on, which nothing here derives yet, so
             // there is no message rather than an invented one.
             status_message: None,
             created_time: Some(reported_time(provisioned.created_time)),
@@ -1777,10 +1828,7 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
                 .rfind(|record| record.is_provisioning())
                 .map(|record| record.id.clone()),
             last_successful_provisioning_record_id: self
-                .provisioned_product_records(provisioned)
-                .rfind(|record| {
-                    record.is_provisioning() && record.status(now) == RECORD_STATUS_SUCCEEDED
-                })
+                .last_successful_provisioning_record(provisioned, now)
                 .map(|record| record.id.clone()),
             product_id: Some(provisioned.product_id.clone()),
             provisioning_artifact_id: Some(provisioned.provisioning_artifact_id.clone()),
@@ -1813,10 +1861,12 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
             last_provisioning_record_id: detail.last_provisioning_record_id,
             last_successful_provisioning_record_id: detail.last_successful_provisioning_record_id,
             tags: Some(tag_list(&provisioned.tags)),
-            // "The assigned identifier for the resource, such as an EC2 instance ID
-            // or an S3 bucket name": the resources a launch creates have none here,
-            // because no launch has run.
-            physical_id: None,
+            // "The assigned identifier for the resource, such as an EC2 instance ID or
+            // an S3 bucket name": a CloudFormation-backed provisioned product IS one
+            // stack, so the resource behind it is that stack, reported by the id
+            // CloudFormation minted for it when the launch stood it up. A provisioned
+            // product no launch has stood a stack up for has no such resource.
+            physical_id: provisioned.stack_id.clone(),
             product_id: detail.product_id,
             product_name: product.map(|product| product.name.clone()),
             provisioning_artifact_id: detail.provisioning_artifact_id,

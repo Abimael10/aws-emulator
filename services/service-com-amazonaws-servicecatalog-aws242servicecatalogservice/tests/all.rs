@@ -33,6 +33,8 @@ mod portfolios_for_product;
 mod product_copies;
 #[path = "all/product_views.rs"]
 mod product_views;
+#[path = "all/provisioned_product_outputs.rs"]
+mod provisioned_product_outputs;
 #[path = "all/provisioned_product_plans.rs"]
 mod provisioned_product_plans;
 #[path = "all/provisioned_product_termination.rs"]
@@ -47,3 +49,5 @@ mod resources_for_tag_option;
 mod state_roundtrip;
 #[path = "all/tag_option_associations.rs"]
 mod tag_option_associations;
+#[path = "all/tmp_declaration_audit.rs"]
+mod tmp_declaration_audit;

@@ -153,11 +153,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
-        let mut state = state.lock();
         let now = std::time::SystemTime::now();
+
+        // Everything this request resolves and stores is done under the lock, which is
+        // released before the resources behind the provisioned product are torn down:
+        // that is a call into CloudFormation, and no lock is held across an await.
+        let (torn_down, record_detail) = {
+        let mut state = state.lock();
 
         // A provisioned product whose termination the clock has already settled stopped
         // existing at that instant, so its entry is dropped before anything is
@@ -216,15 +220,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let path_id = provisioned.path_id.clone();
         let tags = provisioned.tags.clone();
 
+        // The resources behind the provisioned product are the stack its launch stood
+        // up, and this termination tears that stack down — unless the request asks for
+        // them to be kept: `RetainPhysicalResources` "when true, Service Catalog stops
+        // managing the specified provisioned product without deleting the underlying
+        // resources", which is this call leaving the stack where it is. A provisioned
+        // product no launch stood a stack up for has no resources to delete either.
+        let torn_down = provisioned
+            .stack()
+            .filter(|_| !input.retain_physical_resources)
+            .map(|stack| (stack.to_string(), provisioned.region.clone()));
+
         // The termination this request starts is not instantaneous: the record is
         // answered in the non-terminal status and the clock owes its completion, so a
         // caller acting straight after this call still sees the provisioned product
         // `UNDER_CHANGE`, and sees it stop existing once that completion falls due.
         //
-        // `IgnoreErrors` and `RetainPhysicalResources` both govern what becomes of the
-        // resources BEHIND the provisioned product — the stack and what it stood up —
-        // and no launch in this emulator has stood any up, so neither changes what this
-        // termination does to the provisioned product itself.
+        // `IgnoreErrors` governs what becomes of the provisioned product when the
+        // resources behind it cannot be deleted — "Service Catalog stops managing the
+        // specified provisioned product even if it cannot delete the underlying
+        // resources" — which is the business of the failure path a termination that did
+        // not complete settles on, and nothing here derives one yet.
         let completed_at = now + crate::state::PROVISIONING_COMPLETES_AFTER;
         let record_id = state.next_record_id();
         let record = crate::state::Record {
@@ -248,6 +264,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(provisioned) = state.provisioned_products.get_mut(&provisioned_product_id) {
             provisioned.record_ids.push(record_id);
             provisioned.terminated_at = Some(completed_at);
+        }
+
+        (torn_down, record_detail)
+        };
+
+        // "This operation does not delete any records associated with the provisioned
+        // product": what it deletes is the stack the launch stood up, which is
+        // CloudFormation's resource and is torn down by CloudFormation rather than
+        // forgotten here. The call is dispatched IN PROCESS, by the framework's callback
+        // connector, to the CloudFormation mounted beside this service on the same
+        // engine (`crate::state::in_process_cloudformation`).
+        //
+        // The termination has already been accepted at this point, so a stack
+        // CloudFormation will not delete — one it does not hold, because no launch stood
+        // one up — does not un-accept it.
+        if let Some((stack, region)) = torn_down {
+            if let Err(reason) = crate::state::delete_launch_stack(ctx, &region, &stack).await {
+                ::tracing::debug!(
+                    %stack,
+                    %reason,
+                    "CloudFormation tore no stack down for this termination"
+                );
+            }
         }
 
         Ok(TerminateProvisionedProductOutput {

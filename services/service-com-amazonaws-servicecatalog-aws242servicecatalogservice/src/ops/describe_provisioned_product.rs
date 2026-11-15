@@ -218,9 +218,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             provisioned_product_detail: Some(
                 state.provisioned_product_detail(provisioned, now),
             ),
-            // The CloudWatch dashboards of a provisioned product are the dashboards
-            // the resources behind it publish, and no launch has stood any up in this
-            // emulator, so the set is empty rather than absent.
+            // The CloudWatch dashboards of a provisioned product are the dashboards the
+            // resources behind it publish, and nothing a launch's stack stands up
+            // publishes one, so the set is empty rather than absent.
             cloud_watch_dashboards: Some(Vec::new()),
         })
     }

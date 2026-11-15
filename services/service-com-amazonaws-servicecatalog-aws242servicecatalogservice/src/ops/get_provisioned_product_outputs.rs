@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetProvisionedProductOutputs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetProvisionedProductOutputs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetProvisionedProductOutputs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -88,6 +78,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The shared reading of the id-or-name pair the provisioned product this request names
+// is addressed by, and the sentence this service refuses an unresolved one with.
+use crate::state::{Addressed, KIND_PROVISIONED_PRODUCT};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -157,18 +151,179 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetProvisionedProductOutputs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetProvisionedProductOutputsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let now = std::time::SystemTime::now();
+
+        // A pure read: this operation reports what the launch produced and writes
+        // nothing, so a later caller sees exactly what this one saw. The store's lock is
+        // released before the stack is read, so no lock is held across an await.
+        let (stack, region) = {
+            let state = state.lock();
+
+            // "This API takes either a ProvisonedProductId or a
+            // ProvisionedProductName": a request that names both addresses two
+            // provisioned products and one that names neither addresses none, so
+            // neither names the one whose outputs to report.
+            let addressed = crate::state::addressed(
+                input.provisioned_product_id.as_deref(),
+                input.provisioned_product_name.as_deref(),
+                "ProvisionedProductId",
+                "ProvisionedProductName",
+            )
+            .map_err(invalid_parameters)?
+            .ok_or_else(|| {
+                invalid_parameters(crate::state::either_required(
+                    "ProvisionedProductId",
+                    "ProvisionedProductName",
+                ))
+            })?;
+            let provisioned = match addressed {
+                Addressed::Id(id) => state.provisioned_product(id, now),
+                Addressed::Name(name) => state.provisioned_product_by_name(name, now),
+            }
+            .ok_or_else(|| {
+                not_found(crate::state::not_found_message(
+                    KIND_PROVISIONED_PRODUCT,
+                    addressed.identifier(),
+                ))
+            })?;
+
+            // The outputs of a provisioned product are the outputs of its LAST
+            // SUCCESSFUL provisioning: until one has succeeded — the launch is still in
+            // flight, or it did not deploy — there is no provisioning whose outputs
+            // could be reported, and the question is refused rather than answered with
+            // an empty list.
+            if state
+                .last_successful_provisioning_record(provisioned, now)
+                .is_none()
+            {
+                return Err(invalid_parameters(
+                    NO_SUCCESSFUL_PROVISIONING_RECORD.to_string(),
+                ));
+            }
+
+            // The stack that provisioning stood up, in the Region it was performed in:
+            // that is where this provisioned product's outputs live. A provisioned
+            // product no launch stood a stack up for — one of a product type that
+            // launches none — has nothing behind it to read outputs from.
+            (
+                provisioned.stack().map(str::to_string),
+                provisioned.region.clone(),
+            )
+        };
+
+        // "The output for the product created as the result of a request. For example,
+        // the output for a CloudFormation-backed product that creates an S3 bucket would
+        // include the S3 bucket URL": those outputs belong to the stack the launch stood
+        // up, so they are READ from CloudFormation — key, value and description as it
+        // holds them, and the stack's own ARN beside them — rather than derived here. The
+        // read is dispatched IN PROCESS, by the framework's callback connector, to the
+        // CloudFormation mounted beside this service on the same engine: no socket is
+        // opened and no host name is resolved
+        // (`crate::state::in_process_cloudformation`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetProvisionedProductOutputs"))
+        // A provisioned product with NO stack produced no outputs, and reports none. A
+        // provisioned product whose stack CloudFormation will not answer for is a
+        // different thing: the outputs exist and cannot be read, so the question is
+        // refused as the resource that could not be reached rather than answered with an
+        // empty list.
+        let outputs = match &stack {
+            None => Vec::new(),
+            Some(stack) => match crate::state::launch_outputs(ctx, &region, stack).await {
+                Ok(outputs) => outputs,
+                Err(reason) => {
+                    ::tracing::debug!(%stack, %reason, "this launch's stack could not be read");
+                    return Err(not_found(crate::state::not_found_message(
+                        crate::state::KIND_CLOUDFORMATION_STACK,
+                        stack,
+                    )));
+                }
+            },
+        };
+
+        // "The list of keys that the API should return with their values. If none are
+        // provided, the API will return all outputs of the provisioned product" — the
+        // keys SELECT among the stack's outputs, which keep the order CloudFormation
+        // reports them in, and a key that names none of them selects nothing.
+        let wanted: std::collections::BTreeSet<&str> = input
+            .output_keys
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let selected: Vec<RecordOutput> = outputs
+            .into_iter()
+            .filter(|output| {
+                wanted.is_empty()
+                    || output
+                        .output_key
+                        .as_deref()
+                        .is_some_and(|key| wanted.contains(key))
+            })
+            .collect();
+
+        // `PageToken` pages over the selected outputs: this service's own opaque cursor,
+        // the POSITION in that list the next page resumes at. Anything else is a bad
+        // parameter — the same refusal every paged read in this service answers.
+        let resume_at = match input.page_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => match crate::state::decode_page_cursor(token)
+                .and_then(|cursor| cursor.parse::<usize>().ok())
+            {
+                Some(position) => position,
+                None => {
+                    return Err(invalid_parameters(
+                        "PageToken is not a valid page token.".to_string(),
+                    ))
+                }
+            },
+            None => 0,
+        };
+
+        // `PageSize` is modelled `0..20` with a default of 0, and 0 asks for no
+        // caller-imposed bound: the whole remaining list is reported.
+        let page_size = if input.page_size > 0 {
+            input.page_size as usize
+        } else {
+            selected.len()
+        };
+        let total = selected.len();
+        let page: Vec<RecordOutput> = selected.into_iter().skip(resume_at).take(page_size).collect();
+        let reported_through = resume_at.saturating_add(page.len());
+        // "The page token to use to retrieve the next set of results. If there are no
+        // additional results, this value is null."
+        let next_page_token = (reported_through < total)
+            .then(|| crate::state::encode_page_cursor(&reported_through.to_string()));
+
+        Ok(GetProvisionedProductOutputsOutput {
+            outputs: Some(page),
+            next_page_token,
+        })
     }
+}
+
+/// AWS's sentence for a provisioned product no provisioning of which has succeeded yet,
+/// so there are no outputs of a successful provisioning to report. All fixed text: it
+/// carries no value from the request or from stored state.
+const NO_SUCCESSFUL_PROVISIONING_RECORD: &str = "Last Successful Provisioning Record doesn't exist.";
+
+/// This operation's parameter error, carrying `message`.
+fn invalid_parameters(message: String) -> GetProvisionedProductOutputsError {
+    GetProvisionedProductOutputsErrorModeled::InvalidParametersException(
+        InvalidParametersException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// This operation's not-found error for an identifier that resolves to nothing: the
+/// message names the KIND of resource the request addressed and the identifier it used,
+/// the shape every not-found in this service reports
+/// ([`crate::state::not_found_message`]).
+fn not_found(message: String) -> GetProvisionedProductOutputsError {
+    GetProvisionedProductOutputsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
 }

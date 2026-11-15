@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The seam into this emulator's own CloudFormation: the template a product version
-//! NAMES, and the change set a plan IS.
+//! NAMES, the stack a launch STANDS UP, and the change set a plan IS.
 //!
 //! EVERY call here is dispatched IN PROCESS. The client is built on the framework's
 //! callback connector ([`in_process_cloudformation`]), which routes a request to the
@@ -17,11 +17,18 @@
 //! the plan is executed", which is a CloudFormation change set over that template. So
 //! both are asked for, and the resource changes a plan reports are the ones
 //! CloudFormation computed rather than any this service derived.
+//!
+//! The same holds for the launch itself: "provisioning a product that's based on a
+//! CloudFormation template launches a CloudFormation stack and its underlying
+//! resources", so the stack of a provisioned product is stood up, torn down and read
+//! HERE, by CloudFormation, and the outputs a launch produced are the ones that stack
+//! holds rather than any this service invented.
 
 use std::collections::BTreeMap;
 
 use crate::ops::types::{
-    ResourceChange, ResourceChangeDetail, ResourceTargetDefinition, UpdateProvisioningParameter,
+    RecordOutput, ResourceChange, ResourceChangeDetail, ResourceTargetDefinition,
+    UpdateProvisioningParameter,
 };
 
 /// Where the template of one provisioning artifact is, as that version's `Info` names
@@ -81,6 +88,156 @@ pub fn provisioned_product_stack_name(provisioned_product_id: &str) -> String {
         ::emulator_server::EMULATOR_ACCOUNT_ID
     )
 }
+
+/// The launch of one provisioned product, as the stack CloudFormation is asked to stand
+/// up for it.
+#[derive(Debug, Clone)]
+pub struct Launch {
+    /// The stack the launch stands up ([`provisioned_product_stack_name`]).
+    pub stack_name: String,
+    /// Where the product version's template is.
+    pub template: TemplateSource,
+    /// The value the request gave for each provisioning parameter the launch names:
+    /// `None` for a key it named with no value, which leaves whatever the template
+    /// declares for it in force. A map because a stack holds each parameter key once.
+    pub parameters: BTreeMap<String, Option<String>>,
+    /// The launch's tags, which the stack carries onto the resources it stands up.
+    pub tags: BTreeMap<String, String>,
+    /// "Passed to CloudFormation. The SNS topic ARNs to which to publish stack-related
+    /// events."
+    pub notification_arns: Vec<String>,
+}
+
+/// Stand `launch`'s stack up and answer the stack id CloudFormation minted for it — or
+/// the reason CloudFormation gave for not standing it up.
+///
+/// The launch IS the stack: the resources behind a provisioned product are the ones that
+/// stack creates, and its outputs are what the provisioned product's outputs are read
+/// from afterwards ([`launch_outputs`]).
+pub async fn create_launch_stack(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    launch: &Launch,
+) -> Result<String, String> {
+    let cloudformation = in_process_cloudformation(ctx, region);
+    let mut request = cloudformation
+        .create_stack()
+        .stack_name(&launch.stack_name)
+        // Service Catalog submits the product's own template on the administrator's
+        // behalf — the catalogue vetted the product, not each launch — so the
+        // capabilities a vetted template may declare are acknowledged here rather than
+        // asked of the end user, who never sees the template.
+        .capabilities(::aws_sdk_cloudformation::types::Capability::CapabilityIam)
+        .capabilities(::aws_sdk_cloudformation::types::Capability::CapabilityNamedIam)
+        .capabilities(::aws_sdk_cloudformation::types::Capability::CapabilityAutoExpand);
+    for arn in &launch.notification_arns {
+        request = request.notification_arns(arn);
+    }
+    for (key, value) in &launch.tags {
+        request = request.tags(
+            ::aws_sdk_cloudformation::types::Tag::builder()
+                .key(key)
+                .value(value)
+                .build(),
+        );
+    }
+    for (key, value) in &launch.parameters {
+        request = request.parameters(
+            ::aws_sdk_cloudformation::types::Parameter::builder()
+                .parameter_key(key)
+                .set_parameter_value(value.clone())
+                .build(),
+        );
+    }
+    let request = match template_reference(&cloudformation, &launch.template).await? {
+        TemplateReference::Url(url) => request.template_url(url),
+        TemplateReference::Body(body) => request.template_body(body),
+    };
+
+    request
+        .send()
+        .await
+        .map_err(error_message)?
+        .stack_id
+        .ok_or_else(|| "CloudFormation created no stack for this launch.".to_string())
+}
+
+/// Tear the stack `stack` names down, which is what terminating a provisioned product
+/// does to the resources behind it, and answer the reason CloudFormation gave if it
+/// could not.
+pub async fn delete_launch_stack(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    stack: &str,
+) -> Result<(), String> {
+    in_process_cloudformation(ctx, region)
+        .delete_stack()
+        .stack_name(stack)
+        .send()
+        .await
+        .map_err(error_message)
+        .map(|_| ())
+}
+
+/// The outputs of the stack `stack` names, as Service Catalog reports the outputs of a
+/// launch: "the output for the product created as the result of a request. For example,
+/// the output for a CloudFormation-backed product that creates an S3 bucket would
+/// include the S3 bucket URL."
+///
+/// The template's own outputs belong to the stack, so each key, value and description is
+/// the one CloudFormation holds and nothing is derived here. Beside them, Service Catalog
+/// reports the stack ITSELF — the resource a CloudFormation-backed launch stood up — as
+/// the [`STACK_ARN_OUTPUT`] output, whose value is the ARN CloudFormation addresses that
+/// stack by.
+///
+/// A stack CloudFormation does not hold — nothing stood one up for this provisioned
+/// product, or it has been torn down again — has no outputs to report, which is what the
+/// error carries.
+pub async fn launch_outputs(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    stack: &str,
+) -> Result<Vec<RecordOutput>, String> {
+    let described = in_process_cloudformation(ctx, region)
+        .describe_stacks()
+        .stack_name(stack)
+        .send()
+        .await
+        .map_err(error_message)?;
+    let held = described
+        .stacks
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("CloudFormation holds no stack {stack}."))?;
+    let mut outputs: Vec<RecordOutput> = held
+        .outputs
+        .unwrap_or_default()
+        .into_iter()
+        .map(|output| RecordOutput {
+            output_key: output.output_key,
+            output_value: output.output_value,
+            description: output.description,
+        })
+        .collect();
+    // The stack a launch stands up is addressed by its id, which IS its ARN
+    // (`arn:aws:cloudformation:<region>:<account>:stack/<name>/<id>`), so the value
+    // reported for the stack is the one CloudFormation answers for it rather than one
+    // composed here.
+    if let Some(arn) = held.stack_id {
+        outputs.push(RecordOutput {
+            output_key: Some(STACK_ARN_OUTPUT.to_string()),
+            output_value: Some(arn),
+            description: None,
+        });
+    }
+    Ok(outputs)
+}
+
+/// The `OutputKey` Service Catalog reports the stack of a CloudFormation-backed
+/// provisioned product under, beside the outputs that stack's own template declares: the
+/// launch stood that stack up, so the stack is one of the things the request produced.
+pub const STACK_ARN_OUTPUT: &str = "CloudformationStackARN";
 
 /// The change a plan plans, as the change set CloudFormation is asked to compute it.
 #[derive(Debug, Clone)]
@@ -187,30 +344,9 @@ pub async fn plan_change_set(
         }
         request = request.parameters(submitted.build());
     }
-    let request = match &planned.template {
-        TemplateSource::Url(url) => request.template_url(url),
-        TemplateSource::Stack(physical_id) => {
-            // The version names the stack that CONTAINS the template, and a change set
-            // is computed from a body or a URL: the body is the one that stack carries,
-            // which CloudFormation is also what answers.
-            let body = cloudformation
-                .get_template()
-                .stack_name(physical_id)
-                .send()
-                .await
-                .map_err(error_message)?
-                .template_body
-                .ok_or_else(|| {
-                    format!("The stack {physical_id} carries no template to plan from.")
-                })?;
-            request.template_body(body)
-        }
-        TemplateSource::Unaddressed => {
-            return Err(
-                "The provisioning artifact names no CloudFormation template to plan from."
-                    .to_string(),
-            )
-        }
+    let request = match template_reference(&cloudformation, &planned.template).await? {
+        TemplateReference::Url(url) => request.template_url(url),
+        TemplateReference::Body(body) => request.template_body(body),
     };
 
     request
@@ -219,6 +355,43 @@ pub async fn plan_change_set(
         .map_err(error_message)?
         .id
         .ok_or_else(|| "CloudFormation created no change set to plan from.".to_string())
+}
+
+/// The template of a product version as CloudFormation takes it on a create: a URL it
+/// resolves itself, or a body.
+enum TemplateReference {
+    /// The URL the version names, passed on for CloudFormation to read.
+    Url(String),
+    /// A template body: the one carried by the stack a version names the physical id of.
+    Body(String),
+}
+
+/// Where the template `template` addresses is, as the one call that submits it takes it.
+///
+/// A version that names a URL is relayed as that URL, because CloudFormation is what
+/// reads it. A version that names the PHYSICAL ID of a resource that contains the
+/// template is resolved to the body that stack carries, which CloudFormation is also
+/// what answers. A version that addresses no template at all cannot be submitted, and
+/// that is the reason this answers.
+async fn template_reference(
+    cloudformation: &::aws_sdk_cloudformation::Client,
+    template: &TemplateSource,
+) -> Result<TemplateReference, String> {
+    match template {
+        TemplateSource::Url(url) => Ok(TemplateReference::Url(url.clone())),
+        TemplateSource::Stack(physical_id) => cloudformation
+            .get_template()
+            .stack_name(physical_id)
+            .send()
+            .await
+            .map_err(error_message)?
+            .template_body
+            .map(TemplateReference::Body)
+            .ok_or_else(|| format!("The stack {physical_id} carries no template.")),
+        TemplateSource::Unaddressed => {
+            Err("The provisioning artifact names no CloudFormation template.".to_string())
+        }
+    }
 }
 
 /// What the change set `change_set` names says about the plan it backs.

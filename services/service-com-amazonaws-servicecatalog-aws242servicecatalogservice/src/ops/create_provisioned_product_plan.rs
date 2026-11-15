@@ -358,6 +358,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 provision_token: input.idempotency_token.clone(),
                                 tags: tags.clone(),
                                 record_ids: Vec::new(),
+                                // The plan is made in the Region this request was
+                                // signed for, so that is where the stack its execution
+                                // would stand up lives.
+                                region: region.clone(),
+                                // Nothing has stood a stack up for this provisioned
+                                // product: the plan has only been computed, and
+                                // executing it is what would launch one.
+                                stack_id: None,
                                 terminated_at: None,
                                 // This provisioned product exists because this plan
                                 // created it, and nothing has provisioned it yet.

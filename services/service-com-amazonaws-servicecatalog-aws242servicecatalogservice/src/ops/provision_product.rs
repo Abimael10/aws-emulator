@@ -173,8 +173,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
-        let mut state = state.lock();
         let now = std::time::SystemTime::now();
+        // The Region this request was signed for: where the provisioned product's ARN
+        // is minted, and where the stack its launch stands up lives.
+        let region = crate::state::request_region(ctx);
+
+        // Everything this request resolves and stores is done under the lock, which is
+        // released before the launch itself: the stack is stood up by a call into
+        // CloudFormation, and no lock is held across an await.
+        let (provisioned_product_id, launch, record_detail) = {
+        let mut state = state.lock();
 
         // A provisioned product whose termination the clock has settled stopped
         // existing at that instant: its entry is dropped before anything is resolved,
@@ -286,16 +294,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "ProvisioningArtifactName",
             ))
         })?;
-        let artifact_id = match artifact {
+        let artifact = match artifact {
             Addressed::Id(id) => product.provisioning_artifacts.get(id),
             Addressed::Name(name) => product
                 .provisioning_artifacts
                 .values()
                 .find(|artifact| artifact.name.as_deref() == Some(name)),
         }
-        .ok_or_else(|| not_found(KIND_PROVISIONING_ARTIFACT, artifact.identifier()))?
-        .id
-        .clone();
+        .ok_or_else(|| not_found(KIND_PROVISIONING_ARTIFACT, artifact.identifier()))?;
+        let artifact_id = artifact.id.clone();
+        // Where the version's template is: the launch submits it to CloudFormation,
+        // which is what reads whichever of the two sources the version names.
+        let template = crate::state::template_source(&artifact.info);
 
         let product_id = product.id.clone();
         let provisioned_product_type =
@@ -348,7 +358,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // — the stack a launch stands up, named by the provisioned product.
         let arn = ::emulator_server::emulator_arn(
             "servicecatalog",
-            &crate::state::request_region(ctx),
+            &region,
             &format!(
                 "stack/{}/{provisioned_product_id}",
                 input.provisioned_product_name
@@ -359,6 +369,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller acting straight after this call still sees the provisioned product
         // `UNDER_CHANGE`.
         let completed_at = now + crate::state::PROVISIONING_COMPLETES_AFTER;
+
+        // What the launch stands up. A product type that is not CloudFormation-backed
+        // launches no stack, so there is nothing for CloudFormation to stand up for it.
+        let launch = (provisioned_product_type == crate::state::PROVISIONED_PRODUCT_TYPE_CFN_STACK)
+            .then(|| crate::state::Launch {
+                stack_name: crate::state::provisioned_product_stack_name(&provisioned_product_id),
+                template,
+                // A stack holds each parameter key once, so a repeated key collapses to
+                // its last value, exactly as the launch's tags do. A parameter the
+                // request named with no value carries none, which leaves whatever the
+                // template declares for it in force.
+                parameters: input
+                    .provisioning_parameters
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|parameter| parameter.key.map(|key| (key, parameter.value)))
+                    .collect(),
+                tags: tags.clone(),
+                // "Passed to CloudFormation. The SNS topic ARNs to which to publish
+                // stack-related events", which the stack is created with.
+                notification_arns: input.notification_arns.unwrap_or_default(),
+            });
 
         let record = crate::state::Record {
             id: record_id.clone(),
@@ -385,6 +417,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             provision_token: input.provision_token.clone(),
             tags,
             record_ids: vec![record_id.clone()],
+            // The launch is performed in the Region this request was signed for, so
+            // that is where the stack behind this provisioned product lives.
+            region: region.clone(),
+            // The stack this launch stands up is created below, once the store's lock
+            // is released, and the id CloudFormation mints for it is kept then.
+            stack_id: None,
             // Nothing has terminated this provisioned product: it is provisioned here
             // and stops existing only once a termination's completion falls due.
             terminated_at: None,
@@ -396,8 +434,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.remember_record(record);
         state
             .provisioned_products
-            .insert(provisioned_product_id, provisioned);
+            .insert(provisioned_product_id.clone(), provisioned);
         state.remember_provision_token(input.provision_token, record_id);
+
+        (provisioned_product_id, launch, record_detail)
+        };
+
+        // "Provisioning a product that's based on a CloudFormation template launches a
+        // CloudFormation stack and its underlying resources": the launch IS that stack,
+        // so it is stood up by CloudFormation rather than recorded as having happened
+        // here, and the id CloudFormation minted for it is kept on the provisioned
+        // product as the handle every later read of that stack uses.
+        //
+        // The call is dispatched IN PROCESS, by the framework's callback connector, to
+        // the CloudFormation mounted beside this service on the same engine: no socket
+        // is opened, no host name is resolved, and nothing this request carries — the
+        // template the version names, the stack name, the parameters, the Region — can
+        // make this process connect anywhere (`crate::state::in_process_cloudformation`).
+        //
+        // The request has already been accepted at this point — the record answers
+        // `CREATED` and the launch is performed afterwards — so a launch CloudFormation
+        // will not stand up does not un-accept it: the stack is simply not there, and
+        // the provisioned product reports no stack resource and no outputs.
+        if let Some(launch) = launch {
+            match crate::state::create_launch_stack(ctx, &region, &launch).await {
+                Ok(stack_id) => {
+                    if let Some(provisioned) = state
+                        .lock()
+                        .provisioned_products
+                        .get_mut(&provisioned_product_id)
+                    {
+                        provisioned.stack_id = Some(stack_id);
+                    }
+                }
+                Err(reason) => ::tracing::debug!(
+                    provisioned_product = %provisioned_product_id,
+                    %reason,
+                    "CloudFormation stood no stack up for this launch"
+                ),
+            }
+        }
 
         Ok(ProvisionProductOutput {
             record_detail: Some(record_detail),
