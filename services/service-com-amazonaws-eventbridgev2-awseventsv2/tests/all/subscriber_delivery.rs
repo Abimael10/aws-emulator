@@ -43,7 +43,7 @@ use eventsv2::ops::put_events::PutEvents;
 use eventsv2::ops::types::{
     CreateEventBusInput, CreateSubscriberInput, DescribeEventBusInput, DescribeSubscriberInput,
     Filter, FilterConfiguration, InvokeConfiguration, PointInTimeConfiguration, PutEventsInput,
-    PutEventsRequestEntry, PutEventsSystemMetadata, Transformer,
+    PutEventsOutput, PutEventsRequestEntry, PutEventsSystemMetadata, Transformer,
 };
 
 /// The account segment every emulated ARN carries.
@@ -305,13 +305,13 @@ fn entry(source: &str, detail_type: &str, detail: &str, group: Option<&str>) -> 
 }
 
 /// Publish `entries` onto `event_bus_arn`, requiring every entry to be
-/// accepted.
+/// accepted, and hand back what `PutEvents` reported for them.
 async fn publish(
     router: &MultiServiceRouter,
     case: &str,
     event_bus_arn: &str,
     entries: Vec<PutEventsRequestEntry>,
-) {
+) -> PutEventsOutput {
     let answer = eventsv2_ok::<PutEvents<InMemoryEngine>>(
         router,
         &PutEventsInput {
@@ -326,6 +326,7 @@ async fn publish(
         answer.failed_entry_count, 0,
         "case {case:?}: every entry must be accepted, got {answer:?}"
     );
+    answer
 }
 
 /// How many messages the queue at `queue_url` reports available right now.
@@ -518,11 +519,22 @@ async fn an_event_reaches_the_subscribers_whose_filters_select_it() {
             delivered: 2,
         },
         Row {
-            case: "a RAW transformer, which hands the target the payload alone",
+            case: "a RAW transformer, which hands the target the event untransformed",
             filters: None,
             state: None,
             transformer: Some(Transformer {
                 r#type: Some(eventsv2::state::TRANSFORMER_TYPE_RAW.to_string()),
+                jsonata_configuration: None,
+            }),
+            delivered: 2,
+        },
+        Row {
+            case: "a WITH_METADATA transformer, which wraps the event in this \
+                   service's metadata envelope",
+            filters: None,
+            state: None,
+            transformer: Some(Transformer {
+                r#type: Some(eventsv2::state::TRANSFORMER_TYPE_WITH_METADATA.to_string()),
                 jsonata_configuration: None,
             }),
             delivered: 2,
@@ -587,23 +599,14 @@ async fn an_event_reaches_the_subscribers_whose_filters_select_it() {
             row.delivered
         );
 
-        let raw = row
+        let with_metadata = row
             .transformer
             .as_ref()
             .and_then(|transformer| transformer.r#type.as_deref())
-            == Some(eventsv2::state::TRANSFORMER_TYPE_RAW);
+            == Some(eventsv2::state::TRANSFORMER_TYPE_WITH_METADATA);
         for body in &bodies {
-            if raw {
-                // The payload alone: the entry's own detail document.
-                assert!(
-                    body["orderId"].is_string(),
-                    "case {case:?}: a RAW delivery must be the event's payload, got {body}"
-                );
-                assert!(
-                    body.get("Metadata").is_none(),
-                    "case {case:?}: a RAW delivery must carry no metadata, got {body}"
-                );
-            } else {
+            if with_metadata {
+                // This service's own metadata envelope around the event.
                 assert_eq!(
                     body["EventBusArn"].as_str(),
                     Some(bus_arn.as_str()),
@@ -621,6 +624,24 @@ async fn an_event_reaches_the_subscribers_whose_filters_select_it() {
                 assert!(
                     body["Data"]["orderId"].is_string(),
                     "case {case:?}: a delivery must carry the event's payload, got {body}"
+                );
+            } else {
+                // An untransformed delivery is the event envelope: the
+                // published payload sits under `detail`, never at the top
+                // level.
+                assert!(
+                    body["id"].is_string() && body["source"].is_string(),
+                    "case {case:?}: an untransformed delivery must be the event envelope, got \
+                     {body}"
+                );
+                assert!(
+                    body["detail"]["orderId"].is_string(),
+                    "case {case:?}: the envelope must carry the payload under detail, got {body}"
+                );
+                assert!(
+                    body.get("orderId").is_none() && body.get("Data").is_none(),
+                    "case {case:?}: an untransformed delivery must be the envelope rather than \
+                     the payload, got {body}"
                 );
             }
         }
@@ -684,7 +705,7 @@ async fn each_accepted_event_reaches_each_owed_subscriber_once() {
             let bodies = received_bodies(&router, case, queue_url, events).await;
             let mut ids: Vec<String> = bodies
                 .iter()
-                .map(|body| body["EventId"].as_str().unwrap_or_default().to_string())
+                .map(|body| body["id"].as_str().unwrap_or_default().to_string())
                 .collect();
             ids.sort();
             ids.dedup();
@@ -1000,22 +1021,264 @@ async fn a_subscriber_is_owed_its_bus_log_from_its_starting_position() {
         );
         // Each event is delivered at most once, whichever position the
         // subscriber started from.
-        let mut sequence_numbers: Vec<String> = bodies
+        let mut ids: Vec<String> = bodies
             .iter()
-            .map(|body| {
-                body["SequenceNumber"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string()
-            })
+            .map(|body| body["id"].as_str().unwrap_or_default().to_string())
             .collect();
-        sequence_numbers.sort();
-        sequence_numbers.dedup();
+        ids.sort();
+        ids.dedup();
         assert_eq!(
-            sequence_numbers.len(),
+            ids.len(),
             expected,
             "case {case:?}: every delivery must be of a distinct event, got {bodies:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The envelope an untransformed delivery carries
+// ---------------------------------------------------------------------------
+
+/// The `Source` every entry of the envelope table publishes under.
+const ENVELOPE_SOURCE: &str = "orders.service";
+
+/// The `DetailType` every entry of the envelope table publishes under.
+const ENVELOPE_DETAIL_TYPE: &str = "order.created";
+
+/// The members an event envelope carries, sorted — the set a consumer routes,
+/// de-duplicates and orders by.
+const ENVELOPE_MEMBERS: [&str; 9] = [
+    "account",
+    "detail",
+    "detail-type",
+    "id",
+    "region",
+    "resources",
+    "source",
+    "time",
+    "version",
+];
+
+/// One row of the envelope table: what the publishing entry carries, and the
+/// instant the envelope must report for it.
+struct EnvelopeRow {
+    case: &'static str,
+    /// The entry's `Detail`, or `None` for an entry that publishes none.
+    detail: Option<&'static str>,
+    /// The entry's `Resources`, or `None` for an entry that lists none.
+    resources: Option<Vec<&'static str>>,
+    /// The entry's `Time`, or `None` for an entry that states none.
+    time: Option<::aws_smithy_types::DateTime>,
+    /// The `time` the envelope must carry, for a row whose entry states one.
+    expected_time: Option<&'static str>,
+}
+
+/// An untransformed delivery hands the target the event ENVELOPE: `version`,
+/// the `id` `PutEvents` reported, the entry's `detail-type`, `source`,
+/// `resources` and `detail`, the instant the event occurred as `time`, and the
+/// `account` and `region` of the bus it was published to.
+///
+/// The rows differ along what the publishing entry carries — a payload that is
+/// a flat object, a nested one or absent, no resources, an empty list, one and
+/// two of them, and a `Time` that is stated (with and without a sub-second
+/// remainder) or omitted — and each row is run for both of the subscriber
+/// shapes that ask for no transformation: `Transformer` `RAW`, and no
+/// transformer at all.
+#[tokio::test]
+async fn an_untransformed_delivery_carries_the_event_envelope() {
+    let rows = [
+        EnvelopeRow {
+            case: "an entry carrying a flat payload, no resources and no time",
+            detail: Some(r#"{"orderId":"o-1001","quantity":3}"#),
+            resources: None,
+            time: None,
+            expected_time: None,
+        },
+        EnvelopeRow {
+            case: "an entry carrying one resource and a stated time",
+            detail: Some(r#"{"orderId":"o-1002"}"#),
+            resources: Some(vec!["arn:aws:s3:::orders-bucket"]),
+            time: Some(::aws_smithy_types::DateTime::from_secs(1_767_225_600)),
+            expected_time: Some("2026-01-01T00:00:00Z"),
+        },
+        EnvelopeRow {
+            case: "an entry carrying two resources and a time with a sub-second remainder",
+            detail: Some(r#"{"orderId":"o-1003"}"#),
+            resources: Some(vec![
+                "arn:aws:s3:::orders-bucket",
+                "arn:aws:dynamodb:us-west-2:000000000000:table/orders",
+            ]),
+            time: Some(::aws_smithy_types::DateTime::from_fractional_secs(
+                1_772_600_767,
+                0.75,
+            )),
+            expected_time: Some("2026-03-04T05:06:07Z"),
+        },
+        EnvelopeRow {
+            case: "an entry listing an empty set of resources",
+            detail: Some(r#"{"orderId":"o-1004"}"#),
+            resources: Some(Vec::new()),
+            time: None,
+            expected_time: None,
+        },
+        EnvelopeRow {
+            case: "an entry whose payload nests an object and a list",
+            detail: Some(r#"{"order":{"id":"o-1005"},"items":[1,2,3]}"#),
+            resources: None,
+            time: None,
+            expected_time: None,
+        },
+        EnvelopeRow {
+            case: "an entry publishing no payload at all",
+            detail: None,
+            resources: None,
+            time: None,
+            expected_time: None,
+        },
+    ];
+
+    // The two subscriber shapes that ask for no transformation at all.
+    let transformers: [(&str, Option<&'static str>); 2] = [
+        ("no transformer", None),
+        ("a RAW transformer", Some(eventsv2::state::TRANSFORMER_TYPE_RAW)),
+    ];
+
+    for (shape, (asked, transformer_type)) in transformers.into_iter().enumerate() {
+        let router = emulator();
+        let bus_arn = given_active_bus(&router, asked, &format!("envelope-bus-{shape}")).await;
+
+        for (index, row) in rows.iter().enumerate() {
+            let case = format!("{asked}, {}", row.case);
+            let case = case.as_str();
+            let (queue_url, queue_arn) =
+                given_queue(&router, case, &format!("envelope-{shape}-{index}")).await;
+            given_subscriber(
+                &router,
+                case,
+                &format!("envelope-subscriber-{shape}-{index}"),
+                &bus_arn,
+                &queue_arn,
+                Requested {
+                    transformer: transformer_type.map(|value| Transformer {
+                        r#type: Some(value.to_string()),
+                        jsonata_configuration: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+            let reported = publish(
+                &router,
+                case,
+                &bus_arn,
+                vec![PutEventsRequestEntry {
+                    source: ENVELOPE_SOURCE.to_string(),
+                    detail_type: ENVELOPE_DETAIL_TYPE.to_string(),
+                    detail: row.detail.map(str::to_string),
+                    resources: row
+                        .resources
+                        .as_ref()
+                        .map(|resources| resources.iter().map(|arn| arn.to_string()).collect()),
+                    time: row.time,
+                    ..Default::default()
+                }],
+            )
+            .await;
+            let event_id = reported
+                .entries
+                .as_ref()
+                .and_then(|entries| entries.first())
+                .and_then(|entry| entry.event_id.clone())
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: PutEvents reported no EventId in {reported:?}")
+                });
+
+            let bodies = received_bodies(&router, case, &queue_url, 1).await;
+            assert_eq!(
+                bodies.len(),
+                1,
+                "case {case:?}: expected one delivered message, got {bodies:?}"
+            );
+            let body = &bodies[0];
+
+            let mut members: Vec<&str> = body
+                .as_object()
+                .unwrap_or_else(|| panic!("case {case:?}: the delivered body {body} is no object"))
+                .keys()
+                .map(String::as_str)
+                .collect();
+            members.sort_unstable();
+            assert_eq!(
+                members,
+                ENVELOPE_MEMBERS.to_vec(),
+                "case {case:?}: expected the envelope's members, got {body}"
+            );
+            assert_eq!(
+                body["version"].as_str(),
+                Some("0"),
+                "case {case:?}: expected the envelope version, got {body}"
+            );
+            assert_eq!(
+                body["id"].as_str(),
+                Some(event_id.as_str()),
+                "case {case:?}: the envelope must carry the EventId PutEvents reported, got {body}"
+            );
+            assert_eq!(
+                body["source"].as_str(),
+                Some(ENVELOPE_SOURCE),
+                "case {case:?}: expected the entry's source, got {body}"
+            );
+            assert_eq!(
+                body["detail-type"].as_str(),
+                Some(ENVELOPE_DETAIL_TYPE),
+                "case {case:?}: expected the entry's detail-type, got {body}"
+            );
+            assert_eq!(
+                body["account"].as_str(),
+                Some(ACCOUNT),
+                "case {case:?}: expected the bus's account, got {body}"
+            );
+            assert_eq!(
+                body["region"].as_str(),
+                Some(REGION),
+                "case {case:?}: expected the bus's region, got {body}"
+            );
+            let expected_resources = json!(row.resources.clone().unwrap_or_default());
+            assert_eq!(
+                body["resources"], expected_resources,
+                "case {case:?}: expected {expected_resources}, got {body}"
+            );
+            let expected_detail: Value = row
+                .detail
+                .map(|text| {
+                    serde_json::from_str(text)
+                        .unwrap_or_else(|error| panic!("case {case:?}: {text:?}: {error}"))
+                })
+                .unwrap_or_else(|| json!({}));
+            assert_eq!(
+                body["detail"], expected_detail,
+                "case {case:?}: expected {expected_detail} under detail, got {body}"
+            );
+            let rendered = body["time"].as_str().unwrap_or_default();
+            match row.expected_time {
+                Some(stated) => assert_eq!(
+                    Some(rendered),
+                    Some(stated),
+                    "case {case:?}: expected the entry's time, got {body}"
+                ),
+                // An entry stating no time is stamped with when the service
+                // received it, so only the FORM of that instant is pinned:
+                // ISO-8601 to the second, closed by `Z`.
+                None => assert!(
+                    rendered.len() == "2026-01-01T00:00:00Z".len()
+                        && rendered.ends_with('Z')
+                        && !rendered.contains('.'),
+                    "case {case:?}: expected an instant to the second closed by Z, got \
+                     {rendered:?}"
+                ),
+            }
+        }
     }
 }
 

@@ -1248,3 +1248,14 @@ mod zz_probe_whole_emulator;
 //! live in `all/appended_notes.rs`. What a suite covers, and why it lives in this
 //! cross-service target rather than in one service crate's own, belongs in that suite's own
 //! module header.
+//! One `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`, sorted
+//! by name, and no other line — so two branches landing at once insert two lines in two
+//! places and have no prose to duplicate, re-word or mistype. A file no `mod` names is
+//! compiled nowhere and its tests never run; a suite left at the top level of `tests/` fails
+//! the build; and a second `mod` for one name is `E0428`, which fails every suite here.
+//! An inner doc comment (`//!`) is legal only BEFORE the first item, so this header is the
+//! only place one may stand: `//!` further down this file is `E0753` and compiles nothing.
+//! What goes below is a DECLARATION, never a note about one — what a suite covers, and why it
+//! drives the assembled router rather than one service crate, belongs in that suite's own
+//! module header, and the notes earlier landings appended here live in `all/appended_notes.rs`.
+//! every service crate's `tests/all.rs`.
