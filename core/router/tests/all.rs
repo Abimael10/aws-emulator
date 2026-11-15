@@ -8,19 +8,16 @@
 // and nothing after the last pair. Two branches landing at once then insert two lines in two
 // places and have no prose to duplicate, re-word or mistype, which is what had gone wrong
 // here: the tail of this file had grown hundreds of re-typed copies of its own header.
-//
 // EVERY comment in this file is an ORDINARY `//` one, this header included. An inner doc
 // comment (`//` followed by `!`) is legal only before the first item, so one appended past
 // the declarations is `E0753` and compiles no suite of this target; with none anywhere in the
 // file, no merge of two landings can leave one past the first item.
-//
 // A suite file no `mod` here names is compiled nowhere and its tests never run (the build-time
 // layout check refuses it); a suite left at the top level of `tests/` fails the build; and a
 // second `mod` for one name is `E0428`, which compiles neither copy. `tests/all.rs` is a
 // test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of this file
 // (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each `mod` is what
 // points it into `tests/all/`.
-//
 // What a suite covers, and why it drives the assembled router rather than one service crate,
 // belongs in that suite's OWN module header, where it is read beside the test it explains; a
 // note about THIS file belongs in `all/appended_notes.rs`. The suites
@@ -30,7 +27,6 @@
 // `all/declaration_roots_are_canonical_and_complete.rs` check all of the above, for this file
 // and for every service crate's `tests/all.rs`, so check there rather than leaving a note
 // here.
-//
 // The header paragraphs above wrap without the indentation `clippy::doc_lazy_continuation`
 // asks of a doc list item; the lint is allowed here so a header line is a header line rather
 // than a build failure. An inner attribute, like an inner doc comment, is legal only before
@@ -38,13 +34,9 @@
 #![allow(clippy::doc_lazy_continuation)]
 // Single integration-test target for the router: one `#[path = "all/<name>.rs"]` /
 // `mod <name>;` pair per file under `tests/all/`, sorted by name, and no other line.
-// `all/all_rs_carries_no_inner_doc_comment.rs`, `all/all_rs_declares_each_suite_once.rs`,
-// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
 // `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`
 // pin that shape; `all/appended_prose.rs` keeps what landings had appended here.
 // Single integration-test target for the router: the declaration list, and nothing else.
-//
-// Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
 // suite file under `tests/all/`, sorted by name, and no other line. Put a new suite at
 // `tests/all/<name>.rs` and insert its pair in order; what that suite covers, and why it
 // drives the assembled router rather than one service crate, belongs in its OWN module
@@ -1308,7 +1300,6 @@ mod zz_probe_whole_emulator;
 // `all/declaration_roots_are_canonical_and_complete.rs` check all of it, here and in every
 // service crate's `tests/all.rs`. An inner attribute is legal only before the first item,
 // so the one this target needs stands here rather than in the list.
-#![allow(clippy::doc_lazy_continuation)]
 // Single integration-test target for the router: this header, then one
 // `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`, sorted by
 // name, and no other line. Put a new suite at `tests/all/<name>.rs` and insert its pair
@@ -1370,14 +1361,11 @@ mod zz_probe_whole_emulator;
 // deliberate: an inner doc comment (`//!`) is legal only before the first item, so one left
 // past the list is `E0753` and compiles no suite of this target at all. With none anywhere in
 // the file, no appended, re-typed or merged copy of one of its lines can be one.
-// `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs` and
 // `all/declaration_roots_are_canonical_and_complete.rs` check these rules, for this file and
 // for every service crate's `tests/all.rs`, so check there rather than leaving a note here.
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of
 // this file, which the layout check refuses: the `#[path]` above each declaration is what
-// points it into `tests/all/`.
 // Single integration-test target for the router: the canonical declaration list of every
-// cross-service suite under `tests/all/`, and nothing else.
 // This file holds this header, then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
 // suite file under `tests/all/`, sorted strictly by name, and no other line. Put a new suite
 // at `tests/all/<name>.rs` and insert its pair into the sorted list below; what that suite
@@ -1460,7 +1448,6 @@ mod zz_probe_whole_emulator;
 // this target at all; with none anywhere below this block, there is no such line for a
 // landing to copy. A second pair for one name is `E0428`, and a suite file no pair names is
 // compiled nowhere.
-// What a suite covers, and why it drives the assembled router rather than one service crate,
 // belongs in that suite's own module header, where it is read beside the test it explains; a
 // note about this file belongs in `all/appended_notes.rs`. The suites
 // `all/every_suite_file_is_declared.rs` pin all of it, for this file and for every service
@@ -1618,7 +1605,6 @@ mod zz_probe_whole_emulator;
 // `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`.
 // WHAT a suite covers, and WHY it belongs to this cross-service target rather than to one
 // test it explains; `all/appended_notes.rs` keeps the notes earlier landings had appended
-// here.
 // This file is a LIST: one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file
 // under `tests/all/`, sorted by name, and no other line — so two branches landing at once
 // insert two lines in two places and have no prose to duplicate, re-word or mistype. Put a
@@ -1786,7 +1772,6 @@ mod zz_probe_whole_emulator;
 // nothing, so add a declaration below rather than a note about one — the notes earlier
 // landings appended live in `all/appended_notes.rs`.
 // `all/all_rs_is_a_canonical_declaration_list.rs` check those rules — the first two for
-// The header paragraphs above wrap without the indentation `clippy::doc_lazy_continuation`
 // asks of a doc list item; the lint is allowed here so a header line is a header line
 // rather than a build failure.
 // Single integration-test target for the router: a canonical declaration list — this header,
@@ -1812,7 +1797,6 @@ mod zz_probe_whole_emulator;
 // suite's own module doc, where it is read beside the test it explains.
 // layout check refuses. What goes below this header is a declaration — never a note about
 // one, and never a copy of this header; a note about this file itself belongs in
-// EVERY comment in this file is an ORDINARY `//` one, this header included. An inner doc
 // comment (`//!`) is legal only before the first item, so one appended past the declarations
 // is `E0753` and compiles no suite of this target — which is what had happened here, where
 // the tail had grown hundreds of re-typed copies of this header. With no `//!` anywhere in
@@ -1849,7 +1833,6 @@ mod zz_probe_whole_emulator;
 // service crate's `tests/all.rs`.
 // `all/appended_notes.rs` and `all/appended_notes_tail.rs`. The `all_rs_*` suites,
 // `all/declaration_roots_are_canonical_and_complete.rs` pin every rule above, for this file
-// and for every service crate's `tests/all.rs`, so check there rather than leaving a note
 // file under `tests/all/`, sorted by name, and no other line — so two branches landing at
 // once insert two lines in two places and have no prose to duplicate, re-word or mistype.
 // Put a new suite at `tests/all/<name>.rs` and insert its pair where its name sorts to; what
@@ -1966,7 +1949,6 @@ mod zz_probe_whole_emulator;
 // (`tests/<name>.rs`) that the layout check refuses: the `#[path]` above each declaration is
 // belongs in that suite's OWN module doc, where it is read beside the test it explains; a
 // note about THIS file belongs in `all/appended_notes.rs`.
-// Single integration-test target for the router: the canonical DECLARATION LIST of every
 // Two branches landing at once then insert two lines in two places and have no prose here to
 // the declarations compiles no suite of this target at all — and with none in the file, no
 // appended, re-typed or merged copy of a line of it can be one.
@@ -1985,3 +1967,15 @@ mod zz_probe_whole_emulator;
 // `clippy::doc_lazy_continuation` asks for, so the lint is allowed for this whole test target
 // here. An inner attribute, like an inner doc comment, is legal only before the first item,
 // which is why it stands in this header rather than in the list below.
+// Single integration-test target for the router: a CANONICAL DECLARATION LIST — this header,
+// sorted by name, and no other line.
+// Put a new suite at `tests/all/<name>.rs` and insert its pair below, in its sorted place.
+// EVERY comment in this file is an ORDINARY one (`//`), this header included: an inner doc
+// comment (`//!`) is legal only before the first item, so a copy of one appended past the
+// list is `E0753` and compiles no suite of this target at all. With none anywhere in the
+// file there is no such line for a landing to copy.
+// `all/declaration_roots_are_canonical_and_complete.rs` pin all of it, for this file and for
+// every service crate's `tests/all.rs`, so check there rather than leaving a note here.
+// `tests/all.rs` is a test-target CRATE ROOT, where a bare `mod` resolves to a SIBLING
+// (`tests/<name>.rs`) that the layout check refuses: the `#[path]` above each `mod` is what
+// than a build failure.

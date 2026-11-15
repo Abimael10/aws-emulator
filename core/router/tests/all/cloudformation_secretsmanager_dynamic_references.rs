@@ -9,7 +9,10 @@
 //! the secret's text, or the one key of the JSON document it holds that the reference names,
 //! read as the resource is created, so a reference may name a secret the same deployment
 //! creates.** A reference the store cannot satisfy has no value, so that resource fails
-//! carrying the diagnostic and nothing is passed off as created — and a reference the store
+//! carrying the reason that condition is reported with — the resolver's diagnostic naming the
+//! reference, or, where the reference named a `json-key` the secret's `SecretString`
+//! associates no value with, the one fixed sentence CloudFormation states for that
+//! ([`NO_VALUE_FOR_THE_JSON_KEY`]) — and nothing is passed off as created — and a reference the store
 //! CAN satisfy whose value the owning service will not hold fails that resource on that
 //! service's own refusal, which is equally not a resource reported created
 //! ([`a_resolved_value_the_owning_service_refuses_fails_its_resource`]).
@@ -92,6 +95,13 @@ const CURRENT_STAGE: &str = "AWSCURRENT";
 
 /// The head of the diagnostic a reference that cannot be honoured fails its resource with.
 const UNRESOLVED: &str = "Unable to resolve the dynamic reference";
+
+/// The WHOLE reason a reference naming a `json-key` the secret's `SecretString` associates no
+/// value with fails its resource with: one fixed sentence, carrying nothing of the reference,
+/// the secret or the property, so a client classifying a deploy failure by its reason compares
+/// against a constant.
+const NO_VALUE_FOR_THE_JSON_KEY: &str =
+    "Could not find a value associated with JSONKey in SecretString";
 
 /// The two stable halves of the refusal the OWNING SERVICE answers a resolved value it will
 /// not hold with, as the resource's failure reason carries it: the call CloudFormation made
@@ -828,6 +838,19 @@ struct Unresolvable {
     secret: Option<(&'static str, Held)>,
     parameter_name: &'static str,
     reference: &'static str,
+    /// The reason the failed resource must carry for this condition.
+    reason: Reason,
+}
+
+/// WHICH reason a row's condition is reported with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reason {
+    /// The resolver's own diagnostic: it quotes the reference that could not be honoured and
+    /// says what about it could not be.
+    Diagnostic,
+    /// The one FIXED sentence for a `json-key` the secret's `SecretString` associates no value
+    /// with ([`NO_VALUE_FOR_THE_JSON_KEY`]): the whole reason, carrying nothing of the request.
+    NoValueForTheJsonKey,
 }
 
 const UNRESOLVABLE: &[Unresolvable] = &[
@@ -836,6 +859,7 @@ const UNRESOLVABLE: &[Unresolvable] = &[
         secret: None,
         parameter_name: "/probe/cfn-dynref/absent-secret",
         reference: "{{resolve:secretsmanager:cfn-dynref-nothing-holds:SecretString:password}}",
+        reason: Reason::Diagnostic,
     },
     Unresolvable {
         case: "a json key the secret's document has no member for",
@@ -845,12 +869,14 @@ const UNRESOLVABLE: &[Unresolvable] = &[
         )),
         parameter_name: "/probe/cfn-dynref/absent-key",
         reference: "{{resolve:secretsmanager:cfn-dynref-absent-key:SecretString:password}}",
+        reason: Reason::NoValueForTheJsonKey,
     },
     Unresolvable {
         case: "a json key of a secret that holds no JSON document",
         secret: Some(("cfn-dynref-not-json", Held::Written("plain-text-secret"))),
         parameter_name: "/probe/cfn-dynref/not-json",
         reference: "{{resolve:secretsmanager:cfn-dynref-not-json:SecretString:password}}",
+        reason: Reason::NoValueForTheJsonKey,
     },
     Unresolvable {
         case: "a secret-string field that is not the one supported",
@@ -860,12 +886,14 @@ const UNRESOLVABLE: &[Unresolvable] = &[
         )),
         parameter_name: "/probe/cfn-dynref/bad-field",
         reference: "{{resolve:secretsmanager:cfn-dynref-bad-field:SecretBinary:password}}",
+        reason: Reason::Diagnostic,
     },
 ];
 
 /// Every row: the resource whose property carries a reference nothing can honour is not
-/// created in the owning service, the stack does not complete, and the reason it records names
-/// the reference.
+/// created in the owning service, the stack does not complete, and the reason it records is the
+/// one that condition is reported with — the resolver's diagnostic naming the reference, or the
+/// fixed sentence for a `json-key` no value is associated with.
 #[tokio::test]
 async fn a_reference_nothing_can_honour_fails_its_resource_with_the_diagnostic() {
     let router = build_router();
@@ -896,15 +924,37 @@ async fn a_reference_nothing_can_honour_fails_its_resource_with_the_diagnostic()
             "case {case:?}: expected the stack to roll back rather than report {status:?}, with \
              {described} and resource failures {reasons:?}"
         );
-        assert!(
-            reasons
-                .iter()
-                .any(|reason| reason.contains(UNRESOLVED) && reason.contains(row.reference)),
-            "case {case:?}: expected a resource failure quoting {:?} and naming {:?}, got \
-             {reasons:?}",
-            UNRESOLVED,
-            row.reference
-        );
+        match row.reason {
+            Reason::Diagnostic => assert!(
+                reasons
+                    .iter()
+                    .any(|reason| reason.contains(UNRESOLVED) && reason.contains(row.reference)),
+                "case {case:?}: expected a resource failure quoting {:?} and naming {:?}, got \
+                 {reasons:?}",
+                UNRESOLVED,
+                row.reference
+            ),
+            Reason::NoValueForTheJsonKey => {
+                assert!(
+                    reasons
+                        .iter()
+                        .any(|reason| reason.as_str() == NO_VALUE_FOR_THE_JSON_KEY),
+                    "case {case:?}: expected a resource failure stating exactly \
+                     {NO_VALUE_FOR_THE_JSON_KEY:?}, got {reasons:?}"
+                );
+                // That reason is a CONSTANT: nothing of the reference, the secret or the key
+                // is written into it, so it compares equal in any account and Region.
+                assert!(
+                    reasons
+                        .iter()
+                        .all(|reason| !reason.contains(row.reference)
+                            && !reason.contains(UNRESOLVED)),
+                    "case {case:?}: expected no reason quoting the reference {:?} or the \
+                     resolver's own {UNRESOLVED:?} sentence, got {reasons:?}",
+                    row.reference
+                );
+            }
+        }
         // ...and nothing was created for it: the parameter the declaration asked for is not
         // one Systems Manager holds.
         let (status, answer) = ssm(&router, "GetParameter", &json!({ "Name": row.parameter_name }))

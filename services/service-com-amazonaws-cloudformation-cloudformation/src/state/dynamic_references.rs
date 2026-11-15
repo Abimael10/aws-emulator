@@ -34,7 +34,12 @@
 //! with it, which exists only once that resource's dependency has been created. Such a
 //! reference is therefore resolved against the secret in force at the moment the owning
 //! service is asked for the resource, and one that cannot be honoured fails THAT resource,
-//! carrying the diagnostic, rather than the deployment as a whole.
+//! carrying the reason that condition is reported with, rather than the deployment as a
+//! whole: the resolver's diagnostic naming the reference, or — where the reference named a
+//! `json-key` the secret's text associates no value with — the ONE fixed sentence
+//! CloudFormation states for that condition ([`NO_VALUE_FOR_THE_JSON_KEY`]), which carries
+//! nothing of the request, so a client classifying a deploy failure by its reason compares
+//! against a constant.
 //!
 //! The store is read through the SAME in-process, signed call a resource's own create rides
 //! on ([`super::provisioner::call_ssm`],
@@ -95,6 +100,18 @@ const GET_SECRET_VALUE: &str = "GetSecretValue";
 /// only supported value is `SecretString`", which is also the member of that read the value
 /// is taken from.
 const SECRET_STRING: &str = "SecretString";
+
+/// The whole reason the resource carrying a `secretsmanager` reference fails with when the
+/// `json-key` the reference names is one the secret's `SecretString` associates no value
+/// with.
+///
+/// CloudFormation states this one sentence for that condition and writes NOTHING of the
+/// request into it: not the secret's name or ARN, not the key, not the property the
+/// reference stood in. So it is a CONSTANT a client classifying a deploy failure by its
+/// reason can compare against — a reason carrying the secret's ARN would be a different
+/// string in every account and Region.
+const NO_VALUE_FOR_THE_JSON_KEY: &str =
+    "Could not find a value associated with JSONKey in SecretString";
 
 /// The head every ARN is written with, which is what says a reference's secret id is an ARN
 /// rather than a secret NAME ([`Named::split_secret_id`]).
@@ -448,7 +465,9 @@ async fn parameter(
 /// naming none resolves to the whole secret text. A secret holding no text at all (one held
 /// as `SecretBinary`), one whose text is not a JSON document, and one whose document has no
 /// such key each leave the reference with no value, so each fails the resource rather than
-/// configuring it with the reference's own text.
+/// configuring it with the reference's own text — and a reference that named a `json-key`
+/// fails it with the one fixed reason CloudFormation states for that
+/// ([`NO_VALUE_FOR_THE_JSON_KEY`]).
 async fn secret(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -472,36 +491,37 @@ async fn secret(
     let answer = call_secretsmanager(ctx, region, GET_SECRET_VALUE, &Value::Object(request))
         .await
         .map_err(|refusal| unresolvable(refusal.to_string()))?;
-    let Some(held) = answer.get(SECRET_STRING).and_then(Value::as_str) else {
-        return Err(unresolvable(format!(
-            "the secret {} holds no {SECRET_STRING}",
-            named.secret_id
-        )));
-    };
+    let held = answer.get(SECRET_STRING).and_then(Value::as_str);
     let Some(json_key) = named.json_key else {
+        // The reference asks for the whole secret text, and a secret held as binary has none
+        // for it to resolve to: a condition about the SECRET rather than about a key.
+        let Some(held) = held else {
+            return Err(unresolvable(format!(
+                "the secret {} holds no {SECRET_STRING}",
+                named.secret_id
+            )));
+        };
         return Ok(Resolved {
             value: held.to_string(),
             secret: true,
         });
     };
-    let document: Value = serde_json::from_str(held).map_err(|_| {
-        unresolvable(format!(
-            "the secret {} does not hold a JSON document, so it has no {json_key} key",
-            named.secret_id
-        ))
-    })?;
-    let Some(member) = document.get(json_key) else {
-        return Err(unresolvable(format!(
-            "the secret {} holds no {json_key} key",
-            named.secret_id
-        )));
-    };
+    // ONE condition, one sentence: a reference naming a `json-key` the secret's text
+    // associates no value with — the secret holds no text at all, the text it holds is not a
+    // JSON document, or the document carries no such key — is the fixed reason, carrying
+    // nothing of what the reference named ([`NO_VALUE_FOR_THE_JSON_KEY`]).
+    let member = held
+        .and_then(|held| serde_json::from_str::<Value>(held).ok())
+        .as_ref()
+        .and_then(|document| document.get(json_key))
+        .ok_or_else(|| NO_VALUE_FOR_THE_JSON_KEY.to_string())?
+        .clone();
     Ok(Resolved {
         // A key whose value the document writes as a string resolves to that string; one
         // written as a number or a boolean resolves to how the document writes it, since a
         // property carries text either way.
         value: match member {
-            Value::String(text) => text.clone(),
+            Value::String(text) => text,
             other => other.to_string(),
         },
         secret: true,
