@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRefreshSchedules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRefreshSchedules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRefreshSchedules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +144,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRefreshSchedules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRefreshSchedulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRefreshSchedules"))
+        // A report on stored state: nothing here writes to the store. `ctx` carries the
+        // region a refusal's ARN is scoped to.
+        let region = crate::state::request_region(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRefreshSchedulesErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(crate::state::next_request_id()),
+                },
+            )
+            .into());
+        };
+
+        let request_id = crate::state::next_request_id();
+        let store = state.lock();
+
+        // A refresh schedule is a child of the data set it refreshes, so a data set
+        // this account does not hold holds no schedules to list either.
+        if !store
+            .data_sets
+            .contains_key(&(input.aws_account_id.clone(), input.data_set_id.clone()))
+        {
+            return Err(ListRefreshSchedulesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::data_set_not_found_message(
+                        &region,
+                        &input.aws_account_id,
+                        &input.data_set_id,
+                    )),
+                    resource_type: Some("DATA_SET".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // Every schedule the data set holds, each reported exactly as the stored record
+        // describes it. A data set holding none lists none: an empty list, not a
+        // missing member.
+        let refresh_schedules = store
+            .refresh_schedules_in(&input.aws_account_id, &input.data_set_id)
+            .into_iter()
+            .map(crate::state::RefreshScheduleRecord::to_refresh_schedule)
+            .collect();
+
+        Ok(ListRefreshSchedulesOutput {
+            refresh_schedules: Some(refresh_schedules),
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }

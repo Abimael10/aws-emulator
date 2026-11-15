@@ -49,7 +49,7 @@ const MAX_ID_LEN: usize = 48;
 /// `/accounts/{AwsAccountId}/data-sets/{DataSetId}`, and the request body it needs.
 /// Source: smithy_query(query="operation", operation="DescribeDataSet,DeleteDataSet,\
 /// DescribeDataSetPermissions,UpdateDataSetPermissions,CreateRefreshSchedule,\
-/// DescribeRefreshSchedule").
+/// DescribeRefreshSchedule,ListRefreshSchedules").
 struct DataSetCall {
     operation: &'static str,
     method: &'static str,
@@ -58,8 +58,8 @@ struct DataSetCall {
 }
 
 /// Every operation this crate serves that is keyed on a `DataSetId`: the read, the
-/// delete, the two permission calls, and the two refresh-schedule calls addressed through
-/// the data set they belong to.
+/// delete, the two permission calls, and the refresh-schedule calls addressed through the
+/// data set they belong to.
 fn data_set_calls() -> Vec<DataSetCall> {
     vec![
         DataSetCall {
@@ -96,6 +96,12 @@ fn data_set_calls() -> Vec<DataSetCall> {
             operation: "DescribeRefreshSchedule",
             method: "GET",
             suffix: "/refresh-schedules/nightly",
+            body: None,
+        },
+        DataSetCall {
+            operation: "ListRefreshSchedules",
+            method: "GET",
+            suffix: "/refresh-schedules",
             body: None,
         },
     ]

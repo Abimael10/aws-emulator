@@ -4,7 +4,6 @@
 // cross-service suite under `tests/all/`, and nothing else.
 //
 // Single integration-test target for the router: a declaration list, and nothing else.
-//
 // Past this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
 // file under `tests/all/`, sorted by name, and no other line — no prose between the pairs, no
 // blank line, and nothing after the last pair. Two branches landing at once then insert two
@@ -33,8 +32,6 @@
 // `clippy::doc_lazy_continuation` asks of a doc list item, so the lint is allowed for the whole
 // target. An inner attribute, like an inner doc comment, is legal only before the first item,
 // so it stands in this header rather than in the list below.
-// Single integration-test target for the router: the canonical DECLARATION LIST of every
-// cross-service suite under `tests/all/`, and nothing else.
 // This file holds this header and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair
 // per suite file under `tests/all/`, sorted by name, and no other line. Put a new suite at
 // `tests/all/<name>.rs` and insert its pair where its name sorts to; what that suite covers,
@@ -1548,3 +1545,11 @@ mod lambda_delivery_grant_is_each_sources_own;
 // by name, and no other line. Put a new suite at `tests/all/<name>.rs` and insert its pair
 // where its name sorts to, so two branches landing at once insert two lines in two places and
 // have no prose to duplicate, re-word or mistype.
+// and nothing after the last pair. Put a new suite at `tests/all/<name>.rs` and insert its
+// pair where its name sorts to; two branches landing at once then insert two lines in two
+// two landings can leave one past the first item.
+// `mod` is what points the declaration into `tests/all/`. A suite file no `mod` here names is
+// compiled nowhere and its tests never run, and a second `mod` for one name is `E0428`, which
+// compiles neither copy. Some of the files below are shared harnesses or probes rather than
+// suites; all are declared, for that reason.
+// one this target carries stands here rather than in the list below.

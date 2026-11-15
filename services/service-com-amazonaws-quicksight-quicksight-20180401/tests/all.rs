@@ -33,6 +33,8 @@ mod describe_namespace;
 mod iam_policy_assignment_lifecycle;
 #[path = "all/identity_type_refusal.rs"]
 mod identity_type_refusal;
+#[path = "all/list_refresh_schedules.rs"]
+mod list_refresh_schedules;
 #[path = "all/mutation_response_status.rs"]
 mod mutation_response_status;
 #[path = "all/namespace_lifecycle.rs"]
