@@ -290,9 +290,12 @@ async fn an_accepted_policy_deletion_reports_deleting_and_then_the_policy_is_gon
                 text(&deleted.body, "status"),
                 deleted.body.get("statusReasons").cloned()
             ),
-            ("DELETING".to_string(), Some(json!([]))),
-            "case {:?}: an accepted deletion reports the policy DELETING with no status \
-             reason, got {}",
+            (
+                "DELETING".to_string(),
+                Some(json!(["Deletion initiated by user"]))
+            ),
+            "case {:?}: an accepted deletion reports the policy DELETING with the reason the \
+             caller's own deletion is, got {}",
             row.case,
             deleted.body
         );

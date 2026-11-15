@@ -180,7 +180,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let now = ::std::time::SystemTime::now();
-        let store = state.lock();
+        let mut store = state.lock();
+        // An engine whose deletion the clock has already made due is gone before
+        // this read looks for it: the removal was owed at this instant whether or
+        // not anybody called, so the read materialises it rather than reporting
+        // an engine that no longer exists.
+        store.expire_deleted_policy_engines_and_policies(now);
 
         // The id the path carries is the one the create minted, which is how the
         // store is keyed; an id naming no stored engine is the modelled 404 in

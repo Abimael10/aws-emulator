@@ -17,6 +17,8 @@ mod agent_runtime_endpoint_lifecycle;
 mod agent_runtime_endpoint_listing;
 #[path = "all/agent_runtime_lifecycle.rs"]
 mod agent_runtime_lifecycle;
+#[path = "all/api_key_credential_provider_deletion.rs"]
+mod api_key_credential_provider_deletion;
 #[path = "all/api_key_credential_provider_lifecycle.rs"]
 mod api_key_credential_provider_lifecycle;
 #[path = "all/browser_lifecycle.rs"]
@@ -125,6 +127,8 @@ mod payment_credential_provider;
 mod policy_deletion;
 #[path = "all/policy_engine_creation.rs"]
 mod policy_engine_creation;
+#[path = "all/policy_engine_deletion.rs"]
+mod policy_engine_deletion;
 #[path = "all/policy_engine_mutation.rs"]
 mod policy_engine_mutation;
 #[path = "all/policy_plane.rs"]

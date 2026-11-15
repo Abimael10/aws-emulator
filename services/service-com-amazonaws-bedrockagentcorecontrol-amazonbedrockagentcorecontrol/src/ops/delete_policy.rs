@@ -197,10 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        // A policy whose own earlier deletion the clock has already made due is
-        // gone before this call looks for it, so a repeat past the span is the
-        // modelled 404 rather than a second acceptance.
-        store.expire_deleted_policies(now);
+        // A policy, or the engine holding it, whose own earlier deletion the
+        // clock has already made due is gone before this call looks for it, so a
+        // repeat past the span is the modelled 404 rather than a second
+        // acceptance.
+        store.expire_deleted_policy_engines_and_policies(now);
 
         // A policy is addressed only THROUGH the engine that evaluates it, so an
         // engine id this account does not hold is reported in its own sentence

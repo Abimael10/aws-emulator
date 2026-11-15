@@ -16,8 +16,9 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     ConflictException, CreatePolicyEngineInput, CreatePolicyEngineOutput, CreatePolicyInput,
-    CreatePolicyOutput, DeletePolicyOutput, GetPolicyEngineOutput, GetPolicyOutput,
-    PolicyDefinition, ResourceNotFoundException, UpdatePolicyEngineOutput, UpdatedDescription,
+    CreatePolicyOutput, DeletePolicyEngineOutput, DeletePolicyOutput, GetPolicyEngineOutput,
+    GetPolicyOutput, PolicyDefinition, ResourceNotFoundException, UpdatePolicyEngineOutput,
+    UpdatedDescription,
 };
 
 use super::{sorted_map, timestamp};
@@ -36,6 +37,19 @@ pub const POLICY_STATUS_CREATING: &str = "CREATING";
 pub const POLICY_STATUS_ACTIVE: &str = "ACTIVE";
 pub const POLICY_STATUS_UPDATING: &str = "UPDATING";
 pub const POLICY_STATUS_DELETING: &str = "DELETING";
+
+/// The entry a policy resource's `statusReasons` carries while a deletion the
+/// CALLER asked for is under way: "Additional information about the deletion
+/// status" (`smithy_query doc shape=DeletePolicyResponse member=statusReasons`)
+/// for a `DELETING` resource is that the deletion was initiated by the user,
+/// which is what distinguishes it from a resource the service itself is
+/// retiring.
+///
+/// Fixed text: nothing of the request or of the state is interpolated, because
+/// the reason does not depend on which resource was deleted. Shared by the engine
+/// and the policies it holds, so the one transition is reported in one sentence
+/// by every response that describes it.
+pub const POLICY_DELETION_INITIATED_REASON: &str = "Deletion initiated by user";
 
 /// How long a freshly created policy engine or policy stays `CREATING` before
 /// the clock owes it `ACTIVE`, and how long a policy whose deletion was accepted
@@ -90,6 +104,37 @@ pub fn policy_engine_concurrent_modification(policy_engine_id: &str) -> Conflict
     }
 }
 
+/// The modelled conflict for a policy whose `name` this account already holds
+/// one under: "The customer-assigned immutable name for the policy. Must be
+/// unique within the account" (`smithy_query doc shape=CreatePolicy
+/// member=name`), so a repeated name is a conflict rather than a second policy a
+/// caller reading by name could not tell apart.
+///
+/// Fixed text: neither the name nor the policy already holding it is
+/// interpolated, because the remedy — choose another name — does not depend on
+/// either.
+pub fn policy_name_conflict() -> ConflictException {
+    ConflictException {
+        message: Some("Policy with the same name already exists".to_string()),
+    }
+}
+
+/// How this service words the refusal of a `DeletePolicyEngine` for an engine
+/// that still holds policies: what the engine still contains, counted off this
+/// service's own state, and the fact that it cannot be deleted like that.
+///
+/// "The policy engine must not have any associated policies before deletion"
+/// (`smithy_query doc shape=DeletePolicyEngine`), so a policy is never silently
+/// cascaded away with the engine that evaluates it. The text around the count is
+/// fixed; the count is the number of policies the engine still holds.
+pub fn policy_engine_has_policies(policies: usize) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "Policy engine still contains {policies} policy and cannot be deleted"
+        )),
+    }
+}
+
 /// The modelled not-found error for a policy an engine of this account does not
 /// hold, worded as [`policy_engine_not_found`] words a missing engine: the
 /// resource and the id the request carried for it.
@@ -119,6 +164,21 @@ pub fn policy_arn(region: &str, policy_engine_id: &str, policy_id: &str) -> Stri
     )
 }
 
+/// The `statusReasons` a policy resource in `status` reports: the deletion the
+/// caller asked for while that is what the resource is doing, and nothing for
+/// any other status — a create or an update this emulator accepted has failed in
+/// no way, so there is nothing to report beside the status itself.
+///
+/// Shared by the engine and by the policies it holds, so one transition is
+/// reported in one sentence whichever resource is in it.
+fn status_reasons_for(status: &str) -> Vec<String> {
+    if status == POLICY_STATUS_DELETING {
+        vec![POLICY_DELETION_INITIATED_REASON.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// One policy engine: what `CreatePolicyEngine` stored, the policies created in
 /// it, and the transition to `ACTIVE` the clock owes it.
 #[derive(Debug, Clone)]
@@ -138,6 +198,13 @@ pub struct PolicyEngineRecord {
     /// The instant the transient status is owed its transition. Stored, never
     /// slept on: a read materialises the transition the clock already made due.
     pub settles_at: SystemTime,
+    /// The instant an accepted deletion removes this record, once
+    /// `DeletePolicyEngine` has accepted one; `None` for an engine nobody has
+    /// deleted. Stored, never slept on: the removal is the clock's, materialised
+    /// by
+    /// [`expire_deleted_policy_engines_and_policies`](crate::state::ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState::expire_deleted_policy_engines_and_policies)
+    /// on the next call that reads the policy plane.
+    pub removal_due_at: Option<SystemTime>,
     /// Every policy created in this engine, keyed by `policyId`. The key order
     /// is the deterministic list order a policy listing pages over.
     pub policies: BTreeMap<String, PolicyRecord>,
@@ -165,8 +232,34 @@ impl PolicyEngineRecord {
             transient_status: POLICY_STATUS_CREATING.to_string(),
             settled_status: POLICY_STATUS_ACTIVE.to_string(),
             settles_at: now + POLICY_SETTLE_DELAY,
+            removal_due_at: None,
             policies: BTreeMap::new(),
         }
+    }
+
+    /// Whether a deletion has been accepted for this engine: it reports
+    /// `DELETING` and the clock owes its removal.
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
+    /// Accept a deletion at `now`: the engine reports `DELETING` from this
+    /// instant on and the clock owes its removal one settle span later, exactly
+    /// as a policy's own accepted deletion is owed
+    /// ([`PolicyRecord::accept_deletion`]).
+    ///
+    /// Idempotent, as `DeletePolicyEngine` is (`@idempotent`): a repeat while the
+    /// deletion is still under way leaves the record and the instant it is owed
+    /// alone rather than re-arming the clock.
+    pub fn accept_deletion(&mut self, now: SystemTime) {
+        if self.is_deleting() {
+            return;
+        }
+        self.transient_status = POLICY_STATUS_DELETING.to_string();
+        self.settled_status = POLICY_STATUS_DELETING.to_string();
+        self.settles_at = now;
+        self.removal_due_at = Some(now + POLICY_SETTLE_DELAY);
+        self.updated_at = now;
     }
 
     /// The status this engine reports at `now`: the transient one until the
@@ -177,6 +270,14 @@ impl PolicyEngineRecord {
         } else {
             &self.settled_status
         }
+    }
+
+    /// The reasons this engine's status at `now` carries: the deletion the caller
+    /// asked for while that is what the engine is doing, and nothing otherwise —
+    /// a create or an update this emulator accepted has failed in no way, so
+    /// there is nothing to report beside the status itself.
+    pub fn status_reasons_at(&self, now: SystemTime) -> Vec<String> {
+        status_reasons_for(self.status_at(now))
     }
 
     /// Apply an accepted modification at `now`: the engine reports `UPDATING`
@@ -213,10 +314,11 @@ impl PolicyEngineRecord {
             encryption_key_arn: self.encryption_key_arn.clone(),
             description: self.description.clone(),
             // "Additional information about the policy status. This provides
-            // details about any failures or the current state": a create this
-            // emulator accepts has failed in no way, so there is nothing to
-            // report beside the status itself.
-            status_reasons: Vec::new(),
+            // details about any failures or the current state": what the engine
+            // is doing, which is the deletion the caller asked for while one is
+            // under way and nothing for a create or an update this emulator
+            // accepted, which has failed in no way.
+            status_reasons: self.status_reasons_at(now),
         }
     }
 
@@ -225,6 +327,26 @@ impl PolicyEngineRecord {
     pub fn get_output(&self, now: SystemTime) -> GetPolicyEngineOutput {
         let created = self.create_output(now);
         GetPolicyEngineOutput {
+            policy_engine_id: created.policy_engine_id,
+            name: created.name,
+            created_at: created.created_at,
+            updated_at: created.updated_at,
+            policy_engine_arn: created.policy_engine_arn,
+            status: created.status,
+            encryption_key_arn: created.encryption_key_arn,
+            description: created.description,
+            status_reasons: created.status_reasons,
+        }
+    }
+
+    /// This engine as `DeletePolicyEngine`'s response envelope —
+    /// `DeletePolicyEngineResponse` declares the same members as
+    /// `CreatePolicyEngineResponse`, so it too is rendered from the one stored
+    /// record: what the deletion reports about the engine is the engine, with the
+    /// status the accepted deletion left on it.
+    pub fn delete_output(&self, now: SystemTime) -> DeletePolicyEngineOutput {
+        let created = self.create_output(now);
+        DeletePolicyEngineOutput {
             policy_engine_id: created.policy_engine_id,
             name: created.name,
             created_at: created.created_at,
@@ -283,7 +405,7 @@ pub struct PolicyRecord {
     /// The instant an accepted deletion removes this record, once `DeletePolicy`
     /// has accepted one; `None` for a policy nobody has deleted. Stored, never
     /// slept on: the removal is the clock's, materialised by
-    /// [`expire_deleted_policies`](crate::state::ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState::expire_deleted_policies)
+    /// [`expire_deleted_policy_engines_and_policies`](crate::state::ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState::expire_deleted_policy_engines_and_policies)
     /// on the next call that reads the policy plane.
     pub removal_due_at: Option<SystemTime>,
 }
@@ -354,6 +476,12 @@ impl PolicyRecord {
         }
     }
 
+    /// The reasons this policy's status at `now` carries, on the same rule the
+    /// engine that holds it follows ([`PolicyEngineRecord::status_reasons_at`]).
+    pub fn status_reasons_at(&self, now: SystemTime) -> Vec<String> {
+        status_reasons_for(self.status_at(now))
+    }
+
     /// This policy as `CreatePolicy`'s response envelope.
     ///
     /// `CreatePolicyResponse` and `GetPolicyResponse` declare the SAME members,
@@ -372,8 +500,10 @@ impl PolicyRecord {
             enforcement_mode: self.enforcement_mode.clone(),
             definition: self.definition.clone(),
             description: self.description.clone(),
-            // Nothing failed, so the status carries no reason of its own.
-            status_reasons: Vec::new(),
+            // What the policy is doing: the deletion the caller asked for while
+            // one is under way, and nothing otherwise — nothing failed, so the
+            // status carries no reason of its own.
+            status_reasons: self.status_reasons_at(now),
         }
     }
 

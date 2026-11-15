@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteApiKeyCredentialProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteApiKeyCredentialProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteApiKeyCredentialProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +138,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteApiKeyCredentialProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteApiKeyCredentialProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteApiKeyCredentialProviderErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the credential provider store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The name is the identifier every provider route addresses a provider
+        // by, so the removal is keyed by it; a name this account holds no provider
+        // under is the modelled 404, in the sentence this plane words a missing
+        // provider with. The delete answers 204 carrying no member and the model
+        // gives the provider no status to report, so the record goes NOW rather
+        // than after a span: the very next read resolves nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteApiKeyCredentialProvider"))
+        // The Secrets Manager secret the key lives in is NOT deleted here. For an
+        // `EXTERNAL` provider it is the CALLER's own secret, which this service
+        // never wrote to; for a `MANAGED` one it is the secret the create stores
+        // the key in under a name derived from the provider, which a later create
+        // of a provider of the same name writes the new key into
+        // (`crate::state::store_managed_secret`) — so the key a provider reports
+        // is always the one its own create stored, and no stale key can be read
+        // through a provider.
+        let mut store = state.lock();
+        store
+            .api_key_credential_providers
+            .remove(&input.name)
+            .ok_or_else(|| {
+                DeleteApiKeyCredentialProviderErrorModeled::ResourceNotFoundException(
+                    crate::state::api_key_credential_provider_not_found(&input.name),
+                )
+            })?;
+
+        Ok(DeleteApiKeyCredentialProviderOutput {})
     }
 }
