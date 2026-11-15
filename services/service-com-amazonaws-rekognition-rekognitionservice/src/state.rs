@@ -12,8 +12,9 @@
 //! ## What this emulator does and does not compute
 //!
 //! Rekognition's face operations are backed by a face detector and a face
-//! recogniser. The RECOGNISER does not exist in this process: nothing here maps a face
-//! to an IDENTITY, so no face is tied to the person it belongs to. What IS real is
+//! recogniser. The RECOGNISER does not exist in this process: nothing here INFERS the
+//! identity of a photographed face, so no face is tied to a person this emulator was not
+//! told about. What IS real is
 //! the collection store — a collection, the faces indexed into it, their minted ids, and
 //! the counts, filters, pages and lookups computed from them — and, for the operations
 //! that analyse a submitted image, the geometric face DETECTOR in
@@ -46,11 +47,15 @@
 //! its foreground/background split) are measured off the decoded pixels and reported in
 //! full.
 //!
-//! Where an operation PARTITIONS the faces of a submitted image by an identity nothing here
-//! holds, the detector still answers for the part it measured: `RecognizeCelebrities`
-//! reports every face it measured as an unrecognized face — the side the operation itself
-//! puts a face it does not recognise on — and names no celebrity, rather than refusing the
-//! call or inventing one. `DetectProtectiveEquipment` answers the same way about the PERSONS
+//! Where an operation PARTITIONS the faces of a submitted image by an IDENTITY, the identity
+//! is one this service HOLDS rather than one inferred from the pixels:
+//! `RecognizeCelebrities` resolves each face the detector measured against the seeded
+//! celebrity catalogue in [`celebrity_catalogue`] — the entry whose reference face it
+//! resembles most, by the same measured correlation `CompareFaces` reports — and reports it as
+//! that catalogue entry's celebrity, with the resemblance measured for it as the match
+//! confidence, or on the unrecognized side when it resembles no entry of the catalogue at all.
+//! `GetCelebrityInfo` resolves an `Id` the catalogue holds back to the same entry.
+//! `DetectProtectiveEquipment` answers the same way about the PERSONS
 //! a frame carries: each face the detector measured locates a person, reported with the
 //! confidence and the one body part measured for it, while an item of equipment and whether
 //! it covers a body part are a judgement no detector here makes, so each person the summary
@@ -70,6 +75,7 @@
 //! come from the same image content or not. `SearchFaces` reports exactly that and no
 //! graded score — see its own module docs.
 
+pub mod celebrity_catalogue;
 pub mod face_detection;
 pub mod idempotency;
 pub mod image_source;
@@ -488,6 +494,12 @@ pub struct ComAmazonawsRekognitionRekognitionserviceState {
     /// refused. Service-wide rather than per collection: a token names a REQUEST, and
     /// the request's own collection is one of the parameters compared.
     pub client_request_tokens: idempotency::TokenLedger,
+    /// The celebrities this service holds, seeded once with this emulator's own catalogue
+    /// and read — never written — by a call: `RecognizeCelebrities` resolves a measured
+    /// face against it, and `GetCelebrityInfo` resolves the `Id` it reported back to the
+    /// same entry, so one catalogue answers both halves of that documented chain. See
+    /// [`celebrity_catalogue`].
+    pub celebrities: celebrity_catalogue::CelebrityCatalogue,
     /// Every stored-video analysis job a `Start…` operation of this service has
     /// recorded, keyed by the `JobId` it minted. Service-wide and shared by the whole
     /// family, with each job naming the analysis that started it, so one `JobId` space

@@ -850,6 +850,16 @@ impl FaceAppearance {
             .sum();
         (correlation * 100.0).clamp(0.0, 100.0)
     }
+
+    /// The appearance of a face whose own pixels this process does not hold, measured off the
+    /// grid of cell tones that stands for it: the REFERENCE faces of this service's celebrity
+    /// catalogue are shipped in that form ([`crate::state::celebrity_catalogue`]), since their
+    /// portraits' pixels are not. The tones are centred and normalised exactly as a measured
+    /// face's are, so the one correlation [`Self::similarity_to`] computes compares like with
+    /// like.
+    pub fn of_cell_tones(cells: Vec<f32>) -> Self {
+        normalised(cells)
+    }
 }
 
 /// The appearance of the face at `rect`: its box resampled onto an

@@ -17,23 +17,32 @@
 //! it "returns the 64 largest faces in the image" and "doesn't return celebrities whose
 //! faces aren't among the largest 64 faces".
 //!
-//! WHICH SIDE of the partition a face falls on is an IDENTITY: AWS answers it against its
-//! own catalogue of celebrities, and neither that catalogue nor any trained recogniser
-//! exists in this process — nothing here maps a face to the person it belongs to (see
-//! [`crate::state`]). So no face is reported as a celebrity, and no face is DROPPED for
-//! that: each one is reported as an unrecognized face, which is where the operation itself
-//! puts a face it does not recognise, carrying the members the detector measured (a
-//! `BoundingBox`, a `Confidence`, `Landmarks`, a `Pose.Roll` and a `Quality`) and leaving
-//! `Emotions` and `Smile` — a classifier's judgement — absent. An image carrying no face at
-//! all is answered with both lists empty, which is what was measured, and a refusal is
-//! reserved for an image this service could not read at all.
+//! WHICH SIDE of the partition a face falls on is an IDENTITY, and the identity is one this
+//! service HOLDS: [`crate::state::celebrity_catalogue`] is the seeded catalogue of celebrities
+//! it was told about, each with an `Id`, a `Name`, its `Urls`, its `KnownGender` and the
+//! appearance of its own reference face. A measured face is resolved against that catalogue by
+//! the one comparison this process can make about two faces — the template correlation
+//! [`crate::state::face_detection::FaceAppearance`] measures, the same measurement
+//! `CompareFaces` reports a `Similarity` from — so a face is reported as the entry whose
+//! reference face it RESEMBLES MOST, carrying that entry's identity, the resemblance measured
+//! for it as its `MatchConfidence` and the `ComparedFace` the detector measured as its `Face`.
+//! One entry is one person, so an entry is matched at most once per answer. A face that
+//! resembles no entry of the catalogue at all is not identified: it is reported as an
+//! unrecognized face, which is where the operation itself puts a face it does not recognise,
+//! carrying the members the detector measured (a `BoundingBox`, a `Confidence`, `Landmarks`, a
+//! `Pose.Roll` and a `Quality`) and leaving `Emotions` and `Smile` — a classifier's judgement
+//! — absent. No face is on both sides and none is left out. An image carrying no face at all
+//! is answered with both lists empty, which is what was measured, and a refusal is reserved
+//! for an image this service could not read at all.
 //!
-//! It PERSISTS NOTHING and reads no stored resource: "Amazon Rekognition doesn't retain
-//! information about which images a celebrity has been recognized in. Your application must
-//! store this information" (the operation's own documentation, below). The whole answer is a
-//! function of the submitted image, so two identical calls answer identically without either
-//! having changed anything, and the store this service keeps for collections is neither read
-//! nor written here.
+//! It PERSISTS NOTHING: "Amazon Rekognition doesn't retain information about which images a
+//! celebrity has been recognized in. Your application must store this information" (the
+//! operation's own documentation, below). The catalogue it resolves against is READ and the
+//! collection store is neither read nor written, so the whole answer is a function of the
+//! submitted image and the seeded catalogue: two identical calls answer identically without
+//! either having changed anything. The `Id` reported is the catalogue's own, which is what
+//! `GetCelebrityInfo` resolves — "use the Celebrity ID property as a unique identifier for the
+//! celebrity" — so the documented lookup chain closes.
 //!
 //! `OrientationCorrection` is absent because the member's own documentation says it always
 //! is: "any returned values for this field included in an API response will always be NULL".
@@ -121,7 +130,7 @@ use super::types::*;
 
 // A reported face is built by the one conversion every operation that reports a
 // `ComparedFace` shares, so two operations cannot drift apart over what a face carries.
-use crate::state::face_detection::compared_face;
+use crate::state::face_detection::{compared_face, FaceAppearance};
 
 // Every modelled error this handler answers with is built through this trait, so each
 // one carries its `Code` member beside its `Message`.
@@ -207,32 +216,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing is persisted — "Amazon Rekognition doesn't retain information about which
-        // images a celebrity has been recognized in" — and the whole answer is measured off
-        // the image the request submitted, so there is no stored resource to read or write
-        // and the engine this operation was constructed with goes unused. `ctx` is what an
-        // S3-sourced read of the image goes through.
-        let _ = &self.engine;
-        let faces = crate::state::face_detection::faces_in_submitted_image(ctx, &input.image)
-            .await
-            .map_err(unreadable_error)?;
+        // The celebrities this service holds are the one stored thing this answer reads, and
+        // it reads them without writing anything: nothing is persisted — "Amazon Rekognition
+        // doesn't retain information about which images a celebrity has been recognized in".
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RecognizeCelebritiesErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
+        })?;
+        // The faces, with the appearance each is resolved against the catalogue by. `ctx` is
+        // what an S3-sourced read of the image goes through.
+        let measured =
+            crate::state::face_detection::measured_faces_in_submitted_image(ctx, &input.image)
+                .await
+                .map_err(unreadable_error)?;
         // "RecognizeCelebrities returns the 64 largest faces in the image": the detector
         // reports the faces it found largest first, so the ones past the cap are the
         // smallest of them.
-        let unrecognized: Vec<ComparedFace> = faces
+        let reported: Vec<_> = measured.into_iter().take(MAX_REPORTED_FACES).collect();
+        let appearances: Vec<FaceAppearance> = reported
             .iter()
-            .take(MAX_REPORTED_FACES)
-            .map(compared_face)
+            .map(|face| face.appearance.clone())
             .collect();
+
+        let mut celebrity_faces: Vec<Celebrity> = Vec::new();
+        let mut unrecognized_faces: Vec<ComparedFace> = Vec::new();
+        {
+            // The guard is held only for the resolution itself: the pixels were read above,
+            // so no other request is kept waiting while this one measures anything.
+            let store = state.lock();
+            for (face, identified) in reported.iter().zip(store.celebrities.identify(&appearances))
+            {
+                let reported_face = compared_face(&face.detail);
+                match identified {
+                    // "For each celebrity recognized, RecognizeCelebrities returns a Celebrity
+                    // object" — and the face it was measured as goes with it, on this side of
+                    // the partition only.
+                    Some(recognised) => celebrity_faces.push(recognised.celebrity(reported_face)),
+                    // "Details about each unrecognized face in the image": a face the
+                    // catalogue holds no entry resembling.
+                    None => unrecognized_faces.push(reported_face),
+                }
+            }
+        }
+
         Ok(RecognizeCelebritiesOutput {
-            // No face is reported as a celebrity: deciding that is an identity, nothing in
-            // this process holds the identity of a face, and a name nothing established is
-            // not reported. The faces themselves are not lost by it — each one is on the
-            // unrecognized side of the partition below.
-            celebrity_faces: Some(Vec::new()),
-            // "Details about each unrecognized face in the image", which is every face this
-            // answer covers.
-            unrecognized_faces: Some(unrecognized),
+            celebrity_faces: Some(celebrity_faces),
+            unrecognized_faces: Some(unrecognized_faces),
             // "Any returned values for this field included in an API response will always be
             // NULL."
             orientation_correction: None,

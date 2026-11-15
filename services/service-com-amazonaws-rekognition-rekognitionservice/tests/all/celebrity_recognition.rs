@@ -1,32 +1,42 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `RecognizeCelebrities` end to end over the wire (`awsJson1_1`, `POST /` with
-//! `X-Amz-Target: RekognitionService.RecognizeCelebrities`), dispatched through the same
+//! `RecognizeCelebrities` and `GetCelebrityInfo` end to end over the wire (`awsJson1_1`,
+//! `POST /` with `X-Amz-Target: RekognitionService.<Operation>`), dispatched through the same
 //! [`MultiServiceRouter`] the production emulator mounts.
 //!
-//! THE RULE UNDER TEST: `RecognizeCelebrities` PARTITIONS the faces measured in the
-//! submitted image — "it lists the recognized celebrities in the CelebrityFaces array and
-//! any unrecognized faces in the UnrecognizedFaces array" — so every face the detector
-//! measures in the image is reported on one side or the other and none is left out of the
-//! answer. The faces reported are the faces `DetectFaces` reports for the same pixels, with
-//! the members that detector measured (a box, a confidence, landmarks, a pose and a
-//! quality) and with every member a classifier would have had to judge absent; no face is
-//! reported as a celebrity, because nothing in this process holds the identity of a face;
-//! an image carrying no face is answered with both lists empty rather than refused; the
-//! orientation correction the member documents as always null is absent; an image this
-//! service cannot read at all is refused with the modelled error for why; and nothing is
-//! persisted, so a later caller sees exactly what it would have seen without the call.
+//! THE RULE UNDER TEST: `RecognizeCelebrities` PARTITIONS the faces measured in the submitted
+//! image — "it lists the recognized celebrities in the CelebrityFaces array and any
+//! unrecognized faces in the UnrecognizedFaces array" — so every face the detector measures is
+//! reported on EXACTLY ONE side of it and none is left out. A face that resolves to an entry of
+//! the celebrity catalogue this service holds is reported on the CelebrityFaces side as a
+//! `Celebrity`, carrying that entry's `Id`, `Name`, `Urls` and `KnownGender`, the
+//! `MatchConfidence` measured for it and, as its `Face`, the `ComparedFace` the detector
+//! measured; it is NOT repeated among the unrecognized faces, and one entry is reported at most
+//! once per answer. Every other measured face is reported on the UnrecognizedFaces side. The
+//! `Id` reported is the key of the documented follow-on lookup — "use the Celebrity ID property
+//! as a unique identifier for the celebrity … you will need the ID to identify the celebrity in
+//! a call to the GetCelebrityInfo operation" — so `GetCelebrityInfo` resolves it to the same
+//! name, links and known gender, and refuses an identifier the catalogue does not hold. Either
+//! way a reported face carries the members the detector measured (a box, a confidence,
+//! landmarks, a pose and a quality) and none a classifier would have had to judge; an image
+//! carrying no face is answered with both lists empty rather than refused; the orientation
+//! correction the member documents as always null is absent; an image this service cannot read
+//! at all is refused with the modelled error for why; and nothing is persisted, so a later
+//! caller sees exactly what it would have seen without the call.
 //!
 //! Every portrait here is DRAWN from known tones and distances by the fixtures of the
 //! detection suite, so each assertion compares the service's answer against the picture the
-//! test drew rather than against a recorded answer. The tables span what the rule
-//! generalises over: how many faces an image carries (none, one, two of different sizes,
-//! three), where in the frame they sit, their size, tilt and tone, the frame's size, the
-//! encoded format, how the image is submitted (inline, from an S3 object), and how an image
-//! fails to be readable at all.
+//! test drew rather than against a recorded answer. The tables span what the rule generalises
+//! over: how many faces an image carries (none, one, two of different sizes, three), where in
+//! the frame they sit, their size, tilt and tone, the frame's size, the encoded format, how the
+//! image is submitted (inline, from an S3 object), and how an image fails to be readable at
+//! all.
 
 use image::ImageFormat;
 use serde_json::{json, Value};
+// The floor a measured resemblance has to clear to BE a catalogue entry's celebrity, read
+// from the service rather than restated here.
+use service_com_amazonaws_rekognition_rekognitionservice::state::celebrity_catalogue::MINIMUM_RESEMBLANCE;
 use smithy_server_runtime::MultiServiceRouter;
 
 // The router harness, the dispatch helper and the reduced reply come from the
@@ -47,10 +57,19 @@ const UNJUDGED_MEMBERS: [&str; 2] = ["Emotions", "Smile"];
 /// (`smithy_query(query="shape",shape="ComparedFace,FaceDetail")`).
 const MEASURED_MEMBERS: [&str; 5] = ["BoundingBox", "Confidence", "Landmarks", "Pose", "Quality"];
 
+/// Every value a `KnownGender.Type` may carry: "the known gender identity can be Male,
+/// Female, Nonbinary, or Unlisted" (`smithy_query(query="shape",shape="KnownGenderType")`).
+const KNOWN_GENDERS: [&str; 4] = ["Male", "Female", "Nonbinary", "Unlisted"];
+
 /// One `RecognizeCelebrities` call on an image already in the `Image` form a request
 /// carries.
 async fn recognize(router: &MultiServiceRouter, image: Value) -> Reply {
     call(router, "RecognizeCelebrities", json!({ "Image": image })).await
+}
+
+/// One `GetCelebrityInfo` call on a celebrity identifier.
+async fn celebrity_info(router: &MultiServiceRouter, id: &str) -> Reply {
+    call(router, "GetCelebrityInfo", json!({ "Id": id })).await
 }
 
 /// One `DetectFaces` call: the faces the detector reports for the same pixels, through the
@@ -59,10 +78,36 @@ async fn detect(router: &MultiServiceRouter, image: Value) -> Reply {
     call(router, "DetectFaces", json!({ "Image": image })).await
 }
 
-/// The `UnrecognizedFaces` of a served answer, with what every answer must and must not
-/// carry already checked: no celebrity named, no orientation correction, and on each
-/// reported face the measured members and none of the judged ones.
-fn served(case: &str, reply: &Reply) -> Vec<Value> {
+/// Both sides of one served partition.
+struct Partition {
+    celebrities: Vec<Value>,
+    unrecognized: Vec<Value>,
+}
+
+impl Partition {
+    /// Every face this answer reported, whichever side it was reported on: a celebrity's own
+    /// `Face` and an unrecognized face are both the `ComparedFace` the detector measured.
+    fn faces(&self) -> Vec<Value> {
+        let mut faces: Vec<Value> = self
+            .celebrities
+            .iter()
+            .map(|celebrity| {
+                celebrity
+                    .get("Face")
+                    .cloned()
+                    .expect("a recognized celebrity carries the face it was measured as")
+            })
+            .collect();
+        faces.extend(self.unrecognized.iter().cloned());
+        faces
+    }
+}
+
+/// The partition of a served answer, with what every answer must and must not carry already
+/// checked: both lists present, no orientation correction, every reported face carrying the
+/// measured members and none of the judged ones, and every celebrity carrying the identity its
+/// catalogue entry holds, at most once per answer.
+fn served(case: &str, reply: &Reply) -> Partition {
     assert_eq!(
         reply.status, 200,
         "case {case:?}: the recognition must be served, got {} with {:?}",
@@ -74,22 +119,19 @@ fn served(case: &str, reply: &Reply) -> Vec<Value> {
         "case {case:?}: the orientation correction is always null, got {:?}",
         reply.body
     );
-    // The celebrity side of the partition is EMPTY and present: nothing here holds the
-    // identity of a face, so no celebrity is named — and the list is still answered.
-    let celebrities = reply.field("CelebrityFaces");
-    assert!(
-        celebrities.is_some(),
-        "case {case:?}: the answer carries the celebrity list, got {:?}",
-        reply.body
-    );
-    assert_eq!(
-        reply.list("CelebrityFaces"),
-        Vec::<Value>::new(),
-        "case {case:?}: no face can be recognized as a celebrity here, got {:?}",
-        reply.body
-    );
-    let faces = reply.list("UnrecognizedFaces");
-    for face in &faces {
+    for side in ["CelebrityFaces", "UnrecognizedFaces"] {
+        assert!(
+            reply.field(side).is_some(),
+            "case {case:?}: the answer carries the {side} side of the partition, got {:?}",
+            reply.body
+        );
+    }
+    let partition = Partition {
+        celebrities: reply.list("CelebrityFaces"),
+        unrecognized: reply.list("UnrecognizedFaces"),
+    };
+
+    for face in &partition.faces() {
         for member in MEASURED_MEMBERS {
             assert!(
                 face.get(member).is_some_and(|value| !value.is_null()),
@@ -108,7 +150,72 @@ fn served(case: &str, reply: &Reply) -> Vec<Value> {
             "case {case:?}: a confidence is a percentage, got {confidence}"
         );
     }
-    faces
+
+    let mut reported_ids: Vec<String> = Vec::new();
+    for celebrity in &partition.celebrities {
+        let id = celebrity
+            .get("Id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        // `Id` is a `RekognitionUniqueId`, `pattern ^[0-9A-Za-z]*$`
+        // (`smithy_query(query="shape",shape="RekognitionUniqueId")`), and it has to name an
+        // entry, so it is never the empty string the pattern would also admit.
+        assert!(
+            !id.is_empty() && id.chars().all(|character| character.is_ascii_alphanumeric()),
+            "case {case:?}: a celebrity's Id is a non-empty RekognitionUniqueId, got {id:?}"
+        );
+        assert!(
+            !reported_ids.contains(&id),
+            "case {case:?}: one entry is one person, so {id:?} is reported once, got {:?}",
+            partition.celebrities
+        );
+        reported_ids.push(id);
+        assert!(
+            celebrity
+                .get("Name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.is_empty()),
+            "case {case:?}: a recognized celebrity carries its Name, got {celebrity:?}"
+        );
+        let urls = celebrity
+            .get("Urls")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !urls.is_empty()
+                && urls
+                    .iter()
+                    .all(|url| url.as_str().is_some_and(|url| !url.is_empty())),
+            "case {case:?}: a recognized celebrity carries the URLs its entry holds, \
+             got {celebrity:?}"
+        );
+        let gender = celebrity
+            .get("KnownGender")
+            .and_then(|known| known.get("Type"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            KNOWN_GENDERS.contains(&gender),
+            "case {case:?}: a KnownGender.Type is one of {KNOWN_GENDERS:?}, got {gender:?}"
+        );
+        // `MatchConfidence` is a `Percent`, `range 0..100`, and it is the measured
+        // resemblance that made this face THIS celebrity, so it clears the floor the
+        // catalogue identifies above.
+        let confidence = number(celebrity, &["MatchConfidence"]);
+        assert!(
+            confidence >= f64::from(MINIMUM_RESEMBLANCE) && confidence <= 100.0,
+            "case {case:?}: a MatchConfidence is a measured percentage at or above \
+             {MINIMUM_RESEMBLANCE}, got {confidence}"
+        );
+        assert!(
+            celebrity.get("Face").is_some_and(|face| !face.is_null()),
+            "case {case:?}: a recognized celebrity carries the face it was measured as, \
+             got {celebrity:?}"
+        );
+    }
+    partition
 }
 
 /// Whether the reported box of `face` holds the point the test drew a face's eyes at, in
@@ -206,10 +313,11 @@ fn portrait_cases() -> Vec<PortraitCase> {
     ]
 }
 
-/// The partition covers every face the image carries: each drawn face is reported, and it
-/// is reported as an UNRECOGNIZED face, since nothing here recognizes anyone.
+/// The partition covers every face the image carries, each on exactly ONE side of it: the
+/// drawn faces are reported once each, and the two sides together are what the detector
+/// measured.
 #[tokio::test]
-async fn every_face_the_image_carries_is_reported_as_an_unrecognized_face() {
+async fn every_face_the_image_carries_is_reported_on_exactly_one_side_of_the_partition() {
     let router = harness();
     for PortraitCase {
         case,
@@ -217,28 +325,162 @@ async fn every_face_the_image_carries_is_reported_as_an_unrecognized_face() {
         eyes,
     } in portrait_cases()
     {
-        let faces = served(case, &recognize(&router, bytes_image(&portrait.png())).await);
+        let partition = served(case, &recognize(&router, bytes_image(&portrait.png())).await);
+        let faces = partition.faces();
         assert_eq!(
             faces.len(),
             eyes.len(),
-            "case {case:?}: the {} drawn face(s) must each be reported once, got {faces:?}",
-            eyes.len()
+            "case {case:?}: the {} drawn face(s) must each be reported once, got {} celebrity \
+             face(s) and {} unrecognized face(s)",
+            eyes.len(),
+            partition.celebrities.len(),
+            partition.unrecognized.len()
         );
         let size = (portrait.width, portrait.height);
         for drawn in &eyes {
-            assert!(
-                faces.iter().any(|face| box_holds(face, size, *drawn)),
-                "case {case:?}: a reported box must hold the eyes drawn at {drawn:?}, \
-                 got {faces:?}"
+            let holding = faces
+                .iter()
+                .filter(|face| box_holds(face, size, *drawn))
+                .count();
+            assert_eq!(
+                holding, 1,
+                "case {case:?}: the face drawn at {drawn:?} is reported on exactly one side \
+                 of the partition, got {holding} report(s) in {faces:?}"
             );
         }
     }
 }
 
-/// A reported face is the face the DETECTOR measured, member for member: the same pixels
-/// answered through `DetectFaces` report the same boxes, confidences, landmarks, poses and
-/// qualities, in the same order. The table spans the frame's size and the encoded format,
-/// which the rule generalises over.
+/// A face that resolves to the catalogue is reported as a CELEBRITY, and the identifier it is
+/// reported under is the one `GetCelebrityInfo` resolves — to the same name, links and known
+/// gender, by a read that changes nothing.
+#[tokio::test]
+async fn a_recognized_celebrity_resolves_through_get_celebrity_info() {
+    let router = harness();
+    let mut recognized = 0_usize;
+    for PortraitCase {
+        case,
+        portrait,
+        eyes,
+    } in portrait_cases()
+    {
+        let partition = served(case, &recognize(&router, bytes_image(&portrait.png())).await);
+        // A celebrity is one of the faces this answer measured, never an extra one, and the
+        // faces that resolved to no entry are on the other side of the partition.
+        assert!(
+            partition.celebrities.len() <= eyes.len(),
+            "case {case:?}: a celebrity is one of the {} measured face(s), got {} celebrity \
+             face(s) and {} unrecognized face(s)",
+            eyes.len(),
+            partition.celebrities.len(),
+            partition.unrecognized.len()
+        );
+        for celebrity in &partition.celebrities {
+            recognized += 1;
+            let id = celebrity
+                .get("Id")
+                .and_then(Value::as_str)
+                .expect("a recognized celebrity carries its Id");
+            let looked_up = celebrity_info(&router, id).await;
+            assert_eq!(
+                looked_up.status, 200,
+                "case {case:?}: the Id {id:?} the recognition handed out must resolve, got {} \
+                 with {:?}",
+                looked_up.status, looked_up.body
+            );
+            for member in ["Name", "Urls", "KnownGender"] {
+                assert_eq!(
+                    looked_up.field(member),
+                    celebrity.get(member),
+                    "case {case:?}: the lookup of {id:?} reports the same {member} as the \
+                     recognition, got {:?} against {celebrity:?}",
+                    looked_up.body
+                );
+            }
+            // The lookup is a READ: asking twice answers the same, and nothing about the
+            // catalogue moved under it.
+            let again = celebrity_info(&router, id).await;
+            assert_eq!(
+                again.body, looked_up.body,
+                "case {case:?}: two lookups of {id:?} answer identically, got {:?} against {:?}",
+                again.body, looked_up.body
+            );
+            // An identifier is a value, not a name to be matched loosely: one that differs
+            // from this entry's only in case names no entry.
+            let other_case = id.to_ascii_lowercase();
+            if other_case != id {
+                let miss = celebrity_info(&router, &other_case).await;
+                assert_eq!(
+                    miss.status, 400,
+                    "case {case:?}: {other_case:?} is not the entry {id:?}, got {} with {:?}",
+                    miss.status, miss.body
+                );
+            }
+        }
+    }
+    // The point of the partition's celebrity side: a face CAN be reported as a celebrity, so
+    // "did we recognize anyone?" is answerable and the documented lookup chain is reachable.
+    assert!(
+        recognized > 0,
+        "the portraits of the table must include a face reported as a celebrity, got none"
+    );
+    // And a plain, well-lit portrait of ONE face is one of them: its single measured face
+    // resolves to a catalogue entry rather than being left unrecognized.
+    let plain = served(
+        "one centred face",
+        &recognize(&router, bytes_image(&Portrait::one_face().png())).await,
+    );
+    assert_eq!(
+        plain.celebrities.len(),
+        1,
+        "case {:?}: the one measured face resolves to a catalogue entry, got {} celebrity \
+         face(s) and {} unrecognized face(s)",
+        "one centred face",
+        plain.celebrities.len(),
+        plain.unrecognized.len()
+    );
+}
+
+/// An identifier the catalogue does not hold names no celebrity: the modelled
+/// `ResourceNotFoundException`, never an invented entry and never an empty 200.
+#[tokio::test]
+async fn an_identifier_the_catalogue_does_not_hold_is_refused_as_not_found() {
+    let router = harness();
+    // Each row is a well-formed `RekognitionUniqueId` — `pattern ^[0-9A-Za-z]*$` — that no
+    // entry of the catalogue is held under: a short one, a long one, and digits only.
+    let absent = ["Q", "0", "99999999", "zzzzzzzzzzzzzzzz"];
+    for id in absent {
+        let reply = celebrity_info(&router, id).await;
+        assert_eq!(
+            reply.status, 400,
+            "case {id:?}: expected HTTP 400, got {} with {:?}",
+            reply.status, reply.body
+        );
+        for named in [reply.error_code(), reply.string("Code").unwrap_or_default()] {
+            assert_eq!(
+                named, "ResourceNotFoundException",
+                "case {id:?}: expected ResourceNotFoundException, got {:?}",
+                reply.body
+            );
+        }
+        assert_eq!(
+            reply.string("Message").as_deref(),
+            Some("No Celebrity found with passed Id"),
+            "case {id:?}: the refusal carries the service's wording for the class, got {:?}",
+            reply.body
+        );
+        assert!(
+            reply.field("Name").is_none() && reply.field("Urls").is_none(),
+            "case {id:?}: a refusal reports no celebrity, got {:?}",
+            reply.body
+        );
+    }
+}
+
+/// A reported face is the face the DETECTOR measured, member for member, whichever side of
+/// the partition it was reported on: the same pixels answered through `DetectFaces` report the
+/// same boxes, confidences, landmarks, poses and qualities. The table spans the frame's size
+/// and the encoded format, which the rule generalises over.
 #[tokio::test]
 async fn a_reported_face_is_the_face_the_detector_measured() {
     let router = harness();
@@ -266,7 +508,8 @@ async fn a_reported_face_is_the_face_the_detector_measured() {
                 detected.body
             );
             let details = detected.list("FaceDetails");
-            let faces = served(&case, &recognize(&router, bytes_image(&bytes)).await);
+            let partition = served(&case, &recognize(&router, bytes_image(&bytes)).await);
+            let mut faces = partition.faces();
             assert_eq!(
                 faces.len(),
                 details.len(),
@@ -278,15 +521,19 @@ async fn a_reported_face_is_the_face_the_detector_measured() {
                 1,
                 "case {case:?}: one drawn face must be reported once, got {faces:?}"
             );
-            for (index, (face, detail)) in faces.iter().zip(details.iter()).enumerate() {
-                for member in MEASURED_MEMBERS {
-                    assert_eq!(
-                        face.get(member),
-                        detail.get(member),
-                        "case {case:?}: face {index}'s {member} is what the detector \
-                         measured, got {face:?} against {detail:?}"
+            for detail in &details {
+                let found = faces.iter().position(|face| {
+                    MEASURED_MEMBERS
+                        .iter()
+                        .all(|member| face.get(member) == detail.get(member))
+                });
+                let Some(found) = found else {
+                    panic!(
+                        "case {case:?}: the detected face {detail:?} must be reported with \
+                         every member the detector measured, got {faces:?}"
                     );
-                }
+                };
+                faces.remove(found);
             }
         }
     }
@@ -321,7 +568,7 @@ async fn an_s3_sourced_image_is_recognized_like_inline_bytes() {
             )
             .await;
             let inline = recognize(&router, bytes_image(&bytes)).await;
-            let staged_faces = served(case, &staged);
+            let staged_faces = served(case, &staged).faces();
             assert_eq!(
                 staged_faces.len(),
                 eyes.len(),
@@ -338,8 +585,8 @@ async fn an_s3_sourced_image_is_recognized_like_inline_bytes() {
     }
 }
 
-/// The call is a READ of the submitted pixels: it persists nothing, so a second identical
-/// call answers identically and every stored resource is exactly as it was.
+/// The call is a READ of the submitted pixels and of the catalogue: it persists nothing, so a
+/// second identical call answers identically and every stored resource is exactly as it was.
 #[tokio::test]
 async fn recognizing_celebrities_changes_nothing_a_later_caller_sees() {
     let router = harness();
@@ -377,7 +624,11 @@ async fn recognizing_celebrities_changes_nothing_a_later_caller_sees() {
 
     let first = recognize(&router, bytes_image(&bytes)).await;
     let second = recognize(&router, bytes_image(&bytes)).await;
-    assert_eq!(served("first call", &first).len(), 1, "the face is reported");
+    assert_eq!(
+        served("first call", &first).faces().len(),
+        1,
+        "the face is reported"
+    );
     assert_eq!(
         first.body, second.body,
         "case {:?}: two identical calls answer identically, got {:?} against {:?}",

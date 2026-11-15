@@ -133,6 +133,19 @@ pub fn collection_id_does_not_exist(collection_id: &str) -> ResourceNotFoundExce
     ))
 }
 
+/// The fixed text an `Id` naming no celebrity of this service's catalogue is refused with:
+/// AWS's own wording for that class, which interpolates nothing — not even the id, which the
+/// caller sent. The class is `ResourceNotFoundException`: a celebrity is the resource
+/// `GetCelebrityInfo` is given, and the exception the model declares for it describes exactly
+/// this — "the resource specified in the request cannot be found".
+pub const CELEBRITY_NOT_FOUND_MESSAGE: &str = "No Celebrity found with passed Id";
+
+/// An `Id` this service's celebrity catalogue holds no entry under; see
+/// [`CELEBRITY_NOT_FOUND_MESSAGE`].
+pub fn celebrity_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException::with_message(CELEBRITY_NOT_FOUND_MESSAGE)
+}
+
 /// A `FaceId` the named collection does not hold; see
 /// [`FACE_ID_NOT_IN_COLLECTION_MESSAGE`] for why this is a parameter refusal.
 pub fn face_id_not_in_collection() -> InvalidParameterException {

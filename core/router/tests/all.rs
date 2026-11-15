@@ -6,7 +6,6 @@
 //! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted into the sorted list. This file
 //! holds this header and those pairs, and no other line — so two branches landing at once
 //! insert two lines in two places and have no prose to duplicate, re-word or mistype.
-//!
 //! Three rules bind it, each pinned by a suite of its own
 //! (`all/all_rs_declares_each_suite_once.rs`,
 //! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
@@ -16,7 +15,6 @@
 //! fails every suite in this target. This file is a test-target CRATE ROOT, so a bare `mod`
 //! would resolve to a sibling of it, which the layout check refuses: the `#[path]` above each
 //! declaration is what points it into `tests/all/`.
-//!
 //! WHY a suite belongs to this cross-service target rather than to one service crate's own
 //! belongs in that suite's own module doc, beside the test it describes;
 //! `all/appended_notes.rs` keeps the notes this file had collected.
@@ -81,7 +79,6 @@
 // module header; the notes earlier landings had appended to the tail of this file live in
 // `all/appended_notes.rs`, declared below like any other module.
 //! Single integration-test target for the router: the declaration list, and nothing else.
-//!
 //! Put a new suite at `tests/all/<name>.rs` and declare it below with a
 //! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, in the one place its name sorts to.
 //! One pair per suite and NO other line: a suite no `mod` names compiles nowhere and its
@@ -1321,13 +1318,11 @@ mod zz_probe_whole_emulator;
 //! declaration list, and the rules stand here. A note about a landing belongs in the suite
 //! it is about, where it is read with the test it explains (`all/appended_notes.rs` keeps
 //! the ones this file had collected).
-//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
 //! `all/all_rs_is_a_canonical_declaration_list.rs` check all three halves of that, for this
 //! file and for every service crate's `tests/all.rs`.
 // EVERY comment in this file is an ordinary one, this header included, and that is
 // deliberate: with no inner doc comment anywhere, no merge of two landings can leave one
 // past the first item.
-//! Put a new suite at `tests/all/<name>.rs` and declare it below with one
 //! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, keeping the list sorted: this file
 //! holds this header and those pairs and NOTHING else, so a landing has one place to
 //! insert and nothing to duplicate, re-word or mistype.
@@ -1460,10 +1455,8 @@ mod zz_probe_whole_emulator;
 // `all/appended_notes.rs` keeps the notes earlier landings had appended here.
 // An inner attribute, like an inner doc comment, is legal only before the first item of the
 // file, so it stands here rather than in the list below.
-//! Single integration-test target for the router: a canonical declaration list.
 //! Put a new suite at `tests/all/<name>.rs` and add its `#[path]`/`mod` pair below, into the
 //! sorted list — one pair per suite and no other line, so two branches landing at once
-//! insert two lines in two places and have no prose to duplicate, re-word or mistype.
 //! at the top level of `tests/` fails the build; a suite declared twice is `E0428`; and an
 //! inner doc comment (`//!`) past the first item is `E0753`. Each of those fails EVERY suite
 //! in this target, so this header is the only place an inner doc comment may stand, and what
@@ -1681,12 +1674,8 @@ mod zz_probe_whole_emulator;
 //! this file and for every service crate's `tests/all.rs`, so check there rather than
 //! leaving a note here.
 //! module into `tests/all/`.
-//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted into the sorted list. This file
 //! holds those pairs and NOTHING else, so two branches landing at once insert two lines in
 //! two places and have no prose to duplicate, re-word or mistype.
-//! Three rules bind it, each pinned by a suite of its own
-//! (`all/all_rs_declares_each_suite_once.rs`,
-//! `all/all_rs_is_a_canonical_declaration_list.rs`, for this file and for every service
 //! crate's `tests/all.rs`): a suite no `mod` names compiles nowhere, a suite declared twice
 //! is `E0428`, and an inner doc comment past the first item is `E0753` — each of the last two
 //! fails every suite in this target. WHY a suite belongs to this cross-service target rather
