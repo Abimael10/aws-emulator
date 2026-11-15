@@ -1477,3 +1477,17 @@ mod lambda_handler_reaches_amazon_rds;
 // one of their module headers is a note rather than a build failure. An inner attribute,
 // like an inner doc comment, is legal only before the first item, so it stands here rather
 // than in the list.
+// Single integration-test target for the router: a canonical declaration list, and nothing
+// else — this header, then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file
+// under `tests/all/`, sorted by name.
+// Put a new suite at `tests/all/<name>.rs` and insert its pair where its name sorts to; what
+// that suite covers, and why it drives the assembled router rather than one service crate,
+// belongs in that suite's OWN module header, where it is read beside the test it explains, and
+// a note about THIS file belongs in `all/appended_notes.rs`.
+// Every comment here is an ORDINARY one on purpose: an inner doc comment is legal only before
+// the first item, so a re-typed or merged copy of one past the declarations compiles no suite
+// of this target at all — and with none in the file there is no such line to copy.
+// this file, which the layout check refuses: the `#[path]` above each `mod` is what points the
+// declaration into `tests/all/`. A suite file no `mod` names is compiled nowhere and its tests
+// never run, and a second `mod` for one name is `E0428`, which fails every suite here.
+// and for every service crate's `tests/all.rs`, so check there rather than leaving a note here.

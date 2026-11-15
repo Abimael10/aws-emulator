@@ -117,6 +117,8 @@ mod bucket_ownership_controls;
 mod bucket_policy_and_tagging;
 #[path = "all/bucket_policy_delete.rs"]
 mod bucket_policy_delete;
+#[path = "all/bucket_policy_principal_lifecycle.rs"]
+mod bucket_policy_principal_lifecycle;
 #[path = "all/bucket_policy_put_status.rs"]
 mod bucket_policy_put_status;
 #[path = "all/bucket_policy_status.rs"]
