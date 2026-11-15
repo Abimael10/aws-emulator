@@ -59,8 +59,49 @@ pub const INSTANCE_STATE_DELETING: &str = "Deleting";
 /// enough that the poll terminates promptly.
 pub const INSTANCE_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 
-/// The first `versionNumber` a stored instance carries; every change bumps it by one.
-pub const INSTANCE_INITIAL_VERSION: f64 = 1.0;
+/// The `versionNumber` an instance of this service reports.
+///
+/// RECORDED behaviour, not modelled: `Instance$versionNumber` is documented only as "The
+/// version number of the instance" and the model says nothing about how it moves. In the
+/// recorded wire responses it is a property OF THE INSTANCE rather than a count of the
+/// writes made to it — one instance reports the same number from its create, from every
+/// later read, from an update that changed its name or description, and from its delete —
+/// so it names the generation of the AWS Supply Chain application the instance runs, which
+/// nothing a caller does to the instance moves. Seeded onto each record (rather than read
+/// from here at projection time) so the stored instance carries its own version.
+pub const INSTANCE_VERSION_NUMBER: f64 = 2.0;
+
+/// The DNS zone an instance's WebApp hostname and its IAM Identity Center portal hostname
+/// sit under.
+///
+/// Its SOURCE is the recorded wire response of the instance operations, and the model's own
+/// documentation of `webAppDnsDomain` corroborates it — "The DNS subdomain of the web app.
+/// This would be \"example\" in the URL \"example.scn.global.on.aws\"" — so the instance's
+/// own domain label is the only variable part of either hostname and this suffix is fixed
+/// text.
+pub const WEB_APP_ZONE: &str = "scn.global.on.aws";
+
+/// The hostname an instance's domain `label` resolves to: the label followed by the
+/// service's WebApp zone ([`WEB_APP_ZONE`]). Stated once, here, so the hostnames the
+/// `Instance` projection reports cannot drift from each other.
+pub fn web_app_zone_hostname(label: &str) -> String {
+    format!("{label}.{WEB_APP_ZONE}")
+}
+
+/// The `webAppDnsDomain` an instance gets when its create request named none: AWS answers
+/// such a create with an instance that still has a WebApp domain — the service generates
+/// the label — so one is generated here rather than left absent. The generated VALUE is the
+/// emulator's own (AWS's is a per-run server-generated token, so no value reproduces it);
+/// what it has to satisfy is the member's modelled form and its invariants.
+///
+/// The instance's own id is the label: it satisfies `InstanceWebAppDnsDomain`'s modelled
+/// pattern (`^(?![-])[a-zA-Z0-9-]{1,62}[a-zA-Z0-9]$` — 36 characters of lowercase hex and
+/// hyphens, starting and ending alphanumeric), it is stable for the life of the instance,
+/// and no other instance can hold it, so a generated domain never collides with the domain
+/// another live instance holds.
+pub fn generated_web_app_dns_domain(instance_id: &str) -> String {
+    instance_id.to_string()
+}
 
 /// The number of instances this store holds.
 ///
@@ -111,6 +152,13 @@ pub struct InstanceRecord {
     pub last_modified_time: SystemTime,
     pub version_number: f64,
     pub tags: BTreeMap<String, String>,
+    /// Where this instance falls in the order the store's instances were created, as
+    /// [`ComAmazonawsSupplychainGalaxypublicapigatewayState::next_instance_creation_seq`]
+    /// handed it out: strictly increasing, so a larger value is a later create. Kept on
+    /// the record because `ListInstances` reports the most recently created instance
+    /// first, an order neither the store's key nor a wall-clock stamp (two creates can
+    /// share one) gives.
+    pub creation_seq: u64,
     /// The instant at which this instance's `Initializing` -> `Active` transition
     /// becomes due. Stored rather than slept on: the transition is materialised by
     /// whichever call next observes the record (see
@@ -124,8 +172,10 @@ impl InstanceRecord {
     /// The optional members (`instanceName`, `instanceDescription`, `kmsKeyArn`,
     /// `webAppDnsDomain`, `tags`) are left absent for the caller to fill from the
     /// request, so a member the request omitted stays absent rather than being
-    /// invented.
-    pub fn new(instance_id: String, now: SystemTime) -> Self {
+    /// invented — except `webAppDnsDomain`, which every instance has: the create either
+    /// echoes the one the request named or generates one
+    /// ([`generated_web_app_dns_domain`]).
+    pub fn new(instance_id: String, now: SystemTime, creation_seq: u64) -> Self {
         Self {
             instance_id,
             aws_account_id: ::engine::emulator_account_id().to_string(),
@@ -137,14 +187,24 @@ impl InstanceRecord {
             web_app_dns_domain: None,
             created_time: now,
             last_modified_time: now,
-            version_number: INSTANCE_INITIAL_VERSION,
+            version_number: INSTANCE_VERSION_NUMBER,
             tags: BTreeMap::new(),
+            creation_seq,
             active_due: now + INSTANCE_ACTIVATION_DELAY,
         }
     }
 
-    /// This record as the modelled `Instance` shape every instance operation returns.
+    /// This record as the `Instance` shape every instance operation returns.
+    ///
+    /// `primaryDomain` and `idcPortalDomain` are the instance's WebApp hostname and its
+    /// IAM Identity Center portal hostname: both are the instance's own `webAppDnsDomain`
+    /// under the service's WebApp zone ([`web_app_zone_hostname`]), so an instance with no
+    /// domain label reports neither rather than a bare zone.
     pub fn to_wire(&self) -> Instance {
+        let hostname = self
+            .web_app_dns_domain
+            .as_deref()
+            .map(web_app_zone_hostname);
         Instance {
             instance_id: self.instance_id.clone(),
             aws_account_id: self.aws_account_id.clone(),
@@ -157,14 +217,16 @@ impl InstanceRecord {
             instance_description: self.instance_description.clone(),
             kms_key_arn: self.kms_key_arn.clone(),
             version_number: Some(self.version_number),
+            primary_domain: hostname.clone(),
+            idc_portal_domain: hostname,
         }
     }
 
-    /// Record a change made at `now`: a mutation bumps both `lastModifiedTime` and
-    /// `versionNumber`, which is what lets a client detect it read a stale copy.
+    /// Record a change made at `now`: a mutation moves `lastModifiedTime` and nothing
+    /// else. `versionNumber` deliberately does NOT move — it is the instance's own
+    /// version ([`INSTANCE_VERSION_NUMBER`]), not a count of the writes it has taken.
     pub fn touch(&mut self, now: SystemTime) {
         self.last_modified_time = now;
-        self.version_number += 1.0;
     }
 }
 
@@ -703,9 +765,14 @@ impl DataIntegrationFlowRecord {
 /// Per-service state for com-amazonaws-supplychain-galaxypublicapigateway. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSupplychainGalaxypublicapigatewayState {
-    /// Every live instance, keyed by `instanceId`. A `BTreeMap` so `ListInstances`
-    /// pages in one stable order and a page token can name the key to resume at.
+    /// Every live instance, keyed by `instanceId`. A `BTreeMap` so a lookup by id is a
+    /// key lookup and a page token can name the record to resume at; the order
+    /// `ListInstances` reports is the records' creation order reversed
+    /// ([`InstanceRecord::creation_seq`]), which that handler builds.
     pub instances: BTreeMap<String, InstanceRecord>,
+    /// The last value [`Self::next_instance_creation_seq`] handed out, so each created
+    /// instance records where it falls in this store's creation order.
+    pub instance_creation_seq: u64,
     /// `clientToken` -> `instanceId`, so a replayed `CreateInstance` (the operation is
     /// `@idempotent` and its `clientToken` is an `@idempotencyToken`) returns the
     /// instance the first call created instead of creating a second one.
@@ -746,6 +813,15 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
                 record.state = INSTANCE_STATE_ACTIVE.to_string();
             }
         }
+    }
+
+    /// The creation-order position of the next instance this store takes: strictly
+    /// increasing, so the instance that gets a larger value was created later. A counter
+    /// rather than a wall-clock stamp because two creates can land on one instant, and
+    /// `ListInstances` has to put them in a definite order anyway.
+    pub fn next_instance_creation_seq(&mut self) -> u64 {
+        self.instance_creation_seq = self.instance_creation_seq.saturating_add(1);
+        self.instance_creation_seq
     }
 
     /// Whether a further `CreateInstance` would push either caller-driven store past its

@@ -292,7 +292,18 @@ pub struct DataLakeNamespace {
     pub last_modified_time: ::aws_smithy_types::DateTime,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.supplychain#Instance")]
+/// The details of one AWS Supply Chain instance: the members
+/// `smithy_query(query="shape", shape="com.amazonaws.supplychain#Instance")` lists, in the
+/// model's own member order, plus `primaryDomain` and `idcPortalDomain` appended last.
+///
+/// Those two are RECORDED BEHAVIOUR, not modelled: the on-disk `Instance` structure
+/// declares only `instanceId`, `awsAccountId`, `state`, `errorMessage`, `webAppDnsDomain`,
+/// `createdTime`, `lastModifiedTime`, `instanceName`, `instanceDescription`, `kmsKeyArn`
+/// and `versionNumber`, while the recorded responses of every operation that answers this
+/// shape also carry the instance's WebApp hostname and its IAM Identity Center portal
+/// hostname. The model evidently predates them, so they are appended LAST and a later model
+/// refresh only has to move them into place; this is also why the schema and the codec come
+/// from `types/instance_wire.rs` rather than from the derive (see that module's note).
 #[derive(Debug, Clone, Default)]
 pub struct Instance {
     pub instance_id: String,
@@ -306,6 +317,8 @@ pub struct Instance {
     pub instance_description: Option<String>,
     pub kms_key_arn: Option<String>,
     pub version_number: Option<f64>,
+    pub primary_domain: Option<String>,
+    pub idc_portal_domain: Option<String>,
 }
 
 /// The values `ConfigurationJobStatus` accepts on the wire.

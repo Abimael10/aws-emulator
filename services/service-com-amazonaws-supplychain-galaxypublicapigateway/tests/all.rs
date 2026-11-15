@@ -23,6 +23,8 @@ mod data_lake_dataset_refusal_wording;
 mod data_lake_datasets;
 #[path = "all/data_lake_namespaces.rs"]
 mod data_lake_namespaces;
+#[path = "all/instance_domain_projection.rs"]
+mod instance_domain_projection;
 #[path = "all/instance_lifecycle.rs"]
 mod instance_lifecycle;
 #[path = "all/state_roundtrip.rs"]

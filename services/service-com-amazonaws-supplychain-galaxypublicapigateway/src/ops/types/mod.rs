@@ -30,6 +30,9 @@ pub mod get_data_integration_flow_types;
 pub mod get_data_lake_dataset_types;
 pub mod get_data_lake_namespace_types;
 pub mod get_instance_types;
+/// The schema and the codec for the `Instance` shape, whose wire form carries two members
+/// the on-disk model does not declare.
+pub mod instance_wire;
 pub mod list_data_integration_events_types;
 pub mod list_data_integration_flow_executions_types;
 pub mod list_data_integration_flows_types;
@@ -78,6 +81,8 @@ pub use get_data_lake_dataset_types::*;
 pub use get_data_lake_namespace_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_instance_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use instance_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_data_integration_events_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

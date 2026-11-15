@@ -3,9 +3,9 @@
 //! @op ListInstances
 //! IMPLEMENTED: pages over the instances held in the shared store ([`crate::state`]),
 //! applying `instanceNameFilter` / `instanceStateFilter` and `maxResults`, and emits an
-//! opaque `nextToken` that names the record the next page resumes at. The store is a
-//! `BTreeMap` keyed by `instanceId`, so the order a page is cut from is stable and a
-//! token stays meaningful across calls.
+//! opaque `nextToken` that names the record the next page resumes at. A page reports the
+//! most recently created instance first, so the order a page is cut from is a property of
+//! the instances themselves and a token stays meaningful across calls.
 //!
 //! ## Shape of an operation
 //!
@@ -200,13 +200,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The only write a read performs: the transitions the clock owed at `now`.
         store.materialize_due_transitions(now);
 
+        // NEWEST FIRST: a page reports the most recently created instance before the ones
+        // created before it. The store is keyed by `instanceId`, which is an artefact of
+        // how the records are held and names no property a caller can reason about, so the
+        // order is built here from each record's creation position.
+        let mut ordered: Vec<&crate::state::InstanceRecord> = store.instances.values().collect();
+        ordered.sort_by_key(|record| ::std::cmp::Reverse(record.creation_seq));
+
+        // Where a resumed page starts: the creation POSITION the previous page stopped at.
+        // The token names that position rather than a record, so a page still resumes
+        // correctly when the instance the previous page stopped on has been deleted in the
+        // meantime — the rest of the page is reported, never silently dropped.
+        let resume_seq = resume_at;
+
         let mut instances = Vec::new();
         let mut next_token = None;
-        for record in store.instances.values() {
-            if resume_at
-                .as_deref()
-                .is_some_and(|resume| record.instance_id.as_str() < resume)
-            {
+        for record in ordered {
+            if resume_seq.is_some_and(|resume| record.creation_seq > resume) {
                 continue;
             }
             if !name_filter.is_empty()
@@ -225,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // token — a token that cannot advance would make a client paging in a
                 // loop spin forever.
                 if page_size > 0 {
-                    next_token = Some(encode_page_token(&record.instance_id));
+                    next_token = Some(encode_page_token(record.creation_seq));
                 }
                 break;
             }
@@ -240,27 +250,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The stamp every token this operation issues carries: this service, the token format
-/// version, and the list it is a boundary for.
-const PAGE_STAMP: &str = "scn:1:instance:";
+/// version, and the list it is a boundary for. Version `2` is the POSITION-keyed form below;
+/// a token issued in the earlier `instanceId`-keyed form carries version `1` and is refused
+/// by [`decode_page_token`] rather than misread as a position.
+const PAGE_STAMP: &str = "scn:2:instance:";
 
-/// The page token naming the record keyed `instance_id`.
+/// The page token naming the creation POSITION a resumed page starts at.
 ///
-/// `InstanceNextToken` is modelled as an opaque string of length 1..1024 and nothing
-/// else, so the token is the stamped resume key hex-encoded: opaque to a client (it
-/// carries no readable store key), 104 characters for a 36-character UUID — inside the
-/// modelled bound — and readable only through [`decode_page_token`]. The stamp is what
-/// lets a forged or foreign value be refused instead of honoured as a boundary.
-fn encode_page_token(instance_id: &str) -> String {
-    ::hex::encode(format!("{PAGE_STAMP}{instance_id}").as_bytes())
+/// The payload is the position ([`crate::state::InstanceRecord::creation_seq`]) and not an
+/// `instanceId`: a position is still meaningful when the record the previous page stopped on
+/// has since been deleted, which is what keeps a resumed page from dropping the instances
+/// behind it. `InstanceNextToken` is modelled as an opaque string of length 1..1024 and
+/// nothing else, so the token is the stamped position hex-encoded: opaque to a client (it
+/// carries no readable store key), far inside the modelled bound, and readable only through
+/// [`decode_page_token`]. The stamp is what lets a forged or foreign value be refused
+/// instead of honoured as a boundary.
+fn encode_page_token(creation_seq: u64) -> String {
+    ::hex::encode(format!("{PAGE_STAMP}{creation_seq}").as_bytes())
 }
 
-/// The resume key a token names, or `None` when `token` is not one this operation
+/// The resume position a token names, or `None` when `token` is not one this operation
 /// issued — which the caller is told as a `ValidationException`, never as a silently
 /// truncated page.
-fn decode_page_token(token: &str) -> Option<String> {
+fn decode_page_token(token: &str) -> Option<u64> {
     let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    let key = decoded.strip_prefix(PAGE_STAMP)?;
-    // Every key this operation pages on is an `instanceId`, so anything else is a
-    // boundary this service could not have issued.
-    crate::state::is_modelled_uuid(key).then(|| key.to_string())
+    // Every boundary this operation pages on is a creation position, so anything else —
+    // including a token stamped with an earlier format version — is a boundary this service
+    // could not have issued.
+    decoded.strip_prefix(PAGE_STAMP)?.parse().ok()
 }

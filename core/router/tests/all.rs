@@ -2221,3 +2221,16 @@ mod cloudformation_provisions_glue_table_optimizers;
 // is stated in that suite's OWN module doc, where it is read beside the test it explains; a
 // note about this file belongs in `all/appended_notes.rs`, declared below like any other
 // file because the layout check wants a declaration for every file under `tests/all/`.
+// Put a new suite at `tests/all/<name>.rs` and insert ONE
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair below, in name order. The list holds those
+// pairs and no other line, so two branches landing at once insert two lines in two places and
+// have no prose to duplicate, re-word or mistype.
+// EVERY comment in this file is an ORDINARY one, this header included: an inner doc comment is
+// legal only before the first item, so a file that carries none cannot acquire a misplaced one
+// by merge, and a misplaced one compiles no suite of this target.
+// This file is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of it,
+// `tests/all/`. A suite no `mod` here names compiles nowhere and its tests never run, and a
+// suite declared twice fails every suite in this target.
+// `all/every_suite_file_is_declared.rs` pin those rules. What a suite covers, and why it
+// belongs to this cross-service target rather than to one service crate's own, is stated in
+// that suite's own module header; a note about THIS file belongs in `all/appended_notes.rs`.

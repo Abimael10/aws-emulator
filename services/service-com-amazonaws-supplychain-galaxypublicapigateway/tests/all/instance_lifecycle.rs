@@ -132,6 +132,34 @@ fn number_of(case: &str, instance: &Value, member: &str) -> f64 {
         .unwrap_or_else(|| panic!("case {case}: instance carries no numeric `{member}`: {instance}"))
 }
 
+/// How long a poll in this suite may keep looking before it gives up. GENEROUS: every poll
+/// below waits for a CONDITION — a state the emulator has reached, an instant the wall clock
+/// has passed — so the deadline is only there to end a test that can never satisfy it, and
+/// never a budget the host has to beat.
+const POLL_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The wall clock as the epoch seconds this service's restJson1 timestamps carry, so a
+/// poll can compare it against a timestamp a response reported.
+fn epoch_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_secs_f64()
+}
+
+/// Look again until the wall clock has passed `epoch_seconds`, or until [`POLL_DEADLINE`].
+///
+/// The CONDITION an assertion that `lastModifiedTime` ADVANCED past an earlier stamp rests
+/// on is that the clock has an instant left to stamp that is strictly later than that one.
+/// Waiting for that condition rather than for a fixed span is what keeps the assertion
+/// independent of how fast the host runs.
+async fn wait_for_an_instant_after(epoch_seconds: f64) {
+    let deadline = Instant::now() + POLL_DEADLINE;
+    while epoch_now() <= epoch_seconds && Instant::now() < deadline {
+        tokio::task::yield_now().await;
+    }
+}
+
 /// The whole lifecycle from the issue's reproduction script: create, replay the token,
 /// poll to `Active`, list, rename, read the rename back, delete, and observe the 404.
 #[tokio::test]
@@ -170,11 +198,10 @@ async fn an_instance_round_trips_through_create_poll_list_rename_and_delete() {
     );
     let created_time = number_of("create", &created, "createdTime");
     let first_modified = number_of("create", &created, "lastModifiedTime");
-    assert_eq!(
-        number_of("create", &created, "versionNumber"),
-        1.0,
-        "case create: a new instance is version 1, got {created}"
-    );
+    // The instance's own version, read from the create and compared against every later
+    // answer below: what the service fixes is that the number does not move, so the
+    // assertions compare answers with each other rather than with a constant.
+    let created_version = number_of("create", &created, "versionNumber");
 
     // The same clientToken replays onto the SAME instance rather than creating a second.
     let replayed = emulator.create("token replay", request).await;
@@ -213,7 +240,7 @@ async fn an_instance_round_trips_through_create_poll_list_rename_and_delete() {
             );
             break;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::task::yield_now().await;
     }
     assert_eq!(
         observed, INSTANCE_STATE_ACTIVE,
@@ -233,8 +260,9 @@ async fn an_instance_round_trips_through_create_poll_list_rename_and_delete() {
         "case list: the store holds exactly the one created instance"
     );
 
-    // Rename it. `lastModifiedTime` is compared strictly, so leave a measurable gap.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Rename it. `lastModifiedTime` is compared strictly, so wait for the clock to have an
+    // instant left that is strictly later than the one the create stamped.
+    wait_for_an_instant_after(first_modified).await;
     let (status, body) = emulator
         .send(
             "PATCH",
@@ -264,8 +292,8 @@ async fn an_instance_round_trips_through_create_poll_list_rename_and_delete() {
     );
     assert_eq!(
         number_of("rename", &renamed, "versionNumber"),
-        2.0,
-        "case rename: a change bumps versionNumber, got {renamed}"
+        created_version,
+        "case rename: a change must not move versionNumber, got {renamed}"
     );
 
     // The rename is in the store, not just in the response.
@@ -378,17 +406,26 @@ async fn create_persists_exactly_the_members_the_request_carried() {
         minted.push(id.clone());
 
         let stored = emulator.get(case, &id).await;
-        for member in [
-            "instanceName",
-            "instanceDescription",
-            "kmsKeyArn",
-            "webAppDnsDomain",
-        ] {
+        for member in ["instanceName", "instanceDescription", "kmsKeyArn"] {
             let expected = request.get(member).cloned();
             let actual = stored.get(member).cloned().filter(|v| !v.is_null());
             assert_eq!(
                 actual, expected,
                 "case {case}: GetInstance member {member} expected {expected:?}, got {actual:?}"
+            );
+        }
+        // `webAppDnsDomain` is the one optional member an omitting request does NOT leave
+        // absent: every instance has a WebApp domain, so the create echoes the requested
+        // one or mints a conforming label. `instance_domain_projection.rs` owns that rule;
+        // here it is only asserted present and echoed when asked for.
+        let domain = stored
+            .get("webAppDnsDomain")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case}: the stored instance has no webAppDnsDomain: {stored}"));
+        if let Some(requested) = request.get("webAppDnsDomain").and_then(Value::as_str) {
+            assert_eq!(
+                domain, requested,
+                "case {case}: the requested webAppDnsDomain must be echoed, got {stored}"
             );
         }
         assert_eq!(
@@ -398,8 +435,8 @@ async fn create_persists_exactly_the_members_the_request_carried() {
         );
         assert_eq!(
             number_of(case, &stored, "versionNumber"),
-            1.0,
-            "case {case}: an untouched instance is version 1, got {stored}"
+            number_of(case, &created, "versionNumber"),
+            "case {case}: a read must report the version the create reported, got {stored}"
         );
         assert!(
             number_of(case, &stored, "lastModifiedTime")
@@ -499,8 +536,9 @@ async fn list_instances_pages_at_every_page_size_and_honours_its_filters() {
             .await;
         expected_ids.push(id_of(name, &created));
     }
-    // The store is keyed by instanceId, so a page is cut from that order.
-    expected_ids.sort();
+    // A page reports the most recently created instance first, so the order every page is
+    // cut from is the creation order reversed.
+    expected_ids.reverse();
 
     for page_size in [1usize, 2, 3, 5, 20] {
         let case = format!("maxResults={page_size}");
@@ -566,8 +604,10 @@ async fn list_instances_pages_at_every_page_size_and_honours_its_filters() {
         .map(|instance| id_of("after maxResults=0", instance))
         .collect();
     after_zero.sort();
+    let mut every_id = expected_ids.clone();
+    every_id.sort();
     assert_eq!(
-        after_zero, expected_ids,
+        after_zero, every_id,
         "case after maxResults=0: a zero-sized page must not consume anything"
     );
 
@@ -622,9 +662,33 @@ async fn list_instances_pages_at_every_page_size_and_honours_its_filters() {
         );
     }
 
-    // Past the activation span every instance is Active, so the state filter is
-    // deterministic. The values come from `InstanceState`'s modelled value set.
-    tokio::time::sleep(INSTANCE_ACTIVATION_DELAY + Duration::from_millis(250)).await;
+    // The state filter is deterministic only once the clock-owed `Initializing` -> `Active`
+    // transition has been materialised for every instance, so poll for THAT condition rather
+    // than for a span of time. The values come from `InstanceState`'s modelled value set.
+    let deadline = Instant::now() + POLL_DEADLINE;
+    loop {
+        let (status, body) = emulator.send("GET", "/api/instance?maxResults=20", None).await;
+        assert_eq!(
+            status, 200,
+            "case activation poll: expected 200, got {status} with {body}"
+        );
+        let listed = instances_of("activation poll", &body);
+        let active = listed
+            .iter()
+            .filter(|instance| {
+                instance.get("state").and_then(Value::as_str) == Some(INSTANCE_STATE_ACTIVE)
+            })
+            .count();
+        if active == names.len() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case activation poll: only {active} of {} instances became Active, got {body}",
+            names.len()
+        );
+        tokio::task::yield_now().await;
+    }
     let state_rows: Vec<(&str, Vec<&str>, usize)> = vec![
         ("Active alone", vec![INSTANCE_STATE_ACTIVE], names.len()),
         ("Deleting alone", vec![INSTANCE_STATE_DELETING], 0),
@@ -675,21 +739,24 @@ async fn list_instances_pages_at_every_page_size_and_honours_its_filters() {
             raw_page_token("resume-from-here"),
             400,
         ),
+        ("an unstamped position", raw_page_token("3"), 400),
         (
-            "an unstamped instanceId",
-            raw_page_token(&expected_ids[0]),
+            "a stamped boundary that is not a position",
+            stamped_page_token("not-a-position"),
             400,
         ),
         (
-            "a stamped key that is not a UUID",
-            stamped_page_token("not-a-uuid"),
+            // The form this service issued before the page order became the instances'
+            // creation order: stamped, but with an `instanceId` where a position belongs.
+            "a token in the format this service no longer issues",
+            hex::encode(format!("scn:1:instance:{}", expected_ids[0]).as_bytes()),
             400,
         ),
         (
-            // A token this service could have issued, naming a key past every stored
-            // instance: honoured, and the page it resumes is empty.
-            "a stamped key past the last instance",
-            stamped_page_token("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+            // A token this service could have issued, naming a position before every
+            // stored instance: honoured, and the page it resumes is empty.
+            "a stamped position before the first instance",
+            stamped_page_token("0"),
             200,
         ),
     ];
@@ -712,15 +779,15 @@ async fn list_instances_pages_at_every_page_size_and_honours_its_filters() {
         } else {
             assert!(
                 instances_of(case, &body).is_empty(),
-                "case nextToken {case}: a boundary past the last key resumes an empty page, got {body}"
+                "case nextToken {case}: a boundary before the first position resumes an empty page, got {body}"
             );
         }
     }
 }
 
-/// A `nextToken` of the form this service issues: the stamped resume key, hex-encoded.
-fn stamped_page_token(key: &str) -> String {
-    hex::encode(format!("scn:1:instance:{key}").as_bytes())
+/// A `nextToken` of the form this service issues: the stamped resume position, hex-encoded.
+fn stamped_page_token(position: &str) -> String {
+    hex::encode(format!("scn:2:instance:{position}").as_bytes())
 }
 
 /// A hex-encoded value carrying no stamp — well-formed hex that this service never
@@ -870,8 +937,8 @@ async fn an_unknown_instance_is_404_and_a_malformed_id_is_400() {
     );
     assert_eq!(
         number_of("live instance survives", &still_there, "versionNumber"),
-        1.0,
-        "case live instance survives: a refused UpdateInstance must not bump the version, got {still_there}"
+        number_of("live instance survives", &live, "versionNumber"),
+        "case live instance survives: a refused UpdateInstance must not change the version, got {still_there}"
     );
 }
 

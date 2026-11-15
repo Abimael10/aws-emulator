@@ -240,11 +240,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let mut record = crate::state::InstanceRecord::new(instance_id.clone(), now);
+        let creation_seq = store.next_instance_creation_seq();
+        let mut record = crate::state::InstanceRecord::new(instance_id.clone(), now, creation_seq);
         record.instance_name = input.instance_name;
         record.instance_description = input.instance_description;
         record.kms_key_arn = input.kms_key_arn;
-        record.web_app_dns_domain = input.web_app_dns_domain;
+        // Every instance HAS a WebApp domain: the request's own value when it named one
+        // ("You can set this to a custom value"), and one the service generates when it did
+        // not — which is what the instance's WebApp and Identity-Center hostnames are built
+        // from, so leaving it absent would leave the instance unaddressable.
+        record.web_app_dns_domain = Some(
+            input
+                .web_app_dns_domain
+                .unwrap_or_else(|| crate::state::generated_web_app_dns_domain(&instance_id)),
+        );
         if let Some(tags) = input.tags {
             record.tags = tags.into_iter().collect();
         }

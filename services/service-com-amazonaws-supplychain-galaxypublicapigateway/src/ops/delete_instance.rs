@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.drop_instance_events(&record.instance_id);
 
         record.state = crate::state::INSTANCE_STATE_DELETING.to_string();
-        // Wire-only: the record is already out of the store, so this bump shapes the
+        // Wire-only: the record is already out of the store, so this stamp shapes the
         // final payload this call returns and persists nothing.
         record.touch(now);
 
