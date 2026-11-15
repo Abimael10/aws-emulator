@@ -99,8 +99,8 @@
 use super::types::*;
 use crate::state::{
     decode_cursor, encode_cursor, result_page_end, BATCH_PARENT_RESULT_MESSAGE, CURSOR_ROWS,
-    INVALID_TOKEN_MESSAGE, JSON_RESULT_READER_REQUIREMENT, NO_RESULT_MESSAGE, NO_RESULT_STATUS,
-    UNKNOWN_QUERY_MESSAGE, UNKNOWN_QUERY_STATUS,
+    INVALID_TOKEN_MESSAGE, JSON_READER_FORMAT_MISMATCH_MESSAGE, NO_RESULT_MESSAGE,
+    NO_RESULT_STATUS, UNKNOWN_QUERY_MESSAGE, UNKNOWN_QUERY_STATUS,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -200,11 +200,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A statement's rows are read in the format it was SUBMITTED with, and
         // this operation serves the JSON form: one whose result is read in the
-        // CSV form is refused with the requirement this operation's own
-        // documentation states, and read through the other reader, so the two
-        // never answer for the same statement.
+        // CSV form is refused with the service's fixed sentence for the
+        // mismatch, which names this reader and the one that does serve that
+        // statement, so the two never answer for the same statement.
         if statement.result_format_is_csv() {
-            return Err(validation(JSON_RESULT_READER_REQUIREMENT.to_string()));
+            return Err(validation(JSON_READER_FORMAT_MISMATCH_MESSAGE.to_string()));
         }
 
         // Only a statement that ran to completion AND produced a result set has

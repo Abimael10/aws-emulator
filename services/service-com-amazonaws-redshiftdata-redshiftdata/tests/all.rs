@@ -56,6 +56,9 @@ mod refusal_wording;
 #[path = "all/result_pages.rs"]
 mod result_pages;
 
+#[path = "all/result_reader_format_mismatch.rs"]
+mod result_reader_format_mismatch;
+
 #[path = "all/session_parameters.rs"]
 mod session_parameters;
 

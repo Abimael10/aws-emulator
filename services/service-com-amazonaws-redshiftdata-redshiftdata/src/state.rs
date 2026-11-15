@@ -181,29 +181,26 @@ pub const NO_RESULT_MESSAGE: &str =
 /// the error code to move the status.
 pub const NO_RESULT_STATUS: u16 = 400;
 
-/// What a reader of a statement's result requires of the statement it is asked
-/// for, when the statement's result is not read in the format that reader
-/// serves.
+/// The message `GetStatementResult` — the reader of the JSON form — refuses a
+/// statement whose result is read in the other format with.
 ///
 /// A statement's rows are read in the format the statement was SUBMITTED with,
 /// and each format has its own reader: `GetStatementResult` serves the JSON form
 /// and `GetStatementResultV2` the CSV one, so the two are mutually exclusive for
-/// any one statement. Each refuses with the requirement the model DOCUMENTS for
-/// it, rather than with a sentence of this emulator's own: "The ExecuteStatement
-/// or BatchExecuteStatement operation that ran the SQL statement must have
-/// specified ResultFormat as JSON, or let the format default to JSON"
-/// (`smithy_query(query="doc",shape="GetStatementResult")`) and "… must have
-/// specified ResultFormat as CSV"
-/// (`smithy_query(query="doc",shape="GetStatementResultV2")`).
-pub const JSON_RESULT_READER_REQUIREMENT: &str =
-    "The ExecuteStatement or BatchExecuteStatement operation that ran the SQL statement must \
-     have specified ResultFormat as JSON, or let the format default to JSON.";
+/// any one statement. The refusal is the service's own fixed sentence, which
+/// names the reader that WAS called and the reader the caller is to switch to,
+/// and interpolates nothing from the request or from state — the model
+/// documents the reader's PRECONDITION, which is not what the refusal says.
+pub const JSON_READER_FORMAT_MISMATCH_MESSAGE: &str =
+    "GetStatementResult can only return results that are in JSON format. Try using \
+     GetStatementResultV2 for other result formats";
 
-/// The same requirement, as the CSV reader's own documentation states it. See
-/// [`JSON_RESULT_READER_REQUIREMENT`].
-pub const CSV_RESULT_READER_REQUIREMENT: &str =
-    "The ExecuteStatement or BatchExecuteStatement operation that ran the SQL statement must \
-     have specified ResultFormat as CSV.";
+/// The mirror of it: the message `GetStatementResultV2` — the reader of the CSV
+/// form — refuses a statement whose result is read in the other format with.
+/// See [`JSON_READER_FORMAT_MISMATCH_MESSAGE`].
+pub const CSV_READER_FORMAT_MISMATCH_MESSAGE: &str =
+    "GetStatementResultV2 can only return results that are in CSV format. Try using \
+     GetStatementResult instead for JSON format";
 
 /// The message the Data API answers a result read addressed to a BATCH's own
 /// `Id` with: a batch is not a query, and its results live on the `:<n>` ids of

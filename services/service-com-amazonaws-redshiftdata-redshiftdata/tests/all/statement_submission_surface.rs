@@ -228,11 +228,10 @@ struct ReaderCase {
 }
 
 /// A statement's rows are read by the reader that serves the format the
-/// statement was submitted with: the other reader refuses it with the
-/// requirement that reader's own documentation states
-/// (`smithy_query(query="doc",shape="GetStatementResult")` and
-/// `smithy_query(query="doc",shape="GetStatementResultV2")`), and a statement
-/// that produced no result at all is refused as a missing result by both.
+/// statement was submitted with: the other reader refuses it with the service's
+/// fixed sentence for the mismatch, which names the reader that was called and
+/// the one to switch to, and a statement that produced no result at all is
+/// refused as a missing result by both.
 #[tokio::test]
 async fn each_reader_serves_only_the_result_format_it_is_the_reader_for() {
     let emulator = Emulator::new();
@@ -252,9 +251,8 @@ async fn each_reader_serves_only_the_result_format_it_is_the_reader_for() {
             refusal: Some((
                 400,
                 "ValidationException",
-                "The ExecuteStatement or BatchExecuteStatement operation that ran the SQL \
-                 statement must have specified ResultFormat as JSON, or let the format default \
-                 to JSON.",
+                "GetStatementResult can only return results that are in JSON format. Try using \
+                 GetStatementResultV2 for other result formats",
             )),
         },
         ReaderCase {
@@ -272,8 +270,8 @@ async fn each_reader_serves_only_the_result_format_it_is_the_reader_for() {
             refusal: Some((
                 400,
                 "ValidationException",
-                "The ExecuteStatement or BatchExecuteStatement operation that ran the SQL \
-                 statement must have specified ResultFormat as CSV.",
+                "GetStatementResultV2 can only return results that are in CSV format. Try using \
+                 GetStatementResult instead for JSON format",
             )),
         },
         ReaderCase {
@@ -284,8 +282,8 @@ async fn each_reader_serves_only_the_result_format_it_is_the_reader_for() {
             refusal: Some((
                 400,
                 "ValidationException",
-                "The ExecuteStatement or BatchExecuteStatement operation that ran the SQL \
-                 statement must have specified ResultFormat as CSV.",
+                "GetStatementResultV2 can only return results that are in CSV format. Try using \
+                 GetStatementResult instead for JSON format",
             )),
         },
         ReaderCase {
