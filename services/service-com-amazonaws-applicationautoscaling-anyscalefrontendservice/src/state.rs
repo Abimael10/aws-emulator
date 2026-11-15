@@ -1033,13 +1033,24 @@ fn service_linked_role_suffix(service_namespace: &str) -> Option<&'static str> {
 /// `AWSApplicationAutoscaling<resource type>Policy` for the SAME resource-type label its role
 /// name carries ([`SERVICE_LINKED_ROLE_SUFFIXES`]) and filed under the path IAM reserves for
 /// the policies of a service-linked role, so no identity other than that role can take it.
+/// AWS capitalises one entry of the family differently from the rest, which is why the
+/// published name is resolved through IAM's catalog rather than taken from the composition.
 /// `None` for a namespace with no published role, which has no published policy either.
 pub fn service_linked_role_policy_arn(service_namespace: &str) -> Option<String> {
     use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
 
     let suffix = service_linked_role_suffix(service_namespace)?;
+    let policy_name = format!("AWSApplicationAutoscaling{suffix}Policy");
+    // IAM's catalog is authoritative about the name AWS publishes a managed policy under and
+    // the path it files it at, and it resolves a friendly name without regard to case, so the
+    // ARN reported here is the published one even for the entry whose name AWS capitalises
+    // differently from the rest of the family: an ARN this control plane hands a caller is
+    // one IAM can describe.
+    if let Some(published) = iam::aws_managed_policy_named(&policy_name) {
+        return Some(published.arn());
+    }
     Some(format!(
-        "arn:aws:iam::{}:policy{}AWSApplicationAutoscaling{suffix}Policy",
+        "arn:aws:iam::{}:policy{}{policy_name}",
         iam::AWS_MANAGED_POLICY_ACCOUNT,
         iam::SERVICE_LINKED_ROLE_PATH_PREFIX
     ))

@@ -1387,3 +1387,9 @@ mod lambda_in_function_assumed_role_session;
 //! for every service crate's `tests/all.rs`.
 //! (`tests/boot_serve.rs`) — which the layout check refuses. The `#[path]` above each
 //! `mod` is what points it into `tests/all/`.
+//! COMMENT MAY STAND IN THIS FILE: past the first item one is `E0753` and compiles
+//! nothing, so a note below must be an ordinary line comment — better still, add a
+//! `all/all_rs_declares_each_suite_once.rs` and
+// The list below is DECLARATIONS ONLY. What a suite covers, and why it belongs to this
+// cross-service target rather than to one service crate's own, is stated in that suite's own
+// module header, where it is read beside the test it explains — not here.

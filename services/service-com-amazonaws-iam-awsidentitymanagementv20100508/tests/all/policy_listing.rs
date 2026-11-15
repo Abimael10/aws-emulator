@@ -136,16 +136,28 @@ async fn list_policies(router: &MultiServiceRouter, params: &[(String, String)])
 
 /// Every ARN a listing reports across ALL its pages, following the `Marker` the
 /// service hands out, asserting each page is a 200 and the pagination terminates.
+///
+/// A `Marker` the row itself names is where the walk STARTS, so it is taken out of the
+/// row's parameters and carried as the first page's token: the request for a later page
+/// names the one position it resumes after, never that position and the row's together.
 async fn list_every_page(
     router: &MultiServiceRouter,
     params: &[(String, String)],
     case: &str,
 ) -> Vec<String> {
     let mut seen = Vec::new();
-    let mut marker: Option<String> = None;
+    let mut marker: Option<String> = params
+        .iter()
+        .find(|(key, _)| key == "Marker")
+        .map(|(_, value)| value.clone());
+    let base: Vec<(String, String)> = params
+        .iter()
+        .filter(|(key, _)| key != "Marker")
+        .cloned()
+        .collect();
     let mut pages = 0;
     loop {
-        let mut page_params = params.to_vec();
+        let mut page_params = base.clone();
         if let Some(token) = &marker {
             page_params.push(param("Marker", token));
         }
