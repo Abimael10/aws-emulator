@@ -23,7 +23,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // emulator, the seeded catalog, the `restJson1` wire path and the error-code extractor.
 use crate::glue_catalog::{
     account_catalog, create_database, emulator, error_code, lake_formation as call,
-    revoke_default_database_grant, revoke_table_default_grants,
+    revoke_default_database_grant, revoke_table_default_grants, NOTHING_TO_REVOKE,
 };
 
 /// One row of the repeated-grant table: the case name, the permissions each successive
@@ -479,28 +479,18 @@ async fn revoking_what_was_never_granted_is_refused_and_changes_nothing() {
             "InvalidInputException",
             "case {case:?}: expected InvalidInputException, got {payload:?}"
         );
-        // The message names the permissions THIS request asked to revoke and the grantee
-        // does not hold — the part of it built from the request.
+        // The refusal is the fixed sentence Lake Formation answers a revoke that would
+        // take nothing away: no value of THIS request is interpolated, so every row's
+        // refusal reads the same.
         let message = payload
             .get("message")
             .or_else(|| payload.get("Message"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let unheld: Vec<&str> = revoked
-            .iter()
-            .copied()
-            .filter(|permission| {
-                granted
-                    .as_ref()
-                    .is_none_or(|held| !held.contains(permission))
-            })
-            .collect();
-        for permission in &unheld {
-            assert!(
-                message.contains(permission),
-                "case {case:?}: expected the refusal to name {permission:?}, got {message:?}"
-            );
-        }
+        assert_eq!(
+            message, NOTHING_TO_REVOKE,
+            "case {case:?}: expected Message {NOTHING_TO_REVOKE:?}, got {message:?}"
+        );
 
         // The refusal took nothing away: whatever was granted is still there.
         let entries = list(&router, case, &json!({ "Resource": resource })).await;

@@ -216,6 +216,23 @@ pub async fn table_created_by(router: &MultiServiceRouter, database: &str, name:
         .to_string()
 }
 
+/// The sentence Lake Formation refuses a revoke that would take nothing away with: wholly
+/// fixed text, in two sentences, with no part taken from the request.
+///
+/// The one copy the permission suites compare against, spelled out here rather than read
+/// back out of the crate, so the five suites that assert it cannot drift apart.
+pub const NOTHING_TO_REVOKE: &str =
+    "No permissions revoked. Grantee has no permissions and no grantable permissions on \
+     resource.";
+
+/// The ARN-shape refusal as the service words it: fixed text followed by the rejected
+/// identifier, unquoted and exactly as the request wrote it.
+///
+/// The one copy, for the same reason as [`NOTHING_TO_REVOKE`].
+pub fn invalid_arn_message(identifier: &str) -> String {
+    format!("Invalid ARN:ARNs must start with 'arn:': {identifier}")
+}
+
 /// The `PrincipalResourcePermissions` entries a `ListPermissions` body answers, asserting
 /// 200 and that the member is present (a listing that matches nothing answers an EMPTY
 /// list, not an absent member).

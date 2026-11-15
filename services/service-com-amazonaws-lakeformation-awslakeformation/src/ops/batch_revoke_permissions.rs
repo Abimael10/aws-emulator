@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchRevokePermissions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchRevokePermissions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchRevokePermissions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Revokes what every entry of the batch asks for, ONE ENTRY AT A TIME: an entry that can
+//! be revoked is taken out of
+//! [`crate::state::ComAmazonawsLakeformationAwslakeformationState`]'s `permission_grants`
+//! exactly as `RevokePermissions` takes it out — so `ListPermissions` stops reporting it —
+//! and an entry that cannot is reported in `Failures` with the error class and message the
+//! single-entry call would answer. A batch is therefore PARTIAL: the failure of one entry
+//! neither refuses the call nor keeps the others from being applied.
+//!
+//! An entry is read, resolved and applied through the path this operation shares with
+//! `RevokePermissions` ([`crate::state::read_revoke_request`],
+//! [`crate::state::plan_revoke`], [`crate::state::apply_revoke`]), so the two cannot drift
+//! on what a revoke may say or on what it takes away. What is refused for the batch AS A
+//! WHOLE, with nothing applied, is only what is wrong with the request rather than with an
+//! entry: more entries than [`crate::state::MAX_BATCH_PERMISSIONS_ENTRIES`].
 //!
 //! ## Shape of an operation
 //!
@@ -85,11 +91,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-lakeformation-awslakefo
 // here — hence the `BatchRevokePermissionsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.lakeformation#BatchRevokePermissions")]
+//
+// `InternalServiceException` is widened in through `extra_errors` for the same reason as in
+// `revoke_permissions`: this SERVICE models it (HTTP 500) but this operation's own error
+// list omits it, and an engine that holds no state is a server fault, not a bad request and
+// not an unwritten operation.
+#[smithy_macros::operation_error(
+    "com.amazonaws.lakeformation#BatchRevokePermissions",
+    extra_errors = ["InternalServiceException"]
+)]
 #[derive(Debug)]
 pub enum BatchRevokePermissionsErrorModeled {
     InvalidInputException(InvalidInputException),
     OperationTimeoutException(OperationTimeoutException),
+    InternalServiceException(InternalServiceException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -143,18 +158,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchRevokePermissions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchRevokePermissionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchRevokePermissions"))
+        // The caller the audit record below attributes this state change to.
+        let akid = ::engine::extract_akid(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchRevokePermissionsErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("LakeFormation state is unavailable".to_string()),
+            })
+        })?;
+
+        /// The modelled refusal for a batch this handler will not apply at all.
+        fn invalid(message: String) -> BatchRevokePermissionsError {
+            BatchRevokePermissionsErrorModeled::InvalidInputException(InvalidInputException {
+                message: Some(message),
+            })
+            .into()
+        }
+
+        /// One entry's failure, as `Failures` reports it: the entry as the service read it
+        /// (`crate::state::echoed_batch_entry`), and the error class and message the
+        /// single-entry call answers.
+        fn failed(
+            entry: &BatchPermissionsRequestEntry,
+            catalog_id: &str,
+            message: String,
+        ) -> BatchPermissionsFailureEntry {
+            BatchPermissionsFailureEntry {
+                request_entry: Some(crate::state::echoed_batch_entry(entry, catalog_id)),
+                error: Some(ErrorDetail {
+                    error_code: Some(crate::state::BATCH_ENTRY_ERROR_CODE.to_string()),
+                    error_message: Some(message),
+                }),
+            }
+        }
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_deref());
+
+        // The documented ceiling on the request itself, which no entry can be at fault for:
+        // `BatchPermissionsRequestEntryList` carries no length constraint, so this is
+        // refused here rather than at the boundary.
+        if input.entries.len() > crate::state::MAX_BATCH_PERMISSIONS_ENTRIES {
+            return Err(invalid(crate::state::too_many_batch_entries(
+                input.entries.len(),
+            )));
+        }
+
+        // Every entry read and resolved, in request order, with nothing taken away yet: the
+        // resolution reads Glue's store for the grants a table was created carrying, so it
+        // runs before the lock below is taken, for the same reason `RevokePermissions` runs
+        // it before it takes it.
+        let resolved: Vec<Result<(crate::state::RevokeRequest, crate::state::RevokePlan), String>> =
+            input
+                .entries
+                .iter()
+                .map(|entry| {
+                    // A batch entry models every member but `Id` optional, so an entry
+                    // naming no grantee, no resource or no permission is this entry's
+                    // failure rather than the batch's refusal.
+                    let request = crate::state::read_revoke_request(
+                        entry.principal.as_ref(),
+                        entry.permissions.as_deref().unwrap_or_default(),
+                        entry
+                            .permissions_with_grant_option
+                            .as_deref()
+                            .unwrap_or_default(),
+                        entry.condition.as_ref(),
+                    )?;
+                    let plan = crate::state::plan_revoke(
+                        &*self.engine,
+                        &catalog_id,
+                        &request,
+                        entry.resource.as_ref(),
+                    )?;
+                    Ok((request, plan))
+                })
+                .collect();
+
+        // What each entry did, under one lock so the batch sees one store: an entry that
+        // resolved is applied — which is also where a revoke that would take nothing away is
+        // refused, per entry, so a batch reports the entries that had nothing to revoke and
+        // applies the ones that did.
+        let mut failures: Vec<BatchPermissionsFailureEntry> = Vec::new();
+        let mut removed = 0_usize;
+        let mut reduced = 0_usize;
+        {
+            let mut store = state.lock();
+            for (entry, outcome) in input.entries.iter().zip(resolved) {
+                let applied = outcome.and_then(|(request, plan)| {
+                    crate::state::apply_revoke(&mut store, &catalog_id, &request, &plan)
+                });
+                match applied {
+                    Ok(outcome) => {
+                        removed += outcome.removed;
+                        reduced += outcome.reduced;
+                    }
+                    Err(message) => failures.push(failed(entry, &catalog_id, message)),
+                }
+            }
+        }
+
+        // The audit record for a state change: who, what, where, and what the batch did —
+        // counted per record, like the single-revoke path, plus how many entries failed.
+        tracing::info!(
+            operation = "BatchRevokePermissions",
+            akid = %akid,
+            catalog_id = %catalog_id,
+            entries = input.entries.len(),
+            records_removed = removed,
+            records_reduced = reduced,
+            entries_failed = failures.len(),
+            "Lake Formation permissions revoked by batch"
+        );
+
+        Ok(BatchRevokePermissionsOutput {
+            // `BatchPermissionsFailureList` carries no length constraint, so a batch every
+            // entry of which was applied answers the empty list a client can iterate, not
+            // an absent member.
+            failures: Some(failures),
+        })
     }
 }

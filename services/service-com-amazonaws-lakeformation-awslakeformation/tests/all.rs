@@ -11,6 +11,10 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/batch_grant_permissions.rs"]
+mod batch_grant_permissions;
+#[path = "all/batch_revoke_permissions.rs"]
+mod batch_revoke_permissions;
 #[path = "all/client_error_bodies.rs"]
 mod client_error_bodies;
 #[path = "all/creator_table_grants.rs"]
@@ -29,6 +33,8 @@ mod lf_tags;
 mod permission_scope;
 #[path = "all/permissions.rs"]
 mod permissions;
+#[path = "all/principal_and_table_identity.rs"]
+mod principal_and_table_identity;
 #[path = "all/registered_resources.rs"]
 mod registered_resources;
 #[path = "all/revoke_default_grant.rs"]

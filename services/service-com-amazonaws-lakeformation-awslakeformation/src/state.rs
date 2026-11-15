@@ -28,13 +28,25 @@ use ::service_com_amazonaws_glue_awsglue::state as glue_state;
 /// Re-exported, so a handler reaches both under `crate::state::` like every other part of
 /// this store.
 mod creator_table_grants;
+/// One grant, from the request that asks for it to the records it writes: the path
+/// `GrantPermissions` and `BatchGrantPermissions` share.
+mod grant_requests;
 mod implicit_table_grants;
+/// What identifies a Lake Formation principal, and the refusal a value that identifies
+/// none draws.
+mod principals;
 /// How this service words its refusals: the message of each error class, and its own
 /// rendering of a refusal the framework raised before a handler ran.
 mod refusals;
+/// One revoke, from the request that asks for it to the records it trims: the path
+/// `RevokePermissions` and `BatchRevokePermissions` share.
+mod revoke_requests;
 pub use creator_table_grants::*;
+pub use grant_requests::*;
 pub use implicit_table_grants::*;
+pub use principals::*;
 pub use refusals::*;
+pub use revoke_requests::*;
 
 /// One registered data-lake location: the resource ARN Lake Formation manages, the IAM
 /// role it uses to reach it, and the registration flags the caller set.
@@ -1261,6 +1273,11 @@ pub fn resource_types(resource: &Resource) -> Vec<&'static str> {
     }
 }
 
+/// What a call whose `Resource` names no resource at all — no member, or no `Resource`
+/// where a batch entry may leave it out — is refused with.
+pub const RESOURCE_NAMES_NO_TYPE: &str =
+    "Resource must name exactly one resource type, but none was provided";
+
 /// Why `resource` cannot name a resource, or `Ok(())` when it names exactly one.
 ///
 /// `Resource` is modelled as a STRUCTURE whose ten members are all optional, but it
@@ -1269,8 +1286,9 @@ pub fn resource_types(resource: &Resource) -> Vec<&'static str> {
 /// themselves a choice — a table named by `Name` or by `TableWildcard`, and the columns
 /// of a `TableWithColumns` named by `ColumnNames` or by `ColumnWildcard` — are checked
 /// the same way. The caller is refused with the modelled `InvalidInputException`; the
-/// message names the member, which is the rule the boundary validator follows for the
-/// constraints the model CAN express.
+/// message names the member wherever the service's own wording does not fix the sentence
+/// ([`TABLE_NAME_AND_WILDCARD`] does), which is the rule the boundary validator follows
+/// for the constraints the model CAN express.
 pub fn validate_resource(resource: &Resource) -> Result<(), String> {
     let named: Vec<&str> = [
         ("Catalog", resource.catalog.is_some()),
@@ -1289,11 +1307,7 @@ pub fn validate_resource(resource: &Resource) -> Result<(), String> {
     .collect();
     match named.len() {
         1 => {}
-        0 => {
-            return Err(
-                "Resource must name exactly one resource type, but none was provided".to_string(),
-            )
-        }
+        0 => return Err(RESOURCE_NAMES_NO_TYPE.to_string()),
         count => {
             return Err(format!(
                 "Resource must name exactly one resource type, but {count} were provided: {}",
@@ -1304,11 +1318,10 @@ pub fn validate_resource(resource: &Resource) -> Result<(), String> {
 
     if let Some(table) = &resource.table {
         match (table.name.is_some(), table.table_wildcard.is_some()) {
-            (true, true) => {
-                return Err(
-                    "Resource.Table must name either Name or TableWildcard, not both".to_string(),
-                )
-            }
+            // Both members named: the refusal is the service's fixed sentence for the
+            // mutually exclusive pair ([`TABLE_NAME_AND_WILDCARD`]), which names neither
+            // the table nor the member path.
+            (true, true) => return Err(TABLE_NAME_AND_WILDCARD.to_string()),
             (false, false) => {
                 return Err("Resource.Table must name either Name or TableWildcard".to_string())
             }
@@ -1348,13 +1361,6 @@ pub fn validate_resource(resource: &Resource) -> Result<(), String> {
 /// leaving it absent would make the same filter named with and without the account id
 /// two records.
 pub fn normalize_resource(resource: &Resource, catalog_id: &str) -> Resource {
-    /// Fills `slot` with `catalog_id` when it names no catalog.
-    fn default_catalog(slot: &mut Option<String>, catalog_id: &str) {
-        if slot.as_deref().is_none_or(str::is_empty) {
-            *slot = Some(catalog_id.to_string());
-        }
-    }
-
     /// Folds a database or table name the way the Data Catalog stores it.
     ///
     /// "For Hive compatibility, this is folded to lowercase when it is stored"
@@ -1364,28 +1370,21 @@ pub fn normalize_resource(resource: &Resource, catalog_id: &str) -> Resource {
         *name = glue_state::fold_name(name);
     }
 
-    let mut normalized = resource.clone();
+    let mut normalized = resolve_resource_catalogs(resource, catalog_id);
     if let Some(database) = normalized.database.as_mut() {
-        default_catalog(&mut database.catalog_id, catalog_id);
         fold(&mut database.name);
     }
     if let Some(table) = normalized.table.as_mut() {
-        default_catalog(&mut table.catalog_id, catalog_id);
         fold(&mut table.database_name);
         if let Some(name) = table.name.as_mut() {
             fold(name);
         }
     }
     if let Some(table) = normalized.table_with_columns.as_mut() {
-        default_catalog(&mut table.catalog_id, catalog_id);
         fold(&mut table.database_name);
         fold(&mut table.name);
     }
-    if let Some(location) = normalized.data_location.as_mut() {
-        default_catalog(&mut location.catalog_id, catalog_id);
-    }
     if let Some(cells) = normalized.data_cells_filter.as_mut() {
-        default_catalog(&mut cells.table_catalog_id, catalog_id);
         if let Some(database_name) = cells.database_name.as_mut() {
             fold(database_name);
         }
@@ -1393,19 +1392,52 @@ pub fn normalize_resource(resource: &Resource, catalog_id: &str) -> Resource {
             fold(table_name);
         }
     }
-    if let Some(tag) = normalized.lf_tag.as_mut() {
+    normalized
+}
+
+/// `resource` with every absent catalog id the model documents a default for filled in
+/// with `catalog_id`, and nothing else changed.
+///
+/// The first half of [`normalize_resource`], on its own because a resource is also ECHOED
+/// back to the caller — a batch reports the entry it could not apply — and an echo RESOLVES
+/// what the request left out without folding what the request wrote.
+pub fn resolve_resource_catalogs(resource: &Resource, catalog_id: &str) -> Resource {
+    /// Fills `slot` with `catalog_id` when it names no catalog.
+    fn default_catalog(slot: &mut Option<String>, catalog_id: &str) {
+        if slot.as_deref().is_none_or(str::is_empty) {
+            *slot = Some(catalog_id.to_string());
+        }
+    }
+
+    let mut resolved = resource.clone();
+    if let Some(database) = resolved.database.as_mut() {
+        default_catalog(&mut database.catalog_id, catalog_id);
+    }
+    if let Some(table) = resolved.table.as_mut() {
+        default_catalog(&mut table.catalog_id, catalog_id);
+    }
+    if let Some(table) = resolved.table_with_columns.as_mut() {
+        default_catalog(&mut table.catalog_id, catalog_id);
+    }
+    if let Some(location) = resolved.data_location.as_mut() {
+        default_catalog(&mut location.catalog_id, catalog_id);
+    }
+    if let Some(cells) = resolved.data_cells_filter.as_mut() {
+        default_catalog(&mut cells.table_catalog_id, catalog_id);
+    }
+    if let Some(tag) = resolved.lf_tag.as_mut() {
         default_catalog(&mut tag.catalog_id, catalog_id);
     }
-    if let Some(policy) = normalized.lf_tag_policy.as_mut() {
+    if let Some(policy) = resolved.lf_tag_policy.as_mut() {
         default_catalog(&mut policy.catalog_id, catalog_id);
     }
-    if let Some(expression) = normalized.lf_tag_expression.as_mut() {
+    if let Some(expression) = resolved.lf_tag_expression.as_mut() {
         default_catalog(&mut expression.catalog_id, catalog_id);
     }
-    if let Some(policy) = normalized.rls_policy.as_mut() {
+    if let Some(policy) = resolved.rls_policy.as_mut() {
         default_catalog(&mut policy.catalog_id, catalog_id);
     }
-    normalized
+    resolved
 }
 
 /// Appends `value` to `key` length-prefixed (`5:alice`).

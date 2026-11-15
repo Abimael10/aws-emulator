@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGrantPermissions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGrantPermissions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGrantPermissions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Grants what every entry of the batch asks for, ONE ENTRY AT A TIME: an entry that can be
+//! granted is recorded in
+//! [`crate::state::ComAmazonawsLakeformationAwslakeformationState`]'s `permission_grants`
+//! exactly as `GrantPermissions` records it — so `ListPermissions` reads it back — and an
+//! entry that cannot is reported in `Failures` with the error class and message the
+//! single-entry call would answer. A batch is therefore PARTIAL: the failure of one entry
+//! neither refuses the call nor keeps the others from being applied.
+//!
+//! An entry is read, resolved and recorded through the path this operation shares with
+//! `GrantPermissions` ([`crate::state::read_grant_request`],
+//! [`crate::state::plan_grant`], [`crate::state::record_grants`]), so the two cannot drift
+//! on what a grant may say or on what it writes. What is refused for the batch AS A WHOLE,
+//! with nothing applied, is only what is wrong with the request rather than with an entry:
+//! more entries than [`crate::state::MAX_BATCH_PERMISSIONS_ENTRIES`].
 //!
 //! ## Shape of an operation
 //!
@@ -85,11 +91,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-lakeformation-awslakefo
 // here — hence the `BatchGrantPermissionsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.lakeformation#BatchGrantPermissions")]
+//
+// `InternalServiceException` is widened in through `extra_errors` for the same reason as in
+// `grant_permissions`: this SERVICE models it (HTTP 500) but this operation's own error list
+// omits it, and an engine that holds no state is a server fault, not a bad request and not
+// an unwritten operation.
+#[smithy_macros::operation_error(
+    "com.amazonaws.lakeformation#BatchGrantPermissions",
+    extra_errors = ["InternalServiceException"]
+)]
 #[derive(Debug)]
 pub enum BatchGrantPermissionsErrorModeled {
     InvalidInputException(InvalidInputException),
     OperationTimeoutException(OperationTimeoutException),
+    InternalServiceException(InternalServiceException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -143,18 +158,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGrantPermissions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGrantPermissionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGrantPermissions"))
+        // The caller the audit record below attributes this state change to.
+        let akid = ::engine::extract_akid(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchGrantPermissionsErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("LakeFormation state is unavailable".to_string()),
+            })
+        })?;
+
+        /// The modelled refusal for a batch this handler will not apply at all.
+        fn invalid(message: String) -> BatchGrantPermissionsError {
+            BatchGrantPermissionsErrorModeled::InvalidInputException(InvalidInputException {
+                message: Some(message),
+            })
+            .into()
+        }
+
+        /// One entry's failure, as `Failures` reports it: the entry as the service read it
+        /// (`crate::state::echoed_batch_entry`), and the error class and message the
+        /// single-entry call answers.
+        fn failed(
+            entry: &BatchPermissionsRequestEntry,
+            catalog_id: &str,
+            message: String,
+        ) -> BatchPermissionsFailureEntry {
+            BatchPermissionsFailureEntry {
+                request_entry: Some(crate::state::echoed_batch_entry(entry, catalog_id)),
+                error: Some(ErrorDetail {
+                    error_code: Some(crate::state::BATCH_ENTRY_ERROR_CODE.to_string()),
+                    error_message: Some(message),
+                }),
+            }
+        }
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_deref());
+
+        // The documented ceiling on the request itself, which no entry can be at fault for:
+        // `BatchPermissionsRequestEntryList` carries no length constraint, so this is
+        // refused here rather than at the boundary.
+        if input.entries.len() > crate::state::MAX_BATCH_PERMISSIONS_ENTRIES {
+            return Err(invalid(crate::state::too_many_batch_entries(
+                input.entries.len(),
+            )));
+        }
+
+        // Every entry read and resolved, in request order, with nothing written yet: both
+        // steps reach OUTSIDE this service's store — the grantee is resolved against IAM
+        // over the in-process callback and the resource against Glue's own store — so they
+        // run before the lock below is taken, for the same reason `GrantPermissions` runs
+        // them before it takes it.
+        let mut resolved: Vec<
+            Result<(crate::state::GrantRequest, Vec<crate::state::GrantRecord>), String>,
+        > = Vec::with_capacity(input.entries.len());
+        for entry in &input.entries {
+            // A batch entry models every member but `Id` optional, so an entry naming no
+            // grantee, no resource or no permission is this entry's failure rather than the
+            // batch's refusal.
+            let outcome = match crate::state::read_grant_request(
+                entry.principal.as_ref(),
+                entry.permissions.as_deref().unwrap_or_default(),
+                entry
+                    .permissions_with_grant_option
+                    .as_deref()
+                    .unwrap_or_default(),
+                entry.condition.as_ref(),
+            ) {
+                Err(message) => Err(message),
+                Ok(request) => {
+                    match crate::state::unresolved_grant_principal(ctx, &request.principal).await {
+                        Some(unresolved) => Err(unresolved),
+                        None => crate::state::plan_grant(
+                            &*self.engine,
+                            &catalog_id,
+                            &request,
+                            entry.resource.as_ref(),
+                        )
+                        .map(|records| (request, records)),
+                    }
+                }
+            };
+            resolved.push(outcome);
+        }
+
+        // What each entry did, under one lock so the batch sees one store: an entry that
+        // resolved is recorded — which is also where the grant store's ceiling is weighed,
+        // per entry, so a batch that passes it reports the entries it could not fit and
+        // keeps the ones it could.
+        let mut failures: Vec<BatchPermissionsFailureEntry> = Vec::new();
+        let mut inserted = 0_usize;
+        let mut updated = 0_usize;
+        {
+            let mut store = state.lock();
+            for (entry, outcome) in input.entries.iter().zip(resolved) {
+                let applied = outcome.and_then(|(request, records)| {
+                    crate::state::record_grants(&mut store, &catalog_id, &request, &records)
+                });
+                match applied {
+                    Ok((entry_inserted, entry_updated)) => {
+                        inserted += entry_inserted;
+                        updated += entry_updated;
+                    }
+                    Err(message) => failures.push(failed(entry, &catalog_id, message)),
+                }
+            }
+        }
+
+        // The audit record for a state change: who, what, where, and what the batch did —
+        // counted per record, like the single-grant path, plus how many entries failed.
+        tracing::info!(
+            operation = "BatchGrantPermissions",
+            akid = %akid,
+            catalog_id = %catalog_id,
+            entries = input.entries.len(),
+            records_inserted = inserted,
+            records_updated = updated,
+            entries_failed = failures.len(),
+            "Lake Formation permissions granted by batch"
+        );
+
+        Ok(BatchGrantPermissionsOutput {
+            // `BatchPermissionsFailureList` carries no length constraint, so a batch every
+            // entry of which was applied answers the empty list a client can iterate, not
+            // an absent member.
+            failures: Some(failures),
+        })
     }
 }

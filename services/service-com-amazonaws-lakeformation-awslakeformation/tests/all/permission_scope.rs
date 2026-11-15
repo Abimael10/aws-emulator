@@ -24,7 +24,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // extractor.
 use crate::glue_catalog::{
     account_catalog as account, create_database, create_table, emulator, error_code,
-    lake_formation, revoke_default_database_grant, revoke_table_default_grants,
+    lake_formation, revoke_default_database_grant, revoke_table_default_grants, NOTHING_TO_REVOKE,
 };
 
 /// One row of the scope table: the case name, the resource granted on, the permissions
@@ -288,6 +288,106 @@ async fn a_grant_on_an_entity_the_catalog_does_not_hold_is_refused() {
         accepted_count,
         "each accepted grant must leave one record, got {body}"
     );
+}
+
+/// `RevokePermissions` for `principal` on `resource`, answering `(status, body)`.
+async fn revoke(
+    router: &MultiServiceRouter,
+    principal: &str,
+    resource: &Value,
+    permissions: &[&str],
+) -> (u16, Value) {
+    lake_formation(
+        router,
+        "RevokePermissions",
+        &json!({
+            "Principal": {"DataLakePrincipalIdentifier": principal},
+            "Resource": resource,
+            "Permissions": permissions,
+        }),
+    )
+    .await
+}
+
+/// A revoke names a Data Catalog entity the catalog holds, exactly as a grant does: Lake
+/// Formation revokes permissions ON those resources, so one the catalog does not hold names
+/// nothing to revoke from and is refused for the ENTITY rather than for the permissions.
+///
+/// The rows are the grant table's, so the two paths are held to one rule; the last two
+/// fix the ORDER of the two refusals a revoke can draw — an entity that IS there but holds
+/// nothing draws the nothing-to-revoke sentence instead.
+#[tokio::test]
+async fn a_revoke_on_an_entity_the_catalog_does_not_hold_is_refused() {
+    let principal = "arn:aws:iam::000000000000:user/analyst";
+    let router = emulator();
+    create_database(&router, "sales").await;
+    create_table(&router, "sales", "orders").await;
+
+    let refused: Vec<(&str, Value, &str)> = vec![
+        (
+            "a missing database",
+            json!({"Database": {"Name": "absent"}}),
+            "Database not found.",
+        ),
+        (
+            "a missing table in a database that exists",
+            json!({"Table": {"DatabaseName": "sales", "Name": "absent"}}),
+            "Table not found.",
+        ),
+        (
+            "a table under a missing database",
+            json!({"Table": {"DatabaseName": "absent", "Name": "orders"}}),
+            "Database not found.",
+        ),
+        (
+            "every table of a missing database",
+            json!({"Table": {"DatabaseName": "absent", "TableWildcard": {}}}),
+            "Database not found.",
+        ),
+        (
+            "a missing table through TableWithColumns",
+            json!({
+                "TableWithColumns": {
+                    "DatabaseName": "sales",
+                    "Name": "absent",
+                    "ColumnWildcard": {}
+                }
+            }),
+            "Table not found.",
+        ),
+        (
+            // The entity is there, so the refusal is about what it holds.
+            "a database that holds no such grant",
+            json!({"Database": {"CatalogId": account(), "Name": "sales"}}),
+            NOTHING_TO_REVOKE,
+        ),
+        (
+            "a table that holds no such grant",
+            json!({"Table": {"DatabaseName": "sales", "Name": "orders"}}),
+            NOTHING_TO_REVOKE,
+        ),
+    ];
+
+    for (case, resource, message) in refused {
+        let (status, body) = revoke(&router, principal, &resource, &["SELECT"]).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidInputException",
+            "case {case:?}: expected InvalidInputException, got {body}"
+        );
+        let actual = body
+            .get("Message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(
+            actual, message,
+            "case {case:?}: expected Message {message:?}, got {actual:?}"
+        );
+    }
 }
 
 /// A table whose name differs only in case is the SAME table, because the Data Catalog

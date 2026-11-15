@@ -58,6 +58,22 @@ pub const UNSUPPORTED_RESOURCE_ARN: &str = "Un-supported resource arn format";
 /// refusal is this sentence whatever the expression was.
 pub const ROW_FILTER_BOTH_SET: &str = "Filter expression and AllRowsWildcard cannot both be set.";
 
+/// What a call whose `Resource.Table` names BOTH a table `Name` and a `TableWildcard`
+/// answers.
+///
+/// `TableResource` carries both members and they are alternatives — one table, or every
+/// table of the database — so naming both names no table. Wholly fixed text: neither the
+/// table nor the database the request carried is echoed.
+pub const TABLE_NAME_AND_WILDCARD: &str = "Table name and table wildcard cannot both be present.";
+
+/// What a revoke that would take nothing away answers.
+///
+/// Wholly fixed text, in two sentences: the permissions the request named are NOT
+/// interpolated, because the request already carries them.
+pub const NOTHING_TO_REVOKE: &str =
+    "No permissions revoked. Grantee has no permissions and no grantable permissions on \
+     resource.";
+
 /// What a create of an LF-tag whose key the Data Catalog already holds answers.
 ///
 /// Wholly fixed text: neither the key nor the catalog is named.

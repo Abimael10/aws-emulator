@@ -23,6 +23,11 @@
 //! permissions"), which is its own grants together with the grants of the groups it
 //! belongs to, reported under the principal the request asked about.
 //!
+//! A `Principal` filter is a PRINCIPAL, read exactly as the write paths read a grantee
+//! ([`crate::state::malformed_principal`]): an identifier that names no Lake Formation
+//! principal selects nothing and is refused with the service's ARN-shape sentence rather
+//! than answered with an empty page.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -219,6 +224,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .and_then(|principal| principal.data_lake_principal_identifier.as_deref())
             .filter(|identifier| !identifier.is_empty());
+
+        // A filter names a PRINCIPAL, so a value that identifies no Lake Formation
+        // principal selects nothing and is a bad request rather than an empty page: it is
+        // read exactly as the grant and revoke paths read a grantee
+        // (`crate::state::malformed_principal`). A request naming no `Principal` at all,
+        // and one whose identifier is empty, name no filter and are not read as a
+        // principal.
+        if let Some(refusal) = principal_filter.and_then(crate::state::malformed_principal) {
+            return Err(invalid(refusal));
+        }
 
         // "The Principal parameter must not be specified when requesting cell filter
         // information." — `ListPermissions$IncludeRelated`.
