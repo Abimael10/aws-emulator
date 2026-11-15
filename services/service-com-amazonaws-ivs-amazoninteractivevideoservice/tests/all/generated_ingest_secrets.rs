@@ -39,7 +39,7 @@ const SRT_PASSPHRASE_BOUNDS: std::ops::RangeInclusive<usize> = 10..=79;
 /// The creates this suite spans: rows differ along what rule 2 generalises over — the
 /// channel type, the latency mode, the container format, the ingest flags, the name and
 /// the tag count — so the class being asserted is the class of EVERY create, not of one.
-fn create_requests() -> Vec<(&'static str, Value)> {
+pub(crate) fn create_requests() -> Vec<(&'static str, Value)> {
     vec![
         ("every member defaulted", json!({})),
         ("name only", json!({ "name": "secret-probe" })),

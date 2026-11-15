@@ -494,12 +494,17 @@ const STREAM_KEY_SECRET_LEN: usize = 32;
 /// unescaped in the `passphrase` parameter of its ingest URL.
 const SRT_PASSPHRASE_ALPHABET: SecretAlphabet = char::is_ascii_alphanumeric;
 
-/// How many characters an `Srt` passphrase carries.
+/// How many characters an `Srt` passphrase carries: the width AWS's own auto-generated SRT
+/// passphrase has, which is NOT this service's choice to make.
 ///
-/// The model states no width for `SrtPassphrase`, and SRT itself admits a passphrase of
-/// 10 to 79 characters, so this is the width of this service's generated ingest secrets —
-/// the same as [`STREAM_KEY_SECRET_LEN`], well inside what an SRT client accepts.
-const SRT_PASSPHRASE_LEN: usize = 32;
+/// The model constrains `SrtPassphrase` neither in length nor in pattern
+/// (`smithy_query(query="shape", shape="SrtPassphrase")`), so the width is read off the value
+/// AWS answers for the member — the `srt.passphrase` of the recorded `CreateChannel` responses
+/// this emulator is held against, which carry a LONG secret there: several times the width of
+/// an ordinary 32-character token, and far wider than the [`STREAM_KEY_SECRET_LEN`] field of a
+/// stream key. It stays inside the 10 to 79 characters the SRT protocol itself admits for a
+/// passphrase, so an SRT client can take the value as it stands.
+const SRT_PASSPHRASE_LEN: usize = 64;
 
 fn is_lowercase_hex(character: &char) -> bool {
     character.is_ascii_digit() || matches!(*character, 'a'..='f')

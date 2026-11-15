@@ -1439,3 +1439,25 @@ mod eks_nodegroup_nodes_join_the_cluster_api;
 #[path = "all/apigateway_custom_domain_dns_alias.rs"]
 mod apigateway_custom_domain_dns_alias;
 // one this target needs stands HERE, ahead of the declaration list.
+// suite file, sorted by name, and NO other line: no prose between the pairs, no blank line,
+// and nothing at all after the last pair. Put a new suite at `tests/all/<name>.rs` and insert
+// its pair in the one place its name sorts to, so two branches landing at once insert two
+// lines in two places and have no prose to duplicate, re-word or mistype. That is what had
+// gone wrong here before: the tail of this file had grown hundreds of re-typed copies of its
+// own header, and no suite of this target ran.
+// comment, like an inner attribute, is legal only ahead of the first item, so one left below
+// the list is a hard error that compiles no suite of this target; with none anywhere in the
+// file, no merge of two landings can leave one there. A suite file no `mod` names is compiled
+// nowhere and its tests never run, a name declared twice compiles neither copy, and a suite
+// left at the top level of `tests/` fails the build. This file is a test-target CRATE ROOT, so
+// a bare `mod` would resolve to a SIBLING of it, which the layout check refuses: the
+// `#[path]` above each `mod` is what points it into `tests/all/`.
+// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` check it here and
+// in every service crate's own `tests/all.rs`.
+// note about THIS file belongs in `all/appended_notes.rs`, `all/appended_notes_tail.rs`,
+// `all/appended_header_notes.rs` or `all/appended_prose.rs`, which keep what earlier landings
+// had appended here and are declared below like any other file. Some of the files below are
+// shared harnesses or probes rather than suites; every one of them is declared, because a file
+// no declaration names is compiled nowhere.
+// build failure. An inner attribute, like an inner doc comment, is legal only before the first
+// item, so it stands here rather than in the list.

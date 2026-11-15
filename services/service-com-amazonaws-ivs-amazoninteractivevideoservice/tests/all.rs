@@ -61,6 +61,8 @@ mod referenced_resource_admission;
 mod request_id_token_form;
 #[path = "all/signing_name_routing.rs"]
 mod signing_name_routing;
+#[path = "all/srt_ingest_block.rs"]
+mod srt_ingest_block;
 #[path = "all/stated_failures.rs"]
 mod stated_failures;
 #[path = "all/state_roundtrip.rs"]
