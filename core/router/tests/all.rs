@@ -1876,3 +1876,15 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 //! declaration below, never a note about one.
 #[path = "all/every_suite_file_is_declared.rs"]
 mod every_suite_file_is_declared;
+// This file is a LIST: the license header, this block, and then one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted by name, and no other
+// line. Put a new suite at `tests/all/<name>.rs` and insert its pair in sorted position.
+// every suite in this target. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod`
+// would resolve to a sibling of this file, which the layout check refuses: the `#[path]` is
+// what points each declaration into `tests/all/`.
+// EVERY comment here is an ORDINARY one, this block included, and that is deliberate: an
+// inner doc comment (`//!`) is legal only before the first item, so one appended further
+// down is `E0753` and compiles no suite of this target. With none anywhere, no merge of two
+// landings can leave one past the first item.
+// it explains — never here. `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs` check all three rules, for this file and

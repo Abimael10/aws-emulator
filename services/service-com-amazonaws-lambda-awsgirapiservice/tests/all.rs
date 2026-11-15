@@ -311,6 +311,8 @@ mod handler_query_compatible_error_code;
 mod handler_dynamodb_binary_attributes;
 #[path = "all/handler_dynamodb_resource.rs"]
 mod handler_dynamodb_resource;
+#[path = "all/handler_dynamodb_grant_sources.rs"]
+mod handler_dynamodb_grant_sources;
 #[path = "all/handler_image_analysis_sdk.rs"]
 mod handler_image_analysis_sdk;
 #[path = "all/handler_email_sdk.rs"]
@@ -387,6 +389,8 @@ mod invocation_remaining_time_countdown;
 mod invocation_report_memory_used;
 #[path = "all/invocation_reserved_concurrency_burst.rs"]
 mod invocation_reserved_concurrency_burst;
+#[path = "all/invocation_reserved_concurrency_transition.rs"]
+mod invocation_reserved_concurrency_transition;
 #[path = "all/invocation_run_capacity.rs"]
 mod invocation_run_capacity;
 #[path = "all/invoke_addressed_function.rs"]
