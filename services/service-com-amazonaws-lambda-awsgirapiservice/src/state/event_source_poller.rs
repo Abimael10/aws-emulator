@@ -32,6 +32,15 @@
 //!   `IteratorAge` ([`crate::state::metrics`]) — so a batch that sat in the
 //!   shard while the mapping was paused meters that whole wait, and a batch read as its
 //!   records arrive meters almost nothing.
+//! * THE CRITERIA DECIDE WHICH RECORDS ARE HANDED OVER. `FilterCriteria` is "an object that
+//!   defines the filter criteria that determine whether Lambda should process an event", so
+//!   of the records a pass read off a shard exactly those at least one of the mapping's
+//!   patterns matches are handed to the function ([`admitted_of`]); a record none of them
+//!   matches is not handed to any invocation. Such a record is still READ, and the poller
+//!   itself is what accounts for it, so the shard's position moves past it exactly as it
+//!   moves past a record an invocation processed — which is what lets the records behind one
+//!   the criteria reject be delivered — and a batch they reject every record of is a pass
+//!   that made no invocation at all.
 //! * A BATCH IS CHECKPOINTED PAST ONLY ONCE DELIVERED. An invocation that did not succeed
 //!   leaves the cursor where it was, so the same batch is read again — "The default value
 //!   is infinite (-1). When set to infinite (-1), failed records are retried until the
@@ -79,6 +88,7 @@
 //! emulator does not serve itself, and a record is consumed only through the data plane a
 //! client would consume it through.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
@@ -259,6 +269,7 @@ impl Drop for PollerClaim {
 /// are handed to a function as different documents — built by the module that read it, so
 /// everything the poller itself does (metering the batch, delivering it, checkpointing past
 /// what was processed) is the one rule for both sources.
+#[derive(Clone)]
 struct ShardRecord {
     /// "the sequence number of the data record in the shard": how a report of this source
     /// names one record, and what the mapping's cursor reads on from.
@@ -291,6 +302,10 @@ struct ShardSourcedMapping {
     /// How many records one batch holds at most, from `BatchSize`, clamped to what this
     /// emulator reads in one go ([`MAX_RECORDS_PER_BATCH`]).
     batch_size: i32,
+    /// The patterns the mapping's `FilterCriteria` carry, which decide which records of a
+    /// batch the function is invoked with ([`admitted_of`]); empty for a mapping carrying no
+    /// criteria, which admits every record.
+    filters: Vec<String>,
     /// Whether the mapping's `FunctionResponseTypes` asks for the function's report of which
     /// records of the batch failed to be read (see [`super::batch_item_failures`]).
     reports_batch_item_failures: bool,
@@ -659,6 +674,7 @@ fn run_of(
         function_name: mapping.function_name.clone(),
         invoke_identity_arn,
         batch_size: mapping.batch_size.clamp(1, MAX_RECORDS_PER_BATCH),
+        filters: super::event_source_filter::patterns_of(mapping.filter_criteria.as_ref()),
         reports_batch_item_failures: super::reports_batch_item_failures(
             &mapping.function_response_types,
         ),
@@ -706,6 +722,9 @@ async fn move_batches(
     };
     let mut delivered = false;
     let mut failure: Option<String> = None;
+    // The criteria this pass decides each record it reads by, read once for the pass rather
+    // than per shard: the patterns are the mapping's and do not change while it runs.
+    let criteria = super::event_source_filter::Filters::of(uuid, &run.filters);
     // Whether what failed was the FUNCTION's processing of a batch this pass handed over,
     // rather than something the pass could not do at all (see [`Outcome::Failed`]).
     let mut undelivered = false;
@@ -747,18 +766,56 @@ async fn move_batches(
             &run.function_name,
             iterator_age_millis(last.arrived_at.as_ref(), SystemTime::now()),
         );
-        let payload = batch_event(&records);
-        let attempt =
-            hand_over_batch(callback, &mut work.clients, run, &payload, &sequence_numbers).await;
+        // What the mapping's criteria admit of the batch, decided before anything is handed
+        // over: a record no pattern matches is not handed to the function at all, and the
+        // shard still reads on past it ([`admitted_of`]).
+        let admitted = admitted_of(&criteria, run, &records);
+        let Some(invoking) = admitted.invoking() else {
+            // The criteria admitted nothing of this batch, so there is no invocation to make
+            // for it: the pass handled the whole batch by discarding what the filter
+            // rejected, which is a pass that came to no problem, and the shard reads on from
+            // past those records so the ones behind them are delivered.
+            checkpoint(
+                state,
+                uuid,
+                run,
+                &shard,
+                sequence_numbers.last().cloned(),
+                super::LAST_PROCESSING_RESULT_OK,
+            );
+            work.attempts.remove(&shard);
+            delivered = true;
+            continue;
+        };
+        // The function can only report about the records it was HANDED, so the report is read
+        // against those ([`super::batch_item_failures`]).
+        let invoking_sequence_numbers: Vec<String> = invoking
+            .iter()
+            .map(|record| record.sequence_number.clone())
+            .collect();
+        let payload = batch_event(invoking);
+        let attempt = hand_over_batch(
+            callback,
+            &mut work.clients,
+            run,
+            &payload,
+            &invoking_sequence_numbers,
+        )
+        .await;
         // The mapping reads on from past the records the attempt processed, and the attempt
         // is reported as what the mapping last came to. A shard has ONE position, so what it
         // reads on from is the run of records at the head of the batch the attempt
         // processed: the first record its function reported it did not process is where the
-        // next read starts, whatever the report says about the records behind that one.
+        // next read starts, whatever the report says about the records behind that one. A
+        // record the criteria REJECTED is consumed by the pass itself, so it counts as handled
+        // for that position — a batch the function took every admitted record of is read past
+        // whole.
         let through = attempt
             .failure
             .is_none()
-            .then(|| checkpointed_through(&sequence_numbers, &attempt.processed))
+            .then(|| {
+                checkpointed_through(&sequence_numbers, &admitted.handled(&attempt.processed))
+            })
             .flatten();
         if let Some(sequence_number) = through {
             checkpoint(
@@ -805,7 +862,9 @@ async fn move_batches(
                 &failure_destination::FailedBatch {
                     run,
                     shard: &shard,
-                    records: &records,
+                    // The batch the mapping gave up on is the one it HANDED OVER: a record
+                    // its criteria rejected was never the function's to process.
+                    records: invoking,
                     attempts,
                     answered: attempt.answered.as_ref(),
                 },
@@ -926,6 +985,98 @@ fn batch_event(records: &[ShardRecord]) -> Value {
             .map(|record| record.envelope.clone())
             .collect::<Vec<Value>>(),
     })
+}
+
+/// What a mapping's `FilterCriteria` admitted of ONE batch read off a shard.
+enum Admitted<'batch> {
+    /// Every record of the batch: what a mapping carrying no criteria polls, and what a
+    /// batch each record of which matches a pattern comes to.
+    Whole(&'batch [ShardRecord]),
+    /// Some of the batch: the records the criteria admitted, in the order the shard holds
+    /// them, and the sequence numbers of the ones they rejected.
+    Part {
+        /// The records the function is invoked with.
+        invoking: Vec<ShardRecord>,
+        /// The records no pattern matched, by sequence number: they are the PASS's own to
+        /// account for, since no invocation will report about them.
+        rejected: Vec<String>,
+    },
+}
+
+impl Admitted<'_> {
+    /// The records the function is to be invoked with, and `None` when the criteria admitted
+    /// no record of the batch at all — which is a batch there is no invocation to make for.
+    fn invoking(&self) -> Option<&[ShardRecord]> {
+        let invoking = match self {
+            Self::Whole(records) => *records,
+            Self::Part { invoking, .. } => invoking.as_slice(),
+        };
+        (!invoking.is_empty()).then_some(invoking)
+    }
+
+    /// The records of the batch this pass HANDLED, by sequence number: the ones the
+    /// invocation reported as processed, plus the ones the criteria rejected.
+    ///
+    /// A rejected record is discarded by the poller itself — "FilterCriteria … determine
+    /// whether Lambda should process an event", and one that is not to be processed is never
+    /// handed to the function — so it is handled as soon as it has been read, which is what
+    /// lets the shard's position move past it ([`checkpointed_through`]).
+    fn handled(&self, processed: &[String]) -> Vec<String> {
+        match self {
+            Self::Whole(_) => processed.to_vec(),
+            Self::Part { rejected, .. } => {
+                let mut handled = processed.to_vec();
+                handled.extend(rejected.iter().cloned());
+                handled
+            }
+        }
+    }
+}
+
+/// What `criteria` admit of `records`, read as the mapping's source hands each record over.
+///
+/// The decision about one record is the shared one
+/// ([`super::event_source_filter::Filters`]); what is a shard source's own is the record each
+/// one is matched AS ([`filter_event`]).
+fn admitted_of<'batch>(
+    criteria: &super::event_source_filter::Filters,
+    run: &ShardSourcedMapping,
+    records: &'batch [ShardRecord],
+) -> Admitted<'batch> {
+    if criteria.admits_everything() {
+        return Admitted::Whole(records);
+    }
+    let mut budget = super::event_source_filter::budget();
+    let mut invoking: Vec<ShardRecord> = Vec::new();
+    let mut rejected: Vec<String> = Vec::new();
+    for record in records {
+        if criteria.admits(&filter_event(run.source, &record.envelope), &mut budget) {
+            invoking.push(record.clone());
+        } else {
+            rejected.push(record.sequence_number.clone());
+        }
+    }
+    if rejected.is_empty() {
+        return Admitted::Whole(records);
+    }
+    Admitted::Part {
+        invoking,
+        rejected,
+    }
+}
+
+/// One record as the FILTER sees it: the record the function receives, with a payload the
+/// source carries as opaque text read as the document that text spells where it spells one —
+/// the same rule a queue source's body follows ([`super::sqs_poller`]).
+fn filter_event(source: ShardSource, envelope: &Value) -> Cow<'_, Value> {
+    match source {
+        // A DynamoDB stream record carries the change itself as members of its own — which
+        // mutation it was, the item's keys and the images the stream captures, each a typed
+        // attribute map — so the record the function receives IS the document a pattern names
+        // fields in.
+        ShardSource::DynamoDbStream => Cow::Borrowed(envelope),
+        ShardSource::Kinesis => kinesis_stream::filter_event(envelope),
+    }
 }
 
 /// Every open and closed shard of the mapped stream, in the order the stream reports them

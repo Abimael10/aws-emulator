@@ -166,13 +166,6 @@ const SQS_EVENT_SOURCE: &str = "aws:sqs";
 /// publishes for a message carrying message attributes and for no other.
 const RECORD_MD5_OF_MESSAGE_ATTRIBUTES: &str = "md5OfMessageAttributes";
 
-/// How much work ONE pass may spend deciding which of its messages its mapping's filter
-/// criteria admit, in the steps the shared matcher charges.
-///
-/// The pass is background work on a batch bounded by `BatchSize` against at most the
-/// patterns a mapping may carry, so this is the ONE explicit cap on the product of the two.
-const MAX_FILTER_STEPS_PER_BATCH: u64 = ::service_common::event_pattern::MAX_MATCH_STEPS_PER_REQUEST;
-
 /// How often a mapping whose batch keeps failing says so: the first failure, and every this
 /// many after it, so one mapping nothing can process cannot fill the log.
 const FAILURE_LOG_INTERVAL: u32 = 20;
@@ -947,64 +940,27 @@ fn renew_hold(target: &PollTarget, held: &HeldBatch<'_>, now: SystemTime) {
 /// Split `polled` into the messages `target`'s filter criteria admit and the ones they
 /// reject, by message id.
 ///
-/// A mapping carrying no criteria admits every message — there is nothing to determine
-/// otherwise. A mapping whose criteria this emulator cannot read also admits every message:
-/// a message rejected on a pattern nothing could evaluate would be deleted from the queue on
-/// the strength of a filter that was never applied, so the reading failure withholds the
-/// filter rather than the data.
+/// The decision about one record is the shared one
+/// ([`super::event_source_filter::Filters`]), including which criteria admit everything;
+/// what is this source's own is the record each message is matched AS
+/// ([`filter_event`]).
 fn partition_by_filters(
     target: &PollTarget,
     polled: &[PolledMessage],
 ) -> (Vec<String>, Vec<String>) {
-    let admit_all = || {
-        (
-            polled
-                .iter()
-                .map(|message| message.message_id.clone())
-                .collect(),
-            Vec::new(),
-        )
-    };
-    if target.filters.is_empty() {
-        return admit_all();
-    }
-    let Some(patterns) = parsed_filters(&target.filters) else {
-        ::tracing::warn!(
-            mapping = %target.uuid,
-            "an event source mapping carries filter criteria this emulator cannot read, so \
-             every message it polls is handed to its function"
-        );
-        return admit_all();
-    };
-    let mut budget = ::service_common::event_pattern::MatchBudget::new(MAX_FILTER_STEPS_PER_BATCH);
+    let criteria = super::event_source_filter::Filters::of(&target.uuid, &target.filters);
+    let mut budget = super::event_source_filter::budget();
     let mut admitted: Vec<String> = Vec::new();
     let mut rejected: Vec<String> = Vec::new();
     for message in polled {
         let event = filter_event(&message.record);
-        // "The collection of event patterns used to filter events": a record matching ANY
-        // of them is one the function is invoked with.
-        let matched = patterns.iter().any(|pattern| {
-            ::service_common::event_pattern::matches_within(pattern, &event, &mut budget)
-        });
-        if matched {
+        if criteria.admits(&event, &mut budget) {
             admitted.push(message.message_id.clone());
         } else {
             rejected.push(message.message_id.clone());
         }
     }
     (admitted, rejected)
-}
-
-/// The mapping's filter patterns, parsed by the ONE reading of the event-pattern language in
-/// this tree — `None` when any of them is not a pattern this emulator can match, because a
-/// filter is a conjunction of all of them and a partly applied one would admit or reject on
-/// criteria the mapping does not carry.
-fn parsed_filters(filters: &[String]) -> Option<Vec<Value>> {
-    let mut parsed: Vec<Value> = Vec::with_capacity(filters.len());
-    for pattern in filters {
-        parsed.push(::service_common::event_pattern::parse(pattern).ok()?);
-    }
-    Some(parsed)
 }
 
 /// One record as the FILTER sees it: the record the function receives, with a `body` that
@@ -1380,17 +1336,9 @@ fn polling_targets(store: &ComAmazonawsLambdaAwsgirapiserviceState) -> Vec<PollT
                         .unsigned_abs()
                         .into(),
                 ),
-                filters: mapping
-                    .filter_criteria
-                    .as_ref()
-                    .and_then(|criteria| criteria.filters.as_ref())
-                    .map(|filters| {
-                        filters
-                            .iter()
-                            .filter_map(|filter| filter.pattern.clone())
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                filters: super::event_source_filter::patterns_of(
+                    mapping.filter_criteria.as_ref(),
+                ),
                 reports_batch_item_failures: reports_batch_item_failures(
                     &mapping.function_response_types,
                 ),

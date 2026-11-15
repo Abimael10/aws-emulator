@@ -32,6 +32,11 @@
 //! The stream is read through the DynamoDB Streams surface of this same emulator
 //! (`DescribeStream`, `GetShardIterator`, `GetRecords`) over the in-process callback, so a
 //! record is consumed only through the data plane a client would consume it through.
+//!
+//! A third question those two modules also answer — what a `FilterCriteria` pattern is
+//! matched against — needs nothing of this source: the envelope above carries the change as
+//! members of its own, so the record the function receives is already the document a pattern
+//! names fields in (see [`super::filter_event`]).
 
 use super::{Clients, ShardRecord, ShardSourcedMapping, MAX_SHARD_PAGES};
 use crate::state::ShardCursor;

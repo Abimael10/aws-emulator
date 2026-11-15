@@ -245,6 +245,12 @@ pub use sqs_poller::{
     POLL_INTERVAL,
 };
 
+/// Which records of a source a mapping's `FilterCriteria` admit — the one decision BOTH
+/// pollers above take about each record they polled — lives in [`event_source_filter`],
+/// beside them, and is re-exported here for the same reason as [`capacity_provider`]: the
+/// mapping record carrying those criteria stays in this module.
+pub mod event_source_filter;
+
 /// Which records of a batch the function it was handed to reported it did not process — the
 /// ONE reading of a partial batch response, which both pollers above decide what to consume
 /// by — lives in [`batch_item_failures`], beside them. It is re-exported here for the same

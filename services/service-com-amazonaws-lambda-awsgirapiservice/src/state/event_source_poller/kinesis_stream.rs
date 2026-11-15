@@ -6,13 +6,16 @@
 //!
 //! Everything a mapping does with the batch once it has it — metering its age, invoking
 //! the function, checkpointing past what was processed — is the one rule for every shard
-//! source and lives in [`super`]. This module is only the Kinesis half of the two
-//! questions that differ per source, the other half being
-//! [`super::dynamodb_stream`].
+//! source and lives in [`super`]. This module is only the Kinesis half of the questions
+//! that differ per source, the other half being
+//! [`super::dynamodb_stream`]: how the shards are listed, what one record is handed over as,
+//! and what a `FilterCriteria` pattern is matched against ([`filter_event`]).
 //!
 //! The stream is read through the Kinesis surface of this same emulator (`ListShards`,
 //! `GetShardIterator`, `GetRecords`) over the in-process callback, so a record is consumed
 //! only through the data plane a client would consume it through.
+
+use std::borrow::Cow;
 
 use ::serde_json::{json, Value};
 
@@ -187,11 +190,40 @@ fn record_envelope(
     envelope
 }
 
+/// One record as the FILTER sees it: the record the function receives, with the payload it
+/// carries as base64 text read as the document that text spells when it spells one.
+///
+/// A function always receives `data` as the base64 text the event carries — the record's data
+/// "can be any payload" — but a filter names the fields INSIDE that payload, so for matching
+/// it is decoded and read as the JSON document it holds. A payload that is anything else, a
+/// bare scalar or bytes that are no document at all included, stays the text it is, so a
+/// pattern naming fields in it matches nothing rather than matching something else. It is the
+/// rule a queue source follows for a structured body
+/// ([`crate::state::sqs_poller`]), stated here because the member it is about is this
+/// source's own.
+pub(super) fn filter_event(envelope: &Value) -> Cow<'_, Value> {
+    let payload = envelope
+        .get("kinesis")
+        .and_then(|kinesis| kinesis.get("data"))
+        .and_then(Value::as_str)
+        .and_then(|data| ::aws_smithy_types::base64::decode(data).ok())
+        .and_then(|bytes| ::serde_json::from_slice::<Value>(&bytes).ok())
+        .filter(|document| document.is_object() || document.is_array());
+    match payload {
+        Some(document) => {
+            let mut event = envelope.clone();
+            event["kinesis"]["data"] = document;
+            Cow::Owned(event)
+        }
+        None => Cow::Borrowed(envelope),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, SystemTime};
 
-    use super::{record_envelope, ShardSourcedMapping};
+    use super::{filter_event, record_envelope, ShardSourcedMapping};
     use crate::state::event_source_poller::MAX_RECORDS_PER_BATCH;
     use crate::state::{ShardCursor, ShardSource};
 
@@ -205,6 +237,7 @@ mod tests {
             function_name: "consume".to_string(),
             invoke_identity_arn: Some("arn:aws:iam::000000000000:role/consume".to_string()),
             batch_size: MAX_RECORDS_PER_BATCH,
+            filters: Vec::new(),
             reports_batch_item_failures: false,
             attempts_allowed: None,
             on_failure_destination: None,
@@ -272,6 +305,63 @@ mod tests {
                 ::serde_json::json!(format!("shardId-000000000000:{sequence_number}")),
                 "case {case:?}: the record must be identified by its shard and sequence \
                  number, got {envelope:?}"
+            );
+        }
+    }
+
+    /// RULE: the record a filter is matched against is the record the function receives, with
+    /// the payload it carries as base64 text read as the document that text spells when it
+    /// spells one; every other payload stays the text the function receives.
+    ///
+    /// The rows differ along what the rule generalises over: what the payload holds (an
+    /// object, an array, a bare scalar, text that is no document at all, and no payload at
+    /// all).
+    #[test]
+    fn a_filter_sees_the_payload_as_the_document_it_spells() {
+        let run = run();
+        let sequence_number = "49590338271490256608559692538361571095921575989136588898";
+        // (case, the record's data, what the filter must see under `kinesis.data`)
+        let rows: Vec<(&str, &[u8], ::serde_json::Value)> = vec![
+            (
+                "a-json-object",
+                br#"{"city":"Seattle","count":2}"#,
+                ::serde_json::json!({ "city": "Seattle", "count": 2 }),
+            ),
+            ("a-json-array", b"[1,2,3]", ::serde_json::json!([1, 2, 3])),
+            (
+                "a-bare-scalar",
+                b"12",
+                ::serde_json::json!(::aws_smithy_types::base64::encode(b"12".as_slice())),
+            ),
+            (
+                "text-that-is-no-document",
+                b"not a document",
+                ::serde_json::json!(::aws_smithy_types::base64::encode(
+                    b"not a document".as_slice()
+                )),
+            ),
+            (
+                "an-empty-payload",
+                b"",
+                ::serde_json::json!(::aws_smithy_types::base64::encode(b"".as_slice())),
+            ),
+        ];
+        for (case, data, expected) in rows {
+            let record = record(sequence_number, data, None);
+            let envelope = record_envelope(&record, "shardId-000000000000", &run);
+            let event = filter_event(&envelope);
+            assert_eq!(
+                event["kinesis"]["data"], expected,
+                "case {case:?}: expected the filter to see {expected}, got {}",
+                event["kinesis"]["data"]
+            );
+            // Nothing else about the record changes: a filter names fields of the record the
+            // function receives.
+            assert_eq!(
+                event["eventSourceARN"],
+                ::serde_json::json!(run.stream_arn),
+                "case {case:?}: the record the filter sees must still name its stream, got \
+                 {event}"
             );
         }
     }

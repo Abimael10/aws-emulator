@@ -7028,3 +7028,15 @@ mod all_rs_is_a_canonical_declaration_list;
 //! first item one is `E0753` and compiles no suite of this target, so what goes below is a
 //! DECLARATION, never a note about one.
 //! leaving a note below.
+//! `#[path]`/`mod` pair, keeping the list sorted: ONE pair per suite and nothing else, so
+//! a landing has one place to insert and nothing to keep consistent. A suite that is not
+//! declared here compiles nowhere and its tests never run, and a suite left at the top
+//! level of `tests/` fails the build. Declare each suite exactly ONCE: this is one crate
+//! root, so a second `mod` for the same name is `E0428` and fails every suite in this
+//! target. An inner doc comment (`//!`) is legal only BEFORE the first item, so THESE
+//! lines are the only place one may stand — appended further down this file one is `E0753`
+//! and compiles nothing. `all/all_rs_declares_each_suite_once.rs` and
+//! leaving a note here. WHY a suite belongs to this target — which services have to agree
+//! for its rule to hold — is stated in that suite's OWN module docs, which is the one place
+//! it cannot drift from the code it describes; the notes landings had appended to the tail
+//! of this file are kept in `all/appended_notes.rs` instead.

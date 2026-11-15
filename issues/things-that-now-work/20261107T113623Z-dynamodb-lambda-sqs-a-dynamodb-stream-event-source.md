@@ -36,3 +36,23 @@ Actual (emulator): the mapping is created and reaches Enabled, both put_item cal
 3. put_item(pk='row-1', v='first') then put_item(pk='row-1', v='second') BEFORE creating the mapping (so the stream holds one INSERT followed by one MODIFY).
 4. lambda.create_event_source_mapping(EventSourceArn=<LatestStreamArn>, FunctionName=<fn>, StartingPosition='TRIM_HORIZON', BatchSize=10, MaximumBatchingWindowInSeconds=1, FilterCriteria={'Filters':[{'Pattern':'{"eventName": ["INSERT"]}'}]}) and wait until the mapping State is 'Enabled'.
 5. Long-poll the output queue for a message whose JSON body has eventName=='INSERT'. Expected: it arrives (and no eventName=='MODIFY' body ever does). Observed: no message arrives at all and the check runs to its deadline.
+
+## Resolution note
+
+The cause this report names is fixed: an event source mapping's `FilterCriteria` is now evaluated
+per record for both SHARD sources (`services/service-com-amazonaws-lambda-awsgirapiservice/src/state/event_source_poller.rs`,
+deciding with the one reading of the member in
+`src/state/event_source_filter.rs`), so exactly the records a pattern matches are handed to the
+function and the position still advances past the ones it rejects. The scenario above is driven end
+to end over the wire — table with a `NEW_AND_OLD_IMAGES` stream, least-privilege execution role,
+python handler forwarding each record it is handed to an SQS queue, `TRIM_HORIZON`, both items
+written before the mapping — by
+`services/service-com-amazonaws-lambda-awsgirapiservice/tests/all/dynamodb_stream_event_source_filter_criteria.rs`:
+the INSERT's message arrives on the queue and the MODIFY's never does.
+
+What is NOT verified green is this report's own replay key (`_collect#19|Timeout`): replaying the
+recorded unit still ends in the harness's "Check timed out after 60.0s" inside the check's collect
+step, with no error from any call. The delivery path that key blames is exercised by the suite above
+and by `tests/all/dynamodb_stream_event_source_delivery.rs`, and a 3-second function `Timeout` and an
+execution role with no `logs` grant were both ruled out as the cause, so the residual timeout is not
+this cause; a later reader should not take the key as verified.
