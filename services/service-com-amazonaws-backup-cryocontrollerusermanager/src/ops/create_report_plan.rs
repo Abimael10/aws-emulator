@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateReportPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateReportPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateReportPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts a report plan into [`crate::state`] and answers from it: the name it
+//! is stored under, the ARN this service mints for it and the instant it was
+//! stored. Every later read of the plan reports the body stored here and the
+//! deployment status this record's own clock moves.
+//!
+//! A report plan is addressed by name, so the body is stored verbatim except for
+//! the members the model gives a rule for (the delivery formats and
+//! `NumberOfFrameworks` — see [`crate::state::stored_report_delivery_channel`]
+//! and [`crate::state::stored_report_setting`]). A create that repeats an
+//! `IdempotencyToken` already recorded answers with the plan that token made and
+//! makes no second one — the model documents that retrying with the same token
+//! "results in a success message with no action taken"; any OTHER create naming
+//! a report plan this account already holds is refused with
+//! `AlreadyExistsException`, which is what the model documents for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +181,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateReportPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateReportPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateReportPlan"))
+        // `ReportPlanName`, `ReportDeliveryChannel` and `ReportSetting` are
+        // `@required`, as are the channel's `S3BucketName` and the setting's
+        // `ReportTemplate`, and the name targets a patterned, length-bound
+        // shape: an absent or malformed one is refused before this handler runs,
+        // and `crate::service` words that refusal as this service's own
+        // `MissingParameterValueException` / `InvalidParameterValueException`.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateReportPlanErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the backup vault store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // The body rules are `crate::state`'s, shared with every other operation
+        // that stores a report plan body, so the two cannot drift.
+        if let Some(refusal) = crate::state::rejected_report_plan_body(
+            Some(&input.report_setting),
+            Some(&input.report_delivery_channel),
+        ) {
+            return Err(CreateReportPlanErrorModeled::InvalidParameterValueException(refusal).into());
+        }
+
+        // The tag set is sized by the request, so it is capped BEFORE any of it
+        // is stored — the same ceiling `TagResource` applies to the tags of a
+        // resource, so a plan cannot be created carrying more tags than a
+        // tagging call may put on it. AWS answers the same modelled error for a
+        // request past the number of items it allows.
+        let tags = input.report_plan_tags.unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateReportPlanErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "a resource may carry at most {} tags",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // Materialise the deployments the clock has already made due, so a
+        // replayed token answers from the plan's current state rather than from
+        // the status it carried when it was made.
+        store.settle_report_plans(now);
+
+        // A repeated `IdempotencyToken` replays the report plan that token
+        // created: no second plan, and the same identifiers the first call
+        // answered with. Resolved BEFORE the name check, since a replay
+        // necessarily repeats the name of the plan it created.
+        if let Some(existing) = input
+            .idempotency_token
+            .as_deref()
+            .and_then(|token| store.report_plan_by_idempotency_token(token))
+        {
+            return Ok(report_plan_created(existing));
+        }
+
+        // A create that is not the replay above and names a report plan this
+        // account already holds is refused: "If you call CreateReportPlan with a
+        // plan that already exists, you receive an AlreadyExistsException
+        // exception" (the model's doc for this operation).
+        if store.report_plans.contains_key(&input.report_plan_name) {
+            return Err(CreateReportPlanErrorModeled::AlreadyExistsException(
+                crate::state::report_plan_already_exists(&input.report_plan_name),
+            )
+            .into());
+        }
+
+        // The store is in memory and every request can add to it, so the number
+        // of report plans it keeps is bounded. AWS answers the same modelled
+        // error once an account reaches its own report plan quota.
+        if store.report_plans.len() >= crate::state::MAX_REPORT_PLANS {
+            return Err(CreateReportPlanErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this emulator keeps at most {} report plans",
+                        crate::state::MAX_REPORT_PLANS
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let uniquifier = store.next_id(now);
+        let record = crate::state::ReportPlanRecord {
+            arn: crate::state::report_plan_arn(&region, &input.report_plan_name, &uniquifier),
+            name: input.report_plan_name,
+            description: input.report_plan_description,
+            report_setting: crate::state::stored_report_setting(input.report_setting),
+            report_delivery_channel: crate::state::stored_report_delivery_channel(
+                input.report_delivery_channel,
+            ),
+            creation_time: now,
+            // The plan is not deployed the instant the create answers, so it
+            // starts in the non-terminal status AWS reports for one and settles
+            // when the clock makes that due.
+            deployment_status: crate::state::REPORT_PLAN_DEPLOYMENT_STATUS_CREATE_IN_PROGRESS
+                .to_string(),
+            settles_at: now
+                .checked_add(crate::state::REPORT_PLAN_SETTLE_AFTER)
+                .unwrap_or(now),
+            idempotency_token: input.idempotency_token,
+            tags: tags.into_iter().collect(),
+            // No report job of this plan has run yet, so neither execution
+            // instant is there to report.
+            last_attempted_execution_time: None,
+            last_successful_execution_time: None,
+        };
+        let output = report_plan_created(&record);
+        store.report_plans.insert(record.name.clone(), record);
+        Ok(output)
+    }
+}
+
+/// What this operation answers for the report plan it stored — the same answer a
+/// replayed `IdempotencyToken` gets, so a retry cannot report identifiers that
+/// differ from the ones the first call reported.
+fn report_plan_created(record: &crate::state::ReportPlanRecord) -> CreateReportPlanOutput {
+    CreateReportPlanOutput {
+        report_plan_name: Some(record.name.clone()),
+        report_plan_arn: Some(record.arn.clone()),
+        creation_time: Some(::aws_smithy_types::DateTime::from(record.creation_time)),
     }
 }

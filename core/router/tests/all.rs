@@ -1333,3 +1333,23 @@ mod zz_probe_whole_emulator;
 // belongs in that suite's own module header rather than here. Every comment in this file
 // is an ordinary one, this block included: with no inner doc comment anywhere, no merge of
 // two landings can leave one past the first item.
+// Single integration-test target for the router: the CANONICAL DECLARATION LIST of its
+// cross-service suites, and nothing else.
+// `all/all_rs_is_a_canonical_declaration_list.rs` pins that shape: one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file under `tests/all/`, sorted
+// by name, and no other line. Put a new suite at `tests/all/<name>.rs` and insert its pair
+// into the sorted list below — nothing else, so two branches landing at once insert two
+// lines in two places and have no prose to duplicate, re-word or mistype, and nothing is
+// appended past the list.
+// EVERY comment in this file is an ORDINARY `//` one, this block included, and that is
+// deliberate: an inner doc comment is legal only before the first item, so one that lands
+// past the declarations is `E0753` and compiles no suite of this target. With no `//!` and
+// no `#![…]` anywhere, no merge of two landings can put one past the first item.
+// level of `tests/` fails the build; and a suite declared twice is `E0428`, which fails every
+// suite in this target. `all/all_rs_declares_each_suite_once.rs` and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check those two rules, for this
+// file and for every service crate's `tests/all.rs`, so a note about either belongs there.
+// (`tests/boot_serve.rs`) — which the layout check refuses. The `#[path]` is what points each
+// declaration into `tests/all/`. What a suite covers, and why it lives in this cross-service
+// target rather than in one service crate's own, belongs in that suite's own module header;
+// `all/appended_notes.rs` keeps the notes earlier landings had appended here.

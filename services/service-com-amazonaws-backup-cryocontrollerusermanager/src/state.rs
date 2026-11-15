@@ -119,6 +119,12 @@ pub use restore_metadata::*;
 mod restore_testing;
 pub use restore_testing::*;
 
+/// The report plans this service stores, the one read projection of one and the
+/// reading of a report plan body every operation that stores one shares.
+/// Re-exported for the reason given on `events`.
+mod report_plan;
+pub use report_plan::*;
+
 /// The tiering configurations this service stores, and the two projections its
 /// reads answer from. Re-exported for the reason given on `events`.
 mod tiering;
@@ -3095,6 +3101,10 @@ pub struct ComAmazonawsBackupCryocontrollerusermanagerState {
     pub frameworks: BTreeMap<String, FrameworkRecord>,
     /// Legal holds by `LegalHoldId`. Bounded by [`MAX_LEGAL_HOLDS`].
     pub legal_holds: BTreeMap<String, LegalHoldRecord>,
+    /// Report plans by `ReportPlanName` — the name a report plan is addressed
+    /// by, so the map itself is what makes that name unique to the account.
+    /// Bounded by [`MAX_REPORT_PLANS`].
+    pub report_plans: BTreeMap<String, ReportPlanRecord>,
     /// Restore jobs by `RestoreJobId`. Bounded by [`MAX_RESTORE_JOBS`].
     pub restore_jobs: BTreeMap<String, RestoreJobRecord>,
     /// Restore testing plans by `RestoreTestingPlanName` — the name a restore
