@@ -1991,3 +1991,13 @@ mod cloudtrail_iam_credential_write_audit;
 // `all/every_suite_file_is_declared.rs` check that shape.
 #[path = "all/all_rs_carries_no_inner_doc_comment.rs"]
 mod all_rs_carries_no_inner_doc_comment;
+// name, and NO other line. Put a new suite at `tests/all/<name>.rs` and insert its pair into
+// the sorted list; what a suite covers, and why it belongs to this cross-service target
+// rather than to one service crate's own, is stated in that suite's own module doc, and a
+// note about THIS file belongs in `all/appended_notes.rs`, which is declared below like any
+// other module.
+// comment (`//!`) past the first item is `E0753`. Each of those fails EVERY suite of this
+// pin the shape above. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves
+// to a SIBLING of this file, which the layout check refuses: the `#[path]` is what points
+// deliberate: with no `//!` anywhere, no merge of two landings can leave one past the first
+// item.

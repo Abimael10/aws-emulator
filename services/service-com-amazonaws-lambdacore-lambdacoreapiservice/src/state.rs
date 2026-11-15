@@ -138,6 +138,24 @@ pub const MAX_IDEMPOTENCY_TOKENS: usize = 1_000;
 /// zero so a caller acting straight after the call still observes the transient
 /// state. The instant it falls due is stored on the record and materialised by
 /// whichever later call reads it — nothing sleeps.
+///
+/// Both halves of that are load bearing, so neither a longer nor a zero span
+/// serves this service:
+///
+/// * CONVERGENCE. The outcome is owed by the clock alone: it falls due at the
+///   instant stored on the record whether or not anybody calls, and the FIRST
+///   call at or after that instant reports it, whichever operation makes it
+///   (every reporting handler settles the record it reads). So a client
+///   following `CreateNetworkConnector`'s instruction to "poll the connector
+///   state until it reaches `ACTIVE`" converges, and no number of reads moves
+///   the instant it converges at.
+/// * THE TRANSIENT WINDOW. `UpdateNetworkConnector` ("the connector must be in
+///   `ACTIVE` state to accept updates") and `DeleteNetworkConnector` ("you can
+///   delete connectors in `ACTIVE` or `FAILED` states") are both stated over a
+///   connector that is not provisioned yet, so their modelled
+///   `ResourceConflictException` exists only while a freshly created connector
+///   is observably `PENDING` through the operations that report it — not just in
+///   the create's own answer.
 pub const LIFECYCLE_TRANSITION: Duration = Duration::from_millis(500);
 
 /// What the clock owes a connector once its transition falls due.

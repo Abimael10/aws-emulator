@@ -23,6 +23,9 @@ mod delete_idempotence;
 #[path = "all/identifier_refusals.rs"]
 mod identifier_refusals;
 
+#[path = "all/lifecycle_convergence.rs"]
+mod lifecycle_convergence;
+
 #[path = "all/network_connector_lifecycle.rs"]
 mod network_connector_lifecycle;
 
