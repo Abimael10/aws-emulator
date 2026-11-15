@@ -23,5 +23,12 @@
 //! declaration pairs scattered through it. The pairs were moved into the places their names
 //! sort to and the prose was dropped, for the same reason as the three runs before it.
 //!
+//! A FIFTH run had grown back the same way while this note was being written — each landing
+//! that follows one of these cleanups re-appends the run — with several more landings' pairs
+//! inside it, one of them a SECOND declaration of a suite already declared in the sorted list,
+//! which compiles neither copy. Every such pair was moved into the place its name sorts to, the
+//! duplicate was left at that one place, and the prose was dropped, for the same reason as the
+//! four runs before it.
+//!
 //! The module stays declared because it is a file under `tests/all/`, which this crate's
 //! build script requires a declaration for.

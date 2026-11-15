@@ -1508,3 +1508,5 @@ mod bedrock_evaluation_job_saves_its_results_in_s3;
 // `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`
 // pin that shape; `all/appended_prose.rs` keeps what landings had appended here.
 // Single integration-test target for the router: the declaration list, and nothing else.
+#[path = "all/cloudformation_http_api_lambda_invoke_permission.rs"]
+mod cloudformation_http_api_lambda_invoke_permission;
