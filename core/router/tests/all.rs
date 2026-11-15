@@ -1239,3 +1239,27 @@ mod zz_probe_whole_emulator;
 // like an inner doc comment, is legal only before the first item, so it stands here rather
 // than in the list below.
 #![allow(clippy::doc_lazy_continuation)]
+//! Single integration-test target for the router: a canonical declaration list.
+//!
+//! This file holds its module doc, then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair
+//! per suite file under `tests/all/`, sorted by name, and no other line. Put a new suite at
+//! `tests/all/<name>.rs` and insert its pair into the sorted list below; what that suite
+//! covers, and why it drives the assembled router rather than one service crate, belongs in
+//! its OWN module doc, where it is read beside the test it explains, and a note about THIS
+//! file belongs in `all/appended_notes.rs`.
+//! Each of these fails EVERY suite of this target rather than one, which is why nothing else
+//! stands here: a suite no `mod` names compiles nowhere and its tests never run (and a suite
+//! left at the top level of `tests/` fails the build outright); a suite declared twice is
+//! `E0428`; and an inner doc comment (`//!`) is legal only BEFORE the first item, so THIS
+//! BLOCK IS THE ONLY PLACE ONE MAY STAND — past the first declaration it is `E0753`, which is
+//! how the tail of this file, grown by concurrent landings into hundreds of re-typed copies of
+//! this header, came to compile no suite at all. `all/all_rs_declares_each_suite_once.rs`,
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
+//! `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs` and
+//! `all/declaration_roots_are_canonical_and_complete.rs` pin all of it, for this file and for
+//! every service crate's `tests/all.rs`, so check there rather than leaving a note here.
+//! The `#[path]` attribute is what points each declaration into `tests/all/`: this file is a
+//! test-target CRATE ROOT, where a bare `mod` would resolve to a sibling of it, which the
+//! layout check refuses.
+#[path = "all/cloudtrail_iam_credential_write_audit.rs"]
+mod cloudtrail_iam_credential_write_audit;
