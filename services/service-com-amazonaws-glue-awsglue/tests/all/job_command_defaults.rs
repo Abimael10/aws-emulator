@@ -237,8 +237,9 @@ async fn an_update_stores_its_command_with_the_same_python_version_rule() {
 /// The version the service fills in is part of the definition a REPEAT create is compared
 /// against: a second create submitting the same definition is still the retry of the create
 /// that stored it ("It must be unique in your account" — the name is the create's
-/// idempotency identifier), and one submitting a different `PythonVersion` has associated
-/// that identifier with two different records, which is the idempotency mismatch.
+/// idempotency identifier), so it is answered with the stored name, and one submitting a
+/// different `PythonVersion` has associated that identifier with two different records,
+/// which is the idempotency mismatch.
 ///
 /// The rows differ along how the second create states the version: not at all, as the value
 /// the service filled in, and as another value the member admits.
@@ -246,22 +247,19 @@ async fn an_update_stores_its_command_with_the_same_python_version_rule() {
 async fn the_filled_version_is_part_of_the_definition_a_repeat_create_is_compared_against() {
     let router = emulator();
 
-    // (case, the second create's PythonVersion, the error code it must be refused with)
-    let rows: Vec<(&str, Option<&str>, &str)> = vec![
-        (
-            "the repeat names no version either",
-            None,
-            "AlreadyExistsException",
-        ),
+    // (case, the second create's PythonVersion, the error code it must be refused with, or
+    // `None` where it is the retry and answers the stored name)
+    let rows: Vec<(&str, Option<&str>, Option<&str>)> = vec![
+        ("the repeat names no version either", None, None),
         (
             "the repeat states the version the service filled in",
             Some(DEFAULT_PYTHON_VERSION),
-            "AlreadyExistsException",
+            None,
         ),
         (
             "the repeat names another version",
             Some("2"),
-            "IdempotentParameterMismatchException",
+            Some("IdempotentParameterMismatchException"),
         ),
     ];
 
@@ -285,24 +283,40 @@ async fn the_filled_version_is_part_of_the_definition_a_repeat_create_is_compare
             &json!({ "Name": job, "Role": ROLE_ARN, "Command": repeat }),
         )
         .await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: a second create under a stored name is refused, got {status} with \
-             {answer}"
-        );
-        assert!(
-            error_code(&answer).contains(expected),
-            "case {case:?}: expected {expected}, got {answer} ({})",
-            error_message(&answer)
-        );
+        match expected {
+            Some(expected) => {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: a second create submitting another definition is refused, \
+                     got {status} with {answer}"
+                );
+                assert!(
+                    error_code(&answer).contains(expected),
+                    "case {case:?}: expected {expected}, got {answer} ({})",
+                    error_message(&answer)
+                );
+            }
+            None => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: a second create submitting the stored definition answers \
+                     200, got {status} with {answer}"
+                );
+                assert_eq!(
+                    answer.get("Name").and_then(Value::as_str),
+                    Some(job.as_str()),
+                    "case {case:?}: the answer must name the stored job, got {answer}"
+                );
+            }
+        }
 
-        // Whichever refusal it earned, the stored definition is the one the first create
+        // Whichever answer it earned, the stored definition is the one the first create
         // stored.
         let stored = command_of(&router, &job).await;
         assert_eq!(
             stored.get("PythonVersion").and_then(Value::as_str),
             Some(DEFAULT_PYTHON_VERSION),
-            "case {case:?}: the refused create changes nothing, got {stored}"
+            "case {case:?}: the second create changes nothing, got {stored}"
         );
     }
 }

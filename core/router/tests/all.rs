@@ -1349,3 +1349,19 @@ mod cloudformation_provisions_appsync_event_and_merged_apis;
 // doc list item; the lint is allowed here so a header line is a header line rather than a build
 // failure. An inner attribute, like an inner doc comment, is legal only before the first item,
 // so it stands here rather than in the list.
+// Single integration-test target for the router: the canonical DECLARATION LIST of its
+// cross-service suites, and nothing else.
+// file under `tests/all/`, sorted by name, and no other line — no prose between the pairs, no
+// blank line, and nothing after the last pair. Two branches landing at once then insert two
+// lines in two places and have no prose to duplicate, re-word or mistype, which is what had
+// gone wrong here: the tail of this file had grown hundreds of re-typed copies of its header.
+// `E0753` and compiles no suite of this target; with none anywhere in the file, no merge of
+// two landings can leave one past the first item. A suite file no `mod` here names is compiled
+// nowhere, and a second `mod` for one name is `E0428`. `tests/all.rs` is a test-target CRATE
+// ROOT, so a bare `mod` would resolve to a SIBLING of this file, which the layout check
+// refuses: the `#[path]` above each `mod` is what points it into `tests/all/`.
+// belongs in that suite's OWN module header, where it is read beside the test it explains; the
+// notes earlier landings appended to the tail of this file live in `all/appended_notes.rs`,
+// `all/appended_notes_tail.rs`, `all/appended_header_notes.rs` and `all/appended_prose.rs`,
+// each declared below like any other file. An inner attribute, like an inner doc comment, is
+// legal only before the first item, so the one this target needs stands here.

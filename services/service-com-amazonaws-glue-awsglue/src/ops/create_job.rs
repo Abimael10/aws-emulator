@@ -11,6 +11,15 @@
 //! [`crate::state::JobEntry::from_create_input`], so every read reports the same
 //! projection.
 //!
+//! The name is this create's idempotency identifier, so a repeat create that submits the
+//! stored job definition is a RETRY: it is answered with the stored name and writes
+//! nothing ([`crate::state::JobEntry::matches_create_input`] decides that), and only a
+//! repeat submitting a DIFFERENT definition is refused — with
+//! `IdempotentParameterMismatchException`, which is how the recorded responses word this
+//! name collision. That is why nothing here constructs the `AlreadyExistsException` the
+//! model also declares for this operation: no repeat of a stored name earns it, so an
+//! already-exists leg added back here would answer a retry the recording answers 200.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -364,9 +373,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "It must be unique in your account." Glue is regional, so the name has to be
         // free in THIS Region: the same name in another Region names another job. The
         // name is also this create's idempotency identifier, so a create under a name
-        // already taken is told which of the two it is: a retry of the create that stored
-        // the job definition, or one request associating that identifier with a second,
-        // different definition.
+        // already taken is told which of the two it is: a RETRY of the create that stored
+        // the job definition, which this operation is idempotent over — it is answered
+        // with the stored name and writes nothing, so a client that resubmits an unchanged
+        // definition proceeds — or one request associating that identifier with a second,
+        // different definition, which is the one case
+        // `IdempotentParameterMismatchException` ("the same unique identifier was
+        // associated with two different records") states.
         if let Some(stored) = store.job(&region, &input.name) {
             if !stored.matches_create_input(&input) {
                 return Err(CreateJobErrorModeled::IdempotentParameterMismatchException(
@@ -380,12 +393,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            return Err(CreateJobErrorModeled::AlreadyExistsException(
-                AlreadyExistsException {
-                    message: Some(crate::state::messages::JOB_ALREADY_EXISTS.to_string()),
-                },
-            )
-            .into());
+            // The STORED name, read off the record this create is a retry of, so the
+            // answer names what is in the store rather than echoing the request.
+            let stored_name = stored.name.clone();
+            ::tracing::info!(
+                operation = "CreateJob",
+                job = %stored_name,
+                region = %region,
+                "a repeat CreateJob submitted the stored job definition, so nothing was written"
+            );
+            return Ok(CreateJobOutput {
+                // "The unique name that was provided for this job definition."
+                name: Some(stored_name),
+            });
         }
         // The store is resident memory and this create is reachable by any caller, so
         // the number of records one process will hold is bounded. Past the ceiling the

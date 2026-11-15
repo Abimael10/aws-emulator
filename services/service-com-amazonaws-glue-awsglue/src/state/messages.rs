@@ -418,18 +418,6 @@ pub const JOB_NOT_FOUND: &str = "Job not found.";
 pub const MAX_CAPACITY_EXCLUDES_WORKERS: &str =
     "Please do not set Max Capacity if using Worker Type and Number of Workers.";
 
-/// `CreateJob` for a `Name` the request's Region already holds a job definition
-/// under, where the definition submitted is the stored one — so the create is a
-/// retry of the one that stored it rather than a second, different job under one
-/// name ([`already_submitted_with_different_configuration`] words that one).
-///
-/// NOT recorded, because what the corpus records for this name collision is the
-/// idempotency mismatch: inferred from the recorded `CreateDatabase` duplicate, like
-/// [`CRAWLER_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of
-/// the requested name, which is also how the recorded job-definition miss above
-/// withholds it.
-pub const JOB_ALREADY_EXISTS: &str = "Job already exists.";
-
 /// `CreateCrawler` for an S3 target whose `EventQueueArn` (or `DlqEventQueueArn`) names a
 /// queue the crawler's `Role` is shown nothing about: its policies admit no call of that
 /// queue's own service on it ([`super::event_queue_refusal`]).

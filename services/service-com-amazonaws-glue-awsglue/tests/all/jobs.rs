@@ -562,7 +562,9 @@ async fn the_timeout_bounds_are_enforced() {
 
 /// A request `CreateJob` cannot serve is refused with the error the model names for it,
 /// and nothing is stored. The rows differ along which part of the request is at fault:
-/// the name's uniqueness, the role, and the two ways of naming capacity. The job's
+/// the name's uniqueness — which is the create's idempotency identifier, so a second
+/// create under a taken name asking for ANOTHER definition is the mismatch — the role,
+/// and the two ways of naming capacity. The job's
 /// COMMAND is not among them: `JobCommand$Name` is an unconstrained string the create
 /// stores as submitted (see [`crate::job_command_references`]).
 #[tokio::test]
@@ -572,10 +574,16 @@ async fn an_unservable_create_is_refused_with_the_modeled_error() {
 
     let cases: Vec<(&str, Value, &str)> = vec![
         (
-            // "It must be unique in your account."
-            "a name already taken",
-            job_body("taken"),
-            "AlreadyExistsException",
+            // "It must be unique in your account." — so the name is this create's
+            // idempotency identifier, and a second create asking for a DIFFERENT
+            // definition under it has associated one identifier with two records.
+            "a name already taken, for another definition",
+            json!({
+                "Name": "taken",
+                "Role": ROLE_ARN,
+                "Command": { "Name": "glueetl", "ScriptLocation": "s3://etl-scripts/other.py" },
+            }),
+            "IdempotentParameterMismatchException",
         ),
         (
             "a blank role",

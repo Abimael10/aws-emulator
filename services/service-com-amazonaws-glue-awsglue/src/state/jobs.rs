@@ -754,20 +754,25 @@ impl JobEntry {
         }
     }
 
-    /// Whether this stored job definition is the one `input` asks to create, member for
-    /// member.
+    /// Whether this stored job definition is the one `input` asks to create.
     ///
     /// "It must be unique in your account" (`CreateJobRequest$Name`), so the name is what
     /// a create reuses when it submits a definition under one already taken: such a create
-    /// is a RETRY of the create that stored this record only when it asks for the very
-    /// same job, and otherwise it has associated one identifier with two different
+    /// is a RETRY of the create that stored this record — which the create answers with
+    /// the stored name, writing nothing — only when it asks for the very same job, and
+    /// otherwise it has associated one identifier with two different
     /// records — which is what the operation's `IdempotentParameterMismatchException`
     /// ("the same unique identifier was associated with two different records") states.
     ///
-    /// The comparison is over the whole stored definition, the tags included, because any
-    /// member of it is part of the job the caller asked for. It is made on the modelled
-    /// `Job` shape rendered by this service's own JSON codec rather than member by member:
-    /// the definition carries the `CodeGenConfigurationNodes` ETL graph, whose modelled
+    /// The comparison is over the job DEFINITION, which is the modelled `Job` shape a read
+    /// of this record reports. `Tags` are no part of that shape: they are a separately
+    /// addressed surface (`TagResource`/`UntagResource`/`GetTags`) that `CreateJob` merely
+    /// accepts alongside the definition, so a retry sending other tags — or, as a
+    /// retrying client's narrower request does, none at all — still asks for the same job.
+    ///
+    /// The definition is compared as the JSON this service's own codec renders for it
+    /// rather than member by member: the definition carries the `CodeGenConfigurationNodes`
+    /// ETL graph, whose modelled
     /// shapes derive no equality and hold `HashMap` members whose iteration order comes
     /// from a per-process hash seed, so neither `Debug` nor the rendered bytes of two equal
     /// graphs match while `serde_json::Value`'s own equality compares objects member by
@@ -780,9 +785,6 @@ impl JobEntry {
     pub fn matches_create_input(&self, input: &CreateJobInput) -> bool {
         let mut candidate = Self::from_create_input(input, self.created_on);
         candidate.last_modified_on = self.last_modified_on;
-        if self.tags != candidate.tags {
-            return false;
-        }
         match (
             rendered_shape(&Job::SCHEMA, &self.to_job()),
             rendered_shape(&Job::SCHEMA, &candidate.to_job()),

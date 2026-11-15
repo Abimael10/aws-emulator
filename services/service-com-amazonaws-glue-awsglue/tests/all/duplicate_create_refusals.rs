@@ -12,8 +12,8 @@
 //! (the business catalog), the `Message` carries that document. A create for a name
 //! already taken on an operation that models `IdempotentParameterMismatchException`
 //! ("the same unique identifier was associated with two different records") answers THAT
-//! error when the definition submitted is not the stored one, and
-//! `AlreadyExistsException` only when it is.
+//! error when the definition submitted is not the stored one, and — the name being that
+//! create's idempotency identifier — answers its normal success when it IS the stored one.
 //!
 //! Each suite is a table whose rows differ along what the rule generalises over — which
 //! resource the collision is about, the name's value, casing, character set and length,
@@ -94,14 +94,6 @@ fn connection_body(name: &str) -> Value {
     })
 }
 
-fn job_body(name: &str) -> Value {
-    json!({
-        "Name": name,
-        "Role": ROLE_ARN,
-        "Command": { "Name": "glueetl", "ScriptLocation": "s3://etl-scripts/etl.py" },
-    })
-}
-
 fn schema_body(name: &str) -> Value {
     json!({
         "SchemaName": name,
@@ -160,13 +152,6 @@ fn collisions() -> Vec<Collision> {
             body: connection_body,
             code: "AlreadyExistsException",
             message: |_| "Connection already exists.".to_string(),
-        },
-        Collision {
-            case: "job definition re-submitted unchanged",
-            operation: "CreateJob",
-            body: job_body,
-            code: "AlreadyExistsException",
-            message: |_| "Job already exists.".to_string(),
         },
         Collision {
             case: "schema set",
@@ -259,13 +244,14 @@ async fn a_duplicate_glossary_create_carries_a_json_document_as_its_message() {
 
 /// `CreateJob` treats the job name as the create's idempotency identifier: a second
 /// create under a name already taken that submits a DIFFERENT definition is the
-/// mismatch, and one that submits the stored definition is the duplicate. Either way the
-/// stored definition is left as the first create wrote it.
+/// mismatch, and one that submits the stored definition is the retry of the create that
+/// stored it, answered with the stored name. Either way the stored definition is left as
+/// the first create wrote it.
 ///
 /// The rows differ along which member of the definition the second create changes — a
-/// required member, an optional one, a server-defaulted one, a map, a list-valued
-/// connection list and the tags — and two rows change nothing but the ORDER of a map's
-/// entries, which is not a different definition.
+/// required member, an optional one, a server-defaulted one, a map and a list-valued
+/// connection list — beside the tags, which are no part of the definition compared, and
+/// the identical re-submission.
 #[tokio::test]
 async fn a_second_create_job_is_classified_by_the_definition_it_submits() {
     /// One row: how the second create's definition differs, and whether that makes it
@@ -327,9 +313,11 @@ async fn a_second_create_job_is_classified_by_the_definition_it_submits() {
             differs: true,
         },
         Row {
+            // `Tags` are a separately addressed surface rather than part of the job
+            // definition, so a repeat carrying other tags still asks for the stored job.
             case: "another tag",
             patch: json!({ "Tags": { "owner": "platform" } }),
-            differs: true,
+            differs: false,
         },
     ];
 
@@ -359,36 +347,45 @@ async fn a_second_create_job_is_classified_by_the_definition_it_submits() {
         }
 
         let (status, body) = call(&router, "CreateJob", &second).await;
-        assert_eq!(
-            status, 400,
-            "case {}: a name already taken must be refused with 400, got {status} with {body}",
-            row.case
-        );
-        let (expected_code, expected_message) = if row.differs {
-            (
-                "IdempotentParameterMismatchException",
+        if row.differs {
+            assert_eq!(
+                status, 400,
+                "case {}: another definition under a taken name must be refused with 400, got \
+                 {status} with {body}",
+                row.case
+            );
+            assert!(
+                error_code(&body).contains("IdempotentParameterMismatchException"),
+                "case {}: expected IdempotentParameterMismatchException, got {body}",
+                row.case
+            );
+            assert_eq!(
+                error_message(&body),
                 "Job already submitted with different configuration.",
-            )
+                "case {}: unexpected mismatch wording, got {body}",
+                row.case
+            );
         } else {
-            ("AlreadyExistsException", "Job already exists.")
-        };
-        assert!(
-            error_code(&body).contains(expected_code),
-            "case {}: expected {expected_code}, got {body}",
-            row.case
-        );
-        assert_eq!(
-            error_message(&body),
-            expected_message,
-            "case {}: expected Message {expected_message:?}, got {body}",
-            row.case
-        );
+            assert_eq!(
+                status, 200,
+                "case {}: the stored definition re-submitted must answer 200, got {status} with \
+                 {body}",
+                row.case
+            );
+            assert_eq!(
+                body.get("Name").and_then(Value::as_str),
+                Some(name.as_str()),
+                "case {}: the answer must name the stored job, got {body}",
+                row.case
+            );
+        }
 
-        // Neither refusal writes: the stored definition is still the first create's.
+        // Neither answer writes: the stored definition is still the first create's.
         let after = ok(&router, "GetJob", &json!({ "JobName": &name })).await;
         assert_eq!(
             after, read,
-            "case {}: a refused create must change nothing; expected {read}, got {after}",
+            "case {}: a second create under a taken name must change nothing; expected {read}, \
+             got {after}",
             row.case
         );
     }
@@ -396,7 +393,7 @@ async fn a_second_create_job_is_classified_by_the_definition_it_submits() {
 
 /// The same definition re-submitted with its maps written in another ORDER is the stored
 /// definition, not another one: a map is a set of entries, so a retry whose JSON lists
-/// them differently is the duplicate and not the mismatch.
+/// them differently is the retry and not the mismatch.
 #[tokio::test]
 async fn a_map_written_in_another_order_is_the_same_job_definition() {
     let router = emulator();
@@ -417,15 +414,18 @@ async fn a_map_written_in_another_order_is_the_same_job_definition() {
     });
 
     ok(&router, "CreateJob", &first).await;
-    assert_refusal(
-        &router,
-        "the same definition with its maps re-ordered",
-        "CreateJob",
-        &reordered,
-        "AlreadyExistsException",
-        "Job already exists.",
-    )
-    .await;
+    let (status, answer) = call(&router, "CreateJob", &reordered).await;
+    assert_eq!(
+        status, 200,
+        "case the same definition with its maps re-ordered: expected 200, got {status} with \
+         {answer}"
+    );
+    assert_eq!(
+        answer.get("Name").and_then(Value::as_str),
+        Some("ordered-maps"),
+        "case the same definition with its maps re-ordered: the answer must name the stored job, \
+         got {answer}"
+    );
 }
 
 /// A classifier this account holds none of is refused with the sentence the service words
