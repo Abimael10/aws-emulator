@@ -12,7 +12,7 @@
 
 use std::ops::Deref;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 use service_com_amazonaws_connect_amazonconnectservice::state as connect_state;
@@ -206,15 +206,16 @@ pub fn error_code(response: &Value) -> &str {
         .unwrap_or("<no __type>")
 }
 
-/// Onboard `instance` so it is a campaign target by the time this returns:
-/// `CreateCampaign` mints a campaign only for an instance whose onboarding job has
-/// SUCCEEDED, which it does one `ONBOARDING_JOB_DURATION` after
-/// `StartInstanceOnboardingJob` — which in turn onboards only an instance the
-/// account's Connect registry holds, so the instance is registered there first.
-///
-/// Idempotent and cheap to repeat: an instance whose job has already succeeded is
-/// left alone, so the wait is paid once per instance rather than once per campaign.
-pub async fn onboard_instance(router: &Harness, region: &str, instance: &str) {
+/// The error message a failure response carries (restJson1 puts it in `message`).
+pub fn error_message(response: &Value) -> &str {
+    response
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("<no message>")
+}
+
+/// Whether `GetInstanceOnboardingJobStatus` reports `instance`'s job as SUCCEEDED.
+pub async fn onboarding_succeeded(router: &Harness, region: &str, instance: &str) -> bool {
     let (status, body) = call(
         router,
         region,
@@ -223,12 +224,27 @@ pub async fn onboard_instance(router: &Harness, region: &str, instance: &str) {
         &Value::Null,
     )
     .await;
-    if status == 200
+    status == 200
         && body
             .pointer("/connectInstanceOnboardingJobStatus/status")
             .and_then(Value::as_str)
             == Some("SUCCEEDED")
-    {
+}
+
+/// Onboard `instance` so it is a campaign target by the time this returns:
+/// `CreateCampaign` mints a campaign only for an instance whose onboarding job has
+/// SUCCEEDED, which it does one `ONBOARDING_JOB_DURATION` after
+/// `StartInstanceOnboardingJob` — which in turn onboards only an instance the
+/// account's Connect registry holds, so the instance is registered there first.
+///
+/// The wait is on the CONDITION, not on a span of the clock: the job's reported
+/// status is read again until it is SUCCEEDED, under a deadline generous enough
+/// that a loaded host reaches it too.
+///
+/// Idempotent and cheap to repeat: an instance whose job has already succeeded is
+/// left alone, so the wait is paid once per instance rather than once per campaign.
+pub async fn onboard_instance(router: &Harness, region: &str, instance: &str) {
+    if onboarding_succeeded(router, region, instance).await {
         return;
     }
     router.register_connect_instance(region, instance);
@@ -244,7 +260,17 @@ pub async fn onboard_instance(router: &Harness, region: &str, instance: &str) {
         status, 200,
         "StartInstanceOnboardingJob {instance}: expected 200, got {status} {started}"
     );
-    tokio::time::sleep(ONBOARDING_JOB_DURATION + std::time::Duration::from_millis(100)).await;
+    let deadline = std::time::Instant::now() + ONBOARDING_JOB_DURATION + Duration::from_secs(60);
+    loop {
+        if onboarding_succeeded(router, region, instance).await {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "onboarding {instance}: the job never reported SUCCEEDED"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// A minimal telephony campaign named `name` on `instance` (onboarded first), with

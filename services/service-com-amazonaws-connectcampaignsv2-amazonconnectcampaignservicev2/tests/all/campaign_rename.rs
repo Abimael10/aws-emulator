@@ -26,11 +26,11 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
-    CampaignState, CAMPAIGN_NOT_FOUND_MESSAGE, ONBOARDING_JOB_DURATION,
+    CampaignState, CAMPAIGN_NOT_FOUND_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, error_code, router, Harness};
+use super::common::{call, error_code, error_message, onboard_instance as onboard, router};
 
 /// A minimal telephony `channelSubtypeConfig`: `outboundMode` and
 /// `defaultOutboundConfig` are both required by the model.
@@ -41,28 +41,6 @@ fn telephony_config() -> Value {
             "defaultOutboundConfig": {"connectContactFlowId": "flow-0001"}
         }
     })
-}
-
-/// Onboard `instance` and wait out the span the clock owes its onboarding job, so the
-/// instance is a campaign target by the time this returns: `CreateCampaign` mints a
-/// campaign only for an instance whose job has SUCCEEDED.
-async fn onboard(router: &Harness, region: &str, instance: &str) {
-    // Onboarding resolves the `connectInstanceId` against the account's Connect
-    // instance registry, so the instance is registered there first.
-    router.register_connect_instance(region, instance);
-    let (status, body) = call(
-        router,
-        region,
-        "PUT",
-        &format!("/v2/connect-instance/{instance}/onboarding"),
-        &json!({"encryptionConfig": {"enabled": false}}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {instance:?}: expected onboarding to start, got {status} {body}"
-    );
-    tokio::time::sleep(ONBOARDING_JOB_DURATION + std::time::Duration::from_millis(150)).await;
 }
 
 /// `CreateCampaign` for `instance` under `name`, returning its status and body.
@@ -174,14 +152,6 @@ async fn summary_name(
         .find(|summary| summary["id"].as_str() == Some(id))
         .and_then(|summary| summary["name"].as_str())
         .map(str::to_string)
-}
-
-/// The error message a failure response carries.
-fn error_message(response: &Value) -> &str {
-    response
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("<no message>")
 }
 
 /// A rename writes the store, every reader projects the new name, and nothing else
@@ -309,15 +279,23 @@ async fn renaming_onto_a_held_name_is_a_conflict() {
             "case {case:?}: expected ConflictException, got {} ({body})",
             error_code(&body)
         );
-        // The wording itself is a requirement, so it is pinned literally here
-        // rather than read back from the helper the handler composes it with: the
-        // refusal names the name it collides on and the instance it collides in.
+        // The wording itself is a requirement, so it is pinned literally here rather
+        // than read back from the constant the handler carries: AWS words a
+        // campaign-name collision with its fixed conflict sentence, which names
+        // neither the name it collides on nor the instance it collides in.
         assert_eq!(
             error_message(&body),
-            format!("A campaign named {held} already exists in Connect instance {instance}"),
-            "case {case:?}: expected the conflict to name {held:?} and {instance:?}, got {:?}",
+            "Failed due to conflict in current state of the resource.",
+            "case {case:?}: expected the fixed conflict message, got {:?}",
             error_message(&body)
         );
+        for value in [*held, instance] {
+            assert!(
+                !error_message(&body).contains(value),
+                "case {case:?}: expected no request value in the conflict message, got {:?} naming {value:?}",
+                error_message(&body)
+            );
+        }
         let campaign = describe(&router, region, &id, case).await;
         assert_eq!(
             campaign["name"].as_str(),

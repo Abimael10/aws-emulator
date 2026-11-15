@@ -327,10 +327,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = store.next_campaign_id();
         let arn = crate::state::campaign_arn(&region, &id);
 
-        // Kept for the refusal below: both members move into the record.
-        let requested_name = input.name.clone();
-        let requested_instance = input.connect_instance_id.clone();
-
         let stored = store.insert_new_campaign(&region, crate::state::StoredCampaign {
             id,
             arn,
@@ -372,13 +368,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // campaign name identifies a campaign within its instance, so this
             // request names a resource that exists rather than describing a new
             // one: nothing is stored and it is refused with the error the model
-            // declares for a conflict with the current state of the resource.
+            // declares for a conflict with the current state of the resource,
+            // worded with that error's fixed sentence — the refusal carries no
+            // value from the request, neither the name nor the instance it
+            // collides in.
             Err(crate::state::InsertRejected::NameTaken) => {
                 return Err(CreateCampaignErrorModeled::ConflictException(ConflictException {
-                    message: crate::state::campaign_name_taken_message(
-                        &requested_name,
-                        &requested_instance,
-                    ),
+                    message: crate::state::CAMPAIGN_NAME_TAKEN_MESSAGE.to_string(),
                     x_amz_error_type: None,
                 })
                 .into())

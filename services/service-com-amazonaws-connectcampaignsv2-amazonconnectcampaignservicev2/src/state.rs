@@ -1829,17 +1829,20 @@ pub fn onboarding_job_not_found_message(connect_instance_id: &str) -> String {
 /// campaign: that operation's message is composed from the request.)
 pub const CAMPAIGN_NOT_FOUND_MESSAGE: &str = "CampaignId not found.";
 
-/// What this service answers when a campaign name is already held by another
-/// campaign of the same Connect instance, at HTTP 409.
+/// What this service answers when a write is refused because the campaign name it
+/// asks for is already held by another campaign of the same Connect instance, at
+/// HTTP 409.
 ///
-/// Composed from the request and the store, so the refusal names the name and the
-/// instance it collides in. The one text every writer of a campaign name shares
+/// A FIXED service string: the modelled `ConflictException` carries only a
+/// `message` and declares no per-resource template, and the recorded refusal of a
+/// name collision is this one sentence with nothing taken from the request or the
+/// store — no campaign name, no instance id, no campaign id — so every uniqueness
+/// conflict reads the same. The one text every writer of a campaign name shares
 /// (`CreateCampaign` and `UpdateCampaignName`), so two of them cannot disagree
 /// about the invariant they both uphold (see
 /// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::campaign_named`]).
-pub fn campaign_name_taken_message(name: &str, connect_instance_id: &str) -> String {
-    format!("A campaign named {name} already exists in Connect instance {connect_instance_id}")
-}
+pub const CAMPAIGN_NAME_TAKEN_MESSAGE: &str =
+    "Failed due to conflict in current state of the resource.";
 
 /// The `CampaignDeletionPolicy` value that has `DeleteConnectInstanceConfig` remove
 /// the instance's existing campaigns along with its configuration, as the model's
@@ -2372,9 +2375,10 @@ pub enum RenameRejected {
     /// Another campaign of the same Connect instance already holds that name, and a
     /// campaign name identifies a campaign within its instance (see
     /// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::campaign_named`]).
-    /// Carries the instance the collision is in, so the caller's refusal can name
-    /// it. Answered with the modelled `ConflictException` (HTTP 409).
-    NameTaken { connect_instance_id: String },
+    /// Answered with the modelled `ConflictException` (HTTP 409), whose message
+    /// ([`CAMPAIGN_NAME_TAKEN_MESSAGE`]) names neither the instance nor the name,
+    /// so the rejection carries nothing beyond which invariant stopped the write.
+    NameTaken,
 }
 
 /// Why the store refused a lifecycle action on a campaign, as
@@ -2759,9 +2763,7 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
             .campaign_named(campaign.region, &connect_instance_id, name)
             .is_some()
         {
-            return Err(RenameRejected::NameTaken {
-                connect_instance_id,
-            });
+            return Err(RenameRejected::NameTaken);
         }
         match self.campaign_mut(campaign.region, campaign.id) {
             Some(stored) => {

@@ -215,19 +215,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Another campaign of the same Connect instance already answers to that
             // name, so the rename would leave the instance with two campaigns under
             // one name: refused with the error the model declares for a conflict with
-            // the current state of the resource, and the stored name is unchanged.
-            Err(crate::state::RenameRejected::NameTaken {
-                connect_instance_id,
-            }) => Err(UpdateCampaignNameErrorModeled::ConflictException(
-                ConflictException {
-                    message: crate::state::campaign_name_taken_message(
-                        &input.name,
-                        &connect_instance_id,
-                    ),
+            // the current state of the resource, worded with that error's fixed
+            // sentence — the same one `CreateCampaign` answers a name collision with,
+            // carrying no value from the request — and the stored name is unchanged.
+            Err(crate::state::RenameRejected::NameTaken) => {
+                Err(UpdateCampaignNameErrorModeled::ConflictException(ConflictException {
+                    message: crate::state::CAMPAIGN_NAME_TAKEN_MESSAGE.to_string(),
                     x_amz_error_type: None,
-                },
-            )
-            .into()),
+                })
+                .into())
+            }
         }
     }
 }
