@@ -272,16 +272,21 @@ pub fn unresolved_failure(region: &str, resource_type: &str, reference: &str) ->
 /// `TaskDefinition$compatibilities`: "Amazon ECS validates the task definition
 /// parameters with those supported by the launch type" — a revision whose parameters do
 /// not support a launch type was never validated against it, so it cannot be placed
-/// with it, whichever operation does the placing. Shared by every operation that takes a
-/// `launchType`, so a launch type `RunTask` refuses is refused by `CreateService` too.
+/// with it, whichever operation does the placing. A launch type no placement may name
+/// OUTRIGHT ([`PLACEMENT_LAUNCH_TYPES`]) is refused the same way, however compatible the
+/// revision is with the capacity behind it: managed-instances capacity is reached through
+/// a capacity provider strategy and not by naming the launch type. Shared by every
+/// operation that takes a `launchType`, so a launch type `RunTask` refuses is refused by
+/// `CreateService` too.
 pub fn validate_launch_type(
     definition: &TaskDefinitionRecord,
     launch_type: &str,
 ) -> Result<(), String> {
-    if definition
-        .compatibilities()
-        .iter()
-        .any(|supported| supported == launch_type)
+    if PLACEMENT_LAUNCH_TYPES.contains(&launch_type)
+        && definition
+            .compatibilities()
+            .iter()
+            .any(|supported| supported == launch_type)
     {
         return Ok(());
     }
@@ -303,7 +308,7 @@ pub fn validate_launch_type(
 /// or FARGATE_SPOT", [`places_on_fargate`]), so a revision that was never validated against
 /// the Fargate launch type cannot be placed through them either. A placement that names
 /// neither runs on the capacity registered to the cluster, which every revision is
-/// validated against ([`DEFAULT_VALIDATED_LAUNCH_TYPES`]), so there is nothing to check.
+/// validated against ([`PLACEMENT_LAUNCH_TYPES`]), so there is nothing to check.
 pub fn validate_placement_launch_type(
     definition: &TaskDefinitionRecord,
     launch_type: Option<&str>,
@@ -1548,6 +1553,54 @@ pub fn requested_role_arn(requested: Option<&str>) -> Option<String> {
         )),
         None => None,
     }
+}
+
+/// How Amazon ECS words a role member that names no IAM role: it states that the role is
+/// not one and carries none of the request's values.
+pub const ROLE_NOT_VALID_MESSAGE: &str = "Role is not valid";
+
+/// The longest a role name IAM holds may be (the IAM User Guide's `RoleName`: 1-64
+/// characters of `[\w+=,.@-]`), the other half of which [`names_an_iam_role`] reads off
+/// the same definition.
+const MAX_ROLE_NAME_LENGTH: usize = 64;
+
+/// Whether `reference` spells a role NAME IAM could hold, optionally prefixed with the
+/// role's path: "If your specified role has a path other than /, then you must either
+/// specify the full role ARN (this is recommended) or prefix the role name with the path"
+/// (`RegisterTaskDefinition$taskRoleArn`). The name is the last segment; every segment
+/// before it is a path segment, which IAM admits any printable characters in.
+fn names_an_iam_role(reference: &str) -> bool {
+    let pathed = reference.trim_start_matches('/');
+    let (path, name) = pathed.rsplit_once('/').unwrap_or(("", pathed));
+    let path_held = path.is_empty() || !path.split('/').any(str::is_empty);
+    path_held
+        && !name.is_empty()
+        && name.len() <= MAX_ROLE_NAME_LENGTH
+        && name
+            .chars()
+            .all(|held| held.is_ascii_alphanumeric() || "_+=,.@-".contains(held))
+}
+
+/// How a role member that names NO IAM role is refused ([`ROLE_NOT_VALID_MESSAGE`]), and
+/// `None` for one that names a role — or that names no role at all, an absent member being
+/// no mistake.
+///
+/// A role member takes "the short name or full Amazon Resource Name (ARN) of the IAM role"
+/// (`RegisterTaskDefinition$taskRoleArn`), so a value spelling an ARN has to be an IAM
+/// ROLE ARN of this account — an ARN of another vendor, of another IAM entity type
+/// (a user, a policy, an instance profile) or of another account names no role this
+/// account's IAM holds ([`::service_common::iam_role::role_name`], the tree's one reading
+/// of that form) — and a value spelling a NAME has to be a name IAM could hold a role
+/// under ([`names_an_iam_role`]). Read beside [`requested_role_arn`], which resolves the
+/// same two forms, so nothing is stored for a reference this refuses.
+pub fn role_reference_violation(requested: Option<&str>) -> Option<&'static str> {
+    let reference = declared_task_role_arn(requested)?;
+    let names_a_role = if reference.starts_with("arn:") {
+        ::service_common::iam_role::role_name(reference).is_some()
+    } else {
+        names_an_iam_role(reference)
+    };
+    (!names_a_role).then_some(ROLE_NOT_VALID_MESSAGE)
 }
 
 /// The ARN of the ECS service-linked role, `AWSServiceRoleForECS`. An IAM ARN carries no

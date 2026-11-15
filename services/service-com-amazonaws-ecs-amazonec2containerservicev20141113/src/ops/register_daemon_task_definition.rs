@@ -322,6 +322,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Each role member names an IAM role, by name or by ARN, exactly as the plain
+        // registration's own members do, so a value that names no role of this account
+        // names nothing the daemon's tasks could run as
+        // ([`crate::state::role_reference_violation`]). Checked before any revision is
+        // allocated, so a registration Amazon ECS refuses advances the family's revision
+        // counter by nothing.
+        for declared in [&input.task_role_arn, &input.execution_role_arn] {
+            if let Some(message) = crate::state::role_reference_violation(declared.as_deref()) {
+                return Err(RegisterDaemonTaskDefinitionErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
         let region = crate::state::request_region(ctx);
         let mut guard = state.lock();
 

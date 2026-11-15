@@ -5,18 +5,19 @@
 //!
 //! The rule under test: `TaskDefinition$compatibilities` ("Amazon ECS validates the task
 //! definition parameters with those supported by the launch type") reports a launch type
-//! only when the stored revision's parameters meet that launch type's documented
-//! requirements AND Amazon ECS validated the revision against that launch type at all —
-//! the launch types a placement names outright in its `launchType`, plus whatever the
-//! registration asked for in `requiresCompatibilities` ("The task launch type that Amazon
-//! ECS validates the task definition against"). Managed-instances capacity is not one a
-//! placement names outright (`CreateService$launchType`: "If you want to use Amazon ECS
-//! Managed Instances, you must use the capacityProviderStrategy request parameter and omit
-//! the launchType request parameter"), so a revision reports it only when its registration
-//! asked to be validated against it — the network mode alone never puts it in the list.
+//! when the stored revision's parameters meet that launch type's documented requirements,
+//! whether or not the registration asked to be validated against it in its
+//! `requiresCompatibilities` ("The task launch type that Amazon ECS validates the task
+//! definition against"), which is reported separately and unchanged. Managed-instances
+//! capacity gives each task its own network interface, so it is reported for the `awsvpc`
+//! network mode and for no other.
 //!
-//! The same derived list is the gate every placement's `launchType` is checked against, so
-//! the second suite drives `RunTask` through it.
+//! Which of those launch types a PLACEMENT may name is the narrower question: a
+//! `launchType` names the infrastructure outright, and managed-instances capacity is not
+//! reachable that way (`CreateService$launchType`: "If you want to use Amazon ECS Managed
+//! Instances, you must use the capacityProviderStrategy request parameter and omit the
+//! launchType request parameter"), so the second suite drives `RunTask` through the gate
+//! the same derived list feeds.
 //!
 //! Every case goes through the HTTP front door, so a list that is not derived from the
 //! stored revision cannot pass.
@@ -84,7 +85,7 @@ fn compatibilities(definition: &Value, case: &str) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn compatibilities_report_only_the_launch_types_the_revision_was_validated_against() {
+async fn compatibilities_report_only_the_launch_types_the_revision_supports() {
     let router = service();
 
     // The rows differ along everything the rule generalises over: the network mode
@@ -132,21 +133,21 @@ async fn compatibilities_report_only_the_launch_types_the_revision_was_validated
             network_mode: Some("awsvpc"),
             task_size: false,
             requires: &[],
-            expected: &["EC2"],
+            expected: &["EC2", "MANAGED_INSTANCES"],
         },
         Row {
             case: "awsvpc with a task size, asking for nothing",
             network_mode: Some("awsvpc"),
             task_size: true,
             requires: &[],
-            expected: &["EC2", "FARGATE"],
+            expected: &["EC2", "FARGATE", "MANAGED_INSTANCES"],
         },
         Row {
             case: "awsvpc with a task size, asking for Fargate",
             network_mode: Some("awsvpc"),
             task_size: true,
             requires: &["FARGATE"],
-            expected: &["EC2", "FARGATE"],
+            expected: &["EC2", "FARGATE", "MANAGED_INSTANCES"],
         },
         Row {
             case: "awsvpc without a task size, asking for managed instances",
@@ -160,7 +161,7 @@ async fn compatibilities_report_only_the_launch_types_the_revision_was_validated
             network_mode: Some("awsvpc"),
             task_size: true,
             requires: &["EC2", "FARGATE", "MANAGED_INSTANCES"],
-            expected: &["EC2", "MANAGED_INSTANCES", "FARGATE"],
+            expected: &["EC2", "FARGATE", "MANAGED_INSTANCES"],
         },
     ];
 
@@ -213,20 +214,22 @@ async fn a_placement_may_name_only_a_launch_type_the_revision_reports() {
 
     // Two revisions of the SAME shape — `awsvpc` at a legal Fargate task size — that
     // differ only in whether the registration asked to be validated against
-    // managed-instances capacity, which is what the derived list and so the gate follow.
+    // managed-instances capacity: both report it among their compatibilities, and neither
+    // may be placed by NAMING that launch type, which is the narrower question the gate
+    // puts.
     let plain = Row {
         case: "asking for nothing",
         network_mode: Some("awsvpc"),
         task_size: true,
         requires: &[],
-        expected: &["EC2", "FARGATE"],
+        expected: &["EC2", "FARGATE", "MANAGED_INSTANCES"],
     };
     let validated = Row {
         case: "asking for managed instances",
         network_mode: Some("awsvpc"),
         task_size: true,
         requires: &["MANAGED_INSTANCES"],
-        expected: &["EC2", "MANAGED_INSTANCES", "FARGATE"],
+        expected: &["EC2", "FARGATE", "MANAGED_INSTANCES"],
     };
     register(&router, "gateplain", &plain, case).await;
     register(&router, "gatevalidated", &validated, case).await;
@@ -246,7 +249,7 @@ async fn a_placement_may_name_only_a_launch_type_the_revision_reports() {
             "validated on MANAGED_INSTANCES",
             "gatevalidated",
             "MANAGED_INSTANCES",
-            true,
+            false,
         ),
         ("validated on FARGATE", "gatevalidated", "FARGATE", true),
     ];

@@ -98,8 +98,7 @@ async fn all_pages(router: &MultiServiceRouter, request: Value, case: &str) -> V
 /// Register one revision of `family` that is Fargate-compatible (`awsvpc` plus
 /// task-level cpu and memory), and that asked to be validated against the launch types
 /// the services below place it with: `requiresCompatibilities` is "The task launch type
-/// that Amazon ECS validates the task definition against", and managed-instances
-/// capacity — which no placement names outright — is validated for only on that request.
+/// that Amazon ECS validates the task definition against", and is reported as supplied.
 async fn register_awsvpc_definition(router: &MultiServiceRouter, family: &str, case: &str) {
     ok(
         router,
@@ -206,7 +205,7 @@ async fn list_services_reports_the_stored_services_of_one_cluster_narrowed_by_ev
         },
         ServiceRow {
             name: "charlie",
-            launch_type: Some("MANAGED_INSTANCES"),
+            launch_type: Some("EC2"),
             scheduling_strategy: "REPLICA",
             desired: Some(1),
             awsvpc: true,
@@ -315,7 +314,7 @@ async fn list_services_reports_the_stored_services_of_one_cluster_narrowed_by_ev
         (
             "launchType EC2",
             json!({ "cluster": "demo", "launchType": LAUNCH_TYPES[0] }),
-            demo(&["alpha", "echo"]),
+            demo(&["alpha", "charlie", "echo"]),
         ),
         (
             "launchType FARGATE",
@@ -327,10 +326,14 @@ async fn list_services_reports_the_stored_services_of_one_cluster_narrowed_by_ev
             json!({ "cluster": "demo", "launchType": LAUNCH_TYPES[2] }),
             demo(&["delta"]),
         ),
+        // Managed-instances capacity is reached through a capacity-provider strategy and
+        // never by naming the launch type (`CreateService$launchType`), so no stored
+        // service carries it and the filter answers with nothing rather than with every
+        // service.
         (
             "launchType MANAGED_INSTANCES",
             json!({ "cluster": "demo", "launchType": LAUNCH_TYPES[3] }),
-            demo(&["charlie"]),
+            Vec::new(),
         ),
         (
             "schedulingStrategy REPLICA",

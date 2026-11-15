@@ -236,6 +236,8 @@ mod state_roundtrip;
 mod tag_set_reads;
 #[path = "all/tagging_writes.rs"]
 mod tagging_writes;
+#[path = "all/task_definition_capability_attributes.rs"]
+mod task_definition_capability_attributes;
 #[path = "all/task_definition_compatibility_validation.rs"]
 mod task_definition_compatibility_validation;
 #[path = "all/task_definition_deletion.rs"]

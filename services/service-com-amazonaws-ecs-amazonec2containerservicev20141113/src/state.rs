@@ -370,6 +370,11 @@ pub use placement_reporting::*;
 mod page_tokens;
 pub use page_tokens::*;
 
+/// The container-instance capabilities a task-definition revision requires, derived from
+/// the revision and reported as `TaskDefinition$requiresAttributes`.
+mod task_definition_capabilities;
+pub use task_definition_capabilities::*;
+
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
 /// credential scope to read a region from). `emulator_arn`'s own documented default.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -1245,8 +1250,8 @@ pub const DYNAMIC_HOST_PORT: i32 = 0;
 pub const COMPATIBILITY_ORDER: [&str; 4] = [
     "EXTERNAL",
     "EC2",
-    LAUNCH_TYPE_MANAGED_INSTANCES,
     LAUNCH_TYPE_FARGATE,
+    LAUNCH_TYPE_MANAGED_INSTANCES,
 ];
 
 /// The launch types `Cluster$statistics` separates a cluster's counts by, each paired
@@ -1306,23 +1311,21 @@ pub const LAUNCH_TYPE_FARGATE: &str = "FARGATE";
 
 /// The launch type whose tasks run on capacity Amazon ECS manages for the caller, which a
 /// placement request reaches only through a capacity provider — see
-/// [`DEFAULT_VALIDATED_LAUNCH_TYPES`].
+/// [`PLACEMENT_LAUNCH_TYPES`].
 pub const LAUNCH_TYPE_MANAGED_INSTANCES: &str = "MANAGED_INSTANCES";
 
-/// The launch types Amazon ECS validates EVERY registration against, whether or not the
-/// request named them in its `requiresCompatibilities`.
+/// The launch types a PLACEMENT may name outright in its `launchType`, which is a
+/// narrower question than which launch types a revision is compatible with
+/// ([`TaskDefinitionRecord::compatibilities`]).
 ///
-/// These are the launch types a placement request names outright: `RunTask$launchType` /
-/// `CreateService$launchType` is "The infrastructure that you run your service on", whose
-/// doc singles the remaining one out — "If you want to use Amazon ECS Managed Instances,
-/// you must use the `capacityProviderStrategy` request parameter and omit the
-/// `launchType` request parameter" — so a revision is validated against managed-instances
-/// capacity only when its registration ASKED to be
-/// (`RegisterTaskDefinition$requiresCompatibilities`: "The task launch type that Amazon
-/// ECS validates the task definition against"), and a recorded `awsvpc` revision that
-/// asked only for Fargate reports just `EC2` and `FARGATE`.
-/// [`TaskDefinitionRecord::validated_against`] is where the two sources meet.
-pub const DEFAULT_VALIDATED_LAUNCH_TYPES: [&str; 3] = ["EXTERNAL", "EC2", LAUNCH_TYPE_FARGATE];
+/// `RunTask$launchType` / `CreateService$launchType` is "The infrastructure that you run
+/// your service on", whose doc singles the remaining one out — "If you want to use Amazon
+/// ECS Managed Instances, you must use the `capacityProviderStrategy` request parameter
+/// and omit the `launchType` request parameter" — so managed-instances capacity is reached
+/// through a capacity provider and never by naming the launch type, however the revision
+/// is shaped. [`validate_launch_type`] is where a request's `launchType` meets both
+/// questions.
+pub const PLACEMENT_LAUNCH_TYPES: [&str; 3] = ["EXTERNAL", "EC2", LAUNCH_TYPE_FARGATE];
 
 /// The capacity providers Amazon ECS manages for every account in every Region, which
 /// place tasks on Fargate: the `UpdateService$capacityProviderStrategy` doc — "When you
@@ -3234,68 +3237,6 @@ fn container_definition_view(stored: &ContainerDefinition) -> ContainerDefinitio
     }
 }
 
-/// Whether `value_from` names a Secrets Manager secret rather than a Systems Manager
-/// parameter. The `Secret$valueFrom` doc: "the full ARN of the Secrets Manager secret or
-/// the full ARN or name of the Systems Manager Parameter Store parameter", so the
-/// service that holds it is the ARN's own service segment.
-fn is_secrets_manager_reference(value_from: &str) -> bool {
-    value_from
-        .split(':')
-        .nth(2)
-        .is_some_and(|service| service == "secretsmanager")
-}
-
-/// The container-instance attributes ONE container of a revision requires, appended to
-/// `out`. `has_execution_role` is whether the REVISION carries an `executionRoleArn`,
-/// which some container features need beside themselves. See
-/// [`TaskDefinitionRecord::requires_attributes`] for the rule.
-fn container_required_attributes(
-    container: &ContainerDefinition,
-    has_execution_role: bool,
-    out: &mut Vec<String>,
-) {
-    for secret in container.secrets.iter().flatten() {
-        out.push(
-            if is_secrets_manager_reference(&secret.value_from) {
-                ATTRIBUTE_SECRETS_ASM_ENVIRONMENT
-            } else {
-                ATTRIBUTE_SECRETS_SSM_ENVIRONMENT
-            }
-            .to_string(),
-        );
-    }
-    for file in container.environment_files.iter().flatten() {
-        if file.r#type.eq_ignore_ascii_case("s3") {
-            out.push(ATTRIBUTE_ENV_FILES_S3.to_string());
-        }
-    }
-    if container.privileged == Some(true) {
-        out.push(ATTRIBUTE_PRIVILEGED_CONTAINER.to_string());
-    }
-    if let Some(firelens) = container.firelens_configuration.as_ref() {
-        out.push(format!("{ATTRIBUTE_FIRELENS_PREFIX}{}", firelens.r#type));
-    }
-    if let Some(logging) = container.log_configuration.as_ref() {
-        out.push(format!(
-            "{ATTRIBUTE_LOGGING_DRIVER_PREFIX}{}",
-            logging.log_driver
-        ));
-        if has_execution_role && logging.log_driver == LOG_DRIVER_AWSLOGS {
-            out.push(ATTRIBUTE_EXECUTION_ROLE_AWSLOGS.to_string());
-        }
-        for secret in logging.secret_options.iter().flatten() {
-            out.push(
-                if is_secrets_manager_reference(&secret.value_from) {
-                    ATTRIBUTE_SECRETS_ASM_LOG_DRIVER
-                } else {
-                    ATTRIBUTE_SECRETS_SSM_LOG_DRIVER
-                }
-                .to_string(),
-            );
-        }
-    }
-}
-
 /// The `ContainerDefinition$user` Amazon ECS materialises on a task's LOG ROUTER — the
 /// container that carries a `firelensConfiguration`. The FireLens router runs as the root
 /// user, which `user` names by its uid, as the recorded registration carries it.
@@ -3382,23 +3323,24 @@ impl TaskDefinitionRecord {
     /// compatibilities`: "Amazon ECS validates the task definition parameters with
     /// those supported by the launch type."
     ///
-    /// Derived from the STORED revision and reported in [`COMPATIBILITY_ORDER`]. A launch
-    /// type is reported when BOTH halves hold:
+    /// Derived from the STORED revision and reported in [`COMPATIBILITY_ORDER`]: a launch
+    /// type is reported when the revision's parameters meet that launch type's documented
+    /// requirements — Fargate needs `awsvpc` ("For Amazon ECS tasks on Fargate, the awsvpc
+    /// network mode is required") plus task-level `cpu` and `memory` ("This field is
+    /// required for Fargate"); ECS Managed Instances place tasks on AWS-managed capacity
+    /// that gives each task its own network interface, so they likewise need `awsvpc`;
+    /// `awsvpc` is in turn not available to the external (on-premises) launch type; EC2
+    /// supports every network mode; and Fargate additionally needs a principal for every
+    /// image fetch the revision's containers need authenticating
+    /// ([`TaskDefinitionRecord::pull_needs_execution_role`]), because a Fargate task runs
+    /// on capacity Amazon ECS owns and so has no container instance whose own role the
+    /// agent could pull under.
     ///
-    /// * the revision's parameters meet that launch type's documented requirements —
-    ///   Fargate needs `awsvpc` ("For Amazon ECS tasks on Fargate, the awsvpc network
-    ///   mode is required") plus task-level `cpu` and `memory` ("This field is required
-    ///   for Fargate"); ECS Managed Instances place tasks on AWS-managed capacity that
-    ///   gives each task its own network interface, so they likewise need `awsvpc`;
-    ///   `awsvpc` is in turn not available to the external (on-premises) launch type; EC2
-    ///   supports every network mode; and Fargate additionally needs a principal for
-    ///   every image fetch the revision's containers need authenticating
-    ///   ([`TaskDefinitionRecord::pull_needs_execution_role`]), because a Fargate task
-    ///   runs on capacity Amazon ECS owns and so has no container instance whose own role
-    ///   the agent could pull under;
-    /// * Amazon ECS validated the revision against it at all
-    ///   ([`TaskDefinitionRecord::validated_against`]) — every launch type a placement
-    ///   may name outright, plus whatever the registration asked for.
+    /// What the REGISTRATION asked to be validated against (`requiresCompatibilities`) is
+    /// reported separately and unchanged: it neither adds a launch type the parameters rule
+    /// out nor withholds one they support. Which of these launch types a PLACEMENT may name
+    /// outright is a further question, decided where a `launchType` is checked
+    /// ([`validate_launch_type`]).
     pub fn compatibilities(&self) -> Vec<String> {
         let awsvpc = self.network_mode == NETWORK_MODE_AWSVPC;
         COMPATIBILITY_ORDER
@@ -3418,7 +3360,6 @@ impl TaskDefinitionRecord {
                 // classified deliberately rather than inheriting a neighbour's rule.
                 _ => false,
             })
-            .filter(|launch_type| self.validated_against(launch_type))
             .map(|launch_type| (*launch_type).to_string())
             .collect()
     }
@@ -3435,90 +3376,7 @@ impl TaskDefinitionRecord {
     /// which is why this is read where a FARGATE compatibility is derived and where a
     /// registration that REQUIRES Fargate is checked.
     pub fn pull_needs_execution_role(&self) -> bool {
-        self.execution_role_arn.is_none()
-            && needs_execution_role_to_pull(
-                self.container_definitions
-                    .iter()
-                    .filter_map(|container| container.image.as_deref()),
-            )
-    }
-
-    /// Whether Amazon ECS validated this revision against `launch_type` at all, before
-    /// its parameters are weighed against that launch type's requirements.
-    ///
-    /// A registration is validated against the launch types a placement can ask for
-    /// outright ([`DEFAULT_VALIDATED_LAUNCH_TYPES`]), and against the ones it asked to be
-    /// validated against itself — `requiresCompatibilities` is "The task launch type that
-    /// Amazon ECS validates the task definition against", so a stored revision whose
-    /// registration named one was validated against it. A launch type that is in neither
-    /// (managed-instances capacity, which a placement reaches only through a capacity
-    /// provider) was never validated for, so it is not reported however the revision is
-    /// shaped — and `requiresCompatibilities`, what the REQUEST asked for, is reported
-    /// separately and unchanged.
-    fn validated_against(&self, launch_type: &str) -> bool {
-        DEFAULT_VALIDATED_LAUNCH_TYPES.contains(&launch_type)
-            || self
-                .requires_compatibilities
-                .iter()
-                .any(|requested| requested == launch_type)
-    }
-
-    /// The container-instance attributes a task of this revision requires —
-    /// `TaskDefinition$requiresAttributes`: "The container instance attributes required
-    /// by your task."
-    ///
-    /// DERIVED from the stored revision: every feature it declares that only a container
-    /// instance publishing a capability can serve contributes that capability's
-    /// attribute — the `awsvpc` network mode needs [`ATTRIBUTE_TASK_ENI`] (and with it
-    /// the Docker remote-API version that carries task networking), a `taskRoleArn` needs
-    /// [`ATTRIBUTE_TASK_IAM_ROLE`], a `secrets` or
-    /// `secretOptions` reference needs the attribute of the secret store it names, an
-    /// S3 `environmentFiles` entry needs [`ATTRIBUTE_ENV_FILES_S3`], a privileged
-    /// container needs [`ATTRIBUTE_PRIVILEGED_CONTAINER`], a named `logDriver` needs
-    /// that driver's attribute, a `firelensConfiguration` needs the log-router
-    /// capability of the router kind it names ([`ATTRIBUTE_FIRELENS_PREFIX`]) and the
-    /// `awslogs` driver on a revision that also carries an `executionRoleArn` needs
-    /// [`ATTRIBUTE_EXECUTION_ROLE_AWSLOGS`]. Each name is FIXED text completed only by
-    /// the feature it is derived from, never by the account, the family or the revision.
-    /// The names are the Amazon ECS container-agent
-    /// capabilities, which is what an instance registers them as, so
-    /// `ListAttributes`/`DescribeContainerInstances` and this list speak the same
-    /// vocabulary.
-    ///
-    /// Reported deduplicated and sorted by name, so a revision reads back the same list
-    /// however its containers were ordered. A revision that declares no such feature
-    /// requires nothing and the member stays ABSENT (`None`) rather than reporting an
-    /// empty list.
-    pub fn requires_attributes(&self) -> Option<Vec<Attribute>> {
-        let mut names = Vec::new();
-        if self.network_mode == NETWORK_MODE_AWSVPC {
-            names.push(ATTRIBUTE_DOCKER_REMOTE_API_1_18.to_string());
-            names.push(ATTRIBUTE_TASK_ENI.to_string());
-        }
-        // A revision that names a TASK role has the agent serve that role's credentials to
-        // its containers, which is its own capability ([`ATTRIBUTE_TASK_IAM_ROLE`]) — so a
-        // revision that names none requires nothing of the kind.
-        if self.task_role_arn.is_some() {
-            names.push(ATTRIBUTE_TASK_IAM_ROLE.to_string());
-        }
-        let has_execution_role = self.execution_role_arn.is_some();
-        for container in &self.container_definitions {
-            container_required_attributes(container, has_execution_role, &mut names);
-        }
-        names.sort();
-        names.dedup();
-        if names.is_empty() {
-            return None;
-        }
-        Some(
-            names
-                .into_iter()
-                .map(|name| Attribute {
-                    name,
-                    ..Attribute::default()
-                })
-                .collect(),
-        )
+        self.execution_role_arn.is_none() && self.pull_needs_authentication()
     }
 
     /// The `TaskDefinition` every task-definition operation returns, built from what is

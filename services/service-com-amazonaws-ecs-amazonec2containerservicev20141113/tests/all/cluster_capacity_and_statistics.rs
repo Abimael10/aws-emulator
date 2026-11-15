@@ -9,9 +9,10 @@
 //!    tasks, active and draining services — for EVERY launch type the model's
 //!    `LaunchType` enum defines, and each counter is COUNTED off the cluster's own
 //!    records rather than fabricated.
-//! 2. A task definition is placed with a launch type only where it was validated
-//!    against it (`TaskDefinition$compatibilities`); any other launch type is refused
-//!    with the modelled `InvalidParameterException`.
+//! 2. A task definition is placed with a launch type only where its parameters support
+//!    it (`TaskDefinition$compatibilities`) and only where a placement may name that
+//!    launch type outright; any other launch type is refused with the modelled
+//!    `InvalidParameterException`.
 //! 3. A `platformVersion` that names no platform version this service knows is refused
 //!    with the modelled `PlatformUnknownException`, whichever operation carries it.
 //! 4. A task placed with a launch type whose capacity is REGISTERED to the cluster
@@ -61,8 +62,8 @@ const NO_CONTAINER_INSTANCES: &str = "No Container Instances were found in your 
 /// Register a revision of `family` that is Fargate-compatible: `awsvpc` ("For Amazon
 /// ECS tasks on Fargate, the awsvpc network mode is required") plus task-level cpu and
 /// memory ("This field is required for Fargate"). `requires` is what the registration
-/// asks to be validated against (`requiresCompatibilities`), which is what brings a
-/// launch type no placement can name outright into the revision's compatibilities.
+/// asks to be validated against (`requiresCompatibilities`), which is reported as it was
+/// supplied and changes no launch type the revision's parameters decide.
 async fn register_awsvpc_requiring(
     router: &MultiServiceRouter,
     family: &str,
@@ -230,7 +231,7 @@ async fn each_launch_types_statistics_count_only_the_tasks_placed_with_it() {
 }
 
 #[tokio::test]
-async fn a_launch_type_the_revision_was_not_validated_against_is_refused() {
+async fn a_launch_type_the_revision_does_not_support_is_refused() {
     let router = service();
     let case = "compatibility";
     cluster_with_capacity(&router, "compat", case).await;
@@ -248,10 +249,11 @@ async fn a_launch_type_the_revision_was_not_validated_against_is_refused() {
 
     // The rule generalises over the revision's parameters and the launch type asked for.
     // The expected column is the documented compatibility of each shape: EC2 supports
-    // every network mode; Fargate and managed instances need `awsvpc` (plus task-level
-    // cpu/memory for Fargate); `awsvpc` is not available to the external launch type;
-    // and managed instances, which a placement cannot name outright, additionally needs
-    // the registration to have asked to be validated against it.
+    // every network mode; Fargate needs `awsvpc` plus task-level cpu/memory; `awsvpc` is
+    // not available to the external launch type; and managed-instances capacity, which a
+    // placement reaches only through a capacity provider strategy
+    // (`RunTask$launchType`), is refused however the revision is shaped and whatever its
+    // registration asked to be validated against.
     let rows: [(&str, &str, &str, bool); 9] = [
         ("bridge on EC2", "bridgefam", "EC2", true),
         ("bridge on EXTERNAL", "bridgefam", "EXTERNAL", true),
@@ -274,7 +276,7 @@ async fn a_launch_type_the_revision_was_not_validated_against_is_refused() {
             "awsvpc validated for managed instances",
             "managedfam",
             "MANAGED_INSTANCES",
-            true,
+            false,
         ),
         ("awsvpc on EXTERNAL", "awsvpcfam", "EXTERNAL", false),
     ];

@@ -14,9 +14,10 @@
 //!   container-agent capability per feature — including the log router a
 //!   `firelensConfiguration` names and the execution-role capability the `awslogs`
 //!   driver needs when the revision carries an `executionRoleArn` — deduplicated and
-//!   sorted, and stays absent when it declares none;
-//! * `compatibilities` reports the launch types the revision's parameters support and
-//!   that ECS validated it against, in the order ECS reports them;
+//!   reported in the order the derivation takes them, and stays absent when it declares
+//!   none;
+//! * `compatibilities` reports the launch types the revision's parameters support, in the
+//!   order ECS reports them;
 //! * `DescribeTaskDefinition` always materialises its top-level `tags` list, whose
 //!   CONTENT (not presence) follows `include`.
 //!
@@ -306,10 +307,12 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
     let router = service();
 
     // Each row declares ONE feature (or none, or several) and names the
-    // container-agent capability attributes it requires. Sources: the Amazon ECS
-    // container-agent capability names — `ecs.capability.task-eni` and the Docker
-    // remote-API version task networking needs for `awsvpc`,
-    // `ecs.capability.secrets.{asm,ssm}.environment-variables` for a `secrets`
+    // container-agent capability attributes it requires, in the order the derivation
+    // reports them: each container's own features, container by container, then the
+    // revision's own. Sources: the Amazon ECS container-agent capability names —
+    // `ecs.capability.task-eni` and the Docker remote-API version task networking needs
+    // for `awsvpc`, the Docker remote-API versions a `logConfiguration` and its `options`
+    // need, `ecs.capability.secrets.{asm,ssm}.environment-variables` for a `secrets`
     // reference (`Secret$valueFrom`: "the full ARN of the Secrets Manager secret or the
     // full ARN or name of the Systems Manager Parameter Store parameter"),
     // `ecs.capability.secrets.{asm,ssm}.bootstrap.log-driver` for a
@@ -320,10 +323,12 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
     // `firelensConfiguration` names (`FirelensConfiguration$type`: "The log router to
     // use. The valid values are fluentd or fluentbit") and
     // `ecs.capability.execution-role-awslogs` for the `awslogs` driver on a revision
-    // that also carries an `executionRoleArn`.
+    // that also carries an `executionRoleArn`. The image-pull capabilities are tabled in
+    // [`crate::task_definition_capability_attributes`].
     const ASM_SECRET: &str = "arn:aws:secretsmanager:us-west-2:000000000000:secret:db-AbCdEf";
     const SSM_SECRET: &str = "arn:aws:ssm:us-west-2:000000000000:parameter/prod/db";
     const DOCKER_1_18: &str = "com.amazonaws.ecs.capability.docker-remote-api.1.18";
+    const DOCKER_1_19: &str = "com.amazonaws.ecs.capability.docker-remote-api.1.19";
     const TASK_ENI: &str = "ecs.capability.task-eni";
     const EXECUTION_ROLE_AWSLOGS: &str = "ecs.capability.execution-role-awslogs";
     const DRIVER_AWSLOGS: &str = "com.amazonaws.ecs.capability.logging-driver.awslogs";
@@ -419,7 +424,7 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
                     "options": { "awslogs-group": "/ecs/rendering" },
                 },
             })],
-            expected: vec![DRIVER_AWSLOGS, EXECUTION_ROLE_AWSLOGS],
+            expected: vec![DOCKER_1_18, DRIVER_AWSLOGS, DOCKER_1_19, EXECUTION_ROLE_AWSLOGS],
         },
         Row {
             case: "awslogs log driver with no execution role",
@@ -431,7 +436,7 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
                     "options": { "awslogs-group": "/ecs/rendering" },
                 },
             })],
-            expected: vec![DRIVER_AWSLOGS],
+            expected: vec![DOCKER_1_18, DRIVER_AWSLOGS, DOCKER_1_19],
         },
         Row {
             case: "a driver other than awslogs does not need the execution role",
@@ -440,7 +445,10 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
             containers: vec![json!({
                 "logConfiguration": { "logDriver": "splunk" },
             })],
-            expected: vec!["com.amazonaws.ecs.capability.logging-driver.splunk"],
+            expected: vec![
+                DOCKER_1_18,
+                "com.amazonaws.ecs.capability.logging-driver.splunk",
+            ],
         },
         Row {
             case: "fluentd log driver with a secret option",
@@ -453,6 +461,7 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
                 },
             })],
             expected: vec![
+                DOCKER_1_18,
                 "com.amazonaws.ecs.capability.logging-driver.fluentd",
                 "ecs.capability.secrets.asm.bootstrap.log-driver",
             ],
@@ -501,10 +510,11 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
             ],
             expected: vec![
                 DOCKER_1_18,
-                DRIVER_AWSFIRELENS,
                 DRIVER_AWSLOGS,
+                DOCKER_1_19,
                 EXECUTION_ROLE_AWSLOGS,
                 "ecs.capability.firelens.fluentbit",
+                DRIVER_AWSFIRELENS,
                 TASK_ENI,
             ],
         },
@@ -527,8 +537,8 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
                 json!({ "firelensConfiguration": { "type": "fluentbit" } }),
             ],
             expected: vec![
-                "ecs.capability.firelens.fluentbit",
                 "ecs.capability.firelens.fluentd",
+                "ecs.capability.firelens.fluentbit",
             ],
         },
         Row {
@@ -543,6 +553,7 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
                 json!({ "firelensConfiguration": { "type": "fluentbit" } }),
             ],
             expected: vec![
+                DOCKER_1_18,
                 DRIVER_AWSFIRELENS,
                 DRIVER_AWSLOGS,
                 EXECUTION_ROLE_AWSLOGS,
@@ -560,7 +571,7 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
             expected: vec!["ecs.capability.secrets.asm.environment-variables"],
         },
         Row {
-            case: "features of several containers under awsvpc, sorted",
+            case: "features of several containers under awsvpc, container by container",
             network_mode: "awsvpc",
             execution_role: true,
             containers: vec![
@@ -568,9 +579,9 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
                 json!({ "secrets": [{ "name": "A", "valueFrom": ASM_SECRET }] }),
             ],
             expected: vec![
-                DOCKER_1_18,
                 "com.amazonaws.ecs.capability.privileged-container",
                 "ecs.capability.secrets.asm.environment-variables",
+                DOCKER_1_18,
                 TASK_ENI,
             ],
         },
@@ -639,7 +650,7 @@ async fn compatibilities_read_back_in_the_launch_type_order_ecs_reports() {
     // The membership rule is tabled in `task_lifecycle` and
     // `task_definition_compatibility_validation`; here it is the ORDER, read back through
     // BOTH projections. Order source: the recorded ECS responses — EXTERNAL, EC2,
-    // MANAGED_INSTANCES, FARGATE — filtered by what the revision supports
+    // FARGATE, MANAGED_INSTANCES — filtered by what the revision supports
     // (`Compatibility` enum values: EC2, FARGATE, EXTERNAL, MANAGED_INSTANCES).
     let rows: Vec<(&str, Value, Vec<&str>)> = vec![
         (
@@ -650,12 +661,12 @@ async fn compatibilities_read_back_in_the_launch_type_order_ecs_reports() {
         (
             "awsvpc without task size",
             json!({ "networkMode": "awsvpc" }),
-            vec!["EC2"],
+            vec!["EC2", "MANAGED_INSTANCES"],
         ),
         (
             "awsvpc with task size",
             json!({ "networkMode": "awsvpc", "cpu": "256", "memory": "512" }),
-            vec!["EC2", "FARGATE"],
+            vec!["EC2", "FARGATE", "MANAGED_INSTANCES"],
         ),
         (
             "fargate requested",
@@ -665,11 +676,10 @@ async fn compatibilities_read_back_in_the_launch_type_order_ecs_reports() {
                 "memory": "1024",
                 "requiresCompatibilities": ["FARGATE"],
             }),
-            vec!["EC2", "FARGATE"],
+            vec!["EC2", "FARGATE", "MANAGED_INSTANCES"],
         ),
-        // The one shape that reports every launch type `awsvpc` allows, so the middle of
-        // the order is read too: a registration that asked to be validated against
-        // managed-instances capacity as well as Fargate.
+        // What the registration ASKED to be validated against does not reorder the derived
+        // list, nor add to it: the same shape asking for both reads back the same order.
         (
             "fargate and managed instances requested",
             json!({
@@ -678,7 +688,7 @@ async fn compatibilities_read_back_in_the_launch_type_order_ecs_reports() {
                 "memory": "1024",
                 "requiresCompatibilities": ["FARGATE", "MANAGED_INSTANCES"],
             }),
-            vec!["EC2", "MANAGED_INSTANCES", "FARGATE"],
+            vec!["EC2", "FARGATE", "MANAGED_INSTANCES"],
         ),
     ];
 
