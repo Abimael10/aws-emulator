@@ -281,20 +281,39 @@ async fn a_batch_reports_each_statement_it_ran_in_order() {
                 );
             }
 
-            // And it describes itself through the same `Id`, reporting the
-            // BATCH's `Id` as its own: the `:<n>` suffix is the address that
-            // reaches it, not the identity of the submission it belongs to.
+            // And it describes itself through the same `Id`, which answers with
+            // the BATCH's record — the batch's `Id`, no single `QueryString`,
+            // and `SubStatements` narrowed to the addressed position, which is
+            // where this statement's SQL is read.
             let described_sub = emulator
                 .ok(
                     "DescribeStatement",
                     &json!({"Id": format!("{id}:{position}")}),
                 )
                 .await;
+            assert!(
+                described_sub.get("QueryString").is_none(),
+                "case {}: a batch record has no single QueryString, got {described_sub}",
+                case.label
+            );
+            let narrowed = sub_statements(&described_sub);
             assert_eq!(
-                described_sub["QueryString"],
-                json!(case.sqls[index]),
-                "case {}: statement {position} is readable through its own Id, got \
+                narrowed.len(),
+                1,
+                "case {}: the ':{position}' address narrows SubStatements to one statement, got \
                  {described_sub}",
+                case.label
+            );
+            assert_eq!(
+                (
+                    narrowed[0]["Id"].clone(),
+                    narrowed[0]["QueryString"].clone()
+                ),
+                (
+                    json!(format!("{id}:{position}")),
+                    json!(case.sqls[index])
+                ),
+                "case {}: statement {position} is read at SubStatements[0], got {described_sub}",
                 case.label
             );
             assert_eq!(

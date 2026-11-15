@@ -276,7 +276,8 @@ async fn a_created_database_joins_the_provisioned_one() {
 
 /// The catalogue of a warehouse's own database: empty until a statement builds
 /// something in it, readable through `DescribeTable` either way, and a database
-/// the warehouse does not hold at all is still the missing resource.
+/// the warehouse does not hold at all is the missing resource — unlike a table
+/// it does not hold, which describes no column.
 #[tokio::test]
 async fn describe_table_reads_the_provisioned_databases_catalogue() {
     let (warehouses, rows) = provisioned_warehouses().await;
@@ -294,19 +295,19 @@ async fn describe_table_reads_the_provisioned_databases_catalogue() {
              got {empty}"
         );
 
-        // A table named in that empty database is the missing resource.
+        // A table named in that empty database describes no column — a name the
+        // catalog matches nothing for is an empty answer, not a refusal.
         let mut request = connect(&row.target, &row.provisioned);
         request["Table"] = json!("absent_table");
-        let (status, response) = warehouses.data("DescribeTable", &request).await;
-        assert_eq!(
-            status, 404,
-            "case {label}: a table the database does not hold is a missing resource, got \
-             {status} {response}"
+        let described = warehouses.data_ok("DescribeTable", &request).await;
+        assert!(
+            list(&described, "ColumnList").is_empty(),
+            "case {label}: a table the database does not hold describes no column, got \
+             {described}"
         );
-        assert_eq!(
-            message(&response),
-            Some(format!("Table does not exist: {DEFAULT_SCHEMA}.absent_table").as_str()),
-            "case {label}: expected the missing TABLE to be named, got {response}"
+        assert!(
+            described.get("TableName").is_none(),
+            "case {label}: no table was described, so none is named, got {described}"
         );
 
         // A database the warehouse holds no database of that name for is the
@@ -348,6 +349,17 @@ async fn describe_table_reads_the_provisioned_databases_catalogue() {
             vec!["id".to_string(), "placed_at".to_string()],
             "case {label}: expected the created table's columns, got {described}"
         );
+        for column in list(&described, "ColumnList") {
+            assert_eq!(
+                (
+                    column["schemaName"].clone(),
+                    column["tableName"].clone()
+                ),
+                (json!(DEFAULT_SCHEMA), json!("orders")),
+                "case {label}: every described column names the table that includes it, got \
+                 {column}"
+            );
+        }
     }
 }
 

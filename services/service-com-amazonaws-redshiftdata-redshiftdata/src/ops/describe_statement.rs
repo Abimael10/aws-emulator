@@ -3,8 +3,9 @@
 //! @op DescribeStatement
 //! Reports one submitted statement out of [`crate::state`]: its SQL, its status, its
 //! timing and its result-set counters. An `Id` carrying a `:<n>` suffix addresses one
-//! statement of a batch, whose record reports the batch's `Id` — the suffix is the
-//! address that reaches it, not the identity of the submission it belongs to. A
+//! statement of a batch, and answers with the BATCH's record — the batch's `Id`, no
+//! `QueryString` (a batch has no single query) and `SubStatements` narrowed to the
+//! addressed position, which is where that statement's SQL is read. A
 //! reporting operation, so the only thing it
 //! writes is the outcome the statement's execution has already reported — the move
 //! out of `SUBMITTED` that happened when that execution finished, whether or not
@@ -219,7 +220,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         store.materialise_due_transitions();
-        let Some(statement) = store.statement(&input.id) else {
+        // An `Id` carrying the `:<n>` suffix addresses one statement of a
+        // batch, and the record answered for it is the BATCH's own, narrowed to
+        // that position: a batch is one submission, so its record reports the
+        // batch's `Id`, no single `QueryString` — a batch has no one query —
+        // and the addressed statement as the single `SubStatements` entry.
+        let Some((statement, addressed)) = store.addressed_statement(&input.id) else {
             return Err(no_such_query(&input.id));
         };
 
@@ -255,12 +261,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `SubStatements` describes "the SQL statements from a multiple
             // statement run", so it is reported for a batch submission and
             // only for one: a single `ExecuteStatement` ran exactly one
-            // statement, which it reports as `QueryString`.
+            // statement, which it reports as `QueryString`. An `Id` that
+            // addressed one POSITION of the batch narrows the list to that
+            // statement, which is where its SQL is then read.
             sub_statements: statement.is_batch.then(|| {
                 statement
                     .sub_statements
                     .iter()
-                    .map(sub_statement_data)
+                    .enumerate()
+                    .filter(|(index, _)| addressed.is_none_or(|wanted| *index == wanted))
+                    .map(|(_, sub_statement)| sub_statement_data(sub_statement))
                     .collect()
             }),
             workgroup_name: statement.target.workgroup_name(),

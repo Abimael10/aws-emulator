@@ -484,8 +484,10 @@ impl QueueConfig {
     }
 }
 
-/// Whether `label` matches the `%`/`_` pattern `pattern`, the wild cards a WLM
-/// queue's matching rules admit.
+/// Whether `label` matches the `%`/`_` pattern `pattern` — the wild cards a WLM
+/// queue's matching rules admit, and the same two the Data API's catalog
+/// patterns do ("`%` means match any substring of 0 or more characters and `_`
+/// means match any one character").
 ///
 /// Matched with ONE row of the match table at a time, so the memory this takes
 /// is the length of the label and not the product of the two lengths, and
@@ -493,7 +495,7 @@ impl QueueConfig {
 /// [`MAX_SESSION_PARAMETER_BYTES`] and a pattern by
 /// [`MAX_QUEUE_PATTERN_BYTES`], past which the pattern matches nothing rather
 /// than being walked.
-fn wild_card_matches(pattern: &str, label: &str) -> bool {
+pub fn wild_card_matches(pattern: &str, label: &str) -> bool {
     if pattern.len() > MAX_QUEUE_PATTERN_BYTES || label.len() > MAX_SESSION_PARAMETER_BYTES {
         return false;
     }

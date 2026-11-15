@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTables
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTables`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTables::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the tables of one database of a data warehouse, out of the engine's own
+//! catalog: each relation the database holds, with the schema that contains it and
+//! what kind of relation it is, narrowed by the `SchemaPattern`/`TablePattern`
+//! wild cards and paged with an opaque `NextToken`. A reporting operation — it
+//! reads the catalog of a database some statement already created and writes
+//! nothing, not even the database itself.
 //!
 //! ## Shape of an operation
 //!
@@ -135,6 +132,16 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    decode_cursor, encode_cursor, non_empty, split_relation, CatalogFilter, ConnectionRequest,
+    TargetSelectors, ABSENT_ENDPOINT_MESSAGE, CURSOR_TABLES, DEFAULT_PAGE_SIZE,
+    INVALID_TOKEN_MESSAGE,
+};
+
+/// The compute-target selectors THIS operation accepts: its input shape models
+/// `ClusterIdentifier` and `WorkgroupName` and no other selector, so its
+/// target-selection refusal names those two alone.
+const SELECTORS: TargetSelectors = TargetSelectors::Warehouse;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -208,18 +215,196 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTables` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTablesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTables"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTablesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Redshift Data API state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The same connection combinations every operation of this service
+        // documents: one data warehouse, one database, one authorization
+        // method. `Database` is "the name of the database that contains the
+        // tables to list", so it is the database whose catalog is read;
+        // `ConnectedDatabase` names the one the credentials connect to, which
+        // this emulator does not need to tell apart because a statement reaches
+        // exactly the database it names.
+        let requested = ConnectionRequest {
+            cluster_identifier: input.cluster_identifier.as_ref(),
+            workgroup_name: input.workgroup_name.as_ref(),
+            session_id: None,
+            database: Some(&input.database),
+            db_user: input.db_user.as_ref(),
+            secret_arn: input.secret_arn.as_ref(),
+        };
+        let connection = match requested.resolve() {
+            // Every other combination — both warehouses, neither of them, no
+            // database, two authorization methods — is a malformed request, and
+            // how a request SELECTS its target is a fault of the request
+            // itself, so it is reported before any target is resolved.
+            Err(problem) => return Err(validation(&problem.message(SELECTORS))),
+            Ok(connection) => connection,
+        };
+
+        // A table lives in a database of a data warehouse, so the target this
+        // request named is resolved against the service that owns it before its
+        // catalog is read: a cluster or workgroup that does not exist in this
+        // Region has no catalog to list. A target the owner could not be asked
+        // about is UNDECIDED, and is read rather than refused.
+        let facts = crate::state::warehouse::describe_target(ctx, &connection.target).await;
+        if facts.resolution == crate::state::warehouse::TargetResolution::Absent {
+            return Err(validation(ABSENT_ENDPOINT_MESSAGE));
+        }
+
+        let schema_pattern = non_empty(input.schema_pattern.as_ref());
+        let table_pattern = non_empty(input.table_pattern.as_ref());
+
+        // The cursor is an offset into the filtered listing, and its kind names
+        // the database and both patterns the page was issued for, so a token
+        // minted while paging one listing is refused for any other rather than
+        // silently resolving to the same offset in a different one.
+        let cursor_kind = format!(
+            "{CURSOR_TABLES}:{}:{}:{}",
+            connection.database,
+            schema_pattern.as_deref().unwrap_or_default(),
+            table_pattern.as_deref().unwrap_or_default()
+        );
+        let offset = match input.next_token.as_deref() {
+            None => 0_usize,
+            Some(token) => match decode_cursor(&cursor_kind, token)
+                .and_then(|position| usize::try_from(position).ok())
+            {
+                Some(offset) => offset,
+                None => return Err(validation(INVALID_TOKEN_MESSAGE)),
+            },
+        };
+
+        // A reporting operation must not OPEN a database, or a later caller
+        // would find one this read had created — so the catalog is read from
+        // the database this emulator already holds, and a database the
+        // warehouse has but no statement has opened simply holds no table yet.
+        // Only a database the warehouse does not hold at all is the missing
+        // resource the refusal names.
+        let handle = state
+            .lock()
+            .open_database(&connection.target, &connection.database);
+        if handle.is_none() && !facts.provisions_database(&connection.database) {
+            return Err(ListTablesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Database does not exist: {}", connection.database),
+                    resource_id: connection.database.clone(),
+                },
+            )
+            .into());
+        }
+
+        // The catalog is read on the blocking pool with only this database's
+        // lock held, bounded exactly as a statement's execution is, so a catalog
+        // read queued behind a slow statement cannot pin this request: the
+        // engine gives up at its own deadline, and the request waits a grace
+        // period longer than that for the answer.
+        let held = match handle {
+            None => Vec::new(),
+            Some(handle) => {
+                let engine_timeout = crate::state::engine_timeout();
+                let budget = crate::state::CATALOG_REQUEST_BUDGET;
+                let bound = crate::state::ExecutionBound::new();
+                let interrupt = bound.interrupt();
+                // "If neither SchemaPattern nor TablePattern are specified,
+                // then all tables in the database are returned", and a pattern
+                // that IS given narrows the read on the name it filters — with
+                // `%` matching any substring and `_` any one character — so the
+                // read costs what the request asked about rather than what the
+                // database holds.
+                let filter = CatalogFilter {
+                    schema_pattern: schema_pattern.clone(),
+                    table_pattern: table_pattern.clone(),
+                    ..CatalogFilter::default()
+                };
+                let joined = tokio::time::timeout(
+                    budget,
+                    tokio::task::spawn_blocking(move || {
+                        crate::state::catalog_on(&handle, &filter, engine_timeout, &bound)
+                    }),
+                )
+                .await;
+                match joined {
+                    Ok(Ok(Ok(held))) => held,
+                    // The engine could not answer for this database.
+                    Ok(Ok(Err(reason))) => {
+                        return Err(ListTablesErrorModeled::DatabaseConnectionException(
+                            DatabaseConnectionException {
+                                message: format!(
+                                    "the database's catalog could not be read: {reason}"
+                                ),
+                            },
+                        )
+                        .into())
+                    }
+                    Err(_elapsed) => {
+                        interrupt.now();
+                        return Err(ListTablesErrorModeled::QueryTimeoutException(
+                            QueryTimeoutException {
+                                message: Some(format!(
+                                    "the database's catalog did not answer within {} seconds",
+                                    budget.as_secs()
+                                )),
+                            },
+                        )
+                        .into());
+                    }
+                    Ok(Err(_panicked)) => {
+                        return Err(ListTablesErrorModeled::InternalServerException(
+                            InternalServerException {
+                                message: "the SQL engine did not answer for this database's catalog"
+                                    .to_string(),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        // Each relation the read described, as one entry naming the schema that
+        // contains it, the relation itself and what kind of relation it is. The
+        // patterns narrowed the READ, so nothing is filtered again here.
+        let tables: Vec<TableMember> = held
+            .iter()
+            .map(|held| {
+                let (schema, name) = split_relation(&held.table);
+                TableMember {
+                    name: Some(name.to_string()),
+                    schema: Some(schema.to_string()),
+                    r#type: Some(held.kind.to_string()),
+                }
+            })
+            .collect();
+
+        if offset > tables.len() {
+            return Err(validation(INVALID_TOKEN_MESSAGE));
+        }
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|size| *size > 0)
+            .unwrap_or(DEFAULT_PAGE_SIZE);
+        let end = offset.saturating_add(page_size).min(tables.len());
+
+        Ok(ListTablesOutput {
+            tables: Some(tables[offset..end].to_vec()),
+            next_token: (end < tables.len())
+                .then(|| encode_cursor(&cursor_kind, u64::try_from(end).unwrap_or(u64::MAX))),
+        })
     }
+}
+
+/// Refuse the request as invalid, with the `ValidationException` this operation
+/// models.
+fn validation(message: &str) -> ListTablesError {
+    ListTablesErrorModeled::ValidationException(ValidationException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

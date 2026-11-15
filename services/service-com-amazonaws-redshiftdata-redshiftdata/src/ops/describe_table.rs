@@ -2,7 +2,12 @@
 
 //! @op DescribeTable
 //! Describes one table of a database from the engine's own catalog: the columns
-//! it declares, paged with an opaque `NextToken`. A reporting operation — it
+//! it declares, paged with an opaque `NextToken`. `Schema` and `Table` each
+//! narrow the catalogue on the part of a relation's name they filter, and a
+//! name the catalogue holds nothing for describes no column, which is a
+//! successful empty `ColumnList`; only a warehouse or a database that does not
+//! exist is the missing resource.
+//! A reporting operation — it
 //! reads the catalog of a database some statement already created and writes
 //! nothing, not even the database itself.
 //!
@@ -128,8 +133,7 @@
 use super::types::*;
 use crate::state::{
     decode_cursor, encode_cursor, non_empty, ConnectionRequest, TargetSelectors,
-    ABSENT_ENDPOINT_MESSAGE, CURSOR_COLUMNS, DEFAULT_PAGE_SIZE, DEFAULT_SCHEMA,
-    INVALID_TOKEN_MESSAGE,
+    ABSENT_ENDPOINT_MESSAGE, CURSOR_COLUMNS, DEFAULT_PAGE_SIZE, INVALID_TOKEN_MESSAGE,
 };
 
 /// The compute-target selectors THIS operation accepts: its input shape models
@@ -261,12 +265,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let table = non_empty(input.table.as_ref());
 
         // The cursor is a column offset, and its kind names the database and
-        // the table filter the page was issued for, so a token minted while
+        // both name filters the page was issued for, so a token minted while
         // paging one table's columns is refused for any other rather than
         // silently resolving to the same offset in a different column list.
         let cursor_kind = format!(
-            "{CURSOR_COLUMNS}:{}:{}",
+            "{CURSOR_COLUMNS}:{}:{}:{}",
             connection.database,
+            schema.as_deref().unwrap_or_default(),
             table.as_deref().unwrap_or_default()
         );
         let offset = match input.next_token.as_deref() {
@@ -278,17 +283,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => return Err(validation(INVALID_TOKEN_MESSAGE)),
             },
         };
-
-        // "The schema that contains the table. If no schema is specified, then
-        // matching tables for all schemas are returned." This emulator's engine
-        // holds every table of a database in the database's default schema, so
-        // a request naming another schema matches no table there.
-        if schema
-            .as_deref()
-            .is_some_and(|schema| !schema.eq_ignore_ascii_case(DEFAULT_SCHEMA))
-        {
-            return Err(no_such_table(&schema.unwrap_or_default(), table.as_deref()));
-        }
 
         // A reporting operation must not OPEN a database, or a later caller
         // would find one this read had created — so the catalog is read from
@@ -321,11 +315,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let budget = crate::state::CATALOG_REQUEST_BUDGET;
                 let bound = crate::state::ExecutionBound::new();
                 let interrupt = bound.interrupt();
-                let wanted = table.clone();
+                // "The schema that contains the table. If no schema is
+                // specified, then matching tables for all schemas are
+                // returned", and "if no table is specified, then all tables for
+                // all matching schemas are returned": so each name the request
+                // gives narrows the catalogue read to the relations it
+                // describes — the engine holds a relation of a schema under its
+                // qualified name, and the filter is applied to the two parts of
+                // that name — and the read costs what the request asked about
+                // rather than what the database holds.
+                let filter = crate::state::CatalogFilter {
+                    schema: schema.clone(),
+                    table: table.clone(),
+                    ..crate::state::CatalogFilter::default()
+                };
                 let joined = tokio::time::timeout(
                     budget,
                     tokio::task::spawn_blocking(move || {
-                        crate::state::catalog_on(&handle, wanted.as_deref(), engine_timeout, &bound)
+                        crate::state::catalog_on(&handle, &filter, engine_timeout, &bound)
                     }),
                 )
                 .await;
@@ -367,14 +374,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // A named table that the catalog does not hold is a missing resource.
-        if described.is_empty() && table.is_some() {
-            return Err(no_such_table(DEFAULT_SCHEMA, table.as_deref()));
-        }
-
-        // "If no table is specified, then all tables for all matching schemas
-        // are returned", so the column list runs over every matching table in
-        // catalog order, each column carrying the table it belongs to.
+        // A schema or a table the catalogue holds nothing of that name for is
+        // NOT a missing resource: `ColumnList` is "a list of columns in the
+        // table", and a name matching nothing in a database the warehouse does
+        // hold matches no column, so the answer is a successful EMPTY column
+        // list — which is what lets a caller prove a table is gone. The
+        // missing-resource refusal is reserved for a warehouse or a database
+        // that does not exist, which is answered above.
+        //
+        // The column list runs over every relation the filter described, in
+        // catalogue order, each column carrying the table that includes it.
         let columns: Vec<ColumnMetadata> = described
             .iter()
             .flat_map(|described| described.columns.iter().cloned())
@@ -395,7 +404,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // table name and the columns carry their own.
             table_name: table
                 .is_some()
-                .then(|| described.first().map(|described| described.table.clone()))
+                .then(|| {
+                    described
+                        .first()
+                        .map(|described| crate::state::split_relation(&described.table).1.to_string())
+                })
                 .flatten(),
             column_list: Some(columns[offset..end].to_vec()),
             next_token: (end < columns.len())
@@ -413,14 +426,4 @@ fn validation(message: &str) -> DescribeTableError {
     .into()
 }
 
-/// Refuse a table the named database's catalog does not hold — a missing
-/// resource (404), not a malformed request.
-fn no_such_table(schema: &str, table: Option<&str>) -> DescribeTableError {
-    let named = table.unwrap_or("*");
-    DescribeTableErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: format!("Table does not exist: {schema}.{named}"),
-        resource_id: format!("{schema}.{named}"),
-    })
-    .into()
-}
 

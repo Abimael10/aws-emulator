@@ -15,7 +15,9 @@
 //!   boolean as `booleanValue` and a character or temporal column as
 //!   `stringValue`;
 //! * `ColumnMetadata.precision` is the declared width of a non-numeric column
-//!   and the declared precision of an exact-numeric one;
+//!   and the declared precision of an exact-numeric one, `length` carries
+//!   nothing, and a column read from a relation reports that relation and the
+//!   nullability it declares;
 //! * a statement with no result to fetch is refused as a missing RESULT,
 //!   while a query that matched nothing is served as the empty result set it
 //!   produced;
@@ -235,7 +237,7 @@ async fn every_column_of_one_row_takes_its_own_member() {
 // ---------------------------------------------------------------------------
 
 /// One row of the precision table: a column's declared type and the
-/// `precision`, `scale` and `length` it must report.
+/// `precision` and `scale` it must report.
 struct PrecisionCase {
     declared: &'static str,
     precision: i64,
@@ -244,8 +246,9 @@ struct PrecisionCase {
 
 /// `ColumnMetadata.precision` is "the precision value of a decimal number
 /// column, or the column length for a non-numeric column", so it carries the
-/// size the column was DECLARED with rather than the modelled default of 0 —
-/// nothing else in the response carries the declared width.
+/// size the column was DECLARED with — and, for a type that declares none, the
+/// width of that type's widest value. `length` carries nothing: the width is
+/// reported in `precision`.
 #[tokio::test]
 async fn column_metadata_precision_is_the_declared_size_of_the_column() {
     let cases = [
@@ -255,10 +258,11 @@ async fn column_metadata_precision_is_the_declared_size_of_the_column() {
         PrecisionCase { declared: "CHAR(8)", precision: 8, scale: 0 },
         PrecisionCase { declared: "DECIMAL(10,2)", precision: 10, scale: 2 },
         PrecisionCase { declared: "NUMERIC(38,10)", precision: 38, scale: 10 },
-        // A type that declares no size at all reports the modelled default,
-        // which is then the truth about it rather than a dropped value.
-        PrecisionCase { declared: "INTEGER", precision: 0, scale: 0 },
-        PrecisionCase { declared: "BOOLEAN", precision: 0, scale: 0 },
+        // A type that declares no size of its own carries the width of its
+        // widest value: ten digits for the INTEGER range, one character for a
+        // boolean.
+        PrecisionCase { declared: "INTEGER", precision: 10, scale: 0 },
+        PrecisionCase { declared: "BOOLEAN", precision: 1, scale: 0 },
     ];
 
     for case in &cases {
@@ -292,8 +296,8 @@ async fn column_metadata_precision_is_the_declared_size_of_the_column() {
         );
         assert_eq!(
             number(column, "length"),
-            case.precision,
-            "case {}: a declared size is reported as both length and precision, got {column}",
+            0,
+            "case {}: the width is reported in precision, so length carries 0, got {column}",
             case.declared
         );
     }
@@ -452,9 +456,24 @@ async fn a_batch_statement_reports_the_batch_id_and_its_results_live_per_stateme
                 "case {label}: statement {position} must report the batch's Id, got \
                  {described_sub}"
             );
+            // The record is the batch's own, so it carries no single
+            // QueryString; the addressed statement's text is read off the
+            // SubStatements entry the address narrows the list to.
+            assert!(
+                described_sub.get("QueryString").is_none(),
+                "case {label}: a batch record has no single QueryString, got {described_sub}"
+            );
+            let narrowed = list(&described_sub, "SubStatements");
             assert_eq!(
-                described_sub["QueryString"], json!(sqls[index]),
-                "case {label}: statement {position} must report its own text, got \
+                narrowed.len(),
+                1,
+                "case {label}: the ':{position}' address narrows SubStatements to that one \
+                 statement, got {described_sub}"
+            );
+            assert_eq!(
+                (narrowed[0]["Id"].clone(), narrowed[0]["QueryString"].clone()),
+                (json!(address), json!(sqls[index])),
+                "case {label}: statement {position} is read at SubStatements[0], got \
                  {described_sub}"
             );
         }
@@ -933,7 +952,7 @@ async fn describe_table_reports_the_columns_a_table_declares() {
             ddl: "CREATE TABLE people (id INTEGER, name VARCHAR(32), amt DECIMAL(10,2))",
             table: "people",
             columns: &[
-                ExpectedColumn { name: "id", type_name: "int4", precision: 0, scale: 0 },
+                ExpectedColumn { name: "id", type_name: "int4", precision: 10, scale: 0 },
                 ExpectedColumn { name: "name", type_name: "varchar", precision: 32, scale: 0 },
                 ExpectedColumn { name: "amt", type_name: "numeric", precision: 10, scale: 2 },
             ],
@@ -952,9 +971,9 @@ async fn describe_table_reports_the_columns_a_table_declares() {
             ddl: "CREATE TABLE temporal (at TIMESTAMP, on_day DATE, flag BOOLEAN)",
             table: "temporal",
             columns: &[
-                ExpectedColumn { name: "at", type_name: "timestamp", precision: 0, scale: 0 },
-                ExpectedColumn { name: "on_day", type_name: "date", precision: 0, scale: 0 },
-                ExpectedColumn { name: "flag", type_name: "bool", precision: 0, scale: 0 },
+                ExpectedColumn { name: "at", type_name: "timestamp", precision: 29, scale: 6 },
+                ExpectedColumn { name: "on_day", type_name: "date", precision: 13, scale: 0 },
+                ExpectedColumn { name: "flag", type_name: "bool", precision: 1, scale: 0 },
             ],
         },
     ];
@@ -1102,26 +1121,23 @@ async fn describe_table_pages_its_column_list() {
     }
 }
 
-/// A table the named database's catalog does not hold is not found, and a
-/// request that names no data warehouse is refused.
+/// A database the warehouse does not hold is not found, a name the catalog
+/// matches nothing for describes no column, and a request that names no data
+/// warehouse is refused.
 #[tokio::test]
 async fn describe_table_refuses_what_the_catalog_does_not_hold() {
     let emulator = Emulator::new();
     emulator.run("CREATE TABLE present (id INTEGER)").await;
 
-    let not_found: [(&str, Value); 4] = [
-        ("a table no database holds", json!({"Table": "absent"})),
+    // Only a DATABASE the warehouse does not hold is the missing resource.
+    let not_found: [(&str, Value); 2] = [
         (
-            "a table of another database",
+            "a table of a database the warehouse does not hold",
             json!({"Database": "reporting", "Table": "present"}),
         ),
         (
             "a database no statement has opened",
             json!({"Database": "never-used", "Table": "present"}),
-        ),
-        (
-            "a schema this database does not hold",
-            json!({"Schema": "other", "Table": "present"}),
         ),
     ];
     for (label, overrides) in &not_found {
@@ -1138,6 +1154,37 @@ async fn describe_table_refuses_what_the_catalog_does_not_hold() {
             error_code(&response),
             "ResourceNotFoundException",
             "case {label}: expected ResourceNotFoundException, got {response}"
+        );
+    }
+
+    // A schema or a table the database holds nothing of that name for is a
+    // SUCCESS with an empty column list — which is what lets a caller prove a
+    // table is not there.
+    let empty: [(&str, Value); 3] = [
+        ("a table the database does not hold", json!({"Table": "absent"})),
+        (
+            "a schema this database does not hold",
+            json!({"Schema": "other", "Table": "present"}),
+        ),
+        (
+            "a schema and a table the database holds neither of",
+            json!({"Schema": "other", "Table": "absent"}),
+        ),
+    ];
+    for (label, overrides) in &empty {
+        let mut request = cluster();
+        for (member, value) in overrides.as_object().expect("an object of overrides") {
+            request[member] = value.clone();
+        }
+        let described = emulator.ok("DescribeTable", &request).await;
+        assert!(
+            list(&described, "ColumnList").is_empty(),
+            "case {label}: a name the catalog matches nothing for describes no column, got \
+             {described}"
+        );
+        assert!(
+            described.get("TableName").is_none(),
+            "case {label}: no table was described, so no table is named, got {described}"
         );
     }
 

@@ -123,6 +123,12 @@ pub use table_restore::*;
 /// The CONNECTION a submission's statements run on: the temporary relations
 /// that belong to it alone, and the locks it holds against the others.
 mod connections;
+/// The `ColumnMetadata` a result set's and a table's columns are reported as.
+mod column_metadata;
+/// Where a statement's result columns come from, read from its own text and
+/// from the definitions the engine's catalog holds.
+mod column_origins;
+pub use column_metadata::*;
 pub use connections::*;
 
 /// Page size `ListStatements` uses when the request leaves `MaxResults` at its
@@ -202,9 +208,11 @@ pub const CSV_RESULT_READER_REQUIREMENT: &str =
 /// The message the Data API answers a result read addressed to a BATCH's own
 /// `Id` with: a batch is not a query, and its results live on the `:<n>` ids of
 /// the statements it submitted.
+///
+/// Fixed text, carrying no part of the request — the service states the
+/// requirement and nothing about the id that was asked for.
 pub const BATCH_PARENT_RESULT_MESSAGE: &str =
-    "Query is a batch statement; fetch the results of each SQL statement of the batch with its \
-     own Id, which is this Id with a :<n> suffix";
+    "BatchExecuteStatement result can only be retrieved with sub-statement id.";
 
 /// The message the Data API answers an `Id` it holds no query for with.
 ///
@@ -2691,9 +2699,23 @@ fn execute_once(
             )
         })
         .collect();
+    // What the STATEMENT says about those columns: the relation a column is
+    // read from, with the nullability that relation declares for it, and the
+    // type a computed column is cast to — neither of which the engine's
+    // prepared statement exposes.
+    let names: Vec<String> = columns.iter().map(|(name, _)| name.clone()).collect();
+    let read = column_origins::result_columns(connection, sql, &names);
+    // A column the engine declares a type for reports THAT type; a computed one
+    // reports the type the statement casts it to, and one that is neither is
+    // inferred from the values it produces.
     let declared: Vec<Option<ColumnType>> = columns
         .iter()
-        .map(|(_, decl)| decl.as_deref().map(ColumnType::from_declared))
+        .zip(read.iter())
+        .map(|((_, decl), read)| {
+            decl.as_deref()
+                .map(ColumnType::from_declared)
+                .or_else(|| read.declared.clone())
+        })
         .collect();
 
     let mut rows = statement.query(bound.as_slice())?;
@@ -2758,7 +2780,10 @@ fn execute_once(
     let column_metadata = columns
         .iter()
         .zip(observed.iter())
-        .map(|((name, _), column_type)| column_metadata(name, column_type.as_ref()))
+        .zip(read.iter())
+        .map(|(((name, _), column_type), read)| {
+            column_metadata(name, column_type.as_ref(), read.origin.as_ref())
+        })
         .collect();
 
     // The result is kept, so its cost is charged to the submission — only here,
@@ -2832,8 +2857,15 @@ fn field_from(value: rusqlite::types::ValueRef<'_>, column_type: Option<&ColumnT
 /// `None` for a value that is not one of the column's numbers — a NULL, or text
 /// or bytes the engine kept verbatim — which is reported under the member that
 /// matches what it actually is rather than dressed up as a number.
+///
+/// The rendered text is BOUNDED here as well as where the scale is read
+/// ([`ColumnType::declared_scale`]): a declaration naming more digits than an
+/// exact-numeric column can have ([`MAX_NUMERIC_SCALE`]) renders at that many,
+/// so one value's text is its own digits plus at most that many however the
+/// engine spells the type the caller declared.
 fn exact_numeric(value: rusqlite::types::ValueRef<'_>, scale: usize) -> Option<String> {
     use rusqlite::types::ValueRef;
+    let scale = scale.min(usize::try_from(MAX_NUMERIC_SCALE).unwrap_or(0));
     match value {
         // Scaled from the INTEGER itself rather than through a float, so a
         // value past what a double can hold exactly keeps every digit.
@@ -2847,363 +2879,6 @@ fn exact_numeric(value: rusqlite::types::ValueRef<'_>, scale: usize) -> Option<S
 // ---------------------------------------------------------------------------
 // Column metadata
 // ---------------------------------------------------------------------------
-
-/// A resolved column type: the name `ColumnMetadata.typeName` reports plus the
-/// size facts derived from the declaration.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ColumnType {
-    /// The value of `ColumnMetadata.typeName`.
-    pub name: String,
-    /// `ColumnMetadata.length` / `precision`, from a declared `(n)` or `(p,s)`.
-    pub length: i32,
-    /// `ColumnMetadata.scale`, from a declared `(p,s)`.
-    pub scale: i32,
-}
-
-/// `ColumnMetadata.typeName` is "The database-specific data type of the column",
-/// and Redshift answers with the database's own (PostgreSQL) type name rather
-/// than the SQL keyword the column was declared with. This table is that
-/// mapping, for the type keywords in the Amazon Redshift *Data types*
-/// documentation
-/// (<https://docs.aws.amazon.com/redshift/latest/dg/c_Supported_data_types.html>),
-/// whose "Data type" / "Aliases" columns give the left-hand side and whose
-/// internal names give the right.
-///
-/// Longest keyword first is not required: lookup is an exact match on the
-/// declared keyword with any `(..)` size suffix already stripped.
-const DECLARED_TYPE_NAMES: &[(&str, &str)] = &[
-    ("smallint", "int2"),
-    ("int2", "int2"),
-    ("integer", "int4"),
-    ("int", "int4"),
-    ("int4", "int4"),
-    ("bigint", "int8"),
-    ("int8", "int8"),
-    ("decimal", "numeric"),
-    ("numeric", "numeric"),
-    ("real", "float4"),
-    ("float4", "float4"),
-    ("double precision", "float8"),
-    ("float8", "float8"),
-    ("float", "float8"),
-    ("boolean", "bool"),
-    ("bool", "bool"),
-    ("char", "bpchar"),
-    ("character", "bpchar"),
-    ("nchar", "bpchar"),
-    ("bpchar", "bpchar"),
-    ("varchar", "varchar"),
-    ("character varying", "varchar"),
-    ("nvarchar", "varchar"),
-    ("text", "varchar"),
-    ("date", "date"),
-    ("time", "time"),
-    ("time without time zone", "time"),
-    ("timetz", "timetz"),
-    ("time with time zone", "timetz"),
-    ("timestamp", "timestamp"),
-    ("timestamp without time zone", "timestamp"),
-    ("timestamptz", "timestamptz"),
-    ("timestamp with time zone", "timestamptz"),
-    ("varbyte", "varbyte"),
-    ("varbinary", "varbyte"),
-    ("binary varying", "varbyte"),
-    ("super", "super"),
-];
-
-/// The type names [`ColumnType`] reports for a numeric column, used for
-/// `ColumnMetadata.isSigned`. Every Redshift numeric type is signed.
-const SIGNED_TYPE_NAMES: &[&str] = &["int2", "int4", "int8", "numeric", "float4", "float8"];
-
-/// The type names [`ColumnType`] reports for an EXACT-numeric column whose
-/// values carry a declared scale: `DECIMAL` and its alias `NUMERIC`, which the
-/// Amazon Redshift *Numeric types* documentation
-/// (<https://docs.aws.amazon.com/redshift/latest/dg/r_Numeric_types201.html>)
-/// separates from the approximate `REAL`/`DOUBLE PRECISION`. The exact INTEGER
-/// types are not here: they declare no scale, and `longValue` carries them
-/// without loss.
-const EXACT_NUMERIC_TYPE_NAMES: &[&str] = &["numeric"];
-
-/// The greatest scale an exact-numeric column can declare: the same
-/// documentation gives `DECIMAL` a maximum precision of 38 digits, so no more
-/// than 38 of them can sit to the right of the decimal point.
-const MAX_NUMERIC_SCALE: i32 = 38;
-
-/// The type names [`ColumnType`] reports for a character column. Redshift
-/// compares `CHAR` and `VARCHAR` values case-sensitively, which is what
-/// `ColumnMetadata.isCaseSensitive` reports.
-const CASE_SENSITIVE_TYPE_NAMES: &[&str] = &["bpchar", "varchar", "super"];
-
-impl ColumnType {
-    /// Whether this column is an EXACT-numeric one, whose values are reported
-    /// as decimal text so that neither the declared scale nor an exact digit is
-    /// lost to binary floating point.
-    fn is_exact_numeric(&self) -> bool {
-        EXACT_NUMERIC_TYPE_NAMES.contains(&self.name.as_str())
-    }
-
-    /// How many digits this column declares after the decimal point, held to
-    /// the greatest scale an exact-numeric column can have
-    /// ([`MAX_NUMERIC_SCALE`]) so that a declaration naming more than Redshift
-    /// allows cannot widen a rendered value without bound.
-    fn declared_scale(&self) -> usize {
-        usize::try_from(self.scale.clamp(0, MAX_NUMERIC_SCALE)).unwrap_or(0)
-    }
-
-    /// Resolve a column's declared type keyword — `VARCHAR(16)`,
-    /// `NUMERIC(10,2)`, `BIGINT` — through [`DECLARED_TYPE_NAMES`]. A keyword
-    /// the table does not carry keeps its own spelling: it is still the
-    /// database-specific name of that column's type.
-    fn from_declared(declared: &str) -> Self {
-        let declared = declared.trim().to_ascii_lowercase();
-        let (keyword, args) = match declared.split_once('(') {
-            Some((keyword, rest)) => (keyword.trim(), rest.trim_end_matches(')')),
-            None => (declared.as_str(), ""),
-        };
-        let mut sizes = args
-            .split(',')
-            .map(|size| size.trim().parse::<i32>().unwrap_or(0));
-        let length = sizes.next().unwrap_or(0);
-        let scale = sizes.next().unwrap_or(0);
-        // A keyword outside the table is reported verbatim: it is still the
-        // database-specific name of that column's type, and inventing a
-        // different one would misreport it.
-        let name = DECLARED_TYPE_NAMES
-            .iter()
-            .find(|(candidate, _)| *candidate == keyword)
-            .map_or_else(|| keyword.to_string(), |(_, name)| (*name).to_string());
-        Self {
-            name,
-            length,
-            scale,
-        }
-    }
-
-    /// Resolve a column with no declared type — an expression such as
-    /// `SELECT 1` — from the value the engine produced for it.
-    ///
-    /// An INTEGER value takes the NARROWEST Redshift integer type whose range
-    /// holds it, which is how a Redshift (PostgreSQL-derived) integer constant is
-    /// typed: `int4` while the value fits the 4-byte `INTEGER` range
-    /// (-2147483648 to +2147483647) and `int8` for anything past it, the ranges
-    /// the Amazon Redshift *Data types* documentation publishes for `INTEGER` and
-    /// `BIGINT`.
-    fn from_value(value: rusqlite::types::ValueRef<'_>) -> Option<Self> {
-        use rusqlite::types::ValueRef;
-        let name = match value {
-            // NULL says nothing about the column's type.
-            ValueRef::Null => return None,
-            ValueRef::Integer(integer) => {
-                if i32::try_from(integer).is_ok() {
-                    "int4"
-                } else {
-                    "int8"
-                }
-            }
-            ValueRef::Real(_) => "float8",
-            ValueRef::Text(_) => "varchar",
-            ValueRef::Blob(_) => "varbyte",
-        };
-        Some(Self {
-            name: name.to_string(),
-            length: 0,
-            scale: 0,
-        })
-    }
-
-    /// The type an expression column must report once it has produced one more
-    /// `value`: the type that holds EVERY value the column carried.
-    ///
-    /// Only widening happens, and only within the integer types, because that is
-    /// the only family [`Self::from_value`] can infer differently for two values
-    /// of one column: a column whose values all fit `INTEGER` is `int4`, and one
-    /// value past that range makes the whole column `int8`, whichever row it
-    /// arrives in. The first non-NULL value decides anything else, and a NULL
-    /// says nothing.
-    fn widened_with(current: Option<Self>, value: rusqlite::types::ValueRef<'_>) -> Option<Self> {
-        let observed = Self::from_value(value);
-        match (current, observed) {
-            (None, observed) => observed,
-            (Some(current), None) => Some(current),
-            (Some(current), Some(observed)) => {
-                match (integer_width(&current.name), integer_width(&observed.name)) {
-                    (Some(held), Some(seen)) if seen > held => Some(observed),
-                    _ => Some(current),
-                }
-            }
-        }
-    }
-}
-
-/// The integer type names [`ColumnType::from_value`] infers, NARROWEST FIRST — the
-/// order of the ranges the Amazon Redshift *Data types* documentation publishes
-/// for `INTEGER` (`int4`, 4 bytes) and `BIGINT` (`int8`, 8 bytes).
-///
-/// The ordering lives HERE rather than in a pairwise name comparison, so widening
-/// an inferred column keeps working when another inferred width joins the list.
-const INFERRED_INTEGER_WIDTHS: &[&str] = &["int4", "int8"];
-
-/// How wide an inferred integer type is, as its position in
-/// [`INFERRED_INTEGER_WIDTHS`]; `None` for a type that is not one of them.
-fn integer_width(name: &str) -> Option<usize> {
-    INFERRED_INTEGER_WIDTHS
-        .iter()
-        .position(|candidate| *candidate == name)
-}
-
-/// Build the modelled `ColumnMetadata` for one result column.
-fn column_metadata(name: &str, column_type: Option<&ColumnType>) -> ColumnMetadata {
-    let type_name = column_type.map(|column_type| column_type.name.clone());
-    let signed = column_type
-        .is_some_and(|column_type| SIGNED_TYPE_NAMES.contains(&column_type.name.as_str()));
-    let case_sensitive = column_type
-        .is_some_and(|column_type| CASE_SENSITIVE_TYPE_NAMES.contains(&column_type.name.as_str()));
-    let length = column_type.map_or(0, |column_type| column_type.length);
-    let scale = column_type.map_or(0, |column_type| column_type.scale);
-    ColumnMetadata {
-        // SQLite's prepared-statement metadata does not expose a result
-        // column's NOT NULL constraint, so every column is reported with the
-        // weakest claim: nullable.
-        nullable: 1,
-        is_case_sensitive: case_sensitive,
-        // Redshift's supported data types carry no money type, so no column is
-        // a currency column.
-        is_currency: false,
-        is_signed: signed,
-        // Redshift reports the column's output name as both name and label; a
-        // statement that aliases a column changes both together.
-        label: Some(name.to_string()),
-        name: Some(name.to_string()),
-        // "The precision value of a decimal number column, or the column length
-        // for a non-numeric column" — both are the declared size.
-        precision: length,
-        scale,
-        length,
-        type_name,
-        // A result column's origin schema and table, and its default, are not
-        // derivable from a prepared statement here, so they are reported absent
-        // rather than guessed.
-        schema_name: None,
-        table_name: None,
-        column_default: None,
-    }
-}
-
-/// The schema a stored table is reported in.
-///
-/// Redshift creates a user table in `public` unless the statement names another
-/// schema, and this emulator's engine holds every table of a database in one
-/// namespace, so `public` is the schema the catalog reports a table in. Nothing
-/// is invented by it: a table a caller reaches through the Data API's metadata
-/// operations is in the database's default schema.
-pub const DEFAULT_SCHEMA: &str = "public";
-
-/// Build the modelled `ColumnMetadata` for one column of a STORED table, which
-/// — unlike a column of a result set, whose origin a prepared statement does
-/// not expose — has a schema and a table of origin to report.
-fn table_column_metadata(
-    name: &str,
-    column_type: Option<&ColumnType>,
-    table: &str,
-) -> ColumnMetadata {
-    ColumnMetadata {
-        schema_name: Some(DEFAULT_SCHEMA.to_string()),
-        table_name: Some(table.to_string()),
-        ..column_metadata(name, column_type)
-    }
-}
-
-/// One table of a database's catalog: its name, and the columns it declares in
-/// declaration order.
-#[derive(Debug, Clone)]
-pub struct TableColumns {
-    /// The table's name, as the engine's catalog spells it.
-    pub table: String,
-    /// One entry per declared column, in declaration order.
-    pub columns: Vec<ColumnMetadata>,
-}
-
-/// Read the catalog of the database `handle` guards: the tables it holds and the
-/// columns each one declares, optionally narrowed to one `table`.
-///
-/// BLOCKING for the same reason [`run_on`] is, and bounded the same way: the
-/// catalog is read with real SQL on the engine's own `sqlite_master`, and each
-/// table's columns come from the engine's answer to a zero-row query over it,
-/// so a reported column is one the engine really declares.
-pub fn catalog_on(
-    handle: &DatabaseHandle,
-    table: Option<&str>,
-    timeout: Duration,
-    bound: &ExecutionBound,
-) -> Result<Vec<TableColumns>, String> {
-    let mut database = handle
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let connection = &mut database.connection;
-
-    let guard = std::sync::Arc::clone(&bound.0);
-    let handler_guard = std::sync::Arc::clone(&guard);
-    connection
-        .progress_handler(
-            PROGRESS_HANDLER_OPS,
-            Some(move || handler_guard.should_interrupt()),
-        )
-        .map_err(|error| scrub_paths(&error.to_string()))?;
-    guard.arm(timeout, step_budget(timeout));
-    let read = read_catalog(connection, table);
-    guard.disarm();
-    read.map_err(|error| scrub_paths(&error.to_string()))
-}
-
-/// The catalog read [`catalog_on`] bounds: the engine's own list of tables and
-/// views, and the columns each of them declares.
-fn read_catalog(
-    connection: &rusqlite::Connection,
-    table: Option<&str>,
-) -> rusqlite::Result<Vec<TableColumns>> {
-    // The engine's own catalog, in name order. Views are tables a client can
-    // read columns from, so they are described too; the engine's internal
-    // objects are not part of the database's catalog.
-    let mut listing = connection.prepare(
-        "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') \
-         AND name NOT LIKE 'sqlite_%' ORDER BY name",
-    )?;
-    let mut names: Vec<String> = Vec::new();
-    let mut rows = listing.query([])?;
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(0)?;
-        // Redshift matches an unquoted identifier case-insensitively, and so
-        // does the engine, so the filter does too.
-        if table.is_none_or(|wanted| wanted.eq_ignore_ascii_case(&name)) {
-            names.push(name);
-        }
-    }
-    drop(rows);
-    drop(listing);
-
-    let mut described = Vec::with_capacity(names.len());
-    for name in names {
-        // A zero-row query over the table: the engine answers with the table's
-        // columns and their declared types, which is where every reported
-        // column comes from.
-        let quoted = name.replace('"', "\"\"");
-        let probe = connection.prepare(&format!("SELECT * FROM \"{quoted}\" LIMIT 0"))?;
-        let columns = probe
-            .columns()
-            .map(|column| {
-                let declared = column
-                    .decl_type()
-                    .map(|decl| ColumnType::from_declared(&decl.to_ascii_lowercase()));
-                table_column_metadata(column.name(), declared.as_ref(), &name)
-            })
-            .collect();
-        described.push(TableColumns {
-            table: name,
-            columns,
-        });
-    }
-    Ok(described)
-}
 
 // ---------------------------------------------------------------------------
 // Pagination cursors
@@ -3219,6 +2894,8 @@ pub const CURSOR_SESSIONS: &str = "sessions";
 pub const CURSOR_COLUMNS: &str = "columns";
 /// Cursor kind naming an offset into the databases of one data warehouse.
 pub const CURSOR_DATABASES: &str = "databases";
+/// Cursor kind naming an offset into the tables of one database.
+pub const CURSOR_TABLES: &str = "tables";
 
 /// Where the page of a statement's result that starts at `offset` ends.
 ///
@@ -3765,6 +3442,32 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
             .get(batch_id)
             .filter(|batch| batch.is_batch)
             .and_then(|batch| batch.sub_statements.get(position.checked_sub(1)?))
+    }
+
+    /// The statement with this `Id`, and the position within it the `Id`
+    /// addressed.
+    ///
+    /// An `Id` carrying the `:<n>` suffix addresses one statement of a batch,
+    /// and the record that read answers with is the BATCH's own — a batch is
+    /// one submission, and `SubStatementData.Id` documents the suffix
+    /// positionally — so what is returned for such an `Id` is the batch
+    /// statement together with the position it names. A bare `Id` names the
+    /// submission itself and addresses no position in it.
+    ///
+    /// `None` for an `Id` this service holds no statement for, including a
+    /// suffix on a submission that is not a batch and one past the end of a
+    /// batch.
+    pub fn addressed_statement(&self, id: &str) -> Option<(&Statement, Option<usize>)> {
+        if let Some(statement) = self.statements.get(id) {
+            return Some((statement, None));
+        }
+        let (batch_id, position) = split_batch_member(id)?;
+        let index = position.checked_sub(1)?;
+        let batch = self
+            .statements
+            .get(batch_id)
+            .filter(|batch| batch.is_batch && index < batch.sub_statements.len())?;
+        Some((batch, Some(index)))
     }
 
     /// The `Id` a previous `ExecuteStatement` with this `ClientToken` minted.

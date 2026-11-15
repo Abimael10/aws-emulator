@@ -299,10 +299,8 @@ fn materialise_table_info(
     for name in held {
         // A table of a schema is held under its qualified name, so the name the
         // view reports is split back into the schema and the table.
-        let (schema, table) = match name.split_once('.') {
-            Some((schema, table)) => (schema.to_string(), table.to_string()),
-            None => (super::DEFAULT_SCHEMA.to_string(), name.clone()),
-        };
+        let (schema, table) = super::split_relation(&name);
+        let (schema, table) = (schema.to_string(), table.to_string());
         let quoted = name.replace('"', "\"\"");
         let rows: i64 = connection
             .query_row(&format!("SELECT count(*) FROM \"{quoted}\""), [], |row| {

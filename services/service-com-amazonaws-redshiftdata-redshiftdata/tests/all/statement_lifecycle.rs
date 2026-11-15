@@ -281,8 +281,9 @@ struct TypeCase {
     declared: &'static str,
     /// The `typeName` the column must report.
     type_name: &'static str,
-    /// `length` (and therefore `precision`).
-    length: i64,
+    /// `precision`: the declared size, or the width of the type's widest value
+    /// when it declares none.
+    precision: i64,
     /// `scale`.
     scale: i64,
     /// `isSigned`.
@@ -292,38 +293,47 @@ struct TypeCase {
 }
 
 /// `ColumnMetadata.typeName` reports the database-specific name of the column's
-/// declared type, with the declared size carried through to `length`,
-/// `precision` and `scale`.
+/// declared type, with the declared size carried through to `precision` and
+/// `scale` — and `length` carrying nothing, since `precision` is where a
+/// non-numeric column's length is reported.
 ///
 /// The expectations come from the Amazon Redshift *Data types* documentation
 /// (<https://docs.aws.amazon.com/redshift/latest/dg/c_Supported_data_types.html>),
-/// whose per-type rows give each keyword's internal name.
+/// whose per-type rows give each keyword's internal name, its range or
+/// resolution and its default size.
 #[tokio::test]
 async fn column_metadata_reports_the_declared_type_of_each_column() {
     let cases = [
-        TypeCase { declared: "SMALLINT", type_name: "int2", length: 0, scale: 0, signed: true, case_sensitive: false },
-        TypeCase { declared: "INTEGER", type_name: "int4", length: 0, scale: 0, signed: true, case_sensitive: false },
-        TypeCase { declared: "INT", type_name: "int4", length: 0, scale: 0, signed: true, case_sensitive: false },
-        TypeCase { declared: "BIGINT", type_name: "int8", length: 0, scale: 0, signed: true, case_sensitive: false },
-        TypeCase { declared: "DECIMAL(10,2)", type_name: "numeric", length: 10, scale: 2, signed: true, case_sensitive: false },
-        TypeCase { declared: "NUMERIC(38,10)", type_name: "numeric", length: 38, scale: 10, signed: true, case_sensitive: false },
-        TypeCase { declared: "REAL", type_name: "float4", length: 0, scale: 0, signed: true, case_sensitive: false },
-        TypeCase { declared: "DOUBLE PRECISION", type_name: "float8", length: 0, scale: 0, signed: true, case_sensitive: false },
-        TypeCase { declared: "BOOLEAN", type_name: "bool", length: 0, scale: 0, signed: false, case_sensitive: false },
-        TypeCase { declared: "CHAR(4)", type_name: "bpchar", length: 4, scale: 0, signed: false, case_sensitive: true },
-        TypeCase { declared: "VARCHAR(16)", type_name: "varchar", length: 16, scale: 0, signed: false, case_sensitive: true },
-        TypeCase { declared: "VARCHAR(65535)", type_name: "varchar", length: 65535, scale: 0, signed: false, case_sensitive: true },
-        TypeCase { declared: "TEXT", type_name: "varchar", length: 0, scale: 0, signed: false, case_sensitive: true },
-        TypeCase { declared: "DATE", type_name: "date", length: 0, scale: 0, signed: false, case_sensitive: false },
-        TypeCase { declared: "TIME", type_name: "time", length: 0, scale: 0, signed: false, case_sensitive: false },
-        TypeCase { declared: "TIMETZ", type_name: "timetz", length: 0, scale: 0, signed: false, case_sensitive: false },
-        TypeCase { declared: "TIMESTAMP", type_name: "timestamp", length: 0, scale: 0, signed: false, case_sensitive: false },
-        TypeCase { declared: "TIMESTAMPTZ", type_name: "timestamptz", length: 0, scale: 0, signed: false, case_sensitive: false },
-        TypeCase { declared: "VARBYTE", type_name: "varbyte", length: 0, scale: 0, signed: false, case_sensitive: false },
-        TypeCase { declared: "SUPER", type_name: "super", length: 0, scale: 0, signed: false, case_sensitive: true },
+        TypeCase { declared: "SMALLINT", type_name: "int2", precision: 5, scale: 0, signed: true, case_sensitive: false },
+        TypeCase { declared: "INTEGER", type_name: "int4", precision: 10, scale: 0, signed: true, case_sensitive: false },
+        TypeCase { declared: "INT", type_name: "int4", precision: 10, scale: 0, signed: true, case_sensitive: false },
+        TypeCase { declared: "BIGINT", type_name: "int8", precision: 19, scale: 0, signed: true, case_sensitive: false },
+        TypeCase { declared: "DECIMAL(10,2)", type_name: "numeric", precision: 10, scale: 2, signed: true, case_sensitive: false },
+        TypeCase { declared: "NUMERIC(38,10)", type_name: "numeric", precision: 38, scale: 10, signed: true, case_sensitive: false },
+        // DECIMAL declared with no size at all takes its documented default
+        // precision of 18 digits.
+        TypeCase { declared: "DECIMAL", type_name: "numeric", precision: 18, scale: 0, signed: true, case_sensitive: false },
+        TypeCase { declared: "REAL", type_name: "float4", precision: 6, scale: 0, signed: true, case_sensitive: false },
+        TypeCase { declared: "DOUBLE PRECISION", type_name: "float8", precision: 15, scale: 0, signed: true, case_sensitive: false },
+        TypeCase { declared: "BOOLEAN", type_name: "bool", precision: 1, scale: 0, signed: false, case_sensitive: false },
+        TypeCase { declared: "CHAR(4)", type_name: "bpchar", precision: 4, scale: 0, signed: false, case_sensitive: true },
+        TypeCase { declared: "VARCHAR(16)", type_name: "varchar", precision: 16, scale: 0, signed: false, case_sensitive: true },
+        TypeCase { declared: "VARCHAR(65535)", type_name: "varchar", precision: 65535, scale: 0, signed: false, case_sensitive: true },
+        // CHAR and VARCHAR declared without a length take their documented
+        // default lengths, 1 and 256 characters.
+        TypeCase { declared: "CHAR", type_name: "bpchar", precision: 1, scale: 0, signed: false, case_sensitive: true },
+        TypeCase { declared: "VARCHAR", type_name: "varchar", precision: 256, scale: 0, signed: false, case_sensitive: true },
+        TypeCase { declared: "TEXT", type_name: "varchar", precision: 256, scale: 0, signed: false, case_sensitive: true },
+        TypeCase { declared: "DATE", type_name: "date", precision: 13, scale: 0, signed: false, case_sensitive: false },
+        TypeCase { declared: "TIME", type_name: "time", precision: 15, scale: 6, signed: false, case_sensitive: false },
+        TypeCase { declared: "TIMETZ", type_name: "timetz", precision: 21, scale: 6, signed: false, case_sensitive: false },
+        TypeCase { declared: "TIMESTAMP", type_name: "timestamp", precision: 29, scale: 6, signed: false, case_sensitive: false },
+        TypeCase { declared: "TIMESTAMPTZ", type_name: "timestamptz", precision: 35, scale: 6, signed: false, case_sensitive: false },
+        TypeCase { declared: "VARBYTE", type_name: "varbyte", precision: 64000, scale: 0, signed: false, case_sensitive: false },
+        TypeCase { declared: "SUPER", type_name: "super", precision: 0, scale: 0, signed: false, case_sensitive: true },
         // A keyword outside the mapping keeps its own spelling rather than being
         // reported as some other type.
-        TypeCase { declared: "GEOMETRY", type_name: "geometry", length: 0, scale: 0, signed: false, case_sensitive: false },
+        TypeCase { declared: "GEOMETRY", type_name: "geometry", precision: 0, scale: 0, signed: false, case_sensitive: false },
     ];
 
     for case in &cases {
@@ -359,16 +369,17 @@ async fn column_metadata_reports_the_declared_type_of_each_column() {
         );
         assert_eq!(
             number(column, "length"),
-            case.length,
-            "case {}: expected length {}, got {column}",
-            case.declared,
-            case.length
+            0,
+            "case {}: a column's width is reported in precision, so length carries 0, got \
+             {column}",
+            case.declared
         );
         assert_eq!(
             number(column, "precision"),
-            case.length,
-            "case {}: precision must carry the declared size, got {column}",
-            case.declared
+            case.precision,
+            "case {}: expected precision {}, got {column}",
+            case.declared,
+            case.precision
         );
         assert_eq!(
             number(column, "scale"),
@@ -2108,16 +2119,10 @@ async fn the_number_of_open_databases_is_bounded() {
 #[tokio::test]
 async fn the_operations_outside_this_slice_still_answer_not_implemented() {
     let emulator = Emulator::new();
-    let cases: [(&str, Value); 2] = [
-        (
-            "ListSchemas",
-            json!({"ClusterIdentifier": "my-cluster", "Database": "dev"}),
-        ),
-        (
-            "ListTables",
-            json!({"ClusterIdentifier": "my-cluster", "Database": "dev"}),
-        ),
-    ];
+    let cases: [(&str, Value); 1] = [(
+        "ListSchemas",
+        json!({"ClusterIdentifier": "my-cluster", "Database": "dev"}),
+    )];
 
     for (operation, request) in &cases {
         let (status, response) = emulator.call(operation, request).await;

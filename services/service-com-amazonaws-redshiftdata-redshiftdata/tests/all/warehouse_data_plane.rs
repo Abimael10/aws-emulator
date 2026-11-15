@@ -1422,8 +1422,10 @@ async fn a_spectrum_external_table_serves_the_objects_rows_without_loading_them(
         )
         .await;
     assert_eq!(
-        status, 404,
-        "an external table is no table of the database itself, got {status} {body}"
+        (status, body["ColumnList"].clone()),
+        (200, json!([])),
+        "an external table is no table of the database itself, so the database's catalog \
+         describes no column for it, got {status} {body}"
     );
 
     // And the catalog view reports the external table, as a Spectrum client

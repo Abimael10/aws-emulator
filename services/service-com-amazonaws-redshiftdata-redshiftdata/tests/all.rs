@@ -17,6 +17,9 @@ mod batch_execute_statement;
 #[path = "all/caller_patience.rs"]
 mod caller_patience;
 
+#[path = "all/column_metadata.rs"]
+mod column_metadata;
+
 #[path = "all/connection_scope.rs"]
 mod connection_scope;
 
@@ -34,6 +37,9 @@ mod error_surface;
 
 #[path = "all/list_databases.rs"]
 mod list_databases;
+
+#[path = "all/list_tables.rs"]
+mod list_tables;
 
 #[path = "all/numeric_bounds.rs"]
 mod numeric_bounds;
