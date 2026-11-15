@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The map styles a map resource can be created with, and the data provider each
-//! one is sourced from.
+//! The map styles a map resource can be created with, the data provider each one
+//! is sourced from, and how deep that provider publishes its tiles.
 //!
 //! `MapConfiguration$Style` is a plain string in the model (`len 1..100`, pattern
 //! `^[-._\w]+$`), so the request boundary accepts any word-shaped value and WHICH
@@ -13,8 +13,9 @@
 //! (`smithy_query(query="doc",shape="MapConfiguration",member="Style")`). A map
 //! read reports the provider of the style the map was created with
 //! (`DescribeMapResponse$DataSource`: "Specifies the data provider for the
-//! associated map tiles"), so the catalog carries the provider beside each style
-//! and is the one place either is written down.
+//! associated map tiles"), and a tile read is bounded by the zoom range that
+//! style's tiles exist for, so the catalog carries both beside each style and is
+//! the one place any of the three is written down.
 
 /// The Esri data provider, spelled as this API spells a provider name — the same
 /// spelling the `CreateRouteCalculatorRequest$DataSource` member doc lists.
@@ -31,8 +32,8 @@ pub const PROVIDER_GRAB: &str = "Grab";
 /// data provider, so this is the only place the name appears.
 pub const PROVIDER_OPEN_DATA: &str = "Open Data";
 
-/// One catalog entry: a style a map may be created with, and the data provider the
-/// style's tiles come from.
+/// One catalog entry: a style a map may be created with, the data provider the
+/// style's tiles come from, and how deep that provider publishes them.
 #[derive(Debug, Clone, Copy)]
 pub struct MapStyle {
     /// The style, spelled exactly as a request must spell it — the member doc notes
@@ -40,6 +41,18 @@ pub struct MapStyle {
     pub style: &'static str,
     /// The provider a map carrying this style reports as its `DataSource`.
     pub data_source: &'static str,
+    /// The deepest zoom level this style has tiles for, which is what bounds a
+    /// tile read's `Z`; every style's shallowest is
+    /// [`super::map_tiles::MIN_ZOOM`], the single world tile.
+    ///
+    /// The model publishes no zoom table — the `MapConfiguration$Style` doc links
+    /// each provider's own page for what its tiles cover — so the depths here are
+    /// this emulator's catalog: a street-level vector basemap is published deeper
+    /// than the canvas styles beside it, and a raster basemap one level shallower
+    /// than the vector tiles of the same provider. They live on the catalog entry
+    /// because a tile read bounds `Z` by the style the MAP was created with, so
+    /// the depth has to be reachable from the stored resource.
+    pub max_zoom: u32,
 }
 
 /// Every style the `MapConfiguration$Style` doc publishes, in the order that doc
@@ -54,76 +67,113 @@ pub const MAP_STYLES: [MapStyle; 18] = [
     MapStyle {
         style: "VectorEsriDarkGrayCanvas",
         data_source: PROVIDER_ESRI,
+        max_zoom: CANVAS_MAX_ZOOM,
     },
     MapStyle {
         style: "RasterEsriImagery",
         data_source: PROVIDER_ESRI,
+        max_zoom: ESRI_MAX_ZOOM - 1,
     },
     MapStyle {
         style: "VectorEsriLightGrayCanvas",
         data_source: PROVIDER_ESRI,
+        max_zoom: CANVAS_MAX_ZOOM,
     },
     MapStyle {
         style: "VectorEsriTopographic",
         data_source: PROVIDER_ESRI,
+        max_zoom: ESRI_MAX_ZOOM,
     },
     MapStyle {
         style: "VectorEsriStreets",
         data_source: PROVIDER_ESRI,
+        max_zoom: ESRI_MAX_ZOOM,
     },
     MapStyle {
         style: "VectorEsriNavigation",
         data_source: PROVIDER_ESRI,
+        max_zoom: ESRI_MAX_ZOOM,
     },
     MapStyle {
         style: "VectorHereContrast",
         data_source: PROVIDER_HERE,
+        max_zoom: HERE_MAX_ZOOM,
     },
     MapStyle {
         style: "VectorHereBerlin",
         data_source: PROVIDER_HERE,
+        max_zoom: HERE_MAX_ZOOM,
     },
     MapStyle {
         style: "VectorHereExplore",
         data_source: PROVIDER_HERE,
+        max_zoom: HERE_MAX_ZOOM,
     },
     MapStyle {
         style: "VectorHereExploreTruck",
         data_source: PROVIDER_HERE,
+        max_zoom: HERE_MAX_ZOOM,
     },
     MapStyle {
         style: "RasterHereExploreSatellite",
         data_source: PROVIDER_HERE,
+        max_zoom: HERE_MAX_ZOOM - 1,
     },
     MapStyle {
         style: "HybridHereExploreSatellite",
         data_source: PROVIDER_HERE,
+        max_zoom: HERE_MAX_ZOOM - 1,
     },
     MapStyle {
         style: "VectorGrabStandardLight",
         data_source: PROVIDER_GRAB,
+        max_zoom: GRAB_MAX_ZOOM,
     },
     MapStyle {
         style: "VectorGrabStandardDark",
         data_source: PROVIDER_GRAB,
+        max_zoom: GRAB_MAX_ZOOM,
     },
     MapStyle {
         style: "VectorOpenDataStandardLight",
         data_source: PROVIDER_OPEN_DATA,
+        max_zoom: OPEN_DATA_MAX_ZOOM,
     },
     MapStyle {
         style: "VectorOpenDataStandardDark",
         data_source: PROVIDER_OPEN_DATA,
+        max_zoom: OPEN_DATA_MAX_ZOOM,
     },
     MapStyle {
         style: "VectorOpenDataVisualizationLight",
         data_source: PROVIDER_OPEN_DATA,
+        max_zoom: OPEN_DATA_MAX_ZOOM,
     },
     MapStyle {
         style: "VectorOpenDataVisualizationDark",
         data_source: PROVIDER_OPEN_DATA,
+        max_zoom: OPEN_DATA_MAX_ZOOM,
     },
 ];
+
+/// How deep Esri's street-level vector basemaps are published, and so the
+/// deepest zoom a tile read of one of them serves. See
+/// [`MapStyle::max_zoom`] for why the depth is this emulator's own.
+const ESRI_MAX_ZOOM: u32 = 22;
+
+/// How deep the two Esri canvas styles are published: a neutral background style
+/// the `MapConfiguration$Style` doc describes as carrying "minimal colors,
+/// labels, and features" is published shallower than the street map beside it.
+const CANVAS_MAX_ZOOM: u32 = 16;
+
+/// How deep the HERE Technologies basemaps are published.
+const HERE_MAX_ZOOM: u32 = 20;
+
+/// How deep the GrabMaps basemaps are published.
+const GRAB_MAX_ZOOM: u32 = 20;
+
+/// How deep the Open Data basemaps are published.
+const OPEN_DATA_MAX_ZOOM: u32 = 16;
 
 /// The member a refusal about the requested style names: the `MapConfiguration`
 /// member that carries it, as the model spells it.

@@ -1,0 +1,14 @@
+[package]
+name = "vector-tile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# The protobuf codec itself: this crate carries the Mapbox Vector Tile schema and
+# the two parts of that format which are not protobuf, and `prost` encodes them.
+prost = "0.13"
+
+[lints]
+workspace = true

@@ -32,6 +32,9 @@ jpeg-encoder = "0.6"
 # Protobuf codec for the two protobuf formats this service serves: Mapbox
 # Vector Tiles (GetTile) and SDF glyph ranges (GetGlyphs).
 prost = "0.13"
+# ... and the workspace's ONE Mapbox Vector Tile encoder, which `GetTile`'s
+# vector tilesets are built with, rather than a copy of that wire format here.
+vector-tile = { path = "../vector-tile" }
 # The typeface the glyph ranges and the rendered map labels are drawn from: an
 # 8x8 monochrome bitmap font, shipped as data, covering Basic Latin, Latin-1,
 # Greek and Hiragana.

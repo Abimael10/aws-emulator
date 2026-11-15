@@ -28,8 +28,13 @@ tracing = { workspace = true }
 # Polygon geometry checks for geofence writes: ring self-intersection, interior-ring
 # containment and ring crossing (the `geo` crate's OGC validity), plus winding order.
 geo = { version = "0.33", default-features = false }
-# PNG codec for the map sprite sheet a sprite read serves as `image/png`.
+# PNG codec for the map sprite sheet a sprite read serves as `image/png`, and for
+# the raster map tiles a raster basemap's tile read serves.
 png = "0.17"
+# `vector-tile` carries the workspace's ONE Mapbox Vector Tile encoder, which a
+# vector tile read answers through — the same codec the Maps V2 plane's tiles are
+# built with, rather than a second copy of that wire format here.
+vector-tile = { path = "../vector-tile" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

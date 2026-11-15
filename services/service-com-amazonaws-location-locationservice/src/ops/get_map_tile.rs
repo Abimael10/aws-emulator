@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMapTile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMapTile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Serves one tile of the pyramid a stored map resource publishes.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMapTile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The tile's bytes, its media type and the zoom range it may be read at all
+//! follow the map resource's OWN stored configuration (the style it was created
+//! with and the provider that style's tiles are sourced from) and the requested
+//! address; a tile read stores nothing. [`crate::state::map_tiles`] holds the
+//! pyramid and the format, as the sprite sheet's module does beside it.
 //!
 //! ## Shape of an operation
 //!
@@ -94,6 +92,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::map_tiles::{self, TileAddress};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -167,18 +166,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMapTile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMapTileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMapTile"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetMapTileErrorModeled::InternalServerException(InternalServerException {
+                message: "the Amazon Location state store is unavailable".to_string(),
+            })
+        })?;
+
+        // The three address labels target `@sensitive` strings whose modelled
+        // pattern is unanchored, so a label that merely CONTAINS digits reaches
+        // this handler: whether each one spells a number at all is checked here,
+        // in the same sentence the request boundary states for a value outside a
+        // member's pattern. A label is a property of the request alone, so this
+        // precedes resolving the map resource.
+        let [z, x, y] = [
+            (map_tiles::ZOOM_MEMBER, &input.z),
+            (map_tiles::X_MEMBER, &input.x),
+            (map_tiles::Y_MEMBER, &input.y),
+        ]
+        .map(|(member, raw)| {
+            map_tiles::tile_label(raw).ok_or_else(|| {
+                field_validation_failed(
+                    member,
+                    crate::state::pattern_refusal(member, map_tiles::TILE_LABEL_PATTERN),
+                )
+            })
+        });
+        let (z, x, y) = (z?, x?, y?);
+
+        // Read the configuration the map was created with and release the
+        // store: laying the tile out and encoding it reads nothing else, so a
+        // tile read holds no lock while it renders and writes nothing at all.
+        let (style, data_source) = {
+            let store = state.lock();
+            let map = store.maps.get(&input.map_name).ok_or_else(|| {
+                GetMapTileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::resource_not_found(
+                        crate::state::MAP_RESOURCE,
+                        &input.map_name,
+                    ),
+                })
+            })?;
+            (map.configuration.style.clone(), map.data_source.clone())
+        };
+
+        // How deep the pyramid goes is a property of the style the map carries,
+        // which the create resolved against this service's catalog — so a map
+        // holding a style the catalog does not publish cannot be reached through
+        // the API at all, and is a server fault rather than a bad request.
+        let Some(entry) = crate::state::map_style(&style) else {
+            return Err(GetMapTileErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the map resource carries a style this service does not publish"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Only the DEEP end of the range is checked: a label is read from
+        // decimal digits, so it never addresses a zoom below the world tile.
+        if z > u64::from(entry.max_zoom) {
+            return Err(field_validation_failed(
+                map_tiles::ZOOM_MEMBER,
+                map_tiles::zoom_out_of_range(entry.max_zoom),
+            )
+            .into());
+        }
+
+        // A zoom level is a grid of `2^Z` tiles on each axis, so a column or row
+        // at or past that edge addresses no tile of this zoom.
+        let zoom = u32::try_from(z).unwrap_or(u32::MAX);
+        let axis = TileAddress::axis_tiles(zoom);
+        for (member, value) in [(map_tiles::X_MEMBER, x), (map_tiles::Y_MEMBER, y)] {
+            if value >= axis {
+                return Err(field_validation_failed(
+                    member,
+                    map_tiles::axis_out_of_range(member, axis),
+                )
+                .into());
+            }
+        }
+
+        let address = TileAddress {
+            z: zoom,
+            // Inside the axis bound checked above, so each fits a `u32`.
+            x: u32::try_from(x).unwrap_or(u32::MAX),
+            y: u32::try_from(y).unwrap_or(u32::MAX),
+        };
+        let format = map_tiles::tile_format(entry.style);
+        Ok(GetMapTileOutput {
+            blob: Some(map_tiles::tile_bytes(
+                entry.style,
+                &data_source,
+                address,
+            )),
+            content_type: Some(map_tiles::content_type(format).to_string()),
+            cache_control: Some(map_tiles::TILE_CACHE_CONTROL.to_string()),
+        })
     }
+}
+
+/// This operation's channel for a member the request got wrong: the shape comes
+/// from [`crate::state::field_validation_exception`], which every operation
+/// shares; only the lift into this operation's own error enum is local.
+fn field_validation_failed(member: &str, why: String) -> GetMapTileErrorModeled {
+    GetMapTileErrorModeled::ValidationException(crate::state::field_validation_exception(
+        member, why,
+    ))
 }

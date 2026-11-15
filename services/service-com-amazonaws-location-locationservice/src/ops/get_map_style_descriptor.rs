@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMapStyleDescriptor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMapStyleDescriptor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Serves the style descriptor a stored map resource publishes.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMapStyleDescriptor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The document is derived from the map resource's OWN stored configuration: the
+//! style it was created with decides the provider its tiles are credited to, the
+//! zoom range they exist for and the layers they carry.
+//! [`crate::state::style_document`] builds it from the same catalog entry and the
+//! same layer table `GetMapTile` serves tiles from, so what this document
+//! declares and what a tile read answers cannot drift apart.
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +163,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMapStyleDescriptor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMapStyleDescriptorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMapStyleDescriptor"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetMapStyleDescriptorErrorModeled::InternalServerException(InternalServerException {
+                message: "the Amazon Location state store is unavailable".to_string(),
+            })
+        })?;
+
+        // Read the style the map was created with and release the store:
+        // building the document reads nothing else, so a style read holds no
+        // lock while it renders and writes nothing at all.
+        let style = {
+            let store = state.lock();
+            let map = store.maps.get(&input.map_name).ok_or_else(|| {
+                GetMapStyleDescriptorErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::resource_not_found(
+                            crate::state::MAP_RESOURCE,
+                            &input.map_name,
+                        ),
+                    },
+                )
+            })?;
+            map.configuration.style.clone()
+        };
+
+        // The create resolved the style against this service's catalog, so a
+        // stored map carrying one the catalog does not publish cannot be reached
+        // through the API at all, and is a server fault rather than a bad
+        // request.
+        let Some(entry) = crate::state::map_style(&style) else {
+            return Err(GetMapStyleDescriptorErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the map resource carries a style this service does not publish"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The templates in the document are addresses a client fetches LATER, so
+        // they are rooted at the endpoint this emulator is served at rather than
+        // at any provider's own host.
+        let endpoint = ctx.endpoint();
+        Ok(GetMapStyleDescriptorOutput {
+            blob: Some(crate::state::style_document::style_descriptor(
+                &input.map_name,
+                &entry,
+                endpoint.as_str(),
+            )),
+            content_type: Some(crate::state::style_document::STYLE_CONTENT_TYPE.to_string()),
+            cache_control: Some(crate::state::map_tiles::TILE_CACHE_CONTROL.to_string()),
+        })
     }
 }

@@ -51,6 +51,22 @@ pub use constraint_refusals::{
 /// the map resource's own catalog entry rather than from one request.
 pub mod map_sprites;
 
+/// The tile pyramid a map resource publishes and the bytes one tile of it
+/// carries, kept beside this module for the same reason as the sprite sheet: a
+/// tile is derived from the map resource's own stored configuration and the
+/// requested address, never from stored tiles.
+pub mod map_tiles;
+
+/// The Mapbox Vector Tile codec a vector tile read answers through: the
+/// workspace's one copy of that wire format, shared with the Maps V2 plane, and
+/// reached beside the module that builds a tile with it.
+pub mod vector_tile;
+
+/// The style descriptor a map resource publishes, kept beside this module
+/// because it DECLARES what [`map_tiles`] serves: the same zoom range and the
+/// same layers.
+pub mod style_document;
+
 /// Epoch milliseconds. Amazon Location renders every timestamp in ISO 8601
 /// `YYYY-MM-DDThh:mm:ss.sssZ` (see the `CreateTime`/`SampleTime` member docs in the
 /// Smithy model), so millisecond resolution is the precision the wire carries.

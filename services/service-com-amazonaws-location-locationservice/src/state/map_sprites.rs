@@ -381,11 +381,12 @@ pub fn sprite_file_bytes(data_source: &str, file: SpriteFile) -> Vec<u8> {
     }
 }
 
-/// An RGBA raster the sheet is drawn into, and the PNG encoder for it.
+/// An RGBA raster a map asset is drawn into, and the PNG encoder for it.
 ///
-/// Kept private to this module: it carries only the two primitives the
-/// iconography needs.
-struct Canvas {
+/// Visible to the crate rather than to this module alone: a raster map tile is
+/// drawn into the same primitive (see [`super::map_tiles`]), so there is one
+/// RGBA/PNG surface per crate rather than one per asset.
+pub(crate) struct Canvas {
     width: u32,
     height: u32,
     pixels: Vec<u8>,
@@ -394,7 +395,7 @@ struct Canvas {
 impl Canvas {
     /// A fully transparent raster of `width` x `height`, each at least one pixel
     /// so the encoder always has an image to write.
-    fn new(width: u32, height: u32) -> Self {
+    pub(crate) fn new(width: u32, height: u32) -> Self {
         let width = width.max(1);
         let height = height.max(1);
         Self {
@@ -405,7 +406,7 @@ impl Canvas {
     }
 
     /// Paint one pixel, ignoring a coordinate outside the raster.
-    fn set(&mut self, x: u32, y: u32, colour: Rgba) {
+    pub(crate) fn set(&mut self, x: u32, y: u32, colour: Rgba) {
         if x >= self.width || y >= self.height {
             return;
         }
@@ -447,7 +448,7 @@ impl Canvas {
     /// buffer holds exactly four channels per pixel, so the encoder has nothing
     /// left to refuse. An encoder that still refused would answer with no image
     /// rather than a broken one.
-    fn to_png(&self) -> Vec<u8> {
+    pub(crate) fn to_png(&self) -> Vec<u8> {
         let mut out = Vec::new();
         {
             let mut encoder = ::png::Encoder::new(&mut out, self.width, self.height);
