@@ -14,7 +14,9 @@
 //! relative to each view's creation instant (entirely before it, exactly on it,
 //! after it, far in the future), how wide the window is, the type of the view
 //! being selected, and whether a second filter or a page size is combined with
-//! it.
+//! it. Every window here stays inside the one calendar month the member's doc
+//! bounds it by; that bound itself is the subject of
+//! `billing_view_active_time_range_width.rs`.
 //!
 //! The harness (`call`, `emulator_with_engine`, …) is the one `billing_views.rs`
 //! owns.
@@ -23,7 +25,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use crate::billing_views::{call, emulator_with_engine, ACCOUNT_ID, PRIMARY_ARN};
+use crate::billing_views::{call, emulator_with_engine, now_secs, ACCOUNT_ID, PRIMARY_ARN};
 
 /// Every `BillingViewType` the model declares, from
 /// `smithy_query(query="shape", shape="BillingViewType")`: `PRIMARY`,
@@ -79,8 +81,9 @@ fn plant_view(
     }
 }
 
-/// The ARNs an answer lists.
-fn listed_arns(body: &Value) -> Vec<String> {
+/// The ARNs an answer lists. Shared with the suite about this filter's
+/// documented width bound (`billing_view_active_time_range_width.rs`).
+pub(crate) fn listed_arns(body: &Value) -> Vec<String> {
     body["billingViews"]
         .as_array()
         .expect("billingViews is a list")
@@ -130,7 +133,7 @@ async fn the_default_view_is_listed_for_every_time_range() {
         ("a window ending one second after creation", PAST_SECS - 3_600, PAST_SECS + 1),
         ("a one-month window well after creation", PAST_SECS + 86_400, PAST_SECS + 2_678_400),
         ("a degenerate window: one instant, long after creation", 2_000_000_000, 2_000_000_000),
-        ("a window ending far in the future", 0, 4_000_000_000),
+        ("a window far in the future", 4_000_000_000, 4_002_000_000),
     ];
 
     for (case, after, before) in windows {
@@ -233,7 +236,10 @@ async fn a_historical_window_lists_the_default_view_alone() {
         (
             "a window reaching the present lists the CUSTOM view too",
             json!({
-                "activeTimeRange": { "activeAfterInclusive": 0, "activeBeforeInclusive": 4_000_000_000i64 }
+                "activeTimeRange": {
+                    "activeAfterInclusive": now_secs() - 86_400,
+                    "activeBeforeInclusive": now_secs() + 86_400,
+                }
             }),
             {
                 let mut all = vec![PRIMARY_ARN.to_string(), custom_arn.clone()];
@@ -268,7 +274,7 @@ async fn a_filtered_list_leaves_the_store_as_it_found_it() {
     for (case, after, end) in [
         ("a window before every view", 0_i64, 1_i64),
         ("a window ending on the planted view", PAST_SECS - 1, PAST_SECS),
-        ("a window ending far in the future", 0, 4_000_000_000),
+        ("a window far in the future", 4_000_000_000, 4_002_000_000),
     ] {
         let _ = list_for_range(&router, case, after, end).await;
     }

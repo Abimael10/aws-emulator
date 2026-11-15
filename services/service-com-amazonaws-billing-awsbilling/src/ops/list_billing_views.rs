@@ -10,7 +10,10 @@
 //! carries more than one page size of views.
 //! The `activeTimeRange` filter selects views by the period the resource behind
 //! them was active, so the account's default view — which has no such resource —
-//! is listed whatever range the caller asks about.
+//! is listed whatever range the caller asks about. The range itself must run
+//! forwards and must be within one calendar month, the bound its member
+//! documents, so a wider window is a `ValidationException` (400) rather than a
+//! page.
 //! The `arns` filter names resources, so each entry is resolved first: one
 //! outside the caller's account is an `AccessDeniedException` (403) and one this
 //! account stores no view under is a `ValidationException` (400).
@@ -221,6 +224,46 @@ fn resolve_arns_filter(
     Ok(())
 }
 
+/// Refuse every documented relation between the two bounds of the
+/// `activeTimeRange` filter — the two rules the boundary validator cannot see,
+/// because each is a relation between members rather than a constraint on one.
+///
+/// 1. The range runs forwards: its inclusive start is not later than its
+///    inclusive end.
+/// 2. "The time range must be within one calendar month" (the member's own
+///    doc): the end does not fall past the instant one calendar month after
+///    the start, measured on the UTC civil calendar
+///    ([`crate::state::one_calendar_month_after`]) rather than as a fixed span,
+///    so the bound is 28, 29, 30 or 31 days wide according to the month the
+///    range starts in.
+///
+/// Needs no billing state, so the caller decides it before the store is
+/// locked.
+fn check_active_time_range(range: &ActiveTimeRange) -> Result<(), ListBillingViewsError> {
+    let after = crate::state::date_time_secs(&range.active_after_inclusive);
+    let before = crate::state::date_time_secs(&range.active_before_inclusive);
+    if after > before {
+        return Err(invalid_field(
+            "activeTimeRange",
+            "activeAfterInclusive must not be later than activeBeforeInclusive",
+        ));
+    }
+    let one_month_on = crate::state::one_calendar_month_after(&range.active_after_inclusive)
+        .ok_or_else(|| {
+            invalid_field(
+                "activeTimeRange",
+                "activeAfterInclusive must name a representable calendar date",
+            )
+        })?;
+    if before > one_month_on {
+        return Err(invalid_field(
+            "activeTimeRange",
+            "The time range must be within one calendar month.",
+        ));
+    }
+    Ok(())
+}
+
 /// The ARN a `nextToken` resumes after, or a `ValidationException` when the
 /// token is not one THIS read issued under this store's key — one this service
 /// cannot read back, one a caller assembled, and one it minted for another of
@@ -342,23 +385,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(arns) = &input.arns {
             check_arns_filter_accounts(arns, &*self.engine, ctx)?;
         }
+        // The `activeTimeRange` relations are decided before the store is
+        // locked too: both are rules about the request alone.
+        if let Some(range) = &input.active_time_range {
+            check_active_time_range(range)?;
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListBillingViewsErrorModeled::InternalServerException(InternalServerException {
                 message: "the billing view store is unavailable".to_string(),
             })
         })?;
         let state = state.lock();
-
-        if let Some(range) = &input.active_time_range {
-            if crate::state::date_time_secs(&range.active_after_inclusive)
-                > crate::state::date_time_secs(&range.active_before_inclusive)
-            {
-                return Err(invalid_field(
-                    "activeTimeRange",
-                    "activeAfterInclusive must not be later than activeBeforeInclusive",
-                ));
-            }
-        }
 
         // The `arns` filter names resources, so every entry is resolved before
         // any page is built: an unknown one refuses the request instead of

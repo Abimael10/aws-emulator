@@ -109,6 +109,19 @@ pub(crate) async fn call_with_headers(
     (status, parts.headers, value)
 }
 
+/// Now, in whole epoch seconds — the clock a suite reads when a request has to
+/// name an instant relative to the present. Shared by every suite here, so one
+/// reading of the clock is what they all compare against.
+pub(crate) fn now_secs() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs(),
+    )
+    .expect("the current instant fits in an i64")
+}
+
 /// The `__type` an awsJson error body carries, without its namespace prefix.
 pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")

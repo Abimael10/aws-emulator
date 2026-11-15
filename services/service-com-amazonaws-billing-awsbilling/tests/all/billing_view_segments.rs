@@ -40,7 +40,7 @@ use service_com_amazonaws_billing_awsbilling::ComAmazonawsBillingAwsbillingState
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::billing_views::{
-    call, emulator_with_engine, error_code, standalone_emulator_with_engine, ABSENT_ARN,
+    call, emulator_with_engine, error_code, now_secs, standalone_emulator_with_engine, ABSENT_ARN,
     PRIMARY_ARN,
 };
 use crate::credit_allocation_history::at;
@@ -91,17 +91,6 @@ impl Seed {
 /// Epoch seconds as the instant the store holds.
 fn instant(secs: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).expect("a post-epoch instant"))
-}
-
-/// Now, in epoch seconds — the clock the default period is read off.
-fn now_secs() -> i64 {
-    i64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("the clock is after the epoch")
-            .as_secs(),
-    )
-    .expect("the clock fits an i64")
 }
 
 /// The half-open UTC calendar month the instant `secs` falls in, as epoch

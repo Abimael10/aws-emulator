@@ -19,6 +19,8 @@ mod billing_preference_pagination;
 mod billing_preferences;
 #[path = "all/billing_view_active_time_range.rs"]
 mod billing_view_active_time_range;
+#[path = "all/billing_view_active_time_range_width.rs"]
+mod billing_view_active_time_range_width;
 #[path = "all/billing_view_delete_cascade.rs"]
 mod billing_view_delete_cascade;
 #[path = "all/billing_view_health_gate.rs"]

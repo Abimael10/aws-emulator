@@ -8,6 +8,10 @@
 //! (`^\d{4}-(0[1-9]|1[0-2])$`), compare it with the month the clock is in and
 //! report the UTC period its charges accrued in, so that reading of a month
 //! lives here rather than beside either handler.
+//!
+//! The same civil-calendar arithmetic answers how wide "one calendar month" is
+//! from a given instant ([`one_calendar_month_after`]), which is the bound
+//! `ListBillingViews` documents for its `activeTimeRange`.
 
 /// How many ASCII digits the modeled `BillingMonth` states a year in
 /// (`^\d{4}-(0[1-9]|1[0-2])$`), which is also the width the modeled `Timestamp`
@@ -102,6 +106,32 @@ pub fn calendar_month_period(
         first_instant_of(year, month)?,
         first_instant_of(next_year, next_month)?,
     ))
+}
+
+/// Nanoseconds in one second — the scale an instant carries its sub-second
+/// part on.
+const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
+
+/// The instant one calendar month after `at`, in seconds since the epoch — on
+/// the same scale as [`super::date_time_secs`], so a request `Timestamp`
+/// compares against it directly.
+///
+/// The calendar arithmetic is `chrono`'s `checked_add_months`: one calendar
+/// month after an instant is the same day and time of the following month, with
+/// a day that month does not have (the 31st of a 30-day month, the 29th of a
+/// short February) clamped to its last. The width of one calendar month is
+/// therefore the calendar's — 28, 29, 30 or 31 days according to the month the
+/// span starts in — never a fixed span, the same reason
+/// [`calendar_month_period`] takes both its bounds from the calendar.
+///
+/// `None` for an instant outside the range that calendar covers, and for one
+/// whose following month is past its end.
+pub fn one_calendar_month_after(at: &::aws_smithy_types::DateTime) -> Option<f64> {
+    let start = ::chrono::DateTime::from_timestamp(at.secs(), at.subsec_nanos())?;
+    let one_month_on = start.checked_add_months(::chrono::Months::new(1))?;
+    // The month addition keeps the time of day, so one calendar month on falls
+    // on the start's own second and its own fraction of a second.
+    Some(one_month_on.timestamp() as f64 + f64::from(at.subsec_nanos()) / NANOS_PER_SECOND)
 }
 
 /// The half-open UTC period a billing month's charges accrue in: the first
