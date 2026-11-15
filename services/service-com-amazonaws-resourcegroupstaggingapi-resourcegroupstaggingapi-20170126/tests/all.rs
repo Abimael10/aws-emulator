@@ -60,3 +60,6 @@ mod resource_type_filter_spelling;
 
 #[path = "all/health_agent_tagged_resource_index.rs"]
 mod health_agent_tagged_resource_index;
+
+#[path = "all/tag_batch_partial_failure.rs"]
+mod tag_batch_partial_failure;

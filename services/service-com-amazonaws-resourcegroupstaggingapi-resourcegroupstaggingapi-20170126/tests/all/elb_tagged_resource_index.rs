@@ -44,7 +44,7 @@ const ELB_VERSION: &str = owner_elb::service::shared_endpoint::API_VERSION;
 
 /// A router carrying this API and Elastic Load Balancing over ONE engine — the
 /// arrangement `core/router` builds.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The tests exercise handler behaviour, not SigV4: the `Authorization` header below
@@ -63,7 +63,7 @@ fn account() -> &'static str {
 
 /// An Elastic Load Balancing ARN of the form this emulator mints, in the serving Region
 /// and account.
-fn elb_arn(resource: &str) -> String {
+pub(crate) fn elb_arn(resource: &str) -> String {
     format!("arn:aws:elasticloadbalancing:{REGION}:{}:{resource}", account())
 }
 
@@ -76,7 +76,11 @@ fn authorization(signing_name: &str) -> String {
 }
 
 /// One tagging-API operation, over the awsJson wire this API publishes.
-async fn tagging(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn tagging(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let target = format!("ResourceGroupsTaggingAPI_20170126.{operation}");
     let request = http::Request::builder()
         .method("POST")
@@ -119,17 +123,17 @@ pub(crate) fn encode(value: &str) -> String {
 }
 
 /// One awsQuery form field.
-fn p(key: &str, value: &str) -> (String, String) {
+pub(crate) fn p(key: &str, value: &str) -> (String, String) {
     (key.to_string(), value.to_string())
 }
 
 /// `Action` plus `Version`, the two fields every awsQuery request carries.
-fn action(name: &str) -> Vec<(String, String)> {
+pub(crate) fn action(name: &str) -> Vec<(String, String)> {
     vec![p("Action", name), p("Version", ELB_VERSION)]
 }
 
 /// One Elastic Load Balancing operation, over the awsQuery wire that model publishes.
-async fn elb(router: &MultiServiceRouter, fields: &[(String, String)]) -> (u16, String) {
+pub(crate) async fn elb(router: &MultiServiceRouter, fields: &[(String, String)]) -> (u16, String) {
     let body = fields
         .iter()
         .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
@@ -150,7 +154,7 @@ async fn elb(router: &MultiServiceRouter, fields: &[(String, String)]) -> (u16, 
 }
 
 /// One Elastic Load Balancing operation that must succeed.
-async fn elb_ok(router: &MultiServiceRouter, fields: &[(String, String)]) -> String {
+pub(crate) async fn elb_ok(router: &MultiServiceRouter, fields: &[(String, String)]) -> String {
     let (status, body) = elb(router, fields).await;
     assert_eq!(
         status, 200,
@@ -212,14 +216,14 @@ fn elb_tag_pairs(xml: &str) -> BTreeMap<String, String> {
 }
 
 /// The tag map Elastic Load Balancing's own `DescribeTags` reports for one ARN.
-async fn elb_tags(router: &MultiServiceRouter, arn: &str) -> BTreeMap<String, String> {
+pub(crate) async fn elb_tags(router: &MultiServiceRouter, arn: &str) -> BTreeMap<String, String> {
     let mut form = action("DescribeTags");
     form.push(p("ResourceArns.member.1", arn));
     elb_tag_pairs(&elb_ok(router, &form).await)
 }
 
 /// The ARNs of a `GetResources` page, in the order the service returned them.
-fn page_arns(body: &Value) -> Vec<String> {
+pub(crate) fn page_arns(body: &Value) -> Vec<String> {
     body["ResourceTagMappingList"]
         .as_array()
         .unwrap_or_else(|| panic!("a GetResources body with no ResourceTagMappingList: {body}"))
@@ -234,7 +238,7 @@ fn page_arns(body: &Value) -> Vec<String> {
 }
 
 /// The tag map a `GetResources` page reports for one ARN.
-fn page_tags(body: &Value, arn: &str) -> BTreeMap<String, String> {
+pub(crate) fn page_tags(body: &Value, arn: &str) -> BTreeMap<String, String> {
     let mapping = body["ResourceTagMappingList"]
         .as_array()
         .unwrap_or_else(|| panic!("a GetResources body with no ResourceTagMappingList: {body}"))
@@ -255,14 +259,14 @@ fn page_tags(body: &Value, arn: &str) -> BTreeMap<String, String> {
 }
 
 /// `GetResources` restricted to one ARN.
-async fn resources_for(router: &MultiServiceRouter, arn: &str) -> Value {
+pub(crate) async fn resources_for(router: &MultiServiceRouter, arn: &str) -> Value {
     let (status, body) = tagging(router, "GetResources", json!({ "ResourceARNList": [arn] })).await;
     assert_eq!(status, 200, "case {arn}: GetResources body {body}");
     body
 }
 
 /// A tag map as the expected `BTreeMap`.
-fn expected(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+pub(crate) fn expected(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -270,7 +274,7 @@ fn expected(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 }
 
 /// The form fields that put `tags` on a create.
-fn tag_fields(tags: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn tag_fields(tags: &[(&str, &str)]) -> Vec<(String, String)> {
     let mut fields = Vec::new();
     for (index, (key, value)) in tags.iter().enumerate() {
         let at = index + 1;
