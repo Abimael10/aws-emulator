@@ -1956,3 +1956,13 @@ mod cloudtrail_iam_credential_write_audit;
 //! layout check refuses. What a suite covers, and why it drives the assembled router rather
 //! than one service crate, belongs in that suite's own module doc; a note about this file
 //! itself belongs in `all/appended_notes.rs`.
+// `mod <name>;` pair into the sorted list below. Below this header the file holds those
+// pairs and NO other line, so two branches landing at once insert two lines in two places
+// deliberate: an inner doc comment (`//!`) is legal only before the first item, so with
+// none anywhere, no merge of two landings can leave one past the first item, where it is
+// `E0753` and compiles no suite of this target at all.
+// `all/declaration_roots_are_canonical_and_complete.rs` check that shape, for this file and
+// for every service crate's `tests/all.rs`, so a note about those rules belongs there
+// rather than here. What a suite covers, and why it drives the assembled router rather than
+// one service crate, belongs in that suite's own module header; the notes earlier landings
+// appended to the end of this file live in `all/appended_notes.rs`.
