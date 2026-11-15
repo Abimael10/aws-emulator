@@ -1,0 +1,1215 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! A distribution over a LAMBDA FUNCTION URL origin, reached at the address the distribution
+//! PUBLISHED, and the decisions CloudFront makes there ITSELF — end to end over HTTP across
+//! the services on one engine.
+//!
+//! The topology is the one a function URL behind a distribution is: a running Lambda function
+//! whose function URL is the origin's `DomainName`, a standard distribution in front of it,
+//! and a viewer that dials the `host:port` the distribution published with no AWS credential
+//! at all. The rules the rows span:
+//!
+//! * a distribution the control plane reports `Deployed` ANSWERS at its own `DomainName`:
+//!   a viewer request there is served from the origin the matched behaviour targets, so the
+//!   answer carries the origin's own bytes and `X-Cache: Miss from cloudfront`. The origin
+//!   here is a function URL, and whatever that plane answers is what the edge serves. Both
+//!   halves of that one address are served — the `http://` and the `https://` a viewer may
+//!   dial, "viewers can use HTTP or HTTPS";
+//! * `AllowedMethods` decides whether the viewer's METHOD is served at all: a method the
+//!   matched behaviour does not list is refused BY CLOUDFRONT with `403` and
+//!   `X-Cache: Error from cloudfront`, carries none of the origin's bytes, and makes NO
+//!   origin request — which is read off Lambda's own `Invocations` series for the function,
+//!   so "the origin was never invoked" is a fact of the owning service's records rather than
+//!   an absence in the answer;
+//! * `TrustedKeyGroups` decides whether the viewer is AUTHORIZED at all: "when a cache
+//!   behavior contains trusted key groups, CloudFront requires signed URLs or signed cookies
+//!   for all requests that match the cache behavior", so an unsigned request on such a
+//!   behaviour is `403` `MissingKey` with no origin request, while a URL signed by a key in
+//!   that group is served from the function — and a policy whose `IpAddress` condition pins
+//!   the viewer's own source address is served only for the address the edge ITSELF observes,
+//!   which is the one it reports to the origin as `CloudFront-Viewer-Address`;
+//! * an `OriginAccessControl` of origin type `lambda` signing `always` makes the EDGE's own
+//!   origin request a credentialled caller, so a function URL whose `AuthType` is `AWS_IAM` is
+//!   served through the distribution while the same URL called directly with no credential is
+//!   refused by Lambda — the boundary that control exists for. That leg is driven on a router
+//!   that VERIFIES request signatures, which is how the emulator is started, so the signature
+//!   the edge computes is one the emulator's own verifier accepts.
+//!
+//! The rows differ along what each rule generalises over: every method a client can send (the
+//! two the behaviour lists, and five it does not), the scheme the viewer dialled, the
+//! behaviour the viewer path matches (the open one and the one that trusts a key group), the
+//! policy form (canned and custom), the key that signed it (one in the group and one that is
+//! not), whether the policy's source-address condition holds for the address the edge
+//! observed, and whether the request reaching the function came through the edge or straight
+//! from a client.
+//!
+//! What is staged through the SERVICES that own it: the execution role through IAM, the
+//! function, its function URL and the resource policy that admits a caller through Lambda, the
+//! public key and key group through CloudFront, and the invocation counts through CloudWatch.
+//! The signer is [`crate::edge_signed_access`]'s and the dial of the published address
+//! [`crate::published_edge_address`]'s, reused rather than copied.
+
+use std::io::Write as _;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+use service_com_amazonaws_cloudfront_cloudfront2020_05_31::EmulatedService;
+use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
+
+use crate::distribution_lifecycle::{
+    is_reachable_authority, API_VERSION, AUTHORIZATION, HOST, POLL_INTERVAL, READY_DEADLINE,
+};
+use crate::edge_request_metrics::{cloudwatch, now_secs, window, PERIOD};
+use crate::edge_signed_access::{
+    canned_policy, canned_query, create_key_group, custom_policy, custom_query, far_future,
+    upload_public_key, Signer, CACHING_DISABLED,
+};
+use crate::published_edge_address::dial;
+
+/// The Region every setup call below is made in, and the Region CloudFront's own calls are
+/// signed for.
+const REGION: &str = "us-east-1";
+
+/// The AWS-managed origin request policy that forwards all viewer parameters and the
+/// `CloudFront-*` headers the edge generates, `Managed-AllViewerAndCloudFrontHeaders-2022-06`:
+/// its id is the one this service's own managed catalogue publishes. It is what lets the
+/// function report the country and the address the edge observed for the viewer.
+const ALL_VIEWER_AND_CLOUDFRONT: &str = "33f36d7e-f396-46d9-90e0-52428a34d9dc";
+
+/// The AWS-managed origin request policy `Managed-AllViewerExceptHostHeader`, whose id is the
+/// one that same catalogue publishes. It is the policy CloudFront documents for an OAC-signed
+/// origin: forwarding the viewer's own `Host` would not be the host the signature was computed
+/// over.
+const ALL_VIEWER_EXCEPT_HOST: &str = "b689b0a8-53d0-40ab-baf2-68738e2966ac";
+
+/// The marker the function puts in every answer of its own, so an answer that carries it came
+/// from the origin and one that does not was produced by CloudFront itself.
+const ORIGIN_MARKER: &str = "FUNCTION-URL-OK";
+
+/// Lambda's own metric namespace and the series that counts the invocations admitted to a
+/// function, as that service publishes them.
+const LAMBDA_NAMESPACE: &str = "AWS/Lambda";
+const INVOCATIONS: &str = "Invocations";
+
+/// The header CloudFront stamps on every origin request it makes, which is what tells an
+/// origin the request arrived through an edge rather than from a client.
+const EDGE_REQUEST_ID_HEADER: &str = "x-amz-cf-id";
+
+/// The path the open behaviour serves, and the path pattern (and a path under it) of the
+/// behaviour that trusts a key group.
+const OPEN_PATH: &str = "/whoami";
+const PRIVATE_PATTERN: &str = "/private/*";
+const PRIVATE_PATH: &str = "/private/object";
+
+/// `X-Cache` for an answer the origin produced for this request, and for one CloudFront
+/// produced itself.
+const MISS: &str = "Miss from cloudfront";
+const ERROR: &str = "Error from cloudfront";
+
+/// The handler behind the function URL: it reports the request it was handed — the method, the
+/// path, the two `CloudFront-*` headers the edge generates and the names of every header that
+/// reached it — so what the viewer is served says what reached the origin. It imports only the
+/// standard library, so the report is the handler's own work.
+const HANDLER_SOURCE: &str = r#"
+import json
+
+
+def lambda_handler(event, context):
+    headers = event.get("headers") or {}
+    request = (event.get("requestContext") or {}).get("http") or {}
+    return {
+        "statusCode": 200,
+        "headers": {"content-type": "application/json"},
+        "body": json.dumps(
+            {
+                "marker": "FUNCTION-URL-OK",
+                "method": request.get("method", ""),
+                "path": event.get("rawPath", ""),
+                "country": headers.get("cloudfront-viewer-country", ""),
+                "address": headers.get("cloudfront-viewer-address", ""),
+                "header_names": sorted(headers.keys()),
+            }
+        ),
+    }
+"#;
+
+/// A .zip deployment package holding [`HANDLER_SOURCE`] as `index.py`, written in memory the
+/// way a caller uploads one.
+fn package() -> Vec<u8> {
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = ::zip::ZipWriter::new(&mut buffer);
+        writer
+            .start_file("index.py", ::zip::write::SimpleFileOptions::default())
+            .expect("the entry starts");
+        writer
+            .write_all(HANDLER_SOURCE.as_bytes())
+            .expect("the entry's bytes are written");
+        writer.finish().expect("a finished archive");
+    }
+    buffer.into_inner()
+}
+
+/// The text of the first `<name>` element of an XML body, or `""`.
+fn element(body: &str, name: &str) -> String {
+    let open = format!("<{name}>");
+    let Some(start) = body.find(&open).map(|at| at + open.len()) else {
+        return String::new();
+    };
+    body[start..]
+        .find(&format!("</{name}>"))
+        .map(|end| body[start..start + end].to_string())
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// The emulator and what each service stages in it
+// ---------------------------------------------------------------------------
+
+/// CloudFront, Lambda, IAM, the token service and CloudWatch over ONE shared engine, as the
+/// assembled router mounts them: the function the edge fetches is run by that Lambda as a
+/// session of the role IAM holds, and the invocations it admits are counted in the CloudWatch
+/// store both services share.
+struct Topology {
+    router: MultiServiceRouter,
+    callback: EmbeddedEmulator,
+    engine: Arc<engine::InMemoryEngine>,
+    /// Whether this emulator VERIFIES the signature of every request, as it does when it is
+    /// started: a suite that drives the OAC-signed origin fetch needs the verifier on, because
+    /// the fetch the edge makes is a signed in-process call like any other.
+    verifying: bool,
+}
+
+impl Topology {
+    /// An emulator that does not verify signatures, so a setup call carries a credential scope
+    /// (which is what names the Region and routes it) without a computed signature.
+    fn new() -> Self {
+        Self::with_verification(false)
+    }
+
+    /// An emulator that VERIFIES every request's signature, where each call below is signed
+    /// the way an in-process call of this emulator is.
+    fn verifying() -> Self {
+        Self::with_verification(true)
+    }
+
+    fn with_verification(verifying: bool) -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = Self::router_on(&engine);
+        router.set_request_authentication(verifying);
+        let callback = EmbeddedEmulator::from_router(router.clone());
+        Self {
+            router,
+            callback,
+            engine,
+            verifying,
+        }
+    }
+
+    /// The same services, mounted again over the SAME engine, with the verifier ON: the router
+    /// a DIRECT caller of a function URL meets when the emulator is started.
+    fn authenticating(&self) -> MultiServiceRouter {
+        let mut router = Self::router_on(&self.engine);
+        router.set_request_authentication(true);
+        router
+    }
+
+    /// Every service this suite needs, mounted on `engine`.
+    fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+        let mut router = MultiServiceRouter::new();
+        router.register_service(EmulatedService::new(Arc::clone(engine)));
+        router.register_service(
+            service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(Arc::clone(
+                engine,
+            )),
+        );
+        router.register_service(
+            service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                Arc::clone(engine),
+            ),
+        );
+        router.register_service(
+            service_com_amazonaws_sts_awssecuritytokenservicev20110615::EmulatedService::new(
+                Arc::clone(engine),
+            ),
+        );
+        router.register_service(
+            service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
+                Arc::clone(engine),
+            ),
+        );
+        router
+    }
+
+    /// The IAM client, over the in-process callback.
+    fn iam(&self) -> aws_sdk_iam::Client {
+        ::service_common::iam_client::iam_client_through(&self.callback, REGION)
+    }
+
+    /// The Lambda client, over the same callback.
+    fn lambda(&self) -> aws_sdk_lambda::Client {
+        let config = aws_sdk_lambda::Config::builder()
+            .behavior_version(aws_sdk_lambda::config::BehaviorVersion::latest())
+            .region(aws_sdk_lambda::config::Region::new(REGION))
+            .endpoint_url(format!("https://lambda.{REGION}.amazonaws.com"))
+            .credentials_provider(self.callback.aws_credentials_provider())
+            .http_client(self.callback.http_client())
+            .retry_config(aws_sdk_lambda::config::retry::RetryConfig::disabled())
+            .timeout_config(aws_sdk_lambda::config::timeout::TimeoutConfig::disabled())
+            .identity_cache(aws_sdk_lambda::config::IdentityCache::no_cache())
+            .stalled_stream_protection(
+                aws_sdk_lambda::config::StalledStreamProtectionConfig::disabled(),
+            )
+            .build();
+        aws_sdk_lambda::Client::from_conf(config)
+    }
+
+    /// One CloudFront control-plane call, as the status and the body it answered.
+    ///
+    /// On a verifying emulator the request is SIGNED the way an in-process call of this
+    /// emulator is signed, through the one signing path the services share; otherwise it
+    /// carries the credential scope alone, which is what routes it.
+    async fn cloudfront(
+        &self,
+        case: &str,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> (u16, String) {
+        let mut builder = ::http::Request::builder()
+            .method(method)
+            .uri(format!("https://{HOST}{uri}"))
+            .header("host", HOST);
+        if body.is_some() {
+            builder = builder.header("content-type", "application/xml");
+        }
+        let mut request = builder
+            .body(body.unwrap_or_default().as_bytes().to_vec())
+            .expect("the CloudFront request is well formed");
+        if self.verifying {
+            ::service_common::in_process_sigv4::sign_callback_request(
+                &mut request,
+                "cloudfront",
+                REGION,
+                &self.callback,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("setup {case}: signing {method} {uri}: {error}"));
+        } else {
+            let _ = request.headers_mut().insert(
+                ::http::header::AUTHORIZATION,
+                ::http::HeaderValue::from_static(AUTHORIZATION),
+            );
+        }
+        let (parts, payload) = request.into_parts();
+        let response = self
+            .router
+            .dispatch(::http::Request::from_parts(
+                parts,
+                ::bytes::Bytes::from(payload),
+            ))
+            .await;
+        let status = response.status().as_u16();
+        let raw = String::from_utf8_lossy(&response.into_body()).to_string();
+        (status, raw)
+    }
+
+    /// The HOST of a PUBLIC function URL over [`HANDLER_SOURCE`]: `AuthType=NONE` and the
+    /// resource-policy grant that admits the anonymous caller an unsigned origin fetch is.
+    async fn public_function_url_host(&self, case: &str, function: &str) -> String {
+        let host = self
+            .function_url_host(case, function, aws_sdk_lambda::types::FunctionUrlAuthType::None)
+            .await;
+        // `AuthType=NONE` leaves IAM out of it; the function's own resource policy is what
+        // admits the anonymous caller the edge's unsigned origin fetch is.
+        self.lambda()
+            .add_permission()
+            .function_name(function)
+            .statement_id("public-url")
+            .action("lambda:InvokeFunctionUrl")
+            .principal("*")
+            .function_url_auth_type(aws_sdk_lambda::types::FunctionUrlAuthType::None)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("setup {case}: granting the public invoke: {error}"));
+        host
+    }
+
+    /// The HOST of a function URL over [`HANDLER_SOURCE`] whose `AuthType` is `auth_type`: the
+    /// execution role, the function, the wait for the state the clock owes it, and the URL.
+    async fn function_url_host(
+        &self,
+        case: &str,
+        function: &str,
+        auth_type: aws_sdk_lambda::types::FunctionUrlAuthType,
+    ) -> String {
+        let trust = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": "lambda.amazonaws.com" },
+                "Action": "sts:AssumeRole",
+            }],
+        })
+        .to_string();
+        let created_role = self
+            .iam()
+            .create_role()
+            .role_name(format!("{function}-role"))
+            .assume_role_policy_document(trust)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("setup {case}: creating the execution role: {error}"));
+        let role = created_role
+            .role()
+            .map(|role| role.arn().to_string())
+            .filter(|arn| !arn.is_empty())
+            .unwrap_or_else(|| panic!("setup {case}: the created execution role has no ARN"));
+        let code = aws_sdk_lambda::types::FunctionCode::builder()
+            .zip_file(::aws_smithy_types::Blob::new(package()))
+            .build();
+        self.lambda()
+            .create_function()
+            .function_name(function)
+            .role(role)
+            .runtime(aws_sdk_lambda::types::Runtime::Python312)
+            .handler("index.lambda_handler")
+            .code(code)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("setup {case}: creating the function: {error}"));
+
+        // An invocation needs the function Active, which is a span the service owes: the
+        // CONDITION is what is waited for, never a span of the host's clock.
+        let deadline = Instant::now() + READY_DEADLINE;
+        let mut state;
+        loop {
+            let configuration = self
+                .lambda()
+                .get_function_configuration()
+                .function_name(function)
+                .send()
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("setup {case}: reading the function's configuration: {error}")
+                });
+            state = configuration
+                .state()
+                .map(|state| state.as_str().to_string())
+                .unwrap_or_default();
+            if state == "Active" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "setup {case}: the function never reached Active, last reported {state:?}"
+            );
+            ::tokio::time::sleep(POLL_INTERVAL).await;
+        }
+
+        let url = self
+            .lambda()
+            .create_function_url_config()
+            .function_name(function)
+            .auth_type(auth_type)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("setup {case}: creating the function URL: {error}"));
+        let endpoint = url.function_url().to_string();
+        assert!(
+            !endpoint.is_empty(),
+            "setup {case}: the created function URL reports no address"
+        );
+        endpoint
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_string()
+    }
+
+    /// How many invocations Lambda has admitted to `function`, as its own `Invocations` series
+    /// reports them over a window around now: the owning service's record of whether the
+    /// origin was reached at all. `0` for a function nobody invoked, which publishes no
+    /// datapoint.
+    async fn invocations(&self, case: &str, function: &str) -> f64 {
+        let (start, end) = window(now_secs());
+        let answered = cloudwatch(
+            &self.router,
+            case,
+            "GetMetricStatistics",
+            &json!({
+                "Namespace": LAMBDA_NAMESPACE,
+                "MetricName": INVOCATIONS,
+                "Dimensions": [{ "Name": "FunctionName", "Value": function }],
+                "StartTime": start,
+                "EndTime": end,
+                "Period": PERIOD,
+                "Statistics": ["Sum"],
+            }),
+        )
+        .await;
+        answered["Datapoints"]
+            .as_array()
+            .map(|points| {
+                points
+                    .iter()
+                    .filter_map(|point| point["Sum"].as_f64())
+                    .sum::<f64>()
+            })
+            .unwrap_or_default()
+    }
+
+    /// One `OriginAccessControl` over a Lambda function URL origin: `sigv4`, signing always, of
+    /// origin type `lambda`. Answers the id it minted.
+    async fn origin_access_control(&self, case: &str, name: &str) -> String {
+        let (status, raw) = self
+            .cloudfront(
+                case,
+                "POST",
+                &format!("/{API_VERSION}/origin-access-control"),
+                Some(&format!(
+                    "<OriginAccessControlConfig \
+                     xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
+                     <Name>{name}</Name><Description>a function url origin</Description>\
+                     <SigningProtocol>sigv4</SigningProtocol>\
+                     <SigningBehavior>always</SigningBehavior>\
+                     <OriginAccessControlOriginType>lambda</OriginAccessControlOriginType>\
+                     </OriginAccessControlConfig>"
+                )),
+            )
+            .await;
+        assert_eq!(
+            status, 201,
+            "setup {case}: CreateOriginAccessControl must be accepted, got {status} with {raw}"
+        );
+        let id = element(&raw, "Id");
+        assert!(
+            !id.is_empty(),
+            "setup {case}: the created origin access control reports no id: {raw}"
+        );
+        id
+    }
+
+    /// One distribution from `config`: its `(Id, ARN, DomainName)`, with the domain held to
+    /// being an address a client on this machine can dial.
+    async fn created_distribution(&self, case: &str, config: &str) -> (String, String, String) {
+        let (status, raw) = self
+            .cloudfront(case, "POST", &format!("/{API_VERSION}/distribution"), Some(config))
+            .await;
+        assert_eq!(
+            status, 201,
+            "setup {case}: CreateDistribution must be accepted, got {status} with {raw}"
+        );
+        let (id, arn, domain) = (
+            element(&raw, "Id"),
+            element(&raw, "ARN"),
+            element(&raw, "DomainName"),
+        );
+        assert!(
+            !id.is_empty() && !arn.is_empty(),
+            "setup {case}: the created distribution reports no Id or ARN: {raw}"
+        );
+        assert!(
+            is_reachable_authority(&domain),
+            "setup {case}: expected an address a viewer can dial, got {domain:?}"
+        );
+        (id, arn, domain)
+    }
+
+    /// Look again until `GetDistribution` reports `id` `Deployed` — a configuration that has
+    /// not reached the edge locations serves no viewer — or the deadline passes, which fails
+    /// the case. The CONDITION is what is waited for, never a span of the host's clock.
+    async fn awaited_deployment(&self, case: &str, id: &str) {
+        let deadline = Instant::now() + READY_DEADLINE;
+        loop {
+            let (status, raw) = self
+                .cloudfront(
+                    case,
+                    "GET",
+                    &format!("/{API_VERSION}/distribution/{id}"),
+                    None,
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "setup {case}: GetDistribution must answer 200, got {status} with {raw}"
+            );
+            if element(&raw, "Status") == "Deployed" {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "setup {case}: the distribution never reached Deployed, last answer {raw}"
+            );
+            ::tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// One deployed distribution over the function URL `origin` with the behaviours
+    /// `behaviors` carries: the `DomainName` it published.
+    async fn deployed_distribution(
+        &self,
+        case: &str,
+        caller_reference: &str,
+        origin: &str,
+        behaviors: &str,
+    ) -> String {
+        let (id, _arn, domain) = self
+            .created_distribution(
+                case,
+                &config_xml(
+                    caller_reference,
+                    origin,
+                    "",
+                    behaviors,
+                    ALL_VIEWER_AND_CLOUDFRONT,
+                ),
+            )
+            .await;
+        self.awaited_deployment(case, &id).await;
+        domain
+    }
+}
+
+/// One `DistributionConfig` over the function URL `origin`: `origin_extra` goes inside the
+/// origin (the `OriginAccessControlId` an OAC-fronted origin carries), `behaviors` beside the
+/// default behaviour, and `origin_request_policy` on the default behaviour.
+fn config_xml(
+    caller_reference: &str,
+    origin: &str,
+    origin_extra: &str,
+    behaviors: &str,
+    origin_request_policy: &str,
+) -> String {
+    format!(
+        "<DistributionConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
+         <CallerReference>{caller_reference}</CallerReference>\
+         <Origins><Quantity>1</Quantity><Items><Origin>\
+         <Id>function-url</Id><DomainName>{origin}</DomainName>{origin_extra}\
+         <CustomOriginConfig><HTTPPort>80</HTTPPort><HTTPSPort>443</HTTPSPort>\
+         <OriginProtocolPolicy>https-only</OriginProtocolPolicy>\
+         <OriginSslProtocols><Quantity>1</Quantity>\
+         <Items><SslProtocol>TLSv1.2</SslProtocol></Items></OriginSslProtocols>\
+         </CustomOriginConfig>\
+         </Origin></Items></Origins>\
+         <DefaultCacheBehavior><TargetOriginId>function-url</TargetOriginId>\
+         <ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy>\
+         <AllowedMethods><Quantity>2</Quantity>\
+         <Items><Method>GET</Method><Method>HEAD</Method></Items></AllowedMethods>\
+         <CachePolicyId>{CACHING_DISABLED}</CachePolicyId>\
+         <OriginRequestPolicyId>{origin_request_policy}</OriginRequestPolicyId>\
+         </DefaultCacheBehavior>{behaviors}\
+         <Comment>a function url behind a distribution</Comment>\
+         <Enabled>true</Enabled>\
+         </DistributionConfig>"
+    )
+}
+
+/// The ordered behaviour that trusts `key_group`, which is what makes a signed URL the only
+/// way through [`PRIVATE_PATTERN`].
+fn trusted_behavior(key_group: &str) -> String {
+    format!(
+        "<CacheBehaviors><Quantity>1</Quantity><Items><CacheBehavior>\
+         <PathPattern>{PRIVATE_PATTERN}</PathPattern>\
+         <TargetOriginId>function-url</TargetOriginId>\
+         <TrustedKeyGroups><Enabled>true</Enabled><Quantity>1</Quantity>\
+         <Items><KeyGroup>{key_group}</KeyGroup></Items></TrustedKeyGroups>\
+         <ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy>\
+         <AllowedMethods><Quantity>2</Quantity>\
+         <Items><Method>GET</Method><Method>HEAD</Method></Items></AllowedMethods>\
+         <CachePolicyId>{CACHING_DISABLED}</CachePolicyId>\
+         <OriginRequestPolicyId>{ALL_VIEWER_AND_CLOUDFRONT}</OriginRequestPolicyId>\
+         </CacheBehavior></Items></CacheBehaviors>"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Reading one answer off the connection
+// ---------------------------------------------------------------------------
+
+/// What one exchange on the published address observed.
+struct Answered {
+    status: u16,
+    /// The whole answer as it came off the connection, status line and headers included.
+    raw: String,
+    /// The body alone, which is where the origin's own bytes are.
+    body: String,
+}
+
+impl Answered {
+    /// The answer of one viewer request to `domain`, dialled in the clear with no credential.
+    async fn of(case: &str, domain: &str, method: &str, path_and_query: &str) -> Self {
+        let raw = dial(domain, method, path_and_query).await;
+        let status = raw
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or_else(|| panic!("case {case:?}: no status line in {raw:?}"));
+        let body = raw
+            .split_once("\r\n\r\n")
+            .map(|(_head, body)| body.to_string())
+            .unwrap_or_default();
+        Self { status, raw, body }
+    }
+
+    /// Whether the answer carries the origin's own bytes.
+    fn carries_the_origins_bytes(&self) -> bool {
+        self.body.contains(ORIGIN_MARKER)
+    }
+
+    /// Whether the answer was reported as one the edge served from `x_cache`.
+    fn reports_cache(&self, x_cache: &str) -> bool {
+        self.raw
+            .to_ascii_lowercase()
+            .contains(&format!("x-cache: {}", x_cache.to_ascii_lowercase()))
+    }
+
+    /// Whether CloudFront's own error body carries the code `code`.
+    fn carries_code(&self, code: &str) -> bool {
+        self.body.contains(&format!("<Code>{code}</Code>"))
+    }
+
+    /// The function's own report, as the document it answered with.
+    fn report(&self, case: &str) -> Value {
+        serde_json::from_str(&self.body).unwrap_or_else(|error| {
+            panic!(
+                "case {case:?}: the origin's answer is no document ({error}): {:?}",
+                self.body
+            )
+        })
+    }
+}
+
+/// The header names the function reported on the request it served.
+fn header_names(report: &Value) -> Vec<String> {
+    report["header_names"]
+        .as_array()
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|name| name.as_str().map(str::to_ascii_lowercase))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The viewer's ADDRESS out of the value the edge reported for it: `CloudFront-Viewer-Address`
+/// carries the address the request came from, with the viewer's port after it where that port
+/// is known, so the address is read off the front of the value. An IPv6 literal carries its
+/// own colons inside brackets.
+fn viewer_ip(reported: &str) -> String {
+    let trimmed = reported.trim();
+    if let Some(end) = trimmed.find(']') {
+        return trimmed[..=end].to_string();
+    }
+    if trimmed.parse::<::std::net::IpAddr>().is_ok() {
+        return trimmed.to_string();
+    }
+    trimmed
+        .rsplit_once(':')
+        .map_or(trimmed.to_string(), |(address, _port)| address.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// The method gate at the published address
+// ---------------------------------------------------------------------------
+
+/// One method row: the method a viewer sends, and whether the behaviour's `AllowedMethods`
+/// lists it.
+struct MethodRow {
+    case: &'static str,
+    method: &'static str,
+    allowed: bool,
+}
+
+/// Every method a client can send against a behaviour whose `AllowedMethods` is `GET`, `HEAD`:
+/// the two it lists are served from the function URL origin, and each of the five it does not
+/// is refused by CloudFront itself with no origin request made at all.
+#[tokio::test]
+async fn the_published_domain_serves_a_function_url_origin_and_gates_the_method() {
+    let topology = Topology::new();
+    let case = "a function URL origin behind a published edge domain";
+    let function = "cf-edge-method-gate";
+    let origin = topology.public_function_url_host(case, function).await;
+    let domain = topology
+        .deployed_distribution(case, "edge-lambda-url-methods", &origin, "")
+        .await;
+
+    // The rows differ along the method and along whether the behaviour lists it.
+    let rows: &[MethodRow] = &[
+        MethodRow {
+            case: "a GET, which the behaviour lists",
+            method: "GET",
+            allowed: true,
+        },
+        MethodRow {
+            case: "a HEAD, which it lists too",
+            method: "HEAD",
+            allowed: true,
+        },
+        MethodRow {
+            case: "a POST, which it does not list",
+            method: "POST",
+            allowed: false,
+        },
+        MethodRow {
+            case: "a PUT",
+            method: "PUT",
+            allowed: false,
+        },
+        MethodRow {
+            case: "a PATCH",
+            method: "PATCH",
+            allowed: false,
+        },
+        MethodRow {
+            case: "a DELETE",
+            method: "DELETE",
+            allowed: false,
+        },
+        MethodRow {
+            case: "an OPTIONS",
+            method: "OPTIONS",
+            allowed: false,
+        },
+    ];
+    for row in rows {
+        let before = topology.invocations(row.case, function).await;
+        let answered = Answered::of(row.case, &domain, row.method, OPEN_PATH).await;
+        let after = topology.invocations(row.case, function).await;
+        if !row.allowed {
+            assert_eq!(
+                answered.status, 403,
+                "case {:?}: expected CloudFront's own 403 for a method the behaviour does not \
+                 allow, got {} with {:?}",
+                row.case, answered.status, answered.raw
+            );
+            assert!(
+                !answered.carries_the_origins_bytes(),
+                "case {:?}: expected none of the origin's bytes in a refusal CloudFront \
+                 produced, got {:?}",
+                row.case, answered.body
+            );
+            assert!(
+                answered.reports_cache(ERROR),
+                "case {:?}: expected the refusal reported as CloudFront's own answer \
+                 ({ERROR:?}), got {:?}",
+                row.case, answered.raw
+            );
+            assert_eq!(
+                after, before,
+                "case {:?}: a method the behaviour does not allow must make no origin request, \
+                 but the function's invocations went from {before} to {after}",
+                row.case
+            );
+            continue;
+        }
+        assert_eq!(
+            answered.status, 200,
+            "case {:?}: expected the function's own answer through the published address, got \
+             {} with {:?}",
+            row.case, answered.status, answered.raw
+        );
+        assert!(
+            answered.reports_cache(MISS),
+            "case {:?}: expected an answer the origin produced for this request ({MISS:?}), got \
+             {:?}",
+            row.case, answered.raw
+        );
+        assert!(
+            after > before,
+            "case {:?}: a method the behaviour allows must reach the origin, but the function's \
+             invocations stayed at {before} (now {after})",
+            row.case
+        );
+        // A `HEAD` carries no body, so only a `GET` can report what the origin saw.
+        if row.method == "GET" {
+            assert!(
+                answered.carries_the_origins_bytes(),
+                "case {:?}: expected the origin's own bytes, got {:?}",
+                row.case, answered.body
+            );
+            let report = answered.report(row.case);
+            assert_eq!(
+                report["method"].as_str().unwrap_or_default(),
+                row.method,
+                "case {:?}: expected the origin to see the viewer's method, got {report}",
+                row.case
+            );
+            assert_eq!(
+                report["path"].as_str().unwrap_or_default(),
+                OPEN_PATH,
+                "case {:?}: expected the origin to see the viewer's path, got {report}",
+                row.case
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The trusted key group at the same address
+// ---------------------------------------------------------------------------
+
+/// What one signed-access row expects of the edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expected {
+    /// The function answered it: a `200` carrying the origin's own bytes.
+    Served,
+    /// CloudFront refused it itself, under this error code, with no origin request made.
+    Refused(&'static str),
+}
+
+/// The signed-access rule over the same topology: the open behaviour serves an unsigned
+/// viewer, and the behaviour that trusts a key group serves only a URL signed by a key in that
+/// group over a policy whose conditions hold — the source-address condition among them,
+/// against the very address the edge reported to the origin.
+#[tokio::test]
+async fn a_trusted_key_group_decides_a_function_url_origin_at_the_published_domain() {
+    let topology = Topology::new();
+    let case = "a trusted key group over a function URL origin";
+    let function = "cf-edge-signed-access";
+    let origin = topology.public_function_url_host(case, function).await;
+    let signer = Signer::generate();
+    let stranger = Signer::generate();
+    let key = upload_public_key(&topology.router, "edge-lambda-url-trusted", &signer).await;
+    let other = upload_public_key(&topology.router, "edge-lambda-url-stranger", &stranger).await;
+    let (group, _etag) =
+        create_key_group(&topology.router, "edge-lambda-url", &[key.as_str()]).await;
+    let domain = topology
+        .deployed_distribution(
+            case,
+            "edge-lambda-url-signed",
+            &origin,
+            &trusted_behavior(&group),
+        )
+        .await;
+
+    // The baseline the signed rows are read against: the open behaviour, unsigned, served by
+    // the function — and the address the EDGE observed for this viewer, as it reported it to
+    // the origin.
+    let baseline_case = "the unsigned open behaviour";
+    let baseline = Answered::of(baseline_case, &domain, "GET", OPEN_PATH).await;
+    assert_eq!(
+        baseline.status, 200,
+        "case {baseline_case:?}: expected the open behaviour to serve the function's answer, \
+         got {} with {:?}",
+        baseline.status, baseline.raw
+    );
+    assert!(
+        baseline.carries_the_origins_bytes(),
+        "case {baseline_case:?}: expected the origin's own bytes, got {:?}",
+        baseline.body
+    );
+    let report = baseline.report(baseline_case);
+    let country = report["country"].as_str().unwrap_or_default().to_string();
+    assert!(
+        country.len() == 2 && country.chars().all(|letter| letter.is_ascii_uppercase()),
+        "case {baseline_case:?}: expected the edge to tell the origin the viewer's country as a \
+         two-letter uppercase code, got {country:?} ({report})"
+    );
+    let reported_address = report["address"].as_str().unwrap_or_default().to_string();
+    let observed = viewer_ip(&reported_address);
+    assert!(
+        observed.parse::<::std::net::IpAddr>().is_ok(),
+        "case {baseline_case:?}: expected the edge to tell the origin the viewer's address, got \
+         {reported_address:?} ({report})"
+    );
+
+    // A CANNED policy is the one CloudFront rebuilds from the URL itself, so its `Resource`
+    // is the exact URL the viewer asks for; a CUSTOM one may name the object by a wildcard.
+    let exact = format!("http://{domain}{PRIVATE_PATH}");
+    let resource = format!("http://{domain}{PRIVATE_PATTERN}");
+    let signed = |statement: &str| signer.sign(statement);
+    let canned = canned_policy(&exact, far_future());
+    let plain = custom_policy(&resource, far_future(), None, None);
+    let pinned = custom_policy(
+        &resource,
+        far_future(),
+        None,
+        Some(&format!("{observed}/32")),
+    );
+    let elsewhere = custom_policy(&resource, far_future(), None, Some("10.0.0.0/8"));
+
+    // (case, the viewer path and query, what the edge must do)
+    let rows: Vec<(String, String, Expected)> = vec![
+        (
+            "an unsigned request on the behaviour that trusts a key group".to_string(),
+            PRIVATE_PATH.to_string(),
+            Expected::Refused("MissingKey"),
+        ),
+        (
+            "a canned policy signed by a key in the group".to_string(),
+            format!(
+                "{PRIVATE_PATH}?{}",
+                canned_query(far_future(), &signed(&canned), &key)
+            ),
+            Expected::Served,
+        ),
+        (
+            "a custom policy signed by a key in the group".to_string(),
+            format!(
+                "{PRIVATE_PATH}?{}",
+                custom_query(&plain, &signed(&plain), &key)
+            ),
+            Expected::Served,
+        ),
+        (
+            "a custom policy pinning the address the edge observed".to_string(),
+            format!(
+                "{PRIVATE_PATH}?{}",
+                custom_query(&pinned, &signed(&pinned), &key)
+            ),
+            Expected::Served,
+        ),
+        (
+            "a custom policy pinning a range that address is not in".to_string(),
+            format!(
+                "{PRIVATE_PATH}?{}",
+                custom_query(&elsewhere, &signed(&elsewhere), &key)
+            ),
+            Expected::Refused("AccessDenied"),
+        ),
+        (
+            "a policy signed by a key the group does not carry".to_string(),
+            format!(
+                "{PRIVATE_PATH}?{}",
+                custom_query(&plain, &stranger.sign(&plain), &other)
+            ),
+            Expected::Refused("InvalidKey"),
+        ),
+    ];
+
+    for (case, path_and_query, expected) in rows {
+        let before = topology.invocations(&case, function).await;
+        let answered = Answered::of(&case, &domain, "GET", &path_and_query).await;
+        let after = topology.invocations(&case, function).await;
+        match expected {
+            Expected::Served => {
+                assert_eq!(
+                    answered.status, 200,
+                    "case {case:?}: expected the function's own answer, got {} with {:?}",
+                    answered.status, answered.raw
+                );
+                assert!(
+                    answered.carries_the_origins_bytes(),
+                    "case {case:?}: expected the origin's own bytes, got {:?}",
+                    answered.body
+                );
+                assert!(
+                    after > before,
+                    "case {case:?}: an admitted request must reach the origin, but the \
+                     function's invocations stayed at {before} (now {after})"
+                );
+            }
+            Expected::Refused(code) => {
+                assert_eq!(
+                    answered.status, 403,
+                    "case {case:?}: expected CloudFront's own 403, got {} with {:?}",
+                    answered.status, answered.raw
+                );
+                assert!(
+                    answered.carries_code(code),
+                    "case {case:?}: expected the error code {code:?}, got {:?}",
+                    answered.body
+                );
+                assert!(
+                    !answered.carries_the_origins_bytes(),
+                    "case {case:?}: expected none of the origin's bytes, got {:?}",
+                    answered.body
+                );
+                assert_eq!(
+                    after, before,
+                    "case {case:?}: a request CloudFront refuses must make no origin request, \
+                     but the function's invocations went from {before} to {after}"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The `https://` half of the one published address
+// ---------------------------------------------------------------------------
+
+/// How long a dial of the published address waits for its answer. Generous: nothing here
+/// measures the wait, only what came back.
+const TLS_DIAL_DEADLINE: Duration = Duration::from_secs(30);
+
+/// One viewer that dials the published address with `https://`, as a client handed a
+/// distribution's `DomainName` does: a stock TLS client that does not verify this emulator's
+/// self-signed certificate. Answers the status and the body.
+///
+/// The request runs on a blocking thread, so the listener it addresses — a task of this same
+/// runtime — is served while this call waits for the answer.
+async fn dial_over_tls(case: &str, url: String) -> (u16, String) {
+    ::tokio::task::spawn_blocking(move || {
+        let client = ::reqwest::blocking::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(TLS_DIAL_DEADLINE)
+            .build()
+            .expect("a TLS client");
+        let answered = client
+            .get(&url)
+            .send()
+            .unwrap_or_else(|error| panic!("the published address did not answer {url}: {error}"));
+        let status = answered.status().as_u16();
+        (status, answered.text().unwrap_or_default())
+    })
+    .await
+    .unwrap_or_else(|error| panic!("case {case:?}: the dial did not finish: {error}"))
+}
+
+/// The address a distribution publishes serves the `https://` a viewer may dial as well as the
+/// `http://`: the encryption of that one address is negotiated in band, so a stock TLS client
+/// handed the published `DomainName` is served the function URL origin's own answer there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_published_domain_serves_the_https_a_viewer_dials() {
+    let topology = Topology::new();
+    let case = "a viewer that dialled TLS at the published address";
+    let function = "cf-edge-tls-viewer";
+    let origin = topology.public_function_url_host(case, function).await;
+    let domain = topology
+        .deployed_distribution(case, "edge-lambda-url-tls", &origin, "")
+        .await;
+
+    let (status, body) = dial_over_tls(case, format!("https://{domain}{OPEN_PATH}")).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the published address to serve the origin's answer over TLS, \
+         got {status} with {body:?}"
+    );
+    assert!(
+        body.contains(ORIGIN_MARKER),
+        "case {case:?}: expected the origin's own bytes, got {body:?}"
+    );
+    let report: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    assert_eq!(
+        report["path"].as_str().unwrap_or_default(),
+        OPEN_PATH,
+        "case {case:?}: expected the origin to see the viewer's path, got {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The same origin behind an ORIGIN ACCESS CONTROL
+// ---------------------------------------------------------------------------
+
+/// The function URL called DIRECTLY, with no credential at all, as a client that found the
+/// address does: the status and the body.
+async fn direct_call(router: &MultiServiceRouter, host: &str, path: &str) -> (u16, String) {
+    let request = ::http::Request::builder()
+        .method("GET")
+        .uri(format!("https://{host}{path}"))
+        .header("host", host)
+        .body(::bytes::Bytes::new())
+        .expect("the direct request is well formed");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    (
+        status,
+        String::from_utf8_lossy(&response.into_body()).to_string(),
+    )
+}
+
+/// An `OriginAccessControl` of origin type `lambda` over a function URL whose `AuthType` is
+/// `AWS_IAM`: "all origin requests" are signed, so the edge's own fetch is a credentialled
+/// caller Lambda admits and the viewer is served the function's answer — while the SAME
+/// function URL called directly with no credential is refused by Lambda and leaks none of the
+/// function's bytes. That difference is the whole point of the control: only CloudFront can
+/// invoke the function.
+///
+/// Driven on an emulator that VERIFIES every signature, which is how it is started: the fetch
+/// the edge makes is a signed in-process call, so only a verifier can say that the signature
+/// it computes is one Lambda's endpoint admits.
+#[tokio::test]
+async fn an_origin_access_control_signs_a_function_url_origin_the_direct_caller_cannot_reach() {
+    let topology = Topology::verifying();
+    let case = "an OAC-signed function URL origin";
+    let function = "cf-edge-oac-signed";
+    let origin = topology
+        .function_url_host(
+            case,
+            function,
+            aws_sdk_lambda::types::FunctionUrlAuthType::AwsIam,
+        )
+        .await;
+    let control = topology
+        .origin_access_control(case, "edge-lambda-url-oac")
+        .await;
+    let (id, arn, domain) = topology
+        .created_distribution(
+            case,
+            &config_xml(
+                "edge-lambda-url-oac",
+                &origin,
+                &format!("<OriginAccessControlId>{control}</OriginAccessControlId>"),
+                "",
+                ALL_VIEWER_EXCEPT_HOST,
+            ),
+        )
+        .await;
+    // The grant that makes the signed fetch one Lambda admits FOR this distribution: the
+    // CloudFront service principal, scoped to the distribution that signs.
+    for action in ["lambda:InvokeFunctionUrl", "lambda:InvokeFunction"] {
+        topology
+            .lambda()
+            .add_permission()
+            .function_name(function)
+            .statement_id(action.replace(':', "-"))
+            .action(action)
+            .principal("cloudfront.amazonaws.com")
+            .source_arn(&arn)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("setup {case}: granting {action}: {error}"));
+    }
+    topology.awaited_deployment(case, &id).await;
+
+    let through_the_edge = Answered::of(case, &domain, "GET", OPEN_PATH).await;
+    assert_eq!(
+        through_the_edge.status, 200,
+        "case {case:?}: expected the signed origin fetch to be served, got {} with {:?}",
+        through_the_edge.status, through_the_edge.raw
+    );
+    assert!(
+        through_the_edge.carries_the_origins_bytes(),
+        "case {case:?}: expected the origin's own bytes, got {:?}",
+        through_the_edge.body
+    );
+    let names = header_names(&through_the_edge.report(case));
+    assert!(
+        names.iter().any(|name| name == EDGE_REQUEST_ID_HEADER),
+        "case {case:?}: expected the origin to see {EDGE_REQUEST_ID_HEADER:?} on a request that \
+         arrived through the edge, got {names:?}"
+    );
+
+    // The same URL, dialled directly with no credential, on a router that verifies request
+    // signatures: an `AWS_IAM` function URL admits only an authenticated caller, so Lambda
+    // refuses it and the function's bytes stay behind the control.
+    let (status, body) = direct_call(&topology.authenticating(), &origin, OPEN_PATH).await;
+    assert_eq!(
+        status, 403,
+        "case {case:?}: expected an unsigned direct call to an AWS_IAM function URL to be \
+         refused, got {status} with {body:?}"
+    );
+    assert!(
+        !body.contains(ORIGIN_MARKER),
+        "case {case:?}: expected none of the function's bytes in the refusal, got {body:?}"
+    );
+
+    // And the distribution still serves it afterwards: the refusal of the direct caller is
+    // about the caller, not about the function.
+    let again = Answered::of(case, &domain, "GET", OPEN_PATH).await;
+    assert_eq!(
+        again.status, 200,
+        "case {case:?}: expected the distribution to keep serving the signed origin, got {} \
+         with {:?}",
+        again.status, again.raw
+    );
+    assert!(
+        again.carries_the_origins_bytes(),
+        "case {case:?}: expected the origin's own bytes again, got {:?}",
+        again.body
+    );
+}

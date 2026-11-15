@@ -142,6 +142,8 @@ mod edge_data_plane;
 mod edge_function_associations;
 #[path = "all/edge_geo_restriction.rs"]
 mod edge_geo_restriction;
+#[path = "all/edge_lambda_url_origin.rs"]
+mod edge_lambda_url_origin;
 #[path = "all/edge_origin_response_headers.rs"]
 mod edge_origin_response_headers;
 #[path = "all/edge_realtime_logs.rs"]

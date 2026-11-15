@@ -11165,6 +11165,7 @@ dependencies = [
  "pkcs1",
  "pkcs8 0.10.2",
  "rcgen",
+ "reqwest",
  "rquickjs",
  "serde_json",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
@@ -11180,6 +11181,7 @@ dependencies = [
  "tokio",
  "tracing",
  "x509-cert",
+ "zip",
 ]
 
 [[package]]

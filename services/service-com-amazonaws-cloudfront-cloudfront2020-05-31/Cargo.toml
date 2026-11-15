@@ -169,6 +169,14 @@ tokio = { workspace = true, features = ["io-util", "net", "time"] }
 num-bigint = "0.4"
 pkcs1 = "0.7"
 pkcs8 = "0.10"
+# The .zip deployment package the function behind the function-URL origin suite is created
+# from, written in memory the way a caller uploads one. TEST-ONLY.
+zip = { version = "9", default-features = false, features = ["deflate"] }
+# A stock HTTPS client, for the half of a distribution's published address a viewer dials
+# with `https://`: the encryption is negotiated in band on that one address, so only a real
+# TLS client proves that half answers. It does not verify the emulator's self-signed
+# certificate, which is what a viewer of a local emulator does. TEST-ONLY.
+reqwest = { workspace = true }
 
 [lints]
 workspace = true
