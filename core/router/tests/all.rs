@@ -2254,3 +2254,8 @@ mod cloudformation_provisions_glue_table_optimizers;
 // there; the notes earlier landings appended to the tail of this file live in
 // `all/appended_notes.rs` and `all/appended_notes_tail.rs`. What a suite covers, and why it
 // module header.
+// suites, and nothing else. Put a new suite at `tests/all/<name>.rs` and insert its
+// suite and no other line, every comment of this file an ordinary one. The suites under
+// `all/all_rs_*`, `all/every_suite_file_is_declared.rs` and
+// for every service crate's `tests/all.rs`; what a suite covers belongs in its own module
+// header.

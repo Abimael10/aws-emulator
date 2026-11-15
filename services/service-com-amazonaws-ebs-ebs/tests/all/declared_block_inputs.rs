@@ -20,17 +20,22 @@
 //! of blocks that were written to the snapshot",
 //! `smithy_query(query="doc",shape="com.amazonaws.ebs#CompleteSnapshotRequest",member="ChangedBlocksCount")`),
 //! constrained only by the model's `range` min 0
-//! (`smithy_query(query="operation",operation="CompleteSnapshot")`): the service does not
-//! verify it against the blocks the snapshot holds, so a request carrying any modelled
-//! count is accepted and seals the snapshot.
+//! (`smithy_query(query="operation",operation="CompleteSnapshot")`): a request carrying any
+//! modelled count is accepted — never refused synchronously — and the count is what the
+//! completion checks the snapshot's content against, so it decides whether the record
+//! finalises to `completed` or to `error`. The whole of that rule, over the counts and the
+//! writes it generalises over, lives in
+//! `changed_blocks_count_decides_the_terminal_status.rs`; this suite keeps the half that
+//! belongs beside the other DECLARED values — that no declared count is a synchronous
+//! refusal.
 //!
 //! Each rule is asserted over a TABLE: the lengths and indexes a request can declare
 //! (including each volume's last addressable index and the first one past it, over several
 //! volume sizes), and counts above, below and equal to the blocks actually written.
 
 use crate::snapshot_block_loop::{
-    block_bytes, checksum, complete_snapshot, list_blocks, listed_blocks, member, put_block,
-    router, start_snapshot, Reply, BLOCK_SIZE,
+    block_bytes, checksum, complete_snapshot, member, put_block, router, start_snapshot, Reply,
+    BLOCK_SIZE,
 };
 
 /// Block indexes one GiB of volume addresses: one GiB divided by the `524288`-byte block
@@ -284,11 +289,13 @@ struct CountRow {
     declared_count: i32,
 }
 
-/// RULE 2: `CompleteSnapshot` accepts the `ChangedBlocksCount` the request declares
-/// whatever the snapshot holds — more, fewer or exactly as many blocks as were written —
-/// and seals the snapshot, which the listing of the written indexes then proves.
+/// RULE 2: `CompleteSnapshot` ACCEPTS the `ChangedBlocksCount` the request declares whatever
+/// the snapshot holds — more, fewer or exactly as many blocks as were written — with the
+/// operation's 202 acknowledging the status the completion was applied to and no refusal of
+/// any kind. (Which status the record then finalises to is the same rule's other half,
+/// asserted row by row in `changed_blocks_count_decides_the_terminal_status.rs`.)
 #[tokio::test]
-async fn any_modelled_changed_blocks_count_seals_the_snapshot() {
+async fn any_modelled_changed_blocks_count_is_accepted_without_a_refusal() {
     // Rows differ along the declared count against the blocks actually written: equal,
     // zero against writes, one short, one over, and the largest count the header can
     // carry.
@@ -357,47 +364,24 @@ async fn any_modelled_changed_blocks_count_seals_the_snapshot() {
             );
         }
 
-        let sealed = complete_snapshot(&router, &snapshot_id, *declared_count).await;
+        let accepted = complete_snapshot(&router, &snapshot_id, *declared_count).await;
         assert_eq!(
-            sealed.status, 202,
+            accepted.status, 202,
             "case {case:?}: CompleteSnapshot with a declared count of {declared_count} must be \
              accepted 202, got {} with body {}",
-            sealed.status,
-            String::from_utf8_lossy(&sealed.body)
+            accepted.status,
+            String::from_utf8_lossy(&accepted.body)
+        );
+        assert!(
+            accepted.error_code().is_empty(),
+            "case {case:?}: an accepted completion carries no error code, got {:?}",
+            accepted.error_code()
         );
         assert_eq!(
-            member(&sealed, "Status"),
+            member(&accepted, "Status"),
             "pending",
-            "case {case:?}: the acknowledgement reports the status the seal was applied to, got {}",
-            sealed.json()
-        );
-
-        // The seal really happened: the snapshot is readable, and the listing holds
-        // exactly the indexes written to it — the declared count changed nothing about
-        // what is stored.
-        let listing = list_blocks(&router, &snapshot_id, "").await;
-        assert_eq!(
-            listing.status, 200,
-            "case {case:?}: a sealed snapshot must be listable, got {} with body {}",
-            listing.status,
-            String::from_utf8_lossy(&listing.body)
-        );
-        let listed: Vec<i32> = listed_blocks(&listing)
-            .iter()
-            .map(|(index, _)| *index)
-            .collect();
-        let expected: Vec<i32> = blocks.iter().map(|(index, _)| *index).collect();
-        assert_eq!(
-            listed, expected,
-            "case {case:?}: the listing must hold exactly the written indexes, got {listed:?}"
-        );
-        assert_eq!(
-            member(
-                &complete_snapshot(&router, &snapshot_id, *declared_count).await,
-                "Status"
-            ),
-            "completed",
-            "case {case:?}: a later call must read the sealed status back off the record"
+            "case {case:?}: the acknowledgement reports the status the completion was applied to, got {}",
+            accepted.json()
         );
     }
 }

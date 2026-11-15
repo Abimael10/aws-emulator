@@ -90,7 +90,9 @@ pub enum SnapshotStatus {
     Pending,
     /// `CompleteSnapshot` sealed the snapshot; no further writes are accepted.
     Completed,
-    /// The snapshot was cancelled — here, by its `Timeout` elapsing while pending.
+    /// The snapshot cannot be used: its `Timeout` elapsed while it was still pending, or
+    /// the completion it accepted declared a different number of blocks from the number
+    /// written into it, so its content was never the content its producer claimed.
     Error,
 }
 
@@ -156,6 +158,14 @@ pub struct BlockEntry {
     pub block_token: String,
     /// The write progress the caller reported, if any.
     pub progress: Option<i32>,
+    /// Whether `PutSnapshotBlock` wrote this block INTO THIS snapshot, as opposed to the
+    /// snapshot having inherited it from the parent it was started from.
+    ///
+    /// `CompleteSnapshotRequest$ChangedBlocksCount` is "The number of blocks that were
+    /// written to the snapshot", so only the entries carrying this flag are counted
+    /// against it: a block a child starts life holding was written to its PARENT, and
+    /// writing over such an index is a write to the child like any other.
+    pub written: bool,
 }
 
 /// A snapshot and everything written into it.
@@ -187,6 +197,14 @@ pub struct Snapshot {
     /// which case `SseType` is omitted from a response rather than reported as `none`.
     pub sse_type: Option<SseType>,
     pub timeout_minutes: i32,
+    /// The `ChangedBlocksCount` of the `CompleteSnapshot` this snapshot accepted, or `None`
+    /// while no completion has been accepted for it.
+    ///
+    /// Its presence is what says a completion WAS accepted, which outlives the status that
+    /// completion finalised the snapshot to: a snapshot that takes no further block because
+    /// its producer completed it is a different condition from one that takes none because
+    /// its `Timeout` cancelled it, and the two are refused differently.
+    pub declared_changed_blocks_count: Option<i32>,
     /// The blocks written, keyed by `BlockIndex`. A `BTreeMap` because
     /// `ListSnapshotBlocks` enumerates ascending by index and pages from an index.
     pub blocks: BTreeMap<i32, BlockEntry>,
@@ -205,6 +223,59 @@ impl Snapshot {
     /// snapshot must be in the pending state".
     pub fn accepts_writes(&self) -> bool {
         self.status == SnapshotStatus::Pending
+    }
+
+    /// Whether a `CompleteSnapshot` has been accepted for this snapshot.
+    ///
+    /// True whatever status the completion finalised it to, so it answers "has this
+    /// snapshot been completed" — which is the condition "You cannot write new blocks to a
+    /// snapshot after it has been completed" (`CompleteSnapshot`) names — rather than "did
+    /// the completion succeed".
+    pub fn completion_accepted(&self) -> bool {
+        self.declared_changed_blocks_count.is_some()
+    }
+
+    /// How many DISTINCT block indexes `PutSnapshotBlock` wrote into this snapshot.
+    ///
+    /// One per index, however many times it was written: "If the specified block contains
+    /// data, the existing data is overwritten" (`PutSnapshotBlock`), so a rewritten index is
+    /// still one block of the snapshot. Blocks inherited from a parent are not counted —
+    /// they were written to that parent.
+    pub fn written_block_count(&self) -> i64 {
+        let written = self.blocks.values().filter(|entry| entry.written).count();
+        i64::try_from(written).unwrap_or(i64::MAX)
+    }
+
+    /// Accept the completion a `CompleteSnapshot` declaring `declared_changed_blocks_count`
+    /// asks for, as of `now`, and answer the status it finalises this snapshot to.
+    ///
+    /// `ChangedBlocksCount` is the producer's own accounting of the writes it made ("The
+    /// number of blocks that were written to the snapshot"), and completing a snapshot is
+    /// what checks it: the snapshot completes only when that count is the number of blocks
+    /// that really were written to it ([`Self::written_block_count`]). A count that
+    /// disagrees says the producer did not upload everything it claimed, so the snapshot's
+    /// content is incomplete and it finalises to `error` — the status the modelled `Status`
+    /// enum keeps for a snapshot that cannot be used — and it is never readable.
+    ///
+    /// The declared count is recorded either way, because accepting the completion is what
+    /// ends the writes whichever status it finalises to.
+    pub fn apply_completion(
+        &mut self,
+        declared_changed_blocks_count: i32,
+        now: SystemTime,
+    ) -> SnapshotStatus {
+        self.declared_changed_blocks_count = Some(declared_changed_blocks_count);
+        if i64::from(declared_changed_blocks_count) == self.written_block_count() {
+            self.status = SnapshotStatus::Completed;
+            // WHEN the seal was applied, stamped by the call that applied it. It is the
+            // completion time the EC2 side of the same snapshot reports
+            // (`Snapshot$CompletionTime`, "the time stamp when the snapshot was
+            // completed"), which only a snapshot that completed has.
+            self.completed_at = Some(now);
+        } else {
+            self.status = SnapshotStatus::Error;
+        }
+        self.status
     }
 
     /// Whether the READ path — the operations that report a snapshot's blocks — can see

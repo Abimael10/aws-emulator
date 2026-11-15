@@ -277,9 +277,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let index_already_written = snapshot.blocks.contains_key(&input.block_index);
         // "The target snapshot must be in the pending state", and "You cannot write new
         // blocks to a snapshot after it has been completed" — which a `CompleteSnapshot`
-        // applies, so a snapshot whose completion was accepted takes no further block.
+        // applies, so a snapshot whose completion was accepted takes no further block,
+        // whichever status that completion finalised it to. A snapshot that left `pending`
+        // without one — its `Timeout` cancelled it — is a different condition, so it is
+        // refused by the state it is in rather than as a completed snapshot.
         let write_refusal = (!snapshot.accepts_writes()).then(|| {
-            if snapshot.is_sealed() {
+            if snapshot.completion_accepted() {
                 SNAPSHOT_ALREADY_COMPLETED_MESSAGE.to_string()
             } else {
                 format!(
@@ -370,6 +373,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             checksum_algorithm: CHECKSUM_ALGORITHM_SHA256.to_string(),
             block_token,
             progress: input.progress,
+            // Written to THIS snapshot by this call, so it counts towards the
+            // `ChangedBlocksCount` its `CompleteSnapshot` declares — including at an index
+            // the snapshot inherited, whose block this write replaces.
+            written: true,
         };
         let Some(snapshot) = store.snapshots.get_mut(&input.snapshot_id) else {
             return Err(not_found(snapshot_not_found_message(&input.snapshot_id)));

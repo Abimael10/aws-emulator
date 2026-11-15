@@ -17,6 +17,8 @@ mod a_removed_snapshot_resolves_nowhere;
 mod absent_required_members;
 #[path = "all/changed_blocks_between_snapshots.rs"]
 mod changed_blocks_between_snapshots;
+#[path = "all/changed_blocks_count_decides_the_terminal_status.rs"]
+mod changed_blocks_count_decides_the_terminal_status;
 #[path = "all/declared_block_inputs.rs"]
 mod declared_block_inputs;
 #[path = "all/identity_authorization.rs"]

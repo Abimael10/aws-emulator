@@ -8,7 +8,8 @@
 //! The rule under test: a snapshot an EBS direct-API call minted for the account is a
 //! snapshot every EC2 read resolves and reports, with the state that API gives it —
 //! `pending` while it is still being written, `completed` with `Progress` `100%` once
-//! `CompleteSnapshot` seals it, and `error` once its `Timeout` cancels it — and the
+//! `CompleteSnapshot` completes it, and `error` once its `Timeout` cancels it or a
+//! completion declares a different number of blocks from the number written — and the
 //! `InvalidSnapshot.NotFound` refusal stays for an id nothing holds.
 //!
 //! Each table row is a distinct input along what the rule generalises over — the declared
@@ -520,6 +521,52 @@ async fn a_direct_api_snapshot_whose_timeout_elapsed_is_described_as_error() {
         row.case,
         cancelled.member("progress")
     );
+}
+
+/// RULE, under-filled fourth: a completion whose `ChangedBlocksCount` disagrees with the
+/// blocks that were written is accepted (`ebs:CompleteSnapshot` refuses no modelled count)
+/// and drives the snapshot to `error` — the state the EBS direct APIs give a snapshot whose
+/// content is not the content its producer declared — so an EC2 reader can tell a truncated
+/// upload from a usable snapshot.
+#[tokio::test]
+async fn a_direct_api_snapshot_completed_with_a_mismatched_count_is_described_as_error() {
+    // Rows differ along the blocks written and the count the completion then declares:
+    // more blocks than were written, and fewer.
+    let rows: &[(&str, Row, i32)] = &[
+        ("one block written, five declared", ROWS[0], 5),
+        ("two blocks written, none declared", ROWS[1], 0),
+    ];
+
+    for (case, row, declared) in rows {
+        let (router, _engine) = emulator();
+        let snapshot_id = write_snapshot(&router, row).await;
+        complete_snapshot(&router, case, &snapshot_id, *declared).await;
+
+        let reported = described_one(&router, case, &snapshot_id).await;
+        assert_eq!(
+            reported.member("status"),
+            SNAPSHOT_STATE_ERROR,
+            "case {case:?}: expected a snapshot completed with a count other than its {} written \
+             block(s) to be {SNAPSHOT_STATE_ERROR}, got {:?}",
+            row.blocks,
+            reported.member("status")
+        );
+        assert_eq!(
+            reported.member("progress"),
+            SNAPSHOT_PROGRESS_PENDING,
+            "case {case:?}: expected no progress on a snapshot that never completed, got {:?}",
+            reported.member("progress")
+        );
+        // A snapshot that never completed has no completion time, and no full size was ever
+        // measured for it.
+        for absent in ["completionTime", "fullSnapshotSizeInBytes"] {
+            assert!(
+                !reported.members.contains_key(absent),
+                "case {case:?}: expected no {absent} on a snapshot that never completed, got {:?}",
+                reported.member(absent)
+            );
+        }
+    }
 }
 
 /// RULE over the NARROWINGS: a direct-API snapshot is selected by exactly the members and

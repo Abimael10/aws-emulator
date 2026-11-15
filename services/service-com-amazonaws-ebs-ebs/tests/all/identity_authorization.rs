@@ -986,13 +986,20 @@ async fn put_block_as(
 }
 
 /// Seal `snapshot_id` as the account's own credential, so its blocks become readable.
-async fn seal(harness: &Harness, snapshot_id: &str) {
+///
+/// `changed_blocks_count` is how many blocks were really written into it: a completion whose
+/// declared count disagrees finalises the snapshot to `error` instead of completing it, and
+/// then no read resolves it.
+async fn seal(harness: &Harness, snapshot_id: &str, changed_blocks_count: i32) {
     let sealed = harness
         .send_as(
             AMBIENT_KEY_ID,
             "POST",
             &format!("/snapshots/completion/{snapshot_id}"),
-            &[("x-amz-ChangedBlocksCount", "1".to_string())],
+            &[(
+                "x-amz-ChangedBlocksCount",
+                changed_blocks_count.to_string(),
+            )],
             Vec::new(),
         )
         .await;
@@ -1027,7 +1034,9 @@ async fn a_denied_write_persists_no_block() {
         Refusal::ExplicitDeny,
     );
 
-    seal(&harness, &snapshot_id).await;
+    // The denied write persisted no block, so the completion that makes the snapshot
+    // readable declares none.
+    seal(&harness, &snapshot_id, 0).await;
     let listed = Op::ListSnapshotBlocks
         .call(&harness, AMBIENT_KEY_ID, &snapshot_id)
         .await;
@@ -1091,7 +1100,7 @@ async fn granting_the_write_serves_the_very_call_that_was_refused() {
 
     // Read back through the service's own reads: the block is listed once, and its bytes
     // come back exactly as they were written.
-    seal(&harness, &snapshot_id).await;
+    seal(&harness, &snapshot_id, 1).await;
     let listed = Op::ListSnapshotBlocks
         .call(&harness, AMBIENT_KEY_ID, &snapshot_id)
         .await;

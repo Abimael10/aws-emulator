@@ -2,8 +2,9 @@
 
 //! @op CompleteSnapshot
 //!
-//! Implemented: seals the stored snapshot and acknowledges with the status that record
-//! was in when the request was accepted.
+//! Implemented: checks the `ChangedBlocksCount` the request declares against the blocks
+//! written into the stored snapshot, finalises that record accordingly, and acknowledges
+//! with the status it was in when the request was accepted.
 //!
 //! ## Shape of an operation
 //!
@@ -235,34 +236,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ChangedBlocksCount` is the caller's own accounting of the writes it made ("The
         // number of blocks that were written to the snapshot"), bounded only by the
         // model's `range` min 0 and already checked against it at the boundary. It is NOT
-        // a precondition this call verifies against the blocks the snapshot holds: the
-        // request is accepted on any modelled value, so a count that disagrees with what
-        // was written still seals the snapshot rather than being refused.
-        let _ = input.changed_blocks_count;
-
-        // The status the snapshot is in when this request is ACCEPTED, which is what the
-        // 202 reports. `CompleteSnapshot` is modelled `@http(code: 202)` — Accepted — so
-        // the response acknowledges the snapshot the seal was applied TO: the request has
+        // a precondition of the REQUEST: whatever it says, the request is accepted — the
+        // 202 below, never a refusal. What it decides is the status the record FINALISES
+        // to: a snapshot whose declared count is the number of blocks that were written to
+        // it completes, and one whose count disagrees was not filled as its producer
+        // claimed and finalises to `error`, which no read then resolves
+        // ([`crate::state::Snapshot::apply_completion`]).
+        //
+        // The status the snapshot is in when this request is ACCEPTED is what the 202
+        // reports. `CompleteSnapshot` is modelled `@http(code: 202)` — Accepted — so the
+        // response acknowledges the snapshot the completion was applied TO: the request has
         // been taken, and the sealing it asks for is finished only after the answer. The
-        // seal itself is applied by this call ("Completing the snapshot changes the status
-        // to completed"), so every LATER call reads `completed` back off the record, and
-        // nothing is left outstanding for the clock to materialise.
+        // completion itself is applied by this call ("Completing the snapshot changes the
+        // status to completed"), so every LATER call reads the finalised status off the
+        // record, and nothing is left outstanding for the clock to materialise.
         let accepted_status = snapshot.status;
         match snapshot.status {
             SnapshotStatus::Pending => {
-                snapshot.status = SnapshotStatus::Completed;
-                // WHEN the seal was applied, stamped by the call that applied it: this
-                // call is what completes the snapshot ("Completing the snapshot changes
-                // the status to completed"), so the instant is this one and never a
-                // later reader's. It is the completion time the EC2 side of the same
-                // snapshot reports (`Snapshot$CompletionTime`, "the time stamp when the
-                // snapshot was completed").
-                snapshot.completed_at = Some(now);
+                snapshot.apply_completion(input.changed_blocks_count, now);
             }
-            // Already sealed: completing it again changes nothing, so the stored status
+            // Already completed: completing it again changes nothing, so the stored status
             // is the answer.
             SnapshotStatus::Completed => {}
-            // A snapshot whose `Timeout` cancelled it can no longer be sealed.
+            // A snapshot whose completion was already accepted and finalised to `error`
+            // reads that status back for the same reason a completed one does: the
+            // completion was taken, and this call applies no second one.
+            SnapshotStatus::Error if snapshot.completion_accepted() => {}
+            // A snapshot whose `Timeout` cancelled it before anything completed it can no
+            // longer be completed.
             SnapshotStatus::Error => {
                 return Err(validation(
                     "INVALID_SNAPSHOT_ID",
@@ -274,14 +275,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // A sealed snapshot no longer owes its `Timeout` — there is nothing left to
+        // A completed snapshot no longer owes its `Timeout` — there is nothing left to
         // cancel — so the store's schedule is recomputed: `next_transition_due` keeps
         // naming the earliest change the clock really does owe.
         store.refresh_transition_schedule();
 
         // Rendered from the stored record, never from a literal: the status this request
-        // was accepted against. The record itself now holds `completed`, which is what
-        // every later call — including a repeat of this one — reads back.
+        // was accepted against. The record itself now holds the finalised status, which is
+        // what every later call — including a repeat of this one — reads back.
         Ok(CompleteSnapshotOutput {
             status: Some(accepted_status.as_wire().to_string()),
         })

@@ -376,8 +376,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (block_index, entry) in parent_blocks.into_iter().flatten() {
             let block_token = store.mint_block_token(&snapshot_id, block_index);
             // The child lists the inherited block under its OWN token, never the
-            // parent's.
-            blocks.insert(block_index, BlockEntry { block_token, ..entry });
+            // parent's, and the block counts as one written to the PARENT: a child that
+            // writes nothing of its own has written no block.
+            blocks.insert(
+                block_index,
+                BlockEntry {
+                    block_token,
+                    written: false,
+                    ..entry
+                },
+            );
         }
 
         let encrypted = input.encrypted == Some(true) || input.kms_key_arn.is_some();
@@ -420,6 +428,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             encrypted,
             sse_type,
             timeout_minutes,
+            // "The new snapshot enters the pending state after the request completes": no
+            // completion has been accepted for it yet.
+            declared_changed_blocks_count: None,
             blocks,
         };
         store.snapshots.insert(snapshot_id.clone(), snapshot);

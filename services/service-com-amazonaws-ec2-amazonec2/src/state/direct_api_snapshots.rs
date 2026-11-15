@@ -48,10 +48,12 @@ use ::service_com_amazonaws_ebs_ebs::state::{
 
 use super::*;
 
-/// A snapshot the EBS direct APIs hold that has been cancelled: the `SnapshotState` enum's
+/// A snapshot the EBS direct APIs hold that did not complete: the `SnapshotState` enum's
 /// `error` member (`smithy_query(query="shape",shape="SnapshotState")`), which is what a
-/// snapshot whose `Timeout` elapsed before `CompleteSnapshot` sealed it is in — the EBS
-/// direct APIs report the same condition as their own `Status` `error`.
+/// snapshot whose `Timeout` elapsed before `CompleteSnapshot` completed it is in, and what a
+/// snapshot whose completion declared a different number of blocks from the number written
+/// into it is in — the EBS direct APIs report the same condition as their own `Status`
+/// `error`.
 pub const SNAPSHOT_STATE_ERROR: &str = "error";
 
 /// Every snapshot the EBS direct APIs hold for this account as of `now`, keyed by
@@ -224,9 +226,10 @@ fn snapshot_view(snapshot: &DirectApiSnapshot, now: SystemTime) -> SnapshotView 
 /// The `SnapshotState` the EBS direct-API `Status` of `snapshot` is, as of `now`.
 ///
 /// `pending` and `completed` are the same word on both sides. `error` is the third: the EBS
-/// store moves a snapshot there when its `Timeout` elapses unsealed, and that move is owed by
-/// the CLOCK at an instant that store already holds — so it is derived here from the same
-/// comparison rather than read as `pending` until some EBS call next materialises it.
+/// store moves a snapshot there when its `Timeout` elapses unsealed and when the completion it
+/// accepted declared a count other than the blocks written into it, and the first of those is
+/// owed by the CLOCK at an instant that store already holds — so it is derived here from the
+/// same comparison rather than read as `pending` until some EBS call next materialises it.
 fn direct_api_snapshot_state(snapshot: &DirectApiSnapshot, now: SystemTime) -> &'static str {
     match snapshot.status {
         DirectApiSnapshotStatus::Completed => SNAPSHOT_STATE_COMPLETED,
