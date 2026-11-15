@@ -15,10 +15,13 @@
 //! service ([`smithy_server_runtime::OperationContext::callback`]), through the tree's one
 //! construction of that client (`service_common::s3_client`), so nothing here opens a socket,
 //! leaves the process, or names another service crate. Only S3's own ANSWER refuses
-//! anything: a read that reports no such bucket is what refuses the request, while every
-//! other outcome — an emulator assembled without Amazon S3 to ask, or any other failure to
-//! ask it — establishes nothing about the bucket and so refuses nothing
-//! (`services/common/src/network.rs` states which resolution is which).
+//! anything: a read that reports no such bucket — or one reporting the bucket in another
+//! Region, which `S3StorageConfiguration$bucketName` says is not a bucket this configuration
+//! may record to ("the StorageConfiguration and S3 bucket must be in the same region as the
+//! Composition") — is what refuses the request, while every other outcome — an emulator
+//! assembled without Amazon S3 to ask, or any other failure to ask it — establishes nothing
+//! about the bucket and so refuses nothing (`services/common/src/network.rs` states which
+//! resolution is which).
 //!
 //! The one caller-supplied value that reaches a client's authority is the Region, which
 //! [`super::request_region`] has already narrowed to the Region grammar the modelled ARN
@@ -38,12 +41,38 @@ const POLICY_VERSION: &str = "2012-10-17";
 /// permissions to write content to the provided bucket").
 const RECORDING_ACTION: &str = "s3:PutObject";
 
-/// Whether Amazon S3 reports holding no bucket under `name` in `region`.
+/// What Amazon S3 answered about the policy a bucket carries, in the three cases the
+/// amendment has to tell apart.
+///
+/// Only a bucket S3 reports carrying NO policy is one whose policy the grant may become the
+/// whole of; a document S3 did report is merged into; and a question S3 left unanswered — a
+/// read that failed, or a body that is no JSON document — establishes nothing, so the policy
+/// in force stays as it is rather than being overwritten with the grant alone.
+#[derive(Debug)]
+enum CarriedPolicy {
+    /// Amazon S3 reports the bucket carrying no policy at all.
+    None,
+    /// The policy document Amazon S3 reports the bucket carrying.
+    Document(::serde_json::Value),
+    /// Amazon S3 did not say what the bucket carries.
+    Unknown,
+}
+
+/// Whether Amazon S3 reports holding no bucket under `name` IN `region`.
 ///
 /// Asked with `HeadBucket`, the operation S3 documents for exactly this ("You can use this
 /// operation to determine if a bucket exists"): its `NotFound` answer is S3 saying the
 /// bucket is not there. Every other failure leaves the question unanswered, so it reports
 /// the bucket as present and refuses nothing.
+///
+/// The Region is part of the question, not of the address it is asked at: Amazon S3's bucket
+/// names are one global namespace, so a name a bucket of ANOTHER Region holds is answered
+/// for too, and `S3StorageConfiguration$bucketName` states the rule that makes that answer
+/// the wrong bucket — "the StorageConfiguration and S3 bucket must be in the same region as
+/// the Composition". So the Region S3 reports the bucket in ([`HeadBucketOutput::bucket_region`])
+/// decides: a bucket of another Region is one this Region's recording cannot be written to,
+/// and is reported absent. An answer that names no Region establishes nothing about where the
+/// bucket is, so it refuses nothing either.
 ///
 /// Call it with NO guard of this service's store held: it awaits.
 pub async fn recording_bucket_is_absent(
@@ -53,7 +82,10 @@ pub async fn recording_bucket_is_absent(
 ) -> bool {
     let answer = s3_client(ctx, region).head_bucket().bucket(name).send().await;
     match answer {
-        Ok(_) => false,
+        Ok(held) => held
+            .bucket_region
+            .as_deref()
+            .is_some_and(|held_in| !held_in.eq_ignore_ascii_case(region)),
         Err(error)
             if error.as_service_error().is_some_and(
                 ::aws_sdk_s3::operation::head_bucket::HeadBucketError::is_not_found,
@@ -78,6 +110,10 @@ pub async fn recording_bucket_is_absent(
 /// so a second storage configuration over one bucket leaves the bucket granting exactly
 /// once, and a policy the bucket's owner wrote keeps its own statements.
 ///
+/// A policy Amazon S3 does not report, on the other hand, is not one to replace: only a
+/// bucket S3 says carries NO policy gets a document holding the grant alone
+/// ([`CarriedPolicy`]).
+///
 /// Call it with NO guard of this service's store held: it awaits.
 pub async fn grant_recording_access(
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -86,22 +122,37 @@ pub async fn grant_recording_access(
 ) {
     let client = s3_client(ctx, region);
     let carried = match client.get_bucket_policy().bucket(bucket).send().await {
-        Ok(answer) => answer
-            .policy
-            .as_deref()
-            .and_then(|text| ::serde_json::from_str::<::serde_json::Value>(text).ok()),
+        Ok(answer) => match answer.policy.as_deref() {
+            None => CarriedPolicy::None,
+            Some(text) => match ::serde_json::from_str::<::serde_json::Value>(text) {
+                Ok(document) => CarriedPolicy::Document(document),
+                Err(error) => {
+                    ungranted(bucket, &error);
+                    CarriedPolicy::Unknown
+                }
+            },
+        },
         Err(error) => {
             // A bucket that carries no policy yet is the ordinary case of a first create,
             // not a failure: the grant becomes the document's first statement. Anything
-            // else is a bucket this emulator could not ask about, which the put below
-            // reports.
+            // else leaves the question of what the bucket carries unanswered.
             if ::aws_smithy_types::error::metadata::ProvideErrorMetadata::code(&error)
-                != Some(NO_SUCH_BUCKET_POLICY_CODE)
+                == Some(NO_SUCH_BUCKET_POLICY_CODE)
             {
+                CarriedPolicy::None
+            } else {
                 ungranted(bucket, &error);
+                CarriedPolicy::Unknown
             }
-            None
         }
+    };
+    let carried = match carried {
+        CarriedPolicy::None => None,
+        CarriedPolicy::Document(document) => Some(document),
+        // A policy this emulator could not read is not one it may replace: the write below
+        // would put a document holding the grant alone, dropping statements the bucket's
+        // owner wrote. Nothing is written, and the read that failed is already traced.
+        CarriedPolicy::Unknown => return,
     };
     let document = merged_recording_grant(carried, region, bucket);
     let document = match ::serde_json::to_string(&document) {

@@ -191,10 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
 
         // A configuration records to the bucket its `s3.bucketName` names, in the Region it
-        // is created in: a name Amazon S3 holds no bucket under records nothing, so it is
-        // refused with the modelled `ValidationException` (HTTP 400) and nothing is
-        // persisted. Asked BEFORE this service's own store is locked, because it awaits the
-        // service that owns the bucket.
+        // is created in — "the StorageConfiguration and S3 bucket must be in the same region
+        // as the Composition" (`S3StorageConfiguration$bucketName`): a name Amazon S3 holds
+        // no bucket under THERE records nothing, so it is refused with the modelled
+        // `ValidationException` (HTTP 400) and nothing is persisted. Asked BEFORE this
+        // service's own store is locked, because it awaits the service that owns the bucket.
         if crate::state::recording_bucket_is_absent(ctx, &region, &input.s3.bucket_name).await {
             return Err(crate::state::validation_failed(
                 CreateStorageConfigurationErrorModeled::ValidationException,

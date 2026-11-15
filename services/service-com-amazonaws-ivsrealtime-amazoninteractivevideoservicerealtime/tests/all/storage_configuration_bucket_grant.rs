@@ -10,10 +10,13 @@
 //!
 //! The rules under test, each exercised over a SET of inputs rather than on one request:
 //!
-//! 1. A CREATE OVER A BUCKET AMAZON S3 DOES NOT HOLD IS REFUSED, with the modelled
-//!    `ValidationException` (HTTP 400) and the one sentence this service states it with, and
-//!    nothing is persisted: no configuration is minted and the account holds no more of them
-//!    than before.
+//! 1. A CREATE OVER A BUCKET AMAZON S3 DOES NOT HOLD IN THE REGION THE CONFIGURATION IS
+//!    CREATED IN IS REFUSED, with the modelled `ValidationException` (HTTP 400) and the one
+//!    sentence this service states it with, and nothing is persisted: no configuration is
+//!    minted and the account holds no more of them than before. Amazon S3's bucket names are
+//!    one global namespace, so "does not hold" includes a bucket S3 holds in ANOTHER Region:
+//!    `S3StorageConfiguration$bucketName` states that "the StorageConfiguration and S3 bucket
+//!    must be in the same region as the Composition".
 //! 2. A CREATE OVER A BUCKET IT DOES HOLD SUCCEEDS and round-trips: the configuration reads
 //!    back through `GetStorageConfiguration` naming the same bucket.
 //! 3. THE BUCKET CARRIES THE RECORDING GRANT afterwards: its own policy holds a statement
@@ -188,10 +191,18 @@ impl Emulator {
         self.dispatch(request).await
     }
 
-    /// How many storage configurations this Region's view holds, read through
+    /// How many storage configurations [`REGION`]'s view holds, read through
     /// `ListStorageConfigurations`.
     async fn held(&self, case: &str) -> usize {
-        let (status, response) = self.call("ListStorageConfigurations", &json!({})).await;
+        self.held_in(REGION, case).await
+    }
+
+    /// How many storage configurations `region`'s view holds, read through
+    /// `ListStorageConfigurations`.
+    async fn held_in(&self, region: &str, case: &str) -> usize {
+        let (status, response) = self
+            .call_in(region, "ListStorageConfigurations", &json!({}))
+            .await;
         assert_eq!(
             status, 200,
             "case {case:?}: ListStorageConfigurations must answer HTTP 200, \
@@ -445,6 +456,118 @@ async fn a_create_over_a_held_bucket_grants_the_recorder() {
         assert!(
             granting(&document, &recorder_principal("ap-south-1")).is_empty(),
             "case {case:?}: only this Region's recorder may be granted, got {document}"
+        );
+    }
+}
+
+/// RULE 1, over the REGION the bucket is held in: Amazon S3's bucket names are one global
+/// namespace, so a name a bucket of another Region holds is resolved too — and it is not a
+/// bucket this configuration may record to, because
+/// `smithy_query(query="shape",shape="S3StorageConfiguration")` states on `bucketName` that
+/// "the StorageConfiguration and S3 bucket must be in the same region as the Composition".
+///
+/// One row per PAIRING of the Region the bucket is held in with the Region the configuration
+/// is created in: each Region of this suite as the bucket's and as the configuration's, so
+/// the rule is pinned as "the same Region", not as one fixed Region being special. A row
+/// where the two agree is the positive control that the same request succeeds once the
+/// bucket is where the configuration records.
+#[tokio::test]
+async fn a_create_over_a_bucket_held_in_another_region_is_refused() {
+    // (case, the Region Amazon S3 holds the bucket in, the Region the create is made in)
+    let cases = [
+        (
+            "a bucket of the default Region, a configuration elsewhere",
+            DEFAULT_BUCKET_REGION,
+            OTHER_REGION,
+        ),
+        (
+            "a bucket elsewhere, a configuration in the default Region",
+            OTHER_REGION,
+            DEFAULT_BUCKET_REGION,
+        ),
+        (
+            "a bucket of a third Region, a configuration elsewhere",
+            "ap-south-1",
+            OTHER_REGION,
+        ),
+        (
+            "a bucket of the Region the configuration is created in",
+            OTHER_REGION,
+            OTHER_REGION,
+        ),
+        (
+            "a bucket of the default Region, a configuration there too",
+            DEFAULT_BUCKET_REGION,
+            DEFAULT_BUCKET_REGION,
+        ),
+    ];
+
+    for (case, bucket_region, create_region) in cases {
+        // One emulator per row: each row decides against a store holding only its own bucket.
+        let emulator = Emulator::new();
+        let bucket = "ivs-recordings-regional";
+        emulator.given_bucket_in(bucket_region, bucket).await;
+        let request = json!({ "s3": { "bucketName": bucket }, "name": "regional" });
+
+        let before = emulator.held_in(create_region, case).await;
+        let (status, response) = emulator
+            .call_in(create_region, "CreateStorageConfiguration", &request)
+            .await;
+        let same_region = bucket_region == create_region;
+        if same_region {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a create over a bucket of its own Region must answer \
+                 HTTP 200, got {status} {response}"
+            );
+            let (status, document) = emulator.bucket_policy(bucket).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the bucket must carry the grant, got {status} {document}"
+            );
+            assert_grants_recorder(case, &document, create_region, bucket);
+            let after = emulator.held_in(create_region, case).await;
+            assert_eq!(
+                after,
+                before + 1,
+                "case {case:?}: the accepted create must persist its configuration, \
+                 got {after} against {before}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a create over a bucket of Region {bucket_region:?} made in \
+             {create_region:?} must answer HTTP 400, got {status} {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "ValidationException",
+            "case {case:?}: the refusal must be the modelled ValidationException, \
+             got {response}"
+        );
+        assert_eq!(
+            member(&response, "message"),
+            BUCKET_NOT_FOUND_MESSAGE,
+            "case {case:?}: the refusal must state {BUCKET_NOT_FOUND_MESSAGE:?}, \
+             got {response}"
+        );
+        assert!(
+            response.get("storageConfiguration").is_none(),
+            "case {case:?}: a refused create must mint nothing, got {response}"
+        );
+        let after = emulator.held_in(create_region, case).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: a refused create must persist nothing, got {after} against \
+             {before}"
+        );
+        let (status, policy) = emulator.bucket_policy(bucket).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: a refused create must amend no bucket policy, got {status} \
+             {policy}"
         );
     }
 }
