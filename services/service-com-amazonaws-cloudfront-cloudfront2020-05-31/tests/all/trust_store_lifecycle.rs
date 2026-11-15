@@ -53,10 +53,10 @@ use crate::distributions_by_web_acl_id::encode_label;
 use crate::key_value_store_lifecycle::{escape, is_version_token, member};
 
 /// The Region the bundles below are staged in, and so the Region every bundle source names.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The bucket this suite stages its bundles in.
-const BUNDLE_BUCKET: &str = "cloudfront-trust-store-bundles";
+pub(crate) const BUNDLE_BUCKET: &str = "cloudfront-trust-store-bundles";
 
 // ---------------------------------------------------------------------------
 // The emulator: CloudFront plus the object store its trust stores read
@@ -65,13 +65,13 @@ const BUNDLE_BUCKET: &str = "cloudfront-trust-store-bundles";
 /// CloudFront and Amazon S3 over ONE shared engine, with a callback into the same router so
 /// this suite stages bundles through Amazon S3's own API — the very seam the handler reads
 /// them over.
-struct Emulator {
-    router: MultiServiceRouter,
+pub(crate) struct Emulator {
+    pub(crate) router: MultiServiceRouter,
     callback: EmbeddedEmulator,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: std::sync::Arc<engine::InMemoryEngine> =
             std::sync::Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
@@ -95,7 +95,7 @@ impl Emulator {
     }
 
     /// Create [`BUNDLE_BUCKET`], the bucket every staged bundle lives in.
-    async fn bundle_bucket(&self) {
+    pub(crate) async fn bundle_bucket(&self) {
         self.s3()
             .create_bucket()
             .bucket(BUNDLE_BUCKET)
@@ -105,7 +105,7 @@ impl Emulator {
     }
 
     /// Put `body` at `key` of [`BUNDLE_BUCKET`].
-    async fn stage(&self, key: &str, body: &str) {
+    pub(crate) async fn stage(&self, key: &str, body: &str) {
         self.s3()
             .put_object()
             .bucket(BUNDLE_BUCKET)
@@ -129,7 +129,7 @@ impl Emulator {
 /// Each certificate is GENERATED here (`rcgen`), so the count every assertion below expects
 /// is the number of certificates a parser produced rather than a number this suite and the
 /// handler both guessed.
-fn ca_bundle(count: usize) -> String {
+pub(crate) fn ca_bundle(count: usize) -> String {
     (0..count)
         .map(|index| {
             let key = rcgen::KeyPair::generate().expect("a key pair");
@@ -186,7 +186,7 @@ impl Create {
 }
 
 /// The `CreateTrustStoreRequest` XML naming the bundle at `bucket`/`key` in `region`.
-fn request_xml(
+pub(crate) fn request_xml(
     name: &str,
     bucket: &str,
     key: &str,
@@ -268,7 +268,7 @@ fn create_table() -> Vec<Create> {
 // ---------------------------------------------------------------------------
 
 /// `POST /2020-05-31/trust-store` with the request document `body`.
-async fn create_trust_store(router: &MultiServiceRouter, body: &str) -> Answer {
+pub(crate) async fn create_trust_store(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",

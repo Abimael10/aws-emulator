@@ -295,3 +295,21 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .any(|trust_store| trust_store.name == name)
     }
 }
+
+/// Whether `config` validates viewer certificates against the trust store `id` names.
+///
+/// A distribution names a trust store through its viewer mTLS configuration: a
+/// `ViewerMtlsConfig` carries at most one `TrustStoreConfig`, whose required `TrustStoreId`
+/// is "The trust store ID" — the trust store's own minted `Id` — so a distribution is
+/// associated with the trust store exactly when that member names it, and a configuration
+/// carrying no viewer mTLS configuration, or one whose configuration names no trust store,
+/// is associated with none. ONE rule, read from the STORED configuration, so the listing of
+/// the distributions a trust store serves can never disagree with the configuration a
+/// distribution read reports.
+pub fn references_trust_store(config: &DistributionConfig, id: &str) -> bool {
+    config
+        .viewer_mtls_config
+        .as_ref()
+        .and_then(|mtls| mtls.trust_store_config.as_ref())
+        .is_some_and(|trust_store| trust_store.trust_store_id == id)
+}

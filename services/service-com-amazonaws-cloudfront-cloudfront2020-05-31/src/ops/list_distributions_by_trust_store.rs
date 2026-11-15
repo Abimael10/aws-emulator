@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDistributionsByTrustStore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDistributionsByTrustStore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDistributionsByTrustStore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the persisted distributions that validate viewer certificates against ONE
+//! trust store, one page at a time: a distribution is listed exactly when its stored
+//! `DistributionConfig$ViewerMtlsConfig$TrustStoreConfig$TrustStoreId` is the trust store's
+//! own minted `Id`, so a distribution configuring no viewer mTLS is listed under no trust
+//! store at all. The page contract is the one every CloudFront distribution listing shares —
+//! `MaxItems` is the page size, `Marker` is the distribution id the previous page ended at,
+//! and `NextMarker` arrives exactly when matching distributions remain.
+//!
+//! The listing is about ONE trust store, so the identifier is RESOLVED against the store (by
+//! id, by name or by ARN, as every other read of this resource kind resolves one) and an
+//! identifier no trust store answers to is the modelled 404 rather than a page of nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +77,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -145,18 +150,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDistributionsByTrustStore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDistributionsByTrustStoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDistributionsByTrustStore"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // "MaxItems: the maximum number of distributions that you want returned in the
+        // response" — the member BOUNDS the page rather than demanding one, so only a
+        // negative size names no page at all, and the size served is bounded above by this
+        // emulator's own page ceiling. The same parameter, the same constraint and the same
+        // refusal as `ListDistributions`.
+        let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(ListDistributionsByTrustStoreErrorModeled::InvalidArgument(
+                crate::state::invalid_max_items(),
+            )
+            .into());
+        };
+        // "The response includes items in the list that occur after the marker" — the
+        // marker is the distribution id the previous page ended at, so a value that is not
+        // a distribution id was never a resume point this service handed out.
+        if let Some(marker) = input.marker.as_deref() {
+            if !crate::state::is_distribution_id(marker) {
+                return Err(ListDistributionsByTrustStoreErrorModeled::InvalidArgument(
+                    InvalidArgument {
+                        message: Some(format!(
+                            "Marker {marker} is not a distribution id returned by \
+                             ListDistributionsByTrustStore"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+        // Materialise the propagation the clock already owes, so each summary reports the
+        // status its distribution has at this instant.
+        store.settle(SystemTime::now());
+
+        // The listing is about ONE trust store, so an identifier the store holds none for is
+        // the modelled 404 rather than a page of nothing: an empty page would claim the
+        // trust store exists and serves no distribution. The identifier is resolved by id,
+        // by name or by ARN, as every other read of this resource kind resolves one, and the
+        // id an association is matched against is the STORED one.
+        let Some(trust_store) = store.trust_store(&input.trust_store_identifier) else {
+            return Err(ListDistributionsByTrustStoreErrorModeled::EntityNotFound(
+                crate::state::trust_store_not_found(),
+            )
+            .into());
+        };
+        let trust_store_id = trust_store.id.clone();
+
+        // Every stored distribution whose configuration validates viewer certificates
+        // against that trust store, paged by the one page walk every CloudFront
+        // distribution listing shares.
+        Ok(ListDistributionsByTrustStoreOutput {
+            distribution_list: Some(crate::state::distribution_page(
+                &store.distributions,
+                input.marker.as_deref(),
+                max_items,
+                page_size,
+                |stored| crate::state::references_trust_store(&stored.config, &trust_store_id),
+            )),
+        })
     }
 }
