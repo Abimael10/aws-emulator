@@ -295,8 +295,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the held order verbatim.
         merged.sort_by(|left, right| left.key.cmp(&right.key));
         // An empty tag set is the same as no tags, which is how
-        // `CreateOpenIDConnectProvider` stores one: the member is reported only when the
-        // provider carries a tag.
+        // `CreateOpenIDConnectProvider` stores one; every reader of the provider reports
+        // the member either way (`crate::state::reported_tags`).
         provider.tags = (!merged.is_empty()).then_some(merged);
         Ok(TagOpenIDConnectProviderOutput)
     }

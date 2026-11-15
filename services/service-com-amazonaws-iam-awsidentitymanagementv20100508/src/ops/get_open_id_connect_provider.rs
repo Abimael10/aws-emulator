@@ -217,7 +217,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_id_list: Some(provider.client_id_list.clone()),
             thumbprint_list: Some(provider.thumbprint_list.clone()),
             create_date: Some(provider.create_date),
-            tags: provider.tags.clone(),
+            // "A list of tags that are attached to the specified IAM OIDC provider"
+            // (`$Tags`): the set the provider carries, reported whether or not it carries
+            // any (`crate::state::reported_tags`).
+            tags: crate::state::reported_tags(provider.tags.clone()),
         })
     }
 }

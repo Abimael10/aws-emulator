@@ -18,6 +18,10 @@
 //! lives here rather than in each handler: one encode step, applied by every reader, so a
 //! document cannot be reported in one form on one read and another form on the next.
 //!
+//! Which members of one ENTITY carry a document, and what else a reader of that entity writes
+//! differently from the way the record holds it, is [`super::reported_entities`]: the encode step
+//! is applied there, through the per-entity report every handler calls.
+//!
 //! Only the REPORT is encoded. What the account holds stays the plain text every other reader of
 //! the store — this service's own authorization pass, and the services that resolve a role
 //! against IAM — evaluates, so the encoding is a property of the wire and of nothing else.
@@ -25,8 +29,6 @@
 //! A role TEMPLATE's `…Template` member is not one of these: it carries the pattern a role is
 //! created from rather than a policy in force on an entity, and AWS reports it as the text it
 //! published, so [`super::role_templates`] writes those members as they stand.
-
-use crate::ops::types::{InstanceProfile, PolicyVersion, Role};
 
 /// The characters RFC 3986 leaves alone: "unreserved characters" are the ASCII letters and
 /// digits plus `-`, `.`, `_` and `~`. Everything else a policy document carries is written as
@@ -49,49 +51,6 @@ const UNRESERVED: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHA
 #[must_use]
 pub fn reported_policy_document(document: &str) -> String {
     ::percent_encoding::utf8_percent_encode(document, UNRESERVED).to_string()
-}
-
-/// One role as a response reports it: its trust policy
-/// ([`reported_policy_document`]) and every other member as the account holds it.
-///
-/// `Role$AssumeRolePolicyDocument` targets `policyDocumentType`, so it is encoded wherever a
-/// `Role` is written out — a role read on its own, a page of roles, and the roles embedded in an
-/// instance profile.
-#[must_use]
-pub fn reported_role(role: Role) -> Role {
-    Role {
-        assume_role_policy_document: role
-            .assume_role_policy_document
-            .as_deref()
-            .map(reported_policy_document),
-        ..role
-    }
-}
-
-/// One instance profile as a response reports it: each role it contains reported as
-/// [`reported_role`] reports one, since `InstanceProfile$Roles` carries the ROLE and therefore
-/// that role's trust policy.
-#[must_use]
-pub fn reported_instance_profile(instance_profile: InstanceProfile) -> InstanceProfile {
-    InstanceProfile {
-        roles: instance_profile
-            .roles
-            .into_iter()
-            .map(reported_role)
-            .collect(),
-        ..instance_profile
-    }
-}
-
-/// One managed-policy version as a response reports it: its `Document`
-/// ([`reported_policy_document`]) when the reader carries one at all, and its metadata as it
-/// stands.
-#[must_use]
-pub fn reported_policy_version(version: PolicyVersion) -> PolicyVersion {
-    PolicyVersion {
-        document: version.document.as_deref().map(reported_policy_document),
-        ..version
-    }
 }
 
 #[cfg(test)]

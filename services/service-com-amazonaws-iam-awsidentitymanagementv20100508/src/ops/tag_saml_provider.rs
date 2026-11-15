@@ -279,7 +279,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`GetSAMLProvider$Tags`) and that read reports the held order verbatim.
         merged.sort_by(|left, right| left.key.cmp(&right.key));
         // An empty tag set is the same as no tags, which is how `CreateSAMLProvider`
-        // stores one: the member is reported only when the provider carries a tag.
+        // stores one; every reader of the provider reports the member either way
+        // (`crate::state::reported_tags`).
         provider.tags = (!merged.is_empty()).then_some(merged);
         Ok(TagSAMLProviderOutput)
     }

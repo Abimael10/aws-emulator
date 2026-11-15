@@ -221,7 +221,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
 
         match held {
-            Some(user) => Ok(GetUserOutput { user: user.clone() }),
+            // The user as every reader of one reports it: its `Tags` reported whether or
+            // not the user carries any (`crate::state::reported_user`).
+            Some(user) => Ok(GetUserOutput {
+                user: crate::state::reported_user(user.clone()),
+            }),
             None => Err(GetUserErrorModeled::NoSuchEntityException(NoSuchEntityException {
                 message: Some(format!("The user with name {addressed} cannot be found.")),
             })

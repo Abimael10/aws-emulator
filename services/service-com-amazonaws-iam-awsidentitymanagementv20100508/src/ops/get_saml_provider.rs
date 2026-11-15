@@ -212,7 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             saml_metadata_document: Some(provider.metadata_document.clone()),
             create_date: Some(provider.create_date),
             valid_until: provider.valid_until,
-            tags: provider.tags.clone(),
+            // "A list of tags that are attached to the specified IAM SAML provider"
+            // (`$Tags`): the set the provider carries, reported whether or not it carries
+            // any (`crate::state::reported_tags`).
+            tags: crate::state::reported_tags(provider.tags.clone()),
             assertion_encryption_mode: provider.assertion_encryption_mode.clone(),
             private_key_list: Some(provider.private_keys.clone()),
         })

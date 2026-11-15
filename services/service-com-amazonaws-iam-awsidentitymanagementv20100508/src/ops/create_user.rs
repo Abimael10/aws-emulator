@@ -272,12 +272,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     permissions_boundary_arn: Some(arn),
                 }
             }),
-            // An empty `Tags` list is the same as none: report the member only
-            // when the user actually carries tags.
+            // An empty `Tags` list is HELD as none, the one spelling a record keeps for
+            // an empty tag set; every reader of the user reports the member either way
+            // (`crate::state::reported_tags`).
             tags: input.tags.filter(|tags| !tags.is_empty()),
         };
 
         store.users.insert(key, user.clone());
-        Ok(CreateUserOutput { user: Some(user) })
+        // The response is the record that was stored, reported as every reader of a user
+        // reports one (`crate::state::reported_user`), so a caller sees exactly what a
+        // later `GetUser` reports.
+        Ok(CreateUserOutput {
+            user: Some(crate::state::reported_user(user)),
+        })
     }
 }

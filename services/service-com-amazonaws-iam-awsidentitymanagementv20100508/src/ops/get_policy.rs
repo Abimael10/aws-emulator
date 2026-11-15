@@ -209,7 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if let Some(resolved) = store.resolve_policy(&input.policy_arn) {
             return Ok(GetPolicyOutput {
-                policy: Some(resolved.policy),
+                // The policy as every reader of one reports it: its `Tags` reported
+                // whether or not the policy carries any
+                // (`crate::state::reported_policy`).
+                policy: Some(crate::state::reported_policy(resolved.policy)),
             });
         }
 

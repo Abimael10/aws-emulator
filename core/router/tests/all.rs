@@ -2530,3 +2530,10 @@ mod declaration_roots_keep_inner_attributes_ahead_of_the_first_item;
 // every service crate's `tests/all.rs`, so a note about any of those rules belongs there.
 #[path = "all/bedrock_agent_ingestion_populates_its_aoss_index.rs"]
 mod bedrock_agent_ingestion_populates_its_aoss_index;
+// `E0753` and compiles no suite of this target. With none anywhere in the file, no merge of
+// two landings can leave one there. NOTHING goes after the last pair, for the same reason.
+// sibling of this file, which the layout check refuses: the `#[path]` above each `mod` is
+// what points it into `tests/all/`. Declare each suite exactly ONCE — a second `mod` for one
+// explains. `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/every_suite_file_is_declared.rs` pin the rules above for this file and for every
+// service crate's `tests/all.rs`.

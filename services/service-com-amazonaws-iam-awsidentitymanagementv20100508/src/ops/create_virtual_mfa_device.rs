@@ -333,7 +333,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             qr_code_png: Some(qr_code_png),
             user: None,
             enable_date: None,
-            tags,
+            // The tag set the device carries, reported whether or not it carries any
+            // (`crate::state::reported_tags`).
+            tags: crate::state::reported_tags(tags),
         };
         store.virtual_mfa_devices.insert(serial_number, record);
         Ok(CreateVirtualMFADeviceOutput { virtual_mfa_device })

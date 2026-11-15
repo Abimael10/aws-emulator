@@ -219,7 +219,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // An empty tag set is the same as no tags, which is how `CreateRole` stores
-        // one: the member is reported only when the role actually carries tags.
+        // one; every reader of the role reports the member either way
+        // (`crate::state::reported_tags`).
         role.tags = (!remaining.is_empty()).then_some(remaining);
         Ok(UntagRoleOutput)
     }

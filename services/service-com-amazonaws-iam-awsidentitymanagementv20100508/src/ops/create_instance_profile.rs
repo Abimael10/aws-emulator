@@ -262,15 +262,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The role associated with the instance profile" (`$Roles`): a freshly created
             // profile has none until `AddRoleToInstanceProfile` binds one.
             roles: Vec::new(),
-            // An empty `Tags` list is the same as none: report the member only when the
-            // profile actually carries tags.
+            // An empty `Tags` list is HELD as none, the one spelling a record keeps for
+            // an empty tag set; every reader of the profile reports the member either way
+            // (`crate::state::reported_tags`).
             tags,
             instance_profile_name: input.instance_profile_name,
         };
 
-        // The response is the record that was stored, so a caller sees exactly what a
-        // later `GetInstanceProfile` reports. The profile is stored holding NO binding:
-        // a role is bound to it only by `AddRoleToInstanceProfile`.
+        // The response is the record that was stored, reported as every reader of a profile
+        // reports one (`crate::state::reported_instance_profile`), so a caller sees exactly
+        // what a later `GetInstanceProfile` reports. The profile is stored holding NO
+        // binding: a role is bound to it only by `AddRoleToInstanceProfile`.
         store.instance_profiles.insert(
             key,
             crate::state::InstanceProfileRecord {
@@ -278,6 +280,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 role_keys: Vec::new(),
             },
         );
-        Ok(CreateInstanceProfileOutput { instance_profile })
+        Ok(CreateInstanceProfileOutput {
+            instance_profile: crate::state::reported_instance_profile(instance_profile),
+        })
     }
 }

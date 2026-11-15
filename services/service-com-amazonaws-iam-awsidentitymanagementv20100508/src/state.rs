@@ -34,6 +34,7 @@ pub mod outbound_web_identity_federation;
 pub mod outbound_web_identity_keys;
 pub mod policy_document_reports;
 pub mod policy_statement_grammar;
+pub mod reported_entities;
 pub mod reported_services;
 pub mod role_templates;
 pub mod simulated_decisions;
@@ -58,6 +59,7 @@ pub use outbound_web_identity_federation::*;
 pub use outbound_web_identity_keys::*;
 pub use policy_document_reports::*;
 pub use policy_statement_grammar::*;
+pub use reported_entities::*;
 pub use reported_services::*;
 pub use role_templates::*;
 pub use ssh_public_keys::*;
@@ -3808,9 +3810,9 @@ pub fn decode_marker(scope: &str, marker: &str) -> Option<String> {
 /// them.
 pub const INVALID_MARKER: &str = "Invalid Marker.";
 
-/// One stored role as a resource-LISTING operation reports it: the attributes
-/// `ListRoles` documents it withholds are dropped, every other one is reported as
-/// the account holds it.
+/// One role as a resource-LISTING operation reports it: the attributes `ListRoles`
+/// documents it withholds are dropped from the report [`reported_entities`] built, every
+/// other one is reported as that report carries it.
 ///
 /// `ListRoles`' documentation: "IAM resource-listing operations return a subset of
 /// the available attributes for the resource. This operation does not return the
@@ -4222,10 +4224,10 @@ pub fn has_reserved_tag_key<'a, I: IntoIterator<Item = &'a str>>(keys: I) -> boo
 /// The tags a record holds, as a slice: the stored list, or the EMPTY set for a record
 /// that holds no tags at all.
 ///
-/// A tagged IAM record spells "no tags" as an absent list, because its modelled `Tags`
-/// member is optional and a reader "does not return tags" as an empty element
-/// (`User$Tags`); for a caller asking WHICH tags the record carries, both spellings are
-/// the same answer.
+/// A tagged IAM record spells "no tags" as an absent list, the one spelling a write of an
+/// empty tag set leaves behind, while a READER of the record reports the member either way
+/// ([`reported_tags`]); for a caller asking WHICH tags the record carries, both spellings
+/// are the same answer.
 fn held_tags(held: Option<&Vec<Tag>>) -> &[Tag] {
     held.map_or(&[], ::std::vec::Vec::as_slice)
 }

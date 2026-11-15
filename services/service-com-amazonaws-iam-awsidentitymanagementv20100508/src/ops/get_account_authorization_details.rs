@@ -449,7 +449,9 @@ fn user_detail(store: &IamStore, user_key: &str, user: &User) -> UserDetail {
             store.user_attached_policies.get(user_key),
         )),
         permissions_boundary: user.permissions_boundary.clone(),
-        tags: user.tags.clone(),
+        // The tag set the user carries, reported whether or not it carries any
+        // (`crate::state::reported_tags`).
+        tags: crate::state::reported_tags(user.tags.clone()),
     }
 }
 
@@ -507,8 +509,11 @@ fn role_detail(store: &IamStore, role_key: &str, role: &Role) -> RoleDetail {
             store.role_attached_policies.get(role_key),
         )),
         permissions_boundary: role.permissions_boundary.clone(),
-        tags: role.tags.clone(),
-        role_last_used: role.role_last_used.clone(),
+        // The tag set and the last-use detail the role carries, each reported whether or
+        // not the account holds anything in it (`crate::state::reported_tags`,
+        // `crate::state::reported_role_last_used`).
+        tags: crate::state::reported_tags(role.tags.clone()),
+        role_last_used: crate::state::reported_role_last_used(role.role_last_used.clone()),
     }
 }
 

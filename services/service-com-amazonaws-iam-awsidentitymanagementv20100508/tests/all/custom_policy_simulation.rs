@@ -528,8 +528,8 @@ fn hierarchy(levels: &[&str]) -> Vec<(String, String)> {
 
 /// RULE: the service control policies of a named Organizations hierarchy bound the
 /// decision — an action a level does not allow is not available to the account, one a
-/// level denies is denied outright — and what they decided is reported as
-/// `AllowedByOrganizations`.
+/// level denies is denied outright — and what the policies in force decided is reported as
+/// `AllowedByOrganizations` on every result, an allow where no hierarchy caps the account.
 #[tokio::test]
 async fn an_organizations_hierarchy_bounds_the_decision() {
     let allow_everything = scp("Allow", "*");
@@ -539,7 +539,7 @@ async fn an_organizations_hierarchy_bounds_the_decision() {
     // a level that denies the action, and a three-level hierarchy whose innermost level
     // allows it.
     let rows: Vec<(&str, Vec<&str>, &str, Option<&str>)> = vec![
-        ("no hierarchy named", Vec::new(), ALLOWED, None),
+        ("no hierarchy named", Vec::new(), ALLOWED, Some("true")),
         (
             "every level allows everything",
             vec![allow_everything.as_str(), allow_everything.as_str()],

@@ -244,8 +244,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // An empty tag set is the same as no tags, which is how
-        // `CreateOpenIDConnectProvider` stores one: the member is reported only when the
-        // provider carries a tag.
+        // `CreateOpenIDConnectProvider` stores one; every reader of the provider reports
+        // the member either way (`crate::state::reported_tags`).
         provider.tags = (!remaining.is_empty()).then_some(remaining);
         Ok(UntagOpenIDConnectProviderOutput)
     }

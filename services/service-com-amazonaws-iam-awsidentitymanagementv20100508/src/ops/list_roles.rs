@@ -232,13 +232,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 is_truncated = true;
                 break;
             }
-            // A resource-listing operation reports a SUBSET of a role's attributes:
-            // `PermissionsBoundary`, `RoleLastUsed` and `Tags` are withheld here and
-            // reported by `GetRole` (`crate::state::listed_role`). The trust policy is
-            // written out in the form every IAM response carries a policy document in
-            // (`crate::state::reported_role`), so a page reports it exactly as `GetRole`
-            // does.
-            roles.push(crate::state::reported_role(crate::state::listed_role(role)));
+            // The role as every reader reports it — its trust policy in the form every IAM
+            // response carries a policy document in, so a page reports it exactly as
+            // `GetRole` does (`crate::state::reported_role`) — minus the attributes a
+            // resource-listing operation withholds: `PermissionsBoundary`, `RoleLastUsed`
+            // and `Tags` are reported by `GetRole` alone
+            // (`crate::state::listed_role`), which is why the subset is taken of the
+            // finished report rather than before it.
+            roles.push(crate::state::listed_role(&crate::state::reported_role(
+                role.clone(),
+            )));
             last_key = Some(key.clone());
         }
 

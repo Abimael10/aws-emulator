@@ -392,10 +392,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // The response reports the stored record, so a caller sees exactly what a later
-        // `GetServerCertificate` reports.
+        // `GetServerCertificate` reports — its tags included, whether or not the
+        // certificate carries any (`crate::state::reported_tags`).
         Ok(UploadServerCertificateOutput {
             server_certificate_metadata: Some(metadata),
-            tags,
+            tags: crate::state::reported_tags(tags),
         })
     }
 }

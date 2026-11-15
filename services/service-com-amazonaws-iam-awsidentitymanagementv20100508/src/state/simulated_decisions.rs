@@ -691,13 +691,16 @@ pub async fn evaluate_page(
             matched_statements: Some(matched.into_entries()),
             // "Specifies whether the simulated operation is allowed by the Organizations
             // service control policies that impact the simulated user's account"
-            // (`OrganizationsDecisionDetail$AllowedByOrganizations`): reported for a
-            // simulation that named a hierarchy, and absent for one that named none,
-            // where no SCP took part in the decision.
-            organizations_decision_detail: allowed_by_organizations
-                .map(|allowed_by_organizations| OrganizationsDecisionDetail {
-                    allowed_by_organizations,
-                }),
+            // (`OrganizationsDecisionDetail$AllowedByOrganizations`): the detail reports
+            // what the SCPs in force on that account say about the simulated operation, so
+            // it is REPORTED on every result. A simulation that named a hierarchy is
+            // reported on what its levels decided; one that named none is allowed by
+            // Organizations, because no service control policy caps an account outside an
+            // organization and the emulator holds no hierarchy of its own — the detail
+            // then says the decision was not an Organizations one, which absent could not.
+            organizations_decision_detail: Some(OrganizationsDecisionDetail {
+                allowed_by_organizations: allowed_by_organizations.unwrap_or(true),
+            }),
             // `EvalDecisionDetails` is for a decision reported per policy TYPE, which
             // nothing here reports: the decision's sources are already named by the
             // details beside it and by the statements it reports.

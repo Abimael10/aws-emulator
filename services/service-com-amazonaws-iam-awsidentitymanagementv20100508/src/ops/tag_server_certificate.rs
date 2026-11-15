@@ -291,7 +291,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // order verbatim.
         merged.sort_by(|left, right| left.key.cmp(&right.key));
         // An empty tag set is the same as no tags, which is how `UploadServerCertificate`
-        // stores one: the member is reported only when the certificate carries a tag.
+        // stores one; every reader of the certificate reports the member either way
+        // (`crate::state::reported_tags`).
         certificate.tags = (!merged.is_empty()).then_some(merged);
         let server_certificate_name = certificate.metadata.server_certificate_name.clone();
 

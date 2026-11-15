@@ -266,7 +266,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // An empty tag set is the same as no tags, which is how `CreateInstanceProfile`
-        // stores one: the member is reported only when the profile actually carries tags.
+        // stores one; every reader of the profile reports the member either way
+        // (`crate::state::reported_tags`).
         record.profile.tags = (!merged.is_empty()).then_some(merged);
         Ok(TagInstanceProfileOutput)
     }

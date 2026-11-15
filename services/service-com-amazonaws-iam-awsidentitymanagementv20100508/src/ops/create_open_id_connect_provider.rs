@@ -392,10 +392,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         );
         // The response reports the stored record's ARN and tags, so a caller sees exactly
-        // what a later `GetOpenIDConnectProvider` reports.
+        // what a later `GetOpenIDConnectProvider` reports — the tag set reported whether or
+        // not the provider carries any (`crate::state::reported_tags`).
         Ok(CreateOpenIDConnectProviderOutput {
             open_id_connect_provider_arn: Some(arn),
-            tags,
+            tags: crate::state::reported_tags(tags),
         })
     }
 }

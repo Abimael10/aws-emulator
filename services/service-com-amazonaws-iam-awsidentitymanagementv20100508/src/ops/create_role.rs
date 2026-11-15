@@ -329,11 +329,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     permissions_boundary_arn: Some(arn),
                 }
             }),
-            // An empty `Tags` list is the same as none: report the member only when
-            // the role actually carries tags.
+            // An empty `Tags` list is HELD as none, the one spelling a record keeps for
+            // an empty tag set; every reader of the role reports the member either way
+            // (`crate::state::reported_tags`).
             tags,
             // `Role$RoleLastUsed` reports role USAGE, which this emulator does not
-            // record, so the member is absent rather than carrying an invented date.
+            // record, so the RECORD holds none; the report of a role carries the empty
+            // detail for it rather than an invented date
+            // (`crate::state::reported_role_last_used`).
             role_last_used: None,
             // "This member is present only for roles created with AcquireRole"
             // (`Role$SourceRoleTemplate`), which is not this path.

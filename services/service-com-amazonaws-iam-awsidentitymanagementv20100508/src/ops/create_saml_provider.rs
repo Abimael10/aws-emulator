@@ -325,10 +325,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         );
         // The response reports the stored record's ARN and tags, so a caller sees exactly
-        // what a later `GetSAMLProvider` reports.
+        // what a later `GetSAMLProvider` reports — the tag set reported whether or not the
+        // provider carries any (`crate::state::reported_tags`).
         Ok(CreateSAMLProviderOutput {
             saml_provider_arn: Some(arn),
-            tags,
+            tags: crate::state::reported_tags(tags),
         })
     }
 }

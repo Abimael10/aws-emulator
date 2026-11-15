@@ -198,7 +198,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 server_certificate_metadata: held.metadata.clone(),
                 certificate_body: held.certificate_body.clone(),
                 certificate_chain: held.certificate_chain.clone(),
-                tags: held.tags.clone(),
+                // "A list of tags that are attached to the server certificate"
+                // (`$Tags`): the set the certificate carries, reported whether or not it
+                // carries any (`crate::state::reported_tags`).
+                tags: crate::state::reported_tags(held.tags.clone()),
             },
         })
     }

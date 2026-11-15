@@ -339,8 +339,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description,
             create_date: Some(created),
             update_date: Some(created),
-            // An empty `Tags` list is the same as none: report the member only when
-            // the policy actually carries tags.
+            // An empty `Tags` list is HELD as none, the one spelling a record keeps for
+            // an empty tag set; every reader of the policy reports the member either way
+            // (`crate::state::reported_tags`).
             tags,
         };
 
@@ -363,10 +364,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect(),
             },
         );
-        // The response is the record that was stored, so a caller sees exactly what a
+        // The response is the record that was stored, reported as every reader of a policy
+        // reports one (`crate::state::reported_policy`), so a caller sees exactly what a
         // later `GetPolicy` reports.
         Ok(CreatePolicyOutput {
-            policy: Some(policy),
+            policy: Some(crate::state::reported_policy(policy)),
         })
     }
 }
