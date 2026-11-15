@@ -241,11 +241,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "read Glue workflows in a batch"
         );
 
-        // Both output members target a list bounded `length 1..25`, so neither carries an
-        // empty list: a batch in which nothing missed reports no `MissingWorkflows` member
-        // at all, and one in which nothing was found reports no `Workflows` member.
+        // The LIST a batch read answers out of is reported whatever it holds, the empty list
+        // included: a caller iterates `Workflows` to read the batch's answer, so a batch that
+        // resolved nothing has to leave it an empty iteration rather than an absent member —
+        // which is what the reader beside this one does with its own found list
+        // (`BatchGetJobs`, `BatchGetCustomEntityTypes`). `MissingWorkflows` targets
+        // `WorkflowNames`, bounded `length 1..25`, so an empty list is not a value of that
+        // shape: a batch that missed nothing reports no such member.
         Ok(BatchGetWorkflowsOutput {
-            workflows: (!workflows.is_empty()).then_some(workflows),
+            workflows: Some(workflows),
             missing_workflows: (!missing_workflows.is_empty()).then_some(missing_workflows),
         })
     }

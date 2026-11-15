@@ -776,7 +776,12 @@ async fn perform_job_script<Eng: ::std::marker::Send + ::std::marker::Sync + 'st
             "a Glue job run's execution role cannot be assumed by Glue, so nothing was run"
         );
         return Some(
-            JobRunOutcome::Failed(messages::job_run_role_not_assumable(&plan.role_arn)).into(),
+            JobRunOutcome::Failed(messages::job_run_role_not_assumable(
+                &plan.job_name,
+                &plan.run_id,
+                &plan.role_arn,
+            ))
+            .into(),
         );
     }
     let language = plan.job_language();

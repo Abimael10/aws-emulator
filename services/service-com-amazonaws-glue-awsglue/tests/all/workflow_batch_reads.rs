@@ -10,10 +10,12 @@
 //! own order and keeping its repeats — the stored workflow's projection under `Workflows`,
 //! the name itself under `MissingWorkflows` when this account holds no workflow under it —
 //! and the projection it serves for a name is the same one the single-workflow read
-//! (`GetWorkflow`) serves, graph included when the batch asked for one. Because both output
-//! members target a list the model bounds `length 1..25`
-//! (`smithy_query shape=BatchGetWorkflowsResponse`), neither is reported as an empty list:
-//! the member whose list would be empty is omitted.
+//! (`GetWorkflow`) serves, graph included when the batch asked for one. `Workflows` — the
+//! member the batch's answer is read out of — is reported whatever it holds, the EMPTY list
+//! included, so a batch that resolved nothing is an empty iteration rather than an absent
+//! key; `MissingWorkflows` targets `WorkflowNames`, which the model bounds `length 1..25`
+//! (`smithy_query shape=BatchGetWorkflowsResponse`), so a batch that missed nothing reports
+//! no such member.
 //!
 //! The suites are tables: the rows differ along what the rule generalises over — how many
 //! names the batch carries (one, several, the modelled maximum), whether each resolves,
@@ -79,8 +81,8 @@ async fn batch(
 }
 
 /// The elements of an output list member, read as the empty list when the member is absent
-/// — which is how a batch reports "none of these", since the model bounds both of its
-/// output lists `length 1..25` and so admits no empty one.
+/// — which is how a batch reports "none of these" under `MissingWorkflows`, whose shape the
+/// model bounds `length 1..25` and so admits no empty one.
 fn optional_list(body: &Value, member: &str) -> Vec<Value> {
     match body.get(member) {
         None | Some(Value::Null) => Vec::new(),
@@ -104,10 +106,10 @@ fn missing_names(body: &Value) -> Vec<String> {
 }
 
 /// The `Workflows` names a batch reported, in the order it reported them.
+///
+/// The member is always there, so this reads it without a fallback: a batch that resolved
+/// nothing reports it as an empty list, which [`names_in`] reads as no names.
 fn found_names(body: &Value) -> Vec<String> {
-    if body.get("Workflows").is_none_or(Value::is_null) {
-        return Vec::new();
-    }
     names_in(body, "Workflows")
 }
 
@@ -248,7 +250,8 @@ fn batch_cases() -> Vec<BatchCase> {
 
 /// A batch read answers one entry per requested name — the stored projection under
 /// `Workflows`, the name under `MissingWorkflows` — in the request's order and keeping its
-/// repeats, and omits the member whose list would be empty.
+/// repeats, with `Workflows` reported whatever it holds and `MissingWorkflows` omitted when
+/// nothing missed.
 #[tokio::test]
 async fn a_batch_answers_one_entry_per_requested_name() {
     let router = emulator();
@@ -281,15 +284,15 @@ async fn a_batch_answers_one_entry_per_requested_name() {
             case.case
         );
 
-        // Neither member is reported as an empty list: the model bounds both output lists
-        // `length 1..25`, so "none of these" is an omitted member.
-        if case.found.is_empty() {
-            assert!(
-                body.get("Workflows").is_none_or(Value::is_null),
-                "case {}: a batch that found nothing reports no Workflows, got {body}",
-                case.case
-            );
-        }
+        // `Workflows` is the member the answer is read out of, so it is reported whatever it
+        // holds: a batch that resolved nothing reports it as an EMPTY LIST, not as an absent
+        // key, and a client iterating it reads zero workflows rather than nothing at all.
+        assert_eq!(
+            body.get("Workflows").and_then(Value::as_array).map(Vec::len),
+            Some(case.found.len()),
+            "case {}: Workflows must be reported with one entry per resolved name, got {body}",
+            case.case
+        );
         if case.missing.is_empty() {
             assert!(
                 body.get("MissingWorkflows").is_none_or(Value::is_null),

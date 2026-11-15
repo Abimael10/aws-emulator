@@ -6,8 +6,10 @@
 //! or Amazon Resource Name (ARN) of the IAM role associated with this job", `Job$Role`), so
 //! a run is dispatched only while this account's own IAM shows that Glue may both ASSUME that
 //! role and READ, under it, the object the job's `JobCommand$ScriptLocation` names. A run
-//! whose role Glue cannot assume comes to rest in the modelled failure state carrying the
-//! assume-role requirement for that role; a run whose role may not read the script comes to
+//! whose role Glue cannot assume comes to rest in the modelled failure state carrying the job
+//! executor's own failure line for it — the run it is about, the assume-role requirement for
+//! that role, and the clause naming the component that raised it; a run whose role may not
+//! read the script comes to
 //! rest carrying Glue's script-access failure naming that script; and neither run executes
 //! anything, so the object its script would have written is not there. The role is resolved
 //! BEFORE the script, because a script is fetched as the role.
@@ -51,6 +53,13 @@ use crate::wire::{ok, ACCOUNT_ID};
 /// The fixed text Glue's script-access failure states, written out here rather than read from
 /// the crate's own constant so this suite pins the wording.
 pub(crate) const SCRIPT_FILE_DOESNT_EXIST: &str = "Script file doesn't exist";
+
+/// The component the job executor's own failure line names itself with, and the status and
+/// error code it states for a run it refused to execute. Written out here rather than read
+/// from the crate's constants so this suite pins them.
+pub(crate) const JOB_EXECUTOR: &str = "AWSGlueJobExecutor";
+pub(crate) const JOB_EXECUTOR_STATUS: u16 = 400;
+pub(crate) const JOB_EXECUTOR_CODE: &str = "InvalidInputException";
 
 /// The AWS-managed policy a Glue service role is routinely given, which grants
 /// `s3:GetObject` only on the buckets AWS Glue itself owns. Named by its friendly name and
@@ -387,13 +396,35 @@ async fn a_job_run_is_dispatched_only_for_a_role_that_can_assume_and_read_the_sc
                     state, JOB_RUN_STATE_FAILED,
                     "case {case:?}: expected {JOB_RUN_STATE_FAILED}, got {run}"
                 );
+                // The job executor reports a run it could not execute as ONE line naming the
+                // run — the account, the job and the run id — then the exception that stopped
+                // it, then the clause naming the component, status and code it was raised
+                // with. The clause's request id is its one per-run field, so it is stripped
+                // and asserted by shape; everything else is fixed text or read off the run.
+                let sentence = crate::error_classification::without_diagnostic(
+                    case,
+                    &message,
+                    JOB_EXECUTOR,
+                    JOB_EXECUTOR_STATUS,
+                    JOB_EXECUTOR_CODE,
+                );
                 let expected = format!(
-                    "Role {role} should be given assume role permissions for Glue Service."
+                    "AccountId:{ACCOUNT_ID} and JobName:{job_name} and JobRunId:{run_id} \
+                     failed to execute with exception Role {role} should be given assume \
+                     role permissions for Glue Service.\n"
                 );
                 assert_eq!(
-                    message, expected,
+                    sentence, expected,
                     "case {case:?}: expected ErrorMessage {expected:?}, got {message:?}"
                 );
+                // Nothing of this emulator's own internals leaks through the modelled field:
+                // the line a client parses carries no Rust debug rendering of an SDK error.
+                for leak in ["SdkBody", "ServiceError", "StatusCode(", "Unhandled"] {
+                    assert!(
+                        !message.contains(leak),
+                        "case {case:?}: ErrorMessage must carry no {leak:?}, got {message:?}"
+                    );
+                }
                 let token = object_body(&router, &token_key).await;
                 assert!(
                     token.is_none(),

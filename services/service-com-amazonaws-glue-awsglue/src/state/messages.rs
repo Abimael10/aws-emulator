@@ -114,13 +114,30 @@ pub fn session_role_not_assumable(role_arn: &str) -> String {
 /// `JobRun$ErrorMessage` of a run whose job's `Role` Glue cannot assume
 /// ([`super::glue_role_is_unassumable`]), which is a run that was never dispatched.
 ///
-/// RECORDED template: the SAME sentence the session surface states the requirement with —
-/// both are the job executor resolving the role the work would be performed as — carrying
-/// the ARN that addresses the role the job names ([`super::glue_role_reference`]). It is the
-/// whole message: `JobRun$ErrorMessage` is the reason the run carries, not a refusal an
-/// operation answered, so no diagnostic clause is appended to it.
-pub fn job_run_role_not_assumable(role_arn: &str) -> String {
-    assume_role_permissions_sentence(role_arn)
+/// RECORDED template: the job executor reports a run it could not execute as ONE line
+/// naming the run it is about — the account the run was made in, the job definition it is a
+/// run of and the run's own id — then the exception that stopped it, which here is the SAME
+/// sentence the session surface states the requirement with ([`session_role_not_assumable`]):
+/// both are the job executor resolving the role the work would be performed as. The sentence
+/// ends in the line break that component's messages end in, and the clause naming the
+/// component, the status and the code it raised the failure with follows it
+/// ([`with_diagnostic`]).
+///
+/// Every variable part is read off the run and the emulator's own state: the account id this
+/// emulator serves, the `JobName` and `JobRunId` of the run, the ARN that addresses the role
+/// the job names ([`super::glue_role_reference`]), and the clause's own request id.
+pub fn job_run_role_not_assumable(job_name: &str, run_id: &str, role_arn: &str) -> String {
+    with_diagnostic(
+        &format!(
+            "AccountId:{} and JobName:{job_name} and JobRunId:{run_id} failed to execute \
+             with exception {}\n",
+            ::engine::emulator_account_id(),
+            assume_role_permissions_sentence(role_arn)
+        ),
+        DIAGNOSTIC_SERVICE_JOB_EXECUTOR,
+        DIAGNOSTIC_STATUS_VALIDATION,
+        DIAGNOSTIC_CODE_INVALID_INPUT,
+    )
 }
 
 /// The sentence this service states the assume-role requirement with, naming the role it is

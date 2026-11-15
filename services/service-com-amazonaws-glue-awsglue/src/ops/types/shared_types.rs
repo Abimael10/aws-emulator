@@ -2257,6 +2257,7 @@ pub struct JobRun {
     pub completed_on: Option<::aws_smithy_types::DateTime>,
     pub job_run_state: Option<String>,
     pub arguments: Option<std::collections::HashMap<String, String>>,
+    pub execution_arguments: Option<std::collections::HashMap<String, String>>,
     pub error_message: Option<String>,
     pub predecessor_runs: Option<Vec<Predecessor>>,
     pub allocated_capacity: i32,
@@ -2760,6 +2761,7 @@ pub struct Session {
     pub execution_time: Option<f64>,
     pub dpu_seconds: Option<f64>,
     pub idle_timeout: Option<i32>,
+    pub timeout: Option<i32>,
     pub profile_name: Option<String>,
     pub session_type: Option<String>,
 }

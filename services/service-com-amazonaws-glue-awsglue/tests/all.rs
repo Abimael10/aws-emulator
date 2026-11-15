@@ -357,6 +357,8 @@ mod session_tags;
 mod sessions;
 #[path = "all/spark_job_script_execution.rs"]
 mod spark_job_script_execution;
+#[path = "all/started_run_and_session_configuration.rs"]
+mod started_run_and_session_configuration;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/statement_listing.rs"]

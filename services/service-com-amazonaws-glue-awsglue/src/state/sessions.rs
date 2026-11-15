@@ -339,6 +339,13 @@ impl SessionEntry {
             // session that has not run and none for one holding no DPU figure.
             dpu_seconds: Some(execution_time * self.max_capacity.unwrap_or_default()),
             idle_timeout: Some(self.idle_timeout),
+            // "The number of minutes before session times out" (`CreateSession$Timeout`):
+            // the span the create named, else the default this store fills in
+            // ([`DEFAULT_SESSION_TIMEOUT_MINUTES`]) — the same figure the IDLE leg of the
+            // timeout defaults to, and the one this session really ends at
+            // ([`Self::times_out_at`]), so a client that reads a session back can confirm
+            // the timeout it configured.
+            timeout: Some(self.timeout),
             // "The name of an Glue usage profile associated with the session": a session
             // create carries no profile member, so no session this store holds has one.
             profile_name: None,

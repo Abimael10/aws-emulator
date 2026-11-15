@@ -1181,6 +1181,10 @@ pub struct JobRunEntry {
     /// is recorded carrying them — those stay on the definition, where every read of the job
     /// reports them. So a run a start sent no arguments with records none, however many the
     /// job definition it runs carries.
+    ///
+    /// They are also what `JobRun$ExecutionArguments` reports, which differs only in being
+    /// reported whatever it holds: a run started with none carries the empty map there
+    /// ([`JobRunEntry::to_job_run`]).
     pub arguments: Option<HashMap<String, String>>,
     /// The arguments the run's SCRIPT is given: the job's `DefaultArguments` with this run's
     /// own applied over them, then the job's `NonOverridableArguments` — the "arguments for
@@ -1552,6 +1556,11 @@ impl JobRunEntry {
             completed_on: self.completed_on.map(to_date_time),
             job_run_state: Some(self.state.clone()),
             arguments: self.arguments.clone(),
+            // `JobRun$ExecutionArguments` is the same map, reported whatever it holds: a run
+            // started with no arguments carries the EMPTY map rather than no member at all,
+            // so a client that reads the arguments a run was started with reads them off
+            // every run.
+            execution_arguments: Some(self.arguments.clone().unwrap_or_default()),
             error_message: self.error_message.clone(),
             // "A job run that was used in the predicate of a conditional trigger that
             // triggered this job run" (`Predecessor`): the runs that preceded this one, which

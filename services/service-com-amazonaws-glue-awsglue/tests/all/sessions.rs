@@ -65,8 +65,10 @@ const ROLE: &str = "arn:aws:iam::000000000000:role/GlueSessionRole";
 const SECONDS_PER_MINUTE: u64 = 60;
 
 /// The members of a create that the modelled `Session` shape reports back, as a body a
-/// round-trip assertion can be made against. `Timeout`, `Tags` and `RequestOrigin` are not
-/// among them: the shape carries no such members.
+/// round-trip assertion can be made against. `Tags` and `RequestOrigin` are not among them:
+/// the shape carries no such members. `Timeout` IS reported, but a create that named none is
+/// answered with the default the service fills in, so it is asserted beside this rather than
+/// echoed through it.
 ///
 /// Three of them are filled in by the SERVICE when the create named nothing for them, so
 /// what must come back is the create's value where it sent one and the service's otherwise:
@@ -410,14 +412,24 @@ async fn created_sessions_are_read_back_from_the_store() {
                 "case {case}: a fresh session has consumed no {member}, got {read}"
             );
         }
-        // The modelled `Session` shape carries neither member, so what the create sent
-        // under them is not part of the session a read reports.
-        for member in ["Timeout", "Tags"] {
-            assert!(
-                read.get(member).is_none_or(Value::is_null),
-                "case {case}: the Session shape carries no {member}, got {read}"
-            );
-        }
+        // "The number of minutes before session times out" (`CreateSession$Timeout`): the
+        // span the create named, else the default the service fills in — so a client that
+        // created a session with an explicit timeout can read it back and confirm it.
+        let expected_timeout = request
+            .get("Timeout")
+            .and_then(Value::as_i64)
+            .unwrap_or_else(|| i64::from(DEFAULT_SESSION_TIMEOUT_MINUTES));
+        assert_eq!(
+            read["Timeout"].as_i64(),
+            Some(expected_timeout),
+            "case {case}: expected a Timeout of {expected_timeout}, got {read}"
+        );
+        // The modelled `Session` shape carries no `Tags` member, so what the create sent
+        // under it is not part of the session a read reports.
+        assert!(
+            read.get("Tags").is_none_or(Value::is_null),
+            "case {case}: the Session shape carries no Tags, got {read}"
+        );
     }
 
     // Each create is its own record: after every one has landed, each id still reports its

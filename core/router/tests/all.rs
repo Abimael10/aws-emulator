@@ -4718,3 +4718,14 @@ mod appended_notes;
 //! down this file has to be an ordinary `//` comment.
 // (`tests/boot_serve.rs`) — which the layout check refuses. The `#[path]` is what points the
 // declaration into `tests/all/`.
+//! Put a new suite at `tests/all/<name>.rs` and declare it below: one `#[path]` / `mod` pair
+//! per suite and NOTHING else — no note, no narration — so a landing has one place to insert
+//! and nothing to keep consistent.
+//! left at the top level of `tests/` fails the build. Declare each suite exactly ONCE: this is
+//! one crate root, so a second `mod` for the same name is `E0428` and fails every suite in
+//! this target. An inner doc comment (`//!`) is legal only BEFORE the first item, so this
+//! block is the only place one may stand: past it a `//!` line is `E0753` and compiles no
+//! suite of this target. `all/all_rs_declares_each_suite_once.rs` and
+//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of this
+//! file, which the layout check refuses: the `#[path]` is what points each module into
+//! `tests/all/`.

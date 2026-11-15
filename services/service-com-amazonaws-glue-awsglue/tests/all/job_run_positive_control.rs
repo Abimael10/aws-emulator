@@ -40,11 +40,12 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::crawler_role_trust::{glue_trust, seed_role, trust};
 use crate::job_run_execution_role::{
-    emulator_with_iam_and_s3, every_object, grant_role, statement, SCRIPT_FILE_DOESNT_EXIST,
+    emulator_with_iam_and_s3, every_object, grant_role, statement, JOB_EXECUTOR,
+    JOB_EXECUTOR_CODE, JOB_EXECUTOR_STATUS, SCRIPT_FILE_DOESNT_EXIST,
 };
 use crate::job_runs::{run_at_rest, run_at_rest_on_the_services_own_clock};
 use crate::job_script_execution::{create_bucket, object_body, stage_script, BUCKET, SCRIPTS};
-use crate::wire::ok;
+use crate::wire::{ok, ACCOUNT_ID};
 
 /// The script a row stages: it writes a token object at the key its arguments name, carrying
 /// the connection its arguments named — so a row can tell a run that EXECUTED, with its own
@@ -556,12 +557,26 @@ async fn runs_that_fail_for_different_reasons_carry_their_own_message() {
         );
         match fault {
             Fault::RoleGlueCannotAssume => {
+                // The job executor's own line for a run it could not execute: the run it is
+                // about — the account, the job and the run id — then the reason that stopped
+                // it, then the clause naming the component, status and code it was raised
+                // with. The clause's request id is its one per-run field, so it is stripped
+                // and asserted by shape; the rest is fixed text or read off the run.
+                let sentence = crate::error_classification::without_diagnostic(
+                    case,
+                    &message,
+                    JOB_EXECUTOR,
+                    JOB_EXECUTOR_STATUS,
+                    JOB_EXECUTOR_CODE,
+                );
                 let expected = format!(
-                    "Role {} should be given assume role permissions for Glue Service.",
-                    submission.role
+                    "AccountId:{ACCOUNT_ID} and JobName:{} and JobRunId:{} failed to execute \
+                     with exception Role {} should be given assume role permissions for Glue \
+                     Service.\n",
+                    submission.job_name, submission.run_id, submission.role
                 );
                 assert_eq!(
-                    message, expected,
+                    sentence, expected,
                     "case {case:?}: expected ErrorMessage {expected:?}, got {message:?}"
                 );
             }
