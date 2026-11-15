@@ -2537,13 +2537,17 @@ impl Provisioner {
     /// resource, which is the refusal a client would get.
     ///
     /// This is the resource's CONFIGURATION alone. The tags CloudFormation gives it travel
-    /// separately, in [`Self::retag`], because they change independently of any declaration.
+    /// separately, in [`Self::retag`], because they change independently of any declaration —
+    /// with one exception, which is why `propagated` is here: an arm that applies a changed
+    /// declaration by REPLACING the resource makes a CREATE, and a resource CloudFormation
+    /// creates carries the stack's tags from the moment it exists.
     pub(super) async fn update(
         self,
         ctx: &smithy_server_runtime::OperationContext<'_>,
         region: &str,
         resource: &StoredResource,
         declared: &Value,
+        propagated: &[(String, String)],
     ) -> Result<Option<Created>, Refusal> {
         match self {
             Self::SqsQueue => update_queue(ctx, region, resource, declared).await.map(Some),
@@ -2681,10 +2685,12 @@ impl Provisioner {
             Self::RdsDbCluster => {
                 Box::pin(update_db_cluster(ctx, region, resource, declared)).await
             }
-            // The same for a DB instance, through `ModifyDBInstance`
-            // ([`update_db_instance`]).
+            // The same for a DB instance, through `ModifyDBInstance` — except for a
+            // create-only setting, which no modification can change and which that arm
+            // therefore deploys by REPLACING the instance, so it is handed the tags a
+            // replacement is created with ([`update_db_instance`]).
             Self::RdsDbInstance => {
-                Box::pin(update_db_instance(ctx, region, resource, declared)).await
+                Box::pin(update_db_instance(ctx, region, resource, declared, propagated)).await
             }
             Self::RdsDbClusterParameterGroup => {
                 update_parameter_group(

@@ -297,6 +297,8 @@ mod neptune_reference_catalogs;
 mod not_found_paths;
 #[path = "all/not_found_refusal_sentences.rs"]
 mod not_found_refusal_sentences;
+#[path = "all/oracle_standby_switchover.rs"]
+mod oracle_standby_switchover;
 #[path = "all/option_group_copy.rs"]
 mod option_group_copy;
 #[path = "all/option_group_deletion.rs"]

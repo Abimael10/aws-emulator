@@ -2706,6 +2706,9 @@ pub fn name_property(resource_type: &str, properties: &Value) -> Option<String> 
         .find(|property| properties.get(property).is_some())
 }
 
+/// The Amazon RDS DB instance type, whose create-only properties the catalogue below carries.
+const RDS_DB_INSTANCE_TYPE: &str = "AWS::RDS::DBInstance";
+
 /// The properties of this type a resource cannot take a NEW VALUE for while it goes on
 /// existing — the ones the resource and property types reference publishes with "Update
 /// requires: `Replacement`" — BESIDE the name, which is in that position for every type
@@ -2891,6 +2894,35 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
             "RuntimePlatform",
             "TaskRoleArn",
             "Volumes",
+        ],
+        // An Amazon RDS DB INSTANCE is created with the database it hosts, the character sets
+        // it stores text in, the master user it is reached as, whether its storage is
+        // encrypted and under which key, the time zone its engine runs in, the system
+        // identifier an Oracle instance carries, the cluster it joined and what it was created
+        // FROM: each is a member of `CreateDBInstance` (or of the restore and read-replica
+        // creates) and of no member of `ModifyDBInstance` — Amazon RDS publishes no call that
+        // changes any of them on the instance that exists, which is why the update walk sends
+        // none of them (`DB_INSTANCE_UPDATE_PROPERTIES_NOT_SENT`) — so a declaration restating
+        // one asks for a DIFFERENT DB instance, which is what each property's "Update
+        // requires: Replacement" says. Every other property of the type is one that
+        // modification takes, so stating it differently is a change to the instance the stack
+        // already has; `AvailabilityZone` is left out deliberately, since the resource
+        // reference publishes it as an update with "some interruptions" rather than as a
+        // replacement.
+        RDS_DB_INSTANCE_TYPE => &[
+            "CharacterSetName",
+            "DBClusterIdentifier",
+            "DBName",
+            "DBSnapshotIdentifier",
+            "DBSystemId",
+            "KmsKeyId",
+            "MasterUsername",
+            "NcharCharacterSetName",
+            "SourceDBInstanceIdentifier",
+            "SourceDbiResourceId",
+            "SourceRegion",
+            "StorageEncrypted",
+            "Timezone",
         ],
         _ => composite_identity_properties(resource_type),
     }

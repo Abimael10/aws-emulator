@@ -409,6 +409,8 @@ mod publisher_gate_scope;
 mod publisher_reads;
 #[path = "all/publisher_registration.rs"]
 mod publisher_registration;
+#[path = "all/rds_db_instance_replacement_plan.rs"]
+mod rds_db_instance_replacement_plan;
 #[path = "all/rds_generated_resource_names.rs"]
 mod rds_generated_resource_names;
 #[path = "all/rds_proxy_stack_resources.rs"]

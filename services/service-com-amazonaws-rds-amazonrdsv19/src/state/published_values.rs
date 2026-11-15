@@ -191,6 +191,32 @@ pub fn promote_read_replica_state_message(identifier: &str) -> String {
     stop_db_instance_state_message(identifier)
 }
 
+/// Whether `engine` is one this service can SWITCH OVER a read replica of.
+///
+/// `SwitchoverReadReplica` "switches over an Oracle standby database in an Oracle Data Guard
+/// environment", so the operation applies to the Oracle database engines and to no other:
+/// every `Engine` value whose own family is Oracle, which is the plain `oracle-` engines and
+/// the RDS Custom for Oracle ones the member publishes with the `custom-` prefix
+/// (`smithy_query(query="doc",shape="CreateDBInstanceMessage",member="Engine")`).
+pub fn switchover_is_supported_for(engine: &str) -> bool {
+    let lowered = engine.to_ascii_lowercase();
+    lowered.starts_with("oracle") || lowered.starts_with("custom-oracle")
+}
+
+/// The message `SwitchoverReadReplica` answers an `InvalidParameterValue` with for a DB
+/// instance whose database engine the operation does not apply to.
+///
+/// Amazon RDS words it as a statement about the instance the request addressed and the engine
+/// that instance runs: the fixed text names the operation it will not perform, and the two
+/// variable parts are the `DBInstanceIdentifier` from the request and the `Engine` from that
+/// instance's own record — never a value this service chose.
+pub fn switchover_unsupported_engine_message(identifier: &str, engine: &str) -> String {
+    format!(
+        "You can't switch over the DB instance {identifier} because the operation is not \
+         supported for {engine} engine."
+    )
+}
+
 /// How a request that would turn a DB instance's automated backups off while another
 /// instance is built from them is refused: `BackupRetentionPeriod` "can't be set to 0 if the
 /// DB instance is a source to read replicas", so the member and that constraint are the

@@ -610,7 +610,7 @@ impl Owner {
             }
             Self::Builtin(provisioner) => {
                 // Boxed for the reason [`Self::create`]'s arm records.
-                Box::pin(provisioner.update(ctx, region, resource, declared)).await
+                Box::pin(provisioner.update(ctx, region, resource, declared, propagated)).await
             }
             Self::DynamodbTable => {
                 dynamodb_table::update(ctx, region, resource, declared).await

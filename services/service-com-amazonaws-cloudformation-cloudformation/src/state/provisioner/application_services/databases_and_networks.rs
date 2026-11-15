@@ -1730,21 +1730,32 @@ pub(crate) async fn describe_db_instance(
 }
 
 /// Apply a CHANGED declaration to the DB instance a stack already created, through
-/// `ModifyDBInstance` — the call Amazon RDS changes an instance's own settings with.
+/// `ModifyDBInstance` — the call Amazon RDS changes an instance's own settings with — or by
+/// REPLACING the instance where the change is one no modification can make.
 ///
-/// Only the settings the modification TAKES are sent ([`MODIFY_DB_INSTANCE_MEMBERS`]): a
-/// create-only setting is not something a modification can change, so a declaration that
-/// changed one is applied as far as the modification reaches and the rest is left to the
-/// replacement CloudFormation decides elsewhere. `ApplyImmediately` is sent as the
-/// declaration asks, and defaults to applying the change at once, because a stack reports a
-/// resource updated when the update is done rather than when the instance's next maintenance
-/// window comes round.
+/// Only the settings the modification TAKES are sent ([`MODIFY_DB_INSTANCE_MEMBERS`]):
+/// `ApplyImmediately` is sent as the declaration asks, and defaults to applying the change at
+/// once, because a stack reports a resource updated when the update is done rather than when
+/// the instance's next maintenance window comes round.
+///
+/// A CREATE-ONLY setting is not something a modification can change at all
+/// ([`replaces_the_db_instance`]), so such a declaration is deployed as a NEW DB instance
+/// ([`replacement_db_instance`]) rather than applied as far as the modification reaches: a
+/// change set already plans that change as a replacement
+/// (`crate::state::template::replacement_properties`), and this is the same reading of it on
+/// the deployment side, so the plan and the deployment cannot disagree.
 pub(crate) async fn update_db_instance(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
     declared: &Value,
+    propagated: &[(String, String)],
 ) -> Result<Option<Created>, Refusal> {
+    if replaces_the_db_instance(resource, declared) {
+        return replacement_db_instance(ctx, region, resource, declared, propagated)
+            .await
+            .map(Some);
+    }
     let mut parameters = query_members(
         declared,
         MODIFY_DB_INSTANCE_MEMBERS,
@@ -1775,6 +1786,97 @@ pub(crate) async fn update_db_instance(
     // the endpoint all follow the identifier — so a modification reports no new attribute.
     Ok(Some(Created::attributes(BTreeMap::new())))
 }
+
+/// Whether `declared` asks for a DB instance the one `resource` records cannot BECOME: it
+/// states a create-only property differently.
+///
+/// The catalogue is the one a change set's plan reads
+/// (`crate::state::template::replacement_properties`) — every property of this type that is a
+/// member of `CreateDBInstance` and of no member of `ModifyDBInstance` — so the preview and
+/// the deployment decide replacement from one list. Each value is compared as the DECLARATION
+/// writes it, which is how every other arm of this crate compares two revisions of a
+/// property.
+fn replaces_the_db_instance(resource: &StoredResource, declared: &Value) -> bool {
+    crate::state::template::replacement_properties(RDS_DB_INSTANCE)
+        .iter()
+        .any(|property| {
+            let stated = declared.get(*property).and_then(scalar_text);
+            let held = resource.properties.get(*property).and_then(scalar_text);
+            stated != held
+        })
+}
+
+/// Deploy the declaration as a NEW DB instance, which is what a changed create-only property
+/// asks for: the create is the same one a first deployment makes
+/// ([`create_db_instance`]) over the properties this deployment declares, carrying the tags
+/// CloudFormation gives a resource it creates, and the identifier it was created under is
+/// reported as the resource's physical id — so the stack publishes the instance that really
+/// carries the declared configuration, and the one it replaced is taken down by the walk that
+/// reads its `UpdateReplacePolicy`.
+///
+/// The replacement is created under an identifier of its own
+/// ([`replacement_db_instance_identifier`]), because this type's identity IS its identifier:
+/// an instance created under the identifier the old one still holds would be the same
+/// resource, and Amazon RDS refuses a second instance of that identifier.
+async fn replacement_db_instance(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut replacement = resource.clone();
+    replacement.properties = declared.clone();
+    replacement.physical_resource_id = replacement_db_instance_identifier(resource, declared);
+    let mut created = create_db_instance(ctx, region, &replacement, propagated).await?;
+    created.physical_resource_id = Some(replacement.physical_resource_id);
+    Ok(created)
+}
+
+/// The identifier the replacement is created under: the one the declaration states, and
+/// otherwise the identifier the replaced instance carried with a fresh unique segment.
+///
+/// CloudFormation generates an identifier for an instance the template does not name, and a
+/// REPLACEMENT gets a new one — the old instance still holds the old identifier until the
+/// replacement has been created. The segment is derived from the replaced instance's own
+/// identifier and the declaration being deployed, so the same deployment asked for twice
+/// names the same replacement (nothing here is drawn fresh per call) while a declaration that
+/// replaces the instance again names another.
+///
+/// A `DBInstanceIdentifier` "must contain from 1 to 63 letters, numbers, or hyphens" and
+/// "can't end with a hyphen or contain two consecutive hyphens", so the stem gives up the
+/// characters the fresh segment and its separator need, and a stem that ends on a hyphen
+/// after the cut gives that up too.
+fn replacement_db_instance_identifier(resource: &StoredResource, declared: &Value) -> String {
+    if let Some(named) = declared.get("DBInstanceIdentifier").and_then(scalar_text) {
+        return named;
+    }
+    let unique = crate::state::template::content_digest(
+        &resource.physical_resource_id,
+        &declared.to_string(),
+        REPLACEMENT_DIGEST_CHARS,
+    );
+    let room = MAX_DB_INSTANCE_IDENTIFIER_CHARS.saturating_sub(unique.chars().count() + 1);
+    let stem: String = resource
+        .physical_resource_id
+        .chars()
+        .take(room)
+        .collect::<String>()
+        .trim_end_matches('-')
+        .to_string();
+    format!("{stem}-{unique}")
+}
+
+/// How many characters the unique segment of a [`replacement_db_instance_identifier`]
+/// carries: the width the generated names of this crate use, which is wide enough that two
+/// replacements of one instance cannot collide.
+const REPLACEMENT_DIGEST_CHARS: usize = 12;
+
+/// The most characters a `DBInstanceIdentifier` may carry: "must contain from 1 to 63
+/// letters, numbers, or hyphens" (that member's own documentation — Amazon RDS's model
+/// carries no `@length` for it), which is the bound this crate's naming rules hold a
+/// generated identifier of this type to as well.
+const MAX_DB_INSTANCE_IDENTIFIER_CHARS: usize = 63;
 
 /// The members `ModifyDBInstance` takes that an `AWS::RDS::DBInstance` declaration can
 /// carry, from Amazon RDS's own model (`smithy_query(query="operation",

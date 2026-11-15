@@ -1397,3 +1397,17 @@ mod zz_probe_whole_emulator;
 // this header, came to compile no suite at all. This file is a test-target CRATE ROOT, where
 // a bare `mod` would resolve to a SIBLING of it, which the layout check refuses: the
 // `#[path]` above each declaration is what points it into `tests/all/`.
+// Single integration-test target for the router: a canonical DECLARATION LIST.
+// This file holds the license line, this header, and then one `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair per suite file under `tests/all/`, sorted by name, and no other line —
+// so two branches landing at once insert two lines in two places and have no prose to
+// duplicate, re-word or mistype. Put a new suite at `tests/all/<name>.rs` and insert its pair
+// where its name sorts to; a note about a suite belongs in that suite's own module header,
+// and a note about THIS file in `all/appended_notes.rs`.
+// EVERY comment here is an ordinary `//` one, this header included: an inner doc comment is
+// legal only before the first item, so one a landing leaves past the declarations is `E0753`
+// and compiles NO suite of this target. A suite file no `mod` here names is compiled nowhere,
+// and a second `mod` for one name is `E0428`. The `all_rs_*` suites,
+// `all/declaration_roots_are_canonical_and_complete.rs` pin all of that, for this file and for
+// every service crate's `tests/all.rs`. `tests/all.rs` is a test-target CRATE ROOT, so the
+// `#[path]` above each `mod` is what points it into `tests/all/`.

@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SwitchoverReadReplica
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SwitchoverReadReplica`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SwitchoverReadReplica::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A SWITCHOVER exchanges the roles of a primary database and one of its standbys: the
+//! standby the request names becomes the primary, and the instance it was replicating
+//! becomes a read replica of it. It is an Oracle Data Guard operation — "switches over an
+//! Oracle standby database in an Oracle Data Guard environment" — so an instance running any
+//! other database engine names a value this operation does not serve, which is the Query
+//! API's parameter-value refusal rather than a state the instance is in: no waiting changes
+//! the engine an instance runs.
+//!
+//! What it needs beyond the engine is what every instance-level role change needs: an
+//! instance that EXISTS in the region the request was signed for (the modelled 404), one that
+//! is a read replica at all — a switchover has no standby role to exchange on an instance
+//! that replicates nothing — and one whose database engine is running, both of which are the
+//! modelled instance-state fault, worded as this service's other instance-level front doors
+//! word them.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +152,170 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SwitchoverReadReplica` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SwitchoverReadReplicaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SwitchoverReadReplica"))
+        let region =
+            crate::state::request_region(ctx).map_err(SwitchoverReadReplicaError::validation)?;
+        // `DBInstanceIdentifier` is "the DB instance identifier of the current standby
+        // database. This value is stored as a lowercase string", so the lookup folds the way
+        // the stored key does — the same fold every instance-level front door of this service
+        // applies.
+        let identifier = input.db_instance_identifier.to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a switchover nothing performed.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due — owed at this instant whether or not
+        // anybody called — so the switchover is judged against the state the instances are
+        // really in.
+        store.settle_due_transitions(&region);
+
+        // The instance this call ACTS ON is resolved FIRST: the operation models
+        // `DBInstanceNotFoundFault` for exactly this, and an instance that does not exist has
+        // no role to exchange. RDS is regional, so only the region the request was signed for
+        // is in scope.
+        let key = (region.clone(), identifier.clone());
+        let Some(instance) = store.db_instances.get(&key) else {
+            return Err(not_found(&identifier));
+        };
+        // Which ENGINE the instance runs decides whether this operation applies to it at all:
+        // a switchover is the Oracle Data Guard role transition, so an instance running any
+        // other engine is refused with the parameter-value error, naming the instance the
+        // request addressed and the engine that instance runs — taken from its own record.
+        if !crate::state::switchover_is_supported_for(&instance.engine) {
+            return Err(SwitchoverReadReplicaError::invalid_parameter_value(
+                crate::state::switchover_unsupported_engine_message(
+                    &identifier,
+                    &instance.engine,
+                ),
+            ));
+        }
+        // Only a STANDBY can be switched over: `DBInstanceIdentifier` "must match the
+        // identifier of an existing Oracle read replica DB instance", and an instance is one
+        // exactly while it carries the source `CreateDBInstanceReadReplica` resolved for it. A
+        // standalone instance — one created without a source, or one an earlier promotion or
+        // switchover already made primary — is in no state this call can be performed in,
+        // which is the modelled instance state fault rather than an exchange that changed
+        // nothing. It is decided BEFORE the instance's lifecycle status: this is a
+        // precondition on what the identifier names, which no waiting changes, so the caller
+        // is told that rather than to poll.
+        let Some(primary_identifier) = instance
+            .read_replica_source_db_instance_identifier
+            .clone()
+        else {
+            return Err(invalid_state(
+                crate::state::PROMOTE_INSTANCE_NOT_A_READ_REPLICA_MESSAGE.to_string(),
+            ));
+        };
+        // A switchover is work done ON a running instance — the standby has to be up to take
+        // the primary role — so every status but the running one is the same modelled fault.
+        // The status the clock has yet to settle is real, so a switchover issued immediately
+        // after the replica's create sees `creating` and is refused.
+        if instance.status != crate::state::DB_INSTANCE_STATUS_AVAILABLE {
+            return Err(invalid_state(
+                crate::state::promote_read_replica_state_message(&identifier),
+            ));
+        }
+        // The instance on the OTHER side of the relationship has to be there too: it is the
+        // database that becomes the standby, and a switchover cannot exchange roles with an
+        // instance this store no longer holds (its source may have been deleted, which
+        // promotes the replicas of the instance it removes). The primary also has to be
+        // running, for the same reason the standby does.
+        let primary_key = (region.clone(), primary_identifier.clone());
+        let Some(primary) = store.db_instances.get(&primary_key) else {
+            return Err(not_found(&primary_identifier));
+        };
+        if primary.status != crate::state::DB_INSTANCE_STATUS_AVAILABLE {
+            return Err(invalid_state(
+                crate::state::promote_read_replica_state_message(&primary_identifier),
+            ));
+        }
+
+        // THE EXCHANGE ITSELF, on both records: the standby stops replicating and takes the
+        // primary's place, and the former primary replicates IT from now on. That one
+        // relationship is what the whole service reads for the roles — the source reports its
+        // replicas, a replica reports its source and its read-replication status info, and
+        // the data plane admits writes on the primary's endpoint only — so exchanging it is
+        // what makes the switchover real on every read and on every session.
+        let standby_log = format!(
+            "DB instance {identifier} switched over to become the primary of \
+             {primary_identifier}"
+        );
+        let primary_log = format!(
+            "DB instance {primary_identifier} switched over to become a standby of {identifier}"
+        );
+        {
+            let Some(record) = store.db_instances.get_mut(&primary_key) else {
+                return Err(not_found(&primary_identifier));
+            };
+            record.detach_read_replica(&identifier);
+            record.read_replica_source_db_instance_identifier = Some(identifier.clone());
+            begin_switchover(record);
+            record.engine_log.record(primary_log);
+        }
+        let switched = {
+            // A key this handler resolved and a lookup under it can only disagree if the
+            // record is not where the resolve said it was, which answers the same modelled
+            // 404 as an instance that was never there: a disagreement is a "not found", never
+            // a panic that would take the whole emulator down with it.
+            let Some(record) = store.db_instances.get_mut(&key) else {
+                return Err(not_found(&identifier));
+            };
+            record.promote_from_read_replica();
+            record.attach_read_replica(&primary_identifier);
+            begin_switchover(record);
+            record.engine_log.record(standby_log);
+            record.clone()
+        };
+
+        // The answer is the instance the request named — the new primary — projected the one
+        // way every operation of this service projects one, so the switchover a caller is
+        // told about is the switchover a following describe reports.
+        Ok(SwitchoverReadReplicaOutput {
+            db_instance: Some(store.instance_to_wire(&switched)),
+        })
     }
+}
+
+/// The status a DB instance reports while this service exchanges its replication role, and
+/// the one the clock settles it back on.
+///
+/// A switchover is a change APPLIED to both instances — each reports `modifying` while it runs
+/// and returns to `available` on its own — so they report the same pair every other
+/// modification of an instance reports, [`crate::state::STATUS_TRANSITION_DELAY`] apart. A
+/// caller that reads straight after this call therefore still sees the switchover in
+/// progress, exactly as it would against RDS; nothing sleeps for it.
+const SWITCHING_OVER_STATUS: &str = "modifying";
+
+/// Put `record` into the transient status a switchover runs in, with the settled one owed by
+/// the clock. Applied to BOTH instances, so neither side of the exchange reports a state the
+/// other does not.
+fn begin_switchover(record: &mut crate::state::DbInstanceRecord) {
+    record.status = SWITCHING_OVER_STATUS.to_string();
+    record.pending_status = Some(crate::state::PendingStatus::in_a_moment(
+        crate::state::DB_INSTANCE_STATUS_AVAILABLE,
+    ));
+}
+
+/// The modelled 404 for a `DBInstanceIdentifier` naming no DB instance of this region.
+///
+/// The wording is the one this service's instance-lifecycle front doors answer — the stop, the
+/// start and the promotion of a DB instance — since a switchover is the same kind of call on
+/// the same resource: it acts on the instance itself.
+fn not_found(identifier: &str) -> SwitchoverReadReplicaError {
+    SwitchoverReadReplicaErrorModeled::DBInstanceNotFoundFault(DBInstanceNotFoundFault {
+        message: Some(format!("DBInstance {identifier} not found.")),
+    })
+    .into()
+}
+
+/// The modelled 400 for an instance this switchover cannot be performed on: either it is no
+/// read replica at all, or one of the two instances' database engines is not running.
+fn invalid_state(message: String) -> SwitchoverReadReplicaError {
+    SwitchoverReadReplicaErrorModeled::InvalidDBInstanceStateFault(InvalidDBInstanceStateFault {
+        message: Some(message),
+    })
+    .into()
 }
