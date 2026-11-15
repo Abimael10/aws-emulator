@@ -36,10 +36,10 @@ use super::functions::{create_data_source, FUNCTION_VERSION};
 /// `MappingTemplate`'s modelled `@length` bounds, quoted from the model rather than read
 /// from the service's copy of them: `smithy_query(query="shape",
 /// shape="MappingTemplate")` reports `@length(min: 1, max: 65536)`.
-const TEMPLATE_MIN_LEN: usize = 1;
+pub(crate) const TEMPLATE_MIN_LEN: usize = 1;
 
 /// `MappingTemplate`'s modelled maximum ([`TEMPLATE_MIN_LEN`]).
-const TEMPLATE_MAX_LEN: usize = 65_536;
+pub(crate) const TEMPLATE_MAX_LEN: usize = 65_536;
 
 /// `Description`'s modelled `@length` bounds, from `smithy_query(query="shape",
 /// shape="Description")`: `@length(min: 0, max: 255)`.
@@ -62,7 +62,7 @@ const TYPE: &str = "Query";
 /// A template of exactly `length` characters that carries newlines, built by repeating a
 /// line-oriented Velocity fragment and cutting it on a character boundary — so a row at
 /// the modelled maximum is a multi-line value too, not a long single line.
-fn template_of(length: usize) -> String {
+pub(crate) fn template_of(length: usize) -> String {
     let line = "#if($ctx.args.id)\n  $util.toJson($ctx.result)\n#end\n";
     let mut text = String::new();
     while text.chars().count() < length {

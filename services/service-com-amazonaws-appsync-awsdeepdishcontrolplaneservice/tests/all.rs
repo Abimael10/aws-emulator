@@ -147,6 +147,8 @@ mod resolver_caching_config;
 mod resolver_caching_keys;
 #[path = "all/resolver_definition_pairing.rs"]
 mod resolver_definition_pairing;
+#[path = "all/resolver_mapping_template_update.rs"]
+mod resolver_mapping_template_update;
 #[path = "all/resolvers.rs"]
 mod resolvers;
 #[path = "all/resource_tags.rs"]
