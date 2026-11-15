@@ -194,6 +194,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.time_range_upper_bound.as_ref(),
         )
         .map_err(lift)?;
+        // WHO this request speaks for, resolved before this service's store is locked: the
+        // listing is authorized against the caller's own identity-based policies, over the
+        // table it narrows itself to or the account's whole table namespace when it names
+        // none ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
+        if let Some(denial) = crate::state::authorization::account_denial(
+            &caller,
+            ACTION,
+            &crate::state::authorization::account_resource(&region, table.as_deref()),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
 
         let mut store = state.lock();
         // Finish any transition the clock already made due before reporting; this is a
@@ -257,6 +269,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// the model declares for the member (`BackupsInputLimit`, range 1..=100), so a request
 /// that asks for no bound is answered with as many backups as one page may carry.
 const DEFAULT_LIMIT: i32 = 100;
+
+/// The IAM action this operation performs, which a refusal names.
+const ACTION: &str = "dynamodb:ListBackups";
 
 /// The modelled server error for a request that cannot reach this service's store.
 fn store_unavailable() -> ListBackupsError {

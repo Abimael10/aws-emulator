@@ -185,6 +185,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`ListImports$NextToken`), so a token this operation did not mint stands for no
         // page and is refused rather than quietly taken for the first one.
         let cursor = input.next_token.as_deref().map(decode_token).transpose()?;
+        // WHO this request speaks for, resolved before this service's store is locked: the
+        // listing is authorized against the caller's own identity-based policies, over the
+        // table it narrows itself to or the account's whole table namespace when it names
+        // none ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
+        if let Some(denial) = crate::state::authorization::account_denial(
+            &caller,
+            ACTION,
+            &crate::state::authorization::account_resource(&region, table.as_deref()),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
 
         let store = state.lock();
         // A reporting operation, and one that reports nothing a WRITE could settle: an
@@ -243,6 +255,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// ceiling the model declares for the member (`ListImportsMaxLimit`, range 1..=25), so a
 /// request that asks for no bound is answered with as many imports as one page may carry.
 const DEFAULT_PAGE_SIZE: i32 = 25;
+
+/// The IAM action this operation performs, which a refusal names.
+const ACTION: &str = "dynamodb:ListImports";
 
 /// The bytes one group of the token's pattern carries: `^([0-9a-f]{16})+$`
 /// (`ImportNextToken`) is a whole number of 16-hex-digit groups, and 16 hex digits are 8

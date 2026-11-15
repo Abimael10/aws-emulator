@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHO a data-plane request speaks for, and whether the policies in force let it act on
-//! the table it addresses.
+//! WHO a request speaks for, and whether the policies in force let it act on what it
+//! addresses — one table, or the account's whole table namespace.
 //!
 //! A table's resource-based policy is evaluated on every call that reads or writes an item
 //! of that table, at the instant of the call — nothing is cached, so a policy just put
@@ -44,6 +44,13 @@
 //! allow is refused even where the documents in force on the identity allow it, and one only
 //! they allow is refused as if they had allowed nothing — each refusal naming the document
 //! that withheld the grant, because they need different fixes.
+//!
+//! A call that addresses NO single table — a listing of the account's table resources, or a
+//! report of the account's own quotas — acts on the table namespace the account's tables live
+//! in ([`account_resource`]) instead. No table is addressed, so no resource-based policy is
+//! in force and the same rule is decided on the identity-based documents and the credential's
+//! scope alone ([`account_denial`]): IAM's implicit deny still refuses a principal that
+//! nothing grants the action to.
 //!
 //! A statement that names the ACCOUNT rather than the caller (the account's root ARN, or
 //! the bare account id that stands for it) delegates to the account rather than granting:
@@ -602,14 +609,41 @@ fn condition_context(caller: &Caller, keys: &RequestKeys) -> Vec<(String, String
     if let Some(select) = keys.select {
         context.push((SELECT_CONDITION_KEY.to_string(), select.to_string()));
     }
-    for (key, value) in &caller.tags {
-        context.push((
-            format!("{PRINCIPAL_TAG_CONDITION_KEY_FAMILY}{key}"),
-            value.clone(),
-        ));
-    }
+    context.extend(principal_context(caller));
+    context
+}
+
+/// The condition keys the CALLING PRINCIPAL carries values for, whatever the call asks for:
+/// one entry per session tag it carries, and one per claim of the web identity its
+/// credential was minted by exchanging.
+///
+/// Held apart from [`condition_context`] because they are a property of the CREDENTIAL
+/// rather than of the request, so a call that addresses no table of its own
+/// ([`account_denial`]) answers for exactly these.
+fn principal_context(caller: &Caller) -> Vec<(String, String)> {
+    let mut context: Vec<(String, String)> = caller
+        .tags
+        .iter()
+        .map(|(key, value)| {
+            (
+                format!("{PRINCIPAL_TAG_CONDITION_KEY_FAMILY}{key}"),
+                value.clone(),
+            )
+        })
+        .collect();
     context.extend(caller.federated_claims.iter().cloned());
     context
+}
+
+/// The keys [`principal_context`] answers for whether or not it carries a value for each —
+/// the caller's own half of [`published_condition_keys`].
+fn principal_published_keys(caller: &Caller) -> Vec<&str> {
+    let mut published = Vec::new();
+    if caller.tags_known {
+        published.push(PRINCIPAL_TAG_CONDITION_KEY_FAMILY);
+    }
+    published.extend(sts_store::federated_claim_keys(&caller.federated_claims));
+    published
 }
 
 /// The condition keys this request MODELS, whether or not it carries a value for each: the
@@ -634,10 +668,7 @@ fn published_condition_keys<'a>(caller: &'a Caller, keys: &RequestKeys) -> Vec<&
     if keys.addressed.values.is_some() {
         published.push(LEADING_KEYS_CONDITION_KEY);
     }
-    if caller.tags_known {
-        published.push(PRINCIPAL_TAG_CONDITION_KEY_FAMILY);
-    }
-    published.extend(sts_store::federated_claim_keys(&caller.federated_claims));
+    published.extend(principal_published_keys(caller));
     published
 }
 
@@ -659,6 +690,52 @@ pub fn not_authorized(caller_arn: &str, action: &str, resource: &str, reason: &s
 /// [`denial_keys`], which this is the table-wide case of.
 pub fn denial(caller: &Caller, table: &Table, action: &str, now: SystemTime) -> Option<String> {
     denial_addressing(caller, table, action, now, &AddressedKeys::whole_table())
+}
+
+/// The resource a call that addresses no single table of its own acts on: the account's
+/// whole table namespace in the Region the request reached
+/// (`arn:aws:dynamodb:<region>:<account>:table/*`), or the table a listing NARROWS itself to
+/// when the request names one.
+///
+/// A listing of this account's table resources is authorized against the namespace that
+/// holds them, in the form [`super::table_arn`] mints every table ARN of this service in, so
+/// a statement naming `table/*` — or one naming the one table a listing filters to — decides
+/// it.
+pub fn account_resource(region: &str, table: Option<&str>) -> String {
+    super::table_arn(region, table.unwrap_or(ACCOUNT_TABLES_WILDCARD))
+}
+
+/// The table-name position of [`account_resource`] for a call that narrows itself to no
+/// table: the namespace wildcard, which is what stands for "every table of this account in
+/// this Region".
+const ACCOUNT_TABLES_WILDCARD: &str = "*";
+
+/// The `AccessDeniedException` message a request that addresses the account's table
+/// namespace rather than one table earns when the policies in force do not permit it, or
+/// `None` when they do.
+///
+/// `action` is the IAM action the operation performs (`dynamodb:ListTables`) and `resource`
+/// what it acts on ([`account_resource`]). The rule is the module docs' rule with the two
+/// halves such a call has: no table is addressed, so no resource-based policy is in force and
+/// the decision rests on the caller's identity-based documents and the scope its credential
+/// was minted with. An explicit `Deny` in either refuses; otherwise the call needs an `Allow`
+/// in the identity-based documents, and with none it is refused — IAM's implicit deny,
+/// naming the document that withheld the grant — and the operation reports nothing.
+///
+/// The condition keys such a call answers for are the CALLER's own
+/// ([`principal_context`]): it addresses no partition, names no attribute and asks for no
+/// selection, so it publishes no value for the keys a data-plane call answers for and a
+/// clause over one of those stays undecided rather than holding over an empty set.
+pub fn account_denial(caller: &Caller, action: &str, resource: &str) -> Option<String> {
+    let context = principal_context(caller);
+    let published = principal_published_keys(caller);
+    let granting = iam::Request::new(action, resource, &caller.principals)
+        .with_context(&context)
+        .with_published_keys(&published);
+    // The one decision ladder of this service, over the identity-based documents and the
+    // credential's scope alone: such a call addresses no resource whose own policy could
+    // grant or deny it, so nothing is handed in for that half.
+    identity_denial(caller, action, resource, &granting, || false)
 }
 
 /// The `AccessDeniedException` message a data-plane request that names no attribute of its
@@ -730,36 +807,14 @@ pub fn denial_keys(
         .with_context(&context)
         .with_published_keys(&published);
 
-    // What the SCOPE the credential was minted with says about the request, read by the
-    // tree's one reading of a resolved scope ([`sts_store::ScopingPolicies::decision`]). A
-    // session policy caps what the identity's policies grant and grants nothing itself, so
-    // a request it explicitly denies is refused whatever any grant says — which is the
-    // decision taken here, before the grants are read, because no grant overturns it. A
-    // credential scoped by no document this emulator can read is scoped by nothing, which
-    // is the position of a session policy that allows the request.
-    let scoped = caller.scope.decision(&granting);
-    if scoped == Decision::Denied {
-        return refusal("with an explicit deny in a session policy");
-    }
-    // The account's own published credential holds no IAM policies, and the account owns
-    // its tables (see the module docs).
-    if caller.account_credential {
-        return None;
-    }
-
-    let decided = iam::identity_decision(&caller.documents, &granting);
-    if decided == Decision::Denied {
-        return refusal("with an explicit deny in an identity-based policy");
-    }
-    // Whether anything grants the request at all: an `Allow` in the caller's own
-    // documents, or one in the TABLE's policy that names this principal directly, which is
-    // a permission of its own ("the resource-based policy and the identity-based policy
-    // are evaluated together, and access is granted if either allows it"). A grant this
-    // emulator cannot read is not evidence of a refusal (see the module docs), so a
-    // principal carrying one is granted where the readable documents neither grant nor
-    // deny.
-    let granted = decided == Decision::Allowed
-        || policy.is_some_and(|policy| {
+    // What the CALLER may do at all, in IAM's order — the half of the decision every call
+    // of this service is judged by ([`identity_denial`]), handed the one grant a TABLE's
+    // own policy can make: an `Allow` that names this principal directly, which is a
+    // permission of its own ("the resource-based policy and the identity-based policy are
+    // evaluated together, and access is granted if either allows it"). Read only where the
+    // identity-based documents did not already grant the call.
+    identity_denial(caller, action, &table.arn, &granting, || {
+        policy.is_some_and(|policy| {
             // Read by the same holding the deny above was: the document's principals name
             // the identities their unique ids belong to.
             let named = policy.spellings_decided(&caller.principals, &caller.unique_ids);
@@ -768,15 +823,57 @@ pub fn denial_keys(
                 .with_published_keys(&published);
             policy.decision(&granting) == Decision::Allowed
         })
-        || caller.unreadable_attachment;
+    })
+}
+
+/// The `AccessDeniedException` message the policies in force on the CALLER earn a request,
+/// or `None` when they permit it: the one decision ladder this service judges every call by,
+/// so the account-level gate ([`account_denial`]) and the table-level one ([`denial_keys`])
+/// cannot drift apart.
+///
+/// `granting` is the request as the policy evaluator reads it, already carrying the
+/// condition keys this call answers for, and `granted_by_resource` what the addressed
+/// RESOURCE's own policy says about it — `false` for a call that addresses no resource of
+/// its own, and read only where the identity-based documents did not already grant the call.
+/// A resource policy's DENY is not this function's: it refuses whatever any grant says, so
+/// the caller that holds such a document decides it before reaching here.
+///
+/// In IAM's order: the scope the credential was minted with can only refuse, so its explicit
+/// deny is taken first ([`sts_store::ScopingPolicies::decision`], the tree's one reading of a
+/// resolved scope) — a credential scoped by no document this emulator can read is scoped by
+/// nothing, which is the position of a session policy that allows the request. The account's
+/// own published credential holds no IAM documents and owns its resources (see the module
+/// docs). Otherwise an explicit deny in an identity-based document refuses; the call then
+/// needs a grant — from those documents, from the resource's own policy, or unreadable
+/// because the principal carries a document this emulator does not hold — and finally that
+/// grant has to pass the scope, whose refusal names THEM as the document that withheld it,
+/// because the two need different fixes.
+fn identity_denial(
+    caller: &Caller,
+    action: &str,
+    resource: &str,
+    granting: &iam::Request<'_>,
+    granted_by_resource: impl FnOnce() -> bool,
+) -> Option<String> {
+    let refusal = |reason: &str| Some(not_authorized(&caller.arn, action, resource, reason));
+    let scoped = caller.scope.decision(granting);
+    if scoped == Decision::Denied {
+        return refusal("with an explicit deny in a session policy");
+    }
+    if caller.account_credential {
+        return None;
+    }
+    let decided = iam::identity_decision(&caller.documents, granting);
+    if decided == Decision::Denied {
+        return refusal("with an explicit deny in an identity-based policy");
+    }
+    let granted =
+        decided == Decision::Allowed || granted_by_resource() || caller.unreadable_attachment;
     if !granted {
         return refusal(&format!(
             "because no identity-based policy allows the {action} action"
         ));
     }
-    // The grant still has to pass the scope the credential was minted with: a request only
-    // the identity's policies allow is refused as if the session policies had allowed
-    // nothing, and the refusal names THEM as the document that withheld it.
     if scoped != Decision::Allowed {
         return refusal(&format!(
             "because no session policy allows the {action} action"

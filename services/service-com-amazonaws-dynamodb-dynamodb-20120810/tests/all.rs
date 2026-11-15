@@ -13,6 +13,8 @@
 mod absent_table_before_key_binding;
 #[path = "all/account_capacity_limits.rs"]
 mod account_capacity_limits;
+#[path = "all/account_level_authorization.rs"]
+mod account_level_authorization;
 #[path = "all/arn_addressed_tag_refusals.rs"]
 mod arn_addressed_tag_refusals;
 #[path = "all/attribute_value_admission_rules.rs"]

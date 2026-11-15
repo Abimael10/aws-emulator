@@ -164,6 +164,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|named| crate::state::resolve_table_name_in(named, &region))
             .transpose()
             .map_err(lift)?;
+        // WHO this request speaks for, resolved before this service's store is locked: the
+        // listing is authorized against the caller's own identity-based policies, over the
+        // table it narrows itself to or the account's whole table namespace when it names
+        // none ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
+        if let Some(denial) = crate::state::authorization::account_denial(
+            &caller,
+            ACTION,
+            &crate::state::authorization::account_resource(&region, requested.as_deref()),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
 
         let mut store = state.lock();
         // Finish what the clock has already made due before reporting: a table whose
@@ -230,6 +242,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// allows (`ListContributorInsightsLimit`, range ..100), so a caller that asks for no
 /// page size pages as rarely as the API permits.
 const DEFAULT_MAX_RESULTS: i32 = 100;
+
+/// The IAM action this operation performs, which a refusal names.
+const ACTION: &str = "dynamodb:ListContributorInsights";
 
 /// The modelled server error for a request that cannot reach this service's store.
 fn store_unavailable() -> ListContributorInsightsError {

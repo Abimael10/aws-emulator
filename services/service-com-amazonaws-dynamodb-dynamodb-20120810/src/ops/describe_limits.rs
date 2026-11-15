@@ -181,6 +181,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        // WHO this request speaks for, resolved before this service's store is locked: a
+        // report of the account's own quotas addresses the table namespace they are held
+        // over rather than one table, so it is authorized against the caller's own
+        // identity-based policies ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
+        if let Some(denial) = crate::state::authorization::account_denial(
+            &caller,
+            ACTION,
+            &crate::state::authorization::account_resource(&region, None),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
 
         let mut store = state.lock();
         // The one write a reporting operation makes: finishing what the clock has already
@@ -202,6 +214,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The IAM action this operation performs, which a refusal names.
+const ACTION: &str = "dynamodb:DescribeLimits";
 
 /// The modelled server error for a request that cannot reach this service's store.
 fn store_unavailable() -> DescribeLimitsError {

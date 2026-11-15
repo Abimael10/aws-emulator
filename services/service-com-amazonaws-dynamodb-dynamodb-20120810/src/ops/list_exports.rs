@@ -187,6 +187,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`ListExports$NextToken`), so a token this operation did not mint stands for no
         // page and is refused rather than quietly taken for the first one.
         let cursor = input.next_token.as_deref().map(decode_token).transpose()?;
+        // WHO this request speaks for, resolved before this service's store is locked: the
+        // listing is authorized against the caller's own identity-based policies, over the
+        // table it narrows itself to or the account's whole table namespace when it names
+        // none ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
+        if let Some(denial) = crate::state::authorization::account_denial(
+            &caller,
+            ACTION,
+            &crate::state::authorization::account_resource(&region, table.as_deref()),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
 
         let store = state.lock();
         // A reporting operation, and one whose own records need no transition written: an
@@ -246,6 +258,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// ceiling the model declares for the member (`ListExportsMaxLimit`, range 1..=25), so a
 /// request that asks for no bound is answered with as many exports as one page may carry.
 const DEFAULT_MAX_RESULTS: i32 = 25;
+
+/// The IAM action this operation performs, which a refusal names.
+const ACTION: &str = "dynamodb:ListExports";
 
 /// The cursor a truncated page reports: the cursor's bytes in hex.
 ///

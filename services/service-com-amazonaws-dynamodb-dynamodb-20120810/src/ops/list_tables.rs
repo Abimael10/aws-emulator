@@ -4,7 +4,10 @@
 //! IMPLEMENTED: reports the names of the tables this emulator holds, in ascending
 //! name order so `ExclusiveStartTableName` resumes exactly where the previous page
 //! stopped. `Limit` (default 100, per the member doc below) truncates the page and
-//! sets `LastEvaluatedTableName` when more names remain.
+//! sets `LastEvaluatedTableName` when more names remain. The listing addresses the
+//! account's table namespace rather than one table, so it is authorized against the
+//! calling principal's own identity-based policies before any name is read
+//! (`crate::state::authorization::account_denial`).
 //!
 //! ## Shape of an operation
 //!
@@ -150,6 +153,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        // WHO this request speaks for, resolved before this service's store is locked: a
+        // listing of the account's tables is authorized against the caller's own
+        // identity-based policies, over the table namespace it reports from
+        // ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
+        if let Some(denial) = crate::state::authorization::account_denial(
+            &caller,
+            ACTION,
+            &crate::state::authorization::account_resource(&region, None),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
 
         let mut store = state.lock();
         store.apply_due_transitions(now);
@@ -181,6 +196,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The page size `ListTables` uses when the request names none.
 const DEFAULT_LIMIT: i32 = 100;
+
+/// The IAM action this operation performs, which a refusal names.
+const ACTION: &str = "dynamodb:ListTables";
 
 /// The modelled server error for a request that cannot reach this service's store.
 fn store_unavailable() -> ListTablesError {
