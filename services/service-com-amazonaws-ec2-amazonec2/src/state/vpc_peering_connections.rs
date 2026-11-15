@@ -16,8 +16,9 @@
 //!
 //! What the peering operations share lives here — the id mint, the status words, the
 //! `initiating-request` -> `pending-acceptance` move the clock owes a fresh request, the
-//! expiry of a request nobody answered, the ceilings and the refusals — so no two of them
-//! can report one connection differently.
+//! expiry of a request nobody answered, the `deleting` -> `deleted` move a deletion is owed
+//! ([`ComAmazonawsEc2Amazonec2State::delete_vpc_peering_connection`]), the ceilings and the
+//! refusals — so no two of them can report one connection differently.
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -69,6 +70,16 @@ pub const VPC_PEERING_CONNECTION_STATE_FAILED: &str = "failed";
 /// rejected" (`CreateVpcPeeringConnection`).
 pub const VPC_PEERING_CONNECTION_STATE_EXPIRED: &str = "expired";
 
+/// A connection a delete has been asked for and is still on its way out: the same enum's
+/// `deleting` member, the transient state
+/// [`ComAmazonawsEc2Amazonec2State::delete_vpc_peering_connection`] writes.
+pub const VPC_PEERING_CONNECTION_STATE_DELETING: &str = "deleting";
+
+/// A connection whose deletion has finished: the same enum's `deleted` member, which the
+/// clock owes a [`VPC_PEERING_CONNECTION_STATE_DELETING`] connection one
+/// [`super::TRANSITION_DELAY`] later.
+pub const VPC_PEERING_CONNECTION_STATE_DELETED: &str = "deleted";
+
 /// How long an unaccepted peering request lives.
 ///
 /// "The VPC peering connection request expires after 7 days, after which it cannot be
@@ -118,6 +129,15 @@ pub const INVALID_VPC_PEERING_CONNECTION_ID_MALFORMED: &str =
 /// error codes, "VpcPeeringConnectionAlreadyExists").
 pub const VPC_PEERING_CONNECTION_ALREADY_EXISTS: &str = "VpcPeeringConnectionAlreadyExists";
 
+/// EC2's error code for a peering request the connection's own state does not admit (EC2 API
+/// error codes, "InvalidStateTransition": the VPC peering connection is not in the correct
+/// state for the request).
+///
+/// The peering family's own name for the class every other resource of this crate refuses
+/// with [`super::INCORRECT_STATE`]: EC2 words the peering lifecycle's refusals with this code
+/// instead.
+pub const INVALID_STATE_TRANSITION: &str = "InvalidStateTransition";
+
 /// The `VpcPeeringConnectionStateReason$Message` of a request EC2 has just taken, which
 /// names the account the request goes TO — the owner of the accepter VPC
 /// (`CreateVpcPeeringConnectionRequest$PeerOwnerId`), read off the request or defaulted to
@@ -157,6 +177,14 @@ pub fn vpc_peering_connection_awaits_acceptance(code: Option<&str>) -> bool {
     )
 }
 
+/// The `VpcPeeringConnectionStateReason$Message` of a connection a delete has acted on,
+/// naming the account that deleted it — either side's owner may delete an active connection,
+/// and the requester's may delete a request still waiting to be answered
+/// (`DeleteVpcPeeringConnection`), so the message says which one did.
+pub fn vpc_peering_deleted_message(deleted_by_owner_id: &str) -> String {
+    format!("Deleted by {deleted_by_owner_id}")
+}
+
 /// Whether a connection in this state still PEERS its two VPCs, so a second request to
 /// peer the same pair is a duplicate ([`vpc_peering_connection_already_exists`]) rather
 /// than a new request.
@@ -171,6 +199,21 @@ pub fn vpc_peering_connection_holds_its_pair(code: Option<&str>) -> bool {
             Some(VPC_PEERING_CONNECTION_STATE_PROVISIONING)
                 | Some(VPC_PEERING_CONNECTION_STATE_ACTIVE)
         )
+}
+
+/// Whether a delete may act on a connection in this state.
+///
+/// "Either the owner of the requester VPC or the owner of the accepter VPC can delete the VPC
+/// peering connection if it's in the active state. The owner of the requester VPC can delete a
+/// VPC peering connection in the pending-acceptance state. You cannot delete a VPC peering
+/// connection that's in the failed or rejected state" (`DeleteVpcPeeringConnection`): what a
+/// delete acts on is a connection that still peers its two VPCs
+/// ([`vpc_peering_connection_holds_its_pair`]) — a request on its way in, one waiting to be
+/// answered, one being set up, and an active connection. Every other state is one the
+/// connection stopped peering in (`failed`, `rejected`, `expired`) or one a delete has already
+/// put it in (`deleting`, `deleted`), and there is nothing left for a delete to take.
+pub fn vpc_peering_connection_is_deletable(code: Option<&str>) -> bool {
+    vpc_peering_connection_holds_its_pair(code)
 }
 
 /// The caller-chosen bytes a stored peering connection holds: its tags. Everything else on
@@ -202,6 +245,20 @@ pub fn invalid_vpc_peering_connection_id_not_found<E>(
 /// [`VPC_PEERING_CONNECTION_LIMIT_EXCEEDED`].
 pub fn vpc_peering_connection_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
     Scaffolded::service_error(VPC_PEERING_CONNECTION_LIMIT_EXCEEDED, 400, message)
+}
+
+/// Refuse a request the state of the peering connection it names does not admit: HTTP 400
+/// [`INVALID_STATE_TRANSITION`], naming the connection and the state it IS in, so the caller
+/// can tell a connection that has already left the lifecycle from one it may still act on.
+pub fn vpc_peering_connection_invalid_state_transition<E>(
+    vpc_peering_connection_id: &str,
+    state: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_STATE_TRANSITION,
+        400,
+        format!("Invalid state transition for {vpc_peering_connection_id}, state: {state}"),
+    )
 }
 
 /// Refuse a request to peer two VPCs a connection of this account already peers: HTTP 400
@@ -570,10 +627,25 @@ impl ComAmazonawsEc2Amazonec2State {
                 .and_then(|owed| owed.due_by(now))
                 .map(str::to_string)
             {
+                // "A message that provides more information about the status, if applicable"
+                // (`VpcPeeringConnectionStateReason$Message`): a request now waiting for the
+                // accepter's owner names that account, and a deletion that has FINISHED keeps
+                // the sentence the delete wrote, which names the account that deleted it.
+                // Every other state carries none.
+                let message = match due.as_str() {
+                    VPC_PEERING_CONNECTION_STATE_PENDING_ACCEPTANCE => {
+                        Some(vpc_peering_pending_acceptance_message(&accepter_owner_id))
+                    }
+                    VPC_PEERING_CONNECTION_STATE_DELETED => record
+                        .view
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.message.clone()),
+                    _ => None,
+                };
                 record.view.status = Some(VpcPeeringConnectionStateReason {
                     code: Some(due.clone()),
-                    message: (due == VPC_PEERING_CONNECTION_STATE_PENDING_ACCEPTANCE)
-                        .then(|| vpc_peering_pending_acceptance_message(&accepter_owner_id)),
+                    message,
                 });
                 // The move is applied once; nothing is owed on this connection any more.
                 record.pending = None;
@@ -600,6 +672,71 @@ impl ComAmazonawsEc2Amazonec2State {
                 // A request that has expired is owed nothing further, and it can no longer
                 // be accepted, so the move it was waiting on goes with it.
                 record.pending = None;
+            }
+        }
+    }
+
+    /// Delete the peering connection `vpc_peering_connection_id` on behalf of
+    /// `deleted_by_owner_id`, and answer whether this store held one to delete.
+    ///
+    /// The ONE writer of a peering deletion, so nothing can report a deleted connection two
+    /// ways. `VpcPeeringConnectionStateReasonCode` carries `deleting` beside `deleted`
+    /// (`smithy_query(query="shape",shape="VpcPeeringConnectionStateReasonCode")`), so a
+    /// connection a delete has been asked for is still a connection the API reports: the
+    /// delete writes the transient [`VPC_PEERING_CONNECTION_STATE_DELETING`] and the clock
+    /// owes it [`VPC_PEERING_CONNECTION_STATE_DELETED`] one [`super::TRANSITION_DELAY`] later
+    /// ([`Self::materialize_due_vpc_peering_connections`]), rather than making the record
+    /// vanish — the same contract as a NAT gateway's delete.
+    ///
+    /// Two facts follow the deletion, because the connection no longer carries traffic and no
+    /// longer waits for anybody:
+    ///
+    /// * every route whose target is this connection is `blackhole` — "the `blackhole` state
+    ///   indicates that the route's target isn't available" (`Route$State`);
+    /// * it expires at no instant, having nothing left to accept
+    ///   (`VpcPeeringConnection$ExpirationTime` is "the time that an UNACCEPTED VPC peering
+    ///   connection will expire").
+    ///
+    /// The record's tags stay stored, so the bytes they were charged stay charged: the
+    /// connection is still reported, tags and all, until something removes the record.
+    pub fn delete_vpc_peering_connection(
+        &mut self,
+        vpc_peering_connection_id: &str,
+        deleted_by_owner_id: &str,
+    ) -> bool {
+        let Some(record) = self
+            .vpc_peering_connections
+            .get_mut(vpc_peering_connection_id)
+        else {
+            return false;
+        };
+        record.view.status = Some(VpcPeeringConnectionStateReason {
+            code: Some(VPC_PEERING_CONNECTION_STATE_DELETING.to_string()),
+            message: Some(vpc_peering_deleted_message(deleted_by_owner_id)),
+        });
+        record.view.expiration_time = None;
+        record.pending = Some(PendingStateMove::starting_now(
+            VPC_PEERING_CONNECTION_STATE_DELETED,
+        ));
+        self.blackhole_routes_to_vpc_peering_connection(vpc_peering_connection_id);
+        true
+    }
+
+    /// Write [`super::ROUTE_STATE_BLACKHOLE`] into every route of this store whose target is
+    /// the peering connection `vpc_peering_connection_id`.
+    ///
+    /// A route's state is STORED rather than recomputed on read, so the writer that takes the
+    /// target away is what moves it — the same contract as
+    /// [`Self::detach_internet_gateway`]'s routes to a gateway that no longer attaches the
+    /// VPC. A route is not removed with its target: "the `blackhole` state indicates that the
+    /// route's target isn't available" (`Route$State`), which is what a route pointing at a
+    /// deleted peering connection reports.
+    fn blackhole_routes_to_vpc_peering_connection(&mut self, vpc_peering_connection_id: &str) {
+        for route_table in self.route_tables.values_mut() {
+            for route in route_table.routes.iter_mut().flatten() {
+                if route.vpc_peering_connection_id.as_deref() == Some(vpc_peering_connection_id) {
+                    route.state = Some(super::ROUTE_STATE_BLACKHOLE.to_string());
+                }
             }
         }
     }

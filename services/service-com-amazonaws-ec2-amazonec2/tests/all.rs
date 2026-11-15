@@ -967,6 +967,14 @@ mod delete_vpc;
 // suite inserts its lines and merges contend.
 #[path = "all/delete_vpc_endpoints.rs"]
 mod delete_vpc_endpoints;
+// What `DeleteVpcPeeringConnection` writes and what it refuses: the transient `deleting` the
+// delete puts a connection that still peers its two VPCs into with the terminal `deleted`
+// owed to the clock, the routes to it that become blackholes, and the refusal every state
+// that no longer peers gets. Declared HERE, in sorted position inside the long-settled block
+// rather than at the head of the file, where every new ec2 suite inserts its lines and merges
+// contend.
+#[path = "all/delete_vpc_peering_connection.rs"]
+mod delete_vpc_peering_connection;
 #[path = "all/describe_images.rs"]
 mod describe_images;
 // What `DescribeLaunchTemplates` reports out of the launch template store: the templates a

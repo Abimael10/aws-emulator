@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVpcPeeringConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteVpcPeeringConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: deletes the VPC peering connection the request names — the connection moves
+//! into the transient `deleting` state with the clock owing it `deleted`, every route whose
+//! target it was reads back as a blackhole, and the answer is `true`. A connection whose state
+//! admits no delete is refused with `InvalidStateTransition`, an id this account holds no
+//! connection for with `InvalidVpcPeeringConnectionID.NotFound`, and a value that is no
+//! connection id at all with that pair's `.Malformed` half (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::delete_vpc_peering_connection`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteVpcPeeringConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +139,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteVpcPeeringConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteVpcPeeringConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteVpcPeeringConnection"))
+        use crate::state;
+
+        // `ctx` carries request metadata only, and a peering connection is named by its own
+        // id, so this operation reads none of it. The store is reached through the engine held
+        // on `self`.
+        let _ = ctx;
+
+        // A value that is no peering connection id at all is a different client mistake from a
+        // well-formed id naming no connection, and EC2 answers the first WITHOUT looking the
+        // value up — the ordering [`crate::state::require_well_formed_id`] holds every resource
+        // of this crate to. It is asked before the store is read, so a malformed id is never
+        // answered by the DryRun arm below either.
+        state::require_well_formed_id(
+            state::VPC_PEERING_CONNECTION_ID_PREFIX,
+            &input.vpc_peering_connection_id,
+            state::INVALID_VPC_PEERING_CONNECTION_ID_MALFORMED,
+        )?;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first: a request that reached `pending-acceptance`, one whose own expiry
+        // passed and a deletion that has finished all moved at their instants whether or not
+        // anybody called, and which state a connection is in decides what this call may do.
+        store.materialize_due_transitions();
+
+        // "The ID of the VPC peering connection" (`$VpcPeeringConnectionId`): an id this
+        // account holds no connection for is a refusal rather than a no-op, which is what lets
+        // a client tell a deletion it performed from one it did not.
+        let Some(record) = store
+            .vpc_peering_connections
+            .get(&input.vpc_peering_connection_id)
+        else {
+            return Err(state::invalid_vpc_peering_connection_id_not_found(
+                &input.vpc_peering_connection_id,
+            ));
+        };
+        // "You cannot delete a VPC peering connection that's in the failed or rejected state"
+        // (`DeleteVpcPeeringConnection`): the states a delete acts on are the ones a connection
+        // still peers its two VPCs in, which is the one place that question is asked
+        // ([`crate::state::vpc_peering_connection_is_deletable`]). Any other state is refused
+        // with the code EC2 words the peering lifecycle's refusals in, naming the state the
+        // connection IS in.
+        let status_code = record
+            .view
+            .status
+            .as_ref()
+            .and_then(|status| status.code.as_deref())
+            .unwrap_or_default()
+            .to_string();
+        if !state::vpc_peering_connection_is_deletable(Some(status_code.as_str())) {
+            return Err(state::vpc_peering_connection_invalid_state_transition(
+                &input.vpc_peering_connection_id,
+                &status_code,
+            ));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you have
+        // the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The deletion itself, through the store's ONE writer of it: the account this emulator
+        // serves is the one making the request, so it is the account the connection's status
+        // then names as having deleted it.
+        if !store.delete_vpc_peering_connection(
+            &input.vpc_peering_connection_id,
+            ::engine::emulator_account_id(),
+        ) {
+            return Err(state::internal_error(
+                "the VPC peering connection checked a moment ago could not be deleted",
+            ));
+        }
+
+        // "Returns true if the request succeeds; otherwise, it returns an error" (`$Return`).
+        Ok(DeleteVpcPeeringConnectionOutput {
+            r#return: Some(true),
+        })
     }
 }
