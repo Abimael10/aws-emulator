@@ -1915,3 +1915,17 @@ mod cloudtrail_iam_credential_write_audit;
 // many of them written as inner doc comments past the first item (`E0753`), so no suite of
 // this target compiled at all.
 // EVERY comment in this file is an ORDINARY `//` one, this block included, and that is
+// Single integration-test target for the router: the canonical declaration list of its
+// suite file and no other line, so two branches landing at once insert two lines in two
+// the declarations compiles no suite of this target at all, and with none anywhere no merge
+// of two landings can leave one there.
+// A suite file no `mod` here names is compiled nowhere and its tests never run (the layout
+// check fails the build for it), a suite left at the top level of `tests/` fails the build,
+// and a suite declared twice is `E0428`, which fails every suite in this target.
+// this file: the `#[path]` above each `mod` is what points the declaration into `tests/all/`.
+// Three suites of this target check those rules rather than restating them here:
+// `all/all_rs_is_a_canonical_declaration_list.rs`, `all/all_rs_declares_each_suite_once.rs`
+// and `all/all_rs_inner_doc_comments_precede_the_first_item.rs`, for this file and for every
+// service crate's `tests/all.rs`. What a suite covers, and why it drives the assembled
+// router rather than one service crate, belongs in that suite's own module header; the notes
+// earlier landings had appended to this file live in `all/appended_notes.rs`.

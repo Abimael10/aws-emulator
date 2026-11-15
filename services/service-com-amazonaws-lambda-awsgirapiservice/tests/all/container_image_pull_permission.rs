@@ -29,6 +29,13 @@
 //! policy is attached to the repository its statements apply to, so Amazon ECR refuses a
 //! document that names a resource of its own.
 //!
+//! The rows also span how the reference NAMES the image, because the decision has to be the
+//! same however a client spells the same image: the address it carries (AWS's own
+//! `<account-id>.dkr.ecr.<region>.<domain>` host and the address the registry announced) by
+//! the way it addresses the image inside the repository (a tag, a bare reference naming the
+//! default tag, a digest) — and, on the other side of that boundary, a reference into
+//! another Region's or another host's registry, which is no image of this one.
+//!
 //! ECR is mounted BESIDE Lambda on one engine, and every image here is pushed through ECR's
 //! own `CreateRepository`/`PutImage` with the policy applied through its own
 //! `SetRepositoryPolicy` — so what Lambda resolves and decides is the registry's own state
@@ -41,7 +48,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::function_lifecycle::{function_arn, make_activation_due, REGION, ROLE};
+use crate::function_lifecycle::{function_arn, make_activation_due, ACCOUNT, REGION, ROLE};
 use crate::function_url_data_plane::{send, Answer};
 
 /// The service hosts an SDK that resolves AWS's own hostnames is configured with.
@@ -768,4 +775,268 @@ async fn a_code_update_to_a_denied_image_is_refused_and_changes_nothing() {
         Some(expected.as_str()),
         "case {case:?}: expected the function to keep {expected:?}, got {resolved:?}"
     );
+}
+
+/// The tag a reference that names one carries in the rows below.
+const PUSHED_TAG: &str = "v1";
+
+/// The tag a reference that names NONE addresses, which is the one a bare `docker push`
+/// writes (the ECR crate's `registry_pull::DEFAULT_IMAGE_TAG`).
+const DEFAULT_TAG: &str = "latest";
+
+/// The host AWS serves THIS account's registry in this suite's Region at
+/// (`<account-id>.dkr.ecr.<region>.<domain>`), which is the other spelling a private
+/// repository is named by beside the address the registry announces here.
+fn aws_registry_host() -> String {
+    format!("{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com")
+}
+
+/// A repository policy that denies this service both pull calls, which is the deny the rule
+/// turns into the permission failure.
+fn deny_pull_policy() -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Deny",
+            "Principal": { "Service": LAMBDA_PRINCIPAL },
+            "Action": [MANIFEST_ACTION, LAYER_ACTION],
+        }],
+    })
+}
+
+/// Which address a reference carries the repository at.
+#[derive(Debug, Clone, Copy)]
+enum Authority {
+    /// AWS's own registry host for this account and Region.
+    AwsRegistryHost,
+    /// The address the registry ANNOUNCED for the repository, which is what a client that
+    /// pushed the image here was handed.
+    Announced,
+}
+
+/// How a reference addresses the image inside the repository.
+#[derive(Debug, Clone, Copy)]
+enum Addressed {
+    /// `<repository>:<tag>`.
+    Tag,
+    /// A bare reference, which names the registry's default tag.
+    DefaultTag,
+    /// `<repository>@<digest>`.
+    Digest,
+}
+
+impl Addressed {
+    /// The tag an image has to be pushed under for this form to address it.
+    fn pushed_tag(self) -> &'static str {
+        match self {
+            Addressed::DefaultTag => DEFAULT_TAG,
+            Addressed::Tag | Addressed::Digest => PUSHED_TAG,
+        }
+    }
+
+    /// `repository_uri` addressed this way, for the image the registry minted `digest` for.
+    fn reference(self, repository_uri: &str, digest: &str) -> String {
+        match self {
+            Addressed::Tag => format!("{repository_uri}:{PUSHED_TAG}"),
+            Addressed::DefaultTag => repository_uri.to_string(),
+            Addressed::Digest => format!("{repository_uri}@{digest}"),
+        }
+    }
+}
+
+/// The repository `name` at the address `authority` names, where `announced_uri` is what the
+/// registry announced for it.
+fn repository_uri(authority: Authority, announced_uri: &str, name: &str) -> String {
+    match authority {
+        Authority::AwsRegistryHost => format!("{}/{name}", aws_registry_host()),
+        Authority::Announced => announced_uri.to_string(),
+    }
+}
+
+/// The rule holds over how the reference is WRITTEN, not just over the policy: the pull is
+/// decided for a reference carrying AWS's own registry host exactly as for the address the
+/// registry announced, and for a tag, a bare reference naming the default tag, and a digest
+/// alike — a repository that denies this service the pull refuses the write 403 with AWS's
+/// fixed sentence and stores nothing, and one that denies it nothing is served and pins the
+/// function to the digest the registry minted.
+#[tokio::test]
+async fn the_pull_is_decided_however_the_reference_names_the_image() {
+    // (case, the address the reference carries, how it addresses the image)
+    let rows: [(&str, Authority, Addressed); 6] = [
+        (
+            "AWS's registry host with a tag",
+            Authority::AwsRegistryHost,
+            Addressed::Tag,
+        ),
+        (
+            "AWS's registry host with no tag, which names the default one",
+            Authority::AwsRegistryHost,
+            Addressed::DefaultTag,
+        ),
+        (
+            "AWS's registry host with a digest",
+            Authority::AwsRegistryHost,
+            Addressed::Digest,
+        ),
+        (
+            "the announced address with a tag",
+            Authority::Announced,
+            Addressed::Tag,
+        ),
+        (
+            "the announced address with no tag",
+            Authority::Announced,
+            Addressed::DefaultTag,
+        ),
+        (
+            "the recorded case: the announced address with a digest",
+            Authority::Announced,
+            Addressed::Digest,
+        ),
+    ];
+
+    for (index, (case, authority, addressed)) in rows.into_iter().enumerate() {
+        let engine = Arc::new(engine::InMemoryEngine::new());
+        let router = emulator(&engine);
+
+        // One repository this registry denies nothing on, and one whose own policy denies
+        // this service the pull; each row pushes under the tag its reference addresses.
+        let served_name = format!("served-{index}");
+        let denied_name = format!("denied-{index}");
+        let served = push_image(&router, ECR_HOST, &served_name, addressed.pushed_tag()).await;
+        let denied = push_image(&router, ECR_HOST, &denied_name, addressed.pushed_tag()).await;
+        set_repository_policy(&router, ECR_HOST, &denied_name, &deny_pull_policy()).await;
+
+        let served_repository = repository_uri(authority, &served.announced_uri, &served_name);
+        let served_reference = addressed.reference(&served_repository, &served.digest);
+        let function = format!("reference-{index}");
+        let answer = lambda_call(
+            &router,
+            LAMBDA_HOST,
+            "POST",
+            "/2015-03-31/functions",
+            &image_create(&function, &served_reference),
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            201,
+            "case {case:?}: expected 201 from CreateFunction for {served_reference:?}, got {}",
+            answer.summary()
+        );
+        make_activation_due(&engine);
+        let read = get_function(&router, LAMBDA_HOST, &function).await;
+        // The repository as the request spelled it, pinned to the digest the registry
+        // minted for the image the reference resolved to.
+        let expected = format!("{served_repository}@{}", served.digest);
+        let resolved = read
+            .json()
+            .pointer("/Code/ResolvedImageUri")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        assert_eq!(
+            resolved.as_deref(),
+            Some(expected.as_str()),
+            "case {case:?}: expected {expected:?}, got {resolved:?}"
+        );
+
+        let denied_repository = repository_uri(authority, &denied.announced_uri, &denied_name);
+        let denied_reference = addressed.reference(&denied_repository, &denied.digest);
+        let refused_function = format!("reference-denied-{index}");
+        let refused = lambda_call(
+            &router,
+            LAMBDA_HOST,
+            "POST",
+            "/2015-03-31/functions",
+            &image_create(&refused_function, &denied_reference),
+        )
+        .await;
+        assert_refused_access(&router, LAMBDA_HOST, case, &refused_function, &refused).await;
+    }
+}
+
+/// The boundary of the rule's resolution half: a reference carrying AWS's registry host for
+/// ANOTHER Region, or another account's registry id, names no image of the function's own
+/// Region's registry, so it stays the modelled 400 about the parameter — a deny on a
+/// repository of that name here is not what such a reference is refused for.
+#[tokio::test]
+async fn a_reference_into_another_registry_is_no_image_of_this_one() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator(&engine);
+
+    let pushed = push_image(&router, ECR_HOST, "elsewhere", PUSHED_TAG).await;
+    set_repository_policy(&router, ECR_HOST, "elsewhere", &deny_pull_policy()).await;
+
+    // Another Region of this account's registries, and another account's registry in this
+    // Region: an Amazon ECR registry is one account's in one Region.
+    let rows = [
+        (
+            "another Region's registry host",
+            format!("{ACCOUNT}.dkr.ecr.eu-west-1.amazonaws.com/elsewhere:{PUSHED_TAG}"),
+        ),
+        (
+            "a host that is no registry host at all",
+            format!("registry.example:5000/elsewhere:{PUSHED_TAG}"),
+        ),
+    ];
+
+    for (index, (case, image_uri)) in rows.into_iter().enumerate() {
+        let name = format!("elsewhere-{index}");
+        let answer = lambda_call(
+            &router,
+            LAMBDA_HOST,
+            "POST",
+            "/2015-03-31/functions",
+            &image_create(&name, &image_uri),
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            400,
+            "case {case:?}: expected 400 from CreateFunction, got {}",
+            answer.summary()
+        );
+        assert_eq!(
+            error_code(&answer),
+            INVALID_PARAMETER,
+            "case {case:?}: expected {INVALID_PARAMETER}, got {}",
+            error_code(&answer)
+        );
+        let expected =
+            format!("Source image {image_uri} is not valid. Provide a valid source image.");
+        assert_eq!(
+            error_message(&answer).as_deref(),
+            Some(expected.as_str()),
+            "case {case:?}: expected {expected:?}, got {:?}",
+            error_message(&answer)
+        );
+        let read = get_function(&router, LAMBDA_HOST, &name).await;
+        assert_eq!(
+            read.status,
+            404,
+            "case {case:?}: expected the refused function to be absent, got {}",
+            read.summary()
+        );
+    }
+
+    // The repository the deny IS attached to, named the way this registry announced it, is
+    // still the permission failure — so the rows above were refused for the reference and
+    // not for the policy.
+    let reference = format!("{}:{PUSHED_TAG}", pushed.announced_uri);
+    let refused = lambda_call(
+        &router,
+        LAMBDA_HOST,
+        "POST",
+        "/2015-03-31/functions",
+        &image_create("elsewhere-denied", &reference),
+    )
+    .await;
+    assert_refused_access(
+        &router,
+        LAMBDA_HOST,
+        "the repository the deny is attached to",
+        "elsewhere-denied",
+        &refused,
+    )
+    .await;
 }
