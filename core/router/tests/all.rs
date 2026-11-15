@@ -23,13 +23,10 @@
 //! under `tests/all/`.
 //! Single integration-test target for the router: a canonical declaration list.
 //!
-//! Put a new suite at `tests/all/<name>.rs` and declare it below with one
 //! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted into the sorted list. This file
 //! holds this header and those pairs, and no other line — so two branches landing at once
 //! insert two lines in two places and have no prose to duplicate, re-word or mistype.
 //! Three rules bind it, each pinned by a suite of its own
-//! (`all/all_rs_declares_each_suite_once.rs`,
-//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
 //! `all/all_rs_is_a_canonical_declaration_list.rs`, for this file and for every service
 //! crate's `tests/all.rs`): a suite no `mod` names compiles nowhere, a suite declared twice is
 //! `E0428`, and an inner doc comment past the first item is `E0753` — each of the last two
