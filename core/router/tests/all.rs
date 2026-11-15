@@ -2,66 +2,28 @@
 
 //! Single integration-test target for the router.
 //!
-//! Put a new suite at `tests/all/<name>.rs` and declare it below with a `#[path]`/`mod`
+//! Put a new suite at `tests/all/<name>.rs` and declare it below with a `#[path]` / `mod`
 //! pair, keeping the list sorted: one pair per suite and nothing else, so a landing has one
 //! place to insert and nothing to keep consistent.
-//! A suite that is not declared here compiles nowhere and its tests never run; a suite left
-//! at the top level of `tests/` fails the build; and a suite declared twice is `E0428`,
-//! which compiles no suite of this target. THIS HEADER IS THE ONLY PLACE AN INNER DOC
-//! COMMENT (`//!`) MAY STAND IN THIS FILE: past the first item one is `E0753` and compiles
-//! nothing, so a note below must be an ordinary `//` comment — better still, add a
-//! declaration rather than a note about one.
-//! `all/all_rs_declares_each_suite_once.rs` and
-//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of that, for
-//! this file and for every service crate's `tests/all.rs`.
-// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
-// (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is what points each
-// declaration into `tests/all/`.
-//! Put a new suite at `tests/all/<name>.rs` and declare it below with a
-//! `#[path]`/`mod` pair, keeping the list sorted: one pair per suite and nothing
-//! else, so a landing has one place to insert and nothing to keep consistent.
-//! A suite that is not declared here compiles nowhere and its tests never run. A
-//! suite left at the top level of `tests/` fails the build. Declare each suite
-//! exactly ONCE: this is one crate root, so a second `mod` for the same name is
-//! `E0428` and fails every suite in this target. An inner doc comment (`//!`) is
-//! legal only BEFORE the first item, so THIS header is the only place one may
-//! stand — past it, `//!` is `E0753` and compiles nothing, so a note further down
-//! must be an ordinary `//` comment, or better still belong here instead.
-//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of
-//! that, for this file and for every service crate's `tests/all.rs`, so check
-//! there rather than leaving a note below.
-//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a
-//! SIBLING (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is
-//! what points each declaration into `tests/all/`.
-//! place to insert and nothing to keep consistent. A suite no `mod` names compiles nowhere
-//! and its tests never run; a suite left at the top level of `tests/` fails the build; and a
-//! suite declared twice is `E0428`, which fails every suite in this target.
-//! THIS BLOCK IS THE ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE: past
-//! the first item one is `E0753` and compiles no suite of this target. Below, add a
-//! declaration — not a note about one. `all/all_rs_declares_each_suite_once.rs` and
-//! this file and for every service crate's `tests/all.rs`, so check there rather than
-//! leaving a note here.
-//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
-//! (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is what points it
-//! into `tests/all/`.
-//! Put a new suite at `tests/all/<name>.rs` and declare it below with a `#[path]` / `mod`
+//!
 //! A suite that is not declared here compiles nowhere and its tests never run, and a suite
 //! left at the top level of `tests/` fails the build. Declare each suite exactly ONCE: this
-//! is one crate root, so a second `mod` for the same name is `E0428`. THIS HEADER IS THE
-//! ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE: past the first item one
-//! is `E0753`. Either fails every suite in this target, so below add a declaration — not a
-//! note about one. `all/all_rs_declares_each_suite_once.rs` and
-//! (`tests/boot_serve.rs`) — which the layout check refuses. The `#[path]` above each `mod`
-//! is what points it into `tests/all/`.
-//! pair, keeping the list sorted: one pair per suite and nothing else, so a landing has
-//! one place to insert and nothing to keep consistent.
-//! A suite that is not declared here compiles nowhere and its tests never run; a suite
-//! left at the top level of `tests/` fails the build; and a suite declared twice is
-//! `E0428`, which fails every suite in this target. `tests/all.rs` is a test-target CRATE
-//! ROOT, so a bare `mod` resolves to a SIBLING of this file, which the layout check
-//! refuses: the `#[path]` is what points the module into `tests/all/`.
-//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of that,
-//! for this file and for every service crate's `tests/all.rs`.
+//! is one crate root, so a second `mod` for the same name is `E0428` and fails every suite
+//! in this target. An inner doc comment (`//!`) is legal only before the first item, so
+//! THESE lines are the only place one may stand — past the first item `//!` is `E0753` and
+//! compiles nothing, so leave no note below, not even an ordinary `//` one: this file is a
+//! declaration list, and the rules stand here. A note about a landing belongs in the suite
+//! it is about, where it is read with the test it explains (`all/appended_notes.rs` keeps
+//! the ones this file had collected).
+//! `all/all_rs_declares_each_suite_once.rs` and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of that, for
+//! this file and for every service crate's `tests/all.rs`, so check there rather than
+//! leaving a note here.
+//!
+//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
+//! (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what points each
+//! module into `tests/all/`.
+
 #[path = "all/agent_registry_signing_name_routing.rs"]
 mod agent_registry_signing_name_routing;
 #[path = "all/all_rs_declares_each_suite_once.rs"]
@@ -116,6 +78,8 @@ mod apigatewayv2_vpc_link_subnets_resolve_in_ec2;
 mod apigatewayv2_websocket_deploy_then_connections;
 #[path = "all/appconfig_signing_name_routing.rs"]
 mod appconfig_signing_name_routing;
+#[path = "all/appended_notes.rs"]
+mod appended_notes;
 #[path = "all/applicationinsights_resource_group_admission.rs"]
 mod applicationinsights_resource_group_admission;
 #[path = "all/appstream_app_block_builder_role_trust.rs"]

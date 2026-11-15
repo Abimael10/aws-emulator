@@ -160,62 +160,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = std::time::SystemTime::now();
-        let mut state = state.lock();
+        let store = state;
+        // ONE critical section, and the guard is released with the block: nothing of
+        // this service's state is held while the hop into Route 53 below runs.
+        let (operation_id, publication) = {
+            let mut state = store.lock();
 
-        let Some(service_id) = state.resolve_service_id(&input.service_id) else {
-            return Err(DeregisterInstanceErrorModeled::ServiceNotFound(ServiceNotFound {
-                // The service the request named, as its ARN and nothing else — the one
-                // value this service's `ServiceNotFound` carries on the instance
-                // registry's operations.
-                message: Some(crate::state::service_reference_arn(
-                    &crate::state::request_region(ctx),
-                    &input.service_id,
-                )),
-            })
-            .into());
-        };
-
-        let namespace_id = {
-            let service = state
-                .services
-                .get_mut(&service_id)
-                .expect("the resolved service id is present");
-            if service.instances.remove(&input.instance_id).is_some() {
-                // The instance set changed, which is what the revision reports.
-                service.instances_revision += 1;
-            } else if !service.deregistered(&input.instance_id) {
-                return Err(DeregisterInstanceErrorModeled::InstanceNotFound(
-                    InstanceNotFound {
-                        // This operation's own template: the instance the request named
-                        // and the service it asked for, as that service's ARN. The
-                        // instance READ reports the instance id alone, so each operation
-                        // keeps its own body.
-                        message: Some(format!(
-                            "instanceId {} doesn't exists for service {}",
-                            input.instance_id, service.arn
-                        )),
-                    },
-                )
+            let Some(service_id) = state.resolve_service_id(&input.service_id) else {
+                return Err(DeregisterInstanceErrorModeled::ServiceNotFound(ServiceNotFound {
+                    // The service the request named, as its ARN and nothing else — the one
+                    // value this service's `ServiceNotFound` carries on the instance
+                    // registry's operations.
+                    message: Some(crate::state::service_reference_arn(
+                        &crate::state::request_region(ctx),
+                        &input.service_id,
+                    )),
+                })
                 .into());
-            }
-            // A deregistration asks for the instance NOT to be registered with the
-            // service, so a repeat of one that already completed is a request for a
-            // state the service is already in: it changes nothing (the revision stays
-            // put) and is answered with the operation below, exactly as the first call
-            // was. Only an instance this service never held has nothing to deregister.
-            service.remember_deregistered(&input.instance_id);
-            service.namespace_id.clone()
-        };
+            };
 
-        let operation_id = state.record_operation(
-            "DEREGISTER_INSTANCE",
-            now,
-            [
-                ("NAMESPACE".to_string(), namespace_id),
-                ("SERVICE".to_string(), service_id),
-                ("INSTANCE".to_string(), input.instance_id),
-            ],
-        );
+            let namespace_id = {
+                let service = state
+                    .services
+                    .get_mut(&service_id)
+                    .expect("the resolved service id is present");
+                if service.instances.remove(&input.instance_id).is_some() {
+                    // The instance set changed, which is what the revision reports.
+                    service.instances_revision += 1;
+                } else if !service.deregistered(&input.instance_id) {
+                    return Err(DeregisterInstanceErrorModeled::InstanceNotFound(
+                        InstanceNotFound {
+                            // This operation's own template: the instance the request named
+                            // and the service it asked for, as that service's ARN. The
+                            // instance READ reports the instance id alone, so each
+                            // operation keeps its own body.
+                            message: Some(format!(
+                                "instanceId {} doesn't exists for service {}",
+                                input.instance_id, service.arn
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                // A deregistration asks for the instance NOT to be registered with the
+                // service, so a repeat of one that already completed is a request for a
+                // state the service is already in: it changes nothing (the revision stays
+                // put) and is answered with the operation below, exactly as the first call
+                // was. Only an instance this service never held has nothing to deregister.
+                service.remember_deregistered(&input.instance_id);
+                service.namespace_id.clone()
+            };
+
+            let operation_id = state.record_operation(
+                "DEREGISTER_INSTANCE",
+                now,
+                [
+                    ("NAMESPACE".to_string(), namespace_id),
+                    ("SERVICE".to_string(), service_id.clone()),
+                    ("INSTANCE".to_string(), input.instance_id),
+                ],
+            );
+
+            // "Deletes the Amazon Route 53 DNS records … that Cloud Map created for the
+            // specified instance": the record sets of this service are recomputed from the
+            // instances it still holds, so the deregistered instance's record sets are the
+            // ones the zone no longer holds and its siblings' are left where they are.
+            let publication = state
+                .services
+                .get(&service_id)
+                .and_then(|service| crate::state::route53_zone::publication(&state, service));
+            (operation_id, publication)
+        };
+        if let Some(publication) = publication {
+            crate::state::route53_zone::publish(ctx.callback(), &publication).await;
+        }
 
         Ok(DeregisterInstanceOutput {
             operation_id: Some(operation_id),

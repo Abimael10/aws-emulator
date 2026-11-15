@@ -109,6 +109,10 @@ mod hosted_zone_features;
 mod hosted_zone_features_envelope;
 #[path = "all/hosted_zone_limits.rs"]
 mod hosted_zone_limits;
+// Declared beside the zone suites: this one is the OTHER SERVICE a zone reports as its
+// creator, which the projections above do not ask about.
+#[path = "all/hosted_zone_linked_service.rs"]
+mod hosted_zone_linked_service;
 #[path = "all/hosted_zone_records.rs"]
 mod hosted_zone_records;
 #[path = "all/hosted_zones_by_name.rs"]

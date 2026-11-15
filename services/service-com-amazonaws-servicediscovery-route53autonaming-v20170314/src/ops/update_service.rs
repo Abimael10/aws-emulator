@@ -200,215 +200,241 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = std::time::SystemTime::now();
+        let store = state;
         // ONE lock for the whole read-validate-write, so a change is validated against
         // the configuration it is applied to, and two concurrent updates of the same
-        // service serialize.
-        let mut state = state.lock();
+        // service serialize. The guard is released with the block, before the hop into
+        // Route 53 below.
+        let (operation_id, publication) = {
+            let mut state = store.lock();
 
-        // `Id` is modelled as an `Arn` and documented as "the ID or Amazon Resource Name
-        // (ARN) of the service that you want to update", so either form resolves to the
-        // one stored record.
-        let Some(service_id) = state.resolve_service_id(&input.id) else {
-            return Err(UpdateServiceErrorModeled::ServiceNotFound(ServiceNotFound {
-                // The message is the service the request named, as its ARN and nothing
-                // else: the recorded refusal carries that one value, with no sentence
-                // around it, whichever form the request used to name the service.
-                message: Some(crate::state::service_reference_arn(
-                    &crate::state::request_region(ctx),
-                    &input.id,
-                )),
-            })
-            .into());
-        };
-
-        // The stored configuration the change is validated against, cloned so the checks
-        // below hold no borrow of the store.
-        let (stored_dns_config, stored_health_check, custom_health_checked, namespace_id) = {
-            let service = state
-                .services
-                .get(&service_id)
-                .expect("a resolved service id names a stored service");
-            (
-                service.dns_config.clone(),
-                service.health_check_config.clone(),
-                service.custom_health_checked(),
-                service.namespace_id.clone(),
-            )
-        };
-
-        // "You can't call UpdateService and update settings in the following scenarios:
-        // When the service is associated with an HTTP namespace" — an HTTP namespace
-        // holds no Route 53 hosted zone, so there are no records or health checks for
-        // this call to update. The condition is the NAMESPACE's type, not the service's:
-        // a service that registers no records of its own is still updatable while its
-        // namespace is a DNS one.
-        if state
-            .namespaces
-            .get(&namespace_id)
-            .is_some_and(|namespace| namespace.namespace_type == "HTTP")
-        {
-            return Err(UpdateServiceErrorModeled::InvalidInput(InvalidInput {
-                message: Some(crate::state::API_ONLY_NAMESPACE_UPDATE_MESSAGE.to_string()),
-            })
-            .into());
-        }
-
-        // The record types the service carries: the only ones a change may name.
-        let stored_types: Vec<&str> = stored_dns_config
-            .iter()
-            .flat_map(|config| config.dns_records.iter())
-            .map(|record| record.r#type.as_str())
-            .collect();
-        if let Some(change) = input.service.dns_config.as_ref() {
-            let requested_types: Vec<&str> = change
-                .dns_records
-                .iter()
-                .map(|record| record.r#type.as_str())
-                .collect();
-            // The refusal reports both whole type sets — what the service carries and
-            // what the request named — because that is the comparison the caller has to
-            // make to see what it may ask for; neither set names the service.
-            if requested_types
-                .iter()
-                .any(|record_type| !stored_types.contains(record_type))
-            {
-                return Err(UpdateServiceErrorModeled::InvalidInput(InvalidInput {
-                    message: Some(format!(
-                        "The record types in the request must be the same as those present in \
-                         the existing service. Records in the existing service are [{}], but the \
-                         records in the request are [{}]. The record types of a service cannot \
-                         be changed.",
-                        stored_types.join(", "),
-                        requested_types.join(", ")
+            // `Id` is modelled as an `Arn` and documented as "the ID or Amazon Resource
+            // Name (ARN) of the service that you want to update", so either form resolves
+            // to the one stored record.
+            let Some(service_id) = state.resolve_service_id(&input.id) else {
+                return Err(UpdateServiceErrorModeled::ServiceNotFound(ServiceNotFound {
+                    // The message is the service the request named, as its ARN and nothing
+                    // else: the recorded refusal carries that one value, with no sentence
+                    // around it, whichever form the request used to name the service.
+                    message: Some(crate::state::service_reference_arn(
+                        &crate::state::request_region(ctx),
+                        &input.id,
                     )),
                 })
                 .into());
+            };
+
+            // The stored configuration the change is validated against, cloned so the
+            // checks below hold no borrow of the store.
+            let (stored_dns_config, stored_health_check, custom_health_checked, namespace_id) = {
+                let service = state
+                    .services
+                    .get(&service_id)
+                    .expect("a resolved service id names a stored service");
+                (
+                    service.dns_config.clone(),
+                    service.health_check_config.clone(),
+                    service.custom_health_checked(),
+                    service.namespace_id.clone(),
+                )
+            };
+
+            // "You can't call UpdateService and update settings in the following
+            // scenarios: When the service is associated with an HTTP namespace" — an HTTP
+            // namespace holds no Route 53 hosted zone, so there are no records or health
+            // checks for this call to update. The condition is the NAMESPACE's type, not
+            // the service's: a service that registers no records of its own is still
+            // updatable while its namespace is a DNS one.
+            if state
+                .namespaces
+                .get(&namespace_id)
+                .is_some_and(|namespace| namespace.namespace_type == "HTTP")
+            {
+                return Err(UpdateServiceErrorModeled::InvalidInput(InvalidInput {
+                    message: Some(crate::state::API_ONLY_NAMESPACE_UPDATE_MESSAGE.to_string()),
+                })
+                .into());
             }
-            let mut named: Vec<&str> = Vec::new();
-            for record_type in requested_types {
-                // "An array that contains one DnsRecord object for each Route 53 record":
-                // one record type names at most one configuration, so a change stating
-                // the same type twice states two TTLs for one record.
-                if named.contains(&record_type) {
+
+            // The record types the service carries: the only ones a change may name.
+            let stored_types: Vec<&str> = stored_dns_config
+                .iter()
+                .flat_map(|config| config.dns_records.iter())
+                .map(|record| record.r#type.as_str())
+                .collect();
+            if let Some(change) = input.service.dns_config.as_ref() {
+                let requested_types: Vec<&str> = change
+                    .dns_records
+                    .iter()
+                    .map(|record| record.r#type.as_str())
+                    .collect();
+                // The refusal reports both whole type sets — what the service carries and
+                // what the request named — because that is the comparison the caller has
+                // to make to see what it may ask for; neither set names the service.
+                if requested_types
+                    .iter()
+                    .any(|record_type| !stored_types.contains(record_type))
+                {
                     return Err(UpdateServiceErrorModeled::InvalidInput(InvalidInput {
                         message: Some(format!(
-                            "DnsConfig.DnsRecords names the record type {record_type} more than \
-                             once; specify one DnsRecord for each record type."
+                            "The record types in the request must be the same as those present in \
+                             the existing service. Records in the existing service are [{}], but \
+                             the records in the request are [{}]. The record types of a service \
+                             cannot be changed.",
+                            stored_types.join(", "),
+                            requested_types.join(", ")
                         )),
                     })
                     .into());
                 }
-                named.push(record_type);
-            }
-        }
-
-        if let Some(requested) = input.service.health_check_config.as_ref() {
-            // `HealthCheckConfig`: "If you specify a health check configuration, you can
-            // specify either HealthCheckCustomConfig or HealthCheckConfig but not both",
-            // and this call "can't add, update, or delete a HealthCheckCustomConfig
-            // configuration", so a custom-checked service cannot be given one here.
-            if custom_health_checked {
-                return Err(UpdateServiceErrorModeled::InvalidInput(InvalidInput {
-                    message: Some(format!(
-                        "The service {service_id} is checked by a HealthCheckCustomConfig, so a \
-                         HealthCheckConfig can't be added to it: specify either \
-                         HealthCheckCustomConfig or HealthCheckConfig but not both."
-                    )),
-                })
-                .into());
-            }
-            // `HealthCheckConfig$Type`: "You can't change the value of Type after you
-            // create a health check."
-            if let Some(stored) = stored_health_check
-                .as_ref()
-                .filter(|stored| stored.r#type != requested.r#type)
-            {
-                return Err(UpdateServiceErrorModeled::InvalidInput(InvalidInput {
-                    message: Some(format!(
-                        "The health check of service {service_id} is of type {}, and you can't \
-                         change the value of Type after you create a health check.",
-                        stored.r#type
-                    )),
-                })
-                .into());
-            }
-        }
-
-        // Deleting every record configuration deletes the `DnsConfig`: a `DnsConfig` that
-        // registers no record is the same absence of DNS records as no `DnsConfig` at
-        // all. Everything else the stored config holds — its `RoutingPolicy` and the
-        // deprecated `NamespaceId` — has no member on `DnsConfigChange`, so it survives
-        // the change its records go through.
-        let new_dns_config = input.service.dns_config.as_ref().and_then(|change| {
-            if change.dns_records.is_empty() {
-                return None;
-            }
-            let mut config = stored_dns_config.clone().unwrap_or_default();
-            config.dns_records = change.dns_records.clone();
-            // A configuration a service did not have until this call still carries the
-            // members the service itself decides, resolved by the same rule
-            // `CreateService` applies, so the member set a read reports never depends
-            // on which call wrote the record.
-            Some(crate::state::stored_dns_config(config, &namespace_id))
-        });
-        let health_check_changed = !same_health_check(
-            stored_health_check.as_ref(),
-            input.service.health_check_config.as_ref(),
-        );
-
-        {
-            let service = state
-                .services
-                .get_mut(&service_id)
-                .expect("a resolved service id names a stored service");
-
-            // `ServiceChange$Description` is optional, and the documented
-            // deletion-by-omission covers `DnsRecords` and `HealthCheckConfig` only, so a
-            // change that states no description leaves the stored one alone. An empty
-            // string clears it: an empty `ResourceDescription` is indistinguishable on a
-            // read from none at all.
-            if input.service.description.is_some() {
-                service.description = crate::state::described(input.service.description.clone());
-            }
-            service.dns_config = new_dns_config;
-            service.health_check_config = input.service.health_check_config.clone();
-
-            // `Service$Type` says what can discover the instances, and follows whether
-            // DNS records are registered for them — the derivation `CreateService` makes
-            // from the same condition. A service left with no record configuration
-            // registers none, so only `DiscoverInstances` finds its instances.
-            if service.dns_config.is_none() {
-                service.service_type = "HTTP".to_string();
-            }
-
-            if health_check_changed {
-                // "When you update settings for a service, Cloud Map also updates the
-                // corresponding settings in all the records and health checks that were
-                // created by using the specified service": the health check of every
-                // instance of this service is re-created, so each instance is back to
-                // `UNKNOWN` — nothing has reported on the new check yet — with the new
-                // check's verdict owed `ROUTE53_HEALTH_CHECK_SPAN` later, exactly as
-                // `RegisterInstance` leaves a freshly registered instance. Once the check
-                // is deleted nothing checks the instance, so nothing is owed.
-                let pending =
-                    service
-                        .health_check_config
-                        .is_some()
-                        .then(|| crate::state::PendingHealthStatus {
-                            status: crate::state::ROUTE53_HEALTH_CHECK_VERDICT.to_string(),
-                            due_at: now + crate::state::ROUTE53_HEALTH_CHECK_SPAN,
-                        });
-                for instance in service.instances.values_mut() {
-                    instance.health_status = crate::state::HEALTH_STATUS_UNKNOWN.to_string();
-                    instance.pending_health_status = pending.clone();
+                let mut named: Vec<&str> = Vec::new();
+                for record_type in requested_types {
+                    // "An array that contains one DnsRecord object for each Route 53
+                    // record": one record type names at most one configuration, so a
+                    // change stating the same type twice states two TTLs for one record.
+                    if named.contains(&record_type) {
+                        return Err(UpdateServiceErrorModeled::InvalidInput(InvalidInput {
+                            message: Some(format!(
+                                "DnsConfig.DnsRecords names the record type {record_type} more \
+                                 than once; specify one DnsRecord for each record type."
+                            )),
+                        })
+                        .into());
+                    }
+                    named.push(record_type);
                 }
             }
-        }
 
-        // The entity this call changes is the service, so that is what the operation
-        // record targets.
-        let operation_id =
-            state.record_operation("UPDATE_SERVICE", now, [("SERVICE".to_string(), service_id)]);
+            if let Some(requested) = input.service.health_check_config.as_ref() {
+                // `HealthCheckConfig`: "If you specify a health check configuration, you
+                // can specify either HealthCheckCustomConfig or HealthCheckConfig but not
+                // both", and this call "can't add, update, or delete a
+                // HealthCheckCustomConfig configuration", so a custom-checked service
+                // cannot be given one here.
+                if custom_health_checked {
+                    return Err(UpdateServiceErrorModeled::InvalidInput(InvalidInput {
+                        message: Some(format!(
+                            "The service {service_id} is checked by a HealthCheckCustomConfig, so \
+                             a HealthCheckConfig can't be added to it: specify either \
+                             HealthCheckCustomConfig or HealthCheckConfig but not both."
+                        )),
+                    })
+                    .into());
+                }
+                // `HealthCheckConfig$Type`: "You can't change the value of Type after you
+                // create a health check."
+                if let Some(stored) = stored_health_check
+                    .as_ref()
+                    .filter(|stored| stored.r#type != requested.r#type)
+                {
+                    return Err(UpdateServiceErrorModeled::InvalidInput(InvalidInput {
+                        message: Some(format!(
+                            "The health check of service {service_id} is of type {}, and you can't \
+                             change the value of Type after you create a health check.",
+                            stored.r#type
+                        )),
+                    })
+                    .into());
+                }
+            }
+
+            // Deleting every record configuration deletes the `DnsConfig`: a `DnsConfig`
+            // that registers no record is the same absence of DNS records as no
+            // `DnsConfig` at all. Everything else the stored config holds — its
+            // `RoutingPolicy` and the deprecated `NamespaceId` — has no member on
+            // `DnsConfigChange`, so it survives the change its records go through.
+            let new_dns_config = input.service.dns_config.as_ref().and_then(|change| {
+                if change.dns_records.is_empty() {
+                    return None;
+                }
+                let mut config = stored_dns_config.clone().unwrap_or_default();
+                config.dns_records = change.dns_records.clone();
+                // A configuration a service did not have until this call still carries the
+                // members the service itself decides, resolved by the same rule
+                // `CreateService` applies, so the member set a read reports never depends
+                // on which call wrote the record.
+                Some(crate::state::stored_dns_config(config, &namespace_id))
+            });
+            let health_check_changed = !same_health_check(
+                stored_health_check.as_ref(),
+                input.service.health_check_config.as_ref(),
+            );
+
+            {
+                let service = state
+                    .services
+                    .get_mut(&service_id)
+                    .expect("a resolved service id names a stored service");
+
+                // `ServiceChange$Description` is optional, and the documented
+                // deletion-by-omission covers `DnsRecords` and `HealthCheckConfig` only,
+                // so a change that states no description leaves the stored one alone. An
+                // empty string clears it: an empty `ResourceDescription` is
+                // indistinguishable on a read from none at all.
+                if input.service.description.is_some() {
+                    service.description =
+                        crate::state::described(input.service.description.clone());
+                }
+                service.dns_config = new_dns_config;
+                service.health_check_config = input.service.health_check_config.clone();
+
+                // `Service$Type` says what can discover the instances, and follows whether
+                // DNS records are registered for them — the derivation `CreateService`
+                // makes from the same condition. A service left with no record
+                // configuration registers none, so only `DiscoverInstances` finds its
+                // instances.
+                if service.dns_config.is_none() {
+                    service.service_type = "HTTP".to_string();
+                }
+
+                if health_check_changed {
+                    // "When you update settings for a service, Cloud Map also updates the
+                    // corresponding settings in all the records and health checks that
+                    // were created by using the specified service": the health check of
+                    // every instance of this service is re-created, so each instance is
+                    // back to `UNKNOWN` — nothing has reported on the new check yet — with
+                    // the new check's verdict owed `ROUTE53_HEALTH_CHECK_SPAN` later,
+                    // exactly as `RegisterInstance` leaves a freshly registered instance.
+                    // Once the check is deleted nothing checks the instance, so nothing is
+                    // owed.
+                    let pending =
+                        service
+                            .health_check_config
+                            .is_some()
+                            .then(|| crate::state::PendingHealthStatus {
+                                status: crate::state::ROUTE53_HEALTH_CHECK_VERDICT.to_string(),
+                                due_at: now + crate::state::ROUTE53_HEALTH_CHECK_SPAN,
+                            });
+                    for instance in service.instances.values_mut() {
+                        instance.health_status = crate::state::HEALTH_STATUS_UNKNOWN.to_string();
+                        instance.pending_health_status = pending.clone();
+                    }
+                }
+            }
+
+            // The entity this call changes is the service, so that is what the operation
+            // record targets.
+            let operation_id = state.record_operation(
+                "UPDATE_SERVICE",
+                now,
+                [("SERVICE".to_string(), service_id.clone())],
+            );
+
+            // "When you update settings for a service, Cloud Map also updates the
+            // corresponding settings in all the records … that were created by using the
+            // specified service": the record sets of this service are recomputed from the
+            // configuration this call just stored, so a changed TTL is rewritten onto
+            // every instance's record set and a record type the service no longer declares
+            // is removed.
+            let publication = state
+                .services
+                .get(&service_id)
+                .and_then(|service| crate::state::route53_zone::publication(&state, service));
+            (operation_id, publication)
+        };
+        if let Some(publication) = publication {
+            crate::state::route53_zone::publish(ctx.callback(), &publication).await;
+        }
 
         Ok(UpdateServiceOutput {
             operation_id: Some(operation_id),

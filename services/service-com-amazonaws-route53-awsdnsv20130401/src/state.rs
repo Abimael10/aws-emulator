@@ -63,6 +63,12 @@ pub mod vpc_association_authority;
 /// half of the customer managed key the KSK was created from.
 pub mod signing_key;
 
+/// Which other service created a hosted zone, for a zone another service created and
+/// manages — a Cloud Map private DNS namespace's zone among them: what a read reports for
+/// such a zone, and how the creating service records itself on it.
+pub mod linked_service;
+pub mod managed_zone;
+
 /// The DNS query logging configuration a hosted zone publishes its queries under,
 /// and the CloudWatch Logs log group it publishes them to.
 pub mod query_logging;
@@ -852,6 +858,14 @@ pub struct StoredZone {
     pub caller_reference: String,
     /// The `Comment` from `HostedZoneConfig`, when one was given.
     pub comment: Option<String>,
+    /// The other Amazon Web Services service that created this zone and manages it, when
+    /// another service did: `HostedZone$LinkedService` is "if the hosted zone was created
+    /// by another service, the service that created the hosted zone", and it names that
+    /// service's principal and the resource the zone was created for. Recorded by that
+    /// service on the zone this service minted the id of (see
+    /// [`managed_zone::link_zone_to_service`]); a zone a client created for itself has
+    /// none.
+    pub linked_service: Option<crate::ops::types::LinkedService>,
     /// Whether this is a private hosted zone.
     pub private_zone: bool,
     /// The four authoritative name servers Route 53 assigned to this zone.
@@ -951,7 +965,11 @@ impl StoredZone {
             caller_reference: self.caller_reference.clone(),
             config,
             resource_record_set_count: Some(self.records.len() as i64),
-            linked_service: None,
+            // Read off the zone through the one projection of this marker: a zone another
+            // service created for one of its own resources reports that service and the
+            // resource on every hosted-zone read, and a zone a client created for itself
+            // reports none.
+            linked_service: linked_service::of_zone(self),
             // Read off the zone, so what the last accepted features update left
             // is what every hosted-zone read reports.
             features: Some(self.to_hosted_zone_features()),

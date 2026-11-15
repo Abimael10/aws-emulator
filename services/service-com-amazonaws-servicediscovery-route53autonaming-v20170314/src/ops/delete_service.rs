@@ -152,7 +152,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteServiceErrorModeled::InvalidInput(InvalidInput {
                 message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),
@@ -160,49 +159,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let mut state = state.lock();
+        let store = state;
+        // ONE critical section, and the guard is released with the block: nothing of
+        // this service's state is held while the hop into Route 53 below runs.
+        let publication = {
+            let mut state = store.lock();
 
-        // `Id` is modelled as `Arn`, and the docs say a service whose namespace is shared
-        // with the account is named by its ARN, so both forms resolve to the one record.
-        let Some(service_id) = state.resolve_service_id(&input.id) else {
-            return Err(DeleteServiceErrorModeled::ServiceNotFound(ServiceNotFound {
-                // The message is the reference the request named, exactly as it named
-                // it, and nothing else: the recorded refusal echoes the requested `Id`
-                // and composes no sentence around it.
-                message: Some(input.id.clone()),
-            })
-            .into());
+            // `Id` is modelled as `Arn`, and the docs say a service whose namespace is
+            // shared with the account is named by its ARN, so both forms resolve to the
+            // one record.
+            let Some(service_id) = state.resolve_service_id(&input.id) else {
+                return Err(DeleteServiceErrorModeled::ServiceNotFound(ServiceNotFound {
+                    // The message is the reference the request named, exactly as it named
+                    // it, and nothing else: the recorded refusal echoes the requested `Id`
+                    // and composes no sentence around it.
+                    message: Some(input.id.clone()),
+                })
+                .into());
+            };
+
+            // Documented on this operation: "If the service still contains one or more
+            // registered instances, the request fails." Refused BEFORE anything is
+            // removed, so a refused delete leaves the service and its instances
+            // untouched.
+            let instance_count = state
+                .services
+                .get(&service_id)
+                .map(crate::state::ServiceRecord::instance_count)
+                .expect("the resolved service id is present");
+            if instance_count > 0 {
+                return Err(DeleteServiceErrorModeled::ResourceInUse(ResourceInUse {
+                    message: Some(SERVICE_CONTAINS_INSTANCES.to_string()),
+                })
+                .into());
+            }
+
+            let removed = state
+                .services
+                .remove(&service_id)
+                .expect("the resolved service id is present");
+            // Keep the name index in step with the record map. The entry is dropped only
+            // when it still reaches the service just removed, so a service re-created
+            // under the same name is never unindexed by a later delete naming the old id.
+            let name_key = (removed.namespace_id.clone(), removed.name.clone());
+            if state
+                .service_ids_by_namespace_and_name
+                .get(&name_key)
+                .is_some_and(|indexed| *indexed == service_id)
+            {
+                state.service_ids_by_namespace_and_name.remove(&name_key);
+            }
+
+            // The service is gone, so the hosted zone of its namespace holds no record
+            // set for it any more. A delete is refused while the service still holds an
+            // instance, so there is normally nothing left to remove — this reconciliation
+            // is what makes that true of the ZONE as well as of this store.
+            crate::state::route53_zone::publication(&state, &removed)
         };
-
-        // Documented on this operation: "If the service still contains one or more
-        // registered instances, the request fails." Refused BEFORE anything is removed,
-        // so a refused delete leaves the service and its instances untouched.
-        let instance_count = state
-            .services
-            .get(&service_id)
-            .map(crate::state::ServiceRecord::instance_count)
-            .expect("the resolved service id is present");
-        if instance_count > 0 {
-            return Err(DeleteServiceErrorModeled::ResourceInUse(ResourceInUse {
-                message: Some(SERVICE_CONTAINS_INSTANCES.to_string()),
-            })
-            .into());
-        }
-
-        let removed = state
-            .services
-            .remove(&service_id)
-            .expect("the resolved service id is present");
-        // Keep the name index in step with the record map. The entry is dropped only when
-        // it still reaches the service just removed, so a service re-created under the
-        // same name is never unindexed by a later delete naming the old id.
-        let name_key = (removed.namespace_id.clone(), removed.name.clone());
-        if state
-            .service_ids_by_namespace_and_name
-            .get(&name_key)
-            .is_some_and(|indexed| *indexed == service_id)
-        {
-            state.service_ids_by_namespace_and_name.remove(&name_key);
+        if let Some(publication) = publication {
+            crate::state::route53_zone::publish(ctx.callback(), &publication).await;
         }
 
         Ok(DeleteServiceOutput {})

@@ -153,9 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing in the answer depends on request metadata: the namespace is addressed
-        // by a value in the body and every id in the response comes from the store.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteNamespaceErrorModeled::InvalidInput(InvalidInput {
                 message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),
@@ -164,74 +161,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = std::time::SystemTime::now();
-        let mut state = state.lock();
+        let store = state;
+        // ONE critical section, and the guard is released with the block: nothing of
+        // this service's state is held while the hop into Route 53 below runs.
+        let (operation_id, hosted_zone_id) = {
+            let mut state = store.lock();
 
-        let Some(namespace_id) = state.resolve_namespace_id(&input.id) else {
-            // No record under this reference. While a delete already filed for it is
-            // still owed its terminal status, this request is the one the model calls
-            // `DuplicateRequest` ("the operation is already in progress"), and it
-            // carries the id of that operation so the caller polls it rather than
-            // filing a second delete. Once that operation settles the same request is
-            // a plain `NamespaceNotFound`.
-            if let Some(in_progress) =
-                delete_in_progress(&state, referenced_namespace_id(&input.id), now)
-            {
-                return Err(DeleteNamespaceErrorModeled::DuplicateRequest(
-                    DuplicateRequest {
-                        message: Some(format!(
-                            "The deletion of namespace {} is already in progress.",
-                            input.id
-                        )),
-                        duplicate_operation_id: Some(in_progress),
+            let Some(namespace_id) = state.resolve_namespace_id(&input.id) else {
+                // No record under this reference. While a delete already filed for it is
+                // still owed its terminal status, this request is the one the model calls
+                // `DuplicateRequest` ("the operation is already in progress"), and it
+                // carries the id of that operation so the caller polls it rather than
+                // filing a second delete. Once that operation settles the same request is
+                // a plain `NamespaceNotFound`.
+                if let Some(in_progress) =
+                    delete_in_progress(&state, referenced_namespace_id(&input.id), now)
+                {
+                    return Err(DeleteNamespaceErrorModeled::DuplicateRequest(
+                        DuplicateRequest {
+                            message: Some(format!(
+                                "The deletion of namespace {} is already in progress.",
+                                input.id
+                            )),
+                            duplicate_operation_id: Some(in_progress),
+                        },
+                    )
+                    .into());
+                }
+                return Err(DeleteNamespaceErrorModeled::NamespaceNotFound(
+                    // The message is the namespace reference the request named and nothing
+                    // else: this delete reports which reference it could not resolve, with
+                    // no sentence around it, as the namespace updates and the create in a
+                    // namespace do. Only the namespace READS report the class alone.
+                    NamespaceNotFound {
+                        message: Some(input.id.clone()),
                     },
                 )
                 .into());
+            };
+
+            // "If the namespace still contains one or more services, the request fails."
+            // The count is derived from the service map, so it can never disagree with the
+            // `ServiceCount` `GetNamespace` reports.
+            if state.service_count(&namespace_id) > 0 {
+                return Err(DeleteNamespaceErrorModeled::ResourceInUse(ResourceInUse {
+                    message: Some(NAMESPACE_HAS_SERVICES.to_string()),
+                })
+                .into());
             }
-            return Err(DeleteNamespaceErrorModeled::NamespaceNotFound(
-                // The message is the namespace reference the request named and nothing
-                // else: this delete reports which reference it could not resolve, with
-                // no sentence around it, as the namespace updates and the create in a
-                // namespace do. Only the namespace READS report the class alone.
-                NamespaceNotFound {
-                    message: Some(input.id.clone()),
-                },
-            )
-            .into());
+
+            let removed = state
+                .namespaces
+                .remove(&namespace_id)
+                .expect("the resolved namespace id is present");
+            // The name index is maintained beside the record map, so the deleted name
+            // stops resolving here too: a later create of the same name is a create, not
+            // a conflict with a namespace nobody can read any more.
+            if state
+                .namespace_ids_by_name
+                .get(&removed.name)
+                .is_some_and(|indexed| *indexed == namespace_id)
+            {
+                state.namespace_ids_by_name.remove(&removed.name);
+            }
+
+            // Like every other mutating call in this service, the delete files an
+            // `Operation` record that starts `SUBMITTED` and reaches `SUCCESS` when the
+            // clock owes it; `GetOperation` reads it back.
+            let operation_id = state.record_operation(
+                "DELETE_NAMESPACE",
+                now,
+                [("NAMESPACE".to_string(), namespace_id)],
+            );
+            (operation_id, removed.hosted_zone_id)
         };
-
-        // "If the namespace still contains one or more services, the request fails."
-        // The count is derived from the service map, so it can never disagree with the
-        // `ServiceCount` `GetNamespace` reports.
-        if state.service_count(&namespace_id) > 0 {
-            return Err(DeleteNamespaceErrorModeled::ResourceInUse(ResourceInUse {
-                message: Some(NAMESPACE_HAS_SERVICES.to_string()),
-            })
-            .into());
+        // The hosted zone belongs to the namespace, so it goes away with it: a namespace
+        // holds no services by the time it can be deleted, so the zone holds nothing but
+        // its own delegation records by then.
+        if let Some(hosted_zone_id) = hosted_zone_id.as_deref() {
+            crate::state::route53_zone::delete_namespace_zone(ctx.callback(), hosted_zone_id).await;
         }
-
-        let removed = state
-            .namespaces
-            .remove(&namespace_id)
-            .expect("the resolved namespace id is present");
-        // The name index is maintained beside the record map, so the deleted name stops
-        // resolving here too: a later create of the same name is a create, not a
-        // conflict with a namespace nobody can read any more.
-        if state
-            .namespace_ids_by_name
-            .get(&removed.name)
-            .is_some_and(|indexed| *indexed == namespace_id)
-        {
-            state.namespace_ids_by_name.remove(&removed.name);
-        }
-
-        // Like every other mutating call in this service, the delete files an
-        // `Operation` record that starts `SUBMITTED` and reaches `SUCCESS` when the
-        // clock owes it; `GetOperation` reads it back.
-        let operation_id = state.record_operation(
-            "DELETE_NAMESPACE",
-            now,
-            [("NAMESPACE".to_string(), namespace_id)],
-        );
 
         Ok(DeleteNamespaceOutput {
             operation_id: Some(operation_id),

@@ -220,6 +220,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `DnsConfig$DnsRecords` is "an array that contains one DnsRecord object for each
+        // Route 53 record that you want Cloud Map to create when you register an instance",
+        // so one record TYPE names at most one configuration: a create that states the same
+        // type twice states two TTLs for one record, and `UpdateService` refuses a change
+        // that does it for the same reason. Refused before anything is stored, so the
+        // records a service declares are at most one per modelled `RecordType`.
+        let mut declared: Vec<&str> = Vec::new();
+        for record_type in input
+            .dns_config
+            .iter()
+            .flat_map(|dns_config| dns_config.dns_records.iter())
+            .map(|record| record.r#type.as_str())
+        {
+            if declared.contains(&record_type) {
+                return Err(CreateServiceErrorModeled::InvalidInput(InvalidInput {
+                    message: Some(format!(
+                        "DnsConfig.DnsRecords names the record type {record_type} more than \
+                         once; specify one DnsRecord for each record type."
+                    )),
+                })
+                .into());
+            }
+            declared.push(record_type);
+        }
+
         // The namespace is named either directly or by the (deprecated)
         // `DnsConfig.NamespaceId`; one of the two must be present.
         let Some(namespace_reference) = input
@@ -256,18 +281,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // A `DnsConfig` asks Cloud Map to create Route 53 records in the parent
-        // namespace's hosted zone. A namespace that holds no hosted zone has nowhere
-        // for those records to go, so the call is refused up front — before the replay
-        // and the conflict checks, and so before anything is stored — rather than
-        // stored as a service promising DNS records no resolver would ever answer.
-        // The precondition is read from the stored `hosted_zone_id`, which is the
-        // thing the records need, rather than from the namespace's type: a namespace
-        // type that holds no zone is refused whether or not it is `HTTP`.
-        let namespace_has_no_hosted_zone = state
+        // namespace's hosted zone, and only an API-only namespace has none: "when you
+        // create a service using a namespace that has a type of HTTP, you can't include a
+        // DnsConfig element". So the precondition is the namespace's TYPE — the thing that
+        // says whether the namespace is backed by a hosted zone at all — rather than the
+        // zone id the create stored, which is the id of a zone Route 53 holds and so says
+        // whether that zone could be created, not whether the namespace registers records.
+        // Refused up front, before the replay and the conflict checks and so before
+        // anything is stored, rather than stored as a service promising DNS records no
+        // resolver would ever answer.
+        let api_only_namespace = state
             .namespaces
             .get(&namespace_id)
-            .is_some_and(|namespace| namespace.hosted_zone_id.is_none());
-        if namespace_has_no_hosted_zone && input.dns_config.is_some() {
+            .is_some_and(|namespace| namespace.namespace_type == "HTTP");
+        if api_only_namespace && input.dns_config.is_some() {
             return Err(CreateServiceErrorModeled::InvalidInput(InvalidInput {
                 message: Some(
                     "When you create a service using a namespace that has a type of HTTP, you \

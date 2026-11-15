@@ -213,162 +213,181 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = std::time::SystemTime::now();
-        let mut state = state.lock();
+        let store = state;
+        // ONE critical section, and the guard is released with the block: nothing of
+        // this service's state is held while the hop into Route 53 below runs.
+        let (operation_id, publication) = {
+            let mut state = store.lock();
 
-        let Some(service_id) = state.resolve_service_id(&input.service_id) else {
-            return Err(service_not_found(ctx, &input.service_id).into());
-        };
+            let Some(service_id) = state.resolve_service_id(&input.service_id) else {
+                return Err(service_not_found(ctx, &input.service_id).into());
+            };
 
-        // What the token identifies: this instance in this service.
-        let requested = format!("{service_id}/{}", input.instance_id);
-        // A replayed `CreatorRequestId` for the SAME instance returns the operation
-        // the first call filed, and leaves the stored attributes alone — but ONLY
-        // while that instance is still stored. Once it has been deregistered the
-        // token is stale, and replaying it would answer success for a write this call
-        // never made, so the registration is performed again.
-        let still_registered = state
-            .services
-            .get(&service_id)
-            .is_some_and(|service| service.instances.contains_key(&input.instance_id));
-        if still_registered {
-            if let Some(operation_id) = input.creator_request_id.as_deref().and_then(|token| {
-                state.replayed(
+            // What the token identifies: this instance in this service.
+            let requested = format!("{service_id}/{}", input.instance_id);
+            // A replayed `CreatorRequestId` for the SAME instance returns the operation
+            // the first call filed, and leaves the stored attributes alone — but ONLY
+            // while that instance is still stored. Once it has been deregistered the
+            // token is stale, and replaying it would answer success for a write this call
+            // never made, so the registration is performed again.
+            let still_registered = state
+                .services
+                .get(&service_id)
+                .is_some_and(|service| service.instances.contains_key(&input.instance_id));
+            if still_registered {
+                if let Some(operation_id) = input.creator_request_id.as_deref().and_then(|token| {
+                    state.replayed(
+                        crate::state::IdempotencyScope::RegisterInstance,
+                        token,
+                        &requested,
+                    )
+                }) {
+                    return Ok(RegisterInstanceOutput {
+                        operation_id: Some(operation_id),
+                    });
+                }
+            }
+
+            // The initial health status, from `RegisterInstanceRequest$Attributes`: "If the
+            // service configuration includes HealthCheckCustomConfig, you can optionally
+            // use AWS_INIT_HEALTH_STATUS to specify the initial status of the custom health
+            // check, HEALTHY or UNHEALTHY. If you don't specify a value for
+            // AWS_INIT_HEALTH_STATUS, the initial status is HEALTHY." Any other health
+            // checking is performed by the service itself, which has not reported yet when
+            // the instance is registered, so the instance starts UNKNOWN.
+            // Which kind of health checking the service configures, read in one lookup:
+            // the two are mutually exclusive ("you can specify either
+            // HealthCheckCustomConfig or HealthCheckConfig but not both").
+            let (custom_health_check, route53_health_check) = state
+                .services
+                .get(&service_id)
+                .map_or((false, false), |service| {
+                    (
+                        service.custom_health_checked(),
+                        service.health_check_config.is_some(),
+                    )
+                });
+            let initial = input.attributes.get(INIT_HEALTH_STATUS_ATTRIBUTE);
+            let health_status = if custom_health_check {
+                match initial.map(String::as_str) {
+                    None => crate::state::HEALTH_STATUS_HEALTHY,
+                    Some(value) if value == crate::state::HEALTH_STATUS_HEALTHY => {
+                        crate::state::HEALTH_STATUS_HEALTHY
+                    }
+                    Some(value) if value == crate::state::HEALTH_STATUS_UNHEALTHY => {
+                        crate::state::HEALTH_STATUS_UNHEALTHY
+                    }
+                    Some(other) => {
+                        return Err(RegisterInstanceErrorModeled::InvalidInput(InvalidInput {
+                            message: Some(format!(
+                                "The attribute {INIT_HEALTH_STATUS_ATTRIBUTE} must be {} or {}, not {other}.",
+                                crate::state::HEALTH_STATUS_HEALTHY,
+                                crate::state::HEALTH_STATUS_UNHEALTHY
+                            )),
+                        })
+                        .into());
+                    }
+                }
+            } else {
+                crate::state::HEALTH_STATUS_UNKNOWN
+            };
+
+            // A `HealthCheckConfig` health check is the SERVICE's to perform: Cloud Map
+            // reports its verdict once the checker has run, which
+            // `GetInstancesHealthStatus` documents as "a brief delay between when you
+            // register an instance and when the health status for the instance is
+            // available". The verdict this emulator can report is
+            // `ROUTE53_HEALTH_CHECK_VERDICT` (see its documentation: no probe of the
+            // instance's endpoint can be observed here, so `HEALTHY` is never claimed), and
+            // the clock owes it `ROUTE53_HEALTH_CHECK_SPAN` after this call.
+            let pending_health_status =
+                route53_health_check.then(|| crate::state::PendingHealthStatus {
+                    status: crate::state::ROUTE53_HEALTH_CHECK_VERDICT.to_string(),
+                    due_at: now + crate::state::ROUTE53_HEALTH_CHECK_SPAN,
+                });
+
+            let namespace_id = {
+                // The id was resolved from the record map under this same lock; the record
+                // is still reached with a graceful branch so no request-derived reference
+                // can panic a handler, answering the same `ServiceNotFound` the resolution
+                // step does.
+                let Some(service) = state.services.get_mut(&service_id) else {
+                    return Err(service_not_found(ctx, &input.service_id).into());
+                };
+                // A new instance is refused once the service holds its quota; replacing
+                // one that is already there adds nothing, so it is always allowed.
+                if !service.instances.contains_key(&input.instance_id)
+                    && service.instances.len() >= crate::state::MAX_INSTANCES_PER_SERVICE
+                {
+                    return Err(RegisterInstanceErrorModeled::ResourceLimitExceeded(
+                        ResourceLimitExceeded {
+                            message: Some(format!(
+                                "The instance can't be created because service {service_id} holds \
+                                 this emulator's quota of {} instances.",
+                                crate::state::MAX_INSTANCES_PER_SERVICE
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                // Re-registering an instance id REPLACES its attributes rather than
+                // adding a second instance. `AWS_INIT_HEALTH_STATUS` is a directive for
+                // the registration, not an attribute of the instance, so it is consumed
+                // here rather than stored and reported back.
+                let mut attributes = input.attributes;
+                attributes.remove(INIT_HEALTH_STATUS_ATTRIBUTE);
+                service.instances.insert(
+                    input.instance_id.clone(),
+                    crate::state::InstanceRecord {
+                        instance_id: input.instance_id.clone(),
+                        attributes,
+                        creator_request_id: input.creator_request_id.clone(),
+                        // The account that registered the instance, which is what a later
+                        // read reports as `CreatedByAccount`.
+                        created_by_account: crate::state::owning_account(),
+                        health_status: health_status.to_string(),
+                        // Re-registering an instance replaces it, so a status a previous
+                        // `UpdateInstanceCustomHealthStatus` call still owed is dropped
+                        // with the record it was owed to; a Route 53 health check starts
+                        // over, exactly as `RegisterInstanceRequest$InstanceId` documents
+                        // ("Cloud Map deletes the old health check and creates a new one").
+                        pending_health_status,
+                    },
+                );
+                service.instances_revision += 1;
+                service.namespace_id.clone()
+            };
+
+            let operation_id = state.record_operation(
+                "REGISTER_INSTANCE",
+                now,
+                [
+                    ("NAMESPACE".to_string(), namespace_id),
+                    ("SERVICE".to_string(), service_id.clone()),
+                    ("INSTANCE".to_string(), input.instance_id),
+                ],
+            );
+            if let Some(token) = input.creator_request_id.as_deref() {
+                state.remember(
                     crate::state::IdempotencyScope::RegisterInstance,
                     token,
                     &requested,
-                )
-            }) {
-                return Ok(RegisterInstanceOutput {
-                    operation_id: Some(operation_id),
-                });
+                    &operation_id,
+                );
             }
-        }
 
-        // The initial health status, from `RegisterInstanceRequest$Attributes`: "If the
-        // service configuration includes HealthCheckCustomConfig, you can optionally
-        // use AWS_INIT_HEALTH_STATUS to specify the initial status of the custom health
-        // check, HEALTHY or UNHEALTHY. If you don't specify a value for
-        // AWS_INIT_HEALTH_STATUS, the initial status is HEALTHY." Any other health
-        // checking is performed by the service itself, which has not reported yet when
-        // the instance is registered, so the instance starts UNKNOWN.
-        // Which kind of health checking the service configures, read in one lookup:
-        // the two are mutually exclusive ("you can specify either
-        // HealthCheckCustomConfig or HealthCheckConfig but not both").
-        let (custom_health_check, route53_health_check) = state
-            .services
-            .get(&service_id)
-            .map_or((false, false), |service| {
-                (
-                    service.custom_health_checked(),
-                    service.health_check_config.is_some(),
-                )
-            });
-        let initial = input.attributes.get(INIT_HEALTH_STATUS_ATTRIBUTE);
-        let health_status = if custom_health_check {
-            match initial.map(String::as_str) {
-                None => crate::state::HEALTH_STATUS_HEALTHY,
-                Some(value) if value == crate::state::HEALTH_STATUS_HEALTHY => {
-                    crate::state::HEALTH_STATUS_HEALTHY
-                }
-                Some(value) if value == crate::state::HEALTH_STATUS_UNHEALTHY => {
-                    crate::state::HEALTH_STATUS_UNHEALTHY
-                }
-                Some(other) => {
-                    return Err(RegisterInstanceErrorModeled::InvalidInput(InvalidInput {
-                        message: Some(format!(
-                            "The attribute {INIT_HEALTH_STATUS_ATTRIBUTE} must be {} or {}, not {other}.",
-                            crate::state::HEALTH_STATUS_HEALTHY,
-                            crate::state::HEALTH_STATUS_UNHEALTHY
-                        )),
-                    })
-                    .into());
-                }
-            }
-        } else {
-            crate::state::HEALTH_STATUS_UNKNOWN
+            // "When you register an instance, Cloud Map creates the records in the hosted
+            // zone of the service's namespace": the record sets of this service are
+            // recomputed from the instances it now holds, and published into that zone
+            // once this lock is released.
+            let publication = state
+                .services
+                .get(&service_id)
+                .and_then(|service| crate::state::route53_zone::publication(&state, service));
+            (operation_id, publication)
         };
-
-        // A `HealthCheckConfig` health check is the SERVICE's to perform: Cloud Map
-        // reports its verdict once the checker has run, which
-        // `GetInstancesHealthStatus` documents as "a brief delay between when you
-        // register an instance and when the health status for the instance is
-        // available". The verdict this emulator can report is
-        // `ROUTE53_HEALTH_CHECK_VERDICT` (see its documentation: no probe of the
-        // instance's endpoint can be observed here, so `HEALTHY` is never claimed), and
-        // the clock owes it `ROUTE53_HEALTH_CHECK_SPAN` after this call.
-        let pending_health_status = route53_health_check.then(|| crate::state::PendingHealthStatus {
-            status: crate::state::ROUTE53_HEALTH_CHECK_VERDICT.to_string(),
-            due_at: now + crate::state::ROUTE53_HEALTH_CHECK_SPAN,
-        });
-
-        let namespace_id = {
-            // The id was resolved from the record map under this same lock; the record
-            // is still reached with a graceful branch so no request-derived reference
-            // can panic a handler, answering the same `ServiceNotFound` the resolution
-            // step does.
-            let Some(service) = state.services.get_mut(&service_id) else {
-                return Err(service_not_found(ctx, &input.service_id).into());
-            };
-            // A new instance is refused once the service holds its quota; replacing
-            // one that is already there adds nothing, so it is always allowed.
-            if !service.instances.contains_key(&input.instance_id)
-                && service.instances.len() >= crate::state::MAX_INSTANCES_PER_SERVICE
-            {
-                return Err(RegisterInstanceErrorModeled::ResourceLimitExceeded(
-                    ResourceLimitExceeded {
-                        message: Some(format!(
-                            "The instance can't be created because service {service_id} holds this \
-                             emulator's quota of {} instances.",
-                            crate::state::MAX_INSTANCES_PER_SERVICE
-                        )),
-                    },
-                )
-                .into());
-            }
-            // Re-registering an instance id REPLACES its attributes rather than
-            // adding a second instance. `AWS_INIT_HEALTH_STATUS` is a directive for
-            // the registration, not an attribute of the instance, so it is consumed
-            // here rather than stored and reported back.
-            let mut attributes = input.attributes;
-            attributes.remove(INIT_HEALTH_STATUS_ATTRIBUTE);
-            service.instances.insert(
-                input.instance_id.clone(),
-                crate::state::InstanceRecord {
-                    instance_id: input.instance_id.clone(),
-                    attributes,
-                    creator_request_id: input.creator_request_id.clone(),
-                    // The account that registered the instance, which is what a later
-                    // read reports as `CreatedByAccount`.
-                    created_by_account: crate::state::owning_account(),
-                    health_status: health_status.to_string(),
-                    // Re-registering an instance replaces it, so a status a previous
-                    // `UpdateInstanceCustomHealthStatus` call still owed is dropped
-                    // with the record it was owed to; a Route 53 health check starts
-                    // over, exactly as `RegisterInstanceRequest$InstanceId` documents
-                    // ("Cloud Map deletes the old health check and creates a new one").
-                    pending_health_status,
-                },
-            );
-            service.instances_revision += 1;
-            service.namespace_id.clone()
-        };
-
-        let operation_id = state.record_operation(
-            "REGISTER_INSTANCE",
-            now,
-            [
-                ("NAMESPACE".to_string(), namespace_id),
-                ("SERVICE".to_string(), service_id),
-                ("INSTANCE".to_string(), input.instance_id),
-            ],
-        );
-        if let Some(token) = input.creator_request_id.as_deref() {
-            state.remember(
-                crate::state::IdempotencyScope::RegisterInstance,
-                token,
-                &requested,
-                &operation_id,
-            );
+        if let Some(publication) = publication {
+            crate::state::route53_zone::publish(ctx.callback(), &publication).await;
         }
 
         Ok(RegisterInstanceOutput {

@@ -30,6 +30,16 @@ hex = { workspace = true }
 # range (0.16.x), and every match runs under an explicit backtrack budget — see
 # `state::NAMESPACE_NAME_BACKTRACK_LIMIT`.
 fancy-regex = "0.16"
+# `state::route53_zone`: the in-process Amazon Route 53 client this service creates a DNS
+# namespace's hosted zone with and publishes its services' record sets through. Only the
+# generated client is needed: the emulator supplies the transport, so the SDK's own HTTPS
+# stack is left out.
+aws-sdk-route53 = { version = "1", default-features = false }
+# `state::route53_zone`: a DNS namespace's hosted zone is MANAGED by this service, which
+# Route 53 reports as the zone's `LinkedService`. That fact is recorded on the zone whose id
+# Route 53 minted, through the shared engine, so this crate needs the owning service's state
+# TYPE — the same way Route 53 reaches the Amazon EC2 and CloudWatch stores.
+service-com-amazonaws-route53-awsdnsv20130401 = { workspace = true }
 
 # The constraint-refusal wording this service answers with, and the renaming of the
 # member an error body carries its text in: the shared collecting walk, the shared

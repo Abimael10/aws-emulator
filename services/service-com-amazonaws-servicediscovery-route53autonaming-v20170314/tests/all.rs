@@ -53,6 +53,8 @@ mod operation_id_form;
 mod public_dns_namespace;
 #[path = "all/resource_ownership.rs"]
 mod resource_ownership;
+#[path = "all/route53_zone_records.rs"]
+mod route53_zone_records;
 #[path = "all/service_attributes.rs"]
 mod service_attributes;
 #[path = "all/service_identity_and_error_bodies.rs"]

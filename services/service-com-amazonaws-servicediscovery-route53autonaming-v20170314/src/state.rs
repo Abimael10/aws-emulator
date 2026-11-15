@@ -23,6 +23,10 @@
 //! instead (`MAX_RETAINED_OPERATIONS`, `MAX_RETAINED_IDEMPOTENCY_TOKENS`,
 //! `MAX_DEREGISTERED_INSTANCES_PER_SERVICE`).
 
+/// The Route 53 hosted zone a DNS namespace is backed by, and the record sets Cloud Map
+/// publishes into it for the namespace's services and instances.
+pub mod route53_zone;
+
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::LazyLock;
@@ -851,18 +855,6 @@ impl ComAmazonawsServicediscoveryRoute53autonamingV20170314State {
             self.mint_digits("operation", OPERATION_ID_BODY_DIGITS),
             self.mint_digits("operation-suffix", OPERATION_ID_SUFFIX_DIGITS)
         )
-    }
-
-    /// Mint the id of the Route 53 hosted zone a DNS namespace carries —
-    /// `DnsProperties$HostedZoneId` is "the ID for the Route 53 hosted zone that Cloud
-    /// Map creates when you create a namespace".
-    ///
-    /// Route 53 hosted zone ids are an uppercase alphanumeric string that starts with
-    /// `Z`, so the minted digits of [`Self::next_id`] are upper-cased behind that
-    /// prefix. The id is opaque: it is derived from the store's counter and the clock,
-    /// never from the namespace name.
-    pub fn next_hosted_zone_id(&mut self) -> String {
-        format!("Z{}", self.next_id("", 20).to_uppercase())
     }
 
     /// File an operation record and return its `OperationId`.

@@ -191,104 +191,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let now = std::time::SystemTime::now();
-        let mut state = state.lock();
+        let store = state;
+        // ONE critical section, and the guard is released with the block: nothing of
+        // this service's state is held while the hop into Route 53 below runs.
+        let (id, operation_id, name, arn) = {
+            let mut state = store.lock();
 
-        // A replayed `CreatorRequestId` for the SAME name returns the operation the
-        // first call filed rather than creating a second namespace — but only while
-        // the namespace it created is still stored, which
-        // [`crate::state::ComAmazonawsServicediscoveryRoute53autonamingV20170314State::replayed_namespace_create`]
-        // is what decides for every namespace create.
-        if let Some(operation_id) = state.replayed_namespace_create(
-            crate::state::IdempotencyScope::CreatePublicDnsNamespace,
-            input.creator_request_id.as_deref(),
-            &input.name,
-        ) {
-            return Ok(CreatePublicDnsNamespaceOutput {
-                operation_id: Some(operation_id),
-            });
-        }
-
-        // One name index holds every namespace type, so a public DNS namespace cannot
-        // take a name any namespace already answers to. A name already owned by a
-        // COMPLETED create is a duplicate request, not a validation failure: the create
-        // that owns the name has already run, so the conflict is reported as
-        // `DuplicateRequest` (409) naming that operation — the same rule every namespace
-        // create follows. Deleting the namespace frees the name.
-        if let Some(existing) = state
-            .namespace_ids_by_name
-            .get(&input.name)
-            .and_then(|id| state.namespaces.get(id))
-        {
-            return Err(CreatePublicDnsNamespaceErrorModeled::DuplicateRequest(
-                DuplicateRequest {
-                    message: Some(crate::state::duplicate_create_message(
-                        Self::NAME,
-                        existing.create_operation_id.as_deref(),
-                    )),
-                    duplicate_operation_id: existing.create_operation_id.clone(),
-                },
-            )
-            .into());
-        }
-
-        if state.namespaces.len() >= crate::state::MAX_NAMESPACES {
-            return Err(CreatePublicDnsNamespaceErrorModeled::ResourceLimitExceeded(
-                ResourceLimitExceeded {
-                    message: Some(format!(
-                        "The namespace can't be created because this emulator holds its quota of \
-                         {} namespaces.",
-                        crate::state::MAX_NAMESPACES
-                    )),
-                },
-            )
-            .into());
-        }
-
-        let id = state.next_id("ns", 16);
-        let hosted_zone_id = state.next_hosted_zone_id();
-        // The operation is filed first because the namespace record carries its id:
-        // that is what a later create of the same name is refused with.
-        let operation_id = state.record_operation(
-            "CREATE_NAMESPACE",
-            now,
-            [("NAMESPACE".to_string(), id.clone())],
-        );
-        let namespace = crate::state::NamespaceRecord {
-            arn: crate::state::service_arn(&region, &format!("namespace/{id}")),
-            id: id.clone(),
-            name: input.name.clone(),
-            // `Namespace$Type`: instances in a `DNS_PUBLIC` namespace "can be
-            // discovered using public DNS queries and using the DiscoverInstances
-            // API", so the namespace carries BOTH the hosted zone Cloud Map creates
-            // for it and the HTTP name `DiscoverInstances` resolves it by.
-            namespace_type: "DNS_PUBLIC".to_string(),
-            // An empty `Description` is no description, so it is not stored and the read
-            // projection omits the member.
-            description: crate::state::described(input.description.clone()),
-            create_date: now,
-            creator_request_id: input.creator_request_id.clone(),
-            http_name: Some(input.name.clone()),
-            hosted_zone_id: Some(hosted_zone_id),
-            soa_ttl,
-            create_operation_id: Some(operation_id.clone()),
-            tags: input
-                .tags
-                .unwrap_or_default()
-                .into_iter()
-                .map(|tag| (tag.key, tag.value))
-                .collect(),
-        };
-        let name = input.name.clone();
-        state.namespace_ids_by_name.insert(input.name, id.clone());
-        state.namespaces.insert(id, namespace);
-
-        if let Some(token) = input.creator_request_id.as_deref() {
-            state.remember(
+            // A replayed `CreatorRequestId` for the SAME name returns the operation the
+            // first call filed rather than creating a second namespace — but only while
+            // the namespace it created is still stored, which
+            // [`crate::state::ComAmazonawsServicediscoveryRoute53autonamingV20170314State::replayed_namespace_create`]
+            // is what decides for every namespace create.
+            if let Some(operation_id) = state.replayed_namespace_create(
                 crate::state::IdempotencyScope::CreatePublicDnsNamespace,
-                token,
-                &name,
-                &operation_id,
+                input.creator_request_id.as_deref(),
+                &input.name,
+            ) {
+                return Ok(CreatePublicDnsNamespaceOutput {
+                    operation_id: Some(operation_id),
+                });
+            }
+
+            // One name index holds every namespace type, so a public DNS namespace cannot
+            // take a name any namespace already answers to. A name already owned by a
+            // COMPLETED create is a duplicate request, not a validation failure: the
+            // create that owns the name has already run, so the conflict is reported as
+            // `DuplicateRequest` (409) naming that operation — the same rule every
+            // namespace create follows. Deleting the namespace frees the name.
+            if let Some(existing) = state
+                .namespace_ids_by_name
+                .get(&input.name)
+                .and_then(|id| state.namespaces.get(id))
+            {
+                return Err(CreatePublicDnsNamespaceErrorModeled::DuplicateRequest(
+                    DuplicateRequest {
+                        message: Some(crate::state::duplicate_create_message(
+                            Self::NAME,
+                            existing.create_operation_id.as_deref(),
+                        )),
+                        duplicate_operation_id: existing.create_operation_id.clone(),
+                    },
+                )
+                .into());
+            }
+
+            if state.namespaces.len() >= crate::state::MAX_NAMESPACES {
+                return Err(CreatePublicDnsNamespaceErrorModeled::ResourceLimitExceeded(
+                    ResourceLimitExceeded {
+                        message: Some(format!(
+                            "The namespace can't be created because this emulator holds its quota \
+                             of {} namespaces.",
+                            crate::state::MAX_NAMESPACES
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            let id = state.next_id("ns", 16);
+            let arn = crate::state::service_arn(&region, &format!("namespace/{id}"));
+            // The operation is filed first because the namespace record carries its id:
+            // that is what a later create of the same name is refused with.
+            let operation_id = state.record_operation(
+                "CREATE_NAMESPACE",
+                now,
+                [("NAMESPACE".to_string(), id.clone())],
             );
+            let namespace = crate::state::NamespaceRecord {
+                arn: arn.clone(),
+                id: id.clone(),
+                name: input.name.clone(),
+                // `Namespace$Type`: instances in a `DNS_PUBLIC` namespace "can be
+                // discovered using public DNS queries and using the DiscoverInstances
+                // API", so the namespace carries BOTH the hosted zone Cloud Map creates
+                // for it and the HTTP name `DiscoverInstances` resolves it by.
+                namespace_type: "DNS_PUBLIC".to_string(),
+                // An empty `Description` is no description, so it is not stored and the
+                // read projection omits the member.
+                description: crate::state::described(input.description.clone()),
+                create_date: now,
+                creator_request_id: input.creator_request_id.clone(),
+                http_name: Some(input.name.clone()),
+                // The hosted zone is created in Route 53 below, once this service's own
+                // state lock is released, and the id it answers with is written onto the
+                // record. Nothing is reported here: the only hosted zone id a namespace
+                // ever carries is one Route 53 holds a zone under.
+                hosted_zone_id: None,
+                soa_ttl,
+                create_operation_id: Some(operation_id.clone()),
+                tags: input
+                    .tags
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|tag| (tag.key, tag.value))
+                    .collect(),
+            };
+            let name = input.name.clone();
+            state
+                .namespace_ids_by_name
+                .insert(input.name.clone(), id.clone());
+            state.namespaces.insert(id.clone(), namespace);
+
+            if let Some(token) = input.creator_request_id.as_deref() {
+                state.remember(
+                    crate::state::IdempotencyScope::CreatePublicDnsNamespace,
+                    token,
+                    &name,
+                    &operation_id,
+                );
+            }
+            (id, operation_id, name, arn)
+        };
+
+        // A public DNS namespace is backed by a PUBLIC Route 53 hosted zone of the same
+        // name — instances in it "can be discovered using public DNS queries" — so no VPC
+        // is associated with it. The zone's id is what `GetNamespace` reports as
+        // `Properties.DnsProperties.HostedZoneId`, so it is read off the created zone
+        // rather than minted here.
+        if let Some(hosted_zone_id) = crate::state::route53_zone::create_namespace_zone(
+            &*self.engine,
+            ctx,
+            crate::state::route53_zone::NamespaceZone {
+                namespace_name: &name,
+                namespace_id: &id,
+                namespace_arn: &arn,
+                vpc: None,
+                vpc_region: &region,
+            },
+        )
+        .await
+        {
+            if let Some(stored) = store.lock().namespaces.get_mut(&id) {
+                stored.hosted_zone_id = Some(hosted_zone_id);
+            }
         }
 
         Ok(CreatePublicDnsNamespaceOutput {

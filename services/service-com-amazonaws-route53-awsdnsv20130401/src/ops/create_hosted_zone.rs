@@ -432,7 +432,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
-
         // The account's own quota: a caller chooses `CallerReference` freely, so
         // without this the store would grow for every distinct one it sends.
         if store.zones.len() >= MAX_HOSTED_ZONES {
@@ -508,6 +507,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name,
             caller_reference: input.caller_reference.clone(),
             comment,
+            // A zone is created unmanaged: `HostedZone$LinkedService` reports the other
+            // service that created a zone, and that service records itself on the zone
+            // whose id this create answers with (`state::managed_zone`), so nothing a
+            // request carries can claim a linked service for itself.
+            linked_service: None,
             private_zone,
             name_servers,
             vpcs: vpc.cloned().into_iter().collect(),

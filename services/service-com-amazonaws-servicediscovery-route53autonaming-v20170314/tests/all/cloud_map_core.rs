@@ -42,6 +42,12 @@ pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemor
     // These tests drive the router directly rather than signing requests.
     router.set_request_authentication(false);
     router.register_service(cloudmap::EmulatedService::new(Arc::clone(&engine)));
+    // The hosted zone of a DNS namespace is a zone of THIS emulator's Route 53, which a
+    // DNS namespace's create and its services' records reach in process — exactly as the
+    // assembled emulator mounts both services on one engine.
+    router.register_service(
+        service_com_amazonaws_route53_awsdnsv20130401::EmulatedService::new(Arc::clone(&engine)),
+    );
     (router, engine)
 }
 
