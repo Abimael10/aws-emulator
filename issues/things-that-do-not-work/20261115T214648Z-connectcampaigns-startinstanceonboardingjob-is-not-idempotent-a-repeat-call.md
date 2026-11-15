@@ -1,0 +1,39 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: connectcampaigns.instance-onboarding-job-lifecycle
+Issue-Shape-Id: com.amazonaws.connectcampaigns#AmazonConnectCampaignService
+Issue-Key: connectcampaigns|StartInstanceOnboardingJob|ConflictException
+Issue-Commit: 44bbf79358888366d10de6b934e7daf7fcf849e8
+
+# ConnectCampaigns StartInstanceOnboardingJob is not idempotent: a repeat call while the onboarding job is still in flight is refused with ConflictException instead of reporting the current job status
+
+> _Note: this issue was identified against the code base at commit `44bbf79358888366d10de6b934e7daf7fcf849e8`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+StartInstanceOnboardingJob
+
+## Description
+One net-new root cause in the ConnectCampaigns v1 crate (services/service-com-amazonaws-connectcampaigns-amazonconnectcampaignservice). CONTEXT: the open issue 20261103T034551Z-connectcampaigns-v1-control-plane-reserved-aws-tag-keys.md owns a DIFFERENT onboarding defect — its Cause 5 is only the WORDING of the already-onboarded ConflictException (generic doc sentence instead of "Instance <id> under account <account> is already onboarded.") for an instance whose onboarding has long completed. It does not describe the cause below, which is that the refusal is issued AT ALL for a repeat call on a job the service is still running, i.e. that the operation is not idempotent. The checks the suite marked ALREADY FILED (UpdateCampaignDialerConfig stub) and OWNED (by 20261103T034551Z and 20261022T145747Z) are deliberately not re-filed here.
+
+=== Cause 1 of 1: a repeat StartInstanceOnboardingJob on an instance whose onboarding job is still in progress is refused with ConflictException instead of answering 200 with that job's status ===
+AWS: Smithy: StartInstanceOnboardingJob is PUT /connect-instance/{connectInstanceId}/onboarding, success code 200, output connectInstanceOnboardingJobStatus (InstanceOnboardingJobStatus), and the operation carries the @idempotent trait — a repeated PUT of the same onboarding request is defined to be safe to re-send. Recorded behavior: a second StartInstanceOnboardingJob issued immediately after the first, with the same connectInstanceId and the same encryptionConfig={"enabled": false}, is ACCEPTED (HTTP 200) and the response's connectInstanceOnboardingJobStatus reports the CURRENT job — connectInstanceId equal to the one in the request and status IN_PROGRESS, or SUCCEEDED when the onboarding has already finished; never FAILED — and the first job is left undisturbed (it still reaches SUCCEEDED, and GetConnectInstanceConfig then reports the config for that instance). AWS refuses a repeat start only once the instance is fully onboarded, and then with its own sentence "Instance <connectInstanceId> under account <accountId> is already onboarded." (fixed text "Instance ", " under account ", " is already onboarded."; the instance id comes from the request and the account id from the caller) — that wording is the subject of Cause 5 of 20261103T034551Z and is not re-filed here.
+Emulator: the second call is refused with HTTP 409, code `ConflictException`, message "The request could not be processed because of conflict in the current state of the resource." The refusal is unconditional on job status: crate::state::ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState::start_instance_onboarding returns OnboardingRefused::AlreadyOnboarded as soon as `instance_onboarding` holds ANY record for that instance id — including a record whose status_at(now) is still the in-progress value — and the handler maps that straight to ConflictException, so no repeat call can ever succeed and the in-flight job's status is never reported back through this operation.
+Why: a client that re-sends the PUT — which the @idempotent trait and every SDK/retry layer treat as safe, and which is the normal reaction to a timed-out or lost first response — gets a hard 409 from the emulator where AWS returns 200 and the current job status. Onboarding driver code that starts-then-confirms through this one call, or that retries on a transient error, cannot complete at all against the emulator, and a caller cannot tell a genuine already-onboarded conflict from an ordinary retry of a job still running.
+Fix: the onboarding-start decision in the service state (the AlreadyOnboarded branch of start_instance_onboarding) together with its use in the StartInstanceOnboardingJob handler: a record whose job has not finished must be re-reported as the operation's successful output rather than refused, and the request's encryptionConfig must be left as first persisted (nothing written on the repeat). Only a record whose job has already SUCCEEDED keeps the ConflictException branch.
+Traces: connectcampaigns.instance-onboarding-job-lifecycle.
+
+## Evidence
+Cause 1 — StartInstanceOnboardingJob(connectInstanceId=<an ACTIVE Connect instance>, encryptionConfig={'enabled': False}) called twice back to back:
+  Expected (AWS): first call HTTP 200; second call HTTP 200 with connectInstanceOnboardingJobStatus = {'connectInstanceId': <the id from the request>, 'status': 'IN_PROGRESS' or 'SUCCEEDED'}; the original job then still reaches SUCCEEDED and GetConnectInstanceConfig reports that instance's config.
+  Actual (emulator): the second call is refused — HTTP 409, code ConflictException, message "The request could not be processed because of conflict in the current state of the resource." (botocore: "An error occurred (ConflictException) when calling the StartInstanceOnboardingJob operation: The request could not be processed because of conflict in the current state of the resource."). Source: state.rs start_instance_onboarding refuses on `instance_onboarding.contains_key(connect_instance_id)` regardless of the record's status (state.rs:446-448), surfaced as ConflictException in ops/start_instance_onboarding_job.rs:265-274.
+  Replay: connectcampaigns.instance-onboarding-job-lifecycle [error] — the check aborts on this refusal at its duplicate-start step, before its later assertions (config read, config delete, re-onboarding) are reached.
+  Note the status code and error code here are the modeled ones; the divergence is that the call is refused instead of accepted. The generic message text on the already-onboarded refusal is a separate, already-filed defect (Cause 5 of 20261103T034551Z-connectcampaigns-v1-control-plane-reserved-aws-tag-keys.md).
+
+## Steps to Reproduce
+1. Boot the emulator from this branch and point boto3 clients `connect` and `connectcampaigns` at it.
+2. Create a Connect instance (connect.create_instance(IdentityManagementType='CONNECT_MANAGED', InstanceAlias=<unique>, InboundCallsEnabled=True, OutboundCallsEnabled=True)) and poll connect.describe_instance until InstanceStatus == 'ACTIVE'.
+3. campaigns.start_instance_onboarding_job(connectInstanceId=<instance id>, encryptionConfig={'enabled': False}) — succeeds.
+4. Immediately call the SAME request again: campaigns.start_instance_onboarding_job(connectInstanceId=<instance id>, encryptionConfig={'enabled': False}). Observe HTTP 409 ConflictException "The request could not be processed because of conflict in the current state of the resource." instead of HTTP 200 whose connectInstanceOnboardingJobStatus reports {'connectInstanceId': <instance id>, 'status': 'IN_PROGRESS' or 'SUCCEEDED'}.
+5. Confirm the first job was not disturbed: campaigns.get_instance_onboarding_job_status(connectInstanceId=<instance id>) still reaches SUCCEEDED.
+6. Re-replay connectcampaigns.instance-onboarding-job-lifecycle to confirm the fix (the check continues into GetConnectInstanceConfig, DeleteConnectInstanceConfig and re-onboarding, which also depend on Cause 4 of 20261103T034551Z).
