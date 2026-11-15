@@ -2126,3 +2126,21 @@ mod zz_probe_whole_emulator;
 // fails every suite in this target. `tests/all.rs` is a test-target CRATE ROOT, so a bare
 // `all/every_suite_file_is_declared.rs` pin these rules, for this file and for every service
 // crate's `tests/all.rs`, so check there rather than leaving a note here. What a suite
+// Single integration-test target for the router: the DECLARATION LIST of its cross-service
+// sorts; what that suite covers, and why it drives the assembled router rather than one
+// service crate, belongs in that suite's OWN module doc, where it is read beside the test it
+// explains, and a note about THIS file belongs in `all/appended_notes.rs`, declared below
+// like any other suite.
+// the declarations is `E0753` and compiles no suite of this target — which is what the tail
+// of this file, grown by concurrent landings into re-typed copies of this header, had come
+// to do. With none anywhere in the file, no merge of two landings can leave one there.
+// A suite no `mod` names is compiled nowhere and its tests never run; a suite left at the
+// top level of `tests/` fails the build; a suite declared twice is `E0428`. Each of those
+// fails EVERY suite of this target, so four suites pin the rules rather than restating them
+// here: `all/all_rs_declares_each_suite_once.rs`,
+// `all/every_suite_file_is_declared.rs` — for this file and for every service crate's
+// `tests/all.rs`.
+// A note a landing appends to a suite wraps without the indentation
+// `clippy::doc_lazy_continuation` asks of a doc list item, so the lint is allowed here; an
+// inner attribute, like an inner doc comment, is legal only before the first item, so it
+// stands here rather than in the list below.

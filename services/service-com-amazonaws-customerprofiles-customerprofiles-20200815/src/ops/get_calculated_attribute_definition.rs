@@ -187,22 +187,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // Everything but `Status` and `Readiness` is reported exactly as the create
-        // stored it; those two say how far the indexing of the definition's historical
-        // data has got, so they are computed from the clock on every read.
+        // stored it — the configuration structures and the tag map present for as long as
+        // the definition exists, through the same projection the create answers with;
+        // those two say how far the indexing of the definition's historical data has got,
+        // so they are computed from the clock on every read.
         Ok(GetCalculatedAttributeDefinitionOutput {
             calculated_attribute_name: Some(stored.name.clone()),
-            display_name: stored.display_name.clone(),
+            display_name: Some(stored.display_name.clone()),
             description: stored.description.clone(),
             created_at: Some(crate::state::to_date_time(stored.created_at)),
             last_updated_at: Some(crate::state::to_date_time(stored.last_updated_at)),
             statistic: Some(stored.statistic.clone()),
-            filter: stored.filter.clone(),
-            conditions: stored.conditions.clone(),
+            filter: stored.reported_filter(),
+            conditions: stored.reported_conditions(),
             attribute_details: Some(stored.attribute_details.clone()),
             use_historical_data: stored.use_historical_data,
             status: Some(stored.status(now)),
             readiness: Some(stored.readiness(now)),
-            tags: stored.tags.clone(),
+            tags: stored.reported_tags(),
         })
     }
 }

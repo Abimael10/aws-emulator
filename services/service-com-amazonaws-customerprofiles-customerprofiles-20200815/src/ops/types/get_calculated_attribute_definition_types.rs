@@ -27,8 +27,11 @@ pub struct GetCalculatedAttributeDefinitionOutput {
     pub created_at: Option<::aws_smithy_types::DateTime>,
     pub last_updated_at: Option<::aws_smithy_types::DateTime>,
     pub statistic: Option<String>,
-    pub filter: Option<Filter>,
-    pub conditions: Option<Conditions>,
+    // `Filter` and `Conditions` are reported PRESENT for as long as the definition
+    // exists, with the members it left unset carried as JSON null — see
+    // `types::reported_configuration`.
+    pub filter: Option<ReportedFilter>,
+    pub conditions: Option<ReportedConditions>,
     pub attribute_details: Option<AttributeDetails>,
     pub use_historical_data: Option<bool>,
     pub status: Option<String>,

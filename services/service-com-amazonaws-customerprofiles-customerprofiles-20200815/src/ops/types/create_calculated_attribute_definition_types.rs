@@ -33,8 +33,11 @@ pub struct CreateCalculatedAttributeDefinitionOutput {
     pub display_name: Option<String>,
     pub description: Option<String>,
     pub attribute_details: Option<AttributeDetails>,
-    pub conditions: Option<Conditions>,
-    pub filter: Option<Filter>,
+    // `Conditions` and `Filter` are reported PRESENT for as long as the definition
+    // exists, with the members it left unset carried as JSON null — see
+    // `types::reported_configuration`.
+    pub conditions: Option<ReportedConditions>,
+    pub filter: Option<ReportedFilter>,
     pub statistic: Option<String>,
     pub created_at: Option<::aws_smithy_types::DateTime>,
     pub last_updated_at: Option<::aws_smithy_types::DateTime>,

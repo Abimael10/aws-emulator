@@ -19,8 +19,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     Address, AttributeDetails, Conditions, CreateCalculatedAttributeDefinitionInput,
     DataStoreResponse, DomainStats, Filter, MatchingRequest, MatchingResponse, ObjectTypeField,
-    ObjectTypeKey, Profile, Readiness, RecommenderSchemaField, ResultsSummary,
-    RuleBasedMatchingRequest, RuleBasedMatchingResponse,
+    ObjectTypeKey, Profile, Readiness, RecommenderSchemaField, ReportedConditions, ReportedFilter,
+    ResultsSummary, RuleBasedMatchingRequest, RuleBasedMatchingResponse,
 };
 
 /// The resources the tagging operations address by ARN, and the `resourceArn` check the
@@ -190,6 +190,11 @@ pub const READINESS_PREPARING: &str = "PREPARING";
 /// `ReadinessStatus` once every object the calculated attribute covers is indexed, so the
 /// attribute is ready for use.
 pub const READINESS_COMPLETED: &str = "COMPLETED";
+
+/// `Readiness$Message` for a calculated attribute whose historical data is all indexed:
+/// the service's fixed sentence for the ready state, which interpolates nothing — the
+/// whole value is this text.
+pub const CALCULATED_ATTRIBUTE_READY_MESSAGE: &str = "Calculated Attribute is ready to use.";
 
 /// The `DataExpiry` an upload job gets when the request carries none.
 /// `CreateUploadJobRequest$DataExpiry` documents it: "The expiry duration for the
@@ -554,8 +559,10 @@ pub struct StoredCalculatedAttribute {
     /// `CalculatedAttributeName`, as stored (also this record's key in
     /// [`Domain::calculated_attributes`]).
     pub name: String,
-    /// `DisplayName`, as stored.
-    pub display_name: Option<String>,
+    /// `DisplayName`: the definition's human label. Every definition carries one — a
+    /// create that supplies none labels the definition with its own
+    /// `CalculatedAttributeName` — so this is stored, and reported, for every definition.
+    pub display_name: String,
     /// `Description`, as stored.
     pub description: Option<String>,
     /// `AttributeDetails`, as stored: the expression and the attributes it names.
@@ -588,15 +595,22 @@ impl StoredCalculatedAttribute {
     /// already-validated request itself so no member can be transposed on the way in, with
     /// the instant its historical-data indexing falls due. A definition that did not ask
     /// for historical data has nothing to index, so that instant is `now`.
+    ///
+    /// A create that supplies no `DisplayName` leaves the definition labelled by its own
+    /// `CalculatedAttributeName`: the definition's label is part of every definition, and
+    /// the name is the only label the request gave it.
     pub fn from_request(input: CreateCalculatedAttributeDefinitionInput, now: SystemTime) -> Self {
         let indexed_at = if input.use_historical_data == Some(true) {
             now + HISTORICAL_DATA_INDEXING_SPAN
         } else {
             now
         };
+        let display_name = input
+            .display_name
+            .unwrap_or_else(|| input.calculated_attribute_name.clone());
         Self {
             name: input.calculated_attribute_name,
-            display_name: input.display_name,
+            display_name,
             description: input.description,
             attribute_details: input.attribute_details,
             conditions: input.conditions,
@@ -625,24 +639,47 @@ impl StoredCalculatedAttribute {
     }
 
     /// `Readiness` as the wire reports it: how far the indexing has got, as a percentage
-    /// in 0..=100 (the range `Readiness$ProgressPercentage` declares), and a sentence
+    /// in 0..=100 (the range `Readiness$ProgressPercentage` declares), and the sentence
     /// saying whether the attribute can be used yet.
     ///
-    /// `Readiness$Message` is documented only as "Any customer messaging", so the two
-    /// sentences below are CHOSEN wording, in the same form as the one
+    /// The ready sentence is [`CALCULATED_ATTRIBUTE_READY_MESSAGE`], the service's own
+    /// fixed text. `Readiness$Message` is documented only as "Any customer messaging", and
+    /// the service's wording for an attribute still being indexed is not known, so the
+    /// second sentence below stays CHOSEN wording, in the same form as the one
     /// [`Domain::data_store_response`] reports for a data store.
     pub fn readiness(&self, now: SystemTime) -> Readiness {
         Readiness {
             progress_percentage: Some(progress_percentage(self.created_at, self.indexed_at, now)),
             message: Some(
                 if self.is_indexed(now) {
-                    "All historical data has been processed."
+                    CALCULATED_ATTRIBUTE_READY_MESSAGE
                 } else {
                     "Historical data is being processed."
                 }
                 .to_string(),
             ),
         }
+    }
+
+    /// `Conditions` as a definition projection reports it: PRESENT for as long as the
+    /// definition exists, carrying the conditions it configured and `null` for each
+    /// condition member it left unset — see [`crate::ops::types::ReportedConditions`].
+    pub fn reported_conditions(&self) -> Option<ReportedConditions> {
+        Some(ReportedConditions(self.conditions.clone()))
+    }
+
+    /// `Filter` as a definition projection reports it: PRESENT for as long as the
+    /// definition exists, carrying the filter it configured and `null` for each filter
+    /// member it left unset — see [`crate::ops::types::ReportedFilter`].
+    pub fn reported_filter(&self) -> Option<ReportedFilter> {
+        Some(ReportedFilter(self.filter.clone()))
+    }
+
+    /// `Tags` as a definition projection reports it: the tag map this definition carries,
+    /// PRESENT and empty for a definition that carries none, exactly as
+    /// [`Domain::reported_tags`] reports a domain's.
+    pub fn reported_tags(&self) -> Option<HashMap<String, String>> {
+        Some(self.tags.clone().unwrap_or_default())
     }
 }
 

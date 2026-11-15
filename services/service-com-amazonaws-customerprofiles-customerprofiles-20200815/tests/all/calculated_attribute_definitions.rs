@@ -489,7 +489,7 @@ async fn a_create_of_a_held_name_is_refused_and_changes_nothing() {
                 read.get(member)
             );
         }
-        for member in ["DisplayName", "Description", "UseHistoricalData", "Tags"] {
+        for member in ["Description", "UseHistoricalData"] {
             if first.get(member).is_none() {
                 assert_eq!(
                     read.get(member),
@@ -498,6 +498,27 @@ async fn a_create_of_a_held_name_is_refused_and_changes_nothing() {
                     read.get(member)
                 );
             }
+        }
+        // Every definition carries a display name, so a winner that supplied none is
+        // labelled by its own name — and the loser's display name is not adopted.
+        if first.get("DisplayName").is_none() {
+            assert_eq!(
+                read.get("DisplayName").and_then(Value::as_str),
+                Some(name.as_str()),
+                "case {case:?}: the refused create must leave the winner labelled {name:?}, \
+                 got {:?}",
+                read.get("DisplayName")
+            );
+        }
+        // `Tags` is reported for as long as the definition exists, so the loser adding no
+        // tag shows as the EMPTY map rather than as an absent member.
+        if first.get("Tags").is_none() {
+            assert_eq!(
+                read.get("Tags"),
+                Some(&json!({})),
+                "case {case:?}: the refused create must leave the tag map empty, got {:?}",
+                read.get("Tags")
+            );
         }
     }
 

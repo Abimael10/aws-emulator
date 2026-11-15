@@ -15,6 +15,8 @@
 mod batch_get_profile;
 #[path = "all/batch_put_profile_object.rs"]
 mod batch_put_profile_object;
+#[path = "all/calculated_attribute_definition_projection.rs"]
+mod calculated_attribute_definition_projection;
 #[path = "all/calculated_attribute_definitions.rs"]
 mod calculated_attribute_definitions;
 #[path = "all/calculated_attribute_readiness.rs"]

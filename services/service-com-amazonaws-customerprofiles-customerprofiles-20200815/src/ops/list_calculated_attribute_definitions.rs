@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     name.clone(),
                     ListCalculatedAttributeDefinitionItem {
                         calculated_attribute_name: Some(stored.name.clone()),
-                        display_name: stored.display_name.clone(),
+                        display_name: Some(stored.display_name.clone()),
                         description: stored.description.clone(),
                         created_at: Some(crate::state::to_date_time(stored.created_at)),
                         last_updated_at: Some(crate::state::to_date_time(stored.last_updated_at)),

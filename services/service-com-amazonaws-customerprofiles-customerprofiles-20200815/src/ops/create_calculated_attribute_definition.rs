@@ -229,21 +229,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored = crate::state::StoredCalculatedAttribute::from_request(input, now);
 
         // The response is the record that was just stored, so it is the same definition
-        // the readers serve.
+        // the readers serve: the configuration structures and the tag map are reported
+        // present for as long as the definition exists, and `Status` / `Readiness` are
+        // resolved from the clock.
         let output = CreateCalculatedAttributeDefinitionOutput {
             calculated_attribute_name: Some(stored.name.clone()),
-            display_name: stored.display_name.clone(),
+            display_name: Some(stored.display_name.clone()),
             description: stored.description.clone(),
             attribute_details: Some(stored.attribute_details.clone()),
-            conditions: stored.conditions.clone(),
-            filter: stored.filter.clone(),
+            conditions: stored.reported_conditions(),
+            filter: stored.reported_filter(),
             statistic: Some(stored.statistic.clone()),
             created_at: Some(crate::state::to_date_time(stored.created_at)),
             last_updated_at: Some(crate::state::to_date_time(stored.last_updated_at)),
             use_historical_data: stored.use_historical_data,
             status: Some(stored.status(now)),
             readiness: Some(stored.readiness(now)),
-            tags: stored.tags.clone(),
+            tags: stored.reported_tags(),
         };
 
         domain

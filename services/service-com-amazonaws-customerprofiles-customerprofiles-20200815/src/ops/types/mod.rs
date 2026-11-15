@@ -115,6 +115,9 @@ pub mod put_integration_types;
 pub mod put_profile_object_type_types;
 pub mod put_profile_object_types;
 pub mod put_segment_subscription_types;
+/// The configuration structures a calculated-attribute definition response carries even
+/// when the definition configured none of them (not a generated module).
+pub mod reported_configuration;
 pub mod search_profiles_types;
 pub mod search_recommendations_types;
 pub mod shared_types;
@@ -333,6 +336,8 @@ pub use put_profile_object_type_types::*;
 pub use put_profile_object_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use put_segment_subscription_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use reported_configuration::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use search_profiles_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
