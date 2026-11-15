@@ -148,45 +148,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // `EncryptionConfiguration`'s model doc: `kmsKeyArn` "is required when
-        // `encryptionStrategy` is CUSTOMER_MANAGED and must be absent when it is
-        // AWS_OWNED; a mismatch is a ValidationException rather than a silently
-        // ignored field". Omitting the whole structure is "equivalent to passing
-        // `encryptionStrategy` AWS_OWNED" per the `encryptionConfiguration` member doc.
+        // The `encryptionStrategy`/`kmsKeyArn` pairing is a property of
+        // `EncryptionConfiguration` itself, so the refusal comes from the shared rule
+        // every operation accepting one applies. Omitting the whole structure is
+        // "equivalent to passing `encryptionStrategy` AWS_OWNED" per the
+        // `encryptionConfiguration` member doc.
         let encryption_configuration = match input.encryption_configuration {
             None => crate::state::aws_owned_encryption(),
             Some(requested) => {
-                let strategy = requested.encryption_strategy.as_str();
-                if !ENCRYPTION_STRATEGY_VALUES.contains(&strategy) {
-                    return Err(CreateSpaceErrorModeled::ValidationException(ValidationException {
-                        message: format!(
-                            "encryptionConfiguration.encryptionStrategy: '{strategy}' is not a valid EncryptionStrategy; expected one of [{}]",
-                            ENCRYPTION_STRATEGY_VALUES.join(", ")
-                        ),
-                        error_code: None,
-                    })
+                if let Some(message) = crate::state::encryption_configuration_rejection(&requested) {
+                    return Err(CreateSpaceErrorModeled::ValidationException(
+                        ValidationException {
+                            message,
+                            error_code: None,
+                        },
+                    )
                     .into());
                 }
-                let customer_managed = strategy == crate::state::ENCRYPTION_STRATEGY_CUSTOMER_MANAGED;
-                match (customer_managed, requested.kms_key_arn.is_some()) {
-                    (true, false) => {
-                        return Err(CreateSpaceErrorModeled::ValidationException(ValidationException {
-                            message: "encryptionConfiguration.kmsKeyArn is required when encryptionStrategy is CUSTOMER_MANAGED".to_string(),
-                            error_code: None,
-                        })
-                        .into())
-                    }
-                    (false, true) => {
-                        return Err(CreateSpaceErrorModeled::ValidationException(ValidationException {
-                            message: format!(
-                                "encryptionConfiguration.kmsKeyArn must be omitted when encryptionStrategy is {strategy}"
-                            ),
-                            error_code: None,
-                        })
-                        .into())
-                    }
-                    _ => requested,
-                }
+                requested
             }
         };
 

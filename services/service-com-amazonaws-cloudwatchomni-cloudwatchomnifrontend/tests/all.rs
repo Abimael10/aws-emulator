@@ -29,6 +29,8 @@ mod principal_search;
 mod probe;
 #[path = "all/response_shaping.rs"]
 mod response_shaping;
+#[path = "all/space_update.rs"]
+mod space_update;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_message_wording.rs"]

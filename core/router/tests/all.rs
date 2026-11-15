@@ -1917,3 +1917,16 @@ mod zz_probe_whole_emulator;
 // `clippy::doc_lazy_continuation` asks of a doc list item, so the lint is allowed for the
 // whole target. An inner attribute, like an inner doc comment, is legal only before the first
 // item, so it stands in this header rather than in the list.
+// sorted by name, and no other line — so two branches landing at once insert two lines in
+// two places and have no prose to duplicate, re-word or mistype. Put a new suite at
+// `tests/all/<name>.rs` and insert its pair into the sorted list below.
+// no merge of two landings can leave one there. An inner attribute (`#![..]`) is legal only
+// there too, so this file carries none. A suite declared twice is `E0428`, and a suite file
+// no `mod` names is compiled nowhere. `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` pin all of it, for
+// this file and for every service crate's `tests/all.rs`, so check there rather than leaving
+// a note here.
+// `tests/all.rs` is a test-target CRATE ROOT, where a bare `mod` would resolve to a SIBLING
+// (`tests/<name>.rs`) that the layout check refuses: the `#[path]` above each declaration is
+// belongs in that suite's OWN module doc, where it is read beside the test it explains; a
+// note about THIS file belongs in `all/appended_notes.rs`.

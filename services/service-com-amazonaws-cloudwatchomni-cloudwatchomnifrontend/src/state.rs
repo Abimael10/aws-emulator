@@ -20,7 +20,8 @@ use crate::ops::types::{
     AccessGrant, AccessGrantPrincipal, AccessProfile, Alert, AlertStateInfo, Domain,
     EncryptionConfiguration, IdentityProviderConfiguration, NotificationRule, OmniDashboard,
     OmniDashboardSummary, Rule, Space, SpaceSummary, ALERT_STATE_VALUES, COMPARATOR_VALUES,
-    NOTIFICATION_TARGET_TYPE_VALUES, QUERY_LANGUAGE_VALUES, THRESHOLD_MODE_VALUES,
+    ENCRYPTION_STRATEGY_VALUES, NOTIFICATION_TARGET_TYPE_VALUES, QUERY_LANGUAGE_VALUES,
+    THRESHOLD_MODE_VALUES,
 };
 
 /// The region a resource is recorded in when the request carries no SigV4
@@ -949,6 +950,46 @@ pub fn aws_owned_encryption() -> EncryptionConfiguration {
         encryption_strategy: ENCRYPTION_STRATEGY_AWS_OWNED.to_string(),
         kms_key_arn: None,
     }
+}
+
+/// Why `requested` is not an admissible `EncryptionConfiguration`, or `None` when it is.
+///
+/// `EncryptionConfiguration`'s model doc: `kmsKeyArn` "is required when
+/// `encryptionStrategy` is CUSTOMER_MANAGED and must be absent when it is AWS_OWNED; a
+/// mismatch is a ValidationException rather than a silently ignored field". That pairing
+/// is a property of the STRUCTURE rather than of one operation, so every operation that
+/// accepts one — a create that sets the encryption and an update that changes it — states
+/// the same refusal here instead of re-spelling it.
+pub fn encryption_configuration_rejection(requested: &EncryptionConfiguration) -> Option<String> {
+    let strategy = requested.encryption_strategy.as_str();
+    if !ENCRYPTION_STRATEGY_VALUES.contains(&strategy) {
+        return Some(format!(
+            "encryptionConfiguration.encryptionStrategy: '{strategy}' is not a valid \
+             EncryptionStrategy; expected one of [{}]",
+            ENCRYPTION_STRATEGY_VALUES.join(", ")
+        ));
+    }
+    let customer_managed = strategy == ENCRYPTION_STRATEGY_CUSTOMER_MANAGED;
+    match (customer_managed, requested.kms_key_arn.is_some()) {
+        (true, false) => Some(
+            "encryptionConfiguration.kmsKeyArn is required when encryptionStrategy is \
+             CUSTOMER_MANAGED"
+                .to_string(),
+        ),
+        (false, true) => Some(format!(
+            "encryptionConfiguration.kmsKeyArn must be omitted when encryptionStrategy is \
+             {strategy}"
+        )),
+        _ => None,
+    }
+}
+
+/// Whether two `EncryptionConfiguration`s describe the same encryption.
+///
+/// The wire shape derives no `PartialEq`, and the structure is exactly its strategy and
+/// its optional key, so the comparison is over those two members.
+pub fn same_encryption(left: &EncryptionConfiguration, right: &EncryptionConfiguration) -> bool {
+    left.encryption_strategy == right.encryption_strategy && left.kms_key_arn == right.kms_key_arn
 }
 
 /// The tag map a resource reports.
