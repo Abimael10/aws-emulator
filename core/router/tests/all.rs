@@ -1949,3 +1949,20 @@ mod cloudformation_cloudfront_published_edge_address;
 // past the declarations is `E0753` and compiles no suite of this target. With no inner doc
 // note here; `all/appended_notes.rs` records what the notes landings had appended to this file
 // said.
+// suite, sorted by name, and no other line — no line between the pairs and none after the
+// last one — so two branches landing at once insert two lines in two places and have no prose
+// to duplicate, re-word or mistype. That is what had gone wrong here: the file had grown
+// hundreds of re-typed copies of its own header, many of them written as inner doc comments
+// past the first item (`E0753`), so no suite of this target compiled at all.
+// deliberate: an inner doc comment (`//!`) is legal only before the first item, so with none
+// anywhere in the file, no merge of two landings can leave one past the first item. An inner
+// attribute is legal only there as well, which is why the `#![allow]` above stands at the top
+// rather than in the list below.
+// A suite file no `mod` here names is compiled nowhere and its tests never run (this crate's
+// build script refuses the build for it); a suite left at the top level of `tests/` is a test
+// target of its own, which the layout check refuses; and a suite declared twice is `E0428`.
+// SIBLING of this file: the `#[path]` is what points each declaration into `tests/all/`.
+// the test it explains; a note about THIS file belongs in `all/appended_notes.rs`. The suites
+// `all/every_suite_file_is_declared.rs` check the rules above rather than restating them.
+#[path = "all/ses_configuration_set_cursor_shared_across_v1_and_v2.rs"]
+mod ses_configuration_set_cursor_shared_across_v1_and_v2;

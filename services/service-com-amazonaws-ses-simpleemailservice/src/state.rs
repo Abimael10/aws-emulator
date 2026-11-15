@@ -3460,6 +3460,27 @@ pub fn configuration_set_registry<Eng: Send + Sync + 'static>(
         >)
 }
 
+/// The `NextToken` the configuration-set listing hands back to resume at `cursor` — the set
+/// the NEXT page starts at — and the reading of one it is handed.
+///
+/// The registry's, not this surface's: the account's configuration-set APIs page one
+/// collection, so one token form serves them all
+/// ([`::service_common::ses_configuration_sets::page_token`]).
+pub use ::service_common::ses_configuration_sets::{
+    page_cursor as configuration_set_page_cursor, page_token as configuration_set_page_token,
+};
+
+/// The key this account's configuration-set listing tokens are authenticated under, or
+/// `None` when the engine holds no registry at all.
+///
+/// Taken by value — [`PageTokenKey`] is `Copy` — so a listing reads the key and then goes on
+/// to read the sets it is about to report without holding the registry's lock.
+pub fn configuration_set_page_token_key<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<PageTokenKey> {
+    Some(configuration_set_registry(engine)?.lock().page_token_key())
+}
+
 /// Bring this service's configuration-set store and the account's configuration-set
 /// registry back into agreement at `now`, so every API over the account's configuration
 /// sets answers for ONE set of them.

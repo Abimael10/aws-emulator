@@ -29,12 +29,20 @@
 //! declares, and a publication carries the whole set of them, so one surface's write is the
 //! account's configuration rather than a value only that surface reports.
 //!
+//! Because the surfaces page ONE collection, the continuation token of a configuration-set
+//! listing is minted HERE as well ([`page_token`]): it is authenticated under the registry's
+//! own key ([`SesConfigurationSetDirectory::page_token_key`]), so a token either surface's
+//! listing issued names a position in that one collection and continues it on either
+//! surface, while a value no listing issued is refused by both.
+//!
 //! The registry is BOUNDED at [`MAX_REGISTERED_CONFIGURATION_SETS`], the configuration-set
 //! quota SES documents per account per Region, so a caller looping on a create cannot grow
 //! it without end.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
+
+use super::page_tokens::PageTokenKey;
 
 /// The configuration sets one account may hold, and so the ceiling on this registry: SES
 /// documents a limit of 10,000 configuration sets per account per Region, and a publication
@@ -120,6 +128,11 @@ pub struct SesConfigurationSetDirectory {
     /// When each set was first published, which is what a surface that ADOPTS a set reports
     /// as its creation instant rather than stamping the instant it happened to adopt it.
     created: BTreeMap<String, SystemTime>,
+    /// The secret this account's configuration-set listing tokens are authenticated under,
+    /// drawn from the system's randomness when the registry is created and never revealed.
+    /// One key for the account's one configuration-set collection, which is what lets either
+    /// surface verify a token the other minted.
+    page_token_key: PageTokenKey,
 }
 
 impl SesConfigurationSetDirectory {
@@ -184,6 +197,14 @@ impl SesConfigurationSetDirectory {
     /// Whether the account holds no configuration set at all.
     pub fn is_empty(&self) -> bool {
         self.sets.is_empty()
+    }
+
+    /// The key this account's configuration-set listing tokens are authenticated under.
+    ///
+    /// Handed out by value — [`PageTokenKey`] is `Copy` — so a listing can take the key off
+    /// the registry and go on to read the records it is about to report.
+    pub fn page_token_key(&self) -> PageTokenKey {
+        self.page_token_key
     }
 
     /// Bring one surface's own configuration-set `table` and this registry back into
@@ -306,6 +327,31 @@ pub trait AccountConfigurationSetRecord: Sized {
     /// of it has been asked for; the shared options are then taken on by
     /// [`Self::take_shared`], which runs for every set both sides hold.
     fn adopt(record: &SesConfigurationSetRecord, created_at: SystemTime) -> Self;
+}
+
+/// The `NextToken` a configuration-set listing hands back to resume at `cursor` — the set
+/// the NEXT page starts at.
+///
+/// Opaque: the caller reads no position out of it and hands it back verbatim. Authenticated
+/// under the registry's key, so a value the caller assembled names no position at all
+/// ([`page_cursor`]), and rendered as base64, which travels in both surfaces' bodies.
+///
+/// ONE form for the account's one configuration-set collection, which is what lets a token
+/// minted by either surface's listing continue that collection on either surface.
+pub fn page_token(key: &PageTokenKey, cursor: &str) -> String {
+    ::aws_smithy_types::base64::encode(key.mint(cursor))
+}
+
+/// The configuration set a token of the account's configuration-set listing resumes AT, or
+/// `None` for any value no listing of it minted: one that is not base64, one whose
+/// authenticator does not match the cursor it travels with, and one minted under another
+/// registry's key.
+///
+/// The caller refuses such a token rather than restarting the listing at some other
+/// position.
+pub fn page_cursor(key: &PageTokenKey, token: &str) -> Option<String> {
+    let bytes = ::aws_smithy_types::base64::decode(token).ok()?;
+    key.cursor_of(&bytes)
 }
 
 #[cfg(test)]
@@ -522,6 +568,60 @@ mod tests {
             "case at the quota: expected the registry to stay at its ceiling, got {}",
             directory.len()
         );
+    }
+
+    #[test]
+    fn a_page_token_names_a_position_only_under_the_registry_that_minted_it() {
+        let directory = SesConfigurationSetDirectory::default();
+        let other = SesConfigurationSetDirectory::default();
+        let key = directory.page_token_key();
+        // Cursors spanning the set names a listing cuts a page at: one character, a plain
+        // name, and the punctuation `ConfigurationSetName` admits.
+        for cursor in ["a", "orders", "prod-emea_01", "Set.With.Dots"] {
+            let token = page_token(&key, cursor);
+            assert_eq!(
+                page_cursor(&key, &token).as_deref(),
+                Some(cursor),
+                "case {cursor:?}: expected the cursor to round-trip, got {:?}",
+                page_cursor(&key, &token)
+            );
+            assert_eq!(
+                page_cursor(&other.page_token_key(), &token),
+                None,
+                "case {cursor:?}: a token of another registry must name no position, got {:?}",
+                page_cursor(&other.page_token_key(), &token)
+            );
+            // Every value a caller could send that this registry did not mint.
+            for (case, made_up) in [
+                ("the cursor sent bare", cursor.to_string()),
+                ("an empty token", String::new()),
+                ("not base64", "not a token!".to_string()),
+                (
+                    "a token with its last byte dropped",
+                    ::aws_smithy_types::base64::encode(
+                        &key.mint(cursor)[..key.mint(cursor).len() - 1],
+                    ),
+                ),
+                (
+                    "a made-up authenticator",
+                    ::aws_smithy_types::base64::encode(
+                        [
+                            vec![0_u8; crate::page_tokens::AUTHENTICATOR_BYTES],
+                            cursor.as_bytes().to_vec(),
+                        ]
+                        .concat()
+                        .as_slice(),
+                    ),
+                ),
+            ] {
+                assert_eq!(
+                    page_cursor(&key, &made_up),
+                    None,
+                    "case {cursor:?} / {case}: expected no position, got {:?}",
+                    page_cursor(&key, &made_up)
+                );
+            }
+        }
     }
 
     #[test]

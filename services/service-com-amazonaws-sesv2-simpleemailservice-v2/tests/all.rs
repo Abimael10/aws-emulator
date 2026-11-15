@@ -33,6 +33,8 @@ mod boundary_validation_message;
 mod cloud_watch_dimension_source;
 #[path = "all/cloud_watch_event_destination_delivery.rs"]
 mod cloud_watch_event_destination_delivery;
+#[path = "all/configuration_set_cursor_shared_across_surfaces.rs"]
+mod configuration_set_cursor_shared_across_surfaces;
 #[path = "all/configuration_set_deletion.rs"]
 mod configuration_set_deletion;
 #[path = "all/configuration_set_event_destination_capacity.rs"]

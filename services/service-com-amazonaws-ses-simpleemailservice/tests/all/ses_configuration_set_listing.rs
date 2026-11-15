@@ -22,7 +22,8 @@
 
 use crate::harness::{call, element, elements, emulator_over, field, xml_text, Field};
 use service_com_amazonaws_ses_simpleemailservice::state::{
-    encode_page_token, service_state, LISTING_CONFIGURATION_SETS,
+    configuration_set_page_token, configuration_set_page_token_key, encode_page_token,
+    service_state, LISTING_CONFIGURATION_SETS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
@@ -42,9 +43,12 @@ fn emulator_with_store() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// A router holding one configuration set per name in `names`, recorded through
-/// the same state API the handlers use, and the names in the order the listing
+/// the same state API the handlers use, the engine behind it (whose account
+/// registry mints this listing's cursors) and the names in the order the listing
 /// reports them (lexicographic).
-fn emulator_holding(names: &[String]) -> (MultiServiceRouter, Vec<String>) {
+fn emulator_holding_over_engine(
+    names: &[String],
+) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>, Vec<String>) {
     let (router, engine) = emulator_with_store();
     let store = service_state(&*engine).expect("this service has a store on the shared engine");
     for name in names {
@@ -56,6 +60,12 @@ fn emulator_holding(names: &[String]) -> (MultiServiceRouter, Vec<String>) {
     }
     let mut expected = names.to_vec();
     expected.sort();
+    (router, engine, expected)
+}
+
+/// The same router and names, for a case that needs no engine of its own.
+fn emulator_holding(names: &[String]) -> (MultiServiceRouter, Vec<String>) {
+    let (router, _, expected) = emulator_holding_over_engine(names);
     (router, expected)
 }
 
@@ -343,7 +353,9 @@ async fn a_page_size_past_the_ceiling_is_clamped_and_one_below_the_floor_is_refu
 #[tokio::test]
 async fn a_page_token_this_listing_did_not_issue_is_refused() {
     const STORED: usize = 12;
-    let (router, expected) = emulator_holding(&set_names(STORED));
+    let (router, engine, expected) = emulator_holding_over_engine(&set_names(STORED));
+    let token_key = configuration_set_page_token_key(&*engine)
+        .expect("the account's configuration-set registry is on the shared engine");
 
     // The cursor the listing itself hands out is accepted, and resumes the page
     // after the one it was cut from.
@@ -358,12 +370,13 @@ async fn a_page_token_this_listing_did_not_issue_is_refused() {
 
     // Each row is a token shaped unlike anything this listing issues, or one it
     // issued for a different listing or a tampered position.
-    let real = encode_page_token(LISTING_CONFIGURATION_SETS, &expected[3]);
+    let real = configuration_set_page_token(&token_key, &expected[3]);
     let tampered = {
-        let mut bytes = ::hex::decode(&real).expect("an issued token is hex");
+        let mut bytes =
+            ::aws_smithy_types::base64::decode(&real).expect("an issued token is base64");
         let last = bytes.len() - 1;
         bytes[last] ^= 0x01;
-        ::hex::encode(bytes)
+        ::aws_smithy_types::base64::encode(&bytes)
     };
     let rows: Vec<(&str, String)> = vec![
         (
@@ -381,6 +394,10 @@ async fn a_page_token_this_listing_did_not_issue_is_refused() {
         (
             "a cursor of another listing",
             encode_page_token("ListTemplates", &expected[3]),
+        ),
+        (
+            "a cursor of this surface's own other listings",
+            encode_page_token(LISTING_CONFIGURATION_SETS, &expected[3]),
         ),
         // A rejected value is quoted back into the error envelope, so one
         // carrying XML metacharacters must travel escaped rather than breaking
@@ -435,7 +452,7 @@ async fn a_page_token_this_listing_did_not_issue_is_refused() {
     // names where the next page starts, so the listing resumes at the first set
     // at or after it rather than refusing a caller whose page boundary was
     // deleted between calls.
-    let over_a_gap = encode_page_token(LISTING_CONFIGURATION_SETS, &format!("{}-gone", expected[7]));
+    let over_a_gap = configuration_set_page_token(&token_key, &format!("{}-gone", expected[7]));
     let (after_gap, _) = list(&router, None, Some(&over_a_gap)).await;
     assert_eq!(
         after_gap,

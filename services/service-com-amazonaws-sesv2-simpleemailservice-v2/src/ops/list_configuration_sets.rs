@@ -168,16 +168,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok()
             .filter(|size| *size > 0);
 
-        // The token is this operation's own: it names the last set the previous page
-        // reported, so the next page resumes strictly after it.
-        let resume_after = match input.next_token.as_deref() {
+        // The token names the configuration set the NEXT page starts at, and it belongs to
+        // the ACCOUNT's configuration-set listing rather than to this operation: the APIs
+        // over the account's configuration sets page one collection, so a token the classic
+        // surface's `ListConfigurationSets` issued is a position in this listing too (and
+        // the other way round). A value no listing of that collection minted names no
+        // position in it and is refused in this service's one wording for that condition.
+        let Some(token_key) = crate::state::configuration_set_page_token_key(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListConfigurationSets without the account's configuration-set registry",
+            ));
+        };
+        let resume_from = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
-                crate::state::decode_tagged_page_token(
-                    crate::state::CONFIGURATION_SETS_PAGE_TOKEN_TAG,
-                    token,
-                )
-                .ok_or_else(|| bad_request(crate::state::invalid_next_token()))?,
+                crate::state::configuration_set_page_cursor(&token_key, token)
+                    .ok_or_else(|| bad_request(crate::state::invalid_next_token()))?,
             ),
         };
 
@@ -197,22 +203,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect()
         };
 
-        let start = match resume_after.as_deref() {
+        let start = match resume_from.as_deref() {
             None => 0,
-            Some(last) => matching.partition_point(|name| name.as_str() <= last),
+            // The cursor names where the next page STARTS, so a page boundary neither
+            // repeats nor skips an entry even when sets are created or deleted between
+            // calls, and a cursor over a set the account no longer holds resumes at the
+            // first one at or after it.
+            Some(first) => matching.partition_point(|name| name.as_str() < first),
         };
         let remaining = &matching[start..];
         let page = match page_size {
             Some(size) => &remaining[..size.min(remaining.len())],
             None => remaining,
         };
-        // A token only when sets remain behind this page, so a walk terminates.
-        let next_token = page.last().filter(|_| page.len() < remaining.len()).map(|name| {
-            crate::state::encode_tagged_page_token(
-                crate::state::CONFIGURATION_SETS_PAGE_TOKEN_TAG,
-                name,
-            )
-        });
+        // A token only when sets remain behind this page, so a walk terminates; it names
+        // the first of them, which is where the next page begins.
+        let next_token = remaining
+            .get(page.len())
+            .map(|name| crate::state::configuration_set_page_token(&token_key, name));
 
         Ok(ListConfigurationSetsOutput {
             configuration_sets: Some(page.to_vec()),
