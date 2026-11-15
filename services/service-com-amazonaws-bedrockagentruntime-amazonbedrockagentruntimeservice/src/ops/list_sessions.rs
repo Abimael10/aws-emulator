@@ -187,15 +187,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
             Some(token) => match crate::state::decode_next_token(&scope, token) {
                 Some(order) => order,
+                // Stated through the service's ONE invalid-cursor refusal
+                // (`state::invalid_next_token`), so every listing of this service words a
+                // token it did not issue identically and none of them echoes it back.
                 None => {
                     return Err(ListSessionsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(
-                                "nextToken is not a pagination token this service issued for \
-                                 this account's sessions"
-                                    .to_string(),
-                            ),
-                        },
+                        crate::state::invalid_next_token(),
                     )
                     .into());
                 }

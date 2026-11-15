@@ -4,9 +4,10 @@
 //! IMPLEMENTED: stores one invocation step, payload union and all, under the named
 //! session and invocation. AWS documents that an ended session's content can still
 //! be read but not added to (`smithy_query(query="doc",shape="EndSession")`), so a
-//! session that is not `ACTIVE` is a 409 `ConflictException`. The operation is
-//! `@idempotent`, so a write under an `invocationStepId` already stored is a replay
-//! when it carries the same content and a 409 `ConflictException` when it does not.
+//! session that is not `ACTIVE` is a 409 `ConflictException`. `invocationStepId` is a
+//! WRITE-ONCE key per invocation: a write under one already stored is refused with the
+//! modelled 409 `ConflictException` whatever payload it carries, so exactly one caller
+//! claims a step id and a double submit is told so.
 //!
 //! ## Shape of an operation
 //!
@@ -216,19 +217,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let step_id = input
             .invocation_step_id
             .unwrap_or_else(crate::state::new_uuid);
-        // An explicit `invocationStepId` that already names a stored step is a REPLAY
-        // when it carries the same content, and a CONFLICT when it does not: the id is
-        // the step's identity, so one caller's step is never silently rewritten by
-        // another's. A replay stores nothing new — the stored record already IS the
-        // write — so it answers the stored id and leaves the session untouched.
-        if let Some(existing) = invocation.steps.get(&step_id) {
-            if existing.invocation_step_time == input.invocation_step_time
-                && existing.payload == input.payload
-            {
-                return Ok(PutInvocationStepOutput {
-                    invocation_step_id: step_id,
-                });
-            }
+        // `(invocationIdentifier, invocationStepId)` is a WRITE-ONCE key: the id IS the
+        // step's identity, so the FIRST write under it claims it and every later write
+        // under the same pair is refused — whatever either side's content is. The content
+        // is deliberately not compared: a retry carrying the same payload is still a
+        // second write of a key that is already taken, so it earns the same conflict as
+        // one carrying a different payload, and a client that submits twice learns it
+        // from the refusal rather than from a success that stored nothing. The whole
+        // handler holds the store lock, so the check and the insert are one atomic claim.
+        if invocation.steps.contains_key(&step_id) {
             // The refusal states the PAIR the request addressed and nothing else: the
             // conflict is keyed on `(invocationIdentifier, invocationStepId)`, so its
             // sentence names those two ids as the caller submitted them and says nothing

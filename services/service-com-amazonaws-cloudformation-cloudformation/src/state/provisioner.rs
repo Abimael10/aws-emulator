@@ -479,7 +479,8 @@ use super::template::{
     APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_AUTHORIZER, APIGATEWAYV2_DEPLOYMENT,
     APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
     APIGATEWAYV2_STAGE, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT, BATCH_COMPUTE_ENVIRONMENT,
-    BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, BEDROCK_GUARDRAIL, BEDROCK_KNOWLEDGE_BASE,
+    BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, BEDROCK_FLOW, BEDROCK_GUARDRAIL,
+    BEDROCK_KNOWLEDGE_BASE,
     BRAKET_SPENDING_LIMIT,
     CLOUDWATCH_DASHBOARD,
     CLOUDWATCH_METRIC_STREAM, CODEARTIFACT_DOMAIN, CODEARTIFACT_REPOSITORY,
@@ -1019,6 +1020,13 @@ pub(super) enum Provisioner {
     /// knowledge-base API takes — so it is read off that create's own answer and is the
     /// identity a `Ref` resolves to.
     BedrockKnowledgeBase,
+    /// `AWS::Bedrock::Flow`: a FLOW of Amazon Bedrock Agent's build-time control plane, which
+    /// `CreateFlow` creates under the name the template states, `UpdateFlow` changes and
+    /// `DeleteFlow` removes. That service MINTS the ten-character `id` and the `flow/<id>`
+    /// ARN the type publishes — the handles the build-time calls and the runtime `InvokeFlow`
+    /// alike address a flow by — so both are read off that create's own answer and the ARN is
+    /// the identity a `Ref` resolves to.
+    BedrockFlow,
     /// `AWS::BedrockAgentCore::WorkloadIdentity`: a workload identity of the Amazon Bedrock
     /// AgentCore control plane, which `CreateWorkloadIdentity` creates under the name the
     /// template states, `UpdateWorkloadIdentity` changes and `DeleteWorkloadIdentity`
@@ -1281,6 +1289,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         BACKUP_SELECTION => Some(Provisioner::BackupSelection),
         BEDROCK_GUARDRAIL => Some(Provisioner::BedrockGuardrail),
         BEDROCK_KNOWLEDGE_BASE => Some(Provisioner::BedrockKnowledgeBase),
+        BEDROCK_FLOW => Some(Provisioner::BedrockFlow),
         BEDROCK_AGENTCORE_WORKLOAD_IDENTITY => {
             Some(Provisioner::BedrockAgentCoreWorkloadIdentity)
         }
@@ -1900,6 +1909,10 @@ impl Provisioner {
             Self::BedrockKnowledgeBase => {
                 create_bedrock_knowledge_base(ctx, region, resource, propagated).await
             }
+            // `AWS::Bedrock::Flow` publishes `Tags` as a MAP, which is the shape
+            // `CreateFlow`'s own `tags` member takes, so a flow a stack creates carries the
+            // tags CloudFormation gives it beside the ones the declaration asks for.
+            Self::BedrockFlow => create_bedrock_flow(ctx, region, resource, propagated).await,
             // `AWS::BedrockAgentCore::WorkloadIdentity` publishes `Tags`, and
             // `CreateWorkloadIdentity` takes a tag MAP of its own, so an identity a stack
             // creates carries the tags CloudFormation gives it beside the ones the
@@ -2326,6 +2339,11 @@ impl Provisioner {
             Self::BedrockKnowledgeBase => {
                 knowledge_base_readiness(ctx, region, physical_resource_id).await
             }
+            // `CreateFlow` leaves the flow `NotPrepared` and the preparation this type's
+            // create then asks for answers it `Preparing` — in neither can the flow be
+            // invoked — so the resource is held open until Amazon Bedrock Agent reports the
+            // flow `Prepared`.
+            Self::BedrockFlow => flow_readiness(ctx, region, physical_resource_id).await,
             // `CreatePipe` answers the pipe `CREATING` and `UpdatePipe` answers it
             // `UPDATING` — "the state the pipe is in" — and in neither does the pipe carry
             // the configuration the declaration asked for, so the resource is held open
@@ -2419,6 +2437,10 @@ impl Provisioner {
             Self::BedrockKnowledgeBase => {
                 knowledge_base_ready_attributes(ctx, region, physical_resource_id).await
             }
+            // A flow's `Status` and `UpdatedAt` are not the ones its create answered with once
+            // that service has prepared it, so the type's attributes are read off the flow
+            // again when it reports it `Prepared`.
+            Self::BedrockFlow => flow_ready_attributes(ctx, region, physical_resource_id).await,
             // A pipe's `CurrentState`, its `StateReason` and the instant it was last
             // modified are not the ones its create answered with once that service has
             // brought it up, so the type's attributes are read off the pipe again when it
@@ -2817,6 +2839,11 @@ impl Provisioner {
             Self::BedrockKnowledgeBase => {
                 update_bedrock_knowledge_base(ctx, region, resource, declared).await
             }
+            // `UpdateFlow` takes the flow's whole declared configuration by the identity
+            // Amazon Bedrock Agent minted for it, the flow's name and its definition
+            // included, so a changed declaration is applied to that flow rather than
+            // replacing it. Its tags travel separately ([`Self::retag`]).
+            Self::BedrockFlow => update_bedrock_flow(ctx, region, resource, declared).await,
             Self::BedrockAgentCoreWorkloadIdentity => {
                 update_workload_identity(ctx, region, resource, declared)
                     .await
@@ -3639,6 +3666,9 @@ impl Provisioner {
             Self::BedrockKnowledgeBase => {
                 delete_bedrock_knowledge_base(ctx, region, physical_resource_id).await
             }
+            // The delete addresses the flow by the ARN Amazon Bedrock Agent minted for it,
+            // which is this resource's physical id.
+            Self::BedrockFlow => delete_bedrock_flow(ctx, region, physical_resource_id).await,
             Self::BedrockAgentCoreWorkloadIdentity => {
                 delete_workload_identity(ctx, region, physical_resource_id).await
             }
@@ -4185,6 +4215,9 @@ impl Provisioner {
             Self::BedrockKnowledgeBase => {
                 describe_bedrock_knowledge_base(ctx, region, physical_resource_id).await
             }
+            // Amazon Bedrock Agent's own read of the flow the stack created, by the ARN it
+            // minted for it.
+            Self::BedrockFlow => describe_bedrock_flow(ctx, region, physical_resource_id).await,
             // Amazon Redshift's own read of the parameter group the stack created, by the
             // name it was created under.
             Self::RedshiftClusterParameterGroup => {
@@ -4299,6 +4332,10 @@ mod event_pipes;
 mod event_buses;
 mod bedrock_guardrails;
 mod bedrock_knowledge_bases;
+/// The Amazon Bedrock FLOW arms: the flow an `AWS::Bedrock::Flow` declares, created in the
+/// build-time control plane that owns it so the handles the stack publishes resolve — for
+/// that plane's own reads and for the runtime plane that INVOKES the flow.
+mod bedrock_flows;
 /// The Amazon SageMaker AI types a stack declares beside the model registry's: the model,
 /// the notebook instance and the lifecycle configuration one of those runs. Visible to the
 /// rest of this service's state because the type NAMES it owns are what the naming rules and
@@ -4390,6 +4427,7 @@ use ecs_capacity_providers::*;
 use config_recording::*;
 use bedrock_guardrails::*;
 use bedrock_knowledge_bases::*;
+use bedrock_flows::*;
 use sagemaker_resources::*;
 use braket_spending_limits::*;
 use amplify_ui_builder::*;

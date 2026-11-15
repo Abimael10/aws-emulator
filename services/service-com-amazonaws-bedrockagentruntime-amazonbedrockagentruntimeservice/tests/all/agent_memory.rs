@@ -818,27 +818,31 @@ async fn a_memory_read_refuses_a_member_it_cannot_serve() {
             .to_string()
     };
 
-    /// One request that cannot be served as asked, and the member the refusal must name.
+    /// One request that cannot be served as asked, and the sentence the refusal states.
     struct Row {
         case: &'static str,
         /// The query the read carries, with `{token}` standing for a token of `memory-1`.
         query: &'static str,
         memory_id: &'static str,
-        names: &'static str,
+        states: &'static str,
     }
+
+    /// RULE: a cursor this listing did not issue earns ONE fixed sentence, which echoes
+    /// neither the token nor the member it arrived in.
+    const INVALID_NEXT_TOKEN: &str = "Next token for pagination is invalid";
 
     let rows = [
         Row {
             case: "a token issued for another memory of the same alias",
             query: "&nextToken={token}",
             memory_id: "memory-2",
-            names: "nextToken",
+            states: INVALID_NEXT_TOKEN,
         },
         Row {
             case: "a token this service never issued",
             query: "&nextToken=not-a-token-this-service-issued",
             memory_id: "memory-1",
-            names: "nextToken",
+            states: INVALID_NEXT_TOKEN,
         },
     ];
 
@@ -862,11 +866,12 @@ async fn a_memory_read_refuses_a_member_it_cannot_serve() {
             row.case,
             reply.json(row.case)
         );
-        assert!(
-            reply.message(row.case).contains(row.names),
-            "case {:?}: the refusal must name {:?}, got {:?}",
+        assert_eq!(
+            reply.message(row.case),
+            row.states,
+            "case {:?}: expected the refusal {:?}, got {:?}",
             row.case,
-            row.names,
+            row.states,
             reply.message(row.case)
         );
     }

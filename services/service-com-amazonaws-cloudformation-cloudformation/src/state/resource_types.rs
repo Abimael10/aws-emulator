@@ -285,6 +285,7 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::Bedrock::Agent",
     "AWS::Bedrock::AgentAlias",
     "AWS::Bedrock::DataSource",
+    "AWS::Bedrock::Flow",
     "AWS::Bedrock::Guardrail",
     "AWS::Bedrock::KnowledgeBase",
     // Amazon Bedrock AgentCore — the six types this emulator carries the published return

@@ -233,6 +233,11 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         ELB_LISTENER => &["ListenerArn"],
         ELB_LISTENER_RULE => &["IsDefault", "RuleArn"],
         BEDROCK_GUARDRAIL => &["GuardrailArn", "GuardrailId", "Version"],
+        // A flow's ARN, the id Amazon Bedrock Agent minted and the DRAFT version it opens
+        // with are the return values these naming rules can compute; its `Status` and the two
+        // instants are that service's clock and reach the resource off its own report of the
+        // flow, exactly as a knowledge base's do.
+        BEDROCK_FLOW => &["Arn", "Id", "Version"],
         BEDROCK_KNOWLEDGE_BASE => &["KnowledgeBaseArn", "KnowledgeBaseId"],
         // A spending limit's ARN is the one return value these naming rules can compute; its
         // `CreatedAt` is Amazon Braket's clock, which reaches the resource off that
@@ -609,6 +614,13 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // takes — a pattern no name CloudFormation decides can satisfy — so the identifier in
         // force is the one that service answered.
         || resource_type == BEDROCK_KNOWLEDGE_BASE
+        // An Amazon Bedrock FLOW is the same case: `CreateFlow` takes the flow's NAME and
+        // answers the `id` Amazon Bedrock Agent minted (`^[0-9a-zA-Z]{10}$`) with the
+        // `flow/<id>` ARN built around it, which is the ARN that type's `Ref` returns and the
+        // identity every flow API — the build-time calls and the runtime `InvokeFlow` alike —
+        // addresses a flow by, so neither the id nor the ARN can be computed from the
+        // template.
+        || resource_type == BEDROCK_FLOW
         // An Amazon Braket SPENDING LIMIT is one more: `CreateSpendingLimit` takes no
         // identifier for the limit — the declaration states the device, the amount and the
         // period — and answers the `spendingLimitArn` that service minted, whose resource

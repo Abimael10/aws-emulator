@@ -83,6 +83,7 @@ use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_sta
 
 use crate::ops::types::{
     AccessDeniedException, ConflictException, InvocationStepPayload, ResourceNotFoundException,
+    ValidationException,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -501,6 +502,26 @@ pub const SESSION_ALREADY_TERMINATED: &str = "Cannot end a terminated session";
 pub fn session_already_terminated() -> ConflictException {
     ConflictException {
         message: Some(SESSION_ALREADY_TERMINATED.to_string()),
+    }
+}
+
+/// The refusal every listing of this service that DECODES a `nextToken` answers when the
+/// cursor it was handed is not one that listing issued — a malformed token, or one issued
+/// for another listing or another scope.
+///
+/// A CONSTANT sentence: it interpolates NOTHING, so the rejected token is not echoed back,
+/// and it is the same sentence whichever listing did the decoding — a client matches one
+/// fixed string rather than one wording per listing. (An operation that splits no response
+/// and so issues no cursor at all refuses the MEMBER as one it cannot serve, which is a
+/// different refusal: there is no cursor of it for a value to be one of.)
+pub const INVALID_NEXT_TOKEN: &str = "Next token for pagination is invalid";
+
+/// The modelled `ValidationException` (HTTP 400) carrying [`INVALID_NEXT_TOKEN`]: ONE
+/// constructor for every listing of this service that decodes a `nextToken`, so none of
+/// them can drift from the others.
+pub fn invalid_next_token() -> ValidationException {
+    ValidationException {
+        message: Some(INVALID_NEXT_TOKEN.to_string()),
     }
 }
 

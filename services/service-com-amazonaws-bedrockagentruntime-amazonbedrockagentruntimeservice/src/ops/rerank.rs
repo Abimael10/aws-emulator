@@ -265,7 +265,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `nextToken` names a page of a response this service never splits: a request
         // carries at most 1000 sources (`RerankSourcesList`'s own length bound), so the
         // complete ranking always fits one response and NO call issues a token. A token
-        // reaching here therefore cannot have come from this service.
+        // reaching here therefore cannot have come from this service, and is refused as the
+        // member this service cannot serve rather than as a cursor that failed to decode:
+        // there is no cursor of this operation for any value of it to be one of.
         if input.next_token.is_some() {
             return Err(refuse(
                 "nextToken is not a pagination token this service issued: a Rerank response \

@@ -741,12 +741,12 @@ async fn an_invocation_step_payload_round_trips_unchanged_for_every_union_shape(
     }
 }
 
-/// RULE: `PutInvocationStep` is `@idempotent`, so a write under an `invocationStepId`
-/// that already names a stored step is accepted only as a REPLAY of that step's own
-/// content; a write that would change the stored content is refused with the modelled
-/// `ConflictException` (409) and the stored step is left as it was.
+/// RULE: `invocationStepId` is a WRITE-ONCE key per invocation — a write under an
+/// `invocationStepId` that already names a stored step is refused with the modelled
+/// `ConflictException` (409) whatever payload it carries, identical content included — and
+/// the stored step is left as it was.
 #[tokio::test]
-async fn rewriting_a_stored_step_id_with_other_content_is_refused() {
+async fn rewriting_a_stored_step_id_is_refused_whatever_the_content() {
     let router = router();
     let (session_id, _) = create_session(&router, Value::Null).await;
     let invocation_id = create_invocation(&router, &session_id, json!({})).await;
@@ -764,11 +764,11 @@ async fn rewriting_a_stored_step_id_with_other_content_is_refused() {
     // (case, invocationStepTime, payload, expected status, expected error code)
     let rows: Vec<(&str, i64, Value, u16, &str)> = vec![
         (
-            "the same content again: an idempotent replay",
+            "the same content again: a replay of a key already claimed",
             stored_time,
             stored.clone(),
-            201,
-            "",
+            409,
+            "ConflictException",
         ),
         (
             "a different payload under the same id",
@@ -815,7 +815,7 @@ async fn rewriting_a_stored_step_id_with_other_content_is_refused() {
             assert_eq!(
                 out["invocationStepId"].as_str(),
                 Some(step_id.as_str()),
-                "case {case:?}: a replay must answer the stored id, got {out:?}"
+                "case {case:?}: an accepted write must answer the stored id, got {out:?}"
             );
         }
 
@@ -850,7 +850,7 @@ async fn rewriting_a_stored_step_id_with_other_content_is_refused() {
         assert_eq!(
             (status, listed["invocationStepSummaries"].as_array().map(Vec::len)),
             (200, Some(1)),
-            "case {case:?}: neither a replay nor a refusal adds a step, got {status} {listed:?}"
+            "case {case:?}: a refused write adds no step, got {status} {listed:?}"
         );
     }
 }
@@ -1914,7 +1914,9 @@ async fn a_write_past_a_declared_store_maximum_is_refused_not_allocated() {
          {MAX_STEPS_PER_INVOCATION} must be refused, got {status} {refused:?}"
     );
 
-    // A REPLAY of a stored step is not growth, so it is still accepted at the cap.
+    // A write under a step id already stored is refused as the TAKEN KEY it is, and that is
+    // decided before the store guard: a duplicate at the cap reads the conflict, not the
+    // quota.
     let (_, listed) = call(
         &steps_router,
         "POST",
@@ -1925,7 +1927,7 @@ async fn a_write_past_a_declared_store_maximum_is_refused_not_allocated() {
     let summary = &listed["invocationStepSummaries"][0];
     let existing = summary["invocationStepId"]
         .as_str()
-        .unwrap_or_else(|| panic!("ListInvocationSteps: no step to replay in {listed:?}"))
+        .unwrap_or_else(|| panic!("ListInvocationSteps: no step to re-write in {listed:?}"))
         .to_string();
     let (status, out) = call(
         &steps_router,
@@ -1940,9 +1942,9 @@ async fn a_write_past_a_declared_store_maximum_is_refused_not_allocated() {
     )
     .await;
     assert_eq!(
-        (status, out["invocationStepId"].as_str()),
-        (201, Some(existing.as_str())),
-        "case steps: replaying a stored step adds nothing, so it must still be accepted at \
-         the cap, got {status} {out:?}"
+        (status, error_code(&out)),
+        (409, "ConflictException"),
+        "case steps: a write under a step id already stored is refused as a taken key, got \
+         {status} {out:?}"
     );
 }

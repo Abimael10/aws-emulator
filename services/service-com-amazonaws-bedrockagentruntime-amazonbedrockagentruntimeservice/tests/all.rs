@@ -29,8 +29,12 @@ mod document_content_repeated_reads;
 mod inline_agent_invocations;
 #[path = "all/inline_agent_return_control.rs"]
 mod inline_agent_return_control;
+#[path = "all/invalid_pagination_token.rs"]
+mod invalid_pagination_token;
 #[path = "all/invocation_error_messages.rs"]
 mod invocation_error_messages;
+#[path = "all/invocation_step_write_once.rs"]
+mod invocation_step_write_once;
 #[path = "all/invocations.rs"]
 mod invocations;
 #[path = "all/knowledge_base_retrieval.rs"]

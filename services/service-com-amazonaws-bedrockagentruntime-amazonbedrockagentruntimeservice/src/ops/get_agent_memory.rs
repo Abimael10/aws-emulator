@@ -201,13 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let scope = memory_scope(Self::NAME, &input);
         let resume = match input.next_token.as_deref() {
             None => 0,
-            Some(token) => crate::state::decode_next_token(&scope, token).ok_or_else(|| {
-                refuse(
-                    "nextToken is not a pagination token this listing issued: a token \
-                     resumes the memory of the agent alias and memory id it was issued for"
-                        .to_string(),
-                )
-            })?,
+            // See `crate::state::invalid_next_token`: the one sentence every listing of this
+            // service that decodes a cursor states for one it did not issue.
+            Some(token) => crate::state::decode_next_token(&scope, token)
+                .ok_or_else(|| refuse(crate::state::INVALID_NEXT_TOKEN.to_string()))?,
         };
 
         // Authorization is decided against the agent alias the call reads — the resource an

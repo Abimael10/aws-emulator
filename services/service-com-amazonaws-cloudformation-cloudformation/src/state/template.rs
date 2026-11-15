@@ -3026,6 +3026,10 @@ pub fn name_is_create_only(resource_type: &str) -> bool {
             | BEDROCK_AGENT_ALIAS
             | BEDROCK_DATA_SOURCE
             | BEDROCK_GUARDRAIL
+            // An Amazon Bedrock FLOW too: `UpdateFlow` takes a `flowIdentifier` together
+            // with a new required `name`, the flow being identified by the ARN and the id
+            // that service minted for it.
+            | BEDROCK_FLOW
             | APIGATEWAYV2_API
             | APIGATEWAYV2_AUTHORIZER
             // An AWS Amplify app and the three Amplify UI Builder entities of an app

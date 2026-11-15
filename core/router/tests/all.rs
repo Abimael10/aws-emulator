@@ -1461,3 +1461,5 @@ mod apigateway_custom_domain_dns_alias;
 // no declaration names is compiled nowhere.
 // build failure. An inner attribute, like an inner doc comment, is legal only before the first
 // item, so it stands here rather than in the list.
+#[path = "all/cloudformation_provisions_bedrock_flows.rs"]
+mod cloudformation_provisions_bedrock_flows;

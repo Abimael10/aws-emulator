@@ -1407,6 +1407,32 @@ pub(crate) fn return_values(
             );
             (arn, attributes)
         }
+        // Amazon Bedrock Agent's build-time control plane: the FLOW an `AWS::Bedrock::Flow`
+        // declares. "Ref returns the flow ARN" (the type's primary identifier); `Fn::GetAtt`
+        // reads `Arn`, `Id`, `Status`, `Version`, `CreatedAt` and `UpdatedAt`. That service
+        // MINTS the id — `CreateFlow` answers an `id` of `^[0-9a-zA-Z]{10}$`, which no name
+        // CloudFormation decides satisfies — and the ARN around it, so the values here are
+        // STAND-INS of the forms that service's own model fixes and `super::provisioning`
+        // re-points them at what the create really answered
+        // ([`super::provisioner::Provisioner::BedrockFlow`]). The version a created flow
+        // carries is its working copy (`version` is `^DRAFT$`); its status and the two
+        // instants are that service's to report and reach the resource off its create's own
+        // answer rather than being computed here.
+        BEDROCK_FLOW => {
+            let id = service_assigned_label(BEDROCK_FLOW_ID_SALT, name, BEDROCK_FLOW_ID_DIGITS);
+            let arn = ::emulator_server::emulator_arn(
+                BEDROCK_ARN_NAMESPACE,
+                region,
+                &format!("{BEDROCK_FLOW_PATH}/{id}"),
+            );
+            attributes.insert("Arn".to_string(), arn.clone());
+            attributes.insert("Id".to_string(), id);
+            attributes.insert(
+                "Version".to_string(),
+                BEDROCK_FLOW_DRAFT_VERSION.to_string(),
+            );
+            (arn, attributes)
+        }
         // Amazon Bedrock Agent's build-time control plane: the knowledge base an
         // `AWS::Bedrock::KnowledgeBase` declares. "Ref returns the knowledge base ID" (the
         // type's primary identifier); Fn::GetAtt reads `KnowledgeBaseId`,

@@ -218,15 +218,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
             Some(token) => match crate::state::decode_next_token(&scope, token) {
                 Some(order) => order,
+                // See `state::invalid_next_token`: the service's one invalid-cursor
+                // refusal, stated identically by every listing it serves.
                 None => {
                     return Err(ListInvocationStepsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(
-                                "nextToken is not a pagination token this service issued for \
-                                 this session and invocation"
-                                    .to_string(),
-                            ),
-                        },
+                        crate::state::invalid_next_token(),
                     )
                     .into());
                 }

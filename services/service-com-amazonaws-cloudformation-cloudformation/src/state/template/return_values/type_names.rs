@@ -43,6 +43,16 @@ pub const BEDROCK_DATA_SOURCE: &str = "AWS::Bedrock::DataSource";
 /// (`CreateGuardrail`) rather than the agent build-time one.
 pub const BEDROCK_GUARDRAIL: &str = "AWS::Bedrock::Guardrail";
 
+/// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Bedrock FLOW: the workflow
+/// of nodes Amazon Bedrock Agent's `CreateFlow` makes, which `UpdateFlow` changes and
+/// `DeleteFlow` removes, and which the Bedrock Agent RUNTIME plane's `InvokeFlow` runs.
+///
+/// "Ref returns the flow ARN" — the type's primary identifier — and `Fn::GetAtt` reads the
+/// ARN, the `Id` that service minted, the flow's `Status`, its `Version` and the two instants
+/// it keeps. That service mints the id (`^[0-9a-zA-Z]{10}$`) and the ARN around it, which is
+/// why [`identity_is_service_assigned`] names this type.
+pub const BEDROCK_FLOW: &str = "AWS::Bedrock::Flow";
+
 /// Amazon Bedrock's ARN namespace, which is that model's own `awsService.arnNamespace`
 /// (`bedrock`) — the namespace a guardrail ARN carries
 /// (`arn:aws:bedrock:<region>:<account>:guardrail/<id>`, from `GuardrailArn`'s pattern).
@@ -64,6 +74,20 @@ pub(super) const BEDROCK_GUARDRAIL_DRAFT_VERSION: &str = "DRAFT";
 /// alphanumeric characters and carries no separator.
 pub(super) const BEDROCK_KNOWLEDGE_BASE_ID_SALT: &str = "bedrock/knowledge-base";
 pub(super) const BEDROCK_KNOWLEDGE_BASE_ID_DIGITS: usize = 10;
+
+/// The salt the flow-id stand-in is derived under, and how many characters it carries: a
+/// `FlowId` is `^[0-9a-zA-Z]{10}$`, so the stand-in is exactly ten alphanumeric characters
+/// and carries no separator.
+pub(super) const BEDROCK_FLOW_ID_SALT: &str = "bedrock/flow";
+pub(super) const BEDROCK_FLOW_ID_DIGITS: usize = 10;
+
+/// The version a freshly created flow carries: `CreateFlow`'s `version` is `^DRAFT$`, the
+/// working copy every flow has before a numbered version is cut from it.
+pub(super) const BEDROCK_FLOW_DRAFT_VERSION: &str = "DRAFT";
+
+/// The resource path a flow ARN carries before the id that service minted, from
+/// `FlowArn`'s own pattern (`arn:aws:bedrock:<region>:<account>:flow/<id>`).
+pub(super) const BEDROCK_FLOW_PATH: &str = "flow";
 
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Braket SPENDING LIMIT: the
 /// cost control that service's own `CreateSpendingLimit` makes for a quantum device. The

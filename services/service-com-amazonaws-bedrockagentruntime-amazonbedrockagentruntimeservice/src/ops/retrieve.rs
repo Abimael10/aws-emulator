@@ -239,7 +239,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `nextToken` names a page of a response this service never splits: a retrieval
         // reports at most `numberOfResults` results, which the model bounds at 100, so
         // the whole answer always fits one response and NO call issues a token. A token
-        // reaching here cannot have come from this service.
+        // reaching here cannot have come from this service. It is refused as the member
+        // this service cannot serve rather than as a cursor that failed to decode: there is
+        // no cursor of this operation for any value of it to be one of.
         if input.next_token.is_some() {
             return Err(refuse(
                 "nextToken is not a pagination token this service issued: a Retrieve \
