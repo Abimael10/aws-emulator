@@ -15,6 +15,8 @@ mod audit_records;
 mod compaction_sort_order;
 #[path = "all/constraint_refusals.rs"]
 mod constraint_refusals;
+#[path = "all/encryption_configuration_refusals.rs"]
+mod encryption_configuration_refusals;
 #[path = "all/fixed_error_sentences.rs"]
 mod fixed_error_sentences;
 #[path = "all/get_table_addressing.rs"]
@@ -43,6 +45,8 @@ mod namespace_and_table_lifecycle;
 mod name_lookups;
 #[path = "all/non_empty_container_delete_class.rs"]
 mod non_empty_container_delete_class;
+#[path = "all/parameter_validation_refusals.rs"]
+mod parameter_validation_refusals;
 #[path = "all/record_expiration_configuration_reads.rs"]
 mod record_expiration_configuration_reads;
 #[path = "all/rename_table.rs"]

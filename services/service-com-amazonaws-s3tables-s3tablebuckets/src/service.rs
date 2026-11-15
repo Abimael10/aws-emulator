@@ -71,12 +71,19 @@ mod iceberg_rest;
 /// rename gives a resource.
 mod name_lookups;
 
+/// Which refusals are the parameter validator's rather than this service's own,
+/// and the one choice this service makes about how that validator's envelope is
+/// stated.
+mod parameter_validation;
+
 /// The one client-input error this service models: `BadRequestException`,
 /// `errorKind` client, `httpError` 400, one `message` member
 /// (`smithy_query(query="shape", shape="BadRequestException")`). It is a
-/// service-common error, so EVERY operation declares it, and the model declares
-/// no `ValidationException` anywhere — which is why a boundary refusal is
-/// answered under this code rather than under the framework's generic one.
+/// service-common error, so EVERY operation declares it — and it is the code of
+/// every refusal the SERVICE makes, including the ones it makes at the boundary
+/// with a fixed sentence of its own. A refusal of a parameter's shape that the
+/// service words no sentence for is not one of them: that one is the parameter
+/// validator's, and `service_common::validation_message` is what states it.
 const BAD_REQUEST_CODE: &str = "BadRequestException";
 
 /// `TableBucketName`'s character set and length
@@ -109,6 +116,41 @@ fn violated_member(path: &str) -> &str {
     path.split('.').next().unwrap_or(path)
 }
 
+/// The member a violation path ENDS at: the leaf that actually carried the
+/// value, so a member of a structure the request nests (an encryption
+/// configuration's algorithm, carried by three operations under three different
+/// input members) is named by itself rather than by whatever carried it.
+fn violated_leaf(path: &str) -> &str {
+    path.split('.').next_back().unwrap_or(path)
+}
+
+/// The fixed sentence this service states a refused member of an
+/// `encryptionConfiguration` with, or `None` when the violation is of neither of
+/// that structure's two members.
+///
+/// Read off the LEAF member, because the structure is carried by a different
+/// input member in each operation that takes one (`CreateTableBucket` and
+/// `CreateTable` configure encryption as part of a create, and
+/// `PutTableBucketEncryption` sets it on a bucket that exists) while the member
+/// that failed, and the reason it failed, are the same in all of them.
+fn encryption_sentence(violation: &Violation) -> Option<&'static str> {
+    match (violated_leaf(&violation.path), &violation.kind) {
+        // The algorithm names the encryption the data is written under: the
+        // model targets this member at the `SSEAlgorithm` enum, so a value
+        // outside that set names an encryption this service has no keys for.
+        ("sseAlgorithm", ViolationKind::EnumValue(_)) => {
+            Some(crate::state::INVALID_SSE_ALGORITHM_MESSAGE)
+        }
+        // The KMS key is declared with both a length and a pattern, and either
+        // way the value cannot be a KMS key ARN at all.
+        (
+            "kmsKeyArn",
+            ViolationKind::Pattern(_) | ViolationKind::MinLength(_) | ViolationKind::MaxLength(_),
+        ) => Some(crate::state::INVALID_KMS_KEY_ARN_MESSAGE),
+        _ => None,
+    }
+}
+
 /// The fixed sentence this service states `violation` with, or `None` when the
 /// member it refused is not one of the classes this service words itself.
 ///
@@ -116,6 +158,9 @@ fn violated_member(path: &str) -> &str {
 /// two facts a violation carries — never off the operation or the rejected
 /// value, so one arm covers every operation that takes the member.
 fn fixed_sentence(violation: &Violation) -> Option<&'static str> {
+    if let Some(sentence) = encryption_sentence(violation) {
+        return Some(sentence);
+    }
     let member = violated_member(&violation.path);
     match (member, &violation.kind) {
         // `TableBucketARN` declares a pattern and no length, so its only
@@ -175,26 +220,31 @@ fn fixed_sentence(violation: &Violation) -> Option<&'static str> {
 }
 
 /// How this service answers a request the boundary refused for breaking a
-/// modelled constraint: always its own `BadRequestException`, worded with the
-/// fixed sentence for the member class when it states one.
+/// modelled constraint.
 ///
-/// A member class this service has no sentence of its own for keeps the
-/// framework's clause, which names the member and the requirement it broke —
-/// only the error code changes there, and it changes because the code the
-/// framework would otherwise name is a shape this service's model does not
-/// declare.
+/// Which LAYER refused it is what a caller is told, and the member class is what
+/// decides the layer:
+///
+/// * a class this service validates itself — the names a create gives a
+///   resource, the ARNs an operation is addressed by, the encryption, format and
+///   metadata members it will not act on — is the service's own refusal: its
+///   modelled `BadRequestException`, worded with the one fixed sentence it
+///   states that class with;
+/// * every other class is refused by the parameter validator in front of the
+///   service, which answers under its own code and envelope — the code is not
+///   one of this model's shapes precisely because the refusal is not the
+///   service's. Nothing of that envelope is worded in this crate: see
+///   [`parameter_validation`].
 ///
 /// `None` when there is nothing to state, which leaves the framework's wording.
-fn constraint_refusal(violations: &[Violation]) -> Option<Refused> {
-    let message = violations
-        .iter()
-        .find_map(fixed_sentence)
-        .map(str::to_string)
-        .or_else(|| aws_smithy_schema_server::envelope(violations))?;
-    Some(Refused {
-        code: BAD_REQUEST_CODE.to_string(),
-        message,
-    })
+fn constraint_refusal(refusal: &Refusal, violations: &[Violation]) -> Option<Refused> {
+    match violations.iter().find_map(fixed_sentence) {
+        Some(sentence) => Some(Refused {
+            code: BAD_REQUEST_CODE.to_string(),
+            message: sentence.to_string(),
+        }),
+        None => parameter_validation::refusal(refusal),
+    }
 }
 
 /// The `com-amazonaws-s3tables-s3tablebuckets` emulated service: the generated [`ServiceDefinition`] plus
@@ -308,16 +358,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. A value this service's model rules out is its own
-        // `BadRequestException` — the only client-input error it declares — and,
-        // for a name, a namespace or an ARN, the fixed sentence it states that
-        // class with. BOTH the code and the message are replaced together, which
-        // is what [`constraint_refusal`] builds.
+        // service reword it. A member class the service validates ITSELF — a
+        // name, a namespace, an ARN, a format, an encryption configuration — is
+        // its own `BadRequestException` carrying the fixed sentence it states
+        // that class with; every other class is the parameter validator's
+        // refusal and is answered under that validator's code and envelope.
+        // BOTH the code and the message are chosen together, which is what
+        // [`constraint_refusal`] builds.
         //
         // An authentication refusal, and any refusal kind added later, keeps the
         // framework's wording.
         match refusal {
-            Refusal::Invalid(violations) => constraint_refusal(violations),
+            Refusal::Invalid(violations) => constraint_refusal(refusal, violations),
             _ => None,
         }
     }

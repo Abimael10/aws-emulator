@@ -1584,6 +1584,22 @@ pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "The specified resourceArn is not
 /// neither echoes the value nor lists the formats this service does accept.
 pub const INVALID_OPEN_TABLE_FORMAT_MESSAGE: &str = "The specified open table format is not valid";
 
+/// How this service states a server-side encryption algorithm it will not
+/// encrypt under — the `sseAlgorithm` member of every `encryptionConfiguration`,
+/// which the model targets at the `SSEAlgorithm` enum. FIXED text, as
+/// [`INVALID_OPEN_TABLE_FORMAT_MESSAGE`]: it names the CLASS of the failure and
+/// neither echoes the value nor lists the algorithms this service does accept.
+pub const INVALID_SSE_ALGORITHM_MESSAGE: &str = "The specified SSE algorithm is invalid.";
+
+/// How this service states a KMS key it cannot encrypt under — the `kmsKeyArn`
+/// member of every `encryptionConfiguration`, which the model bounds and
+/// patterns. FIXED text: the form it quotes is the key ARN's SHAPE, with a
+/// placeholder for each of its variable parts, so the sentence is the same
+/// whatever key the request named and nothing of that key appears in it.
+pub const INVALID_KMS_KEY_ARN_MESSAGE: &str =
+    "The specified KMS key ARN is invalid. Only key ARN format \
+     'arn:<partition>:kms:<region>:<account-id>:key/<key-id>' is supported.";
+
 /// How this service states a compaction strategy that orders a table's records
 /// by its sort order, asked for on a table whose metadata carries no sort
 /// order: the client request error the model's `BadRequestException` (HTTP 400)

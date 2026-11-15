@@ -2,11 +2,10 @@
 
 //! How S3 Tables refuses a request whose value a modelled constraint rules out.
 //!
-//! The rule under test: a value outside a modelled constraint is refused with
-//! this service's OWN modelled client-input error — `BadRequestException`, HTTP
-//! 400, which every operation declares and which is the only such error the
-//! model carries (there is no `ValidationException` shape in it) — and, for the
-//! member classes the service words itself (a table bucket name, a table name, a
+//! The rule under test: a value outside a modelled constraint on a member this
+//! service validates ITSELF is refused with its OWN modelled client-input error
+//! — `BadRequestException`, HTTP 400, which every operation declares — and, for
+//! the member classes it words itself (a table bucket name, a table name, a
 //! namespace name, a namespace naming more than one part, a table bucket ARN, a
 //! taggable resource's ARN), with one FIXED sentence that takes nothing from the
 //! request. The same holds of the conflict a resident namespace name answers
@@ -36,8 +35,14 @@ use crate::harness::{encode, expected_bucket_arn, query_string, Emulator};
 const REGION: &str = "us-east-1";
 
 /// The code every refusal below must carry: the one client-input error this
-/// service's model declares (`BadRequestException`, `httpError` 400).
+/// service's model declares (`BadRequestException`, `httpError` 400). It is the
+/// code of a refusal the SERVICE makes; a refusal of a parameter's shape the
+/// service words no sentence for carries [`PARAMETER_VALIDATION`] instead, which
+/// `tests/all/parameter_validation_refusals.rs` is what pins.
 const BAD_REQUEST: &str = "BadRequestException";
+
+/// The code the parameter validator in front of the service answers with.
+const PARAMETER_VALIDATION: &str = "ValidationException";
 
 /// The fixed sentences, spelled out here rather than read from the crate, so this
 /// suite pins the wording itself.
@@ -310,16 +315,16 @@ async fn a_value_a_modelled_constraint_rules_out_is_the_services_own_bad_request
 }
 
 #[tokio::test]
-async fn a_refusal_this_service_states_no_sentence_for_still_carries_its_own_error() {
+async fn a_refusal_this_service_states_no_sentence_for_is_the_parameter_validators() {
     let emulator = Emulator::new();
     let arn = resident_bucket_arn();
 
-    // A member class with no fixed sentence of its own keeps the clause that
-    // names the member and the requirement it broke — but the error type is
-    // still this service's, because the type the framework would otherwise name
-    // is a shape this model does not declare. (A table FORMAT outside its enum
-    // is not one of these: this service states its own sentence for that class,
-    // which `invalid_input_refusals.rs` pins.)
+    // A member class this service words no sentence of its own for was refused
+    // by the parameter validator in FRONT of the service, so it carries that
+    // validator's code rather than one of this model's error shapes, and the
+    // clause that names the member and the requirement it broke. (A table FORMAT
+    // outside its enum is not one of these: this service states its own sentence
+    // for that class, which `invalid_input_refusals.rs` pins.)
     let cases = [
         (
             "a storage class outside the modelled enum",
@@ -351,8 +356,8 @@ async fn a_refusal_this_service_states_no_sentence_for_still_carries_its_own_err
         );
         assert_eq!(
             refused.error_code.as_deref(),
-            Some(BAD_REQUEST),
-            "case {label:?}: expected error type {BAD_REQUEST}, got {actual:?}",
+            Some(PARAMETER_VALIDATION),
+            "case {label:?}: expected error type {PARAMETER_VALIDATION}, got {actual:?}",
             actual = refused.error_code
         );
         assert!(
