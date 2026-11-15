@@ -13,6 +13,13 @@
 // and inserts its two lines in sorted order, so the sorted neighbourhood of this suite is
 // the contended region of this file — this fix lost several serialized squash merges to
 // exactly that. The lines above are the file header, which no landing edits.
+// The NAME an Amazon Web Services-managed prefix list is published under — the Region's scope
+// for a list whose ranges are a Region's, the global scope for one AWS publishes once for every
+// Region — and that the id a lookup by that name reports resolves wherever a prefix list id is
+// read. Declared FIRST for the reason the note above gives: the sorted neighbourhood and the
+// tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/aws_managed_prefix_list_name_scopes.rs"]
+mod aws_managed_prefix_list_name_scopes;
 // The OPTIONAL members a read of an AMI and a read of an instance carry: every Amazon EBS
 // device of an image reports the encryption state it restores with, an image's Free Tier
 // eligibility follows its own billing, and the association reported against one private IPv4

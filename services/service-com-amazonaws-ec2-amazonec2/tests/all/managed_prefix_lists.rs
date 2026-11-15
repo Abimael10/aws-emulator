@@ -43,7 +43,8 @@ use std::time::Duration;
 
 use ec2::state::{
     AWS_MANAGED_PREFIX_LIST_OWNER, ComAmazonawsEc2Amazonec2State as Ec2State,
-    FIRST_PREFIX_LIST_VERSION, MAX_PREFIX_LIST_ENTRY_DESCRIPTION_CHARS, MAX_PREFIX_LIST_NAME_CHARS,
+    FIRST_PREFIX_LIST_VERSION, GLOBAL_PREFIX_LIST_SCOPE,
+    MAX_PREFIX_LIST_ENTRY_DESCRIPTION_CHARS, MAX_PREFIX_LIST_NAME_CHARS,
     PREFIX_LIST_ADDRESS_FAMILY_IPV4, PREFIX_LIST_ADDRESS_FAMILY_IPV6,
     PREFIX_LIST_STATE_CREATE_COMPLETE, PREFIX_LIST_STATE_CREATE_IN_PROGRESS, TRANSITION_DELAY,
 };
@@ -904,8 +905,9 @@ async fn a_fresh_account_sees_the_published_lists_and_reading_changes_nothing() 
         "describing prefix lists must not store one"
     );
 
-    // The published lists are facts OF A REGION: another Region's are named for it, so its
-    // ids differ.
+    // A list AWS publishes per Region is a fact OF A REGION: another Region's are named for
+    // it, so the set of ids it reports differs. A list AWS publishes globally is named for
+    // that scope instead and is reported, unchanged, from every Region.
     let (status, elsewhere) = describe_in(&router, OTHER_REGION, &[]).await;
     assert_eq!(
         status, 200,
@@ -923,12 +925,27 @@ async fn a_fresh_account_sees_the_published_lists_and_reading_changes_nothing() 
         elsewhere_ids, reported,
         "another Region publishes its own lists, got {elsewhere_ids:?}"
     );
-    for name in elements(&elsewhere, "prefixListName") {
+    // Every name is under one of the two scopes a published list is named in — the Region's
+    // own, or the global one — and both kinds are reported: the Region publishes lists of its
+    // own services, and it reports the globally published ones beside them.
+    let names = elements(&elsewhere, "prefixListName");
+    let own_scope = format!("com.amazonaws.{OTHER_REGION}.");
+    let global_scope = format!("com.amazonaws.{GLOBAL_PREFIX_LIST_SCOPE}.");
+    for name in &names {
         assert!(
-            name.contains(OTHER_REGION),
-            "another Region: expected its own name, got {name}"
+            name.starts_with(&own_scope) || name.starts_with(&global_scope),
+            "another Region: expected a name under its own scope or the global one, got \
+             {name}"
         );
     }
+    assert!(
+        names.iter().any(|name| name.starts_with(&own_scope)),
+        "another Region: expected a list named for itself, got {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name.starts_with(&global_scope)),
+        "another Region: expected the globally published lists beside its own, got {names:?}"
+    );
 }
 
 /// `PrefixListIds` and the documented filters narrow what the describe reports, an id nothing

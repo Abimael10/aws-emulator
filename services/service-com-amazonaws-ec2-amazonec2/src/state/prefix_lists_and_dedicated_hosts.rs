@@ -560,9 +560,60 @@ impl ServicePrefixList {
 /// `DescribeManagedPrefixLists` selects those lists by.
 pub const AWS_MANAGED_PREFIX_LIST_OWNER: &str = "AWS";
 
-/// The prefix lists Amazon Web Services publishes in every Region: each list's service
-/// label, whether its ranges are IPv6, and whether it is one of the lists the LEGACY report
-/// `DescribePrefixLists` carries.
+/// The scope segment of an Amazon Web Services-managed prefix list whose ranges are not a
+/// fact of ONE Region: `com.amazonaws.global.<label>`.
+///
+/// An AWS-managed prefix list is named `com.amazonaws.<scope>.<label>`, and the scope says
+/// what the list's ranges belong to. A service whose ranges a Region has of its own — Amazon
+/// S3, Amazon DynamoDB, the Region's health checkers — is published under the Region's name,
+/// so each Region reports its own list. A service that answers from one global estate
+/// instead publishes ONE list under this literal scope, and every Region's endpoint reports
+/// that one list under that one name: the Amazon VPC User Guide's "AWS-managed prefix lists"
+/// page names Amazon CloudFront's origin-facing ranges
+/// (`com.amazonaws.global.cloudfront.origin-facing`, the list AWS's own "restrict access to
+/// your origin" guidance tells a caller to look up by name) and AWS Ground Station's
+/// downlink ranges that way.
+pub const GLOBAL_PREFIX_LIST_SCOPE: &str = "global";
+
+/// One prefix list Amazon Web Services publishes: its service label, whether its ranges are
+/// IPv6, whether the LEGACY report `DescribePrefixLists` carries it, and whether AWS
+/// publishes it globally rather than per Region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AwsManagedPrefixList {
+    /// The service component of the list's name, spelled the way an endpoint service name
+    /// spells it: the `<label>` of `com.amazonaws.<scope>.<label>`.
+    pub label: &'static str,
+    /// Whether the ranges this list carries are IPv6 ones.
+    pub ipv6: bool,
+    /// Whether `DescribePrefixLists` — the legacy report — carries this list.
+    pub legacy: bool,
+    /// Whether AWS publishes this list under [`GLOBAL_PREFIX_LIST_SCOPE`], one list for
+    /// every Region, rather than one list per Region under the Region's own name.
+    pub global: bool,
+}
+
+impl AwsManagedPrefixList {
+    /// A list AWS publishes under [`GLOBAL_PREFIX_LIST_SCOPE`]: one list, one name, visible
+    /// from every Region. No such list is in the legacy report
+    /// ([`service_prefix_lists_in_region`]), which carries the gateway service family only.
+    const fn global(label: &'static str, ipv6: bool) -> Self {
+        Self { label, ipv6, legacy: false, global: true }
+    }
+
+    /// A list AWS publishes per Region, named for the Region, that the legacy report
+    /// `DescribePrefixLists` does NOT carry.
+    const fn in_region(label: &'static str, ipv6: bool) -> Self {
+        Self { label, ipv6, legacy: false, global: false }
+    }
+
+    /// A list AWS publishes per Region that the legacy report DOES carry: one of the gateway
+    /// services whose ranges a route table names.
+    const fn legacy_in_region(label: &'static str, ipv6: bool) -> Self {
+        Self { label, ipv6, legacy: true, global: false }
+    }
+}
+
+/// The prefix lists Amazon Web Services publishes, as every Region's endpoint reports them.
 ///
 /// These are the "Amazon Web Services-managed prefix lists" `DescribeManagedPrefixLists`
 /// reports beside the account's own — the set the Amazon VPC User Guide's "AWS-managed
@@ -572,34 +623,54 @@ pub const AWS_MANAGED_PREFIX_LIST_OWNER: &str = "AWS";
 /// IPv6 list each service that publishes one has, named with the `ipv6` label the guide gives
 /// it.
 ///
-/// The third flag is what separates the two reports of a prefix list: `DescribePrefixLists`
-/// "describes available Amazon Web Services services in a prefix list format" (its own doc),
-/// which is the Amazon S3 and Amazon DynamoDB service family — the services whose ranges a
-/// ROUTE TABLE names, each with its IPv6 list — while `DescribeManagedPrefixLists` reports
-/// every list of this catalog. A list AWS publishes for any other service is therefore
-/// reported by the second and not by the first. The flag says which lists that legacy report
-/// carries and nothing about the endpoint TYPES a service is reachable through, which is
-/// [`AWS_ENDPOINT_SERVICES`]'s own column.
+/// [`AwsManagedPrefixList::legacy`] is what separates the two reports of a prefix list:
+/// `DescribePrefixLists` "describes available Amazon Web Services services in a prefix list
+/// format" (its own doc), which is the Amazon S3 and Amazon DynamoDB service family — the
+/// services whose ranges a ROUTE TABLE names, each with its IPv6 list — while
+/// `DescribeManagedPrefixLists` reports every list of this catalog. A list AWS publishes for
+/// any other service is therefore reported by the second and not by the first. The flag says
+/// which lists that legacy report carries and nothing about the endpoint TYPES a service is
+/// reachable through, which is [`AWS_ENDPOINT_SERVICES`]'s own column.
 ///
-/// Each label is the service component of the list's name, spelled the way an endpoint
-/// service name spells it: `com.amazonaws.<region>.<label>`.
-pub(super) const AWS_MANAGED_PREFIX_LIST_SERVICES: [(&str, bool, bool); 15] = [
-    ("cloudfront.origin-facing", false, false),
-    ("dynamodb", false, true),
-    ("ec2-instance-connect", false, false),
-    ("groundstation", false, false),
-    ("ipv6.cloudfront.origin-facing", true, false),
-    ("ipv6.dynamodb", true, true),
-    ("ipv6.groundstation", true, false),
-    ("ipv6.route53-healthchecks", true, false),
-    ("ipv6.s3", true, true),
-    ("ipv6.s3express", true, true),
-    ("ipv6.vpc-lattice", true, false),
-    ("route53-healthchecks", false, false),
-    ("s3", false, true),
-    ("s3express", false, true),
-    ("vpc-lattice", false, false),
+/// [`AwsManagedPrefixList::global`] carries the other half of a list's name, the scope
+/// [`aws_managed_prefix_list_name`] builds it with ([`GLOBAL_PREFIX_LIST_SCOPE`]): the two
+/// services whose ranges are one global estate rather than a Region's are published under
+/// `global`, each with the IPv6 list the guide gives it.
+pub(super) const AWS_MANAGED_PREFIX_LIST_SERVICES: [AwsManagedPrefixList; 15] = [
+    AwsManagedPrefixList::global("cloudfront.origin-facing", false),
+    AwsManagedPrefixList::legacy_in_region("dynamodb", false),
+    AwsManagedPrefixList::in_region("ec2-instance-connect", false),
+    AwsManagedPrefixList::global("groundstation", false),
+    AwsManagedPrefixList::global("ipv6.cloudfront.origin-facing", true),
+    AwsManagedPrefixList::legacy_in_region("ipv6.dynamodb", true),
+    AwsManagedPrefixList::global("ipv6.groundstation", true),
+    AwsManagedPrefixList::in_region("ipv6.route53-healthchecks", true),
+    AwsManagedPrefixList::legacy_in_region("ipv6.s3", true),
+    AwsManagedPrefixList::legacy_in_region("ipv6.s3express", true),
+    AwsManagedPrefixList::in_region("ipv6.vpc-lattice", true),
+    AwsManagedPrefixList::in_region("route53-healthchecks", false),
+    AwsManagedPrefixList::legacy_in_region("s3", false),
+    AwsManagedPrefixList::legacy_in_region("s3express", false),
+    AwsManagedPrefixList::in_region("vpc-lattice", false),
 ];
+
+/// The name Region `region` reports the published prefix list `entry` under:
+/// `com.amazonaws.<scope>.<label>`, the scope being the Region unless AWS publishes the list
+/// globally, in which case it is [`GLOBAL_PREFIX_LIST_SCOPE`].
+///
+/// The ONE spelling of a published list's name, so the report of a list, the legacy report's
+/// subset of it and the id [`service_prefix_list_id`] derives from the name cannot come to
+/// disagree about what one list is called. A global list's name carries no Region, so the id
+/// derived from it is the same from every Region's endpoint — which is the point of a list
+/// published once for all of them: one name, one id, one set of ranges.
+pub(super) fn aws_managed_prefix_list_name(region: &str, entry: &AwsManagedPrefixList) -> String {
+    let scope = if entry.global {
+        GLOBAL_PREFIX_LIST_SCOPE
+    } else {
+        region
+    };
+    format!("com.amazonaws.{scope}.{label}", label = entry.label)
+}
 
 /// The first address of the range every derived prefix list CIDR is carved out of:
 /// `198.18.0.0/15`, which IANA reserves for benchmarking (RFC 2544) and no real service
@@ -621,15 +692,19 @@ pub(super) const PREFIX_LIST_BLOCK_PREFIX_LENGTH: u32 = 21;
 /// a route may reference; [`service_prefix_lists_in_region`] is the gateway-service subset of
 /// it that `DescribePrefixLists` reports. Both read the same entries, so one list's id, name
 /// and ranges are the same whichever report reaches it.
+///
+/// Every Region reports the whole catalog: a list AWS publishes per Region is named for
+/// `region`, and one it publishes globally is named for [`GLOBAL_PREFIX_LIST_SCOPE`] instead
+/// and so is reported under one name and one id whichever Region is asked.
 pub fn managed_prefix_lists_in_region(region: &str) -> Vec<ServicePrefixList> {
     let mut lists: Vec<ServicePrefixList> = AWS_MANAGED_PREFIX_LIST_SERVICES
         .iter()
         .enumerate()
-        .map(|(index, (service, ipv6, _))| {
-            let prefix_list_name = format!("com.amazonaws.{region}.{service}");
+        .map(|(index, entry)| {
+            let prefix_list_name = aws_managed_prefix_list_name(region, entry);
             ServicePrefixList {
                 prefix_list_id: service_prefix_list_id(&prefix_list_name),
-                cidrs: service_prefix_list_cidrs(u32::try_from(index).unwrap_or(0), *ipv6),
+                cidrs: service_prefix_list_cidrs(u32::try_from(index).unwrap_or(0), entry.ipv6),
                 prefix_list_name,
             }
         })
@@ -651,18 +726,14 @@ pub fn managed_prefix_lists_in_region(region: &str) -> Vec<ServicePrefixList> {
 /// and Amazon DynamoDB service family of [`AWS_MANAGED_PREFIX_LIST_SERVICES`], which is what
 /// `DescribePrefixLists` reports — in `PrefixListName` order.
 pub fn service_prefix_lists_in_region(region: &str) -> Vec<ServicePrefixList> {
-    let legacy: Vec<&str> = AWS_MANAGED_PREFIX_LIST_SERVICES
+    let legacy: Vec<String> = AWS_MANAGED_PREFIX_LIST_SERVICES
         .iter()
-        .filter(|(_, _, legacy)| *legacy)
-        .map(|(service, _, _)| *service)
+        .filter(|entry| entry.legacy)
+        .map(|entry| aws_managed_prefix_list_name(region, entry))
         .collect();
     managed_prefix_lists_in_region(region)
         .into_iter()
-        .filter(|list| {
-            legacy.iter().any(|service| {
-                list.prefix_list_name == format!("com.amazonaws.{region}.{service}")
-            })
-        })
+        .filter(|list| legacy.contains(&list.prefix_list_name))
         .collect()
 }
 

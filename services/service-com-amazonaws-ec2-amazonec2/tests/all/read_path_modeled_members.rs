@@ -668,11 +668,12 @@ async fn a_published_prefix_list_reports_no_account_facts() {
 
     // The catalog holds the lists AWS publishes for services that have no gateway endpoint,
     // and the IPv6 list of a service that publishes one — neither of which the legacy report
-    // below carries.
+    // below carries. A list AWS publishes once for every Region is named for the global scope
+    // rather than for the Region.
     for name in [
         format!("com.amazonaws.{REGION}.route53-healthchecks"),
         format!("com.amazonaws.{REGION}.ipv6.s3"),
-        format!("com.amazonaws.{REGION}.cloudfront.origin-facing"),
+        "com.amazonaws.global.cloudfront.origin-facing".to_string(),
         format!("com.amazonaws.{REGION}.s3"),
     ] {
         assert!(
