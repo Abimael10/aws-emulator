@@ -1232,3 +1232,27 @@ mod zz_opensearch_fgac_probe;
 mod zz_probe;
 #[path = "all/zz_probe_whole_emulator.rs"]
 mod zz_probe_whole_emulator;
+// Single integration-test target for the router: the canonical declaration list of its
+// cross-service suites, and nothing else.
+// Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair
+// per file under `tests/all/`, sorted by name, and no other line, so two branches landing
+// at once insert two lines in two places and have no prose to duplicate, re-word or
+// mistype. Put a new suite at `tests/all/<name>.rs` and insert its pair in order; what the
+// suite covers, and why it drives the assembled router rather than one service crate,
+// belongs in that suite's own module header, beside the test it explains.
+// deliberate: an inner doc comment is legal only before the first item, so one appended
+// past the declarations is `E0753` and compiles no suite of this target — and with none in
+// the file at all, no merge of two landings can leave one there. A file no `mod` names is
+// compiled nowhere and its tests never run, and a name declared twice is `E0428`, which
+// fails every suite here too.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING
+// (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each `mod` is
+// what points the declaration into `tests/all/`. Some of the files below are shared
+// harnesses or probes rather than suites; all are declared, because a file no declaration
+// names is compiled nowhere.
+// `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs` and
+// `all/every_suite_file_is_declared.rs` pin those rules, for this file and for every
+// service crate's `tests/all.rs`, so check there rather than leaving a note here;
+// `all/appended_notes.rs` keeps the notes earlier landings had appended to this file.

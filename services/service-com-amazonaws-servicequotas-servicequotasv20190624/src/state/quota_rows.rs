@@ -481,12 +481,13 @@ pub(super) fn ec2_resource_quotas() -> Vec<QuotaRow> {
 /// A quota this catalog can name but whose AWS `QuotaCode` that listing does not state
 /// is NOT published under another quota's code, and the stand-in code is not published
 /// for this service either (the listing keys every row it carries on an AWS `L-` code,
-/// so a stand-in row is a surplus entry): the replay plane, the `PutEvents` rate and
-/// the `TestEventPattern` rate are therefore left to the default-quota-set gap rather
-/// than served under the codes the listing binds to the `DeleteEndpoint` rate, the
-/// event-bus plane and the event-bus policy size. The code this catalog had served the
-/// event-bus plane under a second time is left to that same gap: a quota it cannot cite
-/// is published under no code at all.
+/// so a stand-in row is a surplus entry): the replay plane, the `TestEventPattern` rate
+/// and the `RemoveTargets` and `ListTargetsByRule` rates are therefore left to the
+/// default-quota-set gap rather than served under the codes the listing binds to the
+/// `DeleteEndpoint` and `PutEvents` rates, the event-bus plane, the API-destination
+/// plane and the event-bus policy size. The code this catalog had served the event-bus
+/// plane under a second time is left to that same gap: a quota it cannot cite is
+/// published under no code at all.
 pub(super) fn events_quotas() -> Vec<QuotaRow> {
     vec![
         // The RULE plane of an event bus as the account's own record reports it, under
@@ -560,7 +561,19 @@ pub(super) fn events_quotas() -> Vec<QuotaRow> {
                  will still occur, but are delayed.",
             ),
         events_request_rate("L-8331B29E", "PutTargets", 50.0).fixed(),
-        events_request_rate("L-9B653E91", "RemoveTargets", 50.0),
+        // The PutEvents rate: the recorded listing binds this code to the rate of the
+        // event-INGEST API, so the row carries that API's name, its transactions per
+        // second, the one-second window of the class and the call count of that API. Its
+        // published sentence is NOT the one the rate class carries
+        // ([`events_api_rate_description`]) and no source available here states it, so the
+        // row carries no `Description` rather than one this catalog would be wording
+        // itself. The RemoveTargets rate this catalog had served under the code names no
+        // code the listing states, so it is left to the default-quota-set gap rather than
+        // published under another quota's code.
+        quota("PutEvents throttle limit in transactions per second", 10_000.0)
+            .code("L-9B653E91")
+            .period(1, "SECOND")
+            .metric(call_count_metric("EventBridge", "PutEvents")),
         events_request_rate("L-A8AFA624", "UpdateEndpoint", 5.0).fixed(),
         events_request_rate("L-CB72B930", "CreateEndpoint", 5.0).fixed(),
         // NOT published here: the code this catalog had served the account's event-bus
@@ -589,15 +602,24 @@ pub(super) fn events_quotas() -> Vec<QuotaRow> {
         quota("Endpoints", 100.0)
             .code("L-EAC9A2AC")
             .describe("The maximum number of endpoints per account per Region."),
-        events_request_rate("L-FB1C3A6D", "ListTargetsByRule", 50.0),
+        // The API DESTINATION plane of an account, which the recorded listing publishes
+        // under this code: a count of resources rather than a per-API rate, so it carries
+        // neither a one-second window nor an API's call count, and it is published with
+        // the spelling that listing carries for its name. The ListTargetsByRule rate this
+        // catalog had served under the code names no code the listing states, so it is
+        // left to the default-quota-set gap.
+        quota("Api destinations", 3000.0)
+            .code("L-FB1C3A6D")
+            .describe("The maximum number of API destinations per account per Region."),
         // The SIZE of an event bus's resource policy, which AWS publishes in CHARACTERS
         // and points at the API a caller reads the current size with: a measured quota
         // rather than a request rate, so it carries no window and no call-count metric.
         quota("Event bus policy size", 10_240.0)
             .code("L-FC354966")
             .describe(
-                "Maximum policy size, in characters. You can view the current policy size \
-                 for an event bus by using the DescribeEventBus API.",
+                "Maximum policy size, in characters. This policy size increases each time \
+                 you grant access to another account. You can see your current policy and \
+                 its size by using the DescribeEventBus API.",
             ),
     ]
 }
@@ -784,15 +806,17 @@ pub(super) fn firehose_quotas() -> Vec<QuotaRow> {
         // The data-plane RATES of one delivery stream — the records, the Put requests and
         // the data a stream takes per second — which the recorded listing binds to these
         // three codes. Each is a rate, so it carries the one-second window the service
-        // publishes it over, and none of them is an API call count. The listing's
-        // published sentence for the three is not stated by any source available here, so
-        // the rows carry NO `Description` rather than one this catalog would be wording
-        // itself (`tests/all/recorded_rows_events_through_imagebuilder.rs` pins exactly
-        // these three as the rows published without one).
+        // publishes it over, and none of them is an API call count. Each carries the
+        // sentence the recorded listing states for it, which describes the capacity of ONE
+        // delivery stream in the current Region rather than an account-wide allowance.
         quota("Rate of records", 500_000.0)
             .code("L-17D4EADE")
             .fixed()
-            .period(1, "SECOND"),
+            .period(1, "SECOND")
+            .describe(
+                "The maximum capacity in records per second for a delivery stream in the \
+                 current Region.",
+            ),
         // The DYNAMIC PARTITION plane of one delivery stream, which the service
         // publishes as fixed: a count of the partitions a stream may have rather than a
         // request rate, so it carries neither a window nor an API's call count.
@@ -810,11 +834,19 @@ pub(super) fn firehose_quotas() -> Vec<QuotaRow> {
         quota("Rate of Put requests", 2000.0)
             .code("L-7681C790")
             .fixed()
-            .period(1, "SECOND"),
+            .period(1, "SECOND")
+            .describe(
+                "The maximum number of combined PutRecord and PutRecordBatch requests per \
+                 second for a delivery stream in the current Region.",
+            ),
         quota("Rate of data", 5.0)
             .code("L-937C879B")
             .fixed()
-            .period(1, "SECOND"),
+            .period(1, "SECOND")
+            .describe(
+                "The maximum capacity in mebibyte per second for a delivery stream in the \
+                 current Region.",
+            ),
         rate("L-CC1FDDAA", "UpdateDestination", 5.0),
         rate("L-ED7DA7FC", "TagDeliveryStream", 5.0),
         // A control-plane rate the service meters in its OWN metric namespace rather
@@ -859,8 +891,10 @@ const FIREHOSE_USAGE_SERVICE: &str = "Kinesis Firehose";
 /// publishes for its control plane. Which `QuotaCode` names which quota and each code's
 /// adjustability come from the recorded default-quota listing of `fms`, which binds the
 /// code this catalog had published the `BatchAssociateResource` rate under to the Amazon
-/// VPC instances a common security group policy may have in scope; that call rate names
-/// no code the listing states, so it is left to the default-quota-set gap.
+/// VPC instances a common security group policy may have in scope, and the code it had
+/// published the `ListPolicies` rate under to the organizational units one policy may
+/// have in scope; those two call rates name no code the listing states, so they are left
+/// to the default-quota-set gap.
 pub(super) fn fms_quotas() -> Vec<QuotaRow> {
     let rate =
         |code: &str, api: &str, per_second: f64| request_rate(code, "Firewall Manager", api, per_second);
@@ -889,8 +923,8 @@ pub(super) fn fms_quotas() -> Vec<QuotaRow> {
         quota("Partner rule groups per AWS WAF policy", 1.0)
             .code("L-1608788B")
             .describe(
-                "The maximum number of partner rule groups that you can include in an AWS WAF \
-                 policy.",
+                "The maximum number of partner rule groups that can be applied to a single \
+                 policy, limited by Web Application Firewall WebACL limits.",
             ),
         rate("L-1E778CA5", "AssociateThirdPartyFirewall", 5.0).fixed(),
         // The Amazon VPC instances one COMMON SECURITY GROUP policy may have in scope,
@@ -902,8 +936,10 @@ pub(super) fn fms_quotas() -> Vec<QuotaRow> {
         )
         .code("L-25F99602")
         .describe(
-            "The maximum number of Amazon VPC instances that can be in scope of a common \
-             security group policy.",
+            "The maximum number of Amazon VPC instances that you can have in scope per \
+             Firewall Manager common security group policy per account. This number \
+             represents the combined count of VPCs that you own and VPCs that are shared \
+             with you.",
         ),
         // The security groups ONE content-audit policy may audit, under the code the
         // recorded listing binds that plane to: a count rather than a request rate.
@@ -913,8 +949,8 @@ pub(super) fn fms_quotas() -> Vec<QuotaRow> {
         )
         .code("L-3BC4947E")
         .describe(
-            "The maximum number of security groups that you can audit in a security group \
-             content audit policy.",
+            "The maximum number of audit security groups that you can use in a Firewall \
+             Manager content audit security group policy.",
         ),
         rate("L-3DCEAE01", "DeleteAppsList", 5.0),
         // A COUNT of the resources in one resource set, which the recorded listing
@@ -934,8 +970,8 @@ pub(super) fn fms_quotas() -> Vec<QuotaRow> {
         )
         .code("L-49265FF2")
         .describe(
-            "The maximum number of custom managed application lists in any content audit \
-             security group policy setting.",
+            "The maximum number of custom managed application lists that you can use in \
+             any setting in a Firewall Manager content audit security group policy.",
         ),
         rate("L-4E3D82C8", "DeleteResourceSet", 5.0),
         quota("Resource sets per Firewall Manager admin account", 20.0)
@@ -958,7 +994,17 @@ pub(super) fn fms_quotas() -> Vec<QuotaRow> {
         rate("L-9E030C62", "ListAppsLists", 20.0).fixed(),
         rate("L-BCA8AD34", "ListComplianceStatus", 20.0).fixed(),
         rate("L-C6CF2DBB", "ListMemberAccounts", 20.0),
-        rate("L-C80E7B9E", "ListPolicies", 20.0),
+        // The ORGANIZATIONAL UNITS one policy may have in scope, which the recorded
+        // listing publishes under this code: a counted plane of a policy's scope rather
+        // than a request rate, so it carries neither a window nor an API's call count. The
+        // `ListPolicies` rate this catalog had served under the code names no code the
+        // listing states, so it is left to the default-quota-set gap.
+        quota("Organizational units in scope per policy per Region", 20.0)
+            .code("L-C80E7B9E")
+            .describe(
+                "The maximum number of organizational units that can be in scope of a \
+                 Firewall Manager policy for any Region.",
+            ),
         rate("L-CA0A307F", "ListProtocolsLists", 20.0),
         rate("L-DE1D154D", "PutNotificationChannel", 5.0),
         rate("L-F4032167", "PutPolicy", 5.0),
@@ -976,11 +1022,12 @@ pub(super) fn fms_quotas() -> Vec<QuotaRow> {
 /// plane, each code's adjustability and the unit each row is published in come from the
 /// recorded default-quota listing of `fsx`, which is also where the wording of the one
 /// row whose published description it states comes from. That listing binds the Windows
-/// throughput plane, the NetApp ONTAP file-system plane and the Lustre Persistent
-/// Intelligent-Tiering read cache to codes other than the ones this catalog had published
-/// them under, so each row below is published under the code the listing binds ITS quota
-/// to; the codes they vacate name no quota this catalog can cite, so nothing is published
-/// under them.
+/// throughput plane, the NetApp ONTAP file-system plane, the Lustre Persistent
+/// Intelligent-Tiering read cache and the Lustre persistent_1 file-system plane to codes
+/// other than the ones this catalog had published them under, so each row below is
+/// published under the code the listing binds ITS quota to; the codes they vacate, and
+/// the ONTAP per-file-system volume plane whose own code the listing does not state, name
+/// no quota this catalog can cite, so nothing is published under them.
 pub(super) fn fsx_quotas() -> Vec<QuotaRow> {
     let rate = |code: &str, api: &str, per_second: f64| request_rate(code, "FSx", api, per_second);
     vec![
@@ -990,8 +1037,9 @@ pub(super) fn fsx_quotas() -> Vec<QuotaRow> {
         quota("Lustre Cache_1 storage capacity", 100_800.0)
             .code("L-15D9FE87")
             .describe(
-                "The maximum amount of Cache_1 storage capacity (in GiB) for all Amazon FSx \
-                 for Lustre file systems that you can have in this account.",
+                "The maximum amount of storage capacity (in GiB) that you can configure in \
+                 this account for all Amazon File Cache caches with cache type Lustre and \
+                 deployment type Cache_1.",
             ),
         quota("OpenZFS provisioned SSD read cache storage capacity", 262_144.0)
             .code("L-4E6C2FB3")
@@ -1034,9 +1082,17 @@ pub(super) fn fsx_quotas() -> Vec<QuotaRow> {
             .describe(
                 "The maximum number of storage virtual machines per ONTAP file system.",
             ),
-        quota("ONTAP volumes per file system", 500.0)
+        // The FILE-SYSTEM plane of the Lustre persistent_1 deployment, under the code the
+        // recorded listing binds it to, with the name, value and sentence that listing
+        // carries for it — which it publishes without a closing period. The ONTAP volume
+        // plane this catalog had served under the code names no code the listing states,
+        // so it is left to the default-quota-set gap.
+        quota("Lustre Persistent_1 file systems", 100.0)
             .code("L-9AFA1F09")
-            .describe("The maximum number of volumes per ONTAP file system."),
+            .describe(
+                "The maximum number of Amazon FSx for Lustre persistent_1 file systems that \
+                 you can create in this account",
+            ),
         quota("ONTAP backups per volume", 500.0)
             .code("L-AD2FC696")
             .describe("The maximum number of backups per ONTAP volume."),
@@ -1109,8 +1165,8 @@ pub(super) fn fsx_quotas() -> Vec<QuotaRow> {
         quota("Windows throughput capacity", 10_240.0)
             .code("L-FD89CA8A")
             .describe(
-                "The maximum amount of throughput capacity (in MBps) for all Amazon FSx for \
-                 Windows File Server file systems that you can have in this account.",
+                "The total amount of throughput capacity (in MBps) allowed for all Amazon \
+                 FSx for Windows file systems in this account.",
             ),
     ]
 }
@@ -1123,8 +1179,10 @@ pub(super) fn fsx_quotas() -> Vec<QuotaRow> {
 /// matchmaking and fleet APIs. Which `QuotaCode` names which quota, each code's
 /// adjustability and the unit of the capacity row come from the recorded default-quota
 /// listing of `gamelift`, which binds the code this catalog had published the script
-/// plane under to the player-session timeout; the script plane names no code that
-/// listing states, so it is left to the default-quota-set gap.
+/// plane under to the player-session timeout and the code it had published the
+/// matchmaking rule-set plane under to the game servers of one game server group; the
+/// script plane and that rule-set plane name no code that listing states, so they are
+/// left to the default-quota-set gap.
 pub(super) fn gamelift_quotas() -> Vec<QuotaRow> {
     let rate =
         |code: &str, api: &str, per_second: f64| request_rate(code, "GameLift", api, per_second);
@@ -1156,8 +1214,8 @@ pub(super) fn gamelift_quotas() -> Vec<QuotaRow> {
             .code("L-24BE0A39")
             .unit("Seconds")
             .describe(
-                "The maximum length of time, in seconds, that a player session remains in \
-                 RESERVED status before it times out.",
+                "The maximum time (in seconds) for a reserved player session to timeout \
+                 pending a valid player connection.",
             ),
         quota("Game session queues", 25.0)
             .code("L-293B0017")
@@ -1165,9 +1223,13 @@ pub(super) fn gamelift_quotas() -> Vec<QuotaRow> {
         quota("Matchmaking configurations", 100.0)
             .code("L-3A43EF3C")
             .describe("The maximum number of matchmaking configurations."),
-        quota("Matchmaking rule sets", 100.0)
+        // The GAME SERVER plane of one game server group, which the recorded listing
+        // publishes under this code: a count of the servers a group may hold rather than
+        // the matchmaking rule-set plane this catalog had served under it, whose own code
+        // the listing does not state, so that plane is left to the default-quota-set gap.
+        quota("Game servers per game server group", 1000.0)
             .code("L-51AF299A")
-            .describe("The maximum number of matchmaking rule sets."),
+            .describe("The maximum number of game servers allowed per game server group."),
         quota("Game server groups", 100.0)
             .code("L-55650DB7")
             .describe("The maximum number of game server groups."),
@@ -1193,7 +1255,10 @@ pub(super) fn gamelift_quotas() -> Vec<QuotaRow> {
         rate("L-8EBC4E87", "CreateGameSession", 10.0).fixed(),
         quota("Builds per region", 1000.0)
             .code("L-90D24F1B")
-            .describe("The maximum number of builds per Region."),
+            .describe(
+                "The maximum number of game server builds allowed (in any status) per \
+                 region.",
+            ),
         rate("L-9F9DE0B2", "StartGameSessionPlacement", 10.0),
         // The matchmaking player attribute whose value is a STRING-TO-DOUBLE MAP, under
         // the code the recorded listing binds that plane to: a count of the pairs one
@@ -1206,8 +1271,8 @@ pub(super) fn gamelift_quotas() -> Vec<QuotaRow> {
         .code("L-A8C1B434")
         .fixed()
         .describe(
-            "The maximum number of key-value pairs per string to double map matchmaking \
-             player attribute.",
+            "The maximum number of key-value pairs in a string to double map (SDM) \
+             matchmaking player attribute.",
         ),
         // The ALIAS plane of a Region, under the code the recorded listing binds it to,
         // with the value and the sentence that listing carries for it.
@@ -1223,7 +1288,7 @@ pub(super) fn gamelift_quotas() -> Vec<QuotaRow> {
         rate("L-C30AA854", "SearchGameSessions", 10.0).fixed(),
         quota("Custom locations per region", 20.0)
             .code("L-C6F4238C")
-            .describe("The maximum number of custom locations per Region."),
+            .describe("The maximum number of custom locations allowed per region."),
         rate("L-CCBBB4DA", "UpdateFleetCapacity", 10.0).fixed(),
         rate("L-E8D8BD94", "DescribeFleetAttributes", 10.0).fixed(),
         // As with the queue-destination row above: a count plane the recorded listing
@@ -1326,9 +1391,14 @@ pub(super) fn glacier_quotas() -> Vec<QuotaRow> {
 ///
 /// That listing binds two of the codes this catalog had published the job-concurrency
 /// planes under to the crawler plane of an account and the function plane of one
-/// database; the job-concurrency planes name no code it states, so they are left to the
-/// default-quota-set gap rather than served under another quota's code, and so is the
-/// code this catalog had served the account-wide crawler plane under.
+/// database, the code it had published the per-table partition plane under to the task
+/// DPUs an account may use at once, the code it had published the connection plane under
+/// to the concurrent column-statistics tasks of an account, and the code it had published
+/// the `StartCrawler` rate under to the trigger plane of an account; the job-concurrency
+/// planes, the partition plane, the connection plane and that call rate name no code it
+/// states, so they are left to the default-quota-set gap rather than served under another
+/// quota's code, and so are the codes this catalog had served the account-wide crawler and
+/// trigger planes under.
 pub(super) fn glue_quotas() -> Vec<QuotaRow> {
     let rate = |code: &str, api: &str, per_second: f64| request_rate(code, "Glue", api, per_second);
     vec![
@@ -1338,9 +1408,17 @@ pub(super) fn glue_quotas() -> Vec<QuotaRow> {
         quota("Tables per database", 200_000.0)
             .code("L-071ABE08")
             .describe("The maximum number of tables per database."),
-        quota("Partitions per table", 10_000_000.0)
+        // The compute capacity an account may use CONCURRENTLY, measured in data
+        // processing units, which the recorded listing publishes under this code: a
+        // capacity plane rather than the per-table partition plane this catalog had served
+        // under it, whose own code the listing does not state, so that plane is left to
+        // the default-quota-set gap.
+        quota("Max task DPUs per account", 1000.0)
             .code("L-08F3B322")
-            .describe("The maximum number of partitions per table."),
+            .describe(
+                "The maximum compute capacity in data processing units (DPUs) you can use \
+                 concurrently in your account.",
+            ),
         quota("Table versions per table", 100_000.0)
             .code("L-096DBB95")
             .describe("The maximum number of table versions per table."),
@@ -1349,23 +1427,29 @@ pub(super) fn glue_quotas() -> Vec<QuotaRow> {
         // carries for them.
         quota("Number of crawlers per account", 1000.0)
             .code("L-11FA2C1A")
-            .describe("The maximum number of crawlers per account."),
+            .describe("The maximum number of crawlers in your account."),
         quota("Max functions per database", 100.0)
             .code("L-1DD415D5")
             .describe("The maximum number of functions per database."),
         quota("Development endpoints per account", 5.0)
             .code("L-2C3F5401")
             .describe("The maximum number of development endpoints in your account."),
-        quota("Triggers per account", 25_000.0)
-            .code("L-2E9FB93F")
-            .describe("The maximum number of triggers in your account."),
-        // NOT published here: the code this catalog had served the account-wide crawler
-        // plane under. That plane is published under L-11FA2C1A above, the code the
-        // listing binds it to, and the listing states no quota this catalog can cite under
-        // this one, so it is left to the default-quota-set gap.
-        quota("Connections per account", 1000.0)
-            .code("L-3890A802")
-            .describe("The maximum number of connections in your account."),
+        // NOT published here: the code this catalog had served the account's trigger
+        // plane under. That plane is published under L-F1653A6D below, the code the
+        // recorded listing binds it to, and the listing states no quota this catalog can
+        // cite under this one, so it is left to the default-quota-set gap.
+        //
+        // The COLUMN STATISTICS tasks an account may run at once, under the code the
+        // recorded listing binds that plane to, with the name and value it carries for it;
+        // the listing's sentence for the row is not stated by any source available here,
+        // so it carries no `Description` rather than one this catalog would be wording
+        // itself. The connection plane this catalog had served under the code names no
+        // code the listing states, so it is left to the default-quota-set gap.
+        quota(
+            "Number of column statistics tasks running concurrently per account",
+            50.0,
+        )
+        .code("L-3890A802"),
         quota("Security configurations per account", 200.0)
             .code("L-4071B0E3")
             .describe("The maximum number of security configurations in your account."),
@@ -1425,7 +1509,9 @@ pub(super) fn glue_quotas() -> Vec<QuotaRow> {
         quota("Label file size", 10.0)
             .code("L-B78896B9")
             .unit("Megabytes")
-            .describe("The maximum size of a label file."),
+            .describe(
+                "The maximum file size of an individual label file that can be imported.",
+            ),
         rate("L-B8497671", "GetDatabases", 50.0),
         rate("L-C3952F6C", "GetJob", 50.0),
         // The two rate rows the recorded listing publishes as NOT adjustable.
@@ -1449,12 +1535,20 @@ pub(super) fn glue_quotas() -> Vec<QuotaRow> {
         .code("L-E6C807E7")
         .fixed()
         .describe(
-            "The maximum concurrent compute capacity for Ray worker instances in M-DPUs \
-             per account.",
+            "The maximum number of data processing units that can be concurrently used by \
+             Ray jobs or interactive sessions in this account. The capacity provided by a \
+             Ray worker instance type is measured in memory optimized data processing \
+             units (M-DPUs).",
         ),
         rate("L-EAC30D24", "GetTableVersions", 50.0),
         rate("L-EEC98450", "GetUserDefinedFunction", 50.0),
-        rate("L-F1653A6D", "StartCrawler", 10.0),
+        // The TRIGGER plane of an account, under the code the recorded listing binds it
+        // to, with the sentence that listing carries for it. The `StartCrawler` rate this
+        // catalog had served under the code names no code the listing states, so it is
+        // left to the default-quota-set gap.
+        quota("Triggers per account", 25_000.0)
+            .code("L-F1653A6D")
+            .describe("The maximum number of triggers in your account."),
         rate("L-F1AAB534", "StartJobRun", 50.0),
         rate("L-F545C262", "StartWorkflowRun", 10.0),
         rate("L-F574AED9", "UpdateDatabase", 10.0),
@@ -1595,9 +1689,13 @@ pub(super) fn guardduty_quotas() -> Vec<QuotaRow> {
 /// and the per-API request rates it publishes for its image APIs. Which `QuotaCode`
 /// names which quota and the unit of the size plane come from the recorded default-quota
 /// listing of `imagebuilder`, which binds the code this catalog had published the
-/// `ListImageRecipes` rate under to the infrastructure-configuration plane; that call
-/// rate names no code it states, so it is left to the default-quota-set gap, and so is
-/// the code this catalog had served that plane under.
+/// `ListImageRecipes` rate under to the infrastructure-configuration plane, the code it
+/// had published the lifecycle-policy plane under to the concurrent resource-state
+/// updates of an account, and the code it had published the build-concurrency plane under
+/// to the components of one image recipe; that call rate, the lifecycle-policy plane and
+/// that build-concurrency plane name no code it states, so they are left to the
+/// default-quota-set gap, and so is the code this catalog had served the
+/// infrastructure-configuration plane under.
 pub(super) fn imagebuilder_quotas() -> Vec<QuotaRow> {
     let rate = |code: &str, api: &str, per_second: f64| {
         request_rate(code, "EC2 Image Builder", api, per_second)
@@ -1644,14 +1742,25 @@ pub(super) fn imagebuilder_quotas() -> Vec<QuotaRow> {
                 "The maximum number of images that you can create in an account in the current \
                  Region.",
             ),
-        quota("Concurrent image builds", 10.0)
+        // The COMPONENT plane of one image recipe, which the recorded listing publishes
+        // under this code: a count of the components a recipe may carry rather than the
+        // build-concurrency plane this catalog had served under it, whose own code the
+        // listing does not state, so that plane is left to the default-quota-set gap.
+        quota("Components per image recipe", 20.0)
             .code("L-59EC76F6")
-            .describe("The maximum number of image builds that can run at once."),
-        quota("Lifecycle policies", 100.0)
+            .describe(
+                "The maximum number of components that can be associated with a single \
+                 image recipe.",
+            ),
+        // The concurrent RESOURCE STATE UPDATES of an account, under the code the recorded
+        // listing binds that plane to, with the value and sentence it carries for it. The
+        // lifecycle-policy plane this catalog had served under the code names no code the
+        // listing states, so it is left to the default-quota-set gap.
+        quota("Concurrent resource state update", 50.0)
             .code("L-5E848392")
             .describe(
-                "The maximum number of lifecycle policies that you can create in an account in \
-                 the current Region.",
+                "The maximum number of concurrent resource state updates that can be in \
+                 progress in this account in the current Region.",
             ),
         quota("Workflows", 1000.0)
             .code("L-6105A4EE")
@@ -1670,7 +1779,7 @@ pub(super) fn imagebuilder_quotas() -> Vec<QuotaRow> {
         // this code: a count rather than a request rate.
         quota("Parameters per component", 25.0)
             .code("L-A58CFBED")
-            .describe("The maximum number of parameters that you can define in a component."),
+            .describe("The maximum number of parameters that a single component can contain."),
         // The SSM parameters one distribution configuration may update in a Region,
         // under the code the recorded listing binds that plane to: a count rather than a
         // request rate.
@@ -1680,8 +1789,8 @@ pub(super) fn imagebuilder_quotas() -> Vec<QuotaRow> {
         )
         .code("L-B588F8CA")
         .describe(
-            "The maximum number of SSM parameters that one distribution configuration can \
-             update in a Region.",
+            "The maximum number of SSM Parameters that a single distribution configuration \
+             can update per Region.",
         ),
         // As above: a concurrency plane the recorded listing publishes under this code.
         quota("Concurrent builds", 100.0)
@@ -1696,8 +1805,8 @@ pub(super) fn imagebuilder_quotas() -> Vec<QuotaRow> {
         )
         .code("L-D5665818")
         .describe(
-            "The maximum number of launch templates that one distribution configuration can \
-             update in a Region.",
+            "The maximum number of launch templates that a single distribution \
+             configuration can modify per Region.",
         ),
         // The payload size of a component, which the service publishes as the size of
         // the component's DATA FIELD, in kilobytes rather than as a count.
@@ -1718,7 +1827,7 @@ pub(super) fn imagebuilder_quotas() -> Vec<QuotaRow> {
         quota("Parameters per image workflow", 25.0)
             .code("L-E49825CC")
             .describe(
-                "The maximum number of parameters that you can define in an image workflow.",
+                "The maximum number of parameters that a single image workflow can contain.",
             ),
     ]
 }

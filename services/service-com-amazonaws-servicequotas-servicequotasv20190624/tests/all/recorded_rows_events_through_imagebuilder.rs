@@ -49,18 +49,16 @@ const SERVICE_CODES: &[&str] = &[
 
 /// The `(ServiceCode, QuotaCode)` pairs published WITHOUT a `Description`.
 ///
-/// SOURCE: the recorded `ListAWSDefaultServiceQuotas` response of `firehose` carries a
-/// description for each of these three data-plane rate rows, but no source available to
-/// this emulator states its text — so the row carries none rather than a sentence this
-/// catalog would be wording itself, which is what the rule forbids.
+/// SOURCE: the recorded `ListAWSDefaultServiceQuotas` response of `events` carries a
+/// sentence for the `PutEvents` rate row that is not the one its rate class carries, and
+/// the response of `glue` carries one for the concurrent column-statistics-task row; no
+/// source available to this emulator states either text — so those rows carry none rather
+/// than a sentence this catalog would be wording itself, which is what the rule forbids.
 ///
 /// `pub(crate)` so the suites that assert "every row carries its published sentence"
 /// read the one list rather than each keeping a copy of it.
-pub(crate) const PUBLISHED_WITHOUT_A_DESCRIPTION: &[(&str, &str)] = &[
-    ("firehose", "L-17D4EADE"),
-    ("firehose", "L-7681C790"),
-    ("firehose", "L-937C879B"),
-];
+pub(crate) const PUBLISHED_WITHOUT_A_DESCRIPTION: &[(&str, &str)] =
+    &[("events", "L-9B653E91"), ("glue", "L-3890A802")];
 
 /// Every row of these catalogs, as `ServiceCode -> the listed rows`.
 async fn catalogs(caller: &Client) -> BTreeMap<&'static str, Vec<Value>> {

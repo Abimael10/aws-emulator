@@ -766,6 +766,13 @@ async fn a_request_rate_row_names_the_operation_it_throttles() {
             }
             let code = quota["QuotaCode"].as_str().unwrap_or_default();
             let case = format!("{service_code}/{code}");
+            // A row whose own published sentence no source states carries none rather than
+            // the class sentence: the pairs are named once, in
+            // `recorded_rows_events_through_imagebuilder.rs`. Only the sentence is exempt —
+            // the metric dimensions and the window of the class are asserted for it below
+            // like any other row of the class.
+            let sentence_stated =
+                !PUBLISHED_WITHOUT_A_DESCRIPTION.contains(&(*service_code, code));
             let api = quota["UsageMetric"]["MetricDimensions"]["Resource"]
                 .as_str()
                 .unwrap_or_default()
@@ -801,12 +808,21 @@ async fn a_request_rate_row_names_the_operation_it_throttles() {
                      account in the current Region."
                 )
             };
-            assert_eq!(
-                quota["Description"],
-                json!(expected),
-                "case {case}: expected the sentence AWS publishes for a request-rate quota, \
-                 got {quota}"
-            );
+            if sentence_stated {
+                assert_eq!(
+                    quota["Description"],
+                    json!(expected),
+                    "case {case}: expected the sentence AWS publishes for a request-rate \
+                     quota, got {quota}"
+                );
+            } else {
+                assert_eq!(
+                    quota["Description"],
+                    Value::Null,
+                    "case {case}: a row whose published sentence no source states carries \
+                     none, got {quota}"
+                );
+            }
             assert_eq!(
                 quota["Period"],
                 json!({"PeriodValue": 1, "PeriodUnit": "SECOND"}),

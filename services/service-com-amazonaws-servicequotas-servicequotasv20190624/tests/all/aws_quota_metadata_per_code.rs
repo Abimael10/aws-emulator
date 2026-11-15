@@ -264,7 +264,10 @@ const ROWS: &[Row] = &[
         value: 1.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some(
+            "The maximum number of audit security groups that you can use in a Firewall \
+             Manager content audit security group policy.",
+        ),
         period: None,
         meter: None,
     },
@@ -460,7 +463,12 @@ const ROWS: &[Row] = &[
         value: 50.0,
         unit: "None",
         adjustable: false,
-        description: None,
+        description: Some(
+            "The maximum number of data processing units that can be concurrently used by \
+             Ray jobs or interactive sessions in this account. The capacity provided by a \
+             Ray worker instance type is measured in memory optimized data processing \
+             units (M-DPUs).",
+        ),
         period: None,
         meter: None,
     },
@@ -563,7 +571,10 @@ const ROWS: &[Row] = &[
         value: 10.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some(
+            "The maximum number of SSM Parameters that a single distribution configuration \
+             can update per Region.",
+        ),
         period: None,
         meter: None,
     },
@@ -624,8 +635,9 @@ const ROWS: &[Row] = &[
         unit: "None",
         adjustable: true,
         description: Some(
-            "Maximum policy size, in characters. You can view the current policy size for \
-             an event bus by using the DescribeEventBus API.",
+            "Maximum policy size, in characters. This policy size increases each time you \
+             grant access to another account. You can see your current policy and its \
+             size by using the DescribeEventBus API.",
         ),
         period: None,
         meter: None,
@@ -637,7 +649,10 @@ const ROWS: &[Row] = &[
         value: 500_000.0,
         unit: "None",
         adjustable: false,
-        description: None,
+        description: Some(
+            "The maximum capacity in records per second for a delivery stream in the \
+             current Region.",
+        ),
         period: Some((1, "SECOND")),
         meter: None,
     },
@@ -648,7 +663,10 @@ const ROWS: &[Row] = &[
         value: 2000.0,
         unit: "None",
         adjustable: false,
-        description: None,
+        description: Some(
+            "The maximum number of combined PutRecord and PutRecordBatch requests per \
+             second for a delivery stream in the current Region.",
+        ),
         period: Some((1, "SECOND")),
         meter: None,
     },
@@ -659,7 +677,10 @@ const ROWS: &[Row] = &[
         value: 5.0,
         unit: "None",
         adjustable: false,
-        description: None,
+        description: Some(
+            "The maximum capacity in mebibyte per second for a delivery stream in the \
+             current Region.",
+        ),
         period: Some((1, "SECOND")),
         meter: None,
     },
@@ -684,7 +705,12 @@ const ROWS: &[Row] = &[
         value: 100.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some(
+            "The maximum number of Amazon VPC instances that you can have in scope per \
+             Firewall Manager common security group policy per account. This number \
+             represents the combined count of VPCs that you own and VPCs that are shared \
+             with you.",
+        ),
         period: None,
         meter: None,
     },
@@ -695,7 +721,10 @@ const ROWS: &[Row] = &[
         value: 10_240.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some(
+            "The total amount of throughput capacity (in MBps) allowed for all Amazon FSx \
+             for Windows file systems in this account.",
+        ),
         period: None,
         meter: None,
     },
@@ -717,7 +746,10 @@ const ROWS: &[Row] = &[
         value: 10.0,
         unit: "None",
         adjustable: false,
-        description: None,
+        description: Some(
+            "The maximum number of key-value pairs in a string to double map (SDM) \
+             matchmaking player attribute.",
+        ),
         period: None,
         meter: None,
     },
@@ -728,7 +760,10 @@ const ROWS: &[Row] = &[
         value: 60.0,
         unit: "Seconds",
         adjustable: true,
-        description: None,
+        description: Some(
+            "The maximum time (in seconds) for a reserved player session to timeout \
+             pending a valid player connection.",
+        ),
         period: None,
         meter: None,
     },
@@ -775,7 +810,7 @@ const ROWS: &[Row] = &[
         value: 1000.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some("The maximum number of crawlers in your account."),
         period: None,
         meter: None,
     },

@@ -100,7 +100,7 @@ const SERVICES: &[CatalogService] = &[
         service_code: "glue",
         service_name: "AWS Glue",
         quota_count: 47,
-        gap_codes: &["L-337244C9"],
+        gap_codes: &["L-2E9FB93F", "L-337244C9"],
     },
     CatalogService {
         service_code: "groundstation",
@@ -127,7 +127,7 @@ const SERVICES: &[CatalogService] = &[
 ///
 /// Pinned as ONE number so that leaving a further code to the default-quota-set gap is a
 /// deliberate, visible edit rather than one more entry in a list nothing counts.
-const GAP_CODE_COUNT: usize = 6;
+const GAP_CODE_COUNT: usize = 7;
 
 /// A code this catalog used to derive from a quota NAME for one of these services, which
 /// the service answers to nothing under.
@@ -282,8 +282,8 @@ const PROBES: &[Probe] = &[
     Probe {
         service_code: "glue",
         quota_code: "L-08F3B322",
-        quota_name: "Partitions per table",
-        value: 10_000_000.0,
+        quota_name: "Max task DPUs per account",
+        value: 1000.0,
         unit: "None",
         adjustable: true,
         period: None,
