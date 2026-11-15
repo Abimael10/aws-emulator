@@ -49,6 +49,13 @@ use std::sync::Arc;
 
 /// The body member this service reports an error's detail text in ON THE WIRE.
 ///
+/// The member is reported for EVERY modelled failure, even the one class this service
+/// produces no sentence for (`ListConfigurationSets`' unreadable `PageSize`), where it is
+/// written as JSON `null`: an SDK substitutes the empty string for a detail key a JSON error
+/// document leaves out, so an omitted member would state "the sentence is empty" where this
+/// service means "this class carries no sentence". `service-common` states that rule and
+/// why.
+///
 /// Every exception shape in this model declares `Message` and none carries a `@jsonName`
 /// (`smithy_query(query="shape",shape="BadRequestException,NotFoundException,AlreadyExistsException,LimitExceededException,InternalServiceErrorException,TooManyRequestsException",model_path="services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice/smithy-model/com-amazonaws-pinpointsmsvoice-pinpointsmsvoice.json")`),
 /// so the framework's restJson1 error renderer writes the text under
@@ -80,8 +87,9 @@ const MODELLED_ERROR_SHAPES: [&str; 6] = [
 ];
 
 /// Serves one modelled operation and reports whatever it answers in this service's own error
-/// body: the detail text in [`WIRE_DETAIL_MEMBER`], through the one renaming
-/// `service-common` states for every service whose wire member differs from its model's.
+/// body: the detail text in [`WIRE_DETAIL_MEMBER`], present whether or not the failure
+/// carries one, through the one renaming `service-common` states for every service whose
+/// wire member differs from its model's.
 ///
 /// It re-implements nothing else: the request is handed to the generated
 /// [`ErasedOperation::run`], which owns deserialize -> validate -> handle -> serialize and
@@ -113,7 +121,7 @@ where
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            service_common::error_detail_member::with_renamed_detail_member(
+            service_common::error_detail_member::with_renamed_detail_member_always_present(
                 self.operation.run(svc, req, ctx).await,
                 &MODELLED_ERROR_SHAPES,
                 MODELLED_DETAIL_MEMBER,

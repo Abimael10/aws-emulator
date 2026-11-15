@@ -32,6 +32,23 @@
 //! those words from the refusal seam to the rendered response is
 //! [`crate::restated_refusal`].
 //!
+//! # An error class that produces no sentence at all
+//!
+//! A member a handler leaves unset is written by the framework's generic serializer by
+//! writing NOTHING, which is right for a success body and wrong for the detail member of an
+//! error document: an SDK substitutes the EMPTY STRING for a detail key a JSON error
+//! document does not carry (botocore starts from `{"Error": {"Message": "", "Code": ""}}`
+//! and fills it with `body.get("message", body.get("Message", ""))`), and reports the member
+//! as unset only for a key whose value is JSON `null`. So a refusal for which the service
+//! produces no sentence reaches every client as "the sentence is the empty string", which is
+//! the opposite of what that error class states.
+//!
+//! [`renamed_detail_member_always_present`] and
+//! [`with_renamed_detail_member_always_present`] are the rename above with that one
+//! difference: the member is PRESENT on every error body this rule owns, written as JSON
+//! `null` where neither layer wrote a sentence. A body that does carry one is renamed
+//! exactly as [`renamed_detail_member`] renames it.
+//!
 //! # What it does not touch
 //!
 //! The status, the `__type` discriminator, the `x-amzn-errortype` header, every other member
@@ -51,6 +68,15 @@
 //! module; they are left in place only because this change does not own those services'
 //! issues, and each is covered by its own suite. Nothing new should inline the rule again —
 //! call this module.
+//!
+//! The null half of the rule above has its own copies, each at the SERIALIZER seam rather
+//! than over the rendered body —
+//! `grep -rln 'fn message_member\|fn message_member_name' services/*/src/service/wire.rs`
+//! lists, today: `efs`, `polly` and `sesv2`, which write the member through the error
+//! shape's own schema, and `chatbot`, `customerprofiles` and `iotmanagedintegrations`, which
+//! rewrite the rendered body as this module does. They are to be MIGRATED onto
+//! [`with_renamed_detail_member_always_present`] for the same reason, and a seventh copy
+//! should not be written.
 
 use aws_smithy_runtime_api::http::Response as RtResponse;
 use aws_smithy_types::body::SdkBody;
@@ -111,18 +137,8 @@ fn rewritten_detail_member(
     to: &str,
     restated: Option<&str>,
 ) -> Option<Vec<u8>> {
-    let mut document: Value = serde_json::from_slice(body).ok()?;
+    let mut document = modelled_error_document(body, modelled_shapes)?;
     let object: &mut Map<String, Value> = document.as_object_mut()?;
-    let shape = object
-        .get(SHAPE_DISCRIMINATOR)
-        .and_then(Value::as_str)?
-        .rsplit('#')
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    if !modelled_shapes.contains(&shape.as_str()) {
-        return None;
-    }
     let detail = object.remove(from)?;
     let reported = match restated {
         Some(words) => Value::String(words.to_string()),
@@ -130,6 +146,51 @@ fn rewritten_detail_member(
     };
     object.entry(to.to_string()).or_insert(reported);
     serde_json::to_vec(&document).ok()
+}
+
+/// [`renamed_detail_member`], with the detail member left PRESENT on an error body that
+/// carries no sentence at all: written as JSON `null`, which is the only value an SDK
+/// reports as unset (see this module's documentation).
+///
+/// PRECONDITION: `modelled_shapes` are shapes whose model DECLARES the detail member, since
+/// that is what makes writing it faithful; a shape that declares none would gain a member
+/// its model does not have. A caller reads that set off its own model, as the serving
+/// service's `MODELLED_ERROR_SHAPES` does.
+///
+/// `None` for a body this rule does not own — one that is not a JSON object, or whose
+/// `__type` names no shape in `modelled_shapes`. A body that already carries `to` keeps that
+/// value, so neither the rename nor the null can overwrite a sentence either layer wrote.
+pub fn renamed_detail_member_always_present(
+    body: &[u8],
+    modelled_shapes: &[&str],
+    from: &str,
+    to: &str,
+) -> Option<Vec<u8>> {
+    let mut document = modelled_error_document(body, modelled_shapes)?;
+    let object: &mut Map<String, Value> = document.as_object_mut()?;
+    // An absent sentence is the null: the member is written either way, so the body states
+    // "this class carries no sentence" rather than leaving the key out.
+    let detail = object.remove(from).unwrap_or(Value::Null);
+    object.entry(to.to_string()).or_insert(detail);
+    serde_json::to_vec(&document).ok()
+}
+
+/// `body` parsed, when it is a JSON object whose [`SHAPE_DISCRIMINATOR`] names one of
+/// `modelled_shapes` — the ONE test of whether a body is one this rule owns, so every
+/// rewrite here leaves exactly the same bodies alone.
+///
+/// A `__type` carrying a namespace (`com.amazonaws.example#BadRequestException`) is matched
+/// on the shape name alone.
+fn modelled_error_document(body: &[u8], modelled_shapes: &[&str]) -> Option<Value> {
+    let document: Value = serde_json::from_slice(body).ok()?;
+    let shape = document
+        .as_object()?
+        .get(SHAPE_DISCRIMINATOR)
+        .and_then(Value::as_str)?
+        .rsplit('#')
+        .next()
+        .unwrap_or_default();
+    modelled_shapes.contains(&shape).then_some(document)
 }
 
 /// `resp` as the serving service answers it: a modelled error body whose detail text is in
@@ -147,6 +208,25 @@ pub fn with_renamed_detail_member(
 ) -> RtResponse {
     with_rewritten_body(resp, |body| {
         renamed_detail_member(body, modelled_shapes, from, to)
+    })
+}
+
+/// `resp` with the detail member PRESENT on every modelled error body
+/// ([`renamed_detail_member_always_present`]): renamed as
+/// [`with_renamed_detail_member`] renames it, and written as JSON `null` where the service
+/// produced no sentence for that error class.
+///
+/// The same responses are left untouched, byte for byte, as there: a success, a streamed
+/// body, and a body whose `__type` names no shape of the serving service's model.
+#[must_use]
+pub fn with_renamed_detail_member_always_present(
+    resp: RtResponse,
+    modelled_shapes: &[&str],
+    from: &str,
+    to: &str,
+) -> RtResponse {
+    with_rewritten_body(resp, |body| {
+        renamed_detail_member_always_present(body, modelled_shapes, from, to)
     })
 }
 
@@ -309,6 +389,73 @@ mod tests {
             object.get("Message").is_none(),
             "the renamed member must be gone, got {object:?}"
         );
+    }
+
+    /// The member is PRESENT on every body this rule owns: as the renamed sentence where one
+    /// layer wrote one, as the target member's own value where it already carries one, and as
+    /// JSON `null` where neither did.
+    #[test]
+    fn the_detail_member_is_present_even_with_no_sentence() {
+        // (case, the body, the value the answer carries under the target member)
+        for (case, body, expected) in [
+            (
+                "a sentence under the renamed member",
+                r#"{"__type":"BadRequestException","Message":"no"}"#,
+                Value::String("no".to_string()),
+            ),
+            (
+                "a sentence already under the target member",
+                r#"{"__type":"BadRequestException","message":"no"}"#,
+                Value::String("no".to_string()),
+            ),
+            (
+                "no sentence at all",
+                r#"{"__type":"BadRequestException"}"#,
+                Value::Null,
+            ),
+            (
+                "no sentence, on another modelled shape with another member",
+                r#"{"__type":"com.amazonaws.example#NotFoundException","ErrorCode":"NotFoundException"}"#,
+                Value::Null,
+            ),
+        ] {
+            let rewritten =
+                renamed_detail_member_always_present(body.as_bytes(), &SHAPES, "Message", "message")
+                    .unwrap_or_else(|| panic!("case {case:?}: expected a rewrite"));
+            let object = decoded(rewritten);
+            assert_eq!(
+                object.get("message"),
+                Some(&expected),
+                "case {case:?}: expected {expected:?} under the wire member, got {object:?}"
+            );
+            assert!(
+                object.get("Message").is_none(),
+                "case {case:?}: the modelled member must be gone, got {object:?}"
+            );
+        }
+    }
+
+    /// The same bodies are left alone as by the plain rename: a shape the model does not
+    /// declare, one with no shape at all, one that is not an object, and one that is not
+    /// JSON — so a failure whose class the service does not model keeps the member the
+    /// framework wrote its text in, and gains no null.
+    #[test]
+    fn no_null_is_written_into_a_body_this_rule_does_not_own() {
+        for (case, body) in [
+            (
+                "an unmodelled shape",
+                r#"{"__type":"NotImplemented","message":"no"}"#,
+            ),
+            ("no shape at all", r#"{"message":"no"}"#),
+            ("not an object", r#"["BadRequestException"]"#),
+            ("not JSON", "<Error/>"),
+        ] {
+            assert!(
+                renamed_detail_member_always_present(body.as_bytes(), &SHAPES, "Message", "message")
+                    .is_none(),
+                "case {case:?}: expected no rewrite"
+            );
+        }
     }
 
     /// A success is not an error body: it is returned byte-identical.

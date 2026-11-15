@@ -1469,3 +1469,21 @@ mod lambda_in_function_assumed_role_session;
 //! * The list holds nothing but the pairs. `tests/all.rs` is a test-target CRATE ROOT, so a
 //!   bare `mod` would resolve to a sibling of this file (`tests/<name>.rs`), which the
 //!   layout check refuses: the `#[path]` is what points each declaration into `tests/all/`.
+//! Put a new suite at `tests/all/<name>.rs` and declare it below, keeping the list
+//! sorted: one `#[path]` / `mod` pair per suite and nothing else, so a landing has one
+//! place to insert and nothing to keep consistent. WHY a suite exists belongs in that
+//! suite file's own header, not here.
+//! A suite that is not declared here compiles nowhere and its tests never run (the
+//! crate's build script refuses the build for it), and a suite left at the top level of
+//! `tests/` fails the build. Declare each suite exactly ONCE: this is one crate root, so
+//! a second `mod` for the same name is `E0428` and fails every suite in this target.
+//! THESE HEADER LINES ARE THE ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS
+//! FILE: past the first item one is `error[E0753]: expected outer doc comment`, which
+//! fails every suite in this target. A note further down must be an ordinary `//`
+//! comment — and a note is rarely what is wanted here at all, since this file is a
+//! declaration list. Append nothing to the tail of this file but a declaration.
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check those rules — one declaration
+//! per suite file, no note past the header, pairs only and strictly sorted — so check
+//! there rather than leaving a note here.
+//! (`tests/<name>.rs`), which the layout check refuses: the `#[path = "all/<name>.rs"]`
+//! is what points each declaration into `tests/all/`.

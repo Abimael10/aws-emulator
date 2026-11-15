@@ -242,9 +242,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The refusal carries NO detail text. `BadRequestException$Message` is optional in the
 /// model (`smithy_query(query="shape",shape="BadRequestException",model_path="services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice/smithy-model/com-amazonaws-pinpointsmsvoice-pinpointsmsvoice.json")`)
 /// and the service sends none for this parameter, so none is written: writing one would
-/// put a member on the wire the real response does not carry, and a client that reads a
-/// present `Message` as "the service explained the problem" would branch on it. The code
-/// and the status are the whole answer. (`NextToken`, which this service MINTS, is
+/// put a sentence on the wire the real response does not carry, and a client that reads a
+/// present detail as "the service explained the problem" would branch on it. The code and
+/// the status are the whole answer. The member itself still travels, as JSON `null` — the
+/// one value an SDK reports as unset, the rule and the reason being
+/// `crate::service::WIRE_DETAIL_MEMBER`'s. (`NextToken`, which this service MINTS, is
 /// refused with the sentence that names it — see the caller.)
 fn parse_page_size(raw: &str) -> Result<usize, ListConfigurationSetsErrorModeled> {
     match raw.parse::<usize>() {

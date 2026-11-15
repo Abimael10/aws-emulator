@@ -18,9 +18,10 @@
 //!   service's own lower-camel spelling of that member. A URI label that is PRESENT binds a
 //!   value, so a blank one is this class rather than the one above.
 //!
-//! One parameter is the exception that the member carries nothing for: a `PageSize` this
-//! service cannot read as a page bound is refused with the same code and status and NO
-//! detail member at all, so the rows for it assert the member's absence.
+//! One parameter is the exception that the member carries no SENTENCE for: a `PageSize` this
+//! service cannot read as a page bound is refused with the same code and status and no detail
+//! text at all — the member travels as JSON `null`, which is the one value an SDK reports as
+//! unset, so the rows for it assert that null rather than an absent key.
 //!
 //! The same member carries the text for EVERY error this service's model declares, which
 //! the `NotFoundException` rows pin, and a refused request changes nothing — the listing
@@ -160,8 +161,8 @@ struct Case {
     method: &'static str,
     path: &'static str,
     body: Option<fn() -> Value>,
-    /// The sentence the refusal carries, or `None` where the service carries NO detail
-    /// member at all.
+    /// The sentence the refusal carries, or `None` where the service produces NO sentence
+    /// for that class and the member travels as JSON `null`.
     message: Option<&'static str>,
 }
 
@@ -170,7 +171,7 @@ const MISSING_CONFIGURATION_SET_NAME: &str =
     "Missing required request parameters: [ConfigurationSetName]";
 
 /// The sentences for a parameter this service's validation cannot use, one per parameter
-/// the rows below exercise. `PageSize` has none: that refusal carries no detail member
+/// the rows below exercise. `PageSize` has none: that refusal carries no detail text
 /// (see `ops/list_configuration_sets.rs`), which the `None` rows below pin.
 const INVALID_NEXT_TOKEN: &str = "The following parameter is null, empty or invalid: ['nextToken']";
 const INVALID_CONFIGURATION_SET_NAME: &str =
@@ -438,11 +439,12 @@ async fn a_parameter_this_service_cannot_use_is_refused_in_its_own_wording() {
                 case.name,
                 answer.body
             ),
-            // No detail member AT ALL: not an empty one, and not the modelled spelling
-            // of it either.
+            // No SENTENCE: the member is present and JSON null — not an empty one, not an
+            // absent one (which an SDK reports as the empty string), and not the modelled
+            // spelling of it either.
             None => assert!(
-                answer.body.get("message").is_none() && !answer.has_modelled_member(),
-                "case {:?}: expected no detail member, got {:?}",
+                answer.body.get("message") == Some(&Value::Null) && !answer.has_modelled_member(),
+                "case {:?}: expected the detail member as JSON null, got {:?}",
                 case.name,
                 answer.body
             ),
