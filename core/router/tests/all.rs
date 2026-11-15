@@ -7314,3 +7314,10 @@ mod zz_glue_job_source_permission_probe;
 //! first item, so this header is the only place one may stand: past it one is `E0753` and
 //! compiles nothing, so a note below must be an ordinary comment — better still, add a
 //! declaration rather than a note about one.
+//! declaration — not a note about one, and never a `//!` line.
+//! The list below is the DECLARATIONS and nothing else, one sorted pair per suite file
+//! under `tests/all/`: what a suite covers, and why it belongs to this cross-service
+//! target rather than to one service crate's own, stands in that suite's own module
+//! header, where it is read beside the test it explains.
+#[path = "all/events_lambda_target_permission_granted_after_the_rule.rs"]
+mod events_lambda_target_permission_granted_after_the_rule;

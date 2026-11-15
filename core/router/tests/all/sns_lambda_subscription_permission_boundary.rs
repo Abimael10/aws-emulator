@@ -406,18 +406,37 @@ pub(crate) async fn wait_for(router: &MultiServiceRouter, url: &str, marker: &st
     }
 }
 
-/// Wait out [`QUIET_BUDGET`] and report every body the queue at `url` held in it.
-pub(crate) async fn stayed_quiet(router: &MultiServiceRouter, url: &str) -> Vec<String> {
+/// Wait out [`QUIET_BUDGET`] and report every body the queue at `url` held in it that
+/// `carrying` admits: `None` admits every body, which is how a queue that must stay EMPTY is
+/// read, and `Some(marker)` admits only the bodies naming one publication, which is how a
+/// queue an EARLIER phase of the same test has already written to is read — a received
+/// message becomes visible again, so another phase's body would otherwise be read as this
+/// phase's delivery.
+pub(crate) async fn stayed_quiet_about(
+    router: &MultiServiceRouter,
+    url: &str,
+    carrying: Option<&str>,
+) -> Vec<String> {
     let deadline = Instant::now() + QUIET_BUDGET;
     let mut seen: Vec<String> = Vec::new();
     while Instant::now() < deadline {
-        seen.extend(drain(router, url).await);
+        seen.extend(
+            drain(router, url)
+                .await
+                .into_iter()
+                .filter(|body| carrying.is_none_or(|marker| body.contains(marker))),
+        );
         if !seen.is_empty() {
             return seen;
         }
         tokio::time::sleep(LOOK_INTERVAL).await;
     }
     seen
+}
+
+/// Wait out [`QUIET_BUDGET`] and report every body the queue at `url` held in it.
+pub(crate) async fn stayed_quiet(router: &MultiServiceRouter, url: &str) -> Vec<String> {
+    stayed_quiet_about(router, url, None).await
 }
 
 /// Both halves of the boundary, over one stack: without the grant nothing is invoked, and with
