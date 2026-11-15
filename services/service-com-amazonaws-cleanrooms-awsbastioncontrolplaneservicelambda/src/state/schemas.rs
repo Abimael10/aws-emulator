@@ -272,16 +272,10 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
 /// `arn:aws:cleanrooms:<region>:<account>:membership/<membership id>/configuredtableassociation/<association id>`,
 /// the form the model's `SchemaResourceArn` pattern declares.
 ///
-/// It is NOT the association's own `ConfiguredTableAssociationArn`
-/// (`configuredtableassociation/<membership id>/<id>`): `Schema$resourceArn` names the
-/// resource the relation comes from in the schema plane's own form, so it is minted here
-/// rather than copied off the association.
+/// It is the same layout the association's own ARN carries, so it is rendered by the one
+/// renderer ([`super::configured_table_association_arn`]) rather than spelled out twice.
 pub fn schema_resource_arn(region: &str, membership_id: &str, association_id: &str) -> String {
-    ::engine::emulator_arn(
-        ARN_SERVICE,
-        region,
-        &format!("membership/{membership_id}/configuredtableassociation/{association_id}"),
-    )
+    super::configured_table_association_arn(region, membership_id, association_id)
 }
 
 /// The columns a relation reports: one per column the configured table allows "within

@@ -51,6 +51,8 @@ mod configured_table_analysis_rule_reads;
 mod configured_table_analysis_rule_round_trip;
 #[path = "all/configured_table_analysis_rules.rs"]
 mod configured_table_analysis_rules;
+#[path = "all/configured_table_association_analysis_rule_identity.rs"]
+mod configured_table_association_analysis_rule_identity;
 #[path = "all/configured_table_association_analysis_rules.rs"]
 mod configured_table_association_analysis_rules;
 #[path = "all/configured_table_association_identifier_forms.rs"]

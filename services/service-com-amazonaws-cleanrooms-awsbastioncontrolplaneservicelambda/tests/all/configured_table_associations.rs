@@ -37,6 +37,7 @@ use super::cleanrooms_collaboration_lifecycle::{
     minimal_collaboration, Emulator, REGION,
 };
 use super::cleanrooms_configured_table::create_body;
+use super::configured_table_association_identifier_forms::association_arn;
 
 /// The message AWS reports when the `roleArn` is not a role the caller can pass to the
 /// service. Fixed text: the refusal names no value of the request.
@@ -425,13 +426,7 @@ async fn a_created_association_is_persisted_and_read_back() {
         );
         assert_eq!(
             association["arn"].as_str(),
-            Some(
-                format!(
-                    "arn:aws:cleanrooms:{REGION}:{}:configuredtableassociation/{membership_id}/{id}",
-                    account_id()
-                )
-                .as_str()
-            ),
+            Some(association_arn(&membership_id, &id).as_str()),
             "case {label:?}: the ARN must nest the association in its membership, got {:?}",
             association["arn"]
         );

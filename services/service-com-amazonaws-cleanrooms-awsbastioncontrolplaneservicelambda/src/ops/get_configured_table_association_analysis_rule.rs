@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConfiguredTableAssociationAnalysisRule
-//! Reports the analysis rule the `(configured table association, analysis rule type)`
-//! pair in the request path holds, exactly as the last write persisted it. A reporting
-//! operation: it writes nothing.
+//! Reports the analysis rule the identifier triple in the request path — the membership,
+//! the configured table association and the analysis rule type — addresses, exactly as
+//! the last write persisted it. A reporting operation: it writes nothing.
 //!
-//! A membership the store does not hold, an association that membership does not hold,
-//! an association holding no rule of this type, and a type no association could hold a
-//! rule for are all the modelled 404 `ResourceNotFoundException` — the resource the pair
-//! names does not exist. The rule refusal reports the TYPE by the INTERNAL name of its
-//! rule class (`crate::state::no_such_configured_table_association_analysis_rule_message`),
+//! A membership the store does not hold, an association that membership does not hold, an
+//! association holding no rule of this type (because no create minted one, or
+//! `DeleteConfiguredTableAssociationAnalysisRule` dropped it) and a type no association
+//! could hold a rule for are all the modelled 404 `ResourceNotFoundException` — the
+//! resource the triple names does not exist. The rule refusal reports the TYPE by the
+//! INTERNAL name of its rule class
+//! (`crate::state::no_such_configured_table_association_analysis_rule_message`),
 //! which is how the service names a rule class in a refusal, while the stored rule and
 //! the 200 answer carry the modelled catalog value.
 //!
@@ -195,16 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rule is looked up only once the pair resolves to an association this membership
         // holds.
         let rule = store
-            .configured_table_association_in(
+            .configured_table_association_analysis_rule_in(
                 &input.membership_identifier,
                 &input.configured_table_association_identifier,
+                &input.analysis_rule_type,
             )
-            .and_then(|association| {
-                store.configured_table_association_analysis_rule(
-                    &association.id,
-                    &input.analysis_rule_type,
-                )
-            })
             .cloned();
 
         match rule {

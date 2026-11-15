@@ -5,11 +5,17 @@
 //! later `GetConfiguredTableAssociationAnalysisRule` reports exactly what was created and
 //! the association itself reports the rule's type in `analysisRuleTypes`.
 //!
-//! Every member the SERVICE decides is computed from the STORED association, never
-//! echoed: `configuredTableAssociationId` and `configuredTableAssociationArn` come from
-//! the persisted association the identifier resolves to, `membershipIdentifier` from the
-//! membership that holds it, and `createTime` / `updateTime` are the creation instant.
-//! The caller decides only the rule's `type` and its `policy`.
+//! The rule a response reports identifies its association by the identifiers the request
+//! ADDRESSED it with: `membershipIdentifier` and `configuredTableAssociationId` are the
+//! two `@httpLabel` values of the path, and `configuredTableAssociationArn` is the
+//! membership-qualified ARN of that pair (`crate::state::configured_table_association_arn`).
+//! Those identifiers are persisted with the rule, so every later read of it reports the
+//! association the same way the create did. `createTime` / `updateTime` are the creation
+//! instant; the caller decides the rule's `type` and its `policy`.
+//!
+//! The association the path RESOLVES to is still what the rule is stored under, so the
+//! rule reaches exactly one association of one membership and the association reports the
+//! rule's type in `analysisRuleTypes`.
 //!
 //! The rules the model cannot express are enforced here with the errors the operation
 //! declares:
@@ -175,9 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
+
+        let region = st::request_region(ctx.parts());
 
         let Some(state) = st::service_state(&*self.engine) else {
             return Err(
@@ -287,12 +295,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The rule records the association as the REQUEST addressed it — the membership
+        // and association `@httpLabel` values, and the membership-qualified ARN of that
+        // pair — so what a caller reads back is the association it configured a rule on.
+        // The resolved association's own id stays the key the rule is stored under.
+        //
+        // Both members come from the SAME identifier, which is what the recorded response
+        // reports: the id it carries and the last segment of the ARN it carries are one
+        // value. So where a caller addresses the association by the id of the configured
+        // table it associates — the second form
+        // `crate::state::configured_table_association_in` accepts, which this service
+        // tolerates and AWS does not — the pair it reports is the pair it was given,
+        // rather than one member answering the request and the other answering the store.
         let created_at = st::now();
         store.insert_configured_table_association_analysis_rule(
+            &association.id,
             ConfiguredTableAssociationAnalysisRule {
-                membership_identifier: association.membership_id.clone(),
-                configured_table_association_id: association.id.clone(),
-                configured_table_association_arn: association.arn.clone(),
+                membership_identifier: input.membership_identifier.clone(),
+                configured_table_association_id: input
+                    .configured_table_association_identifier
+                    .clone(),
+                configured_table_association_arn: st::configured_table_association_arn(
+                    &region,
+                    &input.membership_identifier,
+                    &input.configured_table_association_identifier,
+                ),
                 policy: input.analysis_rule_policy,
                 r#type: input.analysis_rule_type.clone(),
                 create_time: created_at,

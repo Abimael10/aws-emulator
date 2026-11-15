@@ -18,14 +18,17 @@
 //! it names rather than the only one there is), every
 //! `ConfiguredTableAssociationAnalysisRuleType` the model declares, the operation doing
 //! the addressing (the association read, the analysis-rule create, the analysis-rule
-//! read), and each form crossed with the other on the create/read round trip. Every
+//! read), and each form crossed with the other on the create/read round trip. An analysis
+//! rule reports the association by the identifier the create ADDRESSED it with (pinned in
+//! `configured_table_association_analysis_rule_identity`), so the round trip below asserts
+//! that identifier rather than the resolved association's own id. Every
 //! request goes over the wire through the same `MultiServiceRouter` the production
 //! router uses.
 
 use serde_json::{json, Value};
 
 use super::cleanrooms_collaboration_lifecycle::{
-    account_id, error_code, minimal_collaboration, Emulator,
+    account_id, error_code, minimal_collaboration, Emulator, REGION,
 };
 use super::cleanrooms_configured_table::{create_body, COLUMN_NAMES};
 
@@ -63,26 +66,26 @@ fn rule_policy(rule_type: &str) -> Value {
 }
 
 /// One stored configured table association, with the configured table it associates.
-struct Associated {
+pub(crate) struct Associated {
     /// The association's own id (`ConfiguredTableAssociation$id`).
-    id: String,
+    pub(crate) id: String,
     /// The association's ARN (`ConfiguredTableAssociation$arn`).
-    arn: String,
+    pub(crate) arn: String,
     /// The id of the configured table the association refers to
     /// (`ConfiguredTableAssociation$configuredTableId`).
-    table_id: String,
+    pub(crate) table_id: String,
     /// The table alias the association was created under.
-    name: String,
+    pub(crate) name: String,
 }
 
 /// A collaboration, the caller's membership in it, and `count` configured tables each
 /// associated once under that membership.
-struct Fixture {
-    membership_id: String,
-    associations: Vec<Associated>,
+pub(crate) struct Fixture {
+    pub(crate) membership_id: String,
+    pub(crate) associations: Vec<Associated>,
 }
 
-async fn fixture(emulator: &Emulator, label: &str, count: usize) -> Fixture {
+pub(crate) async fn fixture(emulator: &Emulator, label: &str, count: usize) -> Fixture {
     let (status, created) = emulator
         .create_collaboration(minimal_collaboration(label))
         .await;
@@ -219,9 +222,20 @@ async fn read_rule(
         .await
 }
 
+/// The membership-qualified ARN of the configured table association an analysis-rule
+/// request addresses as `(membership_id, association_identifier)` — the layout the model's
+/// `AccessBudgetResourceArn` pattern spells out for this resource
+/// (`:membership/<id>/configuredtableassociation/<id>`).
+pub(crate) fn association_arn(membership_id: &str, association_identifier: &str) -> String {
+    format!(
+        "arn:aws:cleanrooms:{REGION}:{}:membership/{membership_id}/configuredtableassociation/{association_identifier}",
+        account_id()
+    )
+}
+
 /// The two forms the identifier takes for one stored association, as the model documents
 /// them.
-fn identifier_forms(association: &Associated) -> [(&'static str, &str); 2] {
+pub(crate) fn identifier_forms(association: &Associated) -> [(&'static str, &str); 2] {
     [
         ("the association's own id", association.id.as_str()),
         ("the configured table's id", association.table_id.as_str()),
@@ -267,6 +281,22 @@ async fn either_identifier_form_addresses_the_association_it_names() {
                 association.name,
                 reported["name"]
             );
+            // Whichever form addressed it, the association reports the one ARN layout
+            // this service renders: its own id nested in its membership.
+            assert_eq!(
+                reported["arn"].as_str(),
+                Some(association.arn.as_str()),
+                "case {case:?}: expected the stored ARN {}, got {}",
+                association.arn,
+                reported["arn"]
+            );
+            assert_eq!(
+                association.arn,
+                association_arn(&held.membership_id, &association.id),
+                "case {case:?}: expected the membership-qualified ARN {}, got {}",
+                association_arn(&held.membership_id, &association.id),
+                association.arn
+            );
         }
     }
 }
@@ -308,20 +338,19 @@ async fn an_analysis_rule_round_trips_through_either_identifier_form() {
                     held.membership_id,
                     rule["membershipIdentifier"]
                 );
-                // Every member the service decides comes from the STORED association the
-                // identifier resolved to, whichever form addressed it.
+                // The rule records the association as the REQUEST addressed it, whichever
+                // form that was, and its ARN is the membership-qualified ARN of that pair.
                 assert_eq!(
                     rule["configuredTableAssociationId"].as_str(),
-                    Some(association.id.as_str()),
-                    "case {case:?}: expected the resolved association's id {}, got {}",
-                    association.id,
+                    Some(create_identifier),
+                    "case {case:?}: expected the identifier the create carried {create_identifier}, got {}",
                     rule["configuredTableAssociationId"]
                 );
                 assert_eq!(
                     rule["configuredTableAssociationArn"].as_str(),
-                    Some(association.arn.as_str()),
-                    "case {case:?}: expected the resolved association's ARN {}, got {}",
-                    association.arn,
+                    Some(association_arn(&held.membership_id, create_identifier).as_str()),
+                    "case {case:?}: expected the ARN of the pair the create addressed {}, got {}",
+                    association_arn(&held.membership_id, create_identifier),
                     rule["configuredTableAssociationArn"]
                 );
                 assert_eq!(

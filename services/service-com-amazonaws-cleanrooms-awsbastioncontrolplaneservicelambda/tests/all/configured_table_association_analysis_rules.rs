@@ -6,10 +6,12 @@
 //!
 //! The rules under test:
 //!
-//! * a create PERSISTS the rule and computes every member the service decides from the
-//!   STORED association — `membershipIdentifier`, `configuredTableAssociationId` and
-//!   `configuredTableAssociationArn` come from the association the path resolves to, and
-//!   both timestamps are the creation instant — so the read after it reports exactly the
+//! * a create PERSISTS the rule and reports the association by the identifiers the
+//!   request ADDRESSED it with — `membershipIdentifier` and
+//!   `configuredTableAssociationId` are the path's `@httpLabel` values and
+//!   `configuredTableAssociationArn` the membership-qualified ARN of that pair (the
+//!   identity rule is pinned in `configured_table_association_analysis_rule_identity`) —
+//!   and both timestamps are the creation instant, so the read after it reports exactly the
 //!   record the create persisted, policy member for policy member, and the association
 //!   itself reports the rule's type in `analysisRuleTypes`;
 //! * each member of the `ConfiguredTableAssociationAnalysisRulePolicyV1` union is the
@@ -40,7 +42,7 @@ use super::cleanrooms_configured_table::{create_body, COLUMN_NAMES};
 
 /// Every `ConfiguredTableAssociationAnalysisRuleType` the model declares (shape
 /// `ConfiguredTableAssociationAnalysisRuleType`: AGGREGATION | LIST | CUSTOM).
-const ALL_RULE_TYPES: [&str; 3] = ["AGGREGATION", "LIST", "CUSTOM"];
+pub(crate) const ALL_RULE_TYPES: [&str; 3] = ["AGGREGATION", "LIST", "CUSTOM"];
 
 /// An identifier in the form the model's `MembershipIdentifier` /
 /// `ConfiguredTableAssociationIdentifier` pattern declares that no create here mints.
@@ -53,7 +55,7 @@ const OTHER_RESULT_RECEIVER: &str = "210987654321";
 /// catalog value as one CamelCase word, except LIST, whose rule class is the
 /// intersection-list rule and is named for it. Catalog source: model shape
 /// `ConfiguredTableAssociationAnalysisRuleType` (AGGREGATION | LIST | CUSTOM).
-fn internal_rule_type_name(rule_type: &str) -> &'static str {
+pub(crate) fn internal_rule_type_name(rule_type: &str) -> &'static str {
     match rule_type {
         "AGGREGATION" => "Aggregation",
         "LIST" => "IntersectionList",
@@ -86,7 +88,7 @@ fn additional_analysis_arn(membership_id: &str, association: &str) -> String {
 /// A `ConfiguredTableAssociationAnalysisRulePolicy` of `rule_type`. Every member of the
 /// three policy shapes is optional (`allowedResultReceivers`, `allowedAdditionalAnalyses`),
 /// so each is present only when given.
-fn association_policy(
+pub(crate) fn association_policy(
     rule_type: &str,
     allowed_result_receivers: Option<&[&str]>,
     allowed_additional_analyses: Option<&[String]>,
@@ -102,7 +104,7 @@ fn association_policy(
 }
 
 impl Emulator {
-    async fn create_association_analysis_rule(
+    pub(crate) async fn create_association_analysis_rule(
         &self,
         membership_id: &str,
         association_id: &str,
@@ -119,7 +121,7 @@ impl Emulator {
         .await
     }
 
-    async fn get_association_analysis_rule(
+    pub(crate) async fn get_association_analysis_rule(
         &self,
         membership_id: &str,
         association_id: &str,
@@ -135,7 +137,7 @@ impl Emulator {
         .await
     }
 
-    async fn read_association(&self, membership_id: &str, association_id: &str) -> (u16, Value) {
+    pub(crate) async fn read_association(&self, membership_id: &str, association_id: &str) -> (u16, Value) {
         self.call(
             "GET",
             &format!("/memberships/{membership_id}/configuredTableAssociations/{association_id}"),

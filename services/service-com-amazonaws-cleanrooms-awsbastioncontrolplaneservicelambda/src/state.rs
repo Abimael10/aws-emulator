@@ -1346,8 +1346,10 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
     /// The analysis rule of `analysis_rule_type` stored for the configured table
     /// association `association_id`, if any.
     ///
-    /// The pair is the rule's identity — every association analysis-rule operation
-    /// addresses one through it — so this is a lookup rather than a scan.
+    /// The pair is what the rule is stored under — the association OWNS its rules, which
+    /// is why `ConfiguredTableAssociation$analysisRuleTypes` can report them — so this is a
+    /// lookup rather than a scan. What a REQUEST addresses is the identifier triple it
+    /// carries, which is [`Self::configured_table_association_analysis_rule_in`].
     pub fn configured_table_association_analysis_rule(
         &self,
         association_id: &str,
@@ -1357,8 +1359,32 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
             .get(&(association_id.to_string(), analysis_rule_type.to_string()))
     }
 
-    /// Persist `rule` and record its type on the configured table association it belongs
-    /// to.
+    /// The analysis rule the identifier triple of a request addresses: the rule of
+    /// `analysis_rule_type` stored for the association `association_identifier` names under
+    /// `membership_id`.
+    ///
+    /// Every operation that addresses an association analysis rule carries that triple as
+    /// its three `@httpLabel`s, so resolving it is one step: the association the pair
+    /// names ([`Self::configured_table_association_in`], which accepts either form of the
+    /// identifier), then the rule that association holds of the type.
+    pub fn configured_table_association_analysis_rule_in(
+        &self,
+        membership_id: &str,
+        association_identifier: &str,
+        analysis_rule_type: &str,
+    ) -> Option<&ConfiguredTableAssociationAnalysisRule> {
+        let association =
+            self.configured_table_association_in(membership_id, association_identifier)?;
+        self.configured_table_association_analysis_rule(&association.id, analysis_rule_type)
+    }
+
+    /// Persist `rule` under the configured table association `association_id` holds it,
+    /// and record its type on that association.
+    ///
+    /// `association_id` is the id of the STORED association the request resolved to, which
+    /// is what the rule is keyed and looked up by; the identifiers the rule REPORTS are the
+    /// ones the request addressed the association with, so the key is passed separately
+    /// rather than read off the record.
     ///
     /// `ConfiguredTableAssociation$analysisRuleTypes` is "the analysis rule types for the
     /// configured table association", so it is maintained here rather than recomputed by
@@ -1367,11 +1393,11 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
     /// [`Self::insert_configured_table_analysis_rule`] for the association plane.
     pub fn insert_configured_table_association_analysis_rule(
         &mut self,
+        association_id: &str,
         rule: ConfiguredTableAssociationAnalysisRule,
     ) {
-        let association_id = rule.configured_table_association_id.clone();
         let rule_type = rule.r#type.clone();
-        if let Some(association) = self.configured_table_associations.get_mut(&association_id) {
+        if let Some(association) = self.configured_table_associations.get_mut(association_id) {
             let held = association.analysis_rule_types.get_or_insert_with(Vec::new);
             if !held.contains(&rule_type) {
                 held.push(rule_type.clone());
@@ -1379,7 +1405,39 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
             association.update_time = rule.update_time;
         }
         self.configured_table_association_analysis_rules
-            .insert((association_id, rule_type), rule);
+            .insert((association_id.to_string(), rule_type), rule);
+    }
+
+    /// Drop the analysis rule of `analysis_rule_type` the association
+    /// `association_identifier` names under `membership_id` holds, and stop reporting that
+    /// type on the association.
+    ///
+    /// The mirror of [`Self::insert_configured_table_association_analysis_rule`]: the type
+    /// leaves `ConfiguredTableAssociation$analysisRuleTypes` ("the analysis rule types for
+    /// the configured table association") with the rule, and the association's `updateTime`
+    /// moves to `at` because that member of it has changed. `None` means the triple held no
+    /// rule, so nothing was dropped.
+    pub fn remove_configured_table_association_analysis_rule(
+        &mut self,
+        membership_id: &str,
+        association_identifier: &str,
+        analysis_rule_type: &str,
+        at: ::aws_smithy_types::DateTime,
+    ) -> Option<ConfiguredTableAssociationAnalysisRule> {
+        let association_id = self
+            .configured_table_association_in(membership_id, association_identifier)?
+            .id
+            .clone();
+        let removed = self
+            .configured_table_association_analysis_rules
+            .remove(&(association_id.clone(), analysis_rule_type.to_string()))?;
+        if let Some(association) = self.configured_table_associations.get_mut(&association_id) {
+            if let Some(held) = association.analysis_rule_types.as_mut() {
+                held.retain(|type_held| type_held != analysis_rule_type);
+            }
+            association.update_time = at;
+        }
+        Some(removed)
     }
 
     /// The stored template `template_id`, but only when it belongs to
@@ -2696,15 +2754,22 @@ pub fn configured_table_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("configuredtable/{id}"))
 }
 
-/// `arn:aws:cleanrooms:<region>:<account>:configuredtableassociation/<membership id>/<id>`,
-/// the form the model's `ConfiguredTableAssociationArn` pattern declares — an association
-/// is a sub-resource of the membership it was created under, so its ARN is nested in that
-/// membership's id.
+/// `arn:aws:cleanrooms:<region>:<account>:membership/<membership id>/configuredtableassociation/<association id>`,
+/// the one form this service renders a configured table association's ARN in.
+///
+/// An association is a sub-resource of the membership it was created under, so its ARN
+/// carries that membership's path segment before its own: the model's
+/// `AccessBudgetResourceArn` pattern spells that layout out for the very same resource
+/// (`^arn:aws:[\w]+:[\w]{2}-[\w]{4,9}-[\d]:[\d]{12}:membership/[\d\w-]+/(configuredtableassociation|intermediatetable)/[\d\w-]+$`
+/// on `ListPrivacyBudgets$accessBudgetResourceArn`), and `SchemaResourceArn` repeats it,
+/// so it is what every operation that reports an association ARN renders. The shorter
+/// `ConfiguredTableAssociationArn` pattern (`:configuredtableassociation/<id>/<id>`) does
+/// not describe the ARN the service actually hands out.
 pub fn configured_table_association_arn(region: &str, membership_id: &str, id: &str) -> String {
     ::engine::emulator_arn(
         ARN_SERVICE,
         region,
-        &format!("configuredtableassociation/{membership_id}/{id}"),
+        &format!("membership/{membership_id}/configuredtableassociation/{id}"),
     )
 }
 

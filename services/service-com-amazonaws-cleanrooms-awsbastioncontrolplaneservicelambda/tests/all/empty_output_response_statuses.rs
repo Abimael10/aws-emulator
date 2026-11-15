@@ -59,7 +59,7 @@ fn carries_no_member(body: &Value) -> bool {
 
 /// Assert one answer is an empty-output success: the no-content status, and nothing to
 /// read in the body.
-fn assert_no_content(case: &str, status: u16, body: &Value) {
+pub(crate) fn assert_no_content(case: &str, status: u16, body: &Value) {
     assert_eq!(
         status, EMPTY_OUTPUT_SUCCESS_STATUS,
         "case {case:?}: an empty output shape must answer {EMPTY_OUTPUT_SUCCESS_STATUS}, \
@@ -348,11 +348,49 @@ async fn every_implemented_delete_with_an_empty_output_shape_answers_no_content(
         "setup: expected CreateConfiguredTableAnalysisRule {POPULATED_OUTPUT_SUCCESS_STATUS}, got {status} with {rule}"
     );
 
-    // One row per `Delete*` operation of this service that is implemented — the eight
+    // An association of that configured table, and a collaboration analysis rule on it,
+    // so the association plane's analysis-rule delete has a row below too.
+    let (status, associated) = emulator
+        .call(
+            "POST",
+            &format!("/memberships/{membership_id}/configuredTableAssociations"),
+            Some(json!({
+                "name": "no_content_association",
+                "configuredTableIdentifier": table_id,
+                "roleArn": format!("arn:aws:iam::{}:role/clean-rooms-table-role", account_id()),
+            })),
+        )
+        .await;
+    assert_eq!(
+        status, POPULATED_OUTPUT_SUCCESS_STATUS,
+        "setup: expected CreateConfiguredTableAssociation {POPULATED_OUTPUT_SUCCESS_STATUS}, got {status} with {associated}"
+    );
+    let association_id = associated["configuredTableAssociation"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("setup: no configuredTableAssociation.id in {associated}"))
+        .to_string();
+    let (status, association_rule) = emulator
+        .call(
+            "POST",
+            &format!(
+                "/memberships/{membership_id}/configuredTableAssociations/{association_id}/analysisRule"
+            ),
+            Some(json!({
+                "analysisRuleType": rule_type,
+                "analysisRulePolicy": { "v1": { "custom": {} } },
+            })),
+        )
+        .await;
+    assert_eq!(
+        status, POPULATED_OUTPUT_SUCCESS_STATUS,
+        "setup: expected CreateConfiguredTableAssociationAnalysisRule {POPULATED_OUTPUT_SUCCESS_STATUS}, got {status} with {association_rule}"
+    );
+
+    // One row per `Delete*` operation of this service that is implemented — the seven
     // others still carry the scaffold header and answer 501, so they serve no success
     // status at all. A child goes before its parent: the collaboration's creator cannot
     // leave while the collaboration is still there, and a membership survives it.
-    let rows: [(&str, String); 6] = [
+    let rows: [(&str, String); 7] = [
         (
             "DeleteAnalysisTemplate",
             format!("/memberships/{membership_id}/analysistemplates/{analysis_template_id}"),
@@ -364,6 +402,12 @@ async fn every_implemented_delete_with_an_empty_output_shape_answers_no_content(
         (
             "DeleteConfiguredTableAnalysisRule",
             format!("/configuredTables/{table_id}/analysisRule/{rule_type}"),
+        ),
+        (
+            "DeleteConfiguredTableAssociationAnalysisRule",
+            format!(
+                "/memberships/{membership_id}/configuredTableAssociations/{association_id}/analysisRule/{rule_type}"
+            ),
         ),
         (
             "DeleteMember",
