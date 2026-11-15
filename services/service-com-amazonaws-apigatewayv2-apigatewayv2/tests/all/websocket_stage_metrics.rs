@@ -157,7 +157,7 @@ fn text(value: &Value, name: &str) -> String {
 
 /// A handler that answers `200` with the event it was given as its body, which is how a
 /// two-way route's reply and the connection id it carries are read here.
-const ECHO_HANDLER: &str = "import json\n\
+pub(crate) const ECHO_HANDLER: &str = "import json\n\
      \n\
      \n\
      def lambda_handler(event, context):\n\
@@ -165,7 +165,7 @@ const ECHO_HANDLER: &str = "import json\n\
 
 /// A handler that answers `200` and nothing else: the lifecycle routes, whose answer reaches
 /// no client.
-const OK_HANDLER: &str = "def lambda_handler(event, context):\n\
+pub(crate) const OK_HANDLER: &str = "def lambda_handler(event, context):\n\
      \x20   return {\"statusCode\": 200}\n";
 
 /// A handler that RAISES, so its route's integration produces no reply at all.
@@ -302,7 +302,7 @@ const UNRESERVED: percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERI
 
 /// Push `payload` to `connection_id` through the `@connections` management API, which must
 /// answer `200`: an out-of-band message the api sends the client.
-async fn pushed(
+pub(crate) async fn pushed(
     emulator: &MultiServiceRouter,
     case: &str,
     connection_id: &str,

@@ -337,6 +337,8 @@ mod websocket_stage_metrics;
 mod websocket_message_reassembly;
 #[path = "all/websocket_message_refusals.rs"]
 mod websocket_message_refusals;
+#[path = "all/websocket_stage_upgrade_counts.rs"]
+mod websocket_stage_upgrade_counts;
 #[path = "all/websocket_tls_transport.rs"]
 mod websocket_tls_transport;
 #[path = "all/websocket_transport_data_plane.rs"]

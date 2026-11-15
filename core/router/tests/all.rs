@@ -1,5 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: the DECLARATION LIST, and nothing else.
+//
+// EVERY comment in this file is an ORDINARY one, this header included, and that is
+// deliberate: an inner doc comment is legal only before the first item, so one that lands
+// past the declarations — which is what concurrent landings appending to this file kept
+// producing — is `E0753` and compiles no suite of this target. With no inner doc comment
+// anywhere in the file, no merge of two landings can put one past the first item.
+//
+// The list below holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file
+// under `tests/all/`, sorted by name, and no other line: a landing inserts its two lines in
+// one place and has no prose to duplicate, re-word or mistype. `tests/all.rs` is a
+// test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING (`tests/<name>.rs`),
+// which the layout check refuses; the `#[path]` is what points each declaration into
+// `tests/all/`. Declare each suite exactly ONCE: a second `mod` for one name is `E0428` and
+// fails every suite in this target.
+//
+// WHAT a suite covers, and WHY it belongs to this cross-service target rather than to one
+// service crate's own, is stated in that suite's own module doc, where it is read beside the
+// test it explains. The notes earlier landings appended to this file live in
+// `all/appended_notes.rs`, and three suites check the rules above rather than restating
+// them: `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
+// `all/all_rs_is_a_canonical_declaration_list.rs`.
 // Single integration-test target for the router: the canonical declaration list.
 //
 // This file is the license line, this header, and then one
