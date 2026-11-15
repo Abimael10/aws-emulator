@@ -300,9 +300,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The pipeline's concurrent-execution accounting, the rule both calls that
         // start an execution admit it by (`state::admit_execution`): past the pipeline's
         // ceiling the report is refused with the error the model declares for exactly
-        // that condition, and in a mode that runs one execution at a time the execution
-        // this revision starts WAITS for the one already running rather than being
-        // refused.
+        // that condition — stated in THIS call's words, which are not the ones a direct
+        // start states it with (`state::concurrent_execution_limit_message`) — and in a
+        // mode that runs one execution at a time the execution this revision starts
+        // WAITS for the one already running rather than being refused.
         let execution_mode = crate::state::resolved_execution_mode(&declaration);
         let queued = match state.admit_execution(&input.pipeline_name, &execution_mode, now) {
             crate::state::ExecutionAdmission::AtLimit => {
@@ -310,7 +311,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     PutActionRevisionErrorModeled::ConcurrentPipelineExecutionsLimitExceededException(
                         ConcurrentPipelineExecutionsLimitExceededException {
                             message: Some(
-                                crate::state::CONCURRENT_EXECUTION_LIMIT_MESSAGE.to_string(),
+                                crate::state::concurrent_execution_limit_message(
+                                    crate::state::ConcurrentExecutionLimitWording::RevisionReport,
+                                )
+                                .to_string(),
                             ),
                         },
                     )

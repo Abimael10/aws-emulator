@@ -21,33 +21,45 @@
 //! emulator's own S3 service the way the production emulator does, and every assertion
 //! goes through the router.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use service_com_amazonaws_codepipeline_codepipeline_20150709::state::MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE;
 
-use crate::execution_engine::Emulator;
+use crate::execution_engine::{Emulator, WAIT};
 use crate::pipeline_lifecycle::ROLE_ARN;
 
-/// The sentence the service states this condition with, written out here so a reword
-/// of the handler's wording fails this suite: the limit was exceeded, and the caller is
-/// told to try again later. It carries no variable part.
-const AT_THE_LIMIT: &str =
+/// The sentence `StartPipelineExecution` states this condition with, written out here so
+/// a reword of the handler's wording fails this suite: the limit was exceeded, and the
+/// caller is told to try again later. It carries no variable part.
+const AT_THE_LIMIT_STARTING: &str =
     "The limit for concurrent pipeline executions has been exceeded. Please try again later.";
 
-/// Long enough for every step one of these one-action executions is owed to have come
-/// due (`state::execution::ACTION_STEP` is the span each step waits), so a status that
-/// has not moved after it has not moved for want of time.
-const BEYOND_THE_STEPS: Duration = Duration::from_millis(1_500);
+/// The sentence `PutActionRevision` states the SAME condition with: the shared first
+/// sentence, and a second one naming what the revision driver is to wait for. The two
+/// calls' texts differ, so one shared constant cannot serve both.
+const AT_THE_LIMIT_REPORTING: &str = "The limit for concurrent pipeline executions has been \
+     exceeded. Wait for concurrent executions to complete, and then try again.";
+
+/// How long a poll loop below waits between looks, while the steps the clock owes come
+/// due (`state::execution::ACTION_STEP` is the span each step waits). The deadline every
+/// loop gives up at is the harness's own `WAIT`.
+const LOOK: Duration = Duration::from_millis(50);
 
 /// The `PipelineExecutionStatus` values an execution can still leave — the ones that
 /// hold a slot.
-const NON_TERMINAL: [&str; 2] = ["InProgress", "Stopping"];
+///
+/// `pub(crate)` with the helpers below: the suite that pins how the ceiling is WORDED
+/// (`concurrent_execution_limit_wording`) reads the slots the same way rather than
+/// growing a second copy of this.
+pub(crate) const NON_TERMINAL: [&str; 2] = ["InProgress", "Stopping"];
 
 /// A pipeline whose source action is `(owner, provider)`, in `PARALLEL` mode so that
 /// every admitted execution runs on its own rather than waiting for the one before it.
-fn pipeline(name: &str, owner: &str, provider: &str) -> Value {
+///
+/// `pub(crate)` with the helpers below, for the same reason as [`NON_TERMINAL`].
+pub(crate) fn pipeline(name: &str, owner: &str, provider: &str) -> Value {
     json!({
         "name": name,
         "roleArn": ROLE_ARN,
@@ -86,7 +98,11 @@ fn pipeline(name: &str, owner: &str, provider: &str) -> Value {
 }
 
 /// Report a new revision for the pipeline's source action.
-async fn put_revision(emulator: &Emulator, pipeline: &str, revision: &str) -> (u16, Value) {
+pub(crate) async fn put_revision(
+    emulator: &Emulator,
+    pipeline: &str,
+    revision: &str,
+) -> (u16, Value) {
     emulator
         .cp(
             "PutActionRevision",
@@ -106,7 +122,7 @@ async fn put_revision(emulator: &Emulator, pipeline: &str, revision: &str) -> (u
 
 /// The statuses the pipeline's retained executions carry, as
 /// `ListPipelineExecutions` reports them.
-async fn statuses(emulator: &Emulator, pipeline: &str) -> Vec<String> {
+pub(crate) async fn statuses(emulator: &Emulator, pipeline: &str) -> Vec<String> {
     let listed = emulator
         .ok("ListPipelineExecutions", &json!({"pipelineName": pipeline}))
         .await;
@@ -117,6 +133,31 @@ async fn statuses(emulator: &Emulator, pipeline: &str) -> Vec<String> {
         .iter()
         .map(|summary| summary["status"].as_str().unwrap_or_default().to_string())
         .collect()
+}
+
+/// Every action run `ListActionExecutions` reports for the pipeline, across all of its
+/// pages: one page carries at most 100 details and a pipeline at its ceiling has more
+/// runs than that.
+async fn action_details(emulator: &Emulator, pipeline: &str) -> Vec<Value> {
+    let mut details: Vec<Value> = Vec::new();
+    let mut next: Option<String> = None;
+    loop {
+        let mut request = json!({"pipelineName": pipeline, "maxResults": 100});
+        if let Some(token) = &next {
+            request["nextToken"] = json!(token);
+        }
+        let page = emulator.ok("ListActionExecutions", &request).await;
+        details.extend(
+            page["actionExecutionDetails"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        match page["nextToken"].as_str() {
+            Some(token) => next = Some(token.to_string()),
+            None => return details,
+        }
+    }
 }
 
 /// RULE: the slot comes back when the execution reaches a terminal status, so a
@@ -146,17 +187,25 @@ async fn a_completed_execution_gives_its_slot_back() {
             "round {round}: a new revision of a pipeline with a free slot is admitted, \
              got {status} with {answered}"
         );
-        tokio::time::sleep(BEYOND_THE_STEPS).await;
-        let statuses = statuses(&emulator, "served").await;
-        let in_flight = statuses
-            .iter()
-            .filter(|status| NON_TERMINAL.contains(&status.as_str()))
-            .count();
-        assert_eq!(
-            in_flight, 0,
-            "round {round}: every execution the clock has carried to a terminal status \
-             has given its slot back, got {statuses:?}"
-        );
+        // Look again until the clock has carried every execution to a terminal status,
+        // rather than waiting a fixed span for it.
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let statuses = statuses(&emulator, "served").await;
+            let in_flight = statuses
+                .iter()
+                .filter(|status| NON_TERMINAL.contains(&status.as_str()))
+                .count();
+            if in_flight == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "round {round}: every execution the clock has carried to a terminal status \
+                 has given its slot back, got {statuses:?}"
+            );
+            tokio::time::sleep(LOOK).await;
+        }
     }
 }
 
@@ -198,10 +247,29 @@ async fn reported_revisions_fill_the_slots_of_a_pipeline_whose_source_is_readabl
         );
     }
 
-    // Past every step the clock owes: the source actions have run and each execution is
-    // held at its approval, so every slot is still taken.
-    tokio::time::sleep(BEYOND_THE_STEPS).await;
-    let held = statuses(&emulator, "holding").await;
+    // Look again until the clock has run every admitted execution's source action: each
+    // execution is then held at the approval nobody answers, so every slot is still
+    // taken.
+    let deadline = Instant::now() + WAIT;
+    let held = loop {
+        let sources_run = action_details(&emulator, "holding")
+            .await
+            .iter()
+            .filter(|detail| {
+                detail["actionName"] == json!("Src") && detail["status"] == json!("Succeeded")
+            })
+            .count();
+        let held = statuses(&emulator, "holding").await;
+        if sources_run == MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE {
+            break held;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected every one of the {MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE} admitted \
+             executions to have run its source action, got {sources_run} with {held:?}"
+        );
+        tokio::time::sleep(LOOK).await;
+    };
     let in_flight = held
         .iter()
         .filter(|status| NON_TERMINAL.contains(&status.as_str()))
@@ -222,7 +290,7 @@ async fn reported_revisions_fill_the_slots_of_a_pipeline_whose_source_is_readabl
         (
             400,
             Some("ConcurrentPipelineExecutionsLimitExceededException"),
-            Some(AT_THE_LIMIT)
+            Some(AT_THE_LIMIT_REPORTING)
         ),
         "a revision report past the bound is refused, got {status} with {response}"
     );
@@ -265,8 +333,8 @@ async fn executions_that_wait_fill_the_pipelines_slots() {
         );
     }
     // The clock changes nothing here: the slots are held by executions waiting for a
-    // report, not by steps that have not come due.
-    tokio::time::sleep(BEYOND_THE_STEPS).await;
+    // report their job worker never makes, not by steps that have not come due, so the
+    // count below is the same at any moment.
     let waiting = statuses(&emulator, "waiting").await;
     let in_flight = waiting
         .iter()
@@ -278,7 +346,7 @@ async fn executions_that_wait_fill_the_pipelines_slots() {
     );
 
     // One past the bound, through either call that starts an execution: the same
-    // accounting and the same refusal answer both.
+    // accounting and the same modelled error answer both, each in that call's own words.
     let (status, response) = put_revision(&emulator, "waiting", "one-too-many").await;
     assert_eq!(
         (
@@ -289,7 +357,7 @@ async fn executions_that_wait_fill_the_pipelines_slots() {
         (
             400,
             Some("ConcurrentPipelineExecutionsLimitExceededException"),
-            Some(AT_THE_LIMIT)
+            Some(AT_THE_LIMIT_REPORTING)
         ),
         "a revision report past the bound is refused, got {status} with {response}"
     );
@@ -305,9 +373,9 @@ async fn executions_that_wait_fill_the_pipelines_slots() {
         (
             400,
             Some("ConcurrentPipelineExecutionsLimitExceededException"),
-            Some(AT_THE_LIMIT)
+            Some(AT_THE_LIMIT_STARTING)
         ),
-        "a start past the same bound is refused the same way, got {status} with {response}"
+        "a start past the same bound is refused in its own words, got {status} with {response}"
     );
 
     // And the refusals started nothing: the pipeline still holds exactly its bound.

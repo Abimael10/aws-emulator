@@ -1899,3 +1899,19 @@ mod cognito_user_pool_replica_over_a_multi_region_key;
 // SIBLING of this file, which the layout check refuses: the `#[path]` above each `mod` is what
 // points it into `tests/all/`. The suites `all/all_rs_carries_no_inner_doc_comment.rs`,
 // here. Some of the files below are shared harnesses or probes rather than suites; all are
+// suite file, sorted by name, and no other line: no prose between the pairs, and nothing
+// after the last one. Two branches landing at once then insert two lines in two places and
+// have no prose to duplicate, re-word or mistype. Put a new suite at `tests/all/<name>.rs`
+// and insert its pair where its name sorts to; what that suite covers, and why it drives the
+// assembled router rather than one service crate, belongs in that suite's OWN module header,
+// where it is read beside the test it explains, and a note about THIS file belongs in
+// comment is legal only ahead of the first item, so one left past the declarations compiles
+// no suite of this target at all, and with none anywhere in the file there is none to copy,
+// re-type or merge into that position.
+// the declaration into `tests/all/`. A suite file no `mod` names is compiled nowhere, and a
+// second `mod` for one name fails every suite of this target. The `all/all_rs_*` suites,
+// `all/every_suite_file_is_declared.rs` and
+// `all/declaration_roots_are_canonical_and_complete.rs` pin all of that, for this file and
+// for every service crate's `tests/all.rs`, so check there rather than leaving a note here.
+// An inner attribute, like an inner doc comment, is legal only ahead of the first item, so
+// the one this target needs stands here rather than in the list below.

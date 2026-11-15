@@ -417,8 +417,9 @@ pub enum ExecutionAdmission {
     /// driver admits it as soon as that stage's turn is free.
     Queued,
     /// The pipeline already carries every execution it may, so the call that asked is
-    /// refused with `ConcurrentPipelineExecutionsLimitExceededException`
-    /// ([`CONCURRENT_EXECUTION_LIMIT_MESSAGE`]).
+    /// refused with `ConcurrentPipelineExecutionsLimitExceededException`, in the words
+    /// the call that asked states it with
+    /// ([`concurrent_execution_limit_message`]).
     AtLimit,
 }
 
@@ -3731,17 +3732,51 @@ pub fn start_execution(
     Some(store.record_execution(record, None))
 }
 
-/// The message `ConcurrentPipelineExecutionsLimitExceededException` carries, for every
-/// call that would start one execution too many.
+/// Which of CodePipeline's `ConcurrentPipelineExecutionsLimitExceededException`
+/// sentences a refusal carries.
 ///
-/// The model DOCUMENTS the condition ("The pipeline has reached the limit for concurrent
-/// pipeline executions."), while the sentence the service STATES it with is this one: the
-/// limit was exceeded, and the caller is told to come back later, because the condition
-/// clears on its own as the running executions finish. It carries no variable part — the
-/// pipeline is the one the request named — so it is a constant, stated once here rather
-/// than worded per handler.
-pub const CONCURRENT_EXECUTION_LIMIT_MESSAGE: &str =
-    "The limit for concurrent pipeline executions has been exceeded. Please try again later.";
+/// The same per-call rule as [`PipelineNotFoundWording`]: one modelled error — 400,
+/// `ConcurrentPipelineExecutionsLimitExceededException`, `errorKind=client`
+/// (`smithy_query(query="shape",
+/// shape="ConcurrentPipelineExecutionsLimitExceededException")`) — stated in the words
+/// of the call that found the pipeline at its ceiling. The model DOCUMENTS the condition
+/// ("The pipeline has reached the limit for concurrent pipeline executions."), while the
+/// service STATES it with a first sentence both calls share and a second sentence of the
+/// call's own, so the text cannot be one constant.
+///
+/// One variant per call that starts an execution, so neither call can word the refusal
+/// the other's way and no handler has a sentence of its own invention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConcurrentExecutionLimitWording {
+    /// The call that starts an execution DIRECTLY: `StartPipelineExecution`. The caller
+    /// asked for one execution and is told to come back later, because the condition
+    /// clears on its own as the running executions finish.
+    ExecutionStart,
+    /// The call that starts one as the effect of RECORDING a new source revision:
+    /// `PutActionRevision`. The caller is a revision driver rather than a person asking
+    /// for a run, so the sentence names what it is to wait for.
+    RevisionReport,
+}
+
+/// The message `ConcurrentPipelineExecutionsLimitExceededException` carries, for a call
+/// that would start one execution too many on the plane `wording` names.
+///
+/// Every sentence is fixed text with no variable part — the pipeline is the one the
+/// request named — so each is stated once here rather than worded per handler.
+pub fn concurrent_execution_limit_message(
+    wording: ConcurrentExecutionLimitWording,
+) -> &'static str {
+    match wording {
+        ConcurrentExecutionLimitWording::ExecutionStart => {
+            "The limit for concurrent pipeline executions has been exceeded. Please try \
+             again later."
+        }
+        ConcurrentExecutionLimitWording::RevisionReport => {
+            "The limit for concurrent pipeline executions has been exceeded. Wait for \
+             concurrent executions to complete, and then try again."
+        }
+    }
+}
 
 /// The variables an execution of `declaration` runs with: every variable the
 /// declaration declares takes `overrides`'s value for it when there is one, else its

@@ -272,7 +272,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         StartPipelineExecutionErrorModeled::ConcurrentPipelineExecutionsLimitExceededException(
                             ConcurrentPipelineExecutionsLimitExceededException {
                                 message: Some(
-                                    crate::state::CONCURRENT_EXECUTION_LIMIT_MESSAGE.to_string(),
+                                    crate::state::concurrent_execution_limit_message(
+                                        crate::state::ConcurrentExecutionLimitWording::ExecutionStart,
+                                    )
+                                    .to_string(),
                                 ),
                             },
                         )
