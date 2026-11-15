@@ -111,6 +111,8 @@ mod cluster_request_validation;
 mod cluster_scalar_coercion;
 #[path = "all/cluster_update_concurrency.rs"]
 mod cluster_update_concurrency;
+#[path = "all/cluster_vended_logs.rs"]
+mod cluster_vended_logs;
 #[path = "all/cluster_version_catalog.rs"]
 mod cluster_version_catalog;
 #[path = "all/cluster_version_update.rs"]

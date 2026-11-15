@@ -19,6 +19,7 @@ pub mod associate_access_policy_types;
 pub mod associate_encryption_config_types;
 pub mod associate_identity_provider_config_types;
 pub mod cancel_update_types;
+pub mod cluster_wire;
 pub mod create_access_entry_types;
 pub mod create_addon_types;
 pub mod create_capability_types;
@@ -96,6 +97,8 @@ pub use associate_encryption_config_types::*;
 pub use associate_identity_provider_config_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use cancel_update_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use cluster_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use create_access_entry_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

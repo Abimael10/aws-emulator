@@ -4,25 +4,29 @@
 //! through `DescribeAddonConfiguration` on the same `MultiServiceRouter` the
 //! production binary mounts.
 //!
-//! The RULE under test: a published add-on's `podIdentityConfiguration` names EVERY
-//! Kubernetes service account that add-on's own workloads call AWS as — one entry per
-//! service account, so a driver whose controller and node components both call AWS
-//! carries both — each with the AWS-managed policies Amazon EKS recommends for that
-//! service account, and an add-on whose workloads call AWS as none reports an empty
-//! list. The list is a property of the ADD-ON, not of a build, so every published
-//! build of one add-on reports the same list.
+//! The RULE under test: `DescribeAddonConfiguration` resolves one `(addonName,
+//! addonVersion)` pair, so the `podIdentityConfiguration` it answers with is THAT
+//! BUILD's — it names every Kubernetes service account that build's own workloads
+//! call AWS as and supports EKS Pod Identity for, so a driver whose controller and
+//! node components both call AWS carries both from the build in which each of them
+//! gained that support, each entry with the AWS-managed policies Amazon EKS
+//! recommends for that service account, and an add-on whose workloads call AWS as
+//! none reports an empty list. Pod-identity support is never withdrawn, so an older
+//! build's entries are a subset of a newer build's.
 //!
-//! Two suites assert it:
+//! Three suites assert it:
 //!
-//! * a TABLE of the recommendations the catalog publishes, whose rows differ along
-//!   what the rule generalises over — how many service accounts an add-on runs as
-//!   (none, one, two), how many policies are recommended for one of them (one, two),
-//!   and the path depth of the policy ARNs (the account root and `/service-role/`) —
-//!   each row read back at both the newest and the oldest build the add-on publishes;
+//! * a TABLE of the recommendations the catalog publishes at each add-on's newest
+//!   build, whose rows differ along what the rule generalises over — how many
+//!   service accounts an add-on runs as (none, one, two), how many policies are
+//!   recommended for one of them (one, two), and the path depth of the policy ARNs
+//!   (the account root and `/service-role/`);
+//! * the version-keyed half of the rule, over the whole published build line of the
+//!   one add-on whose components gained pod identity at different releases;
 //! * an invariant over the WHOLE catalog, every add-on the emulator publishes being a
-//!   row: the entries of one add-on name distinct service accounts, every recommended
-//!   policy is an ARN in AWS's own managed-policy namespace, and two builds of one
-//!   add-on cannot disagree about the list.
+//!   row: the entries of one build name distinct service accounts, every recommended
+//!   policy is an ARN in AWS's own managed-policy namespace, and an older build of an
+//!   add-on publishes a subset of what a newer build does, with the same policies.
 //!
 //! The harness is the crate's own (`wire.rs`), and the catalog readers are the ones
 //! `addon_versions.rs` owns.
@@ -40,9 +44,9 @@ use crate::wire::emulator;
 /// The prefix of an ARN in AWS's own managed-policy namespace.
 const AWS_MANAGED_POLICY_PREFIX: &str = "arn:aws:iam::aws:policy/";
 
-/// What one published add-on's `podIdentityConfiguration` must report: the service
-/// accounts it runs as, in the order the catalog publishes them, each with the
-/// managed policies recommended for it.
+/// What one published add-on's `podIdentityConfiguration` must report at its NEWEST
+/// build: the service accounts it runs as, in the order the catalog publishes them,
+/// each with the managed policies recommended for it.
 #[derive(Debug)]
 struct Expected {
     addon: &'static str,
@@ -167,21 +171,45 @@ fn reported_pod_identity(
         .collect()
 }
 
-/// The newest and the oldest build the catalog publishes for `addon_name`, which is
-/// how each row is read at two builds of the same add-on.
-async fn newest_and_oldest_build(router: &MultiServiceRouter, addon_name: &str) -> Vec<String> {
+/// The newest build the catalog publishes for `addon_name` — the build whose
+/// pod-identity configuration names every service account the add-on has gained pod
+/// identity support for.
+async fn newest_build(router: &MultiServiceRouter, addon_name: &str) -> String {
+    let builds = published_builds(router, addon_name).await;
+    builds
+        .first()
+        .unwrap_or_else(|| panic!("the catalog must publish a build of {addon_name}"))
+        .clone()
+}
+
+/// Every build the catalog publishes for `addon_name`, newest first — the order
+/// `DescribeAddonVersions` publishes them in.
+async fn published_builds(router: &MultiServiceRouter, addon_name: &str) -> Vec<String> {
     let catalog = addons(&whole_catalog(router).await);
     let addon = catalog
         .iter()
         .find(|addon| string_member(addon, "addonName") == addon_name)
         .unwrap_or_else(|| panic!("the catalog must publish {addon_name}"));
-    let builds = versions_of(addon);
-    let newest = string_member(builds.first().expect("a published build"), "addonVersion");
-    let oldest = string_member(builds.last().expect("a published build"), "addonVersion");
-    if newest == oldest {
-        vec![newest]
-    } else {
-        vec![newest, oldest]
+    versions_of(addon)
+        .iter()
+        .map(|build| string_member(build, "addonVersion"))
+        .collect()
+}
+
+/// The `(major, minor, patch)` release a `vX.Y.Z-eksbuild.N` add-on version names,
+/// which is what orders one add-on's builds.
+fn release_of(addon_version: &str) -> (u32, u32, u32) {
+    let numbers: Vec<u32> = addon_version
+        .trim_start_matches('v')
+        .split('-')
+        .next()
+        .unwrap_or_default()
+        .split('.')
+        .filter_map(|part| part.parse().ok())
+        .collect();
+    match numbers.as_slice() {
+        [major, minor, patch] => (*major, *minor, *patch),
+        other => panic!("an add-on version is vX.Y.Z-eksbuild.N, got {addon_version:?} ({other:?})"),
     }
 }
 
@@ -209,57 +237,120 @@ async fn every_service_account_an_addon_runs_as_is_published_with_its_policies()
     let router = emulator();
 
     for expected in EXPECTED {
-        for build in newest_and_oldest_build(&router, expected.addon).await {
-            let case = format!("{}/{build}", expected.addon);
-            let answer = describe_addon_configuration(&router, expected.addon, &build).await;
-            assert_eq!(
-                answer.status, 200,
-                "case {case}: expected HTTP 200, got {answer:?}"
-            );
+        // The newest build, which is the one that names every service account the
+        // add-on has gained pod identity support for; the builds that gained one
+        // later are the next suite's subject.
+        let build = newest_build(&router, expected.addon).await;
+        let case = format!("{}/{build}", expected.addon);
+        let answer = describe_addon_configuration(&router, expected.addon, &build).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected HTTP 200, got {answer:?}"
+        );
 
-            let reported = reported_pod_identity(&answer.body, &case);
-            let reported_accounts: Vec<&str> = reported
-                .iter()
-                .map(|(account, _)| account.as_str())
-                .collect();
-            let expected_accounts: Vec<&str> = expected
-                .pod_identity
-                .iter()
-                .map(|(account, _)| *account)
-                .collect();
+        let reported = reported_pod_identity(&answer.body, &case);
+        let reported_accounts: Vec<&str> = reported
+            .iter()
+            .map(|(account, _)| account.as_str())
+            .collect();
+        let expected_accounts: Vec<&str> = expected
+            .pod_identity
+            .iter()
+            .map(|(account, _)| *account)
+            .collect();
+        assert_eq!(
+            reported_accounts, expected_accounts,
+            "case {case}: expected the service accounts the add-on runs as, got \
+             {reported_accounts:?}"
+        );
+        for ((account, policies), (_, expected_policies)) in
+            reported.iter().zip(expected.pod_identity)
+        {
+            let policies: Vec<&str> = policies.iter().map(String::as_str).collect();
             assert_eq!(
-                reported_accounts, expected_accounts,
-                "case {case}: expected the service accounts the add-on runs as, got \
-                 {reported_accounts:?}"
-            );
-            for ((account, policies), (_, expected_policies)) in
-                reported.iter().zip(expected.pod_identity)
-            {
-                let policies: Vec<&str> = policies.iter().map(String::as_str).collect();
-                assert_eq!(
-                    policies.as_slice(),
-                    *expected_policies,
-                    "case {case}/{account}: expected the policies recommended for it, got \
-                     {policies:?}"
-                );
-            }
-
-            // The schema's service account default is the add-on's FIRST published
-            // entry, and an add-on that runs as none declares no default: a second
-            // entry adds a recommendation, it does not change the install default.
-            let default = schema_service_account_default(&answer.body, &case);
-            assert_eq!(
-                default.as_deref(),
-                expected_accounts.first().copied(),
-                "case {case}: expected the first published service account as the schema \
-                 default, got {default:?}"
+                policies.as_slice(),
+                *expected_policies,
+                "case {case}/{account}: expected the policies recommended for it, got \
+                 {policies:?}"
             );
         }
+
+        // The schema's service account default is the add-on's FIRST published
+        // entry, and an add-on that runs as none declares no default: a second
+        // entry adds a recommendation, it does not change the install default.
+        let default = schema_service_account_default(&answer.body, &case);
+        assert_eq!(
+            default.as_deref(),
+            expected_accounts.first().copied(),
+            "case {case}: expected the first published service account as the schema \
+             default, got {default:?}"
+        );
     }
 }
 
+/// The add-on whose two components gained EKS Pod Identity support at different
+/// releases, with the release its NODE component's service account is published
+/// from.
+///
+/// SOURCE: the minimum add-on version the Amazon EKS User Guide publishes for that
+/// component's pod identity support — the EFS CSI driver's 2.1 line — which is the
+/// external authority this expectation is taken from, not the catalog under test.
+/// The driver's controller has had it for every build the catalog publishes.
+const NODE_COMPONENT_FROM: (&str, &str, &str, (u32, u32, u32)) = (
+    "aws-efs-csi-driver",
+    "efs-csi-controller-sa",
+    "efs-csi-node-sa",
+    (2, 1, 0),
+);
+
 #[tokio::test]
-async fn the_pod_identity_configuration_is_a_property_of_the_addon() {
+async fn a_build_publishes_the_service_accounts_it_supports_pod_identity_for() {
+    let router = emulator();
+    let (addon, controller, node, first_build) = NODE_COMPONENT_FROM;
+
+    // Every build of the published line is a row, so the rows span both sides of
+    // that release and both published bounds — the oldest build the add-on has and
+    // its newest.
+    let builds = published_builds(&router, addon).await;
+    assert!(
+        builds.len() > 1,
+        "setup: the catalog must publish several builds of {addon}, got {builds:?}"
+    );
+    let mut published_for_node = 0;
+    for build in &builds {
+        let case = format!("{addon}/{build}");
+        let answer = describe_addon_configuration(&router, addon, build).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected HTTP 200, got {answer:?}"
+        );
+        let reported = reported_pod_identity(&answer.body, &case);
+        let accounts: Vec<&str> = reported
+            .iter()
+            .map(|(account, _)| account.as_str())
+            .collect();
+        let expected: Vec<&str> = if release_of(build) >= first_build {
+            published_for_node += 1;
+            vec![controller, node]
+        } else {
+            vec![controller]
+        };
+        assert_eq!(
+            accounts, expected,
+            "case {case}: a build publishes the service accounts it supports pod \
+             identity for, got {accounts:?}"
+        );
+    }
+    assert!(
+        published_for_node > 0 && published_for_node < builds.len(),
+        "setup: the published line must cross the release {first_build:?} that \
+         {node} is published from, got {published_for_node} of {} builds",
+        builds.len()
+    );
+}
+
+#[tokio::test]
+async fn the_pod_identity_configuration_of_an_older_build_is_a_subset() {
     let router = emulator();
     let catalog = addons(&whole_catalog(&router).await);
     assert!(
@@ -269,7 +360,9 @@ async fn the_pod_identity_configuration_is_a_property_of_the_addon() {
 
     for addon in &catalog {
         let addon_name = string_member(addon, "addonName");
-        let mut across_builds: Option<Vec<(String, Vec<String>)>> = None;
+        // The builds come newest first, so each one that follows is older than the
+        // one before it and may publish no more than it does.
+        let mut newer: Option<Vec<(String, Vec<String>)>> = None;
         for build in versions_of(addon) {
             let addon_version = string_member(&build, "addonVersion");
             let case = format!("{addon_name}/{addon_version}");
@@ -305,14 +398,19 @@ async fn the_pod_identity_configuration_is_a_property_of_the_addon() {
                 }
             }
 
-            match &across_builds {
-                None => across_builds = Some(reported),
-                Some(first) => assert_eq!(
-                    &reported, first,
-                    "case {case}: every build of one add-on reports the same pod identity \
-                     configuration, got {reported:?} against {first:?}"
-                ),
+            if let Some(newer) = &newer {
+                // Pod identity support is never withdrawn, so this older build
+                // publishes a subset of the newer one's entries, and an entry it
+                // does publish recommends exactly what the newer build does.
+                for entry in &reported {
+                    assert!(
+                        newer.contains(entry),
+                        "case {case}: an older build publishes a subset of what a newer \
+                         build does, got {entry:?} against {newer:?}"
+                    );
+                }
             }
+            newer = Some(reported);
         }
     }
 }

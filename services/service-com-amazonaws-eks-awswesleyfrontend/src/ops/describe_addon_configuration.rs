@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             addon_name: Some(addon.addon_name.clone()),
             addon_version: Some(version.addon_version.clone()),
             configuration_schema: Some(addon.configuration_schema(version)),
-            pod_identity_configuration: Some(addon.to_pod_identity_configuration()),
+            pod_identity_configuration: Some(addon.to_pod_identity_configuration(version)),
         })
     }
 }

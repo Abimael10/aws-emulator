@@ -2012,6 +2012,19 @@ pub struct ClusterRecord {
     /// reports. Deleting the cluster takes it with it, and nothing else keeps a
     /// second copy.
     pub insights_refresh: Option<InsightsRefreshRecord>,
+    /// Whether this cluster's logs are delivered through vended log delivery,
+    /// which `Cluster$vendedLogs` reports on every cluster this service answers
+    /// with.
+    ///
+    /// A delivery is not configured through this API at all — no member of any
+    /// request here names one, and no operation of this service writes this flag —
+    /// so a cluster stored by `CreateCluster` or `RegisterCluster` holds `false`
+    /// and reports it, which is what tells a client that reads it that this
+    /// cluster's logs are not being vended. It is stored rather than computed per
+    /// read for the reason every other reported member is
+    /// ([`ClusterRecord::to_cluster`] reports the record as it stands), so the one
+    /// place a delivery would be recorded is the record itself.
+    pub vended_logs: bool,
     /// When set, the instant of the latest COMPLETED analysis of this cluster's
     /// insights — `InsightSummary$lastRefreshTime`, read through
     /// [`ClusterRecord::insights_refreshed_at`].

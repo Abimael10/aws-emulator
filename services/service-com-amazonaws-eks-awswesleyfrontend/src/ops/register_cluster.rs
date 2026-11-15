@@ -426,6 +426,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // manages, and a connected cluster has none, so no analysis of one
             // ever completes.
             insights_analyzed_at: None,
+            // Nothing in this API configures vended log delivery for a cluster, so
+            // a cluster this registration stores has none (see
+            // [`crate::state::ClusterRecord::vended_logs`]).
+            vended_logs: false,
         };
 
         let cluster = record.to_cluster();

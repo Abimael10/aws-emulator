@@ -835,6 +835,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // cluster's own creation, which is what every insight of a cluster
             // nobody has refreshed reports: no later analysis has completed yet.
             insights_analyzed_at: None,
+            // Nothing in this API configures vended log delivery for a cluster, so
+            // a cluster this create stores has none (see
+            // [`state::ClusterRecord::vended_logs`]).
+            vended_logs: false,
         };
 
         let key = (region.clone(), input.name.clone());

@@ -495,41 +495,9 @@ pub struct HorizontalPodAutoscalerControllerConfigRequest {
     pub horizontal_pod_autoscaler_sync_period: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.eks#Cluster")]
-#[derive(Debug, Clone, Default)]
-pub struct Cluster {
-    pub name: Option<String>,
-    pub arn: Option<String>,
-    pub created_at: Option<::aws_smithy_types::DateTime>,
-    pub version: Option<String>,
-    pub endpoint: Option<String>,
-    pub role_arn: Option<String>,
-    pub resources_vpc_config: Option<VpcConfigResponse>,
-    pub kubernetes_network_config: Option<KubernetesNetworkConfigResponse>,
-    pub logging: Option<Logging>,
-    pub identity: Option<Identity>,
-    pub status: Option<String>,
-    pub certificate_authority: Option<Certificate>,
-    pub client_request_token: Option<String>,
-    pub platform_version: Option<String>,
-    pub tags: Option<std::collections::HashMap<String, String>>,
-    pub encryption_config: Option<Vec<EncryptionConfig>>,
-    pub connector_config: Option<ConnectorConfigResponse>,
-    pub id: Option<String>,
-    pub health: Option<ClusterHealth>,
-    pub outpost_config: Option<OutpostConfigResponse>,
-    pub access_config: Option<AccessConfigResponse>,
-    pub upgrade_policy: Option<UpgradePolicyResponse>,
-    pub zonal_shift_config: Option<ZonalShiftConfigResponse>,
-    pub remote_network_config: Option<RemoteNetworkConfigResponse>,
-    pub compute_config: Option<ComputeConfigResponse>,
-    pub storage_config: Option<StorageConfigResponse>,
-    pub deletion_protection: Option<bool>,
-    pub control_plane_scaling_config: Option<ControlPlaneScalingConfig>,
-    pub kube_api_server_config: Option<KubeApiServerConfigResponse>,
-    pub kube_scheduler_config: Option<KubeSchedulerConfigResponse>,
-    pub kube_controller_manager_config: Option<KubeControllerManagerConfigResponse>,
-}
+// `Cluster` is NOT declared here: an Amazon EKS cluster answer carries one member the
+// on-disk model does not declare (`vendedLogs`), which the derive cannot express, so that
+// structure's schema and codec are written out in `types/cluster_wire.rs`.
 
 #[smithy_macros::smithy(shape = "com.amazonaws.eks#VpcConfigResponse")]
 #[derive(Debug, Clone, Default)]

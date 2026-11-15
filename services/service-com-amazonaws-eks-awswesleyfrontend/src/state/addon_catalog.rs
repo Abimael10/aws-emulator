@@ -452,6 +452,12 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         // mount targets it mounts through, so the catalog carries an entry per
         // service account the driver runs as — not just the controller's — each
         // recommending the policy Amazon EKS publishes for the driver.
+        // BOTH of the driver's components call Amazon EFS: the controller
+        // Deployment provisions access points and the node DaemonSet resolves the
+        // mount targets it mounts through, so the catalog carries an entry per
+        // service account the driver runs as, each recommending the policy Amazon
+        // EKS publishes for the driver. WHICH of them a build publishes is the
+        // build's own ([`ADDON_POD_IDENTITY_FIRST_BUILD`]).
         pod_identity: &[
             (
                 "efs-csi-controller-sa",
@@ -1355,6 +1361,17 @@ pub struct AddonCatalogVersionRecord {
     /// The build's version, in the `vX.Y.Z-eksbuild.N` form every Amazon EKS
     /// add-on version takes.
     pub addon_version: String,
+    /// The add-on's OWN release this build is of, as `(major, minor, patch)` — the
+    /// numbers [`AddonCatalogSeed::releases`] publishes it at, which
+    /// [`Self::addon_version`] is written from.
+    ///
+    /// It is carried as the triple as well as in the version string because the
+    /// catalog ORDERS builds by it: which of the add-on's service accounts a build
+    /// publishes a pod-identity entry for is decided by comparing this release with
+    /// the build that service account was first published for
+    /// ([`ADDON_POD_IDENTITY_FIRST_BUILD`]), and comparing release NUMBERS is not
+    /// the same as comparing the version strings they are written into.
+    pub release: (u32, u32, u32),
     /// When Amazon EKS published this build — the release date of the
     /// Kubernetes version it was published for. A build the clock has not
     /// reached is not one the catalog offers yet, exactly as an unreleased
@@ -1533,11 +1550,26 @@ impl AddonCatalogRecord {
             .collect()
     }
 
-    /// The service accounts this add-on runs as, as the modelled
+    /// The service accounts ONE BUILD of this add-on runs as, as the modelled
     /// `AddonPodIdentityConfiguration` list.
-    pub fn to_pod_identity_configuration(&self) -> Vec<AddonPodIdentityConfiguration> {
+    ///
+    /// `DescribeAddonConfiguration` resolves a `(addonName, addonVersion)` pair —
+    /// both members are `@required` — and what it publishes is that BUILD's own, so
+    /// the entries are the service accounts that build supports EKS Pod Identity
+    /// for: a component's service account is published from the build in which that
+    /// component gained pod identity support and from none older
+    /// ([`ADDON_POD_IDENTITY_FIRST_BUILD`]). An add-on whose components all had it
+    /// from the first published build reports the same list for every build.
+    pub fn to_pod_identity_configuration(
+        &self,
+        version: &AddonCatalogVersionRecord,
+    ) -> Vec<AddonPodIdentityConfiguration> {
         self.pod_identity
             .iter()
+            .filter(|(service_account, _)| {
+                pod_identity_first_build(&self.addon_name, service_account)
+                    .is_none_or(|first| version.release >= first)
+            })
             .map(|(service_account, policies)| AddonPodIdentityConfiguration {
                 service_account: Some(service_account.clone()),
                 recommended_managed_policies: Some(policies.clone()),
@@ -2101,6 +2133,50 @@ pub(super) fn nested_configuration_properties(
         .unwrap_or_default()
 }
 
+/// The first build of an add-on from which one of its service accounts is part of
+/// the pod-identity configuration that add-on publishes, as `(the add-on's name,
+/// the service account, the add-on release it is published from)`. A service
+/// account with no row here is published for every build of its add-on.
+///
+/// `DescribeAddonConfiguration` answers about one BUILD — `addonName` and
+/// `addonVersion` are both `@required` — and EKS Pod Identity support is a
+/// property of the build: a component of an add-on supports it from the release in
+/// which it gained it, and a build older than that one publishes no entry for that
+/// component's service account, so a caller reading an older build's configuration
+/// is told about the accounts that build can actually use pod identity for.
+///
+/// Source: the minimum add-on version the Amazon EKS User Guide publishes for each
+/// add-on component that supports EKS Pod Identity — the EFS CSI driver's node
+/// component gained it in the driver's 2.1 line, after its controller, which has
+/// had it for every build the catalog publishes.
+///
+/// Every OTHER service account the catalog publishes
+/// ([`AddonCatalogSeed::pod_identity`]) needs no row, because its add-on's
+/// component has supported pod identity since the oldest build the catalog
+/// carries for that add-on: the guide publishes a minimum version for those
+/// add-ons that is at or below their first published release, so each of them
+/// reports the same list for every build. A row is REQUIRED for any component the
+/// guide publishes a later minimum version for; without one the catalog would
+/// publish that account for builds that cannot use it.
+pub(super) const ADDON_POD_IDENTITY_FIRST_BUILD: &[(&str, &str, (u32, u32, u32))] =
+    &[("aws-efs-csi-driver", "efs-csi-node-sa", (2, 1, 0))];
+
+/// The add-on release `service_account` is published from for the add-on named
+/// `addon_name`, or `None` for a service account every build of that add-on
+/// publishes. See [`ADDON_POD_IDENTITY_FIRST_BUILD`].
+pub(super) fn pod_identity_first_build(
+    addon_name: &str,
+    service_account: &str,
+) -> Option<(u32, u32, u32)> {
+    // A vendor's rebuild of an add-on is the same software, so the builds its
+    // components support pod identity from are the rebuilt add-on's own.
+    let published_for = rebuilt_addon(addon_name).unwrap_or(addon_name);
+    ADDON_POD_IDENTITY_FIRST_BUILD
+        .iter()
+        .find(|(addon, account, _)| *addon == published_for && *account == service_account)
+        .map(|(_, _, release)| *release)
+}
+
 /// Where AWS Marketplace publishes the listings this catalog's Marketplace
 /// add-ons are subscribed through: the address every published
 /// `marketplaceInformation.productUrl` starts with, which each listing's own
@@ -2288,16 +2364,23 @@ fn first_published_row(seed: &AddonCatalogSeed) -> usize {
 
 /// The version of the build an add-on published for the `step`-th Kubernetes
 /// version it has been offered for, in the `vX.Y.Z-eksbuild.N` form every Amazon
-/// EKS add-on version takes.
+/// EKS add-on version takes. See [`addon_build_release`] for where the numbers
+/// come from.
+fn addon_build_version(seed: &AddonCatalogSeed, step: usize) -> String {
+    let (major, minor, patch) = addon_build_release(seed, step);
+    format!("v{major}.{minor}.{patch}-eksbuild.1")
+}
+
+/// The add-on's own release the build at `step` is of, as `(major, minor,
+/// patch)`.
 ///
 /// It is the add-on's OWN release at that step
 /// ([`AddonCatalogSeed::releases`]) — which is how a published history crosses
 /// the major versions the project released — and past the end of that line it
 /// continues from the last release by one minor version per further step, so a
 /// calendar row the recorded history does not reach still has a build.
-fn addon_build_version(seed: &AddonCatalogSeed, step: usize) -> String {
-    let (major, minor, patch) = seed
-        .releases
+fn addon_build_release(seed: &AddonCatalogSeed, step: usize) -> (u32, u32, u32) {
+    seed.releases
         .get(step)
         .copied()
         .or_else(|| {
@@ -2309,8 +2392,7 @@ fn addon_build_version(seed: &AddonCatalogSeed, step: usize) -> String {
                 "the add-on catalog publishes {} with no release line at all",
                 seed.addon_name
             )
-        });
-    format!("v{major}.{minor}.{patch}-eksbuild.1")
+        })
 }
 
 /// Build the add-on catalog this service publishes from
@@ -2365,6 +2447,7 @@ pub(super) fn seed_addon_catalog() -> Vec<AddonCatalogRecord> {
                         .collect();
                     AddonCatalogVersionRecord {
                         addon_version: addon_build_version(seed, index - first),
+                        release: addon_build_release(seed, index - first),
                         published_at: calendar_instant(release),
                         architecture: ADDON_ARCHITECTURES
                             .iter()

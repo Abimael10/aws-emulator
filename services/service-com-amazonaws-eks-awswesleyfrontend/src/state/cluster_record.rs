@@ -572,6 +572,10 @@ impl ClusterRecord {
             // cluster insights.
             id: None,
             health: None,
+            // Reported on every cluster, from the record: whether this cluster's
+            // logs are delivered through vended log delivery
+            // ([`ClusterRecord::vended_logs`]).
+            vended_logs: self.vended_logs,
         }
     }
 
