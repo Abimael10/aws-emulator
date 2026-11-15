@@ -2117,3 +2117,16 @@ mod s3_sourced_table_derived_key_schema;
 // file at all, no merge of two landings can put one past the first item.
 // declaration into `tests/all/`. Declare each suite exactly ONCE — a second `mod` for one name
 // is `E0428` and fails every suite in this target too.
+//! Single integration-test target for the router: the declaration list of its cross-service
+//! suites, and nothing else.
+//! One `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`, sorted by
+//! name, with no line between the pairs and none after the last one — so two branches landing
+//! at once insert two lines in two places and have no prose to duplicate, re-word or mistype.
+//! An inner doc comment is legal only before the first item, so this header is the only place
+//! one may stand: past the first item it is `E0753` and compiles no suite of this target. A
+//! second pair for one name is `E0428`, and a suite file no pair names compiles nowhere.
+//! What a suite covers, and why it drives the assembled router rather than one service crate,
+//! belongs in that suite's own module header; the notes earlier landings had appended to the
+//! tail of this file live in `all/appended_notes.rs`.
+#[path = "all/s3_notification_lambda_invoke_grant_gates_delivery.rs"]
+mod s3_notification_lambda_invoke_grant_gates_delivery;
