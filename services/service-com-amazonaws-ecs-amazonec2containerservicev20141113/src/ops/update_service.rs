@@ -635,6 +635,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The tasks the service is already running were placed under the configuration this
+        // update would take it off, and only a new deployment replaces them, so a switch
+        // onto a capacity provider strategy is made with `forceNewDeployment` and refused
+        // without it ([`crate::state::capacity_provider_strategy_force_violation`]).
+        if let Some(message) = crate::state::capacity_provider_strategy_force_violation(
+            input.capacity_provider_strategy.as_deref(),
+            &snapshot.capacity_provider_strategy,
+            input.force_new_deployment,
+        ) {
+            return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         // The deployment controller a service deploys through can be changed, but only on
         // a service the new controller has something to take over: the controllers that are
         // not the ECS scheduler deploy through a TASK SET, so the change requires the
@@ -1055,7 +1072,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             service.deployment_controller = controller;
         }
         if let Some(count) = input.desired_count {
-            service.desired_count = count;
+            // The count the caller asks for is the service's from here; the scheduler takes
+            // it on on its own pass ([`crate::state::ServiceRecord::wants_task_count`]).
+            service.wants_task_count(count, now);
         }
         if let Some(found) = definition.as_ref() {
             service.task_definition_arn = Some(found.arn.clone());
@@ -1083,10 +1102,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "For update service requests, when no value is specified for
         // AvailabilityZoneRebalancing, Amazon ECS defaults to the existing service's
-        // AvailabilityZoneRebalancing value."
-        if let Some(rebalancing) = input.availability_zone_rebalancing.clone() {
-            service.availability_zone_rebalancing = rebalancing;
-        }
+        // AvailabilityZoneRebalancing value. If the service never had an
+        // AvailabilityZoneRebalancing value set, Amazon ECS treats this as DISABLED."
+        let (rebalancing, rebalancing_set) = crate::state::az_rebalancing_after_update(
+            input.availability_zone_rebalancing.as_deref(),
+            &service.availability_zone_rebalancing,
+            service.availability_zone_rebalancing_set,
+        );
+        service.availability_zone_rebalancing = rebalancing;
+        service.availability_zone_rebalancing_set = rebalancing_set;
         if input.network_configuration.is_some() {
             service.network_configuration =
                 crate::state::defaulted_network_configuration(input.network_configuration.as_ref());
@@ -1132,11 +1156,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(deployment_id) = new_deployment_id {
             service.deployment_id = deployment_id;
             service.deployment_created_at = updated_at;
-            // A new deployment rolls out a new service revision, so the configuration the
-            // service runs is a new version of it — and the new rollout has taken nothing
-            // over yet.
-            service.version += 1;
+            // The new rollout has taken nothing over yet. `Service$version` does NOT move
+            // with it: the member carries its modelled default and the recorded services
+            // report that default after updates that roll a new deployment and mint a new
+            // service revision, so nothing here advances it.
             service.deployment_rollout_completed = false;
+            // A new deployment is one the scheduler has yet to take the service's count on
+            // for (see `ServiceRecord::scheduled_count`).
+            service.scheduler_due_at = Some(now);
         }
         if let Some(arn) = new_revision_arn {
             service.service_revision_arn = arn;

@@ -1609,6 +1609,50 @@ pub fn service_linked_role_arn() -> String {
     ::engine::emulator_arn("iam", "", SERVICE_LINKED_ROLE_RESOURCE)
 }
 
+/// `InvalidParameterException$message` for an update that would move a service onto a
+/// capacity provider strategy, or change the strategy it already runs, without forcing a
+/// new deployment.
+///
+/// `UpdateService$capacityProviderStrategy` lists the transitions between a launch type and
+/// a capacity provider strategy a service may be taken through, and the tasks already
+/// running were placed under the configuration the service is being taken OFF: only a new
+/// deployment replaces them, so the switch is made with `forceNewDeployment`
+/// ("Determines whether to force a new deployment of the service") and refused without it.
+/// One fixed sentence, naming neither the service nor the providers the request carried.
+pub const CAPACITY_PROVIDER_STRATEGY_NEEDS_FORCED_DEPLOYMENT_MESSAGE: &str =
+    "When switching from launch type to capacity provider strategy on an existing service, \
+     or making a change to a capacity provider strategy on a service that is already using \
+     one, you must force a new deployment.";
+
+/// The refusal above for an update whose `capacityProviderStrategy` would take the service
+/// onto a strategy it is not already running, without `forceNewDeployment`, and `None` for
+/// every other update.
+///
+/// A request that names no strategy, or names the one the service already runs, changes
+/// where its tasks are placed and so needs no deployment to replace them. An EMPTY list is
+/// not a strategy to switch onto: it is the way back to the service's launch type.
+pub fn capacity_provider_strategy_force_violation(
+    requested: Option<&[CapacityProviderStrategyItem]>,
+    stored: &[CapacityProviderStrategyItem],
+    force_new_deployment: bool,
+) -> Option<&'static str> {
+    let requested = requested.filter(|strategy| !strategy.is_empty())?;
+    if force_new_deployment
+        || capacity_provider_strategy_key(requested) == capacity_provider_strategy_key(stored)
+    {
+        return None;
+    }
+    Some(CAPACITY_PROVIDER_STRATEGY_NEEDS_FORCED_DEPLOYMENT_MESSAGE)
+}
+
+/// A `capacityProviderStrategy` rendered as the string two of them are compared on: the
+/// shape carries a derived `Debug` rather than an equality, so rendering it stands in for
+/// comparing it member by member — the same reading
+/// [`capacity_provider_binding_fingerprint`] is written to.
+fn capacity_provider_strategy_key(strategy: &[CapacityProviderStrategyItem]) -> String {
+    format!("{strategy:?}")
+}
+
 /// The ARN resource type a service revision is named under, as the resource segment of
 /// [`service_revision_arn`].
 pub const SERVICE_REVISION_RESOURCE_TYPE: &str = "service-revision";
@@ -1633,9 +1677,40 @@ pub fn service_revision_arn(
 pub const SERVICE_DEPLOYMENT_RESOURCE_TYPE: &str = "service-deployment";
 
 /// The width of the deployment-id token that ends a service-deployment ARN: the fixed-width
-/// counter the store mints it with, so sorting two of these ARNs orders the deployments they
-/// name oldest first.
-pub const SERVICE_DEPLOYMENT_ID_WIDTH: usize = 19;
+/// id the store mints it with ([`service_deployment_id`]), so sorting two of these ARNs
+/// orders the deployments they name oldest first.
+///
+/// Amazon ECS generates these ids as base62 tokens of this width, which is the shape a
+/// `serviceDeploymentArn` a client reads back carries.
+pub const SERVICE_DEPLOYMENT_ID_WIDTH: usize = 21;
+
+/// The digits a generated service-deployment id is spelled in, in ascending byte order, so
+/// a fixed-width rendering of a rising counter rises lexicographically too.
+const BASE62_DIGITS: &[u8; 62] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// The value the id counter is rendered ABOVE, so every id fills
+/// [`SERVICE_DEPLOYMENT_ID_WIDTH`] base62 digits with a mix of digits and letters instead of
+/// a run of leading zeros — the shape of the ids Amazon ECS generates. EMULATOR-CHOSEN, and
+/// fixed, so the rendering stays monotonic in the counter.
+const SERVICE_DEPLOYMENT_ID_ORIGIN: u128 = 10_000_000_000_000_000_000_000_000_000_000_000_000;
+
+/// The id of the `sequence`-th service deployment this store mints: `sequence` rendered as
+/// a fixed-width base62 token ([`SERVICE_DEPLOYMENT_ID_WIDTH`]).
+///
+/// Amazon ECS generates the id, so what a client can rely on is its SHAPE
+/// ([`is_service_deployment_id`]); the counter under it is what makes every deployment of
+/// every service distinct, and the fixed width keeps the rendering ordered — the later
+/// deployment's id always sorts after the earlier one's.
+pub fn service_deployment_id(sequence: u64) -> String {
+    let mut value = SERVICE_DEPLOYMENT_ID_ORIGIN.wrapping_add(u128::from(sequence));
+    let mut digits = [b'0'; SERVICE_DEPLOYMENT_ID_WIDTH];
+    for slot in digits.iter_mut().rev() {
+        *slot = BASE62_DIGITS[(value % 62) as usize];
+        value /= 62;
+    }
+    digits.iter().map(|digit| char::from(*digit)).collect()
+}
 
 /// The ARN of a service deployment:
 /// `arn:aws:ecs:<region>:<account>:service-deployment/<cluster>/<service>/<id>`.
@@ -1654,11 +1729,11 @@ pub fn service_deployment_arn(
     )
 }
 
-/// Whether `token` is a deployment-id token of a service-deployment ARN: the fixed-width
-/// decimal id [`service_deployment_arn`]'s last segment carries
-/// ([`SERVICE_DEPLOYMENT_ID_WIDTH`]).
+/// Whether `token` is a deployment-id token of a service-deployment ARN: a base62 token of
+/// the width the generated ids carry ([`SERVICE_DEPLOYMENT_ID_WIDTH`]).
 pub fn is_service_deployment_id(token: &str) -> bool {
-    token.len() == SERVICE_DEPLOYMENT_ID_WIDTH && token.bytes().all(|byte| byte.is_ascii_digit())
+    token.len() == SERVICE_DEPLOYMENT_ID_WIDTH
+        && token.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 /// Whether `arn` is SHAPED like a service-deployment ARN —

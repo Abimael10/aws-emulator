@@ -59,6 +59,16 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// A placement this emulator has no room for ([`MAX_TASKS`]) is left for later rather
     /// than failing the pass: the clock pass has no caller to answer.
     pub(super) fn maintain_service_task_counts(&mut self, now: SystemTime) {
+        // The counts the scheduler is owed TAKING ON, materialised first so this pass works
+        // to the count it has just committed to: every change to what a service wants is
+        // work for the scheduler, and taking it on was owed at the instant it fell due
+        // whether or not anybody called ([`ServiceRecord::scheduled_count`]).
+        for service in self.services.values_mut() {
+            if service.scheduler_due_at.is_some_and(|due| due <= now) {
+                service.scheduler_due_at = None;
+                service.scheduled_count = service.desired_count;
+            }
+        }
         let keys: Vec<(String, String)> = self.services.keys().cloned().collect();
         for key in keys {
             let Some(service) = self.services.get(&key) else {
@@ -104,6 +114,39 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 let _ = self.scale_service_to(&key, capacity, &region, now);
             }
             let _ = self.scale_service(&key, &definition, &region, now);
+        }
+        self.report_placement_shortfalls(now);
+    }
+
+    /// Write the scheduler's own account of a placement it could not make onto the event
+    /// stream of every service that is short of the tasks it wants.
+    ///
+    /// The event is what the scheduler says about a pass it has MADE — "(service ...) was
+    /// unable to place a task because no container instance met all of its requirements" —
+    /// so it belongs to the pass and not to the call that gave the scheduler the work: a
+    /// call that scales a service up, or rolls a new deployment, is answered before the
+    /// scheduler has tried, and the attempt reported here is the one that follows it.
+    ///
+    /// The same shortfall the service reports as its `runStatus`
+    /// ([`Self::service_placement_shortfall`]), so the sentence and the code cannot
+    /// disagree, and a repeat of the same unchanged sentence is not appended twice
+    /// ([`Self::record_placement_failure`]).
+    pub(super) fn report_placement_shortfalls(&mut self, now: SystemTime) {
+        let shortfalls: Vec<((String, String), &'static str)> = self
+            .services
+            .values()
+            .filter(|service| self.service_short_of_its_desired_count(service))
+            .filter_map(|service| {
+                self.service_placement_shortfall(service).map(|shortfall| {
+                    (
+                        (service.cluster_name.clone(), service.name.clone()),
+                        shortfall.reason,
+                    )
+                })
+            })
+            .collect();
+        for (key, reason) in shortfalls {
+            self.record_placement_failure(&key, reason, now);
         }
     }
 }

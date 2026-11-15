@@ -432,11 +432,6 @@ async fn a_created_service_materialises_its_documented_defaults_and_reads_them_b
                     "case {case:?}: expected a service-revision ARN under {prefix:?}, \
                      got {revision_arn:?}"
                 );
-                assert_eq!(
-                    count(&revisions[0], "requestedTaskCount", case),
-                    1,
-                    "case {case:?}: the revision requests the service's count, got {reported}"
-                );
             } else {
                 assert!(
                     deployments.is_empty() && revisions.is_empty(),
@@ -444,6 +439,31 @@ async fn a_created_service_materialises_its_documented_defaults_and_reads_them_b
                      deployment and no service revision, got {reported}"
                 );
             }
+        }
+        if test.expect_controller == "ECS" {
+            // The count the revision and the deployment report is the one the SCHEDULER has
+            // taken on: the create is answered before its pass, so it reports none of the
+            // count yet, and the read that follows reports the count the service asked for.
+            let reported_counts = |view: &Value| {
+                let revisions = list(view, "currentServiceRevisions", case);
+                let deployments = list(view, "deployments", case);
+                (
+                    count(&revisions[0], "requestedTaskCount", case),
+                    count(&deployments[0], "desiredCount", case),
+                )
+            };
+            assert_eq!(
+                reported_counts(&created),
+                (0, 0),
+                "case {case:?}: the create is answered before the scheduler has taken the \
+                 count on, got {created}"
+            );
+            assert_eq!(
+                reported_counts(&read),
+                (1, 1),
+                "case {case:?}: the revision requests the service's count once the \
+                 scheduler has taken it on, got {read}"
+            );
         }
     }
 }

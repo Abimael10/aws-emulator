@@ -209,6 +209,10 @@ const STRATEGY_ROWS: [StrategyRow; 3] = [
                 "cluster": cluster,
                 "service": "updatedsvc",
                 "desiredCount": 0,
+                // Moving a service onto a capacity provider strategy replaces the tasks it
+                // placed under its launch type, which only a new deployment does, so the
+                // switch is made with `forceNewDeployment`.
+                "forceNewDeployment": true,
             })
         },
     },

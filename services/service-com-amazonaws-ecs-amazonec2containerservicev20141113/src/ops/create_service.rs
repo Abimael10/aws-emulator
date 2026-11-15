@@ -1017,6 +1017,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cluster_arn,
             status: crate::state::SERVICE_ACTIVE.to_string(),
             desired_count,
+            // The scheduler has not taken this count on yet: it is the create that gives it
+            // the work, and the pass that takes it on is the first one after this call (see
+            // `ServiceRecord::scheduled_count`), so the created service reports a deployment
+            // and a service revision the scheduler has not committed to.
+            scheduled_count: 0,
+            scheduler_due_at: (desired_count != 0).then_some(now),
             task_definition_arn: definition.as_ref().map(|found| found.arn.clone()),
             task_definition: definition
                 .as_ref()
@@ -1069,6 +1075,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .availability_zone_rebalancing
                 .clone()
                 .unwrap_or_else(|| crate::state::AZ_REBALANCING_ENABLED.to_string()),
+            // ... and that default is not a value the client SET: the member's doc reads
+            // the two apart, and an update of a service that only ever carried the default
+            // resolves it the other way ([`crate::state::az_rebalancing_after_update`]).
+            availability_zone_rebalancing_set: input.availability_zone_rebalancing.is_some(),
             tags: input.tags.clone().unwrap_or_default(),
             // "The principal that created the service": the authenticated caller, the
             // identity every request to this emulator signs as.

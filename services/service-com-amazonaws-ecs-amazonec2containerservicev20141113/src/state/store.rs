@@ -858,8 +858,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     }
 
     /// Mint the ARN of the SERVICE DEPLOYMENT that records one rollout. The counter is
-    /// what makes every deployment of every service distinct, and it is fixed-width, so
-    /// sorting two of these ARNs orders the deployments they name oldest first.
+    /// what makes every deployment of every service distinct, and the id it is rendered as
+    /// is fixed-width ([`service_deployment_id`]), so sorting two of these ARNs orders the
+    /// deployments they name oldest first.
     pub fn next_service_deployment_arn(
         &mut self,
         region: &str,
@@ -871,11 +872,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             region,
             cluster_name,
             service_name,
-            &format!(
-                "{:0width$}",
-                self.next_service_deployment_seq,
-                width = SERVICE_DEPLOYMENT_ID_WIDTH
-            ),
+            &service_deployment_id(self.next_service_deployment_seq),
         )
     }
 
@@ -1416,7 +1413,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         service.deployment_rollout_completed = false;
         service.deployment_steady_due_at = Some(at + TRANSITION_SPAN);
         service.deployment_stable_due_at = Some(at + TRANSITION_SPAN);
-        service.version += 1;
+        // `Service$version` does NOT move with a rollout: the member carries its modelled
+        // default, which the recorded services report after every rollout they take, this
+        // one included.
         service.task_definition = source.task_definition.clone();
         service.task_definition_arn = Some(definition.arn.clone());
         // A service revision IS a workload configuration, so running the previous one again
@@ -1719,7 +1718,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     ) -> ServiceRevisionSummary {
         let tally = self.deployment_tally(&service.cluster_name, deployment_id);
         let requested_task_count = if service.deployment_id == deployment_id {
-            service.desired_count
+            service.scheduled_count
         } else {
             service
                 .superseded_deployments
@@ -2222,7 +2221,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             id: Some(service.deployment_id.clone()),
             status: Some(DEPLOYMENT_PRIMARY.to_string()),
             task_definition: service.task_definition_arn.clone(),
-            desired_count: service.desired_count,
+            // "The most recent desired count of tasks that was specified for the service to
+            // deploy or maintain": the count the SCHEDULER has taken on, which is a step
+            // behind the one the caller last asked the service for
+            // ([`ServiceRecord::scheduled_count`]).
+            desired_count: service.scheduled_count,
             pending_count: tally.pending,
             running_count: tally.running,
             // "The number of consecutively failed tasks in the deployment. A task is
@@ -2361,12 +2364,28 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 .current_service_deployment(service)
                 .map(|deployment| deployment.arn.clone()),
             current_service_revisions: if scheduler_owned {
-                Some(vec![ServiceCurrentRevisionSummary {
+                // "The list of the service revisions": the one the current deployment rolls
+                // out, and the one each deployment it is still replacing rolled out — so a
+                // client diffing the service's revisions across a rollout reads both. Every
+                // count is the one its own deployment holds: the scheduler's committed
+                // count ([`ServiceRecord::scheduled_count`]) and the tasks that deployment
+                // actually has.
+                let mut revisions = vec![ServiceCurrentRevisionSummary {
                     arn: Some(service.service_revision_arn.clone()),
-                    requested_task_count: service.desired_count,
+                    requested_task_count: service.scheduled_count,
                     running_task_count: tally.running,
                     pending_task_count: tally.pending,
-                }])
+                }];
+                revisions.extend(service.superseded_deployments.iter().map(|superseded| {
+                    let replaced = self.deployment_tally(&service.cluster_name, &superseded.id);
+                    ServiceCurrentRevisionSummary {
+                        arn: Some(superseded.service_revision_arn.clone()),
+                        requested_task_count: superseded.desired_count,
+                        running_task_count: replaced.running,
+                        pending_task_count: replaced.pending,
+                    }
+                }));
+                Some(revisions)
             } else {
                 None
             },
@@ -2395,8 +2414,8 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             enable_execute_command: service.enable_execute_command,
             availability_zone_rebalancing: Some(service.availability_zone_rebalancing.clone()),
             resource_management_type: Some(service.resource_management_type().to_string()),
-            // The version of the configuration the service runs, as stored: it advances
-            // with every new service revision the service rolls out.
+            // The version the service reports, as stored: the modelled default, which no
+            // rollout of it moves (see `ServiceRecord::version`).
             version: service.version,
             // What the scheduler still owes the service, for a service it has run at all.
             run_status: self.service_run_status(service),
@@ -2448,18 +2467,25 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         )
     }
 
-    /// Whether `service` holds FEWER tasks than it wants — the state a placement its
-    /// scheduler cannot make leaves it in.
+    /// Whether `service` holds FEWER tasks than its scheduler owes it — the state a
+    /// placement that scheduler cannot make leaves it in.
     ///
     /// Counted off the task records the service holds, the same tally its own
     /// `runningCount`/`pendingCount` are read from, and only for a service whose scheduler
     /// places its tasks at all (one deploying through a task set takes them from there).
+    ///
+    /// The count it is weighed against is the LARGER of what the caller has asked the
+    /// service for and what the scheduler has taken on ([`ServiceRecord::scheduled_count`]):
+    /// a count just asked for is work the scheduler has not done yet, and a count it has
+    /// taken on is work it still owes even after the caller has asked for fewer — so the
+    /// service is short until both are met, which is what keeps the stall reported across
+    /// the step a change takes to reach the scheduler.
     pub(super) fn service_short_of_its_desired_count(&self, service: &ServiceRecord) -> bool {
         if !service.is_active() || !service.places_tasks() {
             return false;
         }
         let tally = self.service_tally(&service.cluster_name, &service.name);
-        tally.running + tally.pending < service.desired_count
+        tally.running + tally.pending < service.desired_count.max(service.scheduled_count)
     }
 
     /// Whether the scheduler still has work to do for `service`.
@@ -2915,7 +2941,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         let Some(service) = self.services.get_mut(key) else {
             return;
         };
-        service.desired_count = 0;
+        service.wants_task_count(0, now);
         // The drain the delete starts: the service is DRAINING, and the move to the
         // terminal INACTIVE is owed by the clock. An already-draining service keeps the
         // instant its own delete put it on, so repeating the delete does not push the
@@ -3320,7 +3346,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         let Some(service) = self.services.get_mut(key) else {
             return Ok(false);
         };
-        service.desired_count = capacity;
+        service.wants_task_count(capacity, now);
         service.deployment_updated_at = updated_at;
         service.deployment_steady_due_at = Some(now + TRANSITION_SPAN);
         service.deployment_stable_due_at = Some(now + TRANSITION_SPAN);
@@ -3342,10 +3368,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// deployment is no longer wanted, so a new deployment replaces the task set it
     /// inherited.
     ///
-    /// A placement the cluster cannot satisfy places NOTHING and records WHY on the
-    /// service's event stream instead (see [`Self::record_placement_failure`]): the
-    /// desired count is what the caller asked for and does not move because the scheduler
-    /// could not meet it.
+    /// A placement the cluster cannot satisfy places NOTHING: the desired count is what the
+    /// caller asked for and does not move because the scheduler could not meet it, and WHY
+    /// the placement was not made is written onto the service's event stream by the
+    /// scheduler's own pass ([`Self::report_placement_shortfalls`]) rather than by the call
+    /// that gave it the work.
     ///
     /// A service that holds tasks of a SUPERSEDED deployment is mid-rollout, and the two
     /// percentages of its deployment configuration bound what one pass may do to it
@@ -3444,16 +3471,13 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         }
         // "The scheduler may start four new tasks before stopping the four older tasks
         // (provided that the cluster resources required to do this are available)": the
-        // replacements come first, and a cluster with nowhere to put them places nothing
-        // and records why on the service's event stream.
-        if placements > 0 {
-            match self.placement_capacity_reason(&service, &placement) {
-                Some(shortfall) => self.record_placement_failure(key, shortfall.reason, now),
-                None => {
-                    for _ in 0..placements {
-                        self.place_service_task(&service, definition, &placement, region, now);
-                    }
-                }
+        // replacements come first, and a cluster with nowhere to put them places nothing.
+        // WHY it placed nothing is the scheduler's own account of a pass it has made, so it
+        // is written by that pass and not by the call that gave it the work
+        // ([`Self::report_placement_shortfalls`]).
+        if placements > 0 && self.placement_capacity_reason(&service, &placement).is_none() {
+            for _ in 0..placements {
+                self.place_service_task(&service, definition, &placement, region, now);
             }
         }
         // A task whose replacement has come up is retired one step after the pass that

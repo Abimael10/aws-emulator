@@ -24,6 +24,23 @@ pub struct ServiceRecord {
     /// `Service$desiredCount`: "The desired number of instantiations of the task
     /// definition to keep running on the service."
     pub desired_count: i32,
+    /// The count the SCHEDULER has taken on for this service, which is what its deployment
+    /// and its service revision report
+    /// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::service_view`]).
+    ///
+    /// `Service$desiredCount` is the caller's standing instruction and moves with the call
+    /// that states it, while `Deployment$desiredCount` is "the most recent desired count of
+    /// tasks that was specified for the service to deploy or maintain" — the count the
+    /// scheduler is working to, which it takes on when it next runs
+    /// ([`Self::scheduler_due_at`]). So the call that changes what a service wants never
+    /// answers with the scheduler's own account of it, and a caller watching a scale-up sees
+    /// the deployment take the step after the service did.
+    pub scheduled_count: i32,
+    /// When the scheduler's next pass over this service falls due, or `None` when it has
+    /// nothing outstanding to take on. Set by every writer that changes
+    /// [`Self::desired_count`] ([`Self::wants_task_count`]) and cleared by the pass that
+    /// takes the count on, so the catch-up happens once and on the clock.
+    pub scheduler_due_at: Option<SystemTime>,
     pub task_definition_arn: Option<String>,
     /// The family and revision the ARN above names, kept so the scheduler can read the
     /// revision back when it places a task.
@@ -52,6 +69,18 @@ pub struct ServiceRecord {
     pub enable_ecs_managed_tags: bool,
     pub enable_execute_command: bool,
     pub availability_zone_rebalancing: String,
+    /// Whether a REQUEST set `availabilityZoneRebalancing` on this service, as opposed to
+    /// the value above being the one a create with no such member defaults to.
+    ///
+    /// `Service$availabilityZoneRebalancing`: "For create service requests, when no value
+    /// is specified for AvailabilityZoneRebalancing, Amazon ECS defaults the value to
+    /// ENABLED. For update service requests, when no value is specified ... Amazon ECS
+    /// defaults to the existing service's AvailabilityZoneRebalancing value. If the service
+    /// never had an AvailabilityZoneRebalancing value SET, Amazon ECS treats this as
+    /// DISABLED" — so the two sentences read one record apart: the create-time default is
+    /// not a value anybody set, and an update that names none resolves such a service to
+    /// `DISABLED` ([`az_rebalancing_after_update`]).
+    pub availability_zone_rebalancing_set: bool,
     pub tags: Vec<Tag>,
     /// `Service$createdBy`: "The principal that created the service" — the authenticated
     /// caller of the request that created it, resolved by [`caller_identity_arn`].
@@ -142,10 +171,10 @@ pub struct ServiceRecord {
     /// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::service_run_status`]).
     /// Sticky: a later deployment does not take it back.
     pub reached_steady_state: bool,
-    /// `Service$version`: the version of the configuration the service runs, which is `0`
-    /// for the service as created and advances with every NEW service revision the service
-    /// rolls out (the member is not in the Smithy model; recorded responses carry `0`
-    /// through updates that start no new deployment).
+    /// `Service$version`: the version the service reports. It stays at the modelled default
+    /// `0`: the recorded services report that default throughout their lives, after updates
+    /// that roll a new deployment and mint a new service revision as much as after the ones
+    /// that change nothing, so nothing here moves it.
     pub version: i64,
     /// Whether a task set was ever created in this service, and so whether the service HAS
     /// a deployment of its own to lose.
@@ -177,7 +206,13 @@ pub struct SupersededDeployment {
     /// The `Deployment$id` it was reported under, and the `startedBy` of every task it
     /// placed — which is how its remaining tasks are counted.
     pub id: String,
+    /// The ARN of the service revision this deployment rolled out, so a client diffing the
+    /// service's revisions across a rollout reads the one being replaced beside the new
+    /// one (`Service$currentServiceRevisions`, "The list of the service revisions").
+    pub service_revision_arn: String,
     pub task_definition_arn: Option<String>,
+    /// The count the scheduler had taken on for this deployment when it was superseded
+    /// ([`ServiceRecord::scheduled_count`]).
     pub desired_count: i32,
     pub created_at: DateTime,
     pub updated_at: DateTime,
@@ -282,6 +317,25 @@ impl ServiceRecord {
         }
     }
 
+    /// State that this service now WANTS `count` tasks, as of `now`.
+    ///
+    /// `Service$desiredCount` is the caller's standing instruction, so it takes the new
+    /// count here and now. What the SCHEDULER is working to is a step behind it
+    /// ([`Self::scheduled_count`]): taking the new count on is the scheduler's own work, so
+    /// it is owed from this instant and the next clock pass materialises it
+    /// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::advance_clock`]) — which
+    /// is never this call's own pass, since that ran before this write. So the call that
+    /// changes what a service wants is answered with the count the scheduler was still
+    /// working to, and the calls after it read the count it has taken on. A count the
+    /// scheduler is already working to owes nothing, so re-stating it moves nothing.
+    ///
+    /// The ONE place that writes the desired count, so no writer can leave the scheduler's
+    /// own count behind without the pass that catches it up.
+    pub fn wants_task_count(&mut self, count: i32, now: SystemTime) {
+        self.desired_count = count;
+        self.scheduler_due_at = (self.scheduled_count != count).then_some(now);
+    }
+
     /// Move the deployment this service currently reports as `PRIMARY` onto
     /// [`Self::superseded_deployments`], as the deployment a new one replaces.
     ///
@@ -293,8 +347,9 @@ impl ServiceRecord {
             0,
             SupersededDeployment {
                 id: self.deployment_id.clone(),
+                service_revision_arn: self.service_revision_arn.clone(),
                 task_definition_arn: self.task_definition_arn.clone(),
-                desired_count: self.desired_count,
+                desired_count: self.scheduled_count,
                 created_at: self.deployment_created_at,
                 updated_at: self.deployment_updated_at,
                 launch_type: self.launch_type.clone(),

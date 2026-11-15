@@ -190,6 +190,10 @@ mod resource_scoping_and_agent_plane;
 mod resource_tags;
 #[path = "all/rolling_update_bounds.rs"]
 mod rolling_update_bounds;
+// What a CALL answers with and what the SCHEDULER answers with: the count it has taken on,
+// the event its own pass writes, and the configuration a capacity provider is stored with.
+#[path = "all/scheduler_commitment_reporting.rs"]
+mod scheduler_commitment_reporting;
 #[path = "all/service_action_events.rs"]
 mod service_action_events;
 #[path = "all/service_delete_drain.rs"]

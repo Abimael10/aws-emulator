@@ -599,6 +599,7 @@ pub struct AutoScalingGroupProvider {
 #[smithy_macros::smithy(shape = "com.amazonaws.ecs#ManagedScaling")]
 #[derive(Debug, Clone, Default)]
 pub struct ManagedScaling {
+    pub scaling_approach: Option<String>,
     pub status: Option<String>,
     pub target_capacity: Option<i32>,
     pub minimum_scaling_step_size: Option<i32>,

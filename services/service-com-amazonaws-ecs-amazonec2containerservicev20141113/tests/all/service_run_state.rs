@@ -318,7 +318,7 @@ async fn a_created_service_reports_a_rollout_that_has_taken_nothing_over_yet() {
 }
 
 #[tokio::test]
-async fn a_write_restabilizes_the_deployment_and_only_a_new_revision_advances_the_version() {
+async fn a_write_restabilizes_the_deployment_and_moves_no_service_version() {
     let router = service();
     let cluster = "rolling";
     cluster_with_capacity(&router, cluster, "setup").await;
@@ -338,10 +338,10 @@ async fn a_write_restabilizes_the_deployment_and_only_a_new_revision_advances_th
     .await;
 
     // The writes that do NOT roll the service onto a new service revision: each one puts
-    // the deployment back to STABILIZING without advancing the version or taking the
-    // service back off the rollout that holds it. The rows differ along WHICH member the
-    // update carries — a member whose doc says it "doesn't trigger a new service
-    // deployment", and the same desired count the service already has.
+    // the deployment back to STABILIZING without taking the service back off the rollout
+    // that holds it. The rows differ along WHICH member the update carries — a member whose
+    // doc says it "doesn't trigger a new service deployment", and the same desired count the
+    // service already has.
     let unrolled: [(&str, Value); 3] = [
         (
             "re-stating the desired count the service holds",
@@ -413,9 +413,9 @@ async fn a_write_restabilizes_the_deployment_and_only_a_new_revision_advances_th
         );
     }
 
-    // A forced new deployment rolls out a NEW service revision: the version advances, the
-    // new rollout has taken nothing over yet, and the deployment it replaces is reported
-    // beside it holding none of the service either.
+    // A forced new deployment rolls out a NEW service revision: the new rollout has taken
+    // nothing over yet, and the deployment it replaces is reported beside it holding none
+    // of the service either. `Service$version` does not move with it.
     let case = "a forced new deployment";
     let updated = ok(
         &router,
@@ -427,8 +427,8 @@ async fn a_write_restabilizes_the_deployment_and_only_a_new_revision_advances_th
     let updated = updated["service"].clone();
     assert_eq!(
         present_count(&updated, "version", case),
-        Some(1),
-        "case {case:?}: a new service revision advances the version, got {updated}"
+        Some(0),
+        "case {case:?}: a new service revision does not advance the version, got {updated}"
     );
     let deployments = list(&updated, "deployments", case);
     assert_eq!(
@@ -480,8 +480,8 @@ async fn a_write_restabilizes_the_deployment_and_only_a_new_revision_advances_th
     let deployment = primary(&settled, case);
     assert_eq!(
         present_count(&settled, "version", case),
-        Some(1),
-        "case {case:?}: settling is no further service revision, got {settled}"
+        Some(0),
+        "case {case:?}: settling moves no version either, got {settled}"
     );
     assert_eq!(
         (
@@ -497,7 +497,7 @@ async fn a_write_restabilizes_the_deployment_and_only_a_new_revision_advances_th
         "case {case:?}: expected one healthy task and one replaced task, got {settled}"
     );
 
-    // Each further revision advances the version by one, and nothing else does.
+    // And no further revision moves it either: the member carries the modelled default.
     let case = "a second forced new deployment";
     let again = ok(
         &router,
@@ -508,8 +508,8 @@ async fn a_write_restabilizes_the_deployment_and_only_a_new_revision_advances_th
     .await;
     assert_eq!(
         present_count(&again["service"], "version", case),
-        Some(2),
-        "case {case:?}: every new service revision advances the version, got {again}"
+        Some(0),
+        "case {case:?}: no service revision advances the version, got {again}"
     );
 
     // A scale-out leaves the scheduler work to do, which the run status reports until the

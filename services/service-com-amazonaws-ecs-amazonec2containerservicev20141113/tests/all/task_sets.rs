@@ -151,6 +151,32 @@ async fn describe_service(
         .unwrap_or_else(|| panic!("case {case:?}: expected the service to be described, got {body}"))
 }
 
+/// Re-read one service until `runningCount` reaches `desired`, and answer it.
+///
+/// A placed task's start is a clock-owed transition, so the wait is for THAT condition
+/// rather than for a span: this looks again until the count holds or a generous deadline
+/// passes.
+async fn service_running_count_reaching(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    service_name: &str,
+    desired: i64,
+    case: &str,
+) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let read = describe_service(router, cluster, service_name, case).await;
+        if count(&read, "runningCount", case) == desired {
+            return read;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected every placed task to reach RUNNING, got {read}"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
 /// One row of the scale table.
 #[derive(Debug, Clone, Copy)]
 struct ScaleCase {
@@ -768,7 +794,16 @@ async fn the_scheduler_records_why_it_could_not_place_a_task_and_keeps_the_desir
 
         match expected_reason {
             Some(reason) => {
-                let messages = event_messages(created, case);
+                // The scheduler's own account of the placement it could not make is written
+                // by its own pass, so the create that gave it the work is answered before
+                // it has tried: the event is read back from the service.
+                assert!(
+                    event_messages(created, case).is_empty(),
+                    "case {case:?}: the create is answered before the scheduler has tried, \
+                     got {created}"
+                );
+                let read = describe_service(&router, &cluster, "web", case).await;
+                let messages = event_messages(&read, case);
                 assert_eq!(
                     messages.len(),
                     1,
@@ -791,9 +826,10 @@ async fn the_scheduler_records_why_it_could_not_place_a_task_and_keeps_the_desir
                     "case {case:?}: nothing was placed, so nothing is pending, got {created}"
                 );
 
-                // The event is DURABLE: it is still there after the span in which a
-                // placed task would have started, and the counts have not moved.
-                tokio::time::sleep(ONE_SPAN).await;
+                // The event is DURABLE: every later read reports it, and the counts have not
+                // moved — reading the service neither consumes the shortfall nor places
+                // anything.
+                describe_service(&router, &cluster, "web", case).await;
                 let read = describe_service(&router, &cluster, "web", case).await;
                 let messages = event_messages(&read, case);
                 assert!(
@@ -874,14 +910,14 @@ async fn the_scheduler_records_why_it_could_not_place_a_task_and_keeps_the_desir
                     "case {case:?}: expected every wanted task placed, got {created}"
                 );
                 // A Fargate service's tasks are `awsvpc`, so each of them is placed only
-                // once the interface it was allocated is attached.
-                tokio::time::sleep(crate::ecs_wire::AWSVPC_START).await;
-                let read = describe_service(&router, &cluster, "web", case).await;
+                // once the interface it was allocated is attached — which the clock owes,
+                // so the count is polled for rather than timed.
+                let read =
+                    service_running_count_reaching(&router, &cluster, "web", desired, case).await;
                 assert_eq!(
                     count(&read, "runningCount", case),
                     desired,
-                    "case {case:?}: expected every placed task RUNNING after one span, \
-                     got {read}"
+                    "case {case:?}: expected every placed task RUNNING, got {read}"
                 );
             }
         }

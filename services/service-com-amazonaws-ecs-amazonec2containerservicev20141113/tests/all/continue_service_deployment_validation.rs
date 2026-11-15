@@ -141,6 +141,34 @@ fn awaiting_hook(deployment: &Value, case: &str) -> Value {
     waiting[0].clone()
 }
 
+/// Re-read the stored rollout `arn` until a `PAUSE` hook of it is waiting for an action,
+/// and answer it.
+///
+/// The stage a rollout stops at is one the CLOCK brings it to, so the wait is for that
+/// CONDITION rather than for a span: each read materialises what the clock has made due, so
+/// this looks again until a hook is waiting or a generous deadline passes.
+async fn deployment_awaiting_a_hook(
+    router: &MultiServiceRouter,
+    arn: &str,
+    case: &str,
+) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let deployment = describe_deployment(router, arn, case).await;
+        let waiting = list(&deployment, "lifecycleHookDetails", case)
+            .iter()
+            .any(|hook| hook["status"] == json!(AWAITING_ACTION));
+        if waiting {
+            return deployment;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the rollout to be waiting at a hook, got {deployment}"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
 /// One refused `ContinueServiceDeployment`: the modelled error code and the message.
 async fn refused_continue(
     router: &MultiServiceRouter,
@@ -163,8 +191,8 @@ fn deployment_arn(resource: &str) -> String {
     format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:{resource}")
 }
 
-/// A deployment-id token of `width` digits: the fixed-width decimal id a service-deployment
-/// ARN ends in, which is 19 digits wide for the one this service mints.
+/// A deployment-id token of `width` base62 digits: the fixed-width token a
+/// service-deployment ARN ends in, which is 21 digits wide for the one this service mints.
 fn deployment_id(width: usize) -> String {
     "0".repeat(width)
 }
@@ -362,8 +390,7 @@ async fn a_service_deployment_arn_outside_the_minted_form_is_refused_by_shape() 
         "arn shapes",
     )
     .await;
-    tokio::time::sleep(ONE_SPAN).await;
-    let deployment = describe_deployment(&router, &arn, "arn shapes").await;
+    let deployment = deployment_awaiting_a_hook(&router, &arn, "arn shapes").await;
     let waiting_hook_id =
         string(&awaiting_hook(&deployment, "arn shapes"), "hookId", "arn shapes");
     let minted_width = arn
@@ -451,9 +478,9 @@ async fn a_service_deployment_arn_outside_the_minted_form_is_refused_by_shape() 
             format!("{arn}-absent"),
         ),
         (
-            "a deployment-id token with a letter in it",
+            "a deployment-id token with a character outside the alphabet",
             deployment_arn(&format!(
-                "service-deployment/{CLUSTER}/arn-shapes/a{}",
+                "service-deployment/{CLUSTER}/arn-shapes/-{}",
                 deployment_id(minted_width - 1)
             )),
         ),

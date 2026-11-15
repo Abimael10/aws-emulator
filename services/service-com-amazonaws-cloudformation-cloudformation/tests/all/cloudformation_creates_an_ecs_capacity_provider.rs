@@ -118,7 +118,10 @@ struct Row {
     managed_scaling_status: Option<&'static str>,
     /// The numeric `managedScaling` members the provider must report, as (member, value).
     managed_scaling: &'static [(&'static str, i64)],
-    /// The two options beside managed scaling, where the declaration states them.
+    /// The two options beside managed scaling: what the provider must report, which is the
+    /// value the declaration states, or the one Amazon ECS applies for a declaration that
+    /// states none (`managedDraining` is turned on for such a provider, while
+    /// `managedTerminationProtection` stays off and unreported).
     managed_termination_protection: Option<&'static str>,
     managed_draining: Option<&'static str>,
     /// The tags the provider must carry.
@@ -158,7 +161,7 @@ const ROWS: &[Row] = &[
             ("instanceWarmupPeriod", 120),
         ],
         managed_termination_protection: Some("ENABLED"),
-        managed_draining: None,
+        managed_draining: Some("ENABLED"),
         tags: &[("Fleet", "batch")],
     },
     Row {
@@ -240,7 +243,7 @@ const ROWS: &[Row] = &[
         managed_scaling_status: None,
         managed_scaling: &[],
         managed_termination_protection: None,
-        managed_draining: None,
+        managed_draining: Some("ENABLED"),
         tags: &[("Fleet", "unmanaged"), ("Owner", "platform")],
     },
 ];
@@ -434,7 +437,8 @@ async fn a_declared_capacity_provider_is_one_amazon_ecs_holds() {
                 binding["managedDraining"].as_str(),
             ),
             (row.managed_termination_protection, row.managed_draining),
-            "case {case:?}: expected the declared termination-protection and draining options, \
+            "case {case:?}: expected the termination-protection and draining options the \
+             declaration states, or the ones Amazon ECS applies for the ones it does not, \
              got {binding}"
         );
 

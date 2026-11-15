@@ -330,7 +330,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             input.auto_scaling_group_provider.as_ref(),
         ) {
-            Ok(bound) => bound,
+            Ok(bound) => bound.as_ref().map(
+                // The members the request left out of the binding are the ones Amazon ECS
+                // applies its own values to, so the provider is stored with them in place
+                // ([`crate::state::stored_auto_scaling_group_provider`]) — which is what
+                // every read of it reports and what a repeat of this create is compared
+                // against.
+                crate::state::stored_auto_scaling_group_provider,
+            ),
             Err(message) => {
                 return Err(
                     CreateCapacityProviderErrorModeled::ClientException(ClientException {

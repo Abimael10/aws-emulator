@@ -136,6 +136,7 @@ use crate::ops::types::{
     ExpressGatewayScalingTarget, ExpressGatewayServiceConfiguration,
     ExpressGatewayServiceNetworkConfiguration, ExpressGatewayServiceStatus,
     Failure, HealthCheck, KeyValuePair, LoadBalancer, ManagedAgent, ManagedInstancesProvider,
+    ManagedScaling,
     NetworkBinding,
     NetworkConfiguration,
     PlacementConstraint, PlacementStrategy, PlatformDevice, PortMapping, ProtectedTask,
@@ -353,6 +354,12 @@ pub use ec2_capacity::*;
 /// the `(status, updateStatus)` pair each outcome of that delete leaves behind.
 mod capacity_provider_deletion;
 pub use capacity_provider_deletion::*;
+
+/// The scaling configuration an Auto Scaling group capacity provider is stored with: the
+/// managed-scaling members and the managed-draining option Amazon ECS fills in for a create
+/// that names none.
+mod capacity_provider_scaling;
+pub use capacity_provider_scaling::*;
 
 /// The ECS MANAGED DAEMON scheduler: the revisions a daemon's configuration is captured as,
 /// the deployments that roll them out, and the one daemon task each container instance of
@@ -2141,6 +2148,34 @@ pub fn standalone_task_tags(
 /// member's doc: "For create service requests, when no value is specified for
 /// AvailabilityZoneRebalancing, Amazon ECS defaults the value to ENABLED."
 pub const AZ_REBALANCING_ENABLED: &str = "ENABLED";
+
+/// The other value of the `AvailabilityZoneRebalancing` enum, and the one an UPDATE
+/// resolves for a service no request ever set the member on — the member's doc: "If the
+/// service never had an AvailabilityZoneRebalancing value set, Amazon ECS treats this as
+/// DISABLED."
+pub const AZ_REBALANCING_DISABLED: &str = "DISABLED";
+
+/// The `availabilityZoneRebalancing` an UPDATE leaves a service with: the value the request
+/// named, else the value the service was SET to, else [`AZ_REBALANCING_DISABLED`].
+///
+/// The member's own doc states the update case apart from the create case: "For update
+/// service requests, when no value is specified for AvailabilityZoneRebalancing, Amazon ECS
+/// defaults to the existing service's AvailabilityZoneRebalancing value. If the service
+/// never had an AvailabilityZoneRebalancing value set, Amazon ECS treats this as DISABLED."
+/// So an update is what resolves the service that only ever carried the create-time default
+/// ([`ServiceRecord::availability_zone_rebalancing_set`]), and what it resolves to is what
+/// the service reports from then on.
+pub fn az_rebalancing_after_update(
+    requested: Option<&str>,
+    stored: &str,
+    was_set: bool,
+) -> (String, bool) {
+    match requested {
+        Some(requested) => (requested.to_string(), true),
+        None if was_set => (stored.to_string(), true),
+        None => (AZ_REBALANCING_DISABLED.to_string(), false),
+    }
+}
 
 /// `maximumPercent` of a `REPLICA` service's deployment configuration when the request
 /// supplies none. The member's doc: "The default maximumPercent value for a service
