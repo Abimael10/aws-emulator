@@ -20,10 +20,18 @@
 //! [`NUMBER_OF_EMPTY_RECEIVES`] for what its consumers' polls got, and
 //! [`NUMBER_OF_MESSAGES_DELETED`] for what they deleted. Those are counters of real calls:
 //! each observation is one call's own contribution, so a `Sum` over a period is the traffic
-//! that period carried, and a queue nothing called in a period has no datapoint in it. A
-//! message that arrives in a queue because a redrive MOVED it there is not a message sent to
-//! that queue, so nothing counts it as one; it shows up in that queue's depth, which is where
-//! a dead-letter queue's growth is read.
+//! that period carried. A counter of EVENTS reports that traffic for every period the queue
+//! exists through, which means an explicit ZERO for a period none of its events happened in
+//! ([`Queue::counter_zeroes`]): a reader has to be able to tell a queue nothing was sent to
+//! from a queue that is not there to be sent to, and only the queue that does not exist has no
+//! series at all. The one measurement that carries no such zero is [`SENT_MESSAGE_SIZE`]: it
+//! measures the messages a send added, and a period no send added a message to has no message
+//! to measure rather than a message of no size.
+//!
+//! A message that arrives in a queue because a redrive MOVED it there is not a message sent to
+//! that queue, so nothing counts it as one — that queue's sent counter keeps reporting the
+//! zero it owes — and the message shows up in its depth instead, which is where a dead-letter
+//! queue's growth is read.
 //!
 //! # What one sample says
 //!
@@ -265,7 +273,7 @@ fn oldest_message_age(queue: &Queue, now: SystemTime) -> Duration {
 /// Each is a count of what really happened on the queue: the messages a send added, how large
 /// each of them was, the messages a consumer was handed, the polls that got none, and the
 /// messages a consumer deleted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum QueueTraffic {
     /// [`NUMBER_OF_MESSAGES_SENT`].
     MessagesSent,
@@ -280,6 +288,20 @@ pub enum QueueTraffic {
 }
 
 impl QueueTraffic {
+    /// The counters of EVENTS: each counts how many times something happened on the queue, so
+    /// a period in which none of them happened carried none of it and the counter reports that
+    /// as a zero ([`Queue::counter_zeroes`]).
+    ///
+    /// [`Self::SentMessageSize`] is deliberately not one of them: it measures the messages a
+    /// send added rather than counting events, and a period no send added a message to has no
+    /// message to measure rather than a message of no size.
+    pub const EVENT_COUNTERS: [Self; 4] = [
+        Self::MessagesSent,
+        Self::MessagesReceived,
+        Self::EmptyReceives,
+        Self::MessagesDeleted,
+    ];
+
     /// The metric this traffic is counted into.
     pub fn metric_name(self) -> &'static str {
         match self {
@@ -328,11 +350,15 @@ impl Queue {
     /// Count what one data-plane call did to this queue into the counter that counts it.
     ///
     /// A contribution of nothing is no observation, and neither is a negative or unmeasurable
-    /// one: a counter counts what happened.
+    /// one: a counter counts what happened. What a period in which nothing happened reports is
+    /// decided where the queue is read instead ([`Self::counter_zeroes`]).
     pub fn count_traffic(&mut self, traffic: QueueTraffic, value: f64, at: SystemTime) {
         if !value.is_finite() || value <= 0.0 {
             return;
         }
+        // The period this contribution falls in has traffic of this kind in it, so its own
+        // observations are what report that period and it owes no zero ([`Self::counter_zeroes`]).
+        self.counted_minutes.insert(traffic, minute_of(at));
         self.counted_traffic.push(CountedTraffic {
             traffic,
             value,
@@ -345,6 +371,34 @@ impl Queue {
         if overflow > 0 {
             self.counted_traffic.drain(..overflow);
         }
+    }
+
+    /// The zeros this queue's counters owe for the period `at` falls in: one observation of
+    /// nothing for each counter of events ([`QueueTraffic::EVENT_COUNTERS`]) that has counted
+    /// no event in that period.
+    ///
+    /// A counter of a queue that EXISTS reports what each period carried, and a period that
+    /// carried none of its events carried zero of them. Publishing that zero is what lets a
+    /// reader tell a queue nothing happened on from a queue there is nothing to happen on,
+    /// since nothing samples a queue this store does not hold: the series of a queue that is
+    /// not there stays empty, so an empty series means no such queue rather than no traffic.
+    /// It is also what makes the two ways a message reaches a dead-letter queue tell apart —
+    /// a redrive MOVES it, which the sent counter does not count, while a send to that queue
+    /// is counted — because an absent series could not be told from a zero.
+    ///
+    /// A counter whose own observations already report the period is left to them, so a period
+    /// that carried traffic is reported by that traffic alone.
+    pub fn counter_zeroes(&self, at: SystemTime) -> Vec<CountedTraffic> {
+        let minute = minute_of(at);
+        QueueTraffic::EVENT_COUNTERS
+            .into_iter()
+            .filter(|traffic| self.counted_minutes.get(traffic) != Some(&minute))
+            .map(|traffic| CountedTraffic {
+                traffic,
+                value: 0.0,
+                at,
+            })
+            .collect()
     }
 
     /// Count one message of `size` bytes sent to this queue: one message added, of that size.
@@ -428,7 +482,8 @@ type DueReading = (String, QueueReading);
 /// One counter observation of one queue, named by the queue it is of.
 type DueCount = (String, CountedTraffic);
 
-/// What the queues of `store` owe at `now`: the reading of each queue that is due one, and
+/// What the queues of `store` owe at `now`: the reading of each queue that is due one — its
+/// gauges, and the zero of each counter the period it is taken in carried no event of — and
 /// every counter observation its calls have recorded since the last publish, each as
 /// `(QueueName, …)`.
 ///
@@ -464,6 +519,15 @@ fn due_observations(
             continue;
         }
         last_sampled_at.insert(key.clone(), now);
+        // The reading of a queue that exists carries its counters as well as its gauges, so a
+        // period that carried none of a counter's events reports that as a zero rather than
+        // leaving the series empty ([`Queue::counter_zeroes`]).
+        counted.extend(
+            queue
+                .counter_zeroes(now)
+                .into_iter()
+                .map(|observation| (queue.name.clone(), observation)),
+        );
         readings.push((queue.name.clone(), QueueReading::of(queue, now)));
     }
     (readings, counted)

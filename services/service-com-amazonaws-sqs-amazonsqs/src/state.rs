@@ -1251,6 +1251,12 @@ pub struct Queue {
     /// this service has not published yet — see [`Queue::count_traffic`]. Drained by the
     /// seam every request passes through, and bounded there.
     pub counted_traffic: Vec<CountedTraffic>,
+    /// Which publishing period each of this queue's counters last counted an event in,
+    /// keyed by that counter and held as the minute that period is — what tells a period
+    /// whose own observations report it from one that carried nothing and so owes an
+    /// explicit zero ([`Queue::counter_zeroes`]). At most one entry per counter, so this
+    /// never holds more than [`QueueTraffic`] has variants.
+    pub counted_minutes: BTreeMap<QueueTraffic, u64>,
 }
 
 impl Queue {
@@ -1303,6 +1309,9 @@ impl Queue {
             // Nothing has been sent to, received from or deleted out of this queue yet, so
             // its counters have nothing to publish.
             counted_traffic: Vec::new(),
+            // Nor has any period of this queue counted an event, so the first reading of it
+            // owes a zero in every counter.
+            counted_minutes: BTreeMap::new(),
         }
     }
 

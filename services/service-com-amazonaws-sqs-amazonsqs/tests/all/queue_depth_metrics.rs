@@ -34,6 +34,18 @@
 //! series, the counters over real calls, the age of the oldest message over five holdings, a
 //! delay elapsing with no SQS call in between, two queues keeping their own series apart, and
 //! the same series read over the query wire a legacy client speaks.
+//!
+//! A second RULE is under test here: a counter of EVENTS reports what each period carried for
+//! every period the queue exists through, so a period that carried none of its events reports
+//! an explicit ZERO and only a queue that does not exist has no series at all. Its own table
+//! spans the four counters — sent, received, empty receives and deleted — against a queue
+//! driven with none of that traffic, with sends alone, with a send taken and deleted, and with
+//! one empty poll, so each counter is asserted both where it counted traffic and where it
+//! counted nothing; the size of the messages a send added is read beside them, because that
+//! measurement has no value in a period no send added a message to. The last test drives the
+//! recorded dead-letter case over both rules at once: a redrive lands in the dead-letter
+//! queue's own depth and is NOT counted as a send to it, while a later `SendMessage` straight
+//! to that queue is.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -52,7 +64,10 @@ use service_com_amazonaws_sqs_amazonsqs::state::{queue_name_from_url, ComAmazona
 use service_com_amazonaws_sqs_amazonsqs::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::support::{create_ok, fifo_attributes, form_encode, messages, ok, xml_element, REGION};
+use super::support::{
+    all_attributes, attribute_count, create_ok, fifo_attributes, form_encode, messages, ok,
+    xml_element, REGION,
+};
 
 /// The `X-Amz-Target` prefix the CloudWatch model declares.
 const CLOUDWATCH_TARGET_PREFIX: &str = "GraniteServiceVersion20100801";
@@ -78,6 +93,19 @@ const SERIES: [&str; 3] = [
     APPROXIMATE_NUMBER_OF_MESSAGES_VISIBLE,
     APPROXIMATE_NUMBER_OF_MESSAGES_NOT_VISIBLE,
     APPROXIMATE_NUMBER_OF_MESSAGES_DELAYED,
+];
+
+/// The counters of EVENTS, in the order a counter row states its expected totals: each counts
+/// how many times something happened on the queue, so a queue that exists reports an explicit
+/// zero in each of them for a period none of them happened in.
+///
+/// [`SENT_MESSAGE_SIZE`] is not one of them — it measures the messages a send added rather than
+/// counting events — which is why the counter table reads it on its own.
+const EVENT_COUNTERS: [&str; 4] = [
+    NUMBER_OF_MESSAGES_SENT,
+    NUMBER_OF_MESSAGES_RECEIVED,
+    NUMBER_OF_EMPTY_RECEIVES,
+    NUMBER_OF_MESSAGES_DELETED,
 ];
 
 /// One message a row sends: its body, and the `DelaySeconds` the send carries for it.
@@ -191,16 +219,17 @@ async fn every_message_a_queue_holds_is_counted_in_exactly_one_aws_sqs_series() 
 
         // A client discovers those series through `ListMetrics`, dimensioned on the queue;
         // one the store does not hold has none of them. Every queue that exists is sampled,
-        // so it carries all four gauges; the sent counters appear only for a queue something
-        // was really sent to.
+        // so it carries all four gauges and every counter of events — the ones no event
+        // reached report an explicit zero — while the size of the messages a send added is
+        // measured only for a queue something was really sent to.
         let indexed = indexed_series(&router, row.name).await;
         let mut discoverable: Vec<String> = SERIES
             .iter()
             .chain([&APPROXIMATE_AGE_OF_OLDEST_MESSAGE])
+            .chain(EVENT_COUNTERS.iter())
             .map(|name| (*name).to_string())
             .collect();
         if !row.sent.is_empty() {
-            discoverable.push(NUMBER_OF_MESSAGES_SENT.to_string());
             discoverable.push(SENT_MESSAGE_SIZE.to_string());
         }
         discoverable.sort();
@@ -418,14 +447,276 @@ async fn the_data_plane_calls_a_queue_serves_are_counted_into_its_own_counters()
         Some(2.0),
         "case after the deletes: expected both messages counted as deleted, got {deleted:?}"
     );
-    // The counters count real calls, so a period nothing called in has no datapoint: the
-    // queue nothing was sent to has no sent series at all.
+    // The counters count real calls, and a queue that exists reports what each period
+    // carried: the queue nothing was sent to reports the zero its sent counter counted,
+    // which is what tells it from a queue that is not there at all.
     let untouched = create_ok(&router, "depth-traffic-idle", &json!({})).await;
     assert!(untouched.ends_with("depth-traffic-idle"));
     let unsent = total(&router, "depth-traffic-idle", NUMBER_OF_MESSAGES_SENT).await;
     assert_eq!(
-        unsent, None,
+        unsent,
+        Some(0.0),
         "case the idle queue: a queue nothing was sent to counts no send, got {unsent:?}"
+    );
+    let absent = total(&router, "depth-traffic-no-such-queue", NUMBER_OF_MESSAGES_SENT).await;
+    assert_eq!(
+        absent, None,
+        "case the queue that does not exist: nothing samples it, so it has no sent series at \
+         all, got {absent:?}"
+    );
+}
+
+/// What one row of the counter table drives on its queue before its counters are read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Driven {
+    /// Nothing at all: the queue is created and left alone.
+    Nothing,
+    /// Two sends of different sizes, with no consumer.
+    Sends,
+    /// One send, the receive that takes the message and the delete that retires it.
+    SendTakeDelete,
+    /// One poll of a queue holding nothing.
+    EmptyPoll,
+}
+
+/// One row of the counter table: a case name, the queue it drives, what it drives on it, and
+/// the `Sum` each counter of events must then report, in [`EVENT_COUNTERS`] order.
+struct CounterRow {
+    case: &'static str,
+    name: &'static str,
+    driven: Driven,
+    expected: [f64; 4],
+}
+
+/// The counter table. Every row leaves at least one counter with nothing counted in it, so each
+/// of the four is asserted both where it counted traffic and where it counted none.
+fn counter_rows() -> Vec<CounterRow> {
+    vec![
+        CounterRow {
+            case: "a queue nothing was driven on counts none of the four",
+            name: "depth-counter-idle",
+            driven: Driven::Nothing,
+            expected: [0.0, 0.0, 0.0, 0.0],
+        },
+        CounterRow {
+            case: "two sends count as sends and nothing else",
+            name: "depth-counter-sends",
+            driven: Driven::Sends,
+            expected: [2.0, 0.0, 0.0, 0.0],
+        },
+        CounterRow {
+            case: "a message sent, taken and deleted counts one of each and no empty poll",
+            name: "depth-counter-lifecycle",
+            driven: Driven::SendTakeDelete,
+            expected: [1.0, 1.0, 0.0, 1.0],
+        },
+        CounterRow {
+            case: "a poll that gets nothing counts an empty receive alone",
+            name: "depth-counter-empty-poll",
+            driven: Driven::EmptyPoll,
+            expected: [0.0, 0.0, 1.0, 0.0],
+        },
+    ]
+}
+
+#[tokio::test]
+async fn each_counter_of_events_reports_an_explicit_zero_for_a_period_that_carried_none() {
+    for row in counter_rows() {
+        let (router, engine) = emulator_with_cloudwatch();
+        let url = create_ok(&router, row.name, &json!({})).await;
+        let sent_bytes = drive(&router, &url, row.driven).await;
+        // The reading that carries the zeros is taken once a minute, so the next one is made
+        // due through the engine seam instead of waiting for the clock.
+        sample_again(&router, &engine).await;
+
+        for (index, metric) in EVENT_COUNTERS.iter().enumerate() {
+            let expected = row.expected[index];
+            let counted = total(&router, row.name, metric).await;
+            assert_eq!(
+                counted,
+                Some(expected),
+                "case {}: expected {metric} to total {expected}, got {counted:?}",
+                row.case
+            );
+            // A counter of a queue that exists carries a datapoint whatever happened, in the
+            // unit a count of things is published in — which `bounds` requires of every
+            // datapoint it reads.
+            let reading = bounds(&router, row.name, metric).await;
+            assert!(
+                reading.is_some(),
+                "case {}: {metric} must carry a datapoint for a queue that exists, got \
+                 {reading:?}",
+                row.case
+            );
+            if expected <= 0.0 {
+                assert_eq!(
+                    reading,
+                    Some((0.0, 0.0)),
+                    "case {}: expected {metric} to report an explicit zero, got {reading:?}",
+                    row.case
+                );
+            }
+        }
+
+        // A size measures the messages a send added, so a period no send added one to has no
+        // message to measure rather than a message of no size.
+        let size = total(&router, row.name, SENT_MESSAGE_SIZE).await;
+        let expected_size = (sent_bytes > 0.0).then_some(sent_bytes);
+        assert_eq!(
+            size, expected_size,
+            "case {}: expected {SENT_MESSAGE_SIZE} to report {expected_size:?}, got {size:?}",
+            row.case
+        );
+
+        // Nothing samples a queue this store does not hold, so an empty series means no such
+        // queue rather than no traffic — which is what the explicit zero tells apart.
+        let absent = total(&router, "depth-counter-no-such-queue", NUMBER_OF_MESSAGES_SENT).await;
+        assert_eq!(
+            absent, None,
+            "case {}: a queue that does not exist must carry no counter series, got {absent:?}",
+            row.case
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_redrive_lands_in_the_dead_letter_queue_s_own_depth_and_is_no_send_to_it() {
+    let (router, engine) = emulator_with_cloudwatch();
+    let dead_letter_name = "depth-redrive-dead-letter";
+    let source_name = "depth-redrive-source";
+    let dead_letter = create_ok(&router, dead_letter_name, &json!({})).await;
+    let dead_letter_arn = all_attributes(&router, &dead_letter)
+        .await
+        .get("QueueArn")
+        .cloned()
+        .unwrap_or_else(|| panic!("case the dead-letter queue: {dead_letter} reports no QueueArn"));
+    // One delivery is all this source queue allows, so the delivery that is not acknowledged
+    // is the last one and the message is moved instead of being handed over again.
+    let source = create_ok(
+        &router,
+        source_name,
+        &json!({
+            "RedrivePolicy": json!({
+                "deadLetterTargetArn": dead_letter_arn,
+                "maxReceiveCount": "1",
+            })
+            .to_string(),
+        }),
+    )
+    .await;
+
+    send_batch(&router, &source, &[("poisoned", None)]).await;
+    let handed = ok(
+        &router,
+        "ReceiveMessage",
+        json!({"QueueUrl": source, "MaxNumberOfMessages": 1}),
+    )
+    .await;
+    assert_eq!(
+        messages(&handed).len(),
+        1,
+        "case the one delivery: expected the message, got {handed}"
+    );
+    // The visibility timeout lapses with nobody calling — reached through the engine seam
+    // rather than by waiting for it — so the next poll of the source finds the message eligible
+    // to be moved.
+    lapse_in_flight(&engine, &source);
+    let again = ok(
+        &router,
+        "ReceiveMessage",
+        json!({"QueueUrl": source, "MaxNumberOfMessages": 1}),
+    )
+    .await;
+    assert!(
+        messages(&again).is_empty(),
+        "case the redrive: the source queue must hand the message over no more, got {again}"
+    );
+    let moved = attribute_count(&router, &dead_letter, "ApproximateNumberOfMessages").await;
+    assert_eq!(
+        moved, 1,
+        "case the redrive: expected the message to stand in the dead-letter queue, got {moved}"
+    );
+
+    sample_again(&router, &engine).await;
+
+    // The move shows up in the dead-letter queue's OWN depth, under its own name.
+    let depth = peaks(&router, dead_letter_name).await;
+    assert_eq!(
+        depth,
+        [Some(1.0), Some(0.0), Some(0.0)],
+        "case the redrive: expected the dead-letter queue to count the moved message as \
+         visible alone, got {depth:?}"
+    );
+    // A move is not a send and not a delivery, so those counters of the dead-letter queue
+    // report the nothing the period carried rather than no datapoint at all: that is what
+    // tells a redrive from a send to the same queue.
+    for (metric, expected) in [
+        (NUMBER_OF_MESSAGES_SENT, 0.0),
+        (NUMBER_OF_MESSAGES_RECEIVED, 0.0),
+    ] {
+        let counted = total(&router, dead_letter_name, metric).await;
+        assert_eq!(
+            counted,
+            Some(expected),
+            "case the redrive: expected {metric} of the dead-letter queue to total {expected}, \
+             got {counted:?}"
+        );
+    }
+    let unit = unit_of(&router, dead_letter_name, NUMBER_OF_MESSAGES_SENT).await;
+    assert_eq!(
+        unit,
+        Some(COUNT_UNIT.to_string()),
+        "case the redrive: a count of sends is published as a count, got {unit:?}"
+    );
+
+    // The source queue carries the traffic it really served, and its depth has fallen back to
+    // the empty queue the move left behind.
+    for (metric, expected) in [
+        (NUMBER_OF_MESSAGES_SENT, 1.0),
+        (NUMBER_OF_MESSAGES_RECEIVED, 1.0),
+        (NUMBER_OF_EMPTY_RECEIVES, 1.0),
+        (NUMBER_OF_MESSAGES_DELETED, 0.0),
+    ] {
+        let counted = total(&router, source_name, metric).await;
+        assert_eq!(
+            counted,
+            Some(expected),
+            "case the redrive: expected {metric} of the source queue to total {expected}, got \
+             {counted:?}"
+        );
+    }
+    let fell = troughs(&router, source_name).await;
+    for (index, series) in SERIES.iter().enumerate() {
+        assert_eq!(
+            fell[index],
+            Some(0.0),
+            "case the redrive: expected {series} of the source queue to have reported an empty \
+             queue, got {fell:?}"
+        );
+    }
+
+    // A `SendMessage` straight to the dead-letter queue IS a send to it, so its sent counter
+    // moves off the zero while its depth counts both messages.
+    ok(
+        &router,
+        "SendMessage",
+        json!({"QueueUrl": dead_letter, "MessageBody": "sent-by-hand"}),
+    )
+    .await;
+    sample_again(&router, &engine).await;
+    let sent = total(&router, dead_letter_name, NUMBER_OF_MESSAGES_SENT).await;
+    assert_eq!(
+        sent,
+        Some(1.0),
+        "case the manual send: expected the dead-letter queue to count the one send, got \
+         {sent:?}"
+    );
+    let depth = peaks(&router, dead_letter_name).await;
+    assert_eq!(
+        depth[0],
+        Some(2.0),
+        "case the manual send: expected the dead-letter queue to count both messages as \
+         visible, got {depth:?}"
     );
 }
 
@@ -704,6 +995,74 @@ fn make_available(engine: &engine::InMemoryEngine, url: &str) {
             .available_at
             .checked_sub(Duration::from_secs(1_800))
             .unwrap_or(message.available_at);
+    }
+}
+
+/// Drive `driven` on the queue at `url`, and answer how many bytes of message body its sends
+/// added — the figure the size measurement reports, and none when it sent nothing.
+async fn drive(router: &MultiServiceRouter, url: &str, driven: Driven) -> f64 {
+    match driven {
+        Driven::Nothing => 0.0,
+        Driven::Sends => {
+            // Two bodies of different lengths, so the size is a figure the bodies decide.
+            let bodies = ["one", "two-is-longer"];
+            send_batch(router, url, &[(bodies[0], None), (bodies[1], None)]).await;
+            bodies.iter().map(|body| body.len() as f64).sum()
+        }
+        Driven::SendTakeDelete => {
+            let body = "taken-and-deleted";
+            send_batch(router, url, &[(body, None)]).await;
+            let handed = ok(
+                router,
+                "ReceiveMessage",
+                json!({"QueueUrl": url, "MaxNumberOfMessages": 1}),
+            )
+            .await;
+            let delivered = messages(&handed);
+            assert_eq!(
+                delivered.len(),
+                1,
+                "case driving a send, a receive and a delete: expected the message, got {handed}"
+            );
+            let receipt = delivered[0]["ReceiptHandle"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("case driving a send, a receive and a delete: no ReceiptHandle in {handed}")
+                })
+                .to_string();
+            ok(
+                router,
+                "DeleteMessage",
+                json!({"QueueUrl": url, "ReceiptHandle": receipt}),
+            )
+            .await;
+            body.len() as f64
+        }
+        Driven::EmptyPoll => {
+            ok(router, "ReceiveMessage", json!({"QueueUrl": url})).await;
+            0.0
+        }
+    }
+}
+
+/// Move the in-flight deadline of every message the queue at `url` holds into the past, which
+/// is how a test reaches the end of a visibility timeout without sleeping for it: the delivery
+/// was never acknowledged, so the message is eligible again — and, past the deliveries its
+/// `RedrivePolicy` allows, eligible to be MOVED.
+fn lapse_in_flight(engine: &engine::InMemoryEngine, url: &str) {
+    let name = queue_name_from_url(url)
+        .unwrap_or_else(|| panic!("case lapsing the timeout of {url}: the url names no queue"))
+        .to_string();
+    let store = engine.state::<ComAmazonawsSqsAmazonsqsState>();
+    let mut store = store.lock();
+    let queue = store
+        .queue_mut(REGION, &name)
+        .unwrap_or_else(|| panic!("case lapsing the timeout of {url}: no queue named {name}"));
+    for message in &mut queue.messages {
+        if let Some(until) = message.invisible_until {
+            message.invisible_until =
+                Some(until.checked_sub(Duration::from_secs(1_800)).unwrap_or(until));
+        }
     }
 }
 
