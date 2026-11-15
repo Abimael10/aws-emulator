@@ -4570,8 +4570,8 @@ pub enum RateRefusal {
     /// The requested rate is above the account's Service Quotas ceiling for
     /// this limit, so provisioning it would need a quota increase first.
     AboveQuotaCeiling { requested: i32, ceiling: i32 },
-    /// The requested rate is the one a previous provisioning stored for this
-    /// limit, so there is no adjustment to make.
+    /// The requested rate is the one the limit already reports as in force, so
+    /// there is no adjustment to make.
     AlreadyProvisioned,
 }
 
@@ -4600,10 +4600,10 @@ impl RateRefusal {
             Self::AboveQuotaCeiling { requested, ceiling } => {
                 format!("Requested value {requested} exceeds Service Quota ceiling of {ceiling}")
             }
-            // A rate a previous provisioning already stored names no
-            // adjustment, so the sentence reports that the request asks for the
-            // limit in force and states no rate: both halves — what was asked
-            // for and what is provisioned — are the same value the caller sent.
+            // A rate the limit already holds names no adjustment, so the
+            // sentence reports that the request asks for the limit in force and
+            // states no rate: both halves — what was asked for and what is
+            // provisioned — are the same value the caller sent.
             Self::AlreadyProvisioned => {
                 "Requested value is the same as the current provisioned limit".to_string()
             }
@@ -4733,18 +4733,18 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// Provision `requested` requests per second for `category` and return the
     /// limit as it now stands.
     ///
-    /// Every rate in the account's range is stored but the rate this account has
-    /// already PROVISIONED: the range runs from the rate the category includes
-    /// up to the account's Service Quotas ceiling for that limit
+    /// Every rate in the account's range is stored but the rate the limit
+    /// already reports as IN FORCE: the range runs from the rate the category
+    /// includes up to the account's Service Quotas ceiling for that limit
     /// ([`Self::api_category_quota_ceiling`]), a rate outside it is refused, and
-    /// so is the rate a previous provisioning stored — "use this operation to
-    /// adjust" a limit (`UpdateProvisionedLimit` in this service's model), and a
-    /// rate equal to the one provisioned adjusts nothing. A limit NOTHING has
-    /// provisioned holds no such rate, so the first provisioning of any rate in
-    /// the range is an adjustment, the rate the limit reports until then being
-    /// the one the category includes rather than one this account provisioned.
-    /// A refused call stores nothing, so the limit a later read reports is the
-    /// one that was already in force.
+    /// so is the rate the limit already holds — "use this operation to adjust" a
+    /// limit (`UpdateProvisionedLimit` in this service's model), and a rate
+    /// equal to the one in force adjusts nothing. The rate in force is the one
+    /// every reader reports ([`Self::api_category_limit`]): the rate a previous
+    /// provisioning stored, or the rate the category includes while nothing has
+    /// provisioned it, so asking for the value a read just reported names no
+    /// adjustment either way. A refused call stores nothing, so the limit a
+    /// later read reports is the one that was already in force.
     pub fn set_api_category_limit(
         &mut self,
         category: &ApiCategory,
@@ -4760,7 +4760,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         if requested > ceiling {
             return Err(RateRefusal::AboveQuotaCeiling { requested, ceiling });
         }
-        if self.provisioned_api_rates.get(category.name) == Some(&requested) {
+        if requested == self.api_category_limit(category).provisioned_limit_value {
             return Err(RateRefusal::AlreadyProvisioned);
         }
         self.provisioned_api_rates

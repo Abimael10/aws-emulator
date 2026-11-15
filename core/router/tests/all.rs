@@ -1504,3 +1504,7 @@ mod bedrock_evaluation_job_saves_its_results_in_s3;
 // `clippy::doc_lazy_continuation` asks of a doc list item, so the lint is allowed for the whole
 // target. An inner attribute, like an inner doc comment, is legal only before the first item,
 // so it stands in this header rather than in the list below.
+// The `all/all_rs_*` suites, `all/declaration_roots_are_canonical_and_complete.rs`,
+// `all/declaration_roots_end_with_their_last_declaration.rs`,
+// service crate's `tests/all.rs`, so check there rather than leaving a note here, and
+// `all/appended_prose.rs` keep what the notes earlier landings had appended here said.

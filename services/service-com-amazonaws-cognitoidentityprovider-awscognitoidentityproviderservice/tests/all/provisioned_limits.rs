@@ -15,8 +15,9 @@
 //! from the limit's included rate up to the account's Service Quotas ceiling
 //! for that limit, and refuses a rate outside it: below the included rate as a
 //! malformed parameter, above the ceiling as a quota excess naming the rate
-//! asked for and the ceiling it passed. A rate a previous provisioning already
-//! stored adjusts nothing and is refused as a malformed parameter too. A
+//! asked for and the ceiling it passed. A rate the limit already reports as in
+//! force adjusts nothing and is refused as a malformed parameter too, whether a
+//! previous provisioning stored it or it is the rate the category includes. A
 //! refused request stores nothing.
 //!
 //! Stated plainly, because it decides how the tests below reach a provisioned
@@ -493,21 +494,12 @@ async fn an_account_with_no_increase_has_the_included_rate_as_its_ceiling() {
             );
         }
 
-        // The ceiling itself is inside the range, so the refusals above are
-        // about passing it rather than about the operation refusing everything.
-        // Nothing has provisioned this limit yet, so asking for the rate it
-        // REPORTS is still an adjustment: it stores a provisioned rate where
-        // the account had none.
+        // The ceiling itself is not PAST the ceiling, so the refusals above are
+        // about passing it rather than about the operation refusing everything:
+        // while no increase has been granted that ceiling is the rate the limit
+        // already reports as in force, so asking for it names no adjustment and
+        // is refused as a malformed parameter rather than as a quota excess.
         let case = format!("{} asked for its ceiling", limit.category);
-        let (status, answered) = provision(&router, limit.category, limit.included).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: the rate at the ceiling is served, got {status} with {answered}"
-        );
-
-        // Asked for again it adjusts nothing, the account having provisioned it
-        // just now.
-        let case = format!("{} asked for its ceiling twice", limit.category);
         let (status, payload) = provision(&router, limit.category, limit.included).await;
         assert_eq!(
             (
@@ -523,6 +515,84 @@ async fn an_account_with_no_increase_has_the_included_rate_as_its_ceiling() {
             "case {case:?}: the rate already provisioned is refused, got {status} \
              with {payload}"
         );
+    }
+}
+
+#[tokio::test]
+async fn the_rate_a_read_reports_is_refused_as_an_adjustment() {
+    // The two states a limit reports a rate in force from, which is what the
+    // rows vary: one nothing has provisioned, where the rate in force is the
+    // rate the category includes, and one a provisioning stored a rate on,
+    // where it is that stored rate. Either way the value a read REPORTS is the
+    // one an update cannot ask for again. Every limit this account holds is
+    // driven through both, so the rule is asserted over categories with
+    // different included rates rather than over one.
+    for provisioned_first in [false, true] {
+        let (router, engine) = router_and_engine();
+        let state = if provisioned_first {
+            "after a provisioning stored a rate"
+        } else {
+            "with nothing provisioned"
+        };
+
+        for limit in LIMITS {
+            let case = format!("{} {state}", limit.category);
+
+            if provisioned_first {
+                // A granted increase opens the range, so a rate the limit did
+                // not hold can be stored and become the rate in force.
+                let ceiling = granted_increase(&engine, limit, limit.included + GRANTED_INCREASE);
+                let requested = (limit.included + ceiling) / 2;
+                let (status, answered) = provision(&router, limit.category, requested).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the rate the refusal below is measured against is stored \
+                     first, got {status} with {answered}"
+                );
+            }
+
+            let reported = read_back(&router, &case, limit.category).await;
+            let in_force = reported["ProvisionedLimitValue"].as_i64().unwrap_or_else(|| {
+                panic!("case {case:?}: the read must report a rate in force, got {reported}")
+            });
+
+            let (status, payload) = provision(&router, limit.category, in_force).await;
+            assert_eq!(
+                (
+                    status,
+                    error_code(&payload),
+                    error_message(&payload).to_string()
+                ),
+                (
+                    400,
+                    "InvalidParameterException",
+                    already_provisioned_message()
+                ),
+                "case {case:?}: asking for the reported rate {in_force} adjusts nothing and is \
+                 refused, got {status} with {payload}"
+            );
+
+            // The refusal wrote nothing, so the limit still reports the rate it
+            // held.
+            let after = read_back(&router, &case, limit.category).await;
+            assert_eq!(
+                after, reported,
+                "case {case:?}: a refused no-op must leave the limit at {in_force}, got {after}"
+            );
+
+            if provisioned_first {
+                // The next rate up is a rate the limit does NOT hold, and the
+                // increase put it inside the account's range, so the refusal
+                // above is about the request naming the rate in force rather
+                // than about the operation refusing every rate.
+                let (status, answered) = provision(&router, limit.category, in_force + 1).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the next rate up is still an adjustment, got {status} \
+                     with {answered}"
+                );
+            }
+        }
     }
 }
 
