@@ -3,8 +3,9 @@
 //! @op GetShardIterator
 //! IMPLEMENTED: records a cursor against (stream, shard, absolute record position,
 //! issue instant) in [`crate::state`] and hands back the opaque token that resolves
-//! to it. The token is a digest, not an encoding of the input: the position lives
-//! only in the store, so it cannot be decoded or forged.
+//! to it. The token's third segment is an envelope over a digest, not an encoding of
+//! the input: the position lives only in the store, so it cannot be decoded or
+//! forged.
 //!
 //! A shard is addressable only while the stream SERVES it, so a stream whose
 //! asynchronous enable is still pending — which exposes no shards — has no shard to

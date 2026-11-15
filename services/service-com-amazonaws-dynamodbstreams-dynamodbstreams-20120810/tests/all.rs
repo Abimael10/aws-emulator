@@ -29,6 +29,8 @@ mod record_retention_budget;
 mod sequence_number_positions;
 #[path = "all/service_enforced_parameter_bounds.rs"]
 mod service_enforced_parameter_bounds;
+#[path = "all/shard_iterator_token_envelope.rs"]
+mod shard_iterator_token_envelope;
 #[path = "all/shard_page_cursor.rs"]
 mod shard_page_cursor;
 #[path = "all/shard_sequence_bounds.rs"]

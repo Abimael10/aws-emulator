@@ -179,6 +179,39 @@ const SEQUENCE_NUMBER_BASE: u128 = 100_000_000_000_000_000_000;
 /// refused rather than misread.
 const ITERATOR_TOKEN_VERSION: u32 = 1;
 
+/// The bytes an iterator's third segment OPENS with, ahead of its payload length and
+/// its payload.
+///
+/// The model says nothing about the token's internal layout, so this comes from the
+/// tokens DynamoDB Streams itself hands out: their third segment is a base64
+/// envelope that always begins with the fixed preamble `AAAAAAAAAAH`, which is
+/// exactly what base64 renders these nine bytes as. That preamble and the segment's
+/// length are the part of the token a client or a proxy can observe and check —
+/// length-budgeting toward the modelled 2048 bound, or sanity-checking the segment
+/// before forwarding it — so they are reproduced here; the payload BYTES after it
+/// are opaque and are nobody's to check.
+const ITERATOR_ENVELOPE_PREAMBLE: [u8; 9] = [0, 0, 0, 0, 0, 0, 0, 1, 0xC0];
+
+/// How many payload bytes an iterator's envelope carries after its preamble and the
+/// `u16` length of this payload.
+///
+/// From the same source as [`ITERATOR_ENVELOPE_PREAMBLE`]: DynamoDB Streams'
+/// envelope renders as roughly 950 base64 characters, so the payload is sized to
+/// put the segment there — `9 + 2 + 700` is 711 bytes, a multiple of three, which
+/// base64 renders as 948 characters with no padding. With the longest stream ARN a
+/// table name can produce the whole token still leaves hundreds of characters of
+/// room under the modelled `ShardIterator` maximum of 2048.
+const ITERATOR_PAYLOAD_BYTES: usize = 700;
+
+/// The payload length the envelope declares, as the two big-endian bytes of its `u16`
+/// length field.
+///
+/// The field is two bytes wide, so the payload has to fit one: that is checked HERE, where
+/// the size is a constant, rather than papered over at mint time with a length the envelope
+/// would then disagree with.
+const _: () = assert!(ITERATOR_PAYLOAD_BYTES <= u16::MAX as usize);
+const ITERATOR_PAYLOAD_LENGTH_FIELD: [u8; 2] = (ITERATOR_PAYLOAD_BYTES as u16).to_be_bytes();
+
 /// The format of the records a stream captures (the modelled `StreamViewType`
 /// enum; wire values from `STREAM_VIEW_TYPE_VALUES`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -539,11 +572,11 @@ impl StoredStream {
 
 /// What a `ShardIterator` token a client presented resolves to.
 ///
-/// The token is a digest, so it carries no position and cannot be decoded: the
-/// only thing that makes a token an iterator is that this service minted it and
-/// still remembers doing so. That is what separates the two refusals
-/// `GetRecords` can answer — an iterator whose lifetime has passed, and a value
-/// that is not an iterator.
+/// The token's opaque segment is an envelope over a digest, so it carries no
+/// position and cannot be decoded: the only thing that makes a token an iterator is
+/// that this service minted it and still remembers doing so. That is what
+/// separates the two refusals `GetRecords` can answer — an iterator whose lifetime
+/// has passed, and a value that is not an iterator.
 #[derive(Debug, Clone, Copy)]
 pub enum IteratorLookup<'a> {
     /// A live iterator, standing at the position it carries.
@@ -570,22 +603,24 @@ pub struct ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
     /// Registered streams, keyed and ordered by stream ARN so `ListStreams` pages
     /// deterministically.
     streams: BTreeMap<String, StoredStream>,
-    /// Live shard iterators, keyed by the opaque token handed to the client.
+    /// Live shard iterators, keyed by [`iterator_key`] of the token handed to the
+    /// client — a fixed-size derivation of the whole token, so what these capped
+    /// tables hold is a function of their caps rather than of how long a token is.
     iterators: HashMap<String, IteratorState>,
-    /// The live tokens in MINT order (oldest first), so the
-    /// [`MAX_LIVE_ITERATORS`] cap can retire the oldest. It may also hold tokens
+    /// The live iterator keys in MINT order (oldest first), so the
+    /// [`MAX_LIVE_ITERATORS`] cap can retire the oldest. It may also hold keys
     /// the clock has already retired; those are skipped when they come up, and its
     /// own length is what the cap is enforced on, so `iterators` can never be
     /// larger than the cap.
-    live_iterators: VecDeque<String>,
-    /// Tokens this service minted whose lifetime has passed, in retirement order
-    /// (oldest first) so the cap drops the oldest. Paired with
-    /// `retired_iterator_tokens`, which answers membership in one hash.
-    retired_iterators: VecDeque<String>,
-    /// Membership index over `retired_iterators`; the two always hold the same
-    /// tokens, because [`ComAmazonawsDynamodbstreamsDynamodbstreams20120810State::retire_iterator`]
+    live_iterator_keys: VecDeque<String>,
+    /// The keys of tokens this service minted whose lifetime has passed, in
+    /// retirement order (oldest first) so the cap drops the oldest. Paired with
+    /// `retired_iterator_keys`, which answers membership in one hash.
+    retired_iterator_order: VecDeque<String>,
+    /// Membership index over `retired_iterator_order`; the two always hold the same
+    /// keys, because [`ComAmazonawsDynamodbstreamsDynamodbstreams20120810State::retire_iterator`]
     /// is the only thing that writes either.
-    retired_iterator_tokens: HashSet<String>,
+    retired_iterator_keys: HashSet<String>,
     /// Backs sequence-number generation; monotonic for the life of the emulator.
     next_sequence_number: u64,
     /// Backs shard-id generation, so two shards created in the same millisecond
@@ -620,10 +655,11 @@ impl ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
     /// never minted at all.
     #[must_use]
     pub fn resolve_iterator(&self, token: &str) -> IteratorLookup<'_> {
-        if let Some(iterator) = self.iterators.get(token) {
+        let key = iterator_key(token);
+        if let Some(iterator) = self.iterators.get(&key) {
             return IteratorLookup::Live(iterator);
         }
-        if self.retired_iterator_tokens.contains(token) {
+        if self.retired_iterator_keys.contains(&key) {
             return IteratorLookup::Retired;
         }
         IteratorLookup::Unknown
@@ -670,11 +706,11 @@ impl ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
             .iterators
             .iter()
             .filter(|(_, iterator)| older_than(iterator.issued_at, now, SHARD_ITERATOR_TTL))
-            .map(|(token, _)| token.clone())
+            .map(|(key, _)| key.clone())
             .collect();
-        for token in expired {
-            self.iterators.remove(&token);
-            self.retire_iterator(token);
+        for key in expired {
+            self.iterators.remove(&key);
+            self.retire_iterator(key);
         }
     }
 
@@ -934,8 +970,9 @@ impl ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
         let ordinal = self.next_iterator_ordinal;
         self.next_iterator_ordinal += 1;
         let token = opaque_token(stream_arn, shard_id, next_position, ordinal);
+        let key = iterator_key(&token);
         self.iterators.insert(
-            token.clone(),
+            key.clone(),
             IteratorState {
                 stream_arn: stream_arn.to_string(),
                 shard_id: shard_id.to_string(),
@@ -943,9 +980,9 @@ impl ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
                 issued_at: at,
             },
         );
-        self.live_iterators.push_back(token.clone());
-        while self.live_iterators.len() > MAX_LIVE_ITERATORS {
-            let Some(oldest) = self.live_iterators.pop_front() else {
+        self.live_iterator_keys.push_back(key);
+        while self.live_iterator_keys.len() > MAX_LIVE_ITERATORS {
+            let Some(oldest) = self.live_iterator_keys.pop_front() else {
                 break;
             };
             // A token the clock already retired is simply dropped from the order;
@@ -957,15 +994,15 @@ impl ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
         token
     }
 
-    /// Remember that `token` was an iterator of this service's, now past its
-    /// lifetime, bounded by [`MAX_RETIRED_ITERATORS`].
-    fn retire_iterator(&mut self, token: String) {
-        if self.retired_iterator_tokens.insert(token.clone()) {
-            self.retired_iterators.push_back(token);
+    /// Remember that the token `key` derives from was an iterator of this
+    /// service's, now past its lifetime, bounded by [`MAX_RETIRED_ITERATORS`].
+    fn retire_iterator(&mut self, key: String) {
+        if self.retired_iterator_keys.insert(key.clone()) {
+            self.retired_iterator_order.push_back(key);
         }
-        while self.retired_iterators.len() > MAX_RETIRED_ITERATORS {
-            if let Some(dropped) = self.retired_iterators.pop_front() {
-                self.retired_iterator_tokens.remove(&dropped);
+        while self.retired_iterator_order.len() > MAX_RETIRED_ITERATORS {
+            if let Some(dropped) = self.retired_iterator_order.pop_front() {
+                self.retired_iterator_keys.remove(&dropped);
             }
         }
     }
@@ -1181,21 +1218,61 @@ fn event_id(stream_arn: &str, shard_id: &str, sequence_number: &str) -> String {
 }
 
 /// An opaque shard-iterator token, of the form a DynamoDB Streams iterator takes:
-/// `<stream ARN>|<format version>|<opaque blob>`. The leading ARN is what lets a
+/// `<stream ARN>|<format version>|<base64 envelope>`. The leading ARN is what lets a
 /// client that holds only an iterator tell which stream it belongs to — the
-/// DynamoDB Streams Kinesis adapter reads it straight off the token — and the blob
-/// is a DIGEST of the position, not an encoding of it: the position itself lives in
-/// the iterator table, so a client can neither decode a token nor forge one for a
+/// DynamoDB Streams Kinesis adapter reads it straight off the token — while the
+/// third segment carries no position at all: it is an envelope over a digest, not an
+/// encoding of the input, so a client can neither decode a token nor forge one for a
 /// different position. The whole token stays well inside the modelled
-/// `ShardIterator` 1..2048 bound.
+/// `ShardIterator` 1..2048 bound, even for the longest stream ARN there can be.
 fn opaque_token(stream_arn: &str, shard_id: &str, next_position: u64, ordinal: u64) -> String {
-    let blob = ::aws_smithy_types::base64::encode(digest_bytes(&[
+    let seed = digest_bytes(&[
         stream_arn.as_bytes(),
         shard_id.as_bytes(),
         &next_position.to_be_bytes(),
         &ordinal.to_be_bytes(),
-    ]));
+    ]);
+    let payload = expanded_bytes(&seed, ITERATOR_PAYLOAD_BYTES);
+    let mut envelope = Vec::with_capacity(
+        ITERATOR_ENVELOPE_PREAMBLE.len() + ITERATOR_PAYLOAD_LENGTH_FIELD.len() + payload.len(),
+    );
+    envelope.extend_from_slice(&ITERATOR_ENVELOPE_PREAMBLE);
+    envelope.extend_from_slice(&ITERATOR_PAYLOAD_LENGTH_FIELD);
+    envelope.extend_from_slice(&payload);
+    let blob = ::aws_smithy_types::base64::encode(&envelope);
     format!("{stream_arn}|{ITERATOR_TOKEN_VERSION}|{blob}")
+}
+
+/// `len` bytes expanded from one 32 byte seed, by digesting the seed together with a
+/// block counter.
+///
+/// The envelope payload has to be long without being guessable or repeating, and it
+/// has to be REPRODUCIBLE here rather than random: the same coordinates always mint
+/// the same bytes, and two different coordinates never share them, because the seed
+/// they expand from already separates them.
+fn expanded_bytes(seed: &[u8; 32], len: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(len + 32);
+    let mut block: u64 = 0;
+    while bytes.len() < len {
+        bytes.extend_from_slice(&digest_bytes(&[seed.as_slice(), &block.to_be_bytes()]));
+        block += 1;
+    }
+    bytes.truncate(len);
+    bytes
+}
+
+/// The store's key for an iterator token: a fixed-size derivation of the WHOLE
+/// token.
+///
+/// The token a client gets is a kilobyte-scale envelope, and this service keeps
+/// [`MAX_LIVE_ITERATORS`] live plus [`MAX_RETIRED_ITERATORS`] retired entries, so
+/// keying the tables by the token itself would make what they hold a function of the
+/// token's length. Keying them by this digest keeps it a function of the caps alone
+/// and still resolves a presented token EXACTLY: the key is derived from the token
+/// the client sent, so only the token this service minted reaches the entry it
+/// minted.
+fn iterator_key(token: &str) -> String {
+    digest_hex(&[token.as_bytes()])
 }
 
 fn digest_hex(parts: &[&[u8]]) -> String {
