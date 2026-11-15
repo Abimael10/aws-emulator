@@ -27,8 +27,8 @@
 //! 5. A tagging call naming a resource this service does not hold is the modelled
 //!    `ResourceNotFoundException` (404); a `resourceId` no form of the model's pattern
 //!    accepts is refused with 400 before any state is touched.
-//! 6. `tags` is a `TagList` (`@length(1, 50)`), so a resource carrying no tags reports
-//!    the member ABSENT rather than as an empty list.
+//! 6. A response's `tags` member is ALWAYS serialized: a resource carrying no tags
+//!    reports it as an EMPTY list, never as an absent member.
 //! 7. A listing cuts the tag set into pages of at most `maxResults`, whose `nextToken`
 //!    resumes exactly where the previous page stopped, so the pages together are the
 //!    stored set once each and in order.
@@ -119,8 +119,9 @@ fn query_encoded(value: &str) -> String {
     encoded
 }
 
-/// The tags an answer reports, in the order it reported them. An absent `tags` member is
-/// the empty set — rule 6 — so this reads both the same way.
+/// The tags an answer reports, in the order it reported them. `tags` is always a list
+/// (rule 6); an answer whose shape carries no `tags` member at all reads as the empty
+/// set.
 fn reported_tags(case: &str, answer: &Answer) -> Vec<(String, String)> {
     match answer.field("tags") {
         Value::Null => Vec::new(),
@@ -682,10 +683,10 @@ async fn an_unknown_or_unacceptable_resource_id_is_refused() {
     );
 }
 
-/// Rule 6: a resource carrying no tags reports `tags` ABSENT — before any write, and
-/// again once every tag has been removed.
+/// Rule 6: a resource carrying no tags reports `tags` as an EMPTY list — before any
+/// write, and again once every tag has been removed.
 #[tokio::test]
-async fn a_resource_with_no_tags_reports_no_tags_member() {
+async fn a_resource_with_no_tags_reports_an_empty_tag_list() {
     let router = new_router();
     let untagged = created_file_system_id(
         &router,
@@ -720,8 +721,8 @@ async fn a_resource_with_no_tags_reports_no_tags_member() {
         );
         assert_eq!(
             *listed.field("tags"),
-            Value::Null,
-            "case {case:?}: TagList is @length(1, 50), so no tags means an absent member, \
+            json!([]),
+            "case {case:?}: a resource no write has tagged reports an empty tag list, \
              got {:?}",
             listed.field("tags")
         );
@@ -732,7 +733,7 @@ async fn a_resource_with_no_tags_reports_no_tags_member() {
             listed.field("nextToken")
         );
 
-        // Tagged, then stripped: the member comes back and goes absent again.
+        // Tagged, then stripped: the member carries the written set and is empty again.
         let tags: Vec<(&str, &str)> = vec![("env", "test"), ("team", "storage")];
         assert_eq!(
             tag_resource(&router, &label, &tags).await.status,
@@ -754,8 +755,8 @@ async fn a_resource_with_no_tags_reports_no_tags_member() {
         let stripped = list_tags(&router, &label, None, None).await;
         assert_eq!(
             *stripped.field("tags"),
-            Value::Null,
-            "case {case:?}: a resource stripped of every tag reports an absent member, \
+            json!([]),
+            "case {case:?}: a resource stripped of every tag reports an empty tag list, \
              got {:?}",
             stripped.field("tags")
         );

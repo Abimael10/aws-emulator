@@ -12,8 +12,9 @@
 //! [`crate::state::ComAmazonawsS3filesS3filesState::settle`]: the `creating` ->
 //! `available` transition the clock already owed at this instant.
 //!
-//! `tags` is a `TagList`, which is `@length(1, 50)`, so a resource carrying no tags is
-//! reported with the member ABSENT rather than as an empty list the model would reject.
+//! `tags` is ALWAYS serialized, as an empty list for a resource no write has tagged:
+//! `TagList`'s `@length(1, 50)` bounds the tag set a WRITE may carry, not the collection
+//! a read reports ([`crate::state::reported_tags`]).
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -184,9 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         Ok(ListTagsForResourceOutput {
-            // `TagList` is `@length(1, 50)`: no tags means an absent member, never an
-            // empty list.
-            tags: (!page.items.is_empty()).then_some(page.items),
+            // The one reporting rule for a tag list (`crate::state::reported_tags`): the
+            // member is always serialized, as an empty list for a resource no write has
+            // tagged.
+            tags: crate::state::reported_tags(&page.items),
             next_token: page.next_token,
         })
     }

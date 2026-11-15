@@ -25,6 +25,8 @@ mod file_system_lifecycle;
 mod file_system_policy;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/response_projection.rs"]
+mod response_projection;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/synchronization_configuration.rs"]

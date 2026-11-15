@@ -18,7 +18,10 @@
 //! [`crate::state::bucket_is_absent`] — BEFORE anything is persisted; a bucket S3
 //! reports absent is the modelled 404 `ResourceNotFoundException`.
 //!
-//! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
+//! Shared types live in `super::types`; the error channel in `crate::scaffolded`. The
+//! members this answers with are projected from the stored record by
+//! [`crate::state::FileSystemView`], the one projection every operation that reports a
+//! file system uses.
 //!
 //! ---
 //!
@@ -291,20 +294,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::store_unavailable(),
             )
         })?;
-        Ok(CreateFileSystemOutput {
-            creation_time: Some(::aws_smithy_types::DateTime::from(stored.creation_time)),
-            file_system_arn: Some(stored.file_system_arn.clone()),
-            file_system_id: Some(stored.file_system_id.clone()),
-            bucket: Some(stored.bucket.clone()),
-            prefix: Some(stored.prefix.clone()),
-            client_token: stored.client_token.clone(),
-            kms_key_id: stored.kms_key_id.clone(),
-            status: Some(stored.status.clone()),
-            status_message: stored.status_message.clone(),
-            role_arn: Some(stored.role_arn.clone()),
-            owner_id: Some(stored.owner_id.clone()),
-            tags: (!stored.tags.is_empty()).then(|| stored.tags.clone()),
-            name: stored.name.clone(),
-        })
+        // ONE projection for every operation that reports a file system
+        // (`crate::state::FileSystemView`), so this 201 and the `GetFileSystem` /
+        // `ListFileSystems` that follow it report the same record identically: `tags`
+        // always serialized, `creationTime` in whole epoch seconds.
+        Ok(crate::state::FileSystemView::from(stored).into())
     }
 }

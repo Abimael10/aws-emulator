@@ -252,17 +252,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::store_unavailable(),
             )
         })?;
-        Ok(CreateAccessPointOutput {
-            access_point_arn: stored.access_point_arn.clone(),
-            access_point_id: stored.access_point_id.clone(),
-            client_token: stored.client_token.clone(),
-            file_system_id: stored.file_system_id.clone(),
-            status: stored.status.clone(),
-            owner_id: stored.owner_id.clone(),
-            posix_user: stored.posix_user.clone(),
-            root_directory: stored.root_directory.clone(),
-            tags: (!stored.tags.is_empty()).then(|| stored.tags.clone()),
-            name: stored.name.clone(),
-        })
+        // ONE projection for every operation that reports an access point
+        // (`crate::state::AccessPointView`), so this answer and the `GetAccessPoint`
+        // that follows it report the same record identically, `tags` included.
+        Ok(crate::state::AccessPointView::from(stored).into())
     }
 }

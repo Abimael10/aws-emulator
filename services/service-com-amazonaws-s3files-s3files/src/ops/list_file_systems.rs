@@ -145,7 +145,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 (
                     file_system.sequence,
                     ListFileSystemsDescription {
-                        creation_time: ::aws_smithy_types::DateTime::from(
+                        creation_time: crate::state::reported_creation_time(
                             file_system.creation_time,
                         ),
                         file_system_arn: file_system.file_system_arn.clone(),

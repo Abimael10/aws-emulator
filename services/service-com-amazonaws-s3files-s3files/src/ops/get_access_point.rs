@@ -161,17 +161,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        Ok(GetAccessPointOutput {
-            access_point_arn: stored.access_point_arn.clone(),
-            access_point_id: stored.access_point_id.clone(),
-            client_token: stored.client_token.clone(),
-            file_system_id: stored.file_system_id.clone(),
-            status: stored.status.clone(),
-            owner_id: stored.owner_id.clone(),
-            posix_user: stored.posix_user.clone(),
-            root_directory: stored.root_directory.clone(),
-            tags: (!stored.tags.is_empty()).then(|| stored.tags.clone()),
-            name: stored.name.clone(),
-        })
+        // The same projection `CreateAccessPoint` answers with
+        // (`crate::state::AccessPointView`), so a read reports the stored record exactly
+        // as the create that stored it did.
+        Ok(crate::state::AccessPointView::from(stored).into())
     }
 }

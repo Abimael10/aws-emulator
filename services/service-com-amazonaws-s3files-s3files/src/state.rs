@@ -8,6 +8,14 @@
 //! Every implemented operation computes its answer from the records below — nothing is
 //! canned, and nothing is echoed straight back out of a request without being stored
 //! first.
+//!
+//! How a stored record becomes the members a response reports lives in
+//! [`projection`], re-exported here: every operation that reports a file system or an
+//! access point projects it the same way.
+
+mod projection;
+
+pub use projection::*;
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime};

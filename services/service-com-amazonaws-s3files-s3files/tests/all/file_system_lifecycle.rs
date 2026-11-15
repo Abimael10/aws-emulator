@@ -327,9 +327,15 @@ async fn a_created_file_system_is_persisted_and_read_back_member_for_member() {
             &request["kmsKeyId"],
             "case {case:?}: kmsKeyId"
         );
+        // `tags` is always serialized: the stored set, and an empty list for a create
+        // that carried none.
+        let expected_tags = request
+            .get("tags")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
         assert_eq!(
             created.field("tags"),
-            &request["tags"],
+            &expected_tags,
             "case {case:?}: tags"
         );
         assert_eq!(

@@ -6,7 +6,10 @@
 //! `fs-` id or the file system's ARN. The only state this reporting operation writes is
 //! the `creating` -> `available` transition the clock already made due.
 //!
-//! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
+//! Shared types live in `super::types`; the error channel in `crate::scaffolded`. The
+//! members this answers with are projected from the stored record by
+//! [`crate::state::FileSystemView`], the same projection `CreateFileSystem` answers
+//! with.
 //!
 //! ---
 //!
@@ -169,20 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        Ok(GetFileSystemOutput {
-            creation_time: Some(::aws_smithy_types::DateTime::from(stored.creation_time)),
-            file_system_arn: Some(stored.file_system_arn.clone()),
-            file_system_id: Some(stored.file_system_id.clone()),
-            bucket: Some(stored.bucket.clone()),
-            prefix: Some(stored.prefix.clone()),
-            client_token: stored.client_token.clone(),
-            kms_key_id: stored.kms_key_id.clone(),
-            status: Some(stored.status.clone()),
-            status_message: stored.status_message.clone(),
-            role_arn: Some(stored.role_arn.clone()),
-            owner_id: Some(stored.owner_id.clone()),
-            tags: (!stored.tags.is_empty()).then(|| stored.tags.clone()),
-            name: stored.name.clone(),
-        })
+        // The same projection `CreateFileSystem` answers with
+        // (`crate::state::FileSystemView`), so a read reports the stored record exactly
+        // as the create that stored it did.
+        Ok(crate::state::FileSystemView::from(stored).into())
     }
 }

@@ -1308,3 +1308,20 @@ mod lambda_in_function_assumed_role_session;
 //! declared, because a file no declaration names is compiled nowhere. The notes that
 //! concurrent landings appended to the end of THIS file live in the `appended_notes` suite,
 //! which is declared below like any other.
+// Single integration-test target for the router: below this header the file holds one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted by name, and no
+// other line.
+//
+// Add a suite by putting it at `tests/all/<name>.rs` and inserting its pair into the
+// sorted list — nothing beside it. What a suite covers, and why it lives in this target
+// rather than in a service crate's own, belongs in that suite's own module header, where
+// it is read with the test it explains.
+// This is the one file in the target whose breakage compiles no suite at all, so three
+// suites of the target pin the shape above: `all/all_rs_declares_each_suite_once.rs` (a
+// name declared twice is `E0428`), `all/all_rs_inner_doc_comments_precede_the_first_item.rs`
+// (an inner doc comment past the first item is `E0753`) and
+// `all/all_rs_is_a_canonical_declaration_list.rs` (pairs, sorted, nothing else). Every
+// comment here is an ordinary `//` one, this header included, so no merge of two landings
+// can leave a doc comment past the first item.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling
+// of this file, which the layout check refuses: the `#[path]` is what points each
