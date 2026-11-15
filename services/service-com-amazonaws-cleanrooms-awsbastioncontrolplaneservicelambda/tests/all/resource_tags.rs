@@ -60,6 +60,12 @@ const TAGGED_RESOURCE_NOT_FOUND: &str = "Resource was not found";
 /// distinct from the `ResourceNotFoundException` the CRUD operations answer.
 const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
 
+/// The status a tag mutation answers on success: `TagResourceOutput` and
+/// `UntagResourceOutput` model no members, so the answer carries no entity — the status
+/// every operation of this service with an empty output shape answers.
+const TAG_MUTATION_SUCCESS_STATUS: u16 =
+    super::empty_output_response_statuses::EMPTY_OUTPUT_SUCCESS_STATUS;
+
 /// Ids in the model's `UUID` form that no create in these tests mints.
 const NEVER_MINTED_IDS: [&str; 3] = [
     "00000000-0000-0000-0000-000000000000",
@@ -95,7 +101,7 @@ fn query_value(value: &str) -> String {
 
 /// A JSON object of string values as a sorted map, so a comparison does not depend on
 /// map ordering.
-fn as_map(value: &Value) -> BTreeMap<String, String> {
+pub(crate) fn as_map(value: &Value) -> BTreeMap<String, String> {
     value
         .as_object()
         .map(|members| {
@@ -115,7 +121,7 @@ impl Emulator {
     }
 
     /// `POST /tags/{resourceArn}` — `TagResource`, with the map in the body.
-    async fn tag_resource(&self, resource_arn: &str, tags: Value) -> (u16, Value) {
+    pub(crate) async fn tag_resource(&self, resource_arn: &str, tags: Value) -> (u16, Value) {
         self.call(
             "POST",
             &format!("/tags/{}", label(resource_arn)),
@@ -126,7 +132,7 @@ impl Emulator {
 
     /// `DELETE /tags/{resourceArn}?tagKeys=…` — `UntagResource`. `tagKeys` is an
     /// `@httpQuery` list, so each key is its own query entry.
-    async fn untag_resource(&self, resource_arn: &str, tag_keys: &[String]) -> (u16, Value) {
+    pub(crate) async fn untag_resource(&self, resource_arn: &str, tag_keys: &[String]) -> (u16, Value) {
         let query: Vec<String> = tag_keys
             .iter()
             .map(|key| format!("tagKeys={}", query_value(key)))
@@ -142,7 +148,7 @@ impl Emulator {
 
 /// The tags `ListTagsForResource` reports for `resource_arn`, asserting the read itself
 /// succeeded.
-async fn listed_tags(emulator: &Emulator, case: &str, resource_arn: &str) -> BTreeMap<String, String> {
+pub(crate) async fn listed_tags(emulator: &Emulator, case: &str, resource_arn: &str) -> BTreeMap<String, String> {
     let (status, body) = emulator.list_tags(resource_arn).await;
     assert_eq!(
         status, 200,
@@ -344,8 +350,8 @@ async fn tag_list_and_untag_share_one_tag_set_per_resource_for_every_kind_of_res
 
         let (status, body) = emulator.tag_resource(&resource.arn, resource.added.clone()).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected TagResource 200, got {status} with {body}"
+            status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case:?}: expected TagResource {TAG_MUTATION_SUCCESS_STATUS}, got {status} with {body}"
         );
 
         // The added keys are carried, a key already carried takes the new value, and
@@ -361,8 +367,8 @@ async fn tag_list_and_untag_share_one_tag_set_per_resource_for_every_kind_of_res
         let case = format!("{}: UntagResource {:?}", resource.kind, resource.removed);
         let (status, body) = emulator.untag_resource(&resource.arn, &resource.removed).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected UntagResource 200, got {status} with {body}"
+            status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case:?}: expected UntagResource {TAG_MUTATION_SUCCESS_STATUS}, got {status} with {body}"
         );
 
         // Exactly the named keys go; a key the resource does not carry removes nothing.
@@ -380,8 +386,8 @@ async fn tag_list_and_untag_share_one_tag_set_per_resource_for_every_kind_of_res
         let case = format!("{}: UntagResource {:?} again", resource.kind, resource.removed);
         let (status, body) = emulator.untag_resource(&resource.arn, &resource.removed).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected UntagResource 200, got {status} with {body}"
+            status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case:?}: expected UntagResource {TAG_MUTATION_SUCCESS_STATUS}, got {status} with {body}"
         );
         let listed = all_listed_tags(&emulator, &case, &resources).await;
         assert_eq!(
@@ -401,8 +407,8 @@ async fn tag_list_and_untag_share_one_tag_set_per_resource_for_every_kind_of_res
         .tag_resource(&emptied.arn, json!({ "after": "empty" }))
         .await;
     assert_eq!(
-        status, 200,
-        "case {case:?}: expected TagResource 200, got {status} with {body}"
+        status, TAG_MUTATION_SUCCESS_STATUS,
+        "case {case:?}: expected TagResource {TAG_MUTATION_SUCCESS_STATUS}, got {status} with {body}"
     );
     let listed = listed_tags(&emulator, &case, &emptied.arn).await;
     assert_eq!(
@@ -459,8 +465,8 @@ async fn tag_keys_and_values_at_the_published_bounds_round_trip() {
 
         let (status, body) = emulator.tag_resource(&arn, tags.clone()).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected TagResource 200 for {tags}, got {status} with {body}"
+            status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case:?}: expected TagResource {TAG_MUTATION_SUCCESS_STATUS} for {tags}, got {status} with {body}"
         );
 
         let mut want = before.clone();
@@ -477,8 +483,8 @@ async fn tag_keys_and_values_at_the_published_bounds_round_trip() {
         if !keys.is_empty() {
             let (status, body) = emulator.untag_resource(&arn, &keys).await;
             assert_eq!(
-                status, 200,
-                "case {case:?}: expected UntagResource 200 for {keys:?}, got {status} with {body}"
+                status, TAG_MUTATION_SUCCESS_STATUS,
+                "case {case:?}: expected UntagResource {TAG_MUTATION_SUCCESS_STATUS} for {keys:?}, got {status} with {body}"
             );
         }
         let listed = listed_tags(&emulator, case, &arn).await;
@@ -775,7 +781,7 @@ async fn a_resource_cannot_be_tagged_past_what_a_tag_map_can_hold() {
     );
     let (status, body) = emulator.tag_resource(&arn, at_bound.clone()).await;
     assert_eq!(
-        status, 200,
+        status, TAG_MUTATION_SUCCESS_STATUS,
         "a map at TagMap's maximum of {TAG_MAP_MAX} must be accepted, got {status} with {body}"
     );
     let listed = listed_tags(&emulator, "at the bound", &arn).await;
@@ -792,7 +798,7 @@ async fn a_resource_cannot_be_tagged_past_what_a_tag_map_can_hold() {
         .tag_resource(&arn, json!({ "key-0": "replaced" }))
         .await;
     assert_eq!(
-        status, 200,
+        status, TAG_MUTATION_SUCCESS_STATUS,
         "replacing a carried key's value must be accepted at the bound, got {status} with {body}"
     );
     let listed = listed_tags(&emulator, "a replacement at the bound", &arn).await;
@@ -835,14 +841,14 @@ async fn a_resource_cannot_be_tagged_past_what_a_tag_map_can_hold() {
     // Making room first is all it takes, so the bound is on the SET and not on the ARN.
     let (status, body) = emulator.untag_resource(&arn, &["key-0".to_string()]).await;
     assert_eq!(
-        status, 200,
-        "expected UntagResource 200, got {status} with {body}"
+        status, TAG_MUTATION_SUCCESS_STATUS,
+        "expected UntagResource {TAG_MUTATION_SUCCESS_STATUS}, got {status} with {body}"
     );
     let (status, body) = emulator
         .tag_resource(&arn, json!({ "one-too-many": "now-fits" }))
         .await;
     assert_eq!(
-        status, 200,
+        status, TAG_MUTATION_SUCCESS_STATUS,
         "with room made, the same key must be accepted, got {status} with {body}"
     );
     let listed = listed_tags(&emulator, "after making room", &arn).await;

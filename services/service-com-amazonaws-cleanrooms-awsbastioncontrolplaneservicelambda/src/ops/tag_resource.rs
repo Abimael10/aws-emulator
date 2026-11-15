@@ -144,7 +144,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    /// `TagResourceOutput` models NO members
+    /// (`smithy_query(query="shape",shape="TagResourceOutput")`), so a success has
+    /// nothing to serialize and the answer carries no entity — the no-content status.
+    /// The `@http` code the model reports for this operation (200) is restJson1's
+    /// default rather than a code the model states: every operation of this service
+    /// whose output shape is empty and whose code the model DOES state pins 204 (the
+    /// `Delete*` operations), and the served tagging plane answers the same way, so a
+    /// client that branches on the status does not then read a body that is not there.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,

@@ -140,7 +140,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    /// `UntagResourceOutput` models NO members
+    /// (`smithy_query(query="shape",shape="UntagResourceOutput")`), so a success has
+    /// nothing to serialize and the answer carries no entity — the no-content status,
+    /// exactly as `TagResource` on the same plane. The `@http` code the model reports
+    /// for this operation (200) is restJson1's default rather than a code the model
+    /// states; every operation of this service whose output shape is empty and whose
+    /// code the model DOES state pins 204.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,

@@ -59,6 +59,8 @@ mod configured_table_association_identifier_forms;
 mod configured_table_associations;
 #[path = "all/configured_table_updates.rs"]
 mod configured_table_updates;
+#[path = "all/empty_output_response_statuses.rs"]
+mod empty_output_response_statuses;
 #[path = "all/list_members.rs"]
 mod list_members;
 #[path = "all/member_removal.rs"]
