@@ -153,47 +153,6 @@ const PLAYBACK_MODE_LINEAR: &str = "LINEAR";
 const CHANNEL_ALREADY_EXISTS_MESSAGE: &str =
     "This channel already exists. Create a unique channel and resubmit your request.";
 
-/// The per-channel host label this emulator's generated playback URLs carry: a
-/// 28-character label derived from the channel's ARN, so every output of one
-/// channel shares a host that is stable for the life of the channel and is
-/// distinct between channels.
-fn playback_host_label(arn: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = hex::encode(Sha256::digest(format!("{arn}#channel-playback").as_bytes()));
-    digest[..28].to_string()
-}
-
-/// The single-stack and dual-stack playback URLs of one channel output.
-///
-/// The single-stack host is the service's regional endpoint
-/// (`mediatailor.<region>.amazonaws.com`) under this channel's own label; the
-/// dual-stack host is the dual-stack endpoint the model declares for the `aws`
-/// partition (`standardRegionalEndpoints.partitionSpecialCases.aws`:
-/// `https://mediatailor.{region}.{dualStackDnsSuffix}`, whose suffix is
-/// `api.aws`). The path names the channel and the output's manifest — so one URL
-/// addresses exactly one output of one channel — and the manifest carries the
-/// extension of the playlist form the output asked for: a DASH-only output is an
-/// `.mpd` manifest, every other output an `.m3u8` playlist.
-fn playback_urls(
-    label: &str,
-    region: &str,
-    channel: &str,
-    output: &RequestOutputItem,
-) -> (String, String) {
-    let dash_only =
-        output.dash_playlist_settings.is_some() && output.hls_playlist_settings.is_none();
-    let (kind, extension) = if dash_only {
-        ("dash", "mpd")
-    } else {
-        ("channel", "m3u8")
-    };
-    let path = format!("/v1/{kind}/{channel}/{}.{extension}", output.manifest_name);
-    (
-        format!("https://{label}.mediatailor.{region}.amazonaws.com{path}"),
-        format!("https://{label}.mediatailor.{region}.api.aws{path}"),
-    )
-}
-
 /// Why the channel this request would store cannot be held, or `None` when it
 /// can.
 ///
@@ -364,7 +323,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &format!("channel/{}", input.channel_name),
         );
-        let label = playback_host_label(&arn);
+        // WHERE this channel's playback is announced — the pair of hosts every
+        // output of it carries — is decided once, here, and persisted with the
+        // outputs: a channel's manifests are served by the channel-assembly
+        // plane rather than by the control-plane API endpoint, so the hosts are
+        // that plane's ([`crate::state::PlaybackHosts`]).
+        let hosts = crate::state::PlaybackHosts::announced(ctx, &region, &arn);
         // Each request output is stored as the output the reads REPORT: the
         // members the request carried, plus the playback URLs this service
         // derives for it.
@@ -373,7 +337,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .map(|output| {
                 let (playback_url, dual_stack_playback_url) =
-                    playback_urls(&label, &region, &input.channel_name, output);
+                    hosts.output_urls(&input.channel_name, output);
                 ResponseOutputItem {
                     dash_playlist_settings: output.dash_playlist_settings.clone(),
                     // An HLS output advertises an ad-markup type whether or not

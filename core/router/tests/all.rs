@@ -8,7 +8,6 @@
 // holds those pairs and no other line — no prose between them, and NOTHING after the last one
 // — so two branches landing at once insert two lines in two places and have nothing to
 // duplicate, re-word or mistype.
-//
 // EVERY comment in this file is an ORDINARY `//` one, this header included: a doc comment of
 // the enclosing module is legal only ahead of the first item, so one left below the list
 // compiles no suite of this target at all, and with none anywhere in the file there is no such
@@ -16,11 +15,8 @@
 // neither copy, and a suite left at the top level of `tests/` fails the build. This file is a
 // test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of it, which the layout
 // check refuses: the `#[path]` above each `mod` is what points it into `tests/all/`.
-//
 // Suites of this target pin all of that rather than restate it:
 // Single integration-test target for the router: the canonical DECLARATION LIST of every
-// cross-service suite under `tests/all/`, and nothing else.
-//
 // Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
 // suite file, sorted by name, and no other line — no prose between the pairs, no blank line,
 // and nothing after the last pair. Two branches landing at once then insert two lines in two
@@ -47,7 +43,6 @@
 // for every service crate's own `tests/all.rs`. What a suite covers belongs in that suite's own
 // module header, and a note about THIS file in `all/appended_notes.rs`, declared below like any
 // other file.
-//
 // The paragraphs above wrap without the indentation `clippy::doc_lazy_continuation` asks of a
 // doc list item; the lint is allowed here so a header line is a header line rather than a build
 // failure. An inner attribute, like an inner doc comment, is legal only before the first item,
@@ -1590,7 +1585,6 @@ mod zz_probe_whole_emulator;
 // into `tests/all/`. A suite no `mod` here names is compiled nowhere and its tests never run,
 // and a second `mod` for one name fails every suite in this target.
 // `all/all_rs_is_a_canonical_declaration_list.rs`,
-// `all/declaration_roots_are_canonical_and_complete.rs` and
 // `all/every_suite_file_is_declared.rs` pin those rules, so check there rather than leaving a
 // note here; `all/appended_notes.rs` records what the notes earlier landings had appended to
 // this file said.
@@ -1693,7 +1687,6 @@ mod zz_probe_whole_emulator;
 // The lint allowed below is for the suite files this root compiles: a wrapped paragraph in one
 // of their module headers is then a note rather than a build failure. An inner attribute, like
 // an inner doc comment, is legal only before the first item, so it stands here.
-// Single integration-test target for the router: the CANONICAL DECLARATION LIST of every
 // cross-service suite under `tests/all/`, and nothing else. Below this header the file holds
 // one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted by name, and no other
 // line — so two branches landing at once insert two lines in two places and have no prose to
@@ -1815,7 +1808,6 @@ mod default_vpc_internet_path_runs_ecs_tasks;
 // crate's `tests/all.rs`, so check there rather than leaving a note here.
 // An inner attribute, like a module doc comment, is legal only ahead of the first item, so the
 // one this target needs stands here rather than in the list below.
-// Put a new suite at `tests/all/<name>.rs` and insert ONE `#[path = "all/<name>.rs"]` /
 // `mod <name>;` pair into the sorted list below. This file holds this header and those
 // pairs and no other line, so two branches landing at once insert two lines in two places
 // and have no prose to duplicate, re-word or mistype.
@@ -1852,3 +1844,11 @@ mod default_vpc_internet_path_runs_ecs_tasks;
 // of their module headers is a note rather than a build failure.
 // `all/appended_notes.rs`, `all/appended_notes_tail.rs`, `all/appended_header_notes.rs` and
 // `all/appended_prose.rs`, each declared below like any other suite.
+// `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs` and
+// `all/declaration_roots_are_canonical_and_complete.rs` check all of the above, for this file
+// and for every service crate's `tests/all.rs`, so check there rather than leaving a note
+// here.
+// The header paragraphs above wrap without the indentation `clippy::doc_lazy_continuation`
+// asks of a doc list item; the lint is allowed here so a header line is a header line rather
+// than a build failure. An inner attribute, like an inner doc comment, is legal only before
+// the first item, so it stands here rather than in the list below.

@@ -6,6 +6,11 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::ops::types::*;
 
+/// WHERE a channel's outputs are announced for playback — the one statement of the hosts
+/// and paths the playback URLs of every channel this service mints carry.
+mod channel_playback;
+pub use channel_playback::*;
+
 /// The number of playback configurations this emulator will hold at once.
 ///
 /// A real account's playback configurations are limited per Region through
