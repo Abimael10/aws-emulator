@@ -306,6 +306,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             version,
             platform,
             image_recipe_arn,
+            container_recipe_arn,
             image_type,
         } = built;
         let platform = Some(platform);
@@ -373,9 +374,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // directly.
                 source_pipeline_arn: None,
                 image_recipe_arn,
+                container_recipe_arn,
                 infrastructure_configuration_arn: Some(
                     input.infrastructure_configuration_arn.clone(),
                 ),
+                // "The Amazon Resource Name (ARN) of the distribution configuration that
+                // defines and configures the outputs of the image build": the build records
+                // the configuration this request named, which a later read reports.
+                distribution_configuration_arn: input.distribution_configuration_arn.clone(),
+                // "Settings for vulnerability scans that Amazon Inspector runs during image
+                // creation", as this request configured them.
+                image_scanning_configuration: input.image_scanning_configuration.clone(),
+                // "The array of workflow configuration objects for the build": when a
+                // request names workflows "they replace the default workflows that Image
+                // Builder otherwise runs for the build", so the build records exactly the
+                // ones it was given.
+                workflows: input.workflows.clone(),
                 // "Specifies whether to collect additional information about the image
                 // being created ... Defaults to true."
                 enhanced_image_metadata_enabled: input

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the image build version a reference reaches, as the build that produced it
+//! recorded it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What a reference reaches, and what a read of it reports, are the store's own readings of
+//! an image ([`crate::state::ComAmazonawsImagebuilderImagebuilderState::image_answer`], which
+//! resolves a build version this account built or an image AWS publishes).
 //!
 //! ## Shape of an operation
 //!
@@ -103,13 +100,25 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // here — hence the `GetImageError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.imagebuilder#GetImage")]
+//
+// `ResourceNotFoundException` is widened in through `extra_errors`: `imageBuildVersionArn`
+// is an `@httpQuery` member naming an image that may not exist, this SERVICE models that
+// shape for exactly that case (`com.amazonaws.imagebuilder#ResourceNotFoundException`,
+// HTTP 404, "At least one of the resources referenced by your request does not exist",
+// declared in `types/shared_types.rs`), and this operation's own `errors` list omits it. So
+// a reference that resolves to nothing is reported MISSING rather than dressed up as an
+// invalid request, which is a different claim a client branches on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.imagebuilder#GetImage",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum GetImageErrorModeled {
     CallRateLimitExceededException(CallRateLimitExceededException),
     ClientException(ClientException),
     ForbiddenException(ForbiddenException),
     InvalidRequestException(InvalidRequestException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServiceException(ServiceException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
@@ -165,18 +174,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetImage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetImageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetImage"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetImageErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // The instant is read ONCE, so which builds a version ARN may resolve to and the
+        // status the resolved one reports are both answered as of one instant.
+        let at = ::std::time::SystemTime::now();
+
+        // A pure read: the guard is taken, the image the reference reaches is copied out as
+        // the modelled view, and nothing is written. The status that view carries is read
+        // from the clock against the instant the build is due, which this read REPORTS
+        // rather than materialises.
+        let view = state
+            .lock()
+            .image_answer(&input.image_build_version_arn, &region, at);
+
+        let Some(image) = view else {
+            return Err(GetImageErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::required_resource_not_found_message(
+                        &input.image_build_version_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetImageOutput {
+            request_id: Some(crate::state::new_request_id()),
+            // "A set of wildcard version ARNs that always reference the latest version of
+            // the resource", derived from the ARN of the build version this read RESOLVED to
+            // rather than from the reference the request carried, which may name a wildcard
+            // version.
+            latest_version_references: image.arn.as_deref().and_then(|arn| {
+                crate::state::latest_version_references(arn, crate::state::IMAGE_ARN_PREFIX)
+            }),
+            image: Some(image),
+        })
     }
 }

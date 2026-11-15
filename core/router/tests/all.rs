@@ -7524,3 +7524,12 @@ mod events_lambda_target_permission_granted_after_the_rule;
 //! own module doc, where it is read beside the test it describes; a note about this file
 //! itself belongs in `all/appended_notes.rs`.
 //! suite's own module doc, where it is read beside the test it describes.
+//! * Declare each suite exactly ONCE: this is one crate root, so a second `mod` for the same
+//!   name is `E0428` and fails every suite in this target.
+//!   this file, which the layout check refuses: the `#[path]` is what points each
+//! * THIS HEADER IS THE ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE: past
+//!   the first item one is `E0753` and compiles no suite of this target. So what goes below
+//!   is a DECLARATION — never a note about one, and never a copy of this header.
+//! leaving a note here. What a suite covers, and why it belongs to this cross-service target
+//! rather than to one service crate's own, is stated in that suite's own module doc, where it
+//! is read beside the test it describes.

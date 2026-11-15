@@ -157,6 +157,16 @@ pub use infrastructure_configuration_update::*;
 /// state rather than items of its own, so there is nothing to re-export from it.
 mod removals;
 
+/// Which stored image build version a reference to an image reaches, and what a read of one
+/// reports. The module adds methods to this service's state and to the build version record
+/// rather than items of its own, so there is nothing to re-export from it.
+mod image;
+
+/// The images AWS itself publishes, which a read of this service reaches beside the ones an
+/// account built.
+mod managed_image;
+pub use managed_image::*;
+
 use crate::ops::types::{
     AdditionalInstanceConfiguration, AmiDistributionConfiguration, Component,
     ComponentConfiguration, ComponentParameterDetail,
@@ -1121,11 +1131,32 @@ pub struct ImageBuildVersionRecord {
     /// The image recipe this build version was built from, as the reference the build
     /// resolved to at the instant it started: "this is the image recipe that Image
     /// Builder used to create the image" (the modelled `imageRecipe` member of `Image`).
-    /// A build of a container recipe, which this store holds none of, carries none.
+    /// A build of a container recipe carries none, and carries
+    /// [`Self::container_recipe_arn`] instead.
     pub image_recipe_arn: Option<String>,
+    /// The container recipe this build version was built from, when it was built from one:
+    /// "for container images, this is the container recipe that Image Builder used to create
+    /// the image" (the modelled `containerRecipe` member of `Image`). Exactly one of this
+    /// and [`Self::image_recipe_arn`] is held, since a build builds exactly one recipe.
+    pub container_recipe_arn: Option<String>,
     /// The infrastructure configuration the build ran under: "the infrastructure that
     /// Image Builder used to create this image" (`Image`'s `infrastructureConfiguration`).
     pub infrastructure_configuration_arn: Option<String>,
+    /// The distribution configuration the build distributed its output under, when the
+    /// request or the pipeline named one: "the distribution configuration that Image Builder
+    /// used to create this image" (`Image`'s `distributionConfiguration`). A build that named
+    /// none "creates the output image only in the account and Amazon Web Services Region
+    /// where the build runs" (`CreateImage`'s `distributionConfigurationArn`).
+    pub distribution_configuration_arn: Option<String>,
+    /// The vulnerability-scan settings the build was configured with, when the request or the
+    /// pipeline named any: "settings for the vulnerability scans that Amazon Inspector runs
+    /// for this image" (`Image`'s `imageScanningConfiguration`).
+    pub image_scanning_configuration: Option<ImageScanningConfiguration>,
+    /// The workflow configurations the build ran, when the request or the pipeline named any:
+    /// "the build, test, and distribution workflow configurations that are associated with
+    /// the image" (`Image`'s `workflows`). A build that named none ran the default workflows,
+    /// which are not configurations this service holds.
+    pub workflows: Option<Vec<WorkflowConfiguration>>,
     /// Whether the build collected the additional image metadata, as the request or the
     /// pipeline that asked for it named it, with the documented default filled in
     /// ([`DEFAULT_ENHANCED_IMAGE_METADATA_ENABLED`]).
@@ -2338,11 +2369,17 @@ pub fn image_pipeline_arn(region: &str, name: &str) -> String {
 /// reads here reaches the latest matching version at the time it is used. A build number
 /// is deliberately not carried: a reference pinned to one build is not a reference to the
 /// latest.
+///
+/// Every field but the version is the resource's OWN — its partition, its Region and the
+/// account that owns it — so a reference to a resource of this account names this account,
+/// and one to an image AWS publishes names that catalog's owner
+/// ([`MANAGED_IMAGE_OWNER`]).
 #[must_use]
 pub fn latest_version_references(
     arn: &str,
     resource_prefix: &str,
 ) -> Option<LatestVersionReferences> {
+    let owner = ::service_common::arn::parse_of(arn, ARN_SERVICE)?;
     let reference = VersionedReference::parse(arn, resource_prefix)?;
     let assigned = |node: &VersionNode| match node {
         VersionNode::Exact(value) => Some(value.to_string()),
@@ -2355,10 +2392,9 @@ pub fn latest_version_references(
     ];
     let wildcard = WILDCARD_VERSION_NODE;
     let at = |version: String| {
-        Some(::engine::emulator_arn(
-            ARN_SERVICE,
-            &reference.region,
-            &format!("{resource_prefix}{}/{version}", reference.name),
+        Some(format!(
+            "arn:{}:{ARN_SERVICE}:{}:{}:{resource_prefix}{}/{version}",
+            owner.partition, reference.region, owner.account, reference.name
         ))
     };
     Some(LatestVersionReferences {

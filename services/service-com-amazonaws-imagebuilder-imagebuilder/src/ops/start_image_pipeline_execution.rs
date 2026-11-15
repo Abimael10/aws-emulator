@@ -240,6 +240,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // pipeline is borrowed, so the record filed below carries what the pipeline said.
         let infrastructure_configuration_arn =
             Some(pipeline.infrastructure_configuration_arn.clone());
+        // "The distribution configuration associated with this image pipeline", the
+        // vulnerability-scan settings "for the pipeline" and the workflow configurations
+        // "associated with the image" are the pipeline's too, so a build it queues records
+        // the ones the pipeline holds.
+        let distribution_configuration_arn = pipeline.distribution_configuration_arn.clone();
+        let image_scanning_configuration = pipeline.image_scanning_configuration.clone();
+        let workflows = pipeline.workflows.clone();
         let enhanced_image_metadata_enabled = pipeline.enhanced_image_metadata_enabled;
         let image_tests_configuration = pipeline.image_tests_configuration.clone();
         let execution_role = pipeline.execution_role.clone();
@@ -264,6 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (name, version) = (built.name, built.version);
         let platform = Some(built.platform);
         let image_recipe_arn = built.image_recipe_arn;
+        let container_recipe_arn = built.container_recipe_arn;
         let image_type = built.image_type;
 
         // The store is finite: a run that would take it past this emulator's own cap is
@@ -306,7 +314,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 build_version,
                 source_pipeline_arn: Some(input.image_pipeline_arn),
                 image_recipe_arn,
+                container_recipe_arn,
                 infrastructure_configuration_arn,
+                distribution_configuration_arn,
+                image_scanning_configuration,
+                workflows,
                 enhanced_image_metadata_enabled,
                 image_tests_configuration,
                 execution_role,

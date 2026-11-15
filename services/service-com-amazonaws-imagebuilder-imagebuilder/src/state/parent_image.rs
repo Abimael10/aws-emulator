@@ -38,10 +38,12 @@
 //!   nothing about the image is established and the create proceeds rather than refusing a
 //!   value no answer placed.
 //!
-//! The other three forms name catalogs no service of this emulator holds — an Image Builder
-//! MANAGED image (`…:aws:image/…`), a Systems Manager public parameter, a Marketplace
-//! product — so nothing about them is established either and a recipe naming one is stored,
-//! for the same reason.
+//! The other three forms name catalogs no service of this emulator resolves an identifier
+//! against — a Systems Manager public parameter, a Marketplace product, and an Image Builder
+//! MANAGED image (`…:aws:image/…`), of which this store holds only the entries its own
+//! catalog records ([`super::MANAGED_IMAGES`]) rather than the whole of Amazon's — so
+//! nothing about them is established either and a recipe naming one is stored, for the same
+//! reason.
 
 use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
 

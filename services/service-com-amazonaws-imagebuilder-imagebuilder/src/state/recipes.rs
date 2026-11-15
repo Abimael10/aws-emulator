@@ -58,6 +58,10 @@ pub struct BuiltRecipe {
     /// member of `Image` is "the image recipe that Image Builder used to create the image",
     /// so a build of a CONTAINER recipe carries none.
     pub image_recipe_arn: Option<String>,
+    /// The CONTAINER recipe this build is of, when it is of one: "for container images, this
+    /// is the container recipe that Image Builder used to create the image" (the modelled
+    /// `containerRecipe` member of `Image`), so a build of an IMAGE recipe carries none.
+    pub container_recipe_arn: Option<String>,
     /// Whether the build produces an AMI or a container image, from the kind of recipe it
     /// builds.
     pub image_type: &'static str,
@@ -73,6 +77,7 @@ impl From<&ImageRecipeRecord> for BuiltRecipe {
             // recipe version it actually built rather than the wildcard reference it was
             // reached by.
             image_recipe_arn: Some(recipe.arn.clone()),
+            container_recipe_arn: None,
             image_type: IMAGE_TYPE_AMI,
         }
     }
@@ -85,6 +90,9 @@ impl From<&ContainerRecipeRecord> for BuiltRecipe {
             version: recipe.version.clone(),
             platform: recipe.platform.clone(),
             image_recipe_arn: None,
+            // The reference is resolved at the START of the build, for the same reason an
+            // image recipe's is.
+            container_recipe_arn: Some(recipe.arn.clone()),
             image_type: IMAGE_TYPE_DOCKER,
         }
     }
