@@ -145,7 +145,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // `ctx` carries the region a refusal's ARN is scoped to; a deleted data set's
+        // own ARN is the one minted when it was created.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteDataSetErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -162,7 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(removed) = store.data_sets.remove(&key) else {
             return Err(DeleteDataSetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Data set with ID {} not found.", key.1)),
+                    message: Some(crate::state::data_set_not_found_message(
+                        &region, &key.0, &key.1,
+                    )),
                     resource_type: Some("DATA_SET".to_string()),
                     request_id: Some(request_id),
                 },

@@ -154,9 +154,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The update changes only the data set's permission list, so the region is
-        // not needed: the data set's ARN was minted when it was created.
-        let _ = ctx;
+        // The update changes only the data set's permission list, so a stored data
+        // set's ARN is the one minted when it was created; `ctx` carries the region a
+        // refusal's ARN is scoped to.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 UpdateDataSetPermissionsErrorModeled::InternalFailureException(
@@ -176,7 +177,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateDataSetPermissionsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("Data set with ID {} not found.", key.1)),
+                        message: Some(crate::state::data_set_not_found_message(
+                            &region, &key.0, &key.1,
+                        )),
                         resource_type: Some("DATA_SET".to_string()),
                         request_id: Some(request_id),
                     },

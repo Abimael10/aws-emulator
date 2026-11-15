@@ -268,9 +268,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )) {
             return Err(CreateRefreshScheduleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Data set with ID {} not found.",
-                        input.data_set_id
+                    message: Some(crate::state::data_set_not_found_message(
+                        &region,
+                        &input.aws_account_id,
+                        &input.data_set_id,
                     )),
                     resource_type: Some("DATA_SET".to_string()),
                     request_id: Some(request_id),

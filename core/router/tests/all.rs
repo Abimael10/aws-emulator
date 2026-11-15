@@ -2234,3 +2234,11 @@ mod cloudformation_provisions_glue_table_optimizers;
 // `all/every_suite_file_is_declared.rs` pin those rules. What a suite covers, and why it
 // belongs to this cross-service target rather than to one service crate's own, is stated in
 // that suite's own module header; a note about THIS file belongs in `all/appended_notes.rs`.
+// Put a new suite at `tests/all/<name>.rs` and insert ONE `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair below, in the one place its name sorts to. The list holds those pairs
+// and no other line, so two branches landing at once insert two lines in two places and
+// have no prose to duplicate, re-word or mistype. What a suite covers, and why it drives
+// header; `all/appended_notes.rs` keeps the notes earlier landings had appended here.
+// comment is legal only before the first item, so with none anywhere in the file no merge
+// of two landings can leave one past the first declaration.
+// it under `tests/`, which the layout check refuses: the `#[path]` above each `mod` is what

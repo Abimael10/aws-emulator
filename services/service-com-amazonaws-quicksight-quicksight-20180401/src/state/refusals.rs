@@ -37,6 +37,10 @@ const FOLDER: &str = "Folder";
 /// `DataSource` shape spells it, not the two words its documentation prose uses.
 const DATA_SOURCE: &str = "DataSource";
 
+/// The resource kind a data-set refusal names — one word, as the service's own
+/// `DataSet` shape spells it, not the two words its documentation prose uses.
+const DATA_SET: &str = "DataSet";
+
 /// `"<kind> <arn> already exists"`: the conflict a create hits when the id it names
 /// is already taken by a resource of that kind.
 pub fn arn_exists_message(kind: &str, arn: &str) -> String {
@@ -71,6 +75,13 @@ pub fn data_source_not_found_message(
         DATA_SOURCE,
         &data_source_arn(region, aws_account_id, data_source_id),
     )
+}
+
+/// The miss a data-set operation reports for a `DataSetId` the account holds no data
+/// set under — the same text whether the call reads, deletes, reads or writes the
+/// data set's permissions, or addresses a refresh schedule through it.
+pub fn data_set_not_found_message(region: &str, aws_account_id: &str, data_set_id: &str) -> String {
+    arn_not_found_message(DATA_SET, &data_set_arn(region, aws_account_id, data_set_id))
 }
 
 /// The refusal a data-set write reports for a physical table naming a data source

@@ -144,8 +144,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A report on stored state: nothing here writes to the store.
-        let _ = ctx;
+        // A report on stored state: nothing here writes to the store. `ctx` carries
+        // the region a refusal's ARN is scoped to.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DescribeDataSetErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -162,7 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.data_sets.get(&key) else {
             return Err(DescribeDataSetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Data set with ID {} not found.", key.1)),
+                    message: Some(crate::state::data_set_not_found_message(
+                        &region, &key.0, &key.1,
+                    )),
                     resource_type: Some("DATA_SET".to_string()),
                     request_id: Some(request_id),
                 },
