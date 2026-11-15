@@ -53,7 +53,11 @@ pub fn properties(resource_type: &str) -> Vec<String> {
 /// topic ARN" for `AWS::SNS::Topic`, "Ref returns the queue URL" for `AWS::SQS::Queue`, "Ref
 /// returns the key ID" for `AWS::KMS::Key`) — read here for WHICH published member carries
 /// that value, which is the member a client names the resource by.
-fn identifying_return_value(resource_type: &str) -> Option<&'static str> {
+///
+/// Visible to the crate because it is a RECORDED per-type answer, which is what the resource
+/// provider schema the registry serves declares as the type's `primaryIdentifier`
+/// ([`super::resource_schema`]); the name convention below it is not.
+pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static str> {
     use super::template::*;
 
     let identifier = match resource_type {

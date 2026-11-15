@@ -26,7 +26,14 @@
 //! * `typeName` — the type the registry record is for;
 //! * `properties` — one entry per property the type publishes, nested where the published
 //!   name is a path through one (`Endpoint.Address` is `Endpoint`'s `Address`), each typed
-//!   `string` because every value this emulator reports for one is text;
+//!   `string` because every value this emulator reports for one is text, together with every
+//!   property the type's primary identifier is made of where that identifier is RECORDED
+//!   here ([`declared_primary_identifier`]), so each pointer below resolves;
+//! * `primaryIdentifier` — the JSON pointers into `properties` whose values identify one
+//!   resource of the type, which is what tells a client which property to pass as the
+//!   identifier of a resource of this type, for a type whose identifier this emulator
+//!   RECORDS: the parts of a composite one, or the published return value that carries the
+//!   resource's identity;
 //! * `sourceUrl` — the repository the type's resource provider is published in.
 //!
 //! What it deliberately does NOT carry is anything the emulator does not know:
@@ -37,8 +44,10 @@
 //! * no `readOnlyProperties`/`createOnlyProperties` classification, since a published
 //!   return value can also be a property a template sets (a queue's `QueueName` is both)
 //!   and nothing here tells the two apart;
-//! * no `primaryIdentifier`, because which PROPERTY holds the physical id `Ref` returns
-//!   is not something the return-value catalogue records;
+//! * no `primaryIdentifier` for a type whose identifier is NOT recorded here, because the
+//!   property a resource of such a type is identified by is not something the return-value
+//!   catalogue records — a pointer derived from the type's own name would be a guess, and a
+//!   client addressing a resource by it would name a property the type does not have;
 //! * no `handlers`, because what a handler of one of these types requires — the permissions
 //!   [`schema_handler_permissions`] reads back out of a schema that declares them — is not
 //!   something the return-value catalogue records either;
@@ -74,6 +83,14 @@ fn document(type_name: &str, published: &[&str]) -> Value {
     for property in published {
         define_property(&mut properties, property);
     }
+    // The properties the type's primary identifier is made of are defined too, where that
+    // identifier is recorded: every pointer the `primaryIdentifier` list below carries has to
+    // resolve into this document's `properties`, which is what lets a client read the
+    // identifier property of a type off its schema.
+    let identifiers = declared_primary_identifier(type_name);
+    for property in &identifiers {
+        define_property(&mut properties, property);
+    }
     let mut document = Map::new();
     document.insert(
         "$schema".to_string(),
@@ -81,6 +98,17 @@ fn document(type_name: &str, published: &[&str]) -> Value {
     );
     document.insert("typeName".to_string(), Value::String(type_name.to_string()));
     document.insert("properties".to_string(), Value::Object(properties));
+    if !identifiers.is_empty() {
+        document.insert(
+            "primaryIdentifier".to_string(),
+            Value::Array(
+                identifiers
+                    .iter()
+                    .map(|property| Value::String(property_pointer(property)))
+                    .collect(),
+            ),
+        );
+    }
     if let Some(source_url) = super::registry::aws_published_source_url(type_name) {
         document.insert("sourceUrl".to_string(), Value::String(source_url));
     }
@@ -212,6 +240,45 @@ const PROVISIONING_HANDLERS: &[&str] = &["create", "read", "delete"];
 /// The handler whose presence separates `FULLY_MUTABLE` from `IMMUTABLE`.
 const UPDATE_HANDLER: &str = "update";
 
+/// The properties the resource provider schema of `type_name` declares as its
+/// `primaryIdentifier`, as far as this emulator RECORDS them — the empty list for a type
+/// whose identifier it does not.
+///
+/// Two sources, both of them per-type records rather than conventions:
+///
+/// 1. the parts of a COMPOSITE primary identifier, for a type whose resource IS a binding
+///    between others ([`super::template::composite_identity_properties`]);
+/// 2. the published return value that carries the resource's IDENTITY, for a type whose
+///    `Ref` returns something other than the resource's name
+///    ([`super::primary_identifier::identifying_return_value`], read out of each type's own
+///    "Return values" section).
+///
+/// The NAME convention [`super::primary_identifier::properties`] falls back to for an import
+/// summary is deliberately NOT a source here. That answers "which property would a client
+/// state the resource's name in", which for a schema is a guess: `AWS::RDS::DBInstance` is
+/// identified by `DBInstanceIdentifier` and has no `DBInstanceName` at all, so a schema
+/// publishing the conventional name would send a client at a property the type does not have.
+fn declared_primary_identifier(type_name: &str) -> Vec<String> {
+    let composite = super::template::composite_identity_properties(type_name);
+    if !composite.is_empty() {
+        return composite.iter().map(|part| (*part).to_string()).collect();
+    }
+    super::primary_identifier::identifying_return_value(type_name)
+        .map(|published| vec![published.to_string()])
+        .unwrap_or_default()
+}
+
+/// The JSON pointer a provider definition schema names one of its own properties by: the
+/// path into the document's `properties` object, with a published name that is a PATH
+/// through a property pointing through that property's own `properties`
+/// ([`define_property`] defines it in the same shape).
+fn property_pointer(property: &str) -> String {
+    format!(
+        "/properties/{}",
+        property.split('.').collect::<Vec<_>>().join("/properties/")
+    )
+}
+
 /// Define one published property under `into`.
 ///
 /// A published name that is a PATH through a property (`Endpoint.Address`, which is the
@@ -268,6 +335,105 @@ mod tests {
                     defined.is_some(),
                     "case {type_name:?}: expected {pointer:?} to be defined, got \
                      {document:?}"
+                );
+            }
+        }
+    }
+
+    /// Every schema whose type's identifier this emulator records declares it, and every
+    /// pointer of it resolves into that schema's own `properties` — which is what lets a
+    /// client read the identifier property of such a type off the registry. A type whose
+    /// identifier is NOT recorded declares none, rather than one derived from its name.
+    #[test]
+    fn a_schema_declares_the_primary_identifier_the_registry_records() {
+        for type_name in super::super::template::IMPLEMENTED_RESOURCE_TYPES {
+            let schema = resource_type_schema(type_name)
+                .unwrap_or_else(|| panic!("case {type_name:?}: expected a schema, got none"));
+            let document: Value = ::serde_json::from_str(&schema).unwrap_or_else(|error| {
+                panic!("case {type_name:?}: expected JSON, got {schema:?} ({error})")
+            });
+            let declared = declared_primary_identifier(type_name);
+            let pointers = document
+                .get("primaryIdentifier")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            assert_eq!(
+                pointers.len(),
+                declared.len(),
+                "case {type_name:?}: expected the recorded identifier {declared:?} to be \
+                 declared, got {document:?}"
+            );
+            for pointer in pointers {
+                let pointer = pointer.as_str().unwrap_or_else(|| {
+                    panic!("case {type_name:?}: expected a pointer, got {pointer:?}")
+                });
+                let defined = document.pointer(pointer);
+                assert!(
+                    defined.is_some(),
+                    "case {type_name:?}: expected {pointer:?} to be defined, got {document:?}"
+                );
+            }
+        }
+    }
+
+    /// The identifier a schema declares is a RECORDED property of the type, never the name
+    /// its own last segment would make: a type whose identifier the registry does not record
+    /// declares none, so no client is sent at a property the type does not have.
+    #[test]
+    fn an_unrecorded_identifier_is_declared_as_none_rather_than_guessed() {
+        // Each row: a type, and the identifier its schema must declare — the pointers for a
+        // type whose identity the return-value catalogue records, and NOTHING for a type
+        // identified by a name that catalogue does not carry. Source for the rows: each
+        // type's own "Return values" section; `AWS::RDS::DBInstance` is identified by
+        // `DBInstanceIdentifier` (not by any `DBInstanceName`), which is exactly why nothing
+        // may be published for it.
+        let rows: [(&str, &[&str]); 5] = [
+            ("AWS::SQS::Queue", &["/properties/QueueUrl"]),
+            ("AWS::SNS::Topic", &["/properties/TopicArn"]),
+            ("AWS::CloudFront::Distribution", &["/properties/Id"]),
+            ("AWS::RDS::DBInstance", &[]),
+            ("AWS::S3::Bucket", &[]),
+        ];
+        for (type_name, expected) in rows {
+            let schema = resource_type_schema(type_name)
+                .unwrap_or_else(|| panic!("case {type_name:?}: expected a schema, got none"));
+            let document: Value = ::serde_json::from_str(&schema).unwrap_or_else(|error| {
+                panic!("case {type_name:?}: expected JSON, got {schema:?} ({error})")
+            });
+            let declared: Vec<String> = document
+                .get("primaryIdentifier")
+                .and_then(Value::as_array)
+                .map(|pointers| {
+                    pointers
+                        .iter()
+                        .map(|pointer| pointer.as_str().unwrap_or_default().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                declared, expected,
+                "case {type_name:?}: expected the primaryIdentifier {expected:?}, got \
+                 {declared:?} in {document:?}"
+            );
+            // And no property was defined for an identifier that was not published: the
+            // document's properties are the ones the type publishes, plus the recorded
+            // identifier's.
+            if expected.is_empty() {
+                let defined = document
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .map(|properties| properties.len())
+                    .unwrap_or_default();
+                let published = super::super::template::published_attribute_names(type_name)
+                    .iter()
+                    .filter_map(|name| name.split('.').next())
+                    .collect::<::std::collections::BTreeSet<_>>()
+                    .len();
+                assert_eq!(
+                    defined, published,
+                    "case {type_name:?}: expected only the {published} published properties, \
+                     got {defined} in {document:?}"
                 );
             }
         }

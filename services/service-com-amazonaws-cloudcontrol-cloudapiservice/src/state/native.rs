@@ -33,9 +33,11 @@
 //! the request record and the resource it owes are settled together. Never the other way
 //! round: nothing in an owning service reaches back into this one.
 
+mod alarms;
 mod buckets;
 mod destinations;
 mod log_groups;
+mod log_streams;
 mod managed_policies;
 mod parameters;
 mod queues;
@@ -188,6 +190,12 @@ impl NativeResources {
     pub fn for_engine<Eng: Send + Sync + 'static>(engine: &Eng) -> Self {
         let mut providers: Vec<Box<dyn NativeResourceProvider>> = Vec::new();
         if let Some(provider) = log_groups::LogGroupProvider::for_engine(engine) {
+            providers.push(Box::new(provider));
+        }
+        if let Some(provider) = log_streams::LogStreamProvider::for_engine(engine) {
+            providers.push(Box::new(provider));
+        }
+        if let Some(provider) = alarms::AlarmProvider::for_engine(engine) {
             providers.push(Box::new(provider));
         }
         if let Some(provider) = destinations::DestinationProvider::for_engine(engine) {
@@ -450,6 +458,14 @@ mod tests {
         assert!(
             native.provider("AWS::Logs::LogGroup").is_some(),
             "expected the log group provider, got {native:?}"
+        );
+        assert!(
+            native.provider("AWS::Logs::LogStream").is_some(),
+            "expected the log stream provider, got {native:?}"
+        );
+        assert!(
+            native.provider("AWS::CloudWatch::Alarm").is_some(),
+            "expected the metric alarm provider, got {native:?}"
         );
         assert!(
             native.provider("AWS::Logs::Destination").is_some(),

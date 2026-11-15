@@ -43,6 +43,30 @@ fn tag(key: &str, value: &str) -> Value {
     json!({ "Key": key, "Value": value })
 }
 
+/// The `PublicAccessBlockConfiguration` every bucket the OWNING service creates carries
+/// without any client input: "Amazon S3 automatically enables S3 Block Public Access … for
+/// new buckets", so all four settings are on and every read of the model reports them.
+fn blocked_public_access() -> Value {
+    json!({
+        "BlockPublicAcls": true,
+        "BlockPublicPolicy": true,
+        "IgnorePublicAcls": true,
+        "RestrictPublicBuckets": true,
+    })
+}
+
+/// The `BucketEncryption` every bucket carries without any client input: "by default, all
+/// buckets have a default encryption configuration that uses server-side encryption with
+/// Amazon S3 managed keys (SSE-S3)", and "by default, S3 Bucket Key is not enabled".
+fn default_encryption() -> Value {
+    json!({
+        "ServerSideEncryptionConfiguration": [{
+            "ServerSideEncryptionByDefault": { "SSEAlgorithm": "AES256" },
+            "BucketKeyEnabled": false,
+        }],
+    })
+}
+
 /// Create a bucket through the OWNING service's own API — `s3:CreateBucket`. Nothing of
 /// such a bucket is ever named to Cloud Control API.
 async fn create_native(emulator: &Emulator, name: &str) {
@@ -88,7 +112,12 @@ async fn a_created_bucket_is_the_bucket_amazon_s3_holds() {
             "the identity alone",
             "plain-bucket",
             json!({ "BucketName": "plain-bucket" }),
-            json!({ "BucketName": "plain-bucket", "Arn": bucket_arn("plain-bucket") }),
+            json!({
+                "BucketName": "plain-bucket",
+                "Arn": bucket_arn("plain-bucket"),
+                "PublicAccessBlockConfiguration": blocked_public_access(),
+                "BucketEncryption": default_encryption(),
+            }),
         ),
         (
             "a tag set",
@@ -101,6 +130,8 @@ async fn a_created_bucket_is_the_bucket_amazon_s3_holds() {
                 "BucketName": "tagged-bucket",
                 "Arn": bucket_arn("tagged-bucket"),
                 "Tags": [tag("team", "web"), tag("env", "test")],
+                "PublicAccessBlockConfiguration": blocked_public_access(),
+                "BucketEncryption": default_encryption(),
             }),
         ),
         (
@@ -114,6 +145,8 @@ async fn a_created_bucket_is_the_bucket_amazon_s3_holds() {
                 "BucketName": "versioned-bucket",
                 "Arn": bucket_arn("versioned-bucket"),
                 "VersioningConfiguration": { "Status": "Enabled" },
+                "PublicAccessBlockConfiguration": blocked_public_access(),
+                "BucketEncryption": default_encryption(),
             }),
         ),
         (
@@ -129,6 +162,8 @@ async fn a_created_bucket_is_the_bucket_amazon_s3_holds() {
                 "Arn": bucket_arn("both-bucket"),
                 "Tags": [tag("owner", "platform")],
                 "VersioningConfiguration": { "Status": "Suspended" },
+                "PublicAccessBlockConfiguration": blocked_public_access(),
+                "BucketEncryption": default_encryption(),
             }),
         ),
     ];
@@ -355,7 +390,12 @@ async fn a_bucket_the_owning_api_created_is_the_same_resource() {
     let reported = emulator.properties(BUCKET, "native-bucket").await;
     assert_eq!(
         reported,
-        json!({ "BucketName": "native-bucket", "Arn": bucket_arn("native-bucket") }),
+        json!({
+            "BucketName": "native-bucket",
+            "Arn": bucket_arn("native-bucket"),
+            "PublicAccessBlockConfiguration": blocked_public_access(),
+            "BucketEncryption": default_encryption(),
+        }),
         "a bucket the owning API created must resolve, got {reported:?}"
     );
     let listed = emulator.walk(BUCKET, None).await;
@@ -497,9 +537,9 @@ async fn work_the_owning_service_refuses_leaves_the_request_failed() {
             "a property the type declares that this handler does not apply",
             json!({
                 "BucketName": "unapplied-bucket",
-                "PublicAccessBlockConfiguration": { "BlockPublicAcls": true },
+                "LoggingConfiguration": { "DestinationBucketName": "audit" },
             }),
-            "PublicAccessBlockConfiguration is a property of AWS::S3::Bucket this \
+            "LoggingConfiguration is a property of AWS::S3::Bucket this \
              emulator's handler does not apply",
         ),
         (

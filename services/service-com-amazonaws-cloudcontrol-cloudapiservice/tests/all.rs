@@ -19,10 +19,16 @@ mod arn_identified_resources;
 mod audit_records;
 #[path = "all/cancel_resource_request.rs"]
 mod cancel_resource_request;
+#[path = "all/compound_identifiers.rs"]
+mod compound_identifiers;
 #[path = "all/deleted_resource_refusal.rs"]
 mod deleted_resource_refusal;
 #[path = "all/emulator.rs"]
 mod emulator;
+#[path = "all/full_resource_model.rs"]
+mod full_resource_model;
+#[path = "all/metric_alarm_provisioning.rs"]
+mod metric_alarm_provisioning;
 #[path = "all/native_queue_lifecycle.rs"]
 mod native_queue_lifecycle;
 #[path = "all/native_resource_resolution.rs"]

@@ -377,6 +377,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let mut input = input;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateResourceErrorModeled::ServiceInternalErrorException(
                 ServiceInternalErrorException {
@@ -423,6 +424,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &crate::state::patch_document_read_failure(&input.patch_document),
                 ))
             })?;
+        // The Region this call addressed, as its SigV4 credential scope names it: where the
+        // owning service holds one namespace per Region, this is the Region the resource is
+        // resolved in and the one the patch is applied in.
+        let region = crate::state::request_region(ctx.parts());
+        let native = crate::state::native::NativeResources::for_engine(&*self.engine);
+        // "Primary identifiers can be specified as a string or JSON": the reference the
+        // request carried is read as the identifier the resource answers to before anything
+        // is resolved, the way every operation that takes an `Identifier` reads it.
+        input.identifier = crate::state::addressed_identifier(
+            &input.type_name,
+            &input.identifier,
+            native
+                .provider(&input.type_name)
+                .map(crate::state::native::NativeResourceProvider::identifier_property),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
         let fingerprint = crate::state::request_fingerprint(&[
             Some(Self::NAME),
             Some(&input.type_name),
@@ -432,11 +449,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(&input.patch_document),
         ]);
         let resource = crate::state::resource_label(&input.type_name, &input.identifier);
-        // The Region this call addressed, as its SigV4 credential scope names it: where the
-        // owning service holds one namespace per Region, this is the Region the resource is
-        // resolved in and the one the patch is applied in.
-        let region = crate::state::request_region(ctx.parts());
-        let native = crate::state::native::NativeResources::for_engine(&*self.engine);
 
         // Everything this service's own store answers is judged first, under a lock that
         // is DROPPED before the patch below — so no caller waits on the store while
@@ -483,6 +495,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_updatable(&offending));
         }
 
+        // The schema's `readOnlyProperties` are the OWNING service's to compute, so a patch
+        // that names one asks for something no handler can carry out: the request is refused
+        // by the front door — as the input-validation failure it is, rather than as a
+        // handler's verdict about the resource — naming them as the schema's own pointers.
+        let read_only = crate::state::read_only_properties(&input.type_name, &identifier_property);
+        let read_only_offending: Vec<&str> = read_only
+            .iter()
+            .filter(|property| touched.contains(*property))
+            .map(String::as_str)
+            .collect();
+        if !read_only_offending.is_empty() {
+            return Err(validation(crate::state::read_only_message(
+                &read_only_offending,
+            )));
+        }
+
         // "You specify your resource property updates as a list of patch operations
         // contained in a JSON patch document": the patch is applied to a COPY of the
         // model the store holds, with the one rule that bounds the work it can drive
@@ -513,13 +541,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // on the model the patch left behind too: a resource never answers to an
         // identifier other than the one it is stored under, which is the identifier the
         // resource itself carries rather than the reference the request addressed it by.
-        if patched
-            .get(&identifier_property)
-            .and_then(crate::state::identifier_text)
+        // The identifier is read off the patched model by the rule the type's schema states
+        // ([`crate::state::model_identifier`]), so a type identified by a COMBINATION of
+        // properties is held to the whole combination.
+        if crate::state::model_identifier(&input.type_name, &patched, &identifier_property)
             .as_deref()
             != Some(identifier.as_str())
         {
-            return Err(not_updatable(&[identifier_property.as_str()]));
+            let addressed =
+                crate::state::identifier_properties(&input.type_name, &identifier_property);
+            let named: Vec<&str> = addressed.iter().map(String::as_str).collect();
+            return Err(not_updatable(&named));
         }
 
         // The request is recorded under a fresh lock and judged against the store once

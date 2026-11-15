@@ -14,8 +14,12 @@
 //! The table below is one row per shape a published type's property set can take — one
 //! property, several, and a property that is a path through another (`Endpoint.Address`) —
 //! read by `Type`/`TypeName` and by the public ARN, and then the WHOLE catalogue of
-//! published types, so no entry of it is exempt. The recorded trace this suite was written
-//! for is one row: `AWS::S3::Bucket`.
+//! published types, so no entry of it is exempt. Each row also states the type's
+//! `primaryIdentifier`: a schema declares which property identifies one resource of the type
+//! where the registry RECORDS that — the member the type's `Ref` returns — since that is
+//! what a client passes as the identifier of an existing resource, and declares none where it
+//! does not, rather than a pointer at a property the type has no such member for.
+//! The recorded trace this suite was written for is one row: `AWS::S3::Bucket`.
 
 use service_com_amazonaws_cloudformation_cloudformation::state::registry::{
     public_type_arn, registry_type,
@@ -55,22 +59,31 @@ async fn schema_of(router: &MultiServiceRouter, case: &str, members: &[(&str, &s
     })
 }
 
-/// One row of the table: a published resource type, and the properties its schema must
+/// One row of the table: a published resource type, the properties its schema must
 /// define — the type's own published `Fn::GetAtt` return values, as JSON pointers into the
-/// document.
+/// document — and the pointers its `primaryIdentifier` must declare, which is empty for a
+/// type whose identifier the registry does not record.
 ///
 /// Source for each property set: the type's "Return values" section, which is what
-/// `state::template::published_attribute_names` carries; the pointers are spelled out here
-/// rather than derived, so a row is a statement about the type and not a restatement of
-/// the code under test.
+/// `state::template::published_attribute_names` carries; for each identifier, that same
+/// section's statement of what `Ref` returns — "Ref returns the queue URL", "Ref returns the
+/// ID of the distribution". Both are spelled out here rather than derived, so a row is a
+/// statement about the type and not a restatement of the code under test. A type identified
+/// by its own NAME (`AWS::RDS::DBInstance` by `DBInstanceIdentifier`, `AWS::S3::Bucket` by
+/// `BucketName`) publishes no identifier at all: that property is not among the type's return
+/// values, so the registry does not record it and the schema states nothing rather than a
+/// pointer a client would address a non-existent property by.
 struct SchemaCase {
     type_name: &'static str,
     properties: Vec<&'static str>,
+    identifiers: Vec<&'static str>,
 }
 
 fn table() -> Vec<SchemaCase> {
     vec![
-        // The recorded row: the five DNS/identity properties an S3 bucket publishes.
+        // The recorded row: the five DNS/identity properties an S3 bucket publishes. A bucket
+        // is identified by its `BucketName`, which it does not publish, so its schema states
+        // no identifier.
         SchemaCase {
             type_name: "AWS::S3::Bucket",
             properties: vec![
@@ -80,27 +93,34 @@ fn table() -> Vec<SchemaCase> {
                 "/properties/RegionalDomainName",
                 "/properties/WebsiteURL",
             ],
+            identifiers: vec![],
         },
         // A type whose two published properties are both SERVICE-ASSIGNED: a CloudFront
-        // distribution's id and the `cloudfront.net` domain name it is served on.
+        // distribution's id and the `cloudfront.net` domain name it is served on. "Ref
+        // returns the ID of the distribution", so the id identifies one.
         SchemaCase {
             type_name: "AWS::CloudFront::Distribution",
             properties: vec!["/properties/DomainName", "/properties/Id"],
+            identifiers: vec!["/properties/Id"],
         },
         // An API Gateway REST API publishes its own id and the id of the root resource
-        // created with it.
+        // created with it; "Ref returns the ID of the RestApi resource".
         SchemaCase {
             type_name: "AWS::ApiGateway::RestApi",
             properties: vec!["/properties/RestApiId", "/properties/RootResourceId"],
+            identifiers: vec!["/properties/RestApiId"],
         },
         // Two published properties, the second of which a table has only where its own
         // declaration enables a stream ("You must specify the StreamSpecification property
-        // to use this attribute") — the type publishes both names either way.
+        // to use this attribute") — the type publishes both names either way. "Ref returns
+        // the resource name", so the table is identified by a name it does not publish.
         SchemaCase {
             type_name: "AWS::DynamoDB::Table",
             properties: vec!["/properties/Arn", "/properties/StreamArn"],
+            identifiers: vec![],
         },
-        // Three, one of which is the queue's URL rather than an ARN or a name.
+        // Three, one of which is the queue's URL rather than an ARN or a name — and "Ref
+        // returns the queue URL", so that URL is what identifies a queue.
         SchemaCase {
             type_name: "AWS::SQS::Queue",
             properties: vec![
@@ -108,9 +128,11 @@ fn table() -> Vec<SchemaCase> {
                 "/properties/QueueName",
                 "/properties/QueueUrl",
             ],
+            identifiers: vec!["/properties/QueueUrl"],
         },
         // Published names that are PATHS through a property: an endpoint's address and
-        // port are members of the resource's `Endpoint`, so the document nests them.
+        // port are members of the resource's `Endpoint`, so the document nests them. A DB
+        // instance is identified by its `DBInstanceIdentifier`, which it does not publish.
         SchemaCase {
             type_name: "AWS::RDS::DBInstance",
             properties: vec![
@@ -119,6 +141,7 @@ fn table() -> Vec<SchemaCase> {
                 "/properties/Endpoint/properties/Address",
                 "/properties/Endpoint/properties/Port",
             ],
+            identifiers: vec![],
         },
         // The same shape with a second nested property beside the first.
         SchemaCase {
@@ -130,17 +153,20 @@ fn table() -> Vec<SchemaCase> {
                 "/properties/Endpoint/properties/Port",
                 "/properties/ReadEndpoint/properties/Address",
             ],
+            identifiers: vec![],
         },
         // A type whose published names are an identifier and an ARN of the service's own
-        // spelling, neither of them the conventional `Arn`.
+        // spelling, neither of them the conventional `Arn`; "Ref returns the memory ID".
         SchemaCase {
             type_name: "AWS::BedrockAgentCore::Memory",
             properties: vec!["/properties/MemoryArn", "/properties/MemoryId"],
+            identifiers: vec!["/properties/MemoryId"],
         },
     ]
 }
 
-/// Every row's schema names its own type and defines the properties that type publishes.
+/// Every row's schema names its own type, defines the properties that type publishes, and
+/// declares the type's primary identifier as pointers that resolve into those properties.
 #[tokio::test]
 async fn a_published_resource_types_schema_defines_the_properties_it_publishes() {
     let router = router();
@@ -148,6 +174,7 @@ async fn a_published_resource_types_schema_defines_the_properties_it_publishes()
     for SchemaCase {
         type_name,
         properties,
+        identifiers,
     } in table()
     {
         let document = schema_of(
@@ -163,7 +190,7 @@ async fn a_published_resource_types_schema_defines_the_properties_it_publishes()
             "case {type_name:?}: expected the schema to name its own type, got {named:?} \
              in {document:?}"
         );
-        for pointer in &properties {
+        for pointer in properties.iter().chain(identifiers.iter()) {
             let defined = document.pointer(pointer).and_then(|property| {
                 property.get("type").and_then(Value::as_str)
             });
@@ -174,9 +201,28 @@ async fn a_published_resource_types_schema_defines_the_properties_it_publishes()
                  {defined:?} in {document:?}"
             );
         }
-        // And nothing beyond them: the schema defines what the type publishes, not a
-        // property nobody knows the type has. The row's own pointers say how many
-        // top-level properties that is — a nested pointer names its parent.
+        // The type's primary identifier, which is what tells a client which property to
+        // pass as the identifier of one of its resources — and nothing at all for a type
+        // whose identifier the registry does not record, so no pointer names a property the
+        // type does not have.
+        let declared = document.get("primaryIdentifier").cloned();
+        let expected = (!identifiers.is_empty()).then(|| {
+            Value::Array(
+                identifiers
+                    .iter()
+                    .map(|pointer| Value::String((*pointer).to_string()))
+                    .collect(),
+            )
+        });
+        assert_eq!(
+            declared, expected,
+            "case {type_name:?}: expected the primaryIdentifier {expected:?}, got \
+             {declared:?} in {document:?}"
+        );
+        // And nothing beyond them: the schema defines what the type publishes and what
+        // identifies one of its resources, not a property nobody knows the type has. The
+        // row's own pointers say how many top-level properties that is — a nested pointer
+        // names its parent.
         let defined = document
             .get("properties")
             .and_then(Value::as_object)
@@ -184,6 +230,7 @@ async fn a_published_resource_types_schema_defines_the_properties_it_publishes()
             .unwrap_or_default();
         let expected = properties
             .iter()
+            .chain(identifiers.iter())
             .filter_map(|pointer| pointer.split('/').nth(2))
             .collect::<std::collections::BTreeSet<_>>()
             .len();
@@ -229,6 +276,21 @@ async fn every_published_resource_type_reports_the_same_schema_by_name_and_by_ar
                 defined.is_some(),
                 "case {type_name:?}: expected the published {published:?} to be defined \
                  at {pointer:?}, got {by_name:?}"
+            );
+        }
+        // And every pointer of the type's primary identifier, where the registry records
+        // one, resolves into the same document — so a client can read the identifier property
+        // of such a type off the registry rather than only of the ones this suite names.
+        let pointers = by_name
+            .get("primaryIdentifier")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for pointer in &pointers {
+            let pointer = pointer.as_str().unwrap_or_default();
+            assert!(
+                by_name.pointer(pointer).is_some(),
+                "case {type_name:?}: expected {pointer:?} to be defined, got {by_name:?}"
             );
         }
         // The document declares itself against the resource provider meta-schema and says

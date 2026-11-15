@@ -32,6 +32,10 @@ service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
 # And for `AWS::SSM::Parameter`: a parameter lives in the Systems Manager service's store,
 # whichever API created it, so this crate reads and writes it THERE.
 service-com-amazonaws-ssm-amazonssm = { workspace = true }
+# And for `AWS::CloudWatch::Alarm`: a metric alarm lives in the Amazon CloudWatch service's
+# store, so an alarm provisioned through this service is one that service's own
+# `DescribeAlarms` reports and its own evaluation then grades.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

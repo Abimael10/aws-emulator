@@ -34,6 +34,14 @@ pub(crate) const LOGS_SIGNING_NAME: &str = "logs";
 /// Smithy service shape.
 pub(crate) const LOGS_TARGET_PREFIX: &str = "Logs_20140328";
 
+/// The sigv4 signing name of the Amazon CloudWatch service, whose own store holds the
+/// metric alarms `AWS::CloudWatch::Alarm` names.
+pub(crate) const CLOUDWATCH_SIGNING_NAME: &str = "monitoring";
+
+/// The `X-Amz-Target` prefix a client writes for that service: the local name of its Smithy
+/// service shape.
+pub(crate) const CLOUDWATCH_TARGET_PREFIX: &str = "GraniteServiceVersion20100801";
+
 /// The sigv4 signing name of the Amazon SNS service, whose own store holds the topics
 /// `AWS::SNS::Topic` names.
 pub(crate) const SNS_SIGNING_NAME: &str = "sns";
@@ -146,6 +154,18 @@ impl Emulator {
         Self::mounted(|router, engine| {
             router.register_service(
                 service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(engine),
+            );
+        })
+    }
+
+    /// One emulator with the service that OWNS `AWS::CloudWatch::Alarm` mounted beside this
+    /// one.
+    pub(crate) fn with_cloudwatch() -> Self {
+        Self::mounted(|router, engine| {
+            router.register_service(
+                service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
+                    engine,
+                ),
             );
         })
     }
@@ -344,6 +364,30 @@ impl Emulator {
     /// One operation of the CloudWatch Logs service, required to succeed.
     pub(crate) async fn logs_ok(&self, operation: &str, body: Value) -> Value {
         let (status, decoded) = self.logs(operation, body).await;
+        assert_eq!(
+            status, 200,
+            "{operation}: expected HTTP 200, got {status} with body {decoded:?}"
+        );
+        decoded
+    }
+
+    /// One operation of the Amazon CloudWatch service — the OWNING service's own API, the
+    /// one a client uses when it is not going through Cloud Control API. That service
+    /// speaks `awsJson1_0` as well as the query protocol, so the call is the same JSON RPC
+    /// post as this service's own.
+    pub(crate) async fn cloudwatch(&self, operation: &str, body: Value) -> (u16, Value) {
+        self.post(
+            CLOUDWATCH_SIGNING_NAME,
+            "application/x-amz-json-1.0",
+            &format!("{CLOUDWATCH_TARGET_PREFIX}.{operation}"),
+            body,
+        )
+        .await
+    }
+
+    /// One operation of the Amazon CloudWatch service, required to succeed.
+    pub(crate) async fn cloudwatch_ok(&self, operation: &str, body: Value) -> Value {
+        let (status, decoded) = self.cloudwatch(operation, body).await;
         assert_eq!(
             status, 200,
             "{operation}: expected HTTP 200, got {status} with body {decoded:?}"

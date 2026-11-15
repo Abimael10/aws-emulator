@@ -221,6 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let mut input = input;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteResourceErrorModeled::ServiceInternalErrorException(
                 ServiceInternalErrorException {
@@ -261,6 +262,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource is resolved in and the one it is removed from.
         let region = crate::state::request_region(ctx.parts());
         let native = crate::state::native::NativeResources::for_engine(&*self.engine);
+        // "Primary identifiers can be specified as a string or JSON": the reference the
+        // request carried is read as the identifier the resource answers to before anything
+        // is resolved, the way every operation that takes an `Identifier` reads it.
+        input.identifier = crate::state::addressed_identifier(
+            &input.type_name,
+            &input.identifier,
+            native
+                .provider(&input.type_name)
+                .map(crate::state::native::NativeResourceProvider::identifier_property),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
         let mut store = state.lock();
         store.materialise_due(now, &native);
 

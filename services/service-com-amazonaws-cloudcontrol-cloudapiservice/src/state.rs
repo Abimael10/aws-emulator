@@ -32,7 +32,10 @@ pub mod native;
 mod primary_identifiers;
 mod request_listing;
 
-pub use primary_identifiers::handler_rendered_identifier;
+pub use primary_identifiers::{
+    addressed_identifier, compound_identifier_properties, handler_rendered_identifier,
+    identifier_properties, model_identifier, COMPOUND_IDENTIFIER_DELIMITER,
+};
 pub use request_listing::{
     decode_request_page_token, request_page_token, RequestFilter, RequestPosition,
     INVALID_NEXT_TOKEN,
@@ -692,11 +695,8 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
                 // request addressed it by: a type whose owning service ASSIGNS the
                 // identifier resolves more than one reference to one resource, and every
                 // answer about it names the one value it answers to.
-                let own = properties
-                    .get(identifier_property)
-                    .and_then(Value::as_str)
-                    .unwrap_or(identifier)
-                    .to_string();
+                let own = model_identifier(type_name, &properties, identifier_property)
+                    .unwrap_or_else(|| identifier.to_string());
                 ResolvedResource {
                     type_name: type_name.to_string(),
                     identifier: own,
@@ -1138,6 +1138,12 @@ pub fn identifier_text(value: &Value) -> Option<String> {
 /// The primary identifier of the resource `properties` describes, by the one rule every
 /// create applies ([`identifier_property_candidates`]).
 pub fn derive_identifier(properties: &Value, type_name: &str) -> DerivedIdentifier {
+    // A type whose schema points `primaryIdentifier` at several properties is identified by
+    // all of them together, so the identifier is read from those properties rather than from
+    // the one a name convention would pick ([`primary_identifiers`]).
+    if let Some(pointers) = compound_identifier_properties(type_name) {
+        return primary_identifiers::derive_compound_identifier(properties, pointers);
+    }
     for candidate in identifier_property_candidates(type_name) {
         let Some((property, value)) = property_named(properties, &candidate) else {
             continue;
@@ -1973,11 +1979,11 @@ const CREATE_ONLY_PROPERTIES: &[(&str, &[&str])] = &[
 
 /// The properties a patch may not change for `type_name`, whose primary identifier the
 /// resource carries under `identifier_property`: the type's declared
-/// `createOnlyProperties`, and that identifier property wherever the schema's list does
-/// not already name it.
+/// `createOnlyProperties`, and every property that identifier is made of
+/// ([`identifier_properties`]) wherever the schema's list does not already name it.
 ///
-/// Kept in the schema's own order, with the identifier first where it is added, so a
-/// refusal lists the offending properties the way the schema declares them.
+/// Kept in the schema's own order, with the identifier's properties first where they are
+/// added, so a refusal lists the offending properties the way the schema declares them.
 pub fn create_only_properties(type_name: &str, identifier_property: &str) -> Vec<String> {
     let declared = CREATE_ONLY_PROPERTIES
         .iter()
@@ -1985,8 +1991,16 @@ pub fn create_only_properties(type_name: &str, identifier_property: &str) -> Vec
         .map(|(_, properties)| *properties)
         .unwrap_or(&[]);
     let mut properties: Vec<String> = declared.iter().map(|name| (*name).to_string()).collect();
-    if !properties.iter().any(|name| name == identifier_property) {
-        properties.insert(0, identifier_property.to_string());
+    // Every property the type's primary identifier is made of, which for a type whose schema
+    // points `primaryIdentifier` at several of them is all of them: each one addresses the
+    // resource, so none can change while the resource stays the same resource.
+    for identifier in identifier_properties(type_name, identifier_property)
+        .into_iter()
+        .rev()
+    {
+        if !properties.contains(&identifier) {
+            properties.insert(0, identifier);
+        }
     }
     properties
 }
@@ -1998,12 +2012,72 @@ pub fn create_only_properties(type_name: &str, identifier_property: &str) -> Vec
 /// Takes the whole set, because one patch document can touch several create-only
 /// properties and the diagnostic lists them together.
 pub fn not_updatable_message(properties: &[&str]) -> String {
+    invalid_patch_update_message("createOnlyProperties", properties)
+}
+
+/// The properties a resource type's registry schema declares `readOnlyProperties`, keyed by
+/// `TypeName`.
+///
+/// Catalog source: the `readOnlyProperties` list of each type's resource provider schema, as
+/// CloudFormation publishes it (`DescribeType`), with the `/properties/` prefix of each
+/// pointer dropped — it is put back wherever a pointer is rendered
+/// ([`read_only_message`]).
+///
+/// A read-only property is one the OWNING service computes: it is part of the model every
+/// read reports, and no desired state or patch may set it ([`read_only_properties`]).
+const READ_ONLY_PROPERTIES: &[(&str, &[&str])] = &[
+    ("AWS::CloudWatch::Alarm", &["Arn"]),
+    ("AWS::DynamoDB::Table", &["Arn", "StreamArn"]),
+    ("AWS::IAM::ManagedPolicy", &["PolicyArn", "PolicyId", "AttachmentCount", "CreateDate", "DefaultVersionId", "IsAttachable", "PermissionsBoundaryUsageCount", "UpdateDate"]),
+    ("AWS::Logs::LogGroup", &["Arn"]),
+    ("AWS::S3::Bucket", &["Arn", "DomainName", "DualStackDomainName", "RegionalDomainName", "WebsiteURL"]),
+    ("AWS::SNS::Topic", &["TopicArn"]),
+    ("AWS::SQS::Queue", &["Arn", "QueueUrl"]),
+    ("AWS::StepFunctions::StateMachine", &["Arn", "Name", "StateMachineRevisionId"]),
+];
+
+/// The properties of `type_name` a patch may not name at all: the type's declared
+/// `readOnlyProperties`, EXCEPT any the resource is addressed by.
+///
+/// A read-only property is the owning service's to compute, so "a property included in this
+/// resource operation is read-only" is a fault in the patch itself rather than a verdict a
+/// handler reaches about the resource. A property that is ALSO the type's primary identifier
+/// is left out here: a patch that would change it is refused as the create-only property it
+/// is ([`create_only_properties`]), under the one refusal that states the identifier cannot
+/// move, rather than under two.
+pub fn read_only_properties(type_name: &str, identifier_property: &str) -> Vec<String> {
+    let addressed = identifier_properties(type_name, identifier_property);
+    READ_ONLY_PROPERTIES
+        .iter()
+        .find(|(name, _)| *name == type_name)
+        .map(|(_, properties)| *properties)
+        .unwrap_or(&[])
+        .iter()
+        .map(|property| (*property).to_string())
+        .filter(|property| !addressed.contains(property))
+        .collect()
+}
+
+/// How a mutating operation words a patch that names a read-only property: the same patch
+/// diagnostic as [`not_updatable_message`], naming the offending properties as the pointers
+/// the type's `readOnlyProperties` list spells them with.
+pub fn read_only_message(properties: &[&str]) -> String {
+    invalid_patch_update_message("readOnlyProperties", properties)
+}
+
+/// How a mutating operation words a patch refused because of WHICH properties it names:
+/// the schema list that classifies them, and those properties as the pointers into the
+/// type's registry schema that list spells them with.
+///
+/// One wording for both classifications, because Cloud Control API states them alike and
+/// only the list's own name differs.
+fn invalid_patch_update_message(classification: &str, properties: &[&str]) -> String {
     let pointers: Vec<String> = properties
         .iter()
         .map(|property| format!("{PROPERTY_POINTER_PREFIX}{property}"))
         .collect();
     format!(
-        "Invalid patch update: createOnlyProperties [{}] cannot be updated",
+        "Invalid patch update: {classification} [{}] cannot be updated",
         pointers.join(", ")
     )
 }

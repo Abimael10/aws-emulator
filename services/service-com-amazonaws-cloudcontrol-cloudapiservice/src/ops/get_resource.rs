@@ -204,6 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let mut input = input;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetResourceErrorModeled::ServiceInternalErrorException(
                 ServiceInternalErrorException {
@@ -239,16 +240,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut store = state.lock();
         // The Region this call addressed, as its SigV4 credential scope names it: this
         // operation "can be used to return information about an existing resource in your
         // account and Amazon Web Services Region", so a resource of a type whose owning
         // service holds one namespace per Region is resolved THERE.
         let region = crate::state::request_region(ctx.parts());
+        let native = crate::state::native::NativeResources::for_engine(&*self.engine);
+        // "Primary identifiers can be specified as a string or JSON"
+        // (`GetResource$Identifier`): the reference the request carried is read as the
+        // identifier the resource answers to before anything is resolved, so a request may
+        // address a resource by that identifier or by a JSON object of the schema's
+        // identifier properties — and a reference of neither form is refused by the front
+        // door rather than reported as a resource that cannot be found.
+        input.identifier = crate::state::addressed_identifier(
+            &input.type_name,
+            &input.identifier,
+            native
+                .provider(&input.type_name)
+                .map(crate::state::native::NativeResourceProvider::identifier_property),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let mut store = state.lock();
         // What the clock already owes the store: a create whose work has fallen due has
         // provisioned its resource and a delete whose work has fallen due has removed
         // one, whether or not anybody called in between.
-        let native = crate::state::native::NativeResources::for_engine(&*self.engine);
         store.materialise_due(::std::time::SystemTime::now(), &native);
         // "You can use this action to return information about an existing resource in
         // your account and Amazon Web Services Region, whether those resources were
