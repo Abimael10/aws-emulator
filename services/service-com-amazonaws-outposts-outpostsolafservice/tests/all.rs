@@ -93,6 +93,8 @@ mod order_quote_references;
 mod orderable_instance_types;
 #[path = "all/outpost_assets.rs"]
 mod outpost_assets;
+#[path = "all/outpost_billing_information.rs"]
+mod outpost_billing_information;
 #[path = "all/outpost_decommission.rs"]
 mod outpost_decommission;
 #[path = "all/outpost_deletion_cascade.rs"]

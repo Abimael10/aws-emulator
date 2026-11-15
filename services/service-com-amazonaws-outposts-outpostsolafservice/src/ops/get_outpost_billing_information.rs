@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetOutpostBillingInformation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetOutpostBillingInformation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the current and historical billing information of the Outpost
+//! the `OutpostIdentifier` names, resolved from either the bare id or the full ARN the
+//! modelled label pattern accepts — the subscriptions the orders placed on it and the
+//! renewal contracts bought for it create, one page of them at a time, beside the
+//! terms of the contract in force on it now.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetOutpostBillingInformation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A read: it answers from what is persisted for the Outpost
+//! ([`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::outpost_billing`]),
+//! so a caller that asks for an Outpost's billing information sees exactly what the
+//! next caller does. The one thing it writes is the order progress the CLOCK had
+//! already made due — a subscription is billed from the instant the hardware its order
+//! delivers is installed, so the report is derived off the orders as they stand at the
+//! instant it is asked for.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +157,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetOutpostBillingInformation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetOutpostBillingInformationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetOutpostBillingInformation"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetOutpostBillingInformationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Outposts store is unavailable".to_string()),
+                },
+            )
+        })?;
+        // The region this request is addressed to: an Outpost is part of its own
+        // region's inventory and of no other's, so that is where the identifier is
+        // resolved — and with it the orders and contracts this store records for it.
+        let region = crate::state::request_region(ctx.parts());
+        // `OutpostIdentifier` accepts the bare id or the full Outpost ARN. A bare id
+        // names an Outpost of the inventory this endpoint serves; an ARN carries a
+        // partition, a Region and an account of its own, and one that is not this
+        // endpoint's names no Outpost it holds — so there is no billing information of
+        // it here to report.
+        let not_found = || {
+            GetOutpostBillingInformationErrorModeled::NotFoundException(NotFoundException {
+                // The identifier echo, of the value AS SUPPLIED — not of
+                // `outpost_id`, which is the bare id an ARN resolved to.
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                    &input.outpost_identifier,
+                )),
+            })
+        };
+        // A value that is no Outpost identifier at all is a bad request. This
+        // operation's model declares no `ValidationException` of its own, so the
+        // refusal is the 400 the error channel words such a request with — never a
+        // 501, which means "not written yet".
+        let outpost_id = crate::state::resolve_outpost_id(&input.outpost_identifier, &region)
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(
+                    crate::state::outpost_identifier_pattern_report(),
+                )
+            })?
+            .here()
+            .ok_or_else(not_found)?
+            .to_string();
+
+        // The resume point the caller's token names, by the rule
+        // `crate::state::page_boundary` states for every paged answer of this service:
+        // a token it did not issue for THIS report is a bad request, not an empty page.
+        // The report is cut from ONE Outpost's subscriptions, so the stamp it names is
+        // the kind together with that Outpost (`crate::state::nested_page_kind`) and a
+        // token minted while paging another Outpost's report is refused here.
+        let stamp =
+            crate::state::nested_page_kind(crate::state::BILLING_SUBSCRIPTION_PAGE, &[&outpost_id]);
+        let after = crate::state::page_boundary(&stamp, Self::NAME, input.next_token.as_deref())
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        let size = crate::state::page_size(input.max_results);
+
+        let mut store = state.lock();
+        // A subscription on hardware is billed from the instant that hardware is
+        // installed, which is the step that COMPLETES the order it was delivered by —
+        // so the order progress the clock had already made due is materialised before
+        // the report is derived. It writes only what the clock owed at that same
+        // instant, so this answers the billing information the Outpost would carry had
+        // nobody called at all.
+        store.settle_orders();
+        // The billing information is reported OF one Outpost, so one the store does
+        // not hold is the not-found error this operation models, worded as the
+        // identifier echo of the value AS SUPPLIED — not of the bare id an ARN
+        // resolved to.
+        if store.outpost(&region, &outpost_id).is_none() {
+            return Err(not_found().into());
+        }
+        let billing = store.outpost_billing(&region, &outpost_id);
+        // The boundary a page of this report stops at is a place in the report's own
+        // derivation order: a reported subscription is the billing record of an order
+        // or of a renewal contract rather than a resource this store created, so there
+        // is no creation sequence of one to name, and that derivation fixes the order
+        // the whole report is answered in
+        // (`crate::state::BILLING_SUBSCRIPTION_PAGE`).
+        let (subscriptions, next_token) = crate::state::page(
+            &stamp,
+            billing
+                .subscriptions
+                .into_iter()
+                .enumerate()
+                .map(|(position, subscription)| (position as u64, subscription)),
+            after,
+            size,
+        );
+
+        Ok(GetOutpostBillingInformationOutput {
+            // "The subscription details for the specified Outpost": the ones this page
+            // covers, which for an Outpost nothing was ever ordered for is none at
+            // all.
+            subscriptions: Some(subscriptions),
+            next_token,
+            // The contract in force on the Outpost NOW, which is what the three
+            // members that state one report — absent together for an Outpost with no
+            // contract in force, because there is then no current term to state.
+            contract_end_date: billing.contract_end_date,
+            payment_term: billing.payment_term,
+            payment_option: billing.payment_option,
+        })
     }
 }

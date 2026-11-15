@@ -30,11 +30,14 @@
 //!   weighing of a requested capacity configuration against what is available.
 //! * [`quotes`] — the pricing options a renewal and a quote are answered with, and
 //!   the checks an order submitted from a quote must pass.
+//! * [`billing`] — the subscriptions an Outpost's orders and renewal contracts
+//!   create, and the contract term in force on it.
 //! * [`lifecycle`] — the Outpost installs, capacity-task steps, quote expiries and
 //!   order progress the CLOCK owes, materialised by the read that comes after them.
 //! * [`conflicts`] — the work this store still owes a resource and the resources
 //!   still associated with one: the facts a refusal is answered on.
 
+mod billing;
 mod capacity;
 mod catalog;
 mod conflicts;
@@ -42,6 +45,12 @@ mod lifecycle;
 mod quotes;
 mod store;
 
+pub use billing::{
+    OutpostBilling, BILLING_SUBSCRIPTION_PAGE, SUBSCRIPTION_ID_PREFIX,
+    SUBSCRIPTION_STATUS_ACTIVE, SUBSCRIPTION_STATUS_CANCELLED, SUBSCRIPTION_STATUS_INACTIVE,
+    SUBSCRIPTION_STATUS_PENDING, SUBSCRIPTION_TYPE_CAPACITY_INCREASE, SUBSCRIPTION_TYPE_ORIGINAL,
+    SUBSCRIPTION_TYPE_RENEWAL,
+};
 pub use catalog::{
     capacity_instance_type, catalog_item_catalog, instance_type_specifications,
     orderable_instance_type_catalog, CatalogItemRecord, OrderableInstanceTypeRecord,
@@ -63,7 +72,7 @@ use crate::ops::types::{
     CapacityTaskFailure, ComputeAttributes, ConnectionDetails, InstanceTypeCapacity,
     InstanceTypeItem, InstancesToExclude, LineItem, LineItemAssetInformation, Order,
     OrderingRequirement, Outpost, PricingOption, PrivateConnectivityConfig, Quote, QuoteCapacity,
-    QuoteOption, Site, SubscriptionPricingDetails, VpcInformation,
+    QuoteOption, Site, Subscription, SubscriptionPricingDetails, VpcInformation,
 };
 
 /// The region every minted ARN falls back to when the request carries no SigV4
