@@ -226,6 +226,8 @@ mod invalidation_path_set;
 mod key_group_config_read;
 #[path = "all/key_group_delete.rs"]
 mod key_group_delete;
+#[path = "all/key_group_delete_refusal_order.rs"]
+mod key_group_delete_refusal_order;
 #[path = "all/key_group_lifecycle.rs"]
 mod key_group_lifecycle;
 #[path = "all/key_group_list.rs"]

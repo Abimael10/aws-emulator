@@ -2019,3 +2019,6 @@ mod ses_configuration_set_cursor_shared_across_v1_and_v2;
 // suite, sorted by name, and no other line — not a note, not a blank one — so two branches
 // landing at once insert two lines in two places and have no prose to duplicate, re-word or
 // file at all, no landing can put one past the first item.
+// EVERY comment in this file is an ordinary `//` one, this header included. An inner doc
+// `E0753` and compiles no suite of this target; with none anywhere in the file, no merge of
+// name is `E0428` and fails every suite in this target.
