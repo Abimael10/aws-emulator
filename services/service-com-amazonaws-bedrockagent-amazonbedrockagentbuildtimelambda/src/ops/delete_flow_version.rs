@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFlowVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFlowVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFlowVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes the numbered version the request addresses out of the store, so a
+//! following `GetFlowVersion` or `ListFlowVersions` no longer reports it while
+//! the flow it was cut from keeps every other version.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +153,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFlowVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFlowVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFlowVersion"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteFlowVersionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the bedrock-agent store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The modelled `FlowIdentifier` admits a flow ARN or a bare flow id and
+        // nothing else. The boundary validator lets other values through — the
+        // pattern's top-level alternation leaves the second branch anchored only
+        // at its end — so an identifier of neither form is refused here as the
+        // bad request it is, rather than reported as a missing flow.
+        let Some(flow_id) = crate::state::flow_id_from_identifier(&input.flow_identifier) else {
+            return Err(DeleteFlowVersionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::flow_identifier_pattern_message(
+                        &input.flow_identifier,
+                    )),
+                    field_list: None,
+                },
+            )
+            .into());
+        };
+        let flow_id = flow_id.to_string();
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialise_due_transitions(now);
+
+        // The two resources this call addresses are refused apart, exactly as
+        // the read of a version refuses them: a flow that is not there is a
+        // missing `Flow`, and a flow that was never cut at the number asked for
+        // is a missing `FlowVersion`.
+        if !state.flows.contains_key(&flow_id) {
+            return Err(DeleteFlowVersionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::flow_not_found_message(Self::NAME)),
+                },
+            )
+            .into());
+        }
+        // The version the response reports is read off the stored record before
+        // anything is written, so the answer names the resource that was there
+        // rather than the token the request spelled it with.
+        let Some(version) = state
+            .flow_version_of(&flow_id, &input.flow_version)
+            .map(|record| record.version)
+        else {
+            return Err(DeleteFlowVersionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::flow_version_not_found_message(Self::NAME)),
+                },
+            )
+            .into());
+        };
+
+        // `skipResourceInUseCheck` is documented "By default, this value is
+        // false and deletion is stopped if the resource is in use. If you set it
+        // to true, the resource will be deleted even if the resource is in use."
+        // What uses a numbered version is an alias routing to it, so the check
+        // is that reference: while one holds, the delete is refused with the
+        // modelled `ConflictException` naming the alias the caller has to deal
+        // with first, and nothing is removed.
+        if !input.skip_resource_in_use_check {
+            if let Some(alias_id) = state
+                .flow_alias_routing_to_version(&flow_id, &input.flow_version)
+                .map(|alias| alias.alias_id.clone())
+            {
+                return Err(DeleteFlowVersionErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(crate::state::flow_in_use_by_alias_conflict_message(
+                            Self::NAME,
+                            &alias_id,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The version is removed here and now: `DeleteFlowVersionResponse`
+        // carries only the ids, and the modelled `FlowStatus` has no value for a
+        // version being deleted, so there is no transient status for a reader to
+        // observe and nothing for the clock to owe. The flow itself and the
+        // versions cut either side of this one stay exactly as they were, and so
+        // does the flow's numbering: the next cut takes the next number rather
+        // than the one this version held.
+        state.remove_flow_version(&flow_id, &input.flow_version);
+
+        Ok(DeleteFlowVersionOutput {
+            id: flow_id,
+            version: version.to_string(),
+        })
     }
 }

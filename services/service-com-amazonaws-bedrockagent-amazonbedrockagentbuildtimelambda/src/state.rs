@@ -721,6 +721,16 @@ pub fn flow_not_found_message(operation: &str) -> String {
     resource_not_found_message(operation, "Flow")
 }
 
+/// The version number a modelled `NumericalVersion` token counts, or `None`
+/// when the token counts none.
+///
+/// The shape is `pattern ^[0-9]{1,5}$` and a version is held as the integer it
+/// counts, so this is the one place the wire token and the stored number are
+/// related: every lookup of a numbered version goes through it.
+pub fn numerical_version(flow_version: &str) -> Option<u32> {
+    flow_version.parse::<u32>().ok()
+}
+
 /// The `ConflictException` message an operation answers when the resource it
 /// addresses is in a status that does not serve the operation at all.
 ///
@@ -935,7 +945,7 @@ impl FlowVersionCursor {
         let numeric = (1..=NUMERICAL_VERSION_DIGITS).contains(&token.len())
             && is_counted_token_position(token);
         numeric
-            .then(|| token.parse::<u32>().ok())
+            .then(|| numerical_version(token))
             .flatten()
             .map(Self::Numbered)
     }
@@ -3378,8 +3388,28 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     /// A numbered version is identified by the pair, so one flow never reports
     /// another flow's version.
     pub fn flow_version_of(&self, flow_id: &str, flow_version: &str) -> Option<&FlowVersionRecord> {
-        let version = flow_version.parse::<u32>().ok()?;
+        let version = numerical_version(flow_version)?;
         self.flow_versions.get(&(flow_id.to_string(), version))
+    }
+
+    /// Forget the numbered version the modelled `NumericalVersion` token names
+    /// on this flow, and the index that let a repeated cut replay it; `None`
+    /// when the flow holds no version under that number, which is the one thing
+    /// that makes a delete of it a missing resource.
+    ///
+    /// The flow's numbering is left where it stands: [`FlowRecord::versions_cut`]
+    /// is a high-water mark, so the next cut takes the next number rather than
+    /// the one the removed version held.
+    pub fn remove_flow_version(
+        &mut self,
+        flow_id: &str,
+        flow_version: &str,
+    ) -> Option<FlowVersionRecord> {
+        let version = numerical_version(flow_version)?;
+        let record = self.flow_versions.remove(&(flow_id.to_string(), version))?;
+        self.flow_version_client_tokens
+            .retain(|(versioned_flow_id, _), cut| versioned_flow_id != flow_id || *cut != version);
+        Some(record)
     }
 
     /// The numbered versions this flow has been cut into.

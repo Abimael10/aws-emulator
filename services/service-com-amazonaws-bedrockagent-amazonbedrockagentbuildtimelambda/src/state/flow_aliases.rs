@@ -201,6 +201,22 @@ pub fn flow_version_not_found_message(operation: &str) -> String {
     resource_not_found_message(operation, "FlowVersion")
 }
 
+/// The `ConflictException` message a delete answers when the in-use check its
+/// `skipResourceInUseCheck` member governs finds an alias still routing to the
+/// resource the request names.
+///
+/// The sentence is this service's, with two variable parts: `operation`, the
+/// operation the caller invoked, and `alias_id`, the alias in state that still
+/// references the resource — the one thing the caller has to act on to unblock
+/// the delete.
+pub fn flow_in_use_by_alias_conflict_message(operation: &str, alias_id: &str) -> String {
+    format!(
+        "Couldn't perform {operation} operation. The Flow that you specified is currently \
+         in use by the following alias: {alias_id}. Retry your request after the alias has \
+         finished using the Flow."
+    )
+}
+
 /// A `ListFlowAliases` resume cursor: how many of one flow's aliases the listing
 /// has already reported, in the order
 /// [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::page_of_flow_aliases`]
@@ -299,6 +315,33 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             return self.flows.contains_key(flow_id);
         }
         self.flow_version_of(flow_id, flow_version).is_some()
+    }
+
+    /// The alias of `flow_id` whose routing configuration still points at the
+    /// version the modelled `NumericalVersion` token names, or `None` when no
+    /// alias of the flow routes there.
+    ///
+    /// An alias routes to a VERSION of its flow, so the comparison is on the
+    /// number the token counts rather than on how it is spelled, and the flow's
+    /// DRAFT version — which is no numbered version at all — matches nothing
+    /// here. When several aliases route to the same version the earliest-created
+    /// one is reported, so a refusal naming it names the same alias however the
+    /// store happens to be iterated.
+    pub fn flow_alias_routing_to_version(
+        &self,
+        flow_id: &str,
+        flow_version: &str,
+    ) -> Option<&FlowAliasRecord> {
+        let version = numerical_version(flow_version)?;
+        self.flow_aliases
+            .values()
+            .filter(|record| {
+                record.flow_id == flow_id
+                    && record.routing_configuration.iter().any(|item| {
+                        item.flow_version.as_deref().and_then(numerical_version) == Some(version)
+                    })
+            })
+            .min_by_key(|record| record.sort_key())
     }
 
     /// One `ListFlowAliases` page: this flow's aliases in creation order and

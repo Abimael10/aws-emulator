@@ -1551,3 +1551,10 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 //! service crate, belongs in that suite's own module doc, where it is read with the test
 //! it describes. `all/all_rs_declares_each_suite_once.rs`,
 //! `all/all_rs_is_a_canonical_declaration_list.rs` check these rules.
+// pair, keeping the list sorted: one pair per suite and nothing else, so a landing has one
+// place to insert and nothing to keep consistent.
+// A suite that is not declared here compiles nowhere and its tests never run; a suite left
+// at the top level of `tests/` fails the build; and a suite declared twice is `E0428`,
+// which compiles no suite of this target.
+// past the declarations is `E0753` and compiles no suite of this target. With no inner doc
+// comment anywhere, no merge of two landings can put one past the first item.
