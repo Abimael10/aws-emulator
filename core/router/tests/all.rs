@@ -4893,3 +4893,10 @@ mod appended_notes;
 //! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod <name>;` resolves to a sibling
 //! of this file: every declaration carries `#[path = "all/<name>.rs"]`, which is the other
 //! half those two suites check.
+//! in this target. An inner doc comment (`//!`) is legal only BEFORE the first item, so
+//! these header lines are the only place one may stand — past the first item it is `E0753`
+//! and compiles no suite of this target, so a note lower down must be an ordinary `//`
+//! comment. `all/all_rs_declares_each_suite_once.rs` checks the declarations and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` checks the notes, for this file
+//! and for every service crate's `tests/all.rs`, so add a declaration here and leave the
+//! rules to those suites.

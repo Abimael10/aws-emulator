@@ -229,13 +229,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // concurrent attempts all get the same answer and none of them leaves a
         // view behind. See `organization_management_account_id` for why the
         // emulated standalone account is not one.
+        // The refusal's sentence is FIXED for this error class
+        // (`state::NOT_ORGANIZATION_MANAGEMENT_ACCOUNT`): it names neither the
+        // caller's account nor anything the request carried, so the text is the
+        // same for every caller and every request that reaches this gate.
         let caller = crate::state::caller_account_id();
         if !state.is_organization_management_account(caller) {
             return Err(CreateBillingViewErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "Account {caller} is not the management account of an organization. \
-                     Only the management account can create a billing view."
-                ),
+                message: crate::state::NOT_ORGANIZATION_MANAGEMENT_ACCOUNT.to_string(),
                 reason: crate::state::VALIDATION_REASON_OTHER.to_string(),
                 field_list: None,
             })

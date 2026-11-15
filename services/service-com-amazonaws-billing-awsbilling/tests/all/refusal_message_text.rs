@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The MESSAGE TEXT of two billing refusals, end to end over the awsJson1_0
-//! wire — the status and the error code of both are asserted elsewhere; what is
+//! The MESSAGE TEXT of three billing refusals, end to end over the awsJson1_0
+//! wire — the status and the error code of each is asserted elsewhere; what is
 //! asserted here is the sentence each one serializes.
 //!
-//! Two rules, each asserted over the whole class of inputs it holds for, not
+//! Three rules, each asserted over the whole class of inputs it holds for, not
 //! over one request:
 //!
 //! 1. The per-feature billing-access `AccessDeniedException` reports, in its
@@ -22,6 +22,14 @@
 //!    in how many source views they name and whether the view holds them, and
 //!    the view-lifecycle writers' differently-worded refusal on the same views is
 //!    the control.
+//!
+//! 3. An operation reserved to the organization's management account refuses
+//!    every other caller with a sentence that is fixed for the error class: it
+//!    interpolates no account id and no value the request carried. The rows span
+//!    the ways a caller can fail the gate (no organization at all, an
+//!    organization another account manages) crossed with requests that differ in
+//!    every member the operation takes, and the management account itself is the
+//!    control.
 //!
 //! The harness (`call`, `error_code`, …) is the one `billing_views.rs` owns.
 
@@ -270,6 +278,193 @@ async fn disassociating_from_a_non_custom_view_answers_its_own_sentence() {
          got {:?}",
         message(&body)
     );
+}
+
+/// AWS's sentence pair for an organization-management-account operation called
+/// by any other caller: fixed text for the error class, interpolating nothing —
+/// no account id, no name, no ARN, no request value.
+const NOT_MANAGEMENT_ACCOUNT_SENTENCE: &str =
+    "User account is not an AWS Organization's management account. \
+     This operation is only permitted to management accounts.";
+
+/// Put the organization's management account at `management_account`: `None`
+/// models a standalone account, `Some(id)` an account whose organization some
+/// other account manages.
+fn set_organization_management_account(
+    engine: &Arc<engine::InMemoryEngine>,
+    management_account: Option<&str>,
+) {
+    engine
+        .state::<ComAmazonawsBillingAwsbillingState>()
+        .lock()
+        .organization_management_account_id = management_account.map(str::to_string);
+}
+
+/// The `CUSTOM` views the account holds, by name.
+async fn custom_view_names(router: &MultiServiceRouter) -> Vec<String> {
+    let (status, listed) = call(
+        router,
+        "ListBillingViews",
+        &json!({ "billingViewTypes": ["CUSTOM"] }),
+    )
+    .await;
+    assert_eq!(status, 200, "the control list answers, got {listed:?}");
+    listed["billingViews"]
+        .as_array()
+        .expect("billingViews is a list")
+        .iter()
+        .map(|view| view["name"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_caller_that_is_not_the_management_account_reads_the_fixed_sentence() {
+    // The ways the caller can fail the gate: it belongs to no organization at
+    // all, or to one a DIFFERENT account manages — two of those, so a message
+    // that named the managing account instead of the caller would be caught too.
+    let worlds: Vec<(&str, Option<&str>)> = vec![
+        ("no organization", None),
+        ("an organization managed by another account", Some("111111111111")),
+        ("an organization managed by a third account", Some("999999999999")),
+    ];
+
+    // Requests differing in every member `CreateBillingView` declares — source:
+    // `smithy_query(query="operation", operation="CreateBillingView")`: the name
+    // at both modeled length bounds (1 and 128) and in several of the shapes its
+    // pattern admits, with and without a description, naming one source view and
+    // the modeled maximum of ten, with tags, with a client token, and with a
+    // data filter expression. None of it reaches the message.
+    let shortest_name = "a".to_string();
+    let longest_name = "n".repeat(128);
+    let ten_sources: Vec<String> = (0..10).map(|i| source_arn(&format!("mgmt-{i}"))).collect();
+    let requests: Vec<(&str, Value)> = vec![
+        (
+            "the shortest name the model admits",
+            json!({ "name": shortest_name, "sourceViews": [PRIMARY_ARN] }),
+        ),
+        (
+            "the longest name the model admits",
+            json!({ "name": longest_name, "sourceViews": [PRIMARY_ARN] }),
+        ),
+        (
+            "a name carrying spaces and the punctuation the pattern admits",
+            json!({ "name": "a view _+=.-@ 1", "sourceViews": [PRIMARY_ARN] }),
+        ),
+        (
+            "a described view",
+            json!({
+                "name": "described",
+                "description": "a described view",
+                "sourceViews": [PRIMARY_ARN],
+            }),
+        ),
+        (
+            "the modeled maximum of ten source views",
+            json!({ "name": "ten-sources", "sourceViews": ten_sources }),
+        ),
+        (
+            "a tagged view",
+            json!({
+                "name": "tagged",
+                "sourceViews": [PRIMARY_ARN],
+                "resourceTags": [{ "key": "team", "value": "finance" }],
+            }),
+        ),
+        (
+            "an idempotent request",
+            json!({
+                "name": "with-token",
+                "sourceViews": [PRIMARY_ARN],
+                "clientToken": "token-1",
+            }),
+        ),
+        (
+            "a filtered view",
+            json!({
+                "name": "filtered",
+                "sourceViews": [PRIMARY_ARN],
+                "dataFilterExpression": {
+                    "dimensions": { "key": "LINKED_ACCOUNT", "values": [ACCOUNT_ID] },
+                },
+            }),
+        ),
+    ];
+
+    for (world, management_account) in &worlds {
+        let (router, engine) = standalone_emulator_with_engine();
+        set_organization_management_account(&engine, *management_account);
+
+        for (what, body) in &requests {
+            let case = format!("{what}, caller in {world}");
+            let (status, got) = call(&router, "CreateBillingView", body).await;
+            assert_eq!(
+                (status, error_code(&got).as_str()),
+                (400, "ValidationException"),
+                "case {case:?}: expected 400 ValidationException, got {status} {got:?}"
+            );
+            let stated = message(&got);
+            assert_eq!(
+                stated, NOT_MANAGEMENT_ACCOUNT_SENTENCE,
+                "case {case:?}: expected the fixed management-account sentence pair, \
+                 got {stated:?}"
+            );
+            // Fixed means fixed: no account id — the caller's or the managing
+            // one's — and no name the request carried reaches the text, so a
+            // digit anywhere in it is an interpolation.
+            assert!(
+                !stated.chars().any(|character| character.is_ascii_digit()),
+                "case {case:?}: the sentence pair names no account id, got {stated:?}"
+            );
+            // A name short enough to be a substring of ordinary English says
+            // nothing, so the check is on the distinctive ones.
+            let name = body["name"].as_str().unwrap_or_default();
+            assert!(
+                name.len() < 4 || !stated.contains(name),
+                "case {case:?}: the sentence pair names nothing the request carried, \
+                 got {stated:?}"
+            );
+        }
+
+        let names = custom_view_names(&router).await;
+        assert!(
+            names.is_empty(),
+            "case {world:?}: a refused create stores no view, listed {names:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_management_account_itself_is_not_refused() {
+    // The control for the rule above: the sentence belongs to the refusal, so
+    // the one caller the gate admits — the organization's management account —
+    // creates the same views instead of reading it.
+    let (router, engine) = emulator_with_engine();
+    let ten_sources: Vec<String> = (0..10).map(|i| source_arn(&format!("mgmt-ok-{i}"))).collect();
+    crate::billing_views::plant_source_views(&engine, &ten_sources);
+
+    for (case, body) in [
+        (
+            "one source view",
+            json!({ "name": "admitted-one", "sourceViews": [PRIMARY_ARN] }),
+        ),
+        (
+            "ten source views",
+            json!({ "name": "admitted-ten", "sourceViews": ten_sources }),
+        ),
+    ] {
+        let (status, created) = call(&router, "CreateBillingView", &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the management account creates the view, got {status} {created:?}"
+        );
+        let arn = created["arn"].as_str().unwrap_or_default().to_string();
+        let (status, got) = call(&router, "GetBillingView", &json!({ "arn": arn })).await;
+        assert_eq!(
+            (status, got["billingView"]["name"].as_str()),
+            (200, body["name"].as_str()),
+            "case {case:?}: the created view reads back, got {status} {got:?}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -217,6 +217,20 @@ pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
 /// of them answered.
 pub const MANAGED_VIEW_NOT_TAGGABLE: &str = "Managed billing views cannot be tagged";
 
+/// The `message` an operation reserved to the organization's management account
+/// refuses any other caller with.
+///
+/// FIXED text for this error class: the sentence pair interpolates nothing — no
+/// account id, no resource name, no ARN and no value from the request — so the
+/// refusal reads the same whichever caller it answers and whichever operation
+/// made the decision. Shared by every gate that consults
+/// [`ComAmazonawsBillingAwsbillingState::is_organization_management_account`],
+/// so a caller cannot learn from the wording which account the service thinks it
+/// is.
+pub const NOT_ORGANIZATION_MANAGEMENT_ACCOUNT: &str =
+    "User account is not an AWS Organization's management account. \
+     This operation is only permitted to management accounts.";
+
 /// The most credits this emulator keeps resident for the whole billing family.
 ///
 /// `credits` is the store `GetCredits` reports from; like `billing_views` it
