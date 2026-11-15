@@ -2578,3 +2578,15 @@ mod bedrock_agent_ingestion_populates_its_aoss_index;
 // `E0428`. `all/all_rs_carries_no_inner_doc_comment.rs`,
 // This file is a test-target CRATE ROOT, where a bare `mod` would resolve to a SIBLING of it
 // (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each declaration is
+// `tests/all/<name>.rs` and insert its pair into the sorted list below; what that suite covers,
+// and why it drives the assembled router rather than one service crate, belongs in that suite's
+// own module doc, where it is read beside the test it explains.
+// Four sibling suites pin the rules a landing breaks — `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs` — for this file and for every service crate's
+// `tests/all.rs`: a suite no `mod` names compiles nowhere and its tests never run, a suite
+// declared twice is `E0428`, and an inner doc comment is legal only before the first item, so
+// one written past a declaration is `E0753`. Each of the last two fails EVERY suite of this
+// target rather than one, which is why this header is written with ordinary comments
+// throughout: there is no `//!` line in this file for a landing to re-type or merge below the
+// list. This file is a test-target CRATE ROOT, where a bare `mod` would resolve to a sibling of
+// it, which the layout check refuses, so the `#[path]` above each declaration is what points it

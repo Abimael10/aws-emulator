@@ -17,11 +17,14 @@
 //!   endpoints are regional, so each record belongs to the Region its create was
 //!   signed for and is resolved only for requests signed for that Region.
 //!
-//! Attach points are NOT held here: an attach point is a Direct Connect gateway of the
-//! account, so `ListAttachPoints` resolves them against the service that owns them
-//! ([`direct_connect`]) rather than reading a catalog of this service's own — and
-//! `CreateConnection` resolves the attach point it is given through that same walk, so
-//! what a Connection may be attached to is what the listing offers.
+//! Attach points are no catalog of this service's own: `AttachPoint` models two forms of
+//! one, and each is resolved where its resource LIVES. A `directConnectGateway` is a
+//! gateway of the account, so it is resolved against the service that owns those
+//! ([`direct_connect`]); an `arn` is a Connection of this account that is already
+//! providing connectivity, so it is resolved among the records above
+//! ([`arn_attach_point_descriptors`]). `ListAttachPoints` reports BOTH, and both writers
+//! of a connection's attach point resolve what they are given from those same two
+//! readers, so what a Connection may be attached to is exactly what the listing offers.
 //!
 //! Server-owned fields (`id`, `arn`, `sharedId`, `activationKey`, `ownerAccount`,
 //! `provider`, `location`, `type`, `billingTier`, `state`) are computed here or in
@@ -33,8 +36,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    AttachPoint, Bandwidths, Connection, ConnectionSummary, CreateConnectionInput, Environment,
-    Provider, RemoteAccountIdentifier,
+    AttachPoint, AttachPointDescriptor, Bandwidths, Connection, ConnectionSummary,
+    CreateConnectionInput, Environment, Provider, RemoteAccountIdentifier,
 };
 
 /// The secret a listing's page cursors are authenticated under, which is what lets a
@@ -496,53 +499,6 @@ impl ComAmazonawsInterconnectInterconnectState {
             .filter(move |(_, stored)| visible_in(stored, region))
     }
 
-    /// The stored connection an `AmazonResourceName` names field for field IN
-    /// `region`, for the input that carries an ARN as a HANDLE on another resource
-    /// (`AttachPoint$arn`) rather than as the address of the resource it acts on.
-    ///
-    /// Here the ARN identifies the resource in FULL — partition, Region and account
-    /// included — so an ARN whose fields differ from the stored one names a
-    /// resource this store does not hold, exactly as an unknown id does. And the
-    /// store is scoped by the SAME predicate every other resolution here uses
-    /// ([`visible_in`]): a connection belongs to the Region it was created in, so
-    /// an ARN naming one created through another Region's endpoint resolves to
-    /// nothing, whatever that ARN carries. A connection that has reached the
-    /// terminal `deleted` state is gone too: the store keeps the record readable so
-    /// a caller polling a delete sees the terminal state, but a deleted resource is
-    /// no longer one this account holds.
-    pub fn connection_in_by_arn(&self, region: &str, arn: &str) -> Option<&StoredConnection> {
-        let id = connection_id_from_arn(arn)?;
-        self.connections
-            .get(id)
-            .filter(|stored| visible_in(stored, region) && holds_arn(stored, arn))
-    }
-
-    /// The connection `arn` names as an ATTACH POINT in `region`, which is the only
-    /// connection a new Connection is ever provisioned onto by ARN.
-    ///
-    /// Two filters, both of them rules this crate already applies elsewhere. The ARN
-    /// resolves the resource the way a HANDLE on a connection resolves here
-    /// ([`Self::connection_in_by_arn`]): in full, and inside the scope the request
-    /// addressed. And the connectivity behind it has to BE there: an attach point is a
-    /// handle whose whole subject is the connectivity the new Connection is provisioned
-    /// onto, so the handle names something only while the connection behind it is
-    /// providing that connectivity ([`provides_connectivity`]) — the readiness rule the
-    /// union's gateway member is held to as well, where only a gateway that is ready for
-    /// use is a valid attach point ([`direct_connect`]). That covers both ends of the
-    /// connection's life: one still being brought up has no connectivity yet, and one a
-    /// `DeleteConnection` has been made on has none any more — the filter
-    /// [`Self::proposal_in`] applies to the other handle of that kind. The record itself
-    /// stays readable by its identifier and by its ARN, which is how a caller polling the
-    /// delete sees the teardown.
-    pub fn attach_point_connection_in(
-        &self,
-        region: &str,
-        arn: &str,
-    ) -> Option<&StoredConnection> {
-        self.connection_in_by_arn(region, arn)
-            .filter(|stored| provides_connectivity(&stored.connection.state))
-    }
-
     /// The stored connection an `AmazonResourceName` ADDRESSES in `region`, for the
     /// operations whose `arn` member IS the resource they act on (the tag operations).
     ///
@@ -847,36 +803,6 @@ pub fn attach_point_violation(attach_point: &AttachPoint) -> Option<String> {
     }
 }
 
-/// Judge the `attach_point` a request selected for a connection on `environment_id`
-/// against this service's own store, answering `Ok(())` when the connection may be
-/// provisioned onto it.
-///
-/// The ONE rule both writers of a connection's attach point apply (the create that
-/// allocates the first attach point and the acceptance that associates one), so what a
-/// Connection may be attached to does not depend on which operation carried it. Two
-/// things are judged, in this order:
-///
-/// * the value the union carries, against the member's OWN modelled constraints
-///   ([`attach_point_violation`]) — a value outside them is invalid input
-///   ([`direct_connect::AttachPointRefusal::invalid_attach_point`]), never an identifier
-///   resolved against state, so neither member reaches a store lookup or a cross-service
-///   walk as something that is not an identifier of its kind;
-/// * then, for the `arn` member only, the resource it names: the ARN has to name a
-///   connection this store holds as an attach point
-///   ([`ComAmazonawsInterconnectInterconnectState::attach_point_connection_in`]), and one
-///   that does not is the not-found refusal
-///   [`direct_connect::AttachPointRefusal::not_an_attach_point`] — the same refusal,
-///   worded the same way, an identifier the account holds nothing for at all gets, so
-///   what refuses the request never reports what the store does hold for that ARN.
-///
-/// The union's two members are therefore judged through ONE refusal channel: this answers
-/// both members' constraints and the `arn` member's resource against the store under the
-/// caller's lock, and [`direct_connect::judge_attach_point`] answers the
-/// `directConnectGateway` resource — a resource of the service that owns those gateways —
-/// off that lock, under the same readiness rule. Each answers `Ok(())` for what the other
-/// owns, and each scopes itself to the Environment by the same predicate
-/// ([`environment_offers_attach_points`]), so neither member names an attach point valid
-/// for an Environment the other would refuse.
 /// Judge the VALUE an `AttachPoint` carries against its own member's modelled
 /// constraints ([`attach_point_violation`]), through the refusal channel the calling
 /// operation declares: the half of [`judge_attach_point_in_store`] that needs no store
@@ -898,6 +824,92 @@ pub fn judge_attach_point_value<E: direct_connect::AttachPointRefusal>(
     }
 }
 
+/// The descriptor `ListAttachPoints` publishes for one Connection of this account, which
+/// is the attach point `AttachPoint$arn` names.
+///
+/// `AttachPointDescriptor$type` is "the type of this AttachPoint, which will dictate the
+/// syntax of the identifier", so the ARN form ([`ATTACH_POINT_TYPE_ARN`]) carries the
+/// connection's FULL ARN as its `identifier` — the value the member's own pattern spells
+/// out, so what the listing publishes is exactly what a create may send back. `name` is
+/// "the descriptive name of the identifier attach point", which for a Connection is its
+/// own `description`: a create that carried none leaves the record describing the
+/// connection by its id, so the required member is never empty — the same fallback the
+/// gateway form makes ([`direct_connect`]).
+pub fn arn_attach_point_descriptor(connection: &Connection) -> AttachPointDescriptor {
+    AttachPointDescriptor {
+        r#type: ATTACH_POINT_TYPE_ARN.to_string(),
+        identifier: connection.arn.clone(),
+        name: connection.description.clone(),
+    }
+}
+
+/// The ARN attach points `region`'s endpoint offers for `environment`: one descriptor per
+/// Connection of this store that is providing the connectivity a new Connection can be
+/// provisioned onto, in `ConnectionId` order ([`ComAmazonawsInterconnectInterconnectState::connections_in`]).
+///
+/// The counterpart of [`direct_connect::attach_points`] for the member whose resource
+/// this service owns itself, and the ONE reader of it: `ListAttachPoints` publishes this
+/// list and [`judge_attach_point_in_store`] answers an `arn` from the very same list, so
+/// the set the listing offers and the set a create accepts cannot drift apart.
+///
+/// Three rules decide it, each one this crate already applies to the other member. The
+/// Environment has to be able to carry a Connection at all
+/// ([`environment_offers_attach_points`]), because an attach point is where a Connection
+/// on THAT Environment would logically connect. The records are those the called endpoint
+/// holds ([`visible_in`]): a connection created through another Region's endpoint is none
+/// of this one's business, whatever its ARN carries. And the connectivity behind the
+/// handle has to BE there ([`provides_connectivity`]): one still being brought up has
+/// none yet and one a `DeleteConnection` has been made on has none any more, exactly as
+/// only a gateway ready for use is a valid attach point.
+pub fn arn_attach_point_descriptors(
+    store: &ComAmazonawsInterconnectInterconnectState,
+    region: &str,
+    environment: Option<&Environment>,
+) -> Vec<AttachPointDescriptor> {
+    if !environment_offers_attach_points(environment) {
+        return Vec::new();
+    }
+    store
+        .connections_in(region)
+        .map(|(_, stored)| &stored.connection)
+        .filter(|connection| provides_connectivity(&connection.state))
+        .map(arn_attach_point_descriptor)
+        .collect()
+}
+
+/// Judge the `attach_point` a request selected for a connection on `environment_id`
+/// against this service's own store, answering `Ok(())` when the connection may be
+/// provisioned onto it.
+///
+/// The ONE rule both writers of a connection's attach point apply (the create that
+/// allocates the first attach point and the acceptance that associates one), so what a
+/// Connection may be attached to does not depend on which operation carried it. Two
+/// things are judged, in this order:
+///
+/// * the value the union carries, against the member's OWN modelled constraints
+///   ([`attach_point_violation`]) — a value outside them is invalid input
+///   ([`direct_connect::AttachPointRefusal::invalid_attach_point`]), never an identifier
+///   resolved against state, so neither member reaches a store lookup or a cross-service
+///   walk as something that is not an identifier of its kind;
+/// * then, for the `arn` member only, the resource it names: the ARN has to be one of the
+///   ARN attach points this endpoint offers for that Environment
+///   ([`arn_attach_point_descriptors`]) — the same list `ListAttachPoints` publishes, so a
+///   create accepts an ARN exactly when the listing offered it — and the ARN is compared
+///   in FULL against the stored one, so an ARN whose partition, Region or account differs
+///   names no attach point however it is spelled. One that is not among them is the
+///   not-found refusal [`direct_connect::AttachPointRefusal::not_an_attach_point`] — the
+///   same refusal, worded the same way, an identifier the account holds nothing for at
+///   all gets, so what refuses the request never reports what the store does hold for
+///   that ARN.
+///
+/// The union's two members are therefore judged through ONE refusal channel: this answers
+/// both members' constraints and the `arn` member's resource against the store under the
+/// caller's lock, and [`direct_connect::judge_attach_point`] answers the
+/// `directConnectGateway` resource — a resource of the service that owns those gateways —
+/// off that lock, under the same readiness rule. Each answers `Ok(())` for what the other
+/// owns, and each scopes itself to the Environment by the same predicate
+/// ([`environment_offers_attach_points`]), so neither member names an attach point valid
+/// for an Environment the other would refuse.
 pub fn judge_attach_point_in_store<E: direct_connect::AttachPointRefusal>(
     store: &ComAmazonawsInterconnectInterconnectState,
     region: &str,
@@ -908,8 +920,10 @@ pub fn judge_attach_point_in_store<E: direct_connect::AttachPointRefusal>(
     let AttachPoint::Arn(arn) = attach_point else {
         return Ok(());
     };
-    if environment_offers_attach_points(environment_in_region(region, environment_id).as_ref())
-        && store.attach_point_connection_in(region, arn).is_some()
+    let environment = environment_in_region(region, environment_id);
+    if arn_attach_point_descriptors(store, region, environment.as_ref())
+        .iter()
+        .any(|descriptor| descriptor.identifier == *arn)
     {
         return Ok(());
     }
@@ -1594,12 +1608,6 @@ fn exists_as_resource(stored: &StoredConnection) -> bool {
     stored.connection.state != DELETED_CONNECTION_STATE
 }
 
-/// Whether `stored` is the live resource `arn` names: the stored ARN matches field
-/// for field, and the connection has not reached the terminal deleted state.
-fn holds_arn(stored: &StoredConnection, arn: &str) -> bool {
-    stored.connection.arn == arn && exists_as_resource(stored)
-}
-
 /// The `ConnectionState` a new connection is returned in ("requested: The initial
 /// state of a connection. The state will remain here until the Connection is accepted
 /// on the Partner portal"), which is also the first leg of the progression the clock
@@ -2174,9 +2182,18 @@ pub fn environment_in_region(region: &str, environment_id: &str) -> Option<Envir
     environment_catalog(region).remove(environment_id)
 }
 
-/// The `AttachPointType` every descriptor carries.
+/// The `AttachPointType` a descriptor for a Direct Connect gateway carries.
 ///
-/// `AttachPointType` is an enum whose ONLY modelled value is
-/// `DirectConnectGateway`, so it is the only type a descriptor can report even
-/// though `AttachPointDescriptor$type`'s prose also mentions an ARN form.
+/// `AttachPointDescriptor$type` is "the type of this AttachPoint, which will dictate the
+/// syntax of the identifier", and lists the current types as "ARN" and "DirectConnect
+/// Gateway" — the two forms `AttachPoint` models as its members. This is the one
+/// `AttachPointType` also spells as a modelled value, and the type of a descriptor whose
+/// identifier is a `DirectConnectGatewayID`.
 pub const ATTACH_POINT_TYPE_DIRECT_CONNECT_GATEWAY: &str = "DirectConnectGateway";
+
+/// The `AttachPointType` a descriptor for a Connection of this account carries.
+///
+/// The other current type `AttachPointDescriptor$type` documents, and the one whose
+/// identifier syntax is the full ARN `AttachPoint$arn` "identifies an attach point by"
+/// ([`arn_attach_point_descriptor`]).
+pub const ATTACH_POINT_TYPE_ARN: &str = "ARN";

@@ -2,10 +2,11 @@
 
 //! The account's Direct Connect gateways: facts this service RESOLVES rather than holds.
 //!
-//! `AttachPointType`'s only modelled value is `DirectConnectGateway`, and
 //! `AttachPoint$directConnectGateway` identifies an attach point "by
-//! DirectConnectGatewayID" — so the candidate attach points of an account are the Direct
-//! Connect gateways it holds. Those are resources of Direct Connect, not of this service,
+//! DirectConnectGatewayID" — so one of the two forms of attach point an account has is
+//! the Direct Connect gateways it holds (the other being a Connection of its own, which
+//! [`crate::state::arn_attach_point_descriptors`] reads here). Those gateways are
+//! resources of Direct Connect, not of this service,
 //! so they are read the way any emulated service reaches another: the AWS SDK driven over
 //! the in-process callback ([`smithy_server_runtime::OperationContext::callback`]), so
 //! this crate names no other service's crate.
@@ -268,8 +269,10 @@ pub async fn judge_attach_point<E: AttachPointRefusal>(
     }
 }
 
-/// The attach points valid for `environment`: every Direct Connect gateway of the
-/// account that is ready for use, as the descriptors `ListAttachPoints` reports — and
+/// The GATEWAY attach points valid for `environment`: every Direct Connect gateway of the
+/// account that is ready for use, as the descriptors `ListAttachPoints` reports for them
+/// beside the ARN ones this service holds itself
+/// ([`crate::state::arn_attach_point_descriptors`]) — and
 /// NONE at all for an Environment that carries no Connection
 /// ([`crate::state::environment_offers_attach_points`]), because an attach point is
 /// where a Connection on that Environment would logically connect, so an Environment

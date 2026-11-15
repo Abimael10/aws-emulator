@@ -4,20 +4,22 @@
 //! `crate::emulator` harness (Interconnect and Direct Connect on one engine, as the
 //! assembled emulator mounts them).
 //!
-//! An attach point is a Direct Connect gateway of the account, so every row below
-//! creates its gateways through Direct Connect and then reads them back here. Each
+//! One form of attach point is a Direct Connect gateway of the account, so every row
+//! below creates its gateways through Direct Connect and then reads them back here. Each
 //! assertion is about a RULE, checked over a table built from the LIVE seeded
 //! Environment catalog and from the LIVE gateways rather than from a copy of either: a
 //! row differs in the environment, the provider kind, the gateway's name and ASN, how
 //! many gateways the account holds, the page size, and the shape of the identifier the
-//! caller sends.
+//! caller sends. The other form — an attach point naming a Connection of the account by
+//! ARN — has its own suite (`crate::arn_attach_points_are_listed`).
 
 use std::collections::BTreeSet;
 
 use serde_json::{json, Map, Value};
 
 use crate::emulator::{
-    carries_connections, identifiers, remote_account_for, text, Emulator, ATTACH_POINT_TYPE,
+    attach_point_of, carries_connections, identifiers, of_type, remote_account_for, text, Emulator,
+    ATTACH_POINT_TYPE, ATTACH_POINT_TYPE_ARN, CONNECTION_READY_STATE,
 };
 
 /// `MaxResults` is modelled `@range(min: 1, max: 100)`, so these are the published
@@ -379,8 +381,9 @@ async fn unknown_environment_is_refused_rather_than_answered_empty() {
 }
 
 /// RULE: every attach point `ListAttachPoints` reports for an Environment is usable as
-/// that Environment's `CreateConnection$attachPoint`, and the stored connection reports
-/// the attach point it was created with — so the listing and the connection agree.
+/// that Environment's `CreateConnection$attachPoint` — in whichever member of the union
+/// its `type` names — and the stored connection reports the attach point it was created
+/// with, so the listing and the connection agree.
 #[tokio::test]
 async fn a_listed_attach_point_creates_a_connection_that_reports_it_back() {
     let emulator = Emulator::new();
@@ -409,7 +412,10 @@ async fn a_listed_attach_point_creates_a_connection_that_reports_it_back() {
         for (index, descriptor) in before.iter().enumerate() {
             let identifier = text(descriptor, "identifier");
             let bandwidth = &available[index % available.len()];
-            let attach_point = json!({ "directConnectGateway": identifier });
+            // The member the descriptor's own `type` names: it "will dictate the syntax
+            // of the identifier", so a listed attach point is offered back in the form
+            // the listing reported it in.
+            let attach_point = attach_point_of(descriptor);
             let mut request = Map::new();
             request.insert("environmentId".to_string(), json!(id));
             request.insert("bandwidth".to_string(), json!(bandwidth));
@@ -463,16 +469,52 @@ async fn a_listed_attach_point_creates_a_connection_that_reports_it_back() {
             rows += 1;
         }
 
-        // Listing attach points is @readonly: creating connections against them does
-        // not add, remove or reorder what the account offers.
+        // A Connection does not consume an attach point: the account's gateways are the
+        // same descriptors in the same order after the creates as before them. What the
+        // creates CAN add is an ARN attach point of their own, once the clock has carried
+        // a new connection to `available` — so every descriptor the listing offered is
+        // still offered, and anything new is one of those.
         let after = emulator.attach_points(&id).await;
         assert_eq!(
-            after, before,
-            "case {id:?}: expected the attach-point listing to be unchanged by creates, got {after:?}"
+            of_type(&after, ATTACH_POINT_TYPE),
+            of_type(&before, ATTACH_POINT_TYPE),
+            "case {id:?}: expected the gateway attach points to be unchanged by creates, got {after:?}"
         );
+        for descriptor in &before {
+            assert!(
+                after.contains(descriptor),
+                "case {id:?}: expected the listing still to offer {descriptor:?}, got {after:?}"
+            );
+        }
+        let provisioned: BTreeSet<String> = provisioned_arns(&emulator).await;
+        for descriptor in of_type(&after, ATTACH_POINT_TYPE_ARN) {
+            assert!(
+                provisioned.contains(&text(&descriptor, "identifier")),
+                "case {id:?}: expected an ARN attach point to name a fully provisioned connection of the account, got {descriptor:?} with {provisioned:?}"
+            );
+        }
     }
     assert!(
         rows >= 2,
         "case \"coverage\": expected the table to span at least two attach points, got {rows}"
     );
+}
+
+/// The `arn`s of the connections the default Region's endpoint reports in the state the
+/// model documents as fully provisioned — which is the set an ARN attach point names one
+/// of.
+async fn provisioned_arns(emulator: &Emulator) -> BTreeSet<String> {
+    let listed = emulator
+        .ic_ok(
+            "ListConnections",
+            json!({ "state": CONNECTION_READY_STATE, "maxResults": 100 }),
+        )
+        .await;
+    listed["connections"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|summary| text(summary, "arn"))
+        .collect()
 }

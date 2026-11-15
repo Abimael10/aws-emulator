@@ -141,12 +141,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx);
-        // The attach points come from the service that owns the account's gateways and
-        // the Environment from the called Region's catalog, so this operation reads none
-        // of this service's own records. The store is reached for ONE thing: the secret
-        // its page cursors are authenticated under, which is what tells a `nextToken`
-        // this endpoint issued from one a caller built. `PageTokenKey` is `Copy`, so the
-        // guard is released here and nothing of it is held across the await below.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListAttachPointsErrorModeled::InterconnectServerException(
                 InterconnectServerException {
@@ -156,7 +150,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let token_key = state.lock().page_token_key;
 
         // The attach points are listed FOR an Environment, so the catalog record the
         // `environmentId` names is what the listing is scoped by — looked up in the
@@ -168,9 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not exist — so it is the 400 `InterconnectClientException` every
         // environment-resolving operation gives, never the connection-scoped 404 and
         // never an empty page, which a caller could not tell from "this environment
-        // offers none". @readonly: nothing here writes to this service's store, and
-        // Environments are AWS-managed (the model binds no CreateEnvironment), so there
-        // is nothing the clock owes either.
+        // offers none".
         let Some(environment) = crate::state::environment_in_region(&region, &input.environment_id)
         else {
             return Err(ListAttachPointsErrorModeled::InterconnectClientException(
@@ -179,6 +170,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        };
+
+        // Two things come off the store, under one lock that is released here so nothing
+        // of it is held across the await below: the ARN attach points this service owns
+        // itself (the Connections of this endpoint that are providing connectivity), and
+        // the secret this listing's page cursors are authenticated under, which is what
+        // tells a `nextToken` this endpoint issued from one a caller built
+        // (`PageTokenKey` is `Copy`).
+        //
+        // Reporting only (`@readonly`): the one write here settles transitions the clock
+        // had ALREADY made due, the same settle `GetConnection` and `ListConnections`
+        // make, because a page must not offer — or withhold — an attach point on a
+        // `state` whose successor was owed before the call. Nothing else about this
+        // service's records changes, and a connection's own provisioning is not started,
+        // consumed or advanced by having been listed.
+        let (arn_descriptors, token_key) = {
+            let mut store = state.lock();
+            store.materialise_due_transitions(::std::time::Instant::now());
+            (
+                crate::state::arn_attach_point_descriptors(&store, &region, Some(&environment)),
+                store.page_token_key,
+            )
         };
 
         // A cursor this operation did not issue is refused, rather than answered
@@ -205,19 +218,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // "Lists all Attach Points the caller has access to THAT ARE VALID FOR the
-        // specified Environment": `AttachPointType`'s only modelled value is
-        // `DirectConnectGateway` and `AttachPoint$directConnectGateway` names a gateway
-        // by its own id, so the candidates are the account's Direct Connect gateways —
-        // state of the service that owns them, resolved against it rather than held
-        // here — and the Environment this listing is for is what decides which of them
-        // are valid: an Environment no Connection can be placed upon has no attach
-        // point to offer, because an attach point is where a Connection on THAT
-        // Environment would logically connect. The same predicate judges the attach
-        // point a create or an acceptance names, so the listing and those refusals
-        // cannot disagree. An account that owns no gateway has no attach point either,
-        // which is an empty page: a descriptor is never synthesised for a gateway that
-        // does not exist.
+        // "Lists ALL Attach Points the caller has access to that are valid for the
+        // specified Environment": `AttachPoint` models two forms of one and
+        // `AttachPointDescriptor$type` names both as current types, so the page is the
+        // union of the two — the account's Direct Connect gateways, state of the service
+        // that owns them and resolved against it rather than held here, and the
+        // Connections of this endpoint that are already providing connectivity, which
+        // this service holds itself. The Environment this listing is for is what decides
+        // which of either are valid: an Environment no Connection can be placed upon has
+        // no attach point to offer, because an attach point is where a Connection on THAT
+        // Environment would logically connect. The same two readers judge the attach
+        // point a create or an acceptance names, so the listing and those refusals cannot
+        // disagree — what a Connection may be attached to is exactly what the listing
+        // offers. An account that owns neither a gateway nor a provisioned Connection has
+        // no attach point either, which is an empty page: a descriptor is never
+        // synthesised for a resource that does not exist.
         //
         // An account whose gateways this emulator could not read to the end is a
         // DIFFERENT answer from one that holds none: `attachPoints` is `@required`, so
@@ -227,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled `InterconnectServerException` (500), the same class the two writers
         // of a connection's attach point answer the same condition with, rather than a
         // 200 a caller could not tell from "this environment offers none".
-        let descriptors = match crate::state::direct_connect::attach_points(
+        let gateway_descriptors = match crate::state::direct_connect::attach_points(
             ctx,
             &region,
             Some(&environment),
@@ -249,8 +264,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Keyed by `identifier`, which is what identifies an attach point within an
         // environment, and ordered by it so paging walks one stable sequence: a page
         // cursor is the last identifier handed out, so no page is repeated or skipped.
-        let mut keyed: Vec<(String, AttachPointDescriptor)> = descriptors
+        // One sequence over both forms, because a caller pages the listing and not
+        // either half of it.
+        let mut keyed: Vec<(String, AttachPointDescriptor)> = gateway_descriptors
             .into_iter()
+            .chain(arn_descriptors)
             .map(|descriptor| (descriptor.identifier.clone(), descriptor))
             .collect();
         keyed.sort_by(|(left, _), (right, _)| left.cmp(right));

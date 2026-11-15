@@ -9,9 +9,9 @@
 //! live here once rather than in each suite.
 //!
 //! Direct Connect is mounted beside Interconnect on the SAME engine, as the assembled
-//! emulator mounts them: an attach point IS a Direct Connect gateway of the account, so
-//! a suite that needs one creates it through that service ([`Emulator::dx`]) and then
-//! reads it back through `ListAttachPoints`.
+//! emulator mounts them: one form of attach point IS a Direct Connect gateway of the
+//! account, so a suite that needs one creates it through that service ([`Emulator::dx`])
+//! and then reads it back through `ListAttachPoints`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,10 +40,18 @@ pub(crate) const GATEWAY_READY_BUDGET: Duration = Duration::from_secs(5);
 /// How often that wait re-reads.
 pub(crate) const GATEWAY_READY_INTERVAL: Duration = Duration::from_millis(20);
 
-/// The ONLY value `AttachPointType` models
+/// The `AttachPointType` a descriptor for a Direct Connect gateway carries, as
+/// `AttachPointDescriptor$type` documents the current types ("ARN", "DirectConnect
+/// Gateway") and `AttachPointType` models this one
 /// (`smithy_query(query="shape",shape="AttachPointType")` -> values:
-/// ["DirectConnectGateway"]), so it is the only `type` a descriptor can report.
+/// ["DirectConnectGateway"]).
 pub(crate) const ATTACH_POINT_TYPE: &str = "DirectConnectGateway";
+
+/// The `AttachPointType` a descriptor for a Connection of the account carries: the other
+/// current type `AttachPointDescriptor$type` documents, whose identifier syntax is the
+/// full ARN `AttachPoint$arn` identifies an attach point by
+/// (`smithy_query(query="doc",shape="AttachPointDescriptor",member="type")`).
+pub(crate) const ATTACH_POINT_TYPE_ARN: &str = "ARN";
 
 /// The `directConnectGatewayName` the harness gives the gateway it creates for a suite
 /// that needs an attach point but is not itself about the attach-point listing.
@@ -647,6 +655,33 @@ pub(crate) fn identifiers(listed: &[Value]) -> std::collections::BTreeSet<String
     listed
         .iter()
         .map(|descriptor| text(descriptor, "identifier"))
+        .collect()
+}
+
+/// The `AttachPoint` union value that names the attach point `descriptor` describes.
+///
+/// `AttachPointDescriptor$type` is "the type of this AttachPoint, which will dictate the
+/// syntax of the identifier", so the descriptor's type decides which member of the union
+/// carries its `identifier` — which is what lets a suite offer a listed attach point back
+/// to a create without knowing which form it is.
+pub(crate) fn attach_point_of(descriptor: &Value) -> Value {
+    let identifier = text(descriptor, "identifier");
+    match text(descriptor, "type").as_str() {
+        ATTACH_POINT_TYPE => json!({ "directConnectGateway": identifier }),
+        ATTACH_POINT_TYPE_ARN => json!({ "arn": identifier }),
+        other => panic!(
+            "case {other:?}: expected a descriptor of one of the documented AttachPoint types, got {descriptor:?}"
+        ),
+    }
+}
+
+/// The descriptors of a listing that carry `attach_point_type`, so a suite can assert
+/// about one form of attach point without assuming the other is absent.
+pub(crate) fn of_type(listed: &[Value], attach_point_type: &str) -> Vec<Value> {
+    listed
+        .iter()
+        .filter(|descriptor| text(descriptor, "type") == attach_point_type)
+        .cloned()
         .collect()
 }
 
