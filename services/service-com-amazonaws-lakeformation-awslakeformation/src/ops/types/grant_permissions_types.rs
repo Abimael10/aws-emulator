@@ -11,7 +11,17 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-lakeformation-awslakeformation.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.lakeformation#GrantPermissionsRequest")]
+// `skip_validation` names both permission lists. `Permission` is an enum, and Lake
+// Formation answers a value it does not carry with the `InvalidInputException` this
+// operation models, carrying the service's own invalid-permissions sentence and the values
+// it rejected — not with the framework's constraint refusal — so the enum membership is
+// judged by the handler (`crate::state::unmodelled_permissions`) and not at the request
+// boundary. Nothing else leaves the boundary with it: `PermissionList` carries no length
+// limit and `Permission` no pattern, so the enum is the members' only constraint.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.lakeformation#GrantPermissionsRequest",
+    skip_validation = ["Permissions", "PermissionsWithGrantOption"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct GrantPermissionsInput {
     pub catalog_id: Option<String>,

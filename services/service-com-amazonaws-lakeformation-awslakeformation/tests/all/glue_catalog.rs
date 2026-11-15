@@ -98,6 +98,20 @@ pub async fn lake_formation(
     operation: &str,
     body: &Value,
 ) -> (u16, Value) {
+    let (status, _error_type, payload) = lake_formation_response(router, operation, body).await;
+    (status, payload)
+}
+
+/// As [`lake_formation`], also answering the `x-amzn-errortype` header (`""` when the
+/// response carries none).
+///
+/// restJson1 resolves an error SHAPE from that header, so a suite that asserts WHICH
+/// modelled error a refusal is reads it rather than inferring the shape from the body.
+pub async fn lake_formation_response(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, String, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!(
@@ -117,12 +131,18 @@ pub async fn lake_formation(
 
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let error_type = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     let payload = if response.body().is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(response.body()).unwrap_or(Value::Null)
     };
-    (status, payload)
+    (status, error_type, payload)
 }
 
 /// The wire error code (`__type`) of an error envelope, or `""` for a success body.

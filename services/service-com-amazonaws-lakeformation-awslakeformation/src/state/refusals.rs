@@ -9,7 +9,13 @@
 //!
 //! Lake Formation words "the thing you addressed is not there" with a sentence that names
 //! neither the name the request carried nor the kind of thing it addressed, so each of
-//! these is wholly fixed text.
+//! those is wholly fixed text.
+//!
+//! A refusal that is NOT about the thing a request addressed but about a VALUE inside it —
+//! an identifier that is not an ARN, a permission the service does not define — names that
+//! value, because a request carrying a list of them is refused for one entry and the
+//! caller cannot tell which without being told. Those are a fixed template plus the
+//! rejected value, and the template is what lives here.
 
 /// What a read or an update of a data cells filter the store does not hold answers.
 ///
@@ -56,3 +62,44 @@ pub const ROW_FILTER_BOTH_SET: &str = "Filter expression and AllRowsWildcard can
 ///
 /// Wholly fixed text: neither the key nor the catalog is named.
 pub const TAG_KEY_ALREADY_EXISTS: &str = "Tag key already exists";
+
+/// The fixed text of the refusal a value that is not an Amazon Resource Name draws from
+/// this service's ARN reader, which the rejected value follows.
+///
+/// This one is NOT wholly fixed: a list of principals is refused for one of its entries,
+/// and the caller cannot tell which entry that was unless the refusal says, so the value
+/// the request carried is the sentence's one variable part. It is the value as written,
+/// unquoted.
+pub const INVALID_ARN_PREFIX: &str = "Invalid ARN:ARNs must start with 'arn:': ";
+
+/// [`INVALID_ARN_PREFIX`] followed by `identifier`: what an identifier that does not even
+/// begin an ARN is refused with.
+pub fn invalid_arn(identifier: &str) -> String {
+    format!("{INVALID_ARN_PREFIX}{identifier}")
+}
+
+/// The first of the two fixed sentences a write naming a value that is not a Lake
+/// Formation permission draws, up to the bracket the rejected values open.
+///
+/// Fixed to the character, the leading space included.
+pub const INVALID_PERMISSIONS_PREFIX: &str =
+    " Please grant only valid Lake Formation permissions. [";
+
+/// The second of those two sentences, from the bracket the rejected values close.
+///
+/// Fixed to the character, the trailing space included.
+pub const INVALID_PERMISSIONS_SUFFIX: &str =
+    "] are not all valid Lake Formation permissions. ";
+
+/// How the rejected values are listed between those two sentences.
+const REJECTED_PERMISSION_SEPARATOR: &str = ", ";
+
+/// What a grant or a revoke naming `rejected` — values the `Permission` enum does not
+/// carry — is refused with: the two fixed sentences with those values bracketed between
+/// them, in the order the request named them.
+pub fn invalid_permissions(rejected: &[String]) -> String {
+    format!(
+        "{INVALID_PERMISSIONS_PREFIX}{}{INVALID_PERMISSIONS_SUFFIX}",
+        rejected.join(REJECTED_PERMISSION_SEPARATOR)
+    )
+}

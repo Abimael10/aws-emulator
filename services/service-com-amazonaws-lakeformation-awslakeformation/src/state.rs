@@ -711,7 +711,11 @@ fn is_iam_access_control_default(entry: &PrincipalPermissions) -> bool {
 /// * every designated administrator is an IAM user or an IAM role — "A list of Lake
 ///   Formation principals. Supported principals are IAM users or IAM roles."
 ///   (`DataLakeSettings$DataLakeAdmins`, and the same sentence on `ReadOnlyAdmins`), which
-///   [`is_iam_principal`] is;
+///   [`is_iam_principal`] is. It is read in two steps, because the service refuses the two
+///   in two different voices: an identifier that is not an ARN at all ([`ARN_PREFIX`])
+///   never reaches the question of which principal it names and draws the ARN reader's own
+///   refusal ([`invalid_arn`]), naming the rejected value; an ARN that names something
+///   other than an IAM user or role draws the refusal of the rule above;
 /// * no principal is designated in BOTH administrator lists: the two members are separate
 ///   roles — a data lake administrator may "make changes" where a read-only one has "only
 ///   view access to the resources, without the ability to make changes"
@@ -733,6 +737,13 @@ pub fn validate_data_lake_settings(settings: &DataLakeSettings) -> Result<(), St
                 .data_lake_principal_identifier
                 .as_deref()
                 .unwrap_or_default();
+            // A principal is addressed by ARN, so an identifier that does not even begin
+            // one is refused by the service's ARN reader before the question of WHICH
+            // principal it names is reached, and the refusal is that reader's sentence
+            // ([`invalid_arn`]) carrying the value the request wrote.
+            if !identifier.starts_with(ARN_PREFIX) {
+                return Err(invalid_arn(identifier));
+            }
             if !is_iam_principal(identifier) {
                 return Err(format!(
                     "{member} principal {identifier:?} is not supported: a data lake \
@@ -1027,6 +1038,10 @@ pub fn resource_catalog(named: Option<&str>, default_catalog: &str) -> String {
         None => default_catalog.to_string(),
     }
 }
+
+/// The first field of every Amazon Resource Name, with its separator: what a value has to
+/// begin with to be read as an ARN at all.
+pub const ARN_PREFIX: &str = "arn:";
 
 /// The `arn:<partition>:iam::<account>:<type>/…` resource types that name an IAM
 /// principal: an IAM user or an IAM role. Nothing else under the `iam` service is a
@@ -1580,9 +1595,10 @@ pub fn resource_filter_matches(filter: &Resource, stored: &Resource, include_rel
 ///
 /// Grounded in the model, and INHERENT rather than enforced: each member of
 /// `PermissionList` targets the `Permission` enum, whose values are
-/// [`crate::ops::types::PERMISSION_VALUES`], and the framework's boundary validator
-/// refuses a value the enum does not carry with `ValidationException` before a handler
-/// runs (pinned by `permissions.rs::a_permission_the_model_does_not_carry_is_refused_on_both_write_paths`).
+/// [`crate::ops::types::PERMISSION_VALUES`], and a write naming a value the enum does not
+/// carry records nothing — it is refused with the service's invalid-permissions sentence
+/// ([`unmodelled_permissions`] and [`invalid_permissions`]) before anything is stored
+/// (pinned by `permissions.rs::a_permission_the_model_does_not_carry_is_refused_on_both_write_paths`).
 /// So once a handler has de-duplicated a list with [`dedup_values`], it can hold at most
 /// this many entries, whatever `PermissionList`'s own lack of a length constraint admits
 /// on the wire. That is what bounds the set walks below.
@@ -1591,6 +1607,35 @@ pub fn resource_filter_matches(filter: &Resource, stored: &Resource, include_rel
 /// of the enum, so there is no handler-side refusal to fire on it and no allocation to
 /// clamp with it. It names the number the walks rely on, and one test asserts it.
 pub const MAX_PERMISSIONS_PER_GRANT: usize = crate::ops::types::PERMISSION_VALUES.len();
+
+/// The values `named` carries that the `Permission` enum does not, in first-named order
+/// with duplicates dropped: what a grant or a revoke is refused for naming.
+///
+/// `Permission`'s values are [`crate::ops::types::PERMISSION_VALUES`], and a value outside
+/// that set names no permission at all, so neither write path may record it. The
+/// comparison is exact — the enum's values are upper-case, and a value either is one of
+/// them or is not — and the order is the request's, because the refusal lists the rejected
+/// values back to the caller.
+///
+/// The check lives HERE, in the service, rather than at the request boundary
+/// (`skip_validation` on both write paths' inputs in `src/ops/types/`), because Lake
+/// Formation answers such a request with the modelled `InvalidInputException` its
+/// operations declare, carrying [`invalid_permissions`] — not with the framework's own
+/// constraint refusal.
+pub fn unmodelled_permissions<'a, I>(named: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let modelled: BTreeSet<&str> = crate::ops::types::PERMISSION_VALUES
+        .iter()
+        .copied()
+        .collect();
+    dedup_values(
+        named
+            .into_iter()
+            .filter(|value| !modelled.contains(value.as_str())),
+    )
+}
 
 /// Adds `added` to `held`, keeping it a set in first-granted order.
 ///

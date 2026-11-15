@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-lakeformation-awslakeformation.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.lakeformation#RevokePermissionsRequest")]
+// `skip_validation` names both permission lists, for the reason given on
+// `GrantPermissionsInput`: a value the `Permission` enum does not carry is judged by the
+// handler, which answers the `InvalidInputException` this operation models carrying the
+// service's invalid-permissions sentence, so the two write paths are refused alike.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.lakeformation#RevokePermissionsRequest",
+    skip_validation = ["Permissions", "PermissionsWithGrantOption"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct RevokePermissionsInput {
     pub catalog_id: Option<String>,

@@ -1030,11 +1030,12 @@ async fn a_resource_that_names_no_single_target_is_refused() {
 /// A permission value the `Permission` enum does not carry is refused on BOTH write
 /// paths, and nothing is recorded for it.
 ///
-/// `Permission` is modelled as an enum, and a value it does not carry is refused at the
-/// boundary with `ValidationException` (HTTP 400) naming the member path and the admitted
-/// value set, which is how the real service answers one: it never reaches the grant store,
-/// so no later `ListPermissions` can report it. This pins that for both write paths, so a
-/// handler can never start recording an unmodelled value.
+/// `Permission` is modelled as an enum, and a value it does not carry is refused with the
+/// `InvalidInputException` both write paths model (HTTP 400), carrying the service's
+/// invalid-permissions sentence: the value never reaches the grant store, so no later
+/// `ListPermissions` can report it. This pins that for both write paths, so a handler can
+/// never start recording an unmodelled value; the sentence itself is pinned by
+/// `client_error_bodies.rs`.
 ///
 /// The rows differ along WHERE the unmodelled value sits (alone, beside a modelled one, in
 /// `PermissionsWithGrantOption`) and along its form (an invented name, a lower-cased
@@ -1099,8 +1100,8 @@ async fn a_permission_the_model_does_not_carry_is_refused_on_both_write_paths() 
             if !accepted {
                 let code = error_code(&payload);
                 assert_eq!(
-                    code, "ValidationException",
-                    "case {case:?}: expected {operation} to refuse with ValidationException, \
+                    code, "InvalidInputException",
+                    "case {case:?}: expected {operation} to refuse with InvalidInputException, \
                      got {code:?} {payload:?}"
                 );
             }

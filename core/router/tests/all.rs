@@ -1437,3 +1437,22 @@ mod lambda_in_function_assumed_role_session;
 // `E0753` and compiles no suite of this target. With no inner doc comment anywhere, no merge
 // of two landings can put one past the first item. Nothing follows the last declaration.
 // `all/all_rs_is_a_canonical_declaration_list.rs` check these rules, for this file and for
+//! Single integration-test target for the router: the declaration list, and nothing else.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted in name order. The list holds
+//! those pairs and NO other line — no prose between them and none after them — so two
+//! branches landing at once insert two lines in two places and have nothing to keep
+//! consistent. What a suite covers, and why it lives in this cross-service target rather
+//! than in one service crate's own, belongs in that suite's own module header, where it is
+//! read beside the test it explains.
+//! Three rules, each of which fails the whole target rather than one suite:
+//! * a suite no `mod` names compiles nowhere and its tests never run, and a suite left at
+//!   the top level of `tests/` fails the build;
+//! * a suite declared twice is `E0428`, which compiles neither copy;
+//! * this header is the only place an inner doc comment (`//!`) may stand: the language
+//!   accepts one only before the first item, so past the first declaration it is `E0753`.
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check those three, for this file and —
+//! for the first two — for every service crate's `tests/all.rs`, so a rule they already pin
+//! wants no restatement here.
+//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling
+//! of this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what
+//! points each declaration into `tests/all/`.

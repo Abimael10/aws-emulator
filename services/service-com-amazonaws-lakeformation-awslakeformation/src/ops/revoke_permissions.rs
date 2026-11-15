@@ -196,6 +196,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_deref());
 
+        // The same reading of the permission lists the grant path makes, and for the same
+        // reason: a value the `Permission` enum does not carry names no permission, so the
+        // request is refused with the service's invalid-permissions sentence listing the
+        // values it rejected, before anything is read or taken away
+        // (`skip_validation` on `RevokePermissionsInput` keeps it off the boundary).
+        let rejected = crate::state::unmodelled_permissions(
+            input
+                .permissions
+                .iter()
+                .chain(input.permissions_with_grant_option.iter().flatten()),
+        );
+        if !rejected.is_empty() {
+            return Err(invalid(crate::state::invalid_permissions(&rejected)));
+        }
+
         // `Principal` is modelled required, but its only member is not, so a request can
         // still reach here naming no grantee.
         let principal = input
