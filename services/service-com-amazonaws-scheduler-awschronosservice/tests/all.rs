@@ -25,6 +25,8 @@ mod occurrence_timing;
 mod pass_role_authorization;
 #[path = "all/per_schedule_target_input.rs"]
 mod per_schedule_target_input;
+#[path = "all/permanent_target_refusal.rs"]
+mod permanent_target_refusal;
 #[path = "all/reserved_schedule_group.rs"]
 mod reserved_schedule_group;
 #[path = "all/resource_tags.rs"]

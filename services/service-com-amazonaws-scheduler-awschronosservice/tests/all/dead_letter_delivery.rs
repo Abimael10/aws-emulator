@@ -50,7 +50,7 @@ use crate::wire_harness::account_id;
 /// How long a row waits for the message it expects. The occurrence every row states
 /// is seconds ahead; the rest is room for the clock's tick, the refusal and the
 /// dead-letter delivery.
-const PATIENCE: Duration = Duration::from_secs(80);
+pub(crate) const PATIENCE: Duration = Duration::from_secs(80);
 
 /// How long a row watches a queue it expects NOTHING to reach: well past the
 /// occurrence its own expression names, so an invocation this emulator would have
@@ -61,7 +61,7 @@ const QUIET_WINDOW: Duration = Duration::from_secs(15);
 /// A query-compatible service answers such a call with the legacy Query code AWS
 /// refuses an unauthorized call under, which is what a report of a withheld invocation
 /// of a QUEUE target carries.
-const QUEUE_ACCESS_DENIED: &str = "AccessDenied";
+pub(crate) const QUEUE_ACCESS_DENIED: &str = "AccessDenied";
 
 /// What the row's schedule points its target at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
