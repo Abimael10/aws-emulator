@@ -154,7 +154,11 @@ fn names(values: &[&str]) -> String {
 /// Create a cache policy whose query-string behaviour is `behavior` over `listed`, with the
 /// TTLs `ttl` names (zero for a policy that caches nothing) and the two compression flags —
 /// and answer its minted id.
-async fn cache_policy(
+///
+/// `pub(crate)` so a sibling suite that needs a behaviour keyed on a named query string
+/// ([`crate::edge_deployed_distribution_effects`]) creates it through this one builder rather
+/// than growing a copy of the document.
+pub(crate) async fn cache_policy(
     router: &MultiServiceRouter,
     name: &str,
     behavior: &str,

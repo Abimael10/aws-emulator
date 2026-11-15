@@ -1907,3 +1907,11 @@ mod cloudtrail_iam_credential_write_audit;
 // explains; a note about THIS file belongs in `all/appended_notes.rs`, declared below like
 // any other module. `all/all_rs_declares_each_suite_once.rs`,
 // there rather than leaving a note here.
+// Single integration-test target for the router: the suites that drive MORE THAN ONE service
+// over the assembled emulator.
+// by name, and no other line. Two branches landing at once then insert two lines in two
+// places and have no prose to duplicate, re-word or mistype — which is what had gone wrong
+// here before: the tail of this file had grown hundreds of re-typed copies of its header,
+// many of them written as inner doc comments past the first item (`E0753`), so no suite of
+// this target compiled at all.
+// EVERY comment in this file is an ORDINARY `//` one, this block included, and that is

@@ -142,6 +142,8 @@ mod edge_additional_metric_reconciliation;
 mod edge_additional_metrics;
 #[path = "all/edge_data_plane.rs"]
 mod edge_data_plane;
+#[path = "all/edge_deployed_distribution_effects.rs"]
+mod edge_deployed_distribution_effects;
 #[path = "all/edge_function_associations.rs"]
 mod edge_function_associations;
 #[path = "all/edge_geo_restriction.rs"]
