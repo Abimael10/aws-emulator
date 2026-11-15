@@ -139,6 +139,8 @@ mod resource_policy_lifecycle;
 mod resource_policy_not_found_wording;
 #[path = "all/runtime_code_object_vended_logs.rs"]
 mod runtime_code_object_vended_logs;
+#[path = "all/runtime_identifier_authorization.rs"]
+mod runtime_identifier_authorization;
 #[path = "all/runtime_vended_log_group.rs"]
 mod runtime_vended_log_group;
 #[path = "all/service_claim.rs"]

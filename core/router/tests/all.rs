@@ -7269,3 +7269,28 @@ mod zz_glue_job_source_permission_probe;
 //! The `#[path]` is what points each module into `tests/all/`: this file is a test-target
 //! CRATE ROOT, so a bare `mod` would resolve to a SIBLING of it, which the layout check
 //! refuses.
+//! Put a new suite at `tests/all/<name>.rs` and declare it below with a `#[path]`/`mod`
+//! is one crate root, so a second `mod` for the same name is `E0428`. THIS HEADER IS THE
+//! ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE: past the first item one
+//! is `E0753`. Either fails every suite in this target, so below add a declaration — not a
+//! note about one. `all/all_rs_declares_each_suite_once.rs` and
+//! (`tests/boot_serve.rs`) — which the layout check refuses. The `#[path]` above each `mod`
+//! is what points it into `tests/all/`.
+//! pair, keeping the list sorted: one pair per suite and nothing else, so a landing has
+//! one place to insert and nothing to keep consistent.
+//! A suite that is not declared here compiles nowhere and its tests never run; a suite
+//! left at the top level of `tests/` fails the build; and a suite declared twice is
+//! `E0428`, which fails every suite in this target. `tests/all.rs` is a test-target CRATE
+//! refuses: the `#[path]` is what points the module into `tests/all/`.
+//! THIS BLOCK IS THE ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE: past
+//! declaration — not a note about one. `all/all_rs_declares_each_suite_once.rs` and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of that,
+//! for this file and for every service crate's `tests/all.rs`.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
+// declaration into `tests/all/`.
+// (A long run of notes stood here: copies of this file's own header typed with `//!` past
+// the first item — `E0753`, which compiles no suite of this target — appended by successive
+// landings. They are removed rather than re-typed, because the rules they restated stand in
+// the module doc at the HEAD of this file, where an inner doc comment is legal.)
+// (A second long run of header copies stood here, typed with `//!` past the first item
+// (`E0753`) by successive landings: removed for the reason the note above states.)

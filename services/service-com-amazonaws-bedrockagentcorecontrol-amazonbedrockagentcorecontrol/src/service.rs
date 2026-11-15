@@ -67,6 +67,14 @@
 //! words a refusal that reaches the centralized walk anyway through that same module, so
 //! the wording lives in ONE place.
 //!
+//! ## This service's other edited seam: the refusal that PRECEDES validation
+//!
+//! A signed call is decided by IAM ahead of the service, so a principal whose policies do
+//! not allow the action is refused before the model's constraints are checked — earlier than
+//! any handler runs, and earlier than the centralized walk's own refusal.
+//! [`StatedPerOperation`] is therefore where that decision is taken too, ahead of the
+//! wording above: [`authorization`] states the rule and words the refusal.
+//!
 //! ## This service's other edited seam: the endpoint a gateway publishes
 //!
 //! A gateway's `gatewayUrl` is a host of its OWN
@@ -78,6 +86,7 @@
 //! for it, so the emulator verifies the credential the request carries before anything is
 //! served. [`mcp`] documents what answers there.
 
+pub mod authorization;
 pub mod mcp;
 pub(crate) mod validation;
 
@@ -176,6 +185,7 @@ macro_rules! wrap_operations {
                 stringify!($operation),
                 ::std::boxed::Box::new(StatedPerOperation::new(
                     crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                    ::std::sync::Arc::clone(&$engine),
                 )) as ::std::boxed::Box<dyn ErasedOperation>,
             );
         )+
@@ -384,14 +394,16 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     }
 }
 
-/// One modelled operation, served so that a refused request is stated the way the backend
-/// serving that operation states it: the family's value policy, the element constraint sets
-/// its own input schema declares, and the value as submitted.
+/// One modelled operation, served so that a request refused before its handler runs is
+/// answered the way the backend serving that operation answers it: the authorization
+/// decision the calling principal's policies settle, and otherwise the family's value
+/// policy, the element constraint sets its own input schema declares, and the value as
+/// submitted.
 ///
 /// Nothing else is re-implemented. A request this wrapper does not refuse is handed to the
 /// generated [`ErasedOperation::run`], which owns deserialize -> validate -> handle ->
 /// serialize, telemetry and every modelled error. The violations come from the framework's
-/// own machinery ([`stated_refusal`]), so this cannot refuse a request the framework's own
+/// own machinery ([`pre_handler`]), so this cannot refuse a request the framework's own
 /// walk would accept, nor accept one it would refuse. The cost is that a request this
 /// wrapper does not refuse is read twice, once here and once in the operation's own
 /// sequence, because the framework hands no already-built input to an operation. The
@@ -399,24 +411,46 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// handler, or `override_refusal`, the input it already built — which
 /// `services/common/src/validation.rs` records as the core seam this re-read exists only
 /// until.
-struct StatedPerOperation<O> {
+struct StatedPerOperation<O, Eng> {
     operation: O,
+    /// The SAME shared engine the operation was constructed from, so the authorization
+    /// decision this wrapper takes AHEAD of the framework's validation can read the
+    /// principal's policies out of the one store every service of this emulator shares
+    /// ([`authorization`]). A decision that precedes validation has no handler to read it
+    /// in.
+    engine: Arc<Eng>,
 }
 
-impl<O> StatedPerOperation<O> {
+impl<O, Eng> StatedPerOperation<O, Eng> {
     /// Wrap one operation, already constructed from the shared engine.
-    fn new(operation: O) -> Self {
-        Self { operation }
+    fn new(operation: O, engine: Arc<Eng>) -> Self {
+        Self { operation, engine }
     }
 }
 
-/// This service's answer to every modelled constraint `req` breaks, for the operation `O`:
-/// the violations the framework's own walk finds, and the wording [`validation`] gives
-/// them. `None` when the request breaks none — and for a failure that is NOT a refusal (a
-/// body the codec cannot read at all, a member of the wrong type), which the framework's
-/// own walk answers in its own envelope.
+/// How this service answers `req` before `O`'s handler runs, when it answers it at all.
+enum PreHandler {
+    /// The authorization decision refused it: the calling principal's own IAM policies do
+    /// not allow the action on the resource the request addresses (see [`authorization`]).
+    /// Rendered at the 403 the protocol gives an authorization refusal.
+    Denied(Refused),
+    /// It breaks modelled constraints, worded as [`validation`] states them.
+    Invalid(Vec<Violation>, Refused),
+}
+
+/// This service's pre-handler answer to `req` for the operation `O`: the authorization
+/// refusal first, then the wording of every modelled constraint it breaks. `None` when
+/// neither refuses it — and for a failure that is NOT a refusal (a body the codec cannot
+/// read at all, a member of the wrong type), which the framework's own walk answers in its
+/// own envelope.
 ///
-/// The collecting half is the tree's shared one,
+/// The ORDER is the one AWS takes, and the reason the authorization decision is taken here
+/// at all: IAM decides a signed call ahead of the service, so a principal whose policies do
+/// not allow the action is told that rather than told its input is malformed — and the
+/// framework's centralized walk validates the model's constraints before any handler runs,
+/// so no handler could take a decision that precedes it ([`authorization`]).
+///
+/// The collecting half of the validation answer is the tree's shared one,
 /// `service_common::validation::refusing_violations_with_lists`: one read of the request
 /// yields the framework's own violations (the protocol's deserializer for an absent
 /// `@required` member, `constraints::validate` over the built input) with each value echo
@@ -424,10 +458,15 @@ impl<O> StatedPerOperation<O> {
 /// states at a LIST member, which no violation carries. Nothing is re-checked here, and no
 /// second copy of that walk lives in this crate: both halves are bounded where those
 /// bounds are stated.
-fn stated_refusal<O: Operation>(
+fn pre_handler<O: Operation, Eng: Send + Sync + 'static>(
+    engine: &Eng,
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
-) -> Option<(Vec<Violation>, Refused)> {
+    ctx: &OperationContext<'_>,
+) -> Option<PreHandler> {
+    if let Some(denial) = authorization::refusal(engine, ctx, O::NAME) {
+        return Some(PreHandler::Denied(denial));
+    }
     let (violations, lists) =
         service_common::validation::refusing_violations_with_lists::<O>(protocol, req);
     let stated = validation::refusal(
@@ -436,12 +475,13 @@ fn stated_refusal<O: Operation>(
         validation::echo_of(O::INPUT_SCHEMA),
         &lists,
     )?;
-    Some((violations, stated))
+    Some(PreHandler::Invalid(violations, stated))
 }
 
-impl<O> ErasedOperation for StatedPerOperation<O>
+impl<O, Eng> ErasedOperation for StatedPerOperation<O, Eng>
 where
     O: Operation + ErasedOperation,
+    Eng: Send + Sync + 'static,
 {
     fn run<'r>(
         &'r self,
@@ -453,11 +493,33 @@ where
             // The definition is read, used and dropped inside each statement:
             // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
             // below would make this future non-`Send`.
-            let refused = stated_refusal::<O>(svc.definition().protocol(), req);
-            if let Some((violations, stated)) = refused {
-                return svc
-                    .definition()
-                    .refusal_response(ProtocolError::Invalid(violations), Some(stated), req);
+            let refused =
+                pre_handler::<O, Eng>(&*self.engine, svc.definition().protocol(), req, ctx);
+            match refused {
+                // The status and the envelope stay with the protocol, which gives an
+                // authentication/authorization refusal its 403. `Some(denial)` replaces
+                // BOTH the code and the message the error carries
+                // (`protocol_error_response_with`), so the two fields below are a
+                // placeholder the renderer never states: the words and the code a client
+                // branches on are the gate's.
+                Some(PreHandler::Denied(denial)) => {
+                    return svc.definition().refusal_response(
+                        ProtocolError::Unauthenticated {
+                            code: crate::state::ACCESS_DENIED_SHAPE,
+                            message: crate::state::ACCESS_DENIED_SHAPE,
+                        },
+                        Some(denial),
+                        req,
+                    )
+                }
+                Some(PreHandler::Invalid(violations, stated)) => {
+                    return svc.definition().refusal_response(
+                        ProtocolError::Invalid(violations),
+                        Some(stated),
+                        req,
+                    )
+                }
+                None => {}
             }
             self.operation.run(svc, req, ctx).await
         })
