@@ -40,6 +40,11 @@
 //!   token, a status no caller can ask for, enabling an unconfirmed destination, a second
 //!   create for one URL, and a configuration naming a destination kind this emulator does
 //!   not create.
+//! * the REVOCATION table varies how a destination stops being `ENABLED` — the owner
+//!   disables it, asks for a fresh confirmation challenge, or deletes it — and asserts that
+//!   the same enabled rule then delivers nothing to the endpoint, and that a re-challenged
+//!   destination takes traffic again only once the whole trajectory (a fresh token, the
+//!   rest at `DISABLED`, the update to `ENABLED`) has been walked a second time.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -231,6 +236,40 @@ impl Emulator {
             Some(&json!({ "arn": arn, "status": status })),
         )
         .await
+    }
+
+    /// `DeleteTopicRuleDestination`: `DELETE /destinations/{arn+}`.
+    async fn delete_destination(&self, arn: &str) -> Reply {
+        self.iot("DELETE", &format!("/destinations/{arn}"), None)
+            .await
+    }
+
+    /// The token of the confirmation challenge that arrived at the endpoint topic `topic`
+    /// AFTER the one `superseded` carried, waited for up to [`ARRIVAL_DEADLINE`].
+    ///
+    /// A fresh challenge is sent with the destination store's guard released, so it arrives
+    /// once the update that asked for it has already answered: the endpoint is read again
+    /// until it holds a `DestinationConfirmation` carrying a token that is not the
+    /// superseded one.
+    async fn fresh_token_within(&self, case: &str, topic: &str, superseded: &str) -> String {
+        let deadline = SystemTime::now() + ARRIVAL_DEADLINE;
+        loop {
+            if let Some(received) = self.received(topic).await {
+                let document: Value = serde_json::from_slice(&received).unwrap_or(Value::Null);
+                let is_challenge =
+                    document["messageType"].as_str() == Some(DESTINATION_CONFIRMATION_MESSAGE_TYPE);
+                let token = document["confirmationToken"].as_str().unwrap_or_default();
+                if is_challenge && token != superseded {
+                    return token.to_string();
+                }
+            }
+            assert!(
+                SystemTime::now() < deadline,
+                "case {case:?}: no fresh challenge arrived at the endpoint topic {topic:?} \
+                 within {ARRIVAL_DEADLINE:?}"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
     }
 
     /// `CreateTopicRule`: `POST /rules/{ruleName}`, whose body IS the `topicRulePayload`.
@@ -945,19 +984,9 @@ async fn a_requested_challenge_supersedes_the_token_the_last_one_carried() {
         resent.status, resent.body
     );
     // The endpoint receives a second challenge, carrying a token that is not the first.
-    let deadline = SystemTime::now() + ARRIVAL_DEADLINE;
-    let second = loop {
-        let token = token_of(case, &emulator.received_within(case, endpoint_topic).await);
-        if token != first {
-            break token;
-        }
-        assert!(
-            SystemTime::now() < deadline,
-            "case {case:?}: no fresh challenge arrived at the endpoint within \
-             {ARRIVAL_DEADLINE:?}"
-        );
-        tokio::time::sleep(POLL_INTERVAL).await;
-    };
+    let second = emulator
+        .fresh_token_within(case, endpoint_topic, &first)
+        .await;
 
     let stale = emulator.confirm_destination(&first).await;
     assert_eq!(
@@ -986,7 +1015,8 @@ async fn a_requested_challenge_supersedes_the_token_the_last_one_carried() {
         "case {case:?}: expected the destination to still be {DESTINATION_IN_PROGRESS} \
          immediately after the confirmation"
     );
-    tokio::time::sleep(past_the_confirmation()).await;
+    // The move out of `IN_PROGRESS` is the clock's, so it is waited for by reading the
+    // destination again until it reports the status it rests at.
     assert_eq!(
         emulator.status_within(case, &arn, DESTINATION_DISABLED).await,
         DESTINATION_DISABLED,
@@ -1326,5 +1356,285 @@ async fn a_request_no_destination_can_serve_is_refused_with_a_modelled_error() {
             "case {case:?}: a refusal must say what was wrong, got {:?}",
             refused.body
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Leaving ENABLED closes the endpoint again
+// ---------------------------------------------------------------------------
+
+/// Assert that a publish that must NOT be delivered reached the endpoint with nothing: what
+/// the endpoint holds is exactly what it already held (`baseline`) — or, where the
+/// destination's own lifecycle is sending one (`a_challenge_is_owed`), a fresh
+/// `DestinationConfirmation` challenge. Never `published`.
+///
+/// The challenge is admitted only for the row whose destination was put back in
+/// `IN_PROGRESS`: that is the one endpoint this service owes a request of its own, so for
+/// every other row anything but the baseline fails the case.
+fn assert_nothing_was_delivered(
+    case: &str,
+    after: &str,
+    baseline: &[u8],
+    held: &[u8],
+    published: &str,
+    a_challenge_is_owed: bool,
+) {
+    let is_a_challenge = a_challenge_is_owed
+        && serde_json::from_slice::<Value>(held).is_ok_and(|document| {
+            document["messageType"] == json!(DESTINATION_CONFIRMATION_MESSAGE_TYPE)
+        });
+    assert!(
+        held == baseline || is_a_challenge,
+        "case {case:?}: expected the endpoint to hold what it already had{} after {after} \
+         rather than the published {published:?}, got {:?}",
+        if a_challenge_is_owed {
+            ", or the fresh confirmation challenge it is owed,"
+        } else {
+            ""
+        },
+        String::from_utf8_lossy(held)
+    );
+}
+
+/// How a destination stops being `ENABLED`, which is what the rows of
+/// [`the_endpoint_closes_again_whenever_its_destination_leaves_enabled`] vary.
+#[derive(Debug, Clone, Copy)]
+enum LeavesEnabled {
+    /// `UpdateTopicRuleDestination` with `DISABLED`: "Confirmation was completed, and
+    /// traffic to this destination is not allowed".
+    Disabled,
+    /// `UpdateTopicRuleDestination` with `IN_PROGRESS`, which asks for a new confirmation
+    /// challenge and leaves the destination unconfirmed again.
+    Challenged,
+    /// `DeleteTopicRuleDestination`: there is no destination admitting the URL any more.
+    Deleted,
+}
+
+/// The gate holds for as long as the destination is `ENABLED` and no longer: whichever way
+/// a destination leaves that status, the SAME enabled rule stops delivering to the endpoint
+/// — and a re-challenged destination takes traffic again only after the whole
+/// confirm-then-enable trajectory has been walked a second time.
+///
+/// Each row drives the trajectory a client drives, through the modelled API only
+/// (`POST /destinations`, `GET /confirmdestination/{confirmationToken+}`,
+/// `PATCH /destinations`, `DELETE /destinations/{arn+}`, `GET /destinations/{arn+}` and the
+/// data plane's `Publish`), and reads what the endpoint received through that endpoint's own
+/// service: traffic is allowed only while a destination that admits the action's URL is
+/// `ENABLED` (`TopicRuleDestinationStatus`, `HttpAction$confirmationUrl`).
+#[tokio::test]
+async fn the_endpoint_closes_again_whenever_its_destination_leaves_enabled() {
+    // (case, how the destination leaves ENABLED, the endpoint topic the rule delivers to)
+    for (case, leaves, endpoint_topic) in [
+        (
+            "the owner disables it",
+            LeavesEnabled::Disabled,
+            "closed-by-disable",
+        ),
+        (
+            "the owner asks for a fresh challenge",
+            LeavesEnabled::Challenged,
+            "closed-by-challenge",
+        ),
+        (
+            "the owner deletes it",
+            LeavesEnabled::Deleted,
+            "closed-by-delete",
+        ),
+    ] {
+        // One emulator per row, so the row's destination and rule are the only ones: what
+        // the endpoint holds is what THIS row's rule put there.
+        let emulator = Emulator::new();
+        let url = endpoint_url(endpoint_topic);
+
+        let created = emulator.create_http_destination(&url).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreateTopicRuleDestination answered {} {:?}",
+            created.status, created.body
+        );
+        let arn = created.arn();
+
+        // One enabled rule, whose `http` action names the destination's URL as its endpoint.
+        // It is never changed below: every difference in what arrives is the destination's.
+        emulator
+            .create_topic_rule(
+                case,
+                "destination_revocation",
+                &json!({
+                    "sql": "SELECT * FROM 'revocation/+'",
+                    "ruleDisabled": false,
+                    "actions": [{ "http": { "url": url } }],
+                }),
+            )
+            .await;
+
+        // The trajectory a client walks: the challenge arrives at the endpoint, its token
+        // confirms the destination, the confirmed destination rests at DISABLED, and only
+        // the update enables it.
+        let token = token_of(case, &emulator.received_within(case, endpoint_topic).await);
+        let confirmed = emulator.confirm_destination(&token).await;
+        assert_eq!(
+            confirmed.status, 200,
+            "case {case:?}: ConfirmTopicRuleDestination answered {} {:?}",
+            confirmed.status, confirmed.body
+        );
+        let rested = emulator
+            .status_within(case, &arn, DESTINATION_DISABLED)
+            .await;
+        assert_eq!(
+            rested, DESTINATION_DISABLED,
+            "case {case:?}: expected a confirmed destination to rest at \
+             {DESTINATION_DISABLED}, got {rested}"
+        );
+        let enabled = emulator
+            .update_destination(&arn, DESTINATION_ENABLED)
+            .await;
+        assert_eq!(
+            enabled.status, 200,
+            "case {case:?}: UpdateTopicRuleDestination({DESTINATION_ENABLED}) answered {} {:?}",
+            enabled.status, enabled.body
+        );
+        let reported = emulator
+            .status_within(case, &arn, DESTINATION_ENABLED)
+            .await;
+        assert_eq!(
+            reported, DESTINATION_ENABLED,
+            "case {case:?}: expected the updated destination to be {DESTINATION_ENABLED}, \
+             got {reported}"
+        );
+
+        // While it is ENABLED the endpoint takes the rule's traffic.
+        let while_enabled = format!("{endpoint_topic}-while-enabled");
+        emulator
+            .publish(case, "revocation/room", while_enabled.as_bytes())
+            .await;
+        let received = emulator.received_within(case, endpoint_topic).await;
+        assert_eq!(
+            String::from_utf8_lossy(&received),
+            while_enabled,
+            "case {case:?}: expected an {DESTINATION_ENABLED} destination to take the \
+             published message, got {:?}",
+            String::from_utf8_lossy(&received)
+        );
+
+        // The row's own way out of ENABLED.
+        let left = match leaves {
+            LeavesEnabled::Disabled => {
+                emulator
+                    .update_destination(&arn, DESTINATION_DISABLED)
+                    .await
+            }
+            LeavesEnabled::Challenged => {
+                emulator
+                    .update_destination(&arn, DESTINATION_IN_PROGRESS)
+                    .await
+            }
+            LeavesEnabled::Deleted => emulator.delete_destination(&arn).await,
+        };
+        assert_eq!(
+            left.status, 200,
+            "case {case:?}: leaving {DESTINATION_ENABLED} by {leaves:?} answered {} {:?}",
+            left.status, left.body
+        );
+
+        // Nothing published now reaches the endpoint: what it holds is still the message it
+        // took while ENABLED, or the fresh challenge a re-challenged destination's endpoint
+        // is sent — never the message published after the destination left ENABLED.
+        let after_leaving = format!("{endpoint_topic}-after-leaving");
+        emulator
+            .publish(case, "revocation/room", after_leaving.as_bytes())
+            .await;
+        let held = emulator.received_within(case, endpoint_topic).await;
+        assert_nothing_was_delivered(
+            case,
+            &format!("leaving {DESTINATION_ENABLED} by {leaves:?}"),
+            &received,
+            &held,
+            &after_leaving,
+            // Only the row that asked for a fresh challenge is owed a request of its own.
+            matches!(leaves, LeavesEnabled::Challenged),
+        );
+
+        if matches!(leaves, LeavesEnabled::Challenged) {
+            // A re-challenged destination is unconfirmed again, so the whole trajectory is
+            // walked a second time before the endpoint takes anything: the superseded token
+            // confirms nothing, the fresh one does, the destination rests at DISABLED —
+            // where it still takes no traffic — and only the update opens the endpoint
+            // again.
+            let unconfirmed = emulator
+                .status_within(case, &arn, DESTINATION_IN_PROGRESS)
+                .await;
+            assert_eq!(
+                unconfirmed, DESTINATION_IN_PROGRESS,
+                "case {case:?}: expected a re-challenged destination to be \
+                 {DESTINATION_IN_PROGRESS}, got {unconfirmed}"
+            );
+            let fresh = emulator
+                .fresh_token_within(case, endpoint_topic, &token)
+                .await;
+            let reconfirmed = emulator.confirm_destination(&fresh).await;
+            assert_eq!(
+                reconfirmed.status, 200,
+                "case {case:?}: the fresh token must confirm, got {} {:?}",
+                reconfirmed.status, reconfirmed.body
+            );
+            let rested_again = emulator
+                .status_within(case, &arn, DESTINATION_DISABLED)
+                .await;
+            assert_eq!(
+                rested_again, DESTINATION_DISABLED,
+                "case {case:?}: expected the re-confirmed destination to rest at \
+                 {DESTINATION_DISABLED}, got {rested_again}"
+            );
+
+            // The endpoint holds the challenge it was just sent; nothing is added to it by a
+            // publish while the re-confirmed destination only rests at DISABLED.
+            let baseline = emulator.received_within(case, endpoint_topic).await;
+            let while_disabled = format!("{endpoint_topic}-while-disabled");
+            emulator
+                .publish(case, "revocation/room", while_disabled.as_bytes())
+                .await;
+            let still_held = emulator.received_within(case, endpoint_topic).await;
+            assert_nothing_was_delivered(
+                case,
+                &format!("resting at {DESTINATION_DISABLED}"),
+                &baseline,
+                &still_held,
+                &while_disabled,
+                // The challenge this row was owed has already arrived and been confirmed.
+                false,
+            );
+
+            let re_enabled = emulator
+                .update_destination(&arn, DESTINATION_ENABLED)
+                .await;
+            assert_eq!(
+                re_enabled.status, 200,
+                "case {case:?}: UpdateTopicRuleDestination({DESTINATION_ENABLED}) answered \
+                 {} {:?}",
+                re_enabled.status, re_enabled.body
+            );
+            let reopened = emulator
+                .status_within(case, &arn, DESTINATION_ENABLED)
+                .await;
+            assert_eq!(
+                reopened, DESTINATION_ENABLED,
+                "case {case:?}: expected the re-enabled destination to be \
+                 {DESTINATION_ENABLED}, got {reopened}"
+            );
+
+            let after_reconfirming = format!("{endpoint_topic}-after-reconfirming");
+            emulator
+                .publish(case, "revocation/room", after_reconfirming.as_bytes())
+                .await;
+            let delivered = emulator.received_within(case, endpoint_topic).await;
+            assert_eq!(
+                String::from_utf8_lossy(&delivered),
+                after_reconfirming,
+                "case {case:?}: expected the re-confirmed and re-enabled destination to \
+                 take the published message, got {:?}",
+                String::from_utf8_lossy(&delivered)
+            );
+        }
     }
 }
