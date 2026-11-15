@@ -61,6 +61,8 @@ mod execution_previews;
 mod hybrid_activation_role;
 #[path = "all/hybrid_activations.rs"]
 mod hybrid_activations;
+#[path = "all/identity_document_in_the_guest.rs"]
+mod identity_document_in_the_guest;
 #[path = "all/instance_properties.rs"]
 mod instance_properties;
 #[path = "all/just_in_time_node_access.rs"]

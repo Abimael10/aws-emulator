@@ -108,7 +108,11 @@ impl ComAmazonawsEc2Amazonec2State {
                 ..SessionConfig::default()
             },
             volume,
-        );
+        )
+        // The programs this machine has installed in it, which an agent's command reads the
+        // instance's own facts with ([`super::guest_metadata`]) — the same client the boot's
+        // own program has.
+        .with_environment_programs(super::guest_metadata::guest_programs(&machine));
         let mut status = 0;
         for command in commands {
             status = session.run(command);

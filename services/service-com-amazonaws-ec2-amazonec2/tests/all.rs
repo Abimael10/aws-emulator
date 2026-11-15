@@ -2352,3 +2352,9 @@ mod modify_transit_gateway_metering_policy;
 // tail of this file, which is where every new ec2 suite lands.
 #[path = "all/delete_transit_gateway_vpc_attachment.rs"]
 mod delete_transit_gateway_vpc_attachment;
+// The instance metadata service one instance's guest reads itself from: the published
+// categories, the signed identity document its agents register the machine with, the IMDSv2
+// token form, and what it publishes nothing for. Declared at the tail of this file, which is
+// where every new ec2 suite lands.
+#[path = "all/instance_guest_metadata_service.rs"]
+mod instance_guest_metadata_service;

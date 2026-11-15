@@ -733,6 +733,19 @@ impl ShellSession {
         self
     }
 
+    /// This session with `programs` as the programs the ENVIRONMENT it runs in provides, for
+    /// a caller that constructed it some other way than [`Self::with_programs`] — a session
+    /// running in a MACHINE's tree ([`Self::in_volume`]) whose machine also has programs
+    /// installed in it.
+    ///
+    /// The same seam [`Self::with_programs`] fills: a command neither catalog names is asked
+    /// of `programs` before it is reported as one this session could not run.
+    #[must_use]
+    pub fn with_environment_programs(mut self, programs: Box<dyn EnvironmentPrograms>) -> Self {
+        self.programs = Some(programs);
+        self
+    }
+
     /// Put `contents` at `path` in the tree this session reads and writes, the way the
     /// environment seeds a file its program is to find there — a source archive the build
     /// unpacked, a cached path it restored.

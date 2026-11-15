@@ -164,6 +164,18 @@ pub struct GuestMachine {
     /// The vCPUs and the memory (in MiB) the instance type gives the guest, where the
     /// published catalog holds facts for that type.
     pub processor: Option<(i32, i64)>,
+    /// "The kernel associated with this instance, if applicable" (`Instance$KernelId`),
+    /// which the identity document its metadata service publishes carries.
+    pub kernel_id: Option<String>,
+    /// "The RAM disk associated with this instance, if applicable" (`Instance$RamdiskId`),
+    /// carried by the same document.
+    pub ramdisk_id: Option<String>,
+    /// Whether this machine's metadata service answers its guest at all
+    /// (`InstanceMetadataOptionsResponse$HttpEndpoint` is `enabled`).
+    pub metadata_endpoint_enabled: bool,
+    /// Whether a metadata request of its guest has to carry a session token
+    /// (`InstanceMetadataOptionsResponse$HttpTokens` is `required`).
+    pub metadata_token_required: bool,
 }
 
 impl ComAmazonawsEc2Amazonec2State {
@@ -187,6 +199,11 @@ impl ComAmazonawsEc2Amazonec2State {
                 .and_then(|(device, ebs)| ebs.volume_size.map(|size| (device, size))),
             processor: super::instance_type_record(&instance.instance_type)
                 .map(|record| (record.default_vcpus, record.memory_mib)),
+            kernel_id: instance.kernel_id.clone(),
+            ramdisk_id: instance.ramdisk_id.clone(),
+            metadata_endpoint_enabled: instance.detail.http_endpoint
+                == super::METADATA_ENDPOINT_ENABLED,
+            metadata_token_required: instance.detail.http_tokens == super::HTTP_TOKENS_REQUIRED,
         }
     }
 
@@ -502,7 +519,7 @@ fn guest_command_line(machine: &GuestMachine) -> String {
 
 /// The MAC address of this machine's primary network interface, derived from its own private
 /// address — a locally administered address, which is what a virtualised interface carries.
-fn guest_mac_address(machine: &GuestMachine) -> String {
+pub(super) fn guest_mac_address(machine: &GuestMachine) -> String {
     let mixed = ::service_common::stable_hex_id(&["mac", &machine.private_ip]);
     // Five pairs read out of the mixed hex without indexing it, so a shorter value is
     // rendered short rather than panicking.
@@ -569,7 +586,10 @@ fn run_guest_program(
             ..SessionConfig::default()
         },
         volume,
-    );
+    )
+    // The programs this machine has installed in it, which a boot script reads the
+    // instance's own facts with ([`super::guest_metadata`]).
+    .with_environment_programs(super::guest_metadata::guest_programs(machine));
     // The instant the boot happened is the console's, not the program's: a guest's own clock
     // is not something a boot script reads here.
     let _ = booted_at;
@@ -671,6 +691,10 @@ mod tests {
             kernel_release: "6.1.0".to_string(),
             root_device: Some(("/dev/xvda".to_string(), 8)),
             processor: Some((2, 1024)),
+            kernel_id: None,
+            ramdisk_id: None,
+            metadata_endpoint_enabled: true,
+            metadata_token_required: false,
         }
     }
 

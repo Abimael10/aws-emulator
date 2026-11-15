@@ -2535,6 +2535,12 @@ pub use guest_console::*;
 pub mod guest_commands;
 pub use guest_commands::*;
 
+/// The INSTANCE METADATA SERVICE one instance's guest reads itself from, and the programs of
+/// that guest which read it: the instance's own facts and the signed identity document its
+/// agents register with. A SUBMODULE for the same reason [`image_usage_reports`] is one.
+pub mod guest_metadata;
+pub use guest_metadata::*;
+
 /// Which capacity resources each of Capacity Manager's metrics measures, and the DIMENSION
 /// VALUES each of those resources carries — the one reading every operation that answers
 /// along Capacity Manager's dimensions shares, so the report of the available dimensions and

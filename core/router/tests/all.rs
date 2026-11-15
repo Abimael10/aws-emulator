@@ -4737,3 +4737,16 @@ mod appended_notes;
 //! this target, so leave no note below — add a declaration, not a note about one.
 //! file — which the layout check refuses. The `#[path]` is what points each module into
 //! in this target.
+//! This file is a LIST and nothing else: one `#[path = "all/<name>.rs"]` / `mod <name>;`
+//! pair per suite under `tests/all/`, and no prose between them. Put a new suite at
+//! `tests/all/<name>.rs` and append its pair here.
+//! * A suite that is not declared here compiles nowhere and its tests never run, and a
+//!   suite left at the top level of `tests/` fails the build.
+//! * Declare each suite exactly ONCE: this is one crate root, so a second `mod` for the
+//!   same name is `E0428` and fails every suite in this target.
+//! * `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of
+//!   this file: every declaration carries the `#[path = "all/<name>.rs"]` attribute.
+//! * THIS HEADER IS THE ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE.
+//!   Past the first item one is `E0753` and compiles no suite of this target, so add a
+//!   declaration here — never a note about one, and never a copy of this header.
+//! file and for every service crate's `tests/all.rs`.
