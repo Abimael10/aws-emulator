@@ -14,6 +14,12 @@
 //! engine ([`crate::state::log_groups`]) — the `CloudWatchLogGroupArn` every later read
 //! reports for an enabled log type names a group `logs:DescribeLogGroups` finds.
 //!
+//! Three members of the configuration are REFERENCES to resources other services own — the
+//! execution role in IAM, the DAG source bucket in Amazon S3 and the security groups in
+//! Amazon EC2 — so each is resolved against the service that owns it before the environment
+//! is recorded pointing at it, and a reference that service answers is unusable is refused
+//! with `ValidationException` ([`crate::state::configuration_dependencies`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -418,6 +424,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(validation(crate::state::reserved_tag_key_message(
                 "Tags", reserved,
             )));
+        }
+
+        // The members this create stores that point at a resource of another service — the
+        // execution role, the DAG source bucket and the security groups — are resolved
+        // against the services that own them before anything is written, and a reference one
+        // of those services answers is unusable is refused rather than stored
+        // ([`crate::state::configuration_dependencies`]). Asked with NO store guard held,
+        // because each of them is a call into another service of this same emulator.
+        if let Some(unmet) = crate::state::configuration_dependencies::unmet_dependency(
+            ctx,
+            &region,
+            crate::state::configuration_dependencies::RequestedDependencies {
+                execution_role_arn: Some(spec.execution_role_arn.as_str()),
+                security_group_ids: Some(spec.network_configuration.security_group_ids.as_slice()),
+                source_bucket_arn: Some(spec.source_bucket_arn.as_str()),
+            },
+        )
+        .await
+        {
+            return Err(validation(unmet));
         }
 
         // Enabling an Apache Airflow log type asks MWAA to publish that type's logs, and it

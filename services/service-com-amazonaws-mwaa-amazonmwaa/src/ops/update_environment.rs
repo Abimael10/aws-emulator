@@ -18,6 +18,14 @@
 //! of a pair leaves the environment loading no such object, with neither member of the
 //! pair left on the record (see [`crate::state::EnvironmentSpec::normalise_s3_objects`]).
 //!
+//! A patch that REPLACES a member pointing at a resource of another service — the execution
+//! role in IAM, the DAG source bucket in Amazon S3, the security groups in Amazon EC2 — is
+//! resolved against the service that owns it before the record is left pointing at it: a
+//! reference that service answers is unusable is refused with `ValidationException` and the
+//! environment goes on running the configuration it already had
+//! ([`crate::state::configuration_dependencies`]). The addressed environment is resolved
+//! BEFORE any of that, so an unknown name is still a 404.
+//!
 //! An update that SWITCHES AN APACHE AIRFLOW LOG TYPE ON provisions one resource outside
 //! this service's own store, exactly as a create that enables one does: that log type
 //! publishes to a CloudWatch Logs log group MWAA creates for the environment, so the group
@@ -275,28 +283,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the Region this request was signed for and nowhere else.
         let region = crate::state::request_region(ctx);
 
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            UpdateEnvironmentErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the Amazon MWAA environment store is unavailable".to_string()),
-            })
-        })?;
-        let mut store = state.lock();
-        store.settle(now);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
 
-        let stored = store.environment_mut(&region, &input.name).ok_or_else(|| {
-            UpdateEnvironmentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::environment_not_found_message(&input.name)),
-            })
-        })?;
+        // The environment this request ADDRESSES is resolved FIRST, and so is the status
+        // gate on it: an unknown name is a 404 whatever else the request carries, and the
+        // references resolved below say nothing about an environment that does not exist.
+        // The guard is released before those calls, because each of them is a call into
+        // another service of this same emulator.
+        {
+            let mut store = state.lock();
+            store.settle(now);
+            let stored = store
+                .environment(&region, &input.name)
+                .ok_or_else(|| not_found(&input.name))?;
 
-        // An update reconfigures a RUNNING environment: one still being created, or
-        // already under an update the clock has not settled yet, cannot take another.
-        // Checked AFTER the lookup, so an unknown name is still a 404.
-        if !stored.accepts_update() {
-            return Err(validation(crate::state::update_not_allowed_message(
-                &input.name,
-                &stored.status,
-            )));
+            // An update reconfigures a RUNNING environment: one still being created, or
+            // already under an update the clock has not settled yet, cannot take another.
+            // Checked AFTER the lookup, so an unknown name is still a 404.
+            if !stored.accepts_update() {
+                return Err(validation(crate::state::update_not_allowed_message(
+                    &input.name,
+                    &stored.status,
+                )));
+            }
         }
 
         // An S3 object's version has to travel with its path IN THIS REQUEST, so the
@@ -311,6 +320,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         .validate()
         .map_err(validation)?;
+
+        // The members this patch REPLACES that point at a resource of another service — the
+        // execution role, the DAG source bucket and the security groups — are resolved
+        // against the services that own them before the record is left pointing at them, and
+        // a reference one of those services answers is unusable is refused rather than
+        // stored ([`crate::state::configuration_dependencies`]). A member the patch does not
+        // carry names nothing new, so nothing is resolved for it. Asked with NO store guard
+        // held.
+        if let Some(unmet) = crate::state::configuration_dependencies::unmet_dependency(
+            ctx,
+            &region,
+            crate::state::configuration_dependencies::RequestedDependencies {
+                execution_role_arn: input.execution_role_arn.as_deref(),
+                security_group_ids: input
+                    .network_configuration
+                    .as_ref()
+                    .map(|requested| requested.security_group_ids.as_slice()),
+                source_bucket_arn: input.source_bucket_arn.as_deref(),
+            },
+        )
+        .await
+        {
+            return Err(validation(unmet));
+        }
+
+        // The merge and the write, under the guard again — and with the clock read again,
+        // because the calls above took time the clock may owe a transition for. The
+        // environment is re-resolved and re-gated for the same reason: it is the record as
+        // it stands NOW that this update is applied to.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let stored = store
+            .environment_mut(&region, &input.name)
+            .ok_or_else(|| not_found(&input.name))?;
+        if !stored.accepts_update() {
+            return Err(validation(crate::state::update_not_allowed_message(
+                &input.name,
+                &stored.status,
+            )));
+        }
 
         // Merge, member by member, onto a COPY of the stored spec: a member the request
         // does not carry keeps the value the create (or an earlier update) stored for it,
@@ -443,6 +494,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn validation(message: impl Into<String>) -> UpdateEnvironmentError {
     UpdateEnvironmentErrorModeled::ValidationException(ValidationException {
         message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server-side fault, which this operation models as
+/// `InternalServerException` (HTTP 500). Never answered by constructing a private engine.
+fn store_unavailable() -> UpdateEnvironmentError {
+    UpdateEnvironmentErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the Amazon MWAA environment store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// No environment of that name in the Region this request was signed for: the modelled
+/// `ResourceNotFoundException` (HTTP 404), worded by the one place this service words it.
+fn not_found(name: &str) -> UpdateEnvironmentError {
+    UpdateEnvironmentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::environment_not_found_message(name)),
     })
     .into()
 }

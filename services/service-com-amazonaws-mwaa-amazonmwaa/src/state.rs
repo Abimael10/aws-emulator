@@ -31,6 +31,11 @@ pub mod log_groups;
 /// token operations report alike.
 pub mod webserver_address;
 
+/// The resources an environment's configuration POINTS AT in other services — its execution
+/// role, its DAG source bucket and its security groups — resolved against the services that
+/// own them before a create or an update stores that configuration.
+pub mod configuration_dependencies;
+
 pub use webserver_address::{published_webserver_url, webserver_hostname, webserver_url};
 
 /// STS's own state accessors, which answer who a request's credential speaks for. The

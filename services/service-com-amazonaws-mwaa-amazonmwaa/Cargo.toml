@@ -45,6 +45,12 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 # type and reports that group's ARN, so the group has to exist in the very store CloudWatch
 # Logs' own `DescribeLogGroups` / `GetLogEvents` read.
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+# The Amazon EC2 read that resolves the security groups an environment's configuration names
+# (`state::configuration_dependencies`): security groups are EC2's records, so the
+# `DescribeSecurityGroups` this client generates is what says whether the account has them,
+# asked over the in-process callback. Only the generated client is needed — the emulator
+# supplies the transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -59,6 +65,11 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # beside this service on one engine and asked through its own `ListMetrics` and
 # `GetMetricStatistics`.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# The DAG source bucket and the security groups an environment's configuration names are REAL
+# records of those services, so the suite about resolving them mounts Amazon S3 and Amazon EC2
+# beside this service on the same engine and creates them through their own operations.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true

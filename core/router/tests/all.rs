@@ -204,6 +204,8 @@ mod bedrock_agentcore_gateway_mcp_transport_path;
 mod bedrock_agentcore_signing_name_routing;
 #[path = "all/bedrock_catalogue_is_invocable.rs"]
 mod bedrock_catalogue_is_invocable;
+#[path = "all/bedrock_evaluation_job_saves_its_results_in_s3.rs"]
+mod bedrock_evaluation_job_saves_its_results_in_s3;
 #[path = "all/bedrock_guardrail_applied_across_planes.rs"]
 mod bedrock_guardrail_applied_across_planes;
 #[path = "all/bedrock_knowledge_base_over_an_aoss_collection.rs"]
