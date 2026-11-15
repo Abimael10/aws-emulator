@@ -175,12 +175,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The catalog publishes no blueprint of this name — HTTP 404 `ResourceNotFoundException`.
 ///
-/// The message names the blueprint the request named: a blueprint name is a published
-/// catalog name a caller reads out of `ListPipelineBlueprints`, so naming it back is what
-/// tells a caller which of the names it resolved is not published.
+/// The wording is the blueprint lookup's own, not a not-found template shared with the
+/// name-addressed pipeline operations: the service prefixes the resource kind and states
+/// that the named blueprint does not exist, with the requested name as the only variable
+/// part, echoed verbatim from the `BlueprintName` path label. A caller that recognises an
+/// unpublished blueprint name by this text — the blueprint-discovery flow resolves a name
+/// out of `ListPipelineBlueprints` before fetching its body — matches on exactly it.
 fn not_found(blueprint_name: &str) -> GetPipelineBlueprintError {
     GetPipelineBlueprintErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("The blueprint {blueprint_name} could not be found")),
+        message: Some(format!("Blueprint: {blueprint_name} does not exists")),
     })
     .into()
 }

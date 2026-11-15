@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/blueprint_catalog.rs"]
 mod blueprint_catalog;
+#[path = "all/blueprint_not_found_wording.rs"]
+mod blueprint_not_found_wording;
 #[path = "all/blueprint_retrieval.rs"]
 mod blueprint_retrieval;
 #[path = "all/error_messages.rs"]

@@ -7294,3 +7294,19 @@ mod zz_glue_job_source_permission_probe;
 // the module doc at the HEAD of this file, where an inner doc comment is legal.)
 // (A second long run of header copies stood here, typed with `//!` past the first item
 // (`E0753`) by successive landings: removed for the reason the note above states.)
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, keeping the list sorted. The list
+//! holds one pair per suite and NOTHING else, so a landing has one place to insert and
+//! nothing to keep consistent.
+//! A suite that is not declared here compiles nowhere and its tests never run, and the
+//! build script refuses a suite file no declaration names. A suite left at the top level
+//! of `tests/` fails the build. Declare each suite exactly ONCE: this is one crate root,
+//! so a second `mod` for the same name is `E0428`.
+//! An inner doc comment is legal only BEFORE the first item, so this block is the only
+//! place one may stand in this file: past the first item it is `E0753` and compiles no
+//! suite of this target. Below, add a declaration — never a note about one, and never a
+//! copy of this header; a note that must be written below is an ordinary comment.
+//! (`tests/boot_serve.rs`) — which the layout check refuses. The `#[path]` above each
+//! `mod` is what points it into `tests/all/`. What a suite covers, and why it belongs to
+//! this cross-service target rather than to one service crate, is stated in that suite's
+//! own module doc, where it is read beside the test it explains.
+// (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is what points each

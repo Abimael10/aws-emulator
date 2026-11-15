@@ -440,7 +440,7 @@ async fn a_name_the_catalog_does_not_publish_is_refused() {
         let message = answer.message();
         assert_eq!(
             message,
-            format!("The blueprint {name} could not be found"),
+            format!("Blueprint: {name} does not exists"),
             "case {case:?}: the refusal must name the blueprint the request named, \
              got {message:?}"
         );
