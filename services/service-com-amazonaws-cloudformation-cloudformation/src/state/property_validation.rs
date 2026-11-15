@@ -23,19 +23,28 @@
 //! type and no value set at all ([`super::resource_schema`] says so in full), and the service
 //! that owns a type is reachable only by CREATING the resource — there is no read that asks
 //! it whether a declaration would be accepted. So this stage is NOT that schema check and
-//! does not stand in for it: it decides the two questions a type's published contract makes
+//! does not stand in for it: it decides the questions a type's published contract makes
 //! decidable without asking anybody —
 //!
 //! * a property the contract marks REQUIRED that the declaration does not carry at all, over
 //!   the rows this emulator holds ([`REQUIRED_PROPERTIES`]), which is the
 //!   `Required property [<member>] not found` the stage reports
 //!   ([`missing_property_reason`]);
+//! * a member the contract states NO property for, over the types whose property set this
+//!   emulator holds in full ([`declared_properties`]), which is the
+//!   `Unsupported property [<member>]` the stage reports
+//!   ([`declared_properties::unsupported_property_reason`]);
 //! * a property whose contract publishes the values it admits, carrying a value that is not
 //!   one of them, over the rows this emulator holds ([`CONSTRAINED_PROPERTIES`]).
 //!
 //! A resource is judged in that order, because a property that is not there has no value to
-//! hold to a set, and the resources in the order the deployment would have created them — so
-//! the failure reported is the one the operation would have run into first.
+//! hold to a set and a member the type does not have has no set to hold one to, and the
+//! resources in the order the deployment would have created them — so the failure reported is
+//! the one the operation would have run into first.
+//!
+//! What the STACK reports for a failure of this stage is not one of those reasons but the
+//! summary over them ([`validation_failure_summary`]): the count of errors, and that the
+//! detail of each is on the operation's own events, which is where each failure is recorded.
 //!
 //! That makes the stage deliberately PARTIAL, and fail-open: a property no row covers, a type
 //! with no row at all, and a value an expression produced that is not text are each left to
@@ -83,6 +92,10 @@
 use ::serde_json::Value;
 
 use super::StoredResource;
+
+/// Which properties a type HAS at all, which is the other question its schema makes
+/// decidable here.
+pub mod declared_properties;
 
 /// One property whose admitted values its type's contract publishes.
 #[derive(Debug, Clone, Copy)]
@@ -319,12 +332,15 @@ pub struct PropertyFailure {
     pub logical_id: String,
     /// That resource's declared type.
     pub resource_type: String,
-    /// Why it failed: which property is missing ([`missing_property_reason`]), or which
-    /// property carries a value its type does not admit ([`failure_reason`]).
+    /// Why it failed: which property is missing ([`missing_property_reason`]), which member
+    /// the type does not have
+    /// ([`declared_properties::unsupported_property_reason`]), or which property carries a
+    /// value its type does not admit ([`failure_reason`]).
     pub reason: String,
     /// `OperationEvent$ValidationPath`: "the path within the resource where the validation
     /// was applied" — the element of the submitted template this validation ran on
-    /// ([`properties_path`]).
+    /// ([`properties_path`], or the property itself where that is what was judged,
+    /// [`declared_properties::property_path`]).
     pub path: String,
 }
 
@@ -352,14 +368,40 @@ const PROPERTIES_SECTION: &str = "Properties";
 ///
 /// The resources are walked in the order the deployment would have created them, so the
 /// failure reported is the one the operation would have run into first, and each resource is
-/// judged for a MISSING required property before the values it does carry: a property that
-/// is not there has no value to hold to a published set.
+/// judged in the order its type's schema states its conditions: that the document carries
+/// every property the type REQUIRES (a property that is not there has no value to hold to a
+/// set), then that every member it does carry is one the type HAS
+/// ([`declared_properties`]), then the `oneOf` over those members, and last each value
+/// against the set its property publishes.
 pub fn failure(declared: &[StoredResource]) -> Option<PropertyFailure> {
     declared.iter().find_map(|resource| {
         missing_required_property(resource)
+            .or_else(|| declared_properties::undeclared_property(resource))
             .or_else(|| matched_several_subschemas(resource))
             .or_else(|| inadmissible_value(resource))
     })
+}
+
+/// How a stack operation reports, ON THE STACK, that its resources did not pass this stage:
+/// how many errors the stage found, and that the detail of each one is on the operation's own
+/// events.
+///
+/// A failed schema validation has as many errors as there are declarations it refused, and
+/// each error's detail — the resource, the property and the path — is recorded as the
+/// validation result it is ([`PropertyFailure`]), which `DescribeEvents` reports. So what the
+/// STACK carries is the summary that counts them and says where to read them, rather than one
+/// of the reasons standing in for all of them.
+///
+/// The one variable part is the count, which is how many failures this stage reported for the
+/// operation — the length of `failures`, since [`failure`] reports the FIRST declaration the
+/// stage refuses and the operation is then refused on it.
+pub fn validation_failure_summary(failures: &[PropertyFailure]) -> String {
+    let errors = failures.len();
+    format!(
+        "Validation failed with {errors} error(s). Call DescribeEvents to retrieve the full \
+         list of issues with resource and property details, resolve each error, then retry \
+         the operation."
+    )
 }
 
 /// `Some(failure)` for a resource carrying MORE THAN ONE of a group of properties its type's

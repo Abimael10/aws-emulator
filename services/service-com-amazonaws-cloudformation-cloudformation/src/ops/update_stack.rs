@@ -1372,11 +1372,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     stack.client_request_token.clone(),
                 );
             }
-            // What a failed pre-deployment validation refuses the deployment with: the
-            // validation's own reason, which is what the stack then reports it failed for.
+            // What a failed pre-deployment validation refuses the deployment with. A failed
+            // PROPERTY validation refuses it with the summary over its errors, each error's
+            // own detail being on the validation result recorded above; the existence check,
+            // whose verdict is one sentence about one identifier, refuses it with that
+            // sentence.
             let failed_validation = property_failure
                 .as_ref()
-                .map(|failure| failure.reason.clone())
+                .map(|failure| {
+                    crate::state::property_validation::validation_failure_summary(
+                        ::std::slice::from_ref(failure),
+                    )
+                })
                 .or_else(|| {
                     name_conflict.as_ref().map(|conflicting| {
                         crate::state::early_validation::name_conflict_failure(conflicting).reason

@@ -687,6 +687,8 @@ mod unreverted_rollback_resumption;
 mod unschedulable_update_leaves_the_deployment_alone;
 #[path = "all/unsignalled_gate_hold.rs"]
 mod unsignalled_gate_hold;
+#[path = "all/unsupported_resource_properties.rs"]
+mod unsupported_resource_properties;
 #[path = "all/update_after_a_refused_delete.rs"]
 mod update_after_a_refused_delete;
 #[path = "all/update_failed_stack_operations.rs"]
