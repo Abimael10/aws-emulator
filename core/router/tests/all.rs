@@ -2462,3 +2462,10 @@ mod declaration_roots_are_canonical_and_complete;
 //! it belongs to this cross-service target rather than to one service crate's own, is stated
 //! in that suite's own module doc, where it is read beside the test it describes, and the
 //! notes successive landings had appended to this list live in `all/appended_notes.rs`.
+// name. The list holds those pairs and no other line, so two branches landing at once
+// insert two lines in two places and have no prose to duplicate, re-word or mistype. What
+// a suite covers, and why it drives the assembled router rather than one service crate,
+// appended past the declarations is `E0753` and compiles no suite of this target. With
+// none anywhere, no merge of two landings can leave one past the first item.
+// declaration into `tests/all/`. Three suites pin the shape above rather than have it
+// restated here: `all/all_rs_declares_each_suite_once.rs`,

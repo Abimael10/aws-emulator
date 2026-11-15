@@ -15,6 +15,9 @@
 //! The rows of each table differ along what the rule generalises over: which lifecycle
 //! call armed the transition, which status it settles into, which operation reports it
 //! (`GetPipeline` or `ListPipelines`), and the pipeline's name shape and unit counts.
+//!
+//! The harness below is this service's shared one for driving the pipeline lifecycle over
+//! HTTP: `pipeline_stop_start_cycle` reaches it rather than keeping a second copy.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -41,19 +44,19 @@ const START_ELIGIBLE: &str = "STOPPED, START_FAILED, CREATE_FAILED";
 /// What one call answered: the HTTP status, the modelled error code (empty on success) and
 /// the parsed body.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     error_type: String,
-    body: Value,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// One member of the returned `Pipeline`.
-    fn member(&self, name: &str) -> &Value {
+    pub(crate) fn member(&self, name: &str) -> &Value {
         &self.body["Pipeline"][name]
     }
 
-    fn status_value(&self) -> String {
+    pub(crate) fn status_value(&self) -> String {
         self.member("Status")
             .as_str()
             .unwrap_or_else(|| panic!("expected a Status in {:?}", self.body))
@@ -72,7 +75,7 @@ impl Answer {
     }
 }
 
-fn new_router() -> MultiServiceRouter {
+pub(crate) fn new_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signature verification is the emulator's own concern and is exercised elsewhere;
@@ -134,7 +137,7 @@ async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Optio
 
 /// A create request: `PipelineName` is `@length(3, 28)` / `^[a-z][a-z0-9\-]+$` and
 /// `MinUnits` / `MaxUnits` are `@range(1,)` (smithy_query: operation CreatePipeline).
-fn create_body(name: &str, min_units: i64, max_units: i64) -> Value {
+pub(crate) fn create_body(name: &str, min_units: i64, max_units: i64) -> Value {
     json!({
         "PipelineName": name,
         "MinUnits": min_units,
@@ -143,7 +146,7 @@ fn create_body(name: &str, min_units: i64, max_units: i64) -> Value {
     })
 }
 
-async fn create_pipeline(router: &MultiServiceRouter, body: Value) -> Answer {
+pub(crate) async fn create_pipeline(router: &MultiServiceRouter, body: Value) -> Answer {
     call(router, "POST", "/2022-01-01/osis/createPipeline", Some(body)).await
 }
 
@@ -157,7 +160,7 @@ async fn get_pipeline(router: &MultiServiceRouter, name: &str) -> Answer {
     .await
 }
 
-async fn stop_pipeline(router: &MultiServiceRouter, name: &str) -> Answer {
+pub(crate) async fn stop_pipeline(router: &MultiServiceRouter, name: &str) -> Answer {
     call(
         router,
         "PUT",
@@ -167,7 +170,7 @@ async fn stop_pipeline(router: &MultiServiceRouter, name: &str) -> Answer {
     .await
 }
 
-async fn start_pipeline(router: &MultiServiceRouter, name: &str) -> Answer {
+pub(crate) async fn start_pipeline(router: &MultiServiceRouter, name: &str) -> Answer {
     call(
         router,
         "PUT",
@@ -219,7 +222,7 @@ fn listed_statuses(listed: &Answer) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn expect_ok(case: &str, step: &str, answer: Answer) -> Answer {
+pub(crate) fn expect_ok(case: &str, step: &str, answer: Answer) -> Answer {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected 200 from {step}, got {} / {:?}",
@@ -239,6 +242,18 @@ async fn poll_for_status(
     name: &str,
     targets: &[&str],
 ) -> (String, usize) {
+    let (read, reads) = poll_for_report(router, case, name, targets).await;
+    (read.status_value(), reads)
+}
+
+/// The same poll, answering with the whole report the pipeline settled in rather than only
+/// its status: a case that compares other members across a lifecycle leg needs the report.
+pub(crate) async fn poll_for_report(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    targets: &[&str],
+) -> (Answer, usize) {
     let mut last = String::new();
     for reads in 1..=READ_BUDGET {
         let read = get_pipeline(router, name).await;
@@ -249,7 +264,7 @@ async fn poll_for_status(
         );
         last = read.status_value();
         if targets.contains(&last.as_str()) {
-            return (last, reads);
+            return (read, reads);
         }
     }
     panic!(
@@ -669,3 +684,4 @@ async fn a_listing_reports_every_pipeline_in_its_settled_status() {
         "case \"a listing after a stop\": expected {expected:?}, got {statuses:?}"
     );
 }
+
