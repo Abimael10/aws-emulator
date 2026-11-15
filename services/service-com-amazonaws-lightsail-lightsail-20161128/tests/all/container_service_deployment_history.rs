@@ -647,7 +647,7 @@ async fn a_name_no_service_is_held_under_is_refused() {
         );
         assert_eq!(
             refused["message"].as_str(),
-            Some(format!("The ContainerService does not exist: {name}").as_str()),
+            Some(crate::instance_lifecycle::does_not_exist_message("ContainerService", name).as_str()),
             "case {case}: expected the message to name the resource type and the name the \
              request carried, got {refused:?}"
         );

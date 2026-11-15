@@ -705,7 +705,10 @@ async fn the_cache_reset_apis_refuse_what_the_service_does_not_serve() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some("The Distribution does not exist: no-such-cdn"),
+            Some(
+                crate::instance_lifecycle::does_not_exist_message("Distribution", "no-such-cdn")
+                    .as_str()
+            ),
             "case {case}: expected the message to name the resource type and the name, got \
              {body:?}"
         );

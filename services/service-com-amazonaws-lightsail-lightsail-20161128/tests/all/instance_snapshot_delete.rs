@@ -110,7 +110,7 @@ async fn assert_absent(emulator: &Emulator, case: &str, name: &str) {
     );
     assert_eq!(
         body["message"].as_str(),
-        Some(format!("The InstanceSnapshot does not exist: {name}").as_str()),
+        Some(crate::instance_lifecycle::does_not_exist_message("InstanceSnapshot", name).as_str()),
         "case {case}: expected the resource-type/name message for {name}, got {body:?}"
     );
 }
@@ -726,7 +726,13 @@ async fn a_name_the_account_holds_no_instance_snapshot_under_is_refused() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(format!("The InstanceSnapshot does not exist: {}", refusal.name).as_str()),
+            Some(
+                crate::instance_lifecycle::does_not_exist_message(
+                    "InstanceSnapshot",
+                    refusal.name
+                )
+                .as_str()
+            ),
             "case {case}: expected the resource-type/name message, got {body:?}"
         );
     }

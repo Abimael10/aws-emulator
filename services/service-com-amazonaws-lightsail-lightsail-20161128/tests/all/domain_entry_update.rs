@@ -843,7 +843,7 @@ async fn an_update_to_a_zone_that_does_not_exist_is_refused() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(format!("The Domain does not exist: {name}").as_str()),
+            Some(crate::instance_lifecycle::does_not_exist_message("Domain", name).as_str()),
             "case updating in {name}: expected the resource-type/name message, got {body:?}"
         );
     }

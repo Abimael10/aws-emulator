@@ -256,55 +256,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `statistics` is "The statistic for the metric": a request that names
         // none asks for no statistic of the metric, so there is nothing it could
-        // be answered with.
+        // be answered with. Each entry names one member of the modelled
+        // `MetricStatistic` enum, of which there are five
+        // (`crate::state::MAX_METRIC_STATISTICS`), and the list carries no
+        // length bound of its own — so a longer one repeats a member, selects no
+        // more of the datapoint than five entries would, and is refused rather
+        // than walked.
         if input.statistics.is_empty() {
             return Err(invalid(
                 "statistics must name at least one statistic of the metric to return".to_string(),
             ));
         }
+        if input.statistics.len() > crate::state::MAX_METRIC_STATISTICS {
+            return Err(invalid(format!(
+                "statistics names {} entries, more than the {} statistics a metric has: name \
+                 each at most once",
+                input.statistics.len(),
+                crate::state::MAX_METRIC_STATISTICS
+            )));
+        }
+
+        // Both bounds in the unit this store's clock reads, so the requested
+        // window and the instants the instance has been publishing at are
+        // compared in one unit.
+        let start_ms = epoch_millis(input.start_time, "startTime")?;
+        let end_ms = epoch_millis(input.end_time, "endTime")?;
+        let now = crate::state::now_ms();
 
         let metric_name = input.metric_name;
         let instance_name = input.instance_name;
+        let statistics = input.statistics;
+        let period = i64::from(input.period);
         crate::state::with_state(&*self.engine, |store| {
             // Metrics are reported for an instance this account HOLDS: a name no
             // instance record answers to earns the service's `DoesNotExist`
             // envelope, not an authoritative-looking empty series.
-            if store.instance(&instance_name).is_none() {
+            let Some(instance) = store.instance(&instance_name) else {
                 return Err(not_found(&instance_name));
-            }
+            };
+            // The series is the store's, not this handler's: an instance's
+            // telemetry is owned by `crate::state::instance_metric_series`,
+            // which cuts the requested window into one datapoint per `period`
+            // window the instance has published a sample in and fills each with
+            // the statistics the request asked for. A window before the
+            // instance existed, or one that has not happened, holds no sample
+            // and so no datapoint — which is what the service itself answers
+            // for a window it has no data for.
+            //
+            // What each of those samples MEASURED is zero, and that is the
+            // whole of what this emulator can stand behind: it runs no guest,
+            // so no status check failed, no byte crossed an interface, no disk
+            // operation completed and no compute unit is in use — the value
+            // each metric's own documentation gives such a window
+            // (`crate::state::INSTANCE_METRIC_SAMPLE`). A plausible-looking
+            // number per window would be invented telemetry a client could not
+            // tell from a measured one.
+            let metric_data = crate::state::instance_metric_series(
+                instance,
+                crate::state::MetricRead {
+                    metric_name: &metric_name,
+                    unit: published_unit,
+                    period_seconds: period,
+                    start_ms,
+                    end_ms,
+                    now_ms: now,
+                    statistics: &statistics,
+                },
+            )
+            .ok_or_else(|| {
+                // Unreachable: the published unit above came from the same
+                // catalog, so a metric that has a unit here has a series too.
+                crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "GetInstanceMetricData for the instance metric {metric_name}"
+                ))
+            })?;
             Ok(GetInstanceMetricDataOutput {
                 // "The name of the metric returned" — the metric whose series
                 // this answer is, which is the one the request named.
                 metric_name: Some(metric_name.clone()),
-                // The datapoints the store holds for that metric over the
-                // requested window: NONE, for every window and every instance.
-                //
-                // Each instance metric is a measurement taken on a running
-                // guest — the percentage of allocated compute units in use, the
-                // bytes the instance's interfaces carried, the operations its
-                // system disk completed, whether its status checks passed, how
-                // often its metadata service was reached without a token. This
-                // emulator runs no guest and monitors none, so no observation
-                // was ever made in any of the period windows the request spans,
-                // whatever its `period` and whichever granularity the metric is
-                // published at (60 seconds for the status checks, 300 for the
-                // rest, from `GetInstanceMetricDataRequest$period`).
-                //
-                // An empty `metricData` says exactly that, and is what the
-                // service itself answers for a window it holds no data for — a
-                // window before the instance existed, say. A plausible-looking
-                // number per window would be invented telemetry a client could
-                // not tell from a measured one, and would contradict the rest of
-                // this store, where every alarm stays `INSUFFICIENT_DATA`
-                // because no metric of it has data
-                // (`crate::state::ALARM_STATE_INSUFFICIENT_DATA`). The
-                // `statistics` the request asked for select members OF a
-                // datapoint, so with no datapoints they have nothing to fill.
-                metric_data: Some(Vec::new()),
+                // "An array of objects that describe the metric data returned."
+                metric_data: Some(metric_data),
             })
         })
         .ok_or_else(unavailable)?
     }
+}
+
+/// `at` in epoch milliseconds — the unit this store's clock reads
+/// (`crate::state::now_ms`) — or this operation's refusal when `at` names an
+/// instant too far from the epoch to be one.
+fn epoch_millis(
+    at: ::aws_smithy_types::DateTime,
+    member: &str,
+) -> Result<i64, GetInstanceMetricDataError> {
+    at.to_millis().map_err(|_| {
+        invalid(format!(
+            "{member} must name an instant within the range of epoch milliseconds"
+        ))
+    })
 }
 
 /// This operation's 400 refusal for a request the model admits but the service

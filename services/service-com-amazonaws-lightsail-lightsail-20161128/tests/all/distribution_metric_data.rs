@@ -608,7 +608,7 @@ async fn a_name_no_distribution_answers_to_earns_the_does_not_exist_envelope() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(format!("The Distribution does not exist: {name}").as_str()),
+            Some(crate::instance_lifecycle::does_not_exist_message("Distribution", name).as_str()),
             "case {case}: expected the resource-type/name message, got {body:?}"
         );
     }

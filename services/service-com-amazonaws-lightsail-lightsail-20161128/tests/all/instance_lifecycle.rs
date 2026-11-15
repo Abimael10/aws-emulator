@@ -213,6 +213,33 @@ pub(crate) fn error_code(body: &Value) -> String {
         .to_string()
 }
 
+/// The message Lightsail refuses a request naming a resource the account does
+/// not hold with: fixed text around the identifier the request carried and the
+/// bracketed list of resource types the operation looked for it among.
+///
+/// SOURCE: the recorded refusal of a `DeleteAlarm` naming an alarm that had
+/// already been deleted — "The specified resource <alarmName> does not exist
+/// within types [Alarm]. Please provide a valid resource name." Nothing in it is
+/// per-run: the fixed text is the service's, and the two variable parts are the
+/// request's own identifier and the operation's type list.
+///
+/// `pub(crate)` so every suite in this test target states the one template once
+/// rather than carrying a copy of it each.
+pub(crate) fn does_not_exist_message(resource_type: &str, name: &str) -> String {
+    does_not_exist_within_message(&[resource_type], name)
+}
+
+/// [`does_not_exist_message`] for an operation that looks for the identifier
+/// among SEVERAL resource types, which the message lists in the order the
+/// operation resolves them in.
+pub(crate) fn does_not_exist_within_message(resource_types: &[&str], name: &str) -> String {
+    format!(
+        "The specified resource {name} does not exist within types [{}]. Please provide a valid \
+         resource name.",
+        resource_types.join(", ")
+    )
+}
+
 /// Whether `value` has the shape of the UUID Lightsail's instance and operation
 /// ids take: five hex groups of 8-4-4-4-12.
 ///

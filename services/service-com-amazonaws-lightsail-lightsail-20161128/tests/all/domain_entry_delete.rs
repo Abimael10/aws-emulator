@@ -20,9 +20,9 @@
 //! exactly that; the removal is answered as one terminal `DeleteDomainEntry`
 //! operation against the `Domain`; a `domainEntry` resolving to no entry of the
 //! zone — one already deleted, say — has nothing to remove, so the delete cannot
-//! execute and is refused with the modelled `OperationFailureException`, carrying
-//! the service's `DoesNotExist` body code and a message saying there is no such
-//! domain record; and a request naming no stored zone, or carrying neither handle,
+//! execute and is refused with the modelled `OperationFailureException` carrying
+//! the fixed sentence the service words that failure with; and a request naming
+//! no stored zone, or carrying neither handle,
 //! is refused too, each with its own modelled error, and removes nothing.
 
 use serde_json::{json, Value};
@@ -32,6 +32,16 @@ use super::instance_lifecycle::{error_code, is_uuid_shaped, Emulator};
 
 /// The zone every case deletes an entry of.
 const ZONE: &str = "example.com";
+
+/// The sentence Lightsail refuses a delete addressed at a recordset the zone
+/// does not hold with.
+///
+/// SOURCE: the recorded refusal of a second `DeleteDomainEntry` for an entry
+/// already deleted. The whole string is fixed text: it interpolates no value of
+/// the request and none of the zone, so every case below expects exactly it.
+const NO_SUCH_RECORD_MESSAGE: &str =
+    "Input error: No such domain record found in this domain for this name/type/target \
+     combination.";
 
 /// The `operationType` an entry's removal from a zone is logged under, the
 /// modelled `OperationType` enum's own `DeleteDomainEntry` member.
@@ -484,6 +494,12 @@ async fn deleting_the_same_entry_twice_is_refused_the_second_time() {
              OperationFailureException, got {body:?}"
         );
         assert_eq!(
+            body["message"].as_str(),
+            Some(NO_SUCH_RECORD_MESSAGE),
+            "case a second delete addressed by {case}: expected the no-such-record \
+             sentence, got {body:?}"
+        );
+        assert_eq!(
             entries(&emulator, ZONE).await,
             after,
             "case a second delete addressed by {case}: expected the zone to be unchanged \
@@ -569,9 +585,11 @@ async fn a_delete_reaches_only_the_zone_it_names() {
 
 /// RULE: a `domainEntry` neither of whose handles resolves to an entry of the zone
 /// gives the delete no recordset to remove, so the operation cannot execute: the
-/// modelled `OperationFailureException` (400), whose body carries the service's
-/// `DoesNotExist` code and a message, built from the request, saying there is no
-/// such domain record — and nothing removed.
+/// modelled `OperationFailureException` (400), carrying the FIXED sentence the
+/// service words that failure with — the same text whichever handle the request
+/// addressed the entry by, interpolating nothing of the request or of the zone,
+/// and with no `DoesNotExist` body code, which belongs to a request naming a
+/// resource the account does not hold — and nothing removed.
 #[tokio::test]
 async fn a_domain_entry_the_zone_does_not_hold_is_refused() {
     // Each case is one way the request addresses no entry of this zone: an id this
@@ -648,33 +666,32 @@ async fn a_domain_entry_the_zone_does_not_hold_is_refused() {
             "OperationFailureException",
             "case {case}: expected the modelled OperationFailureException, got {body:?}"
         );
-        // The refusal says there is no such domain record, and is built from the
-        // request: it names the zone it looked in and every handle the request
-        // carried.
-        let message = body["message"].as_str().unwrap_or_default();
-        assert!(
-            message.to_lowercase().contains("no such domain record"),
-            "case {case}: expected the refusal to say there is no such domain record, \
-             got {body:?}"
-        );
-        assert!(
-            message.contains(ZONE),
-            "case {case}: expected the refusal to name the zone, got {body:?}"
+        // The refusal is the sentence AWS words this failure with: FIXED text,
+        // the same whichever handle the request carried and whatever this store
+        // minted for the entry, so nothing of the request or of the zone is in
+        // it — and no `code` either, because this is an operation that failed to
+        // execute rather than a resource the account does not hold.
+        assert_eq!(
+            body["message"].as_str(),
+            Some(NO_SUCH_RECORD_MESSAGE),
+            "case {case}: expected the no-such-record sentence, got {body:?}"
         );
         for handle in ["id", "name", "type", "target"] {
             if let Some(value) = requested[handle].as_str() {
                 assert!(
-                    message.contains(value),
-                    "case {case}: expected the refusal to name the {handle} the request \
-                     carried ({value}), got {body:?}"
+                    !body["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains(value),
+                    "case {case}: expected the refusal to interpolate none of the request's \
+                     handles, found the {handle} ({value}) in {body:?}"
                 );
             }
         }
-        assert_eq!(
-            body["code"].as_str(),
-            Some("DoesNotExist"),
-            "case {case}: expected the body code that tells a client the record is \
-             already gone, got {body:?}"
+        assert!(
+            body["code"].is_null(),
+            "case {case}: expected no DoesNotExist code on an operation-failure body, got \
+             {body:?}"
         );
         assert_eq!(
             entries(&emulator, ZONE).await,
@@ -806,7 +823,7 @@ async fn a_delete_in_a_zone_that_does_not_exist_is_refused() {
             );
             assert_eq!(
                 body["message"].as_str(),
-                Some(format!("The Domain does not exist: {name}").as_str()),
+                Some(crate::instance_lifecycle::does_not_exist_message("Domain", name).as_str()),
                 "case deleting in {name}: expected the resource-type/name message, got {body:?}"
             );
         }

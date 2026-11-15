@@ -498,7 +498,7 @@ async fn an_unresolvable_name_answers_the_does_not_exist_envelope() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(format!("The Instance does not exist: {name}").as_str()),
+            Some(crate::instance_lifecycle::does_not_exist_message("Instance", name).as_str()),
             "case {case}: expected a message naming the resource type and the name, got {body:?}"
         );
     }

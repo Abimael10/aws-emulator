@@ -419,7 +419,10 @@ async fn deleting_a_zone_removes_it_and_all_of_its_records() {
             );
             assert_eq!(
                 body["message"].as_str(),
-                Some(format!("The Domain does not exist: {}", row.domain_name).as_str()),
+                Some(
+                    crate::instance_lifecycle::does_not_exist_message("Domain", row.domain_name)
+                        .as_str()
+                ),
                 "case {case}: expected the refusal to be about the missing zone, got {body:?}"
             );
         }
@@ -556,7 +559,7 @@ async fn deleting_a_zone_the_account_does_not_hold_is_refused() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(format!("The Domain does not exist: {name}").as_str()),
+            Some(crate::instance_lifecycle::does_not_exist_message("Domain", name).as_str()),
             "case deleting {name:?}: expected the resource-type/name message, got {body:?}"
         );
 

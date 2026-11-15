@@ -955,7 +955,10 @@ async fn a_restore_the_account_cannot_serve_is_refused_and_stores_nothing() {
             zone,
             "nano_3_0",
             json!({"sourceInstanceName": "absent-instance", "useLatestRestorableAutoSnapshot": true}),
-            Refusal::DoesNotExist("The Instance does not exist: absent-instance"),
+            Refusal::DoesNotExist(
+                "The specified resource absent-instance does not exist within types [Instance]. \
+                 Please provide a valid resource name.",
+            ),
         ),
         (
             "a plan one size below the system volume the copy was taken of",

@@ -842,7 +842,7 @@ async fn an_unknown_resource_answers_the_does_not_exist_envelope() {
                     400,
                     "NotFoundException".to_string(),
                     Some("DoesNotExist"),
-                    Some(format!("The Instance does not exist: {name}").as_str()),
+                    Some(crate::instance_lifecycle::does_not_exist_message("Instance", name).as_str()),
                 ),
                 "case {operation} on {name:?}: expected the DoesNotExist envelope naming \
                  the resource type and the requested name, got {status} {answered:?}"

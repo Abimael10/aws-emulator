@@ -963,8 +963,8 @@ async fn an_unknown_load_balancer_is_refused() {
         assert_eq!(
             body["message"].as_str(),
             Some(
-                format!(
-                    "The {LOAD_BALANCER_RESOURCE_TYPE} does not exist: {}",
+                crate::instance_lifecycle::does_not_exist_message(
+                    LOAD_BALANCER_RESOURCE_TYPE,
                     refusal.name
                 )
                 .as_str()

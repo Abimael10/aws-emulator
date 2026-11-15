@@ -5,6 +5,17 @@
 
 use super::*;
 
+/// The sentence this service refuses an operation addressed at a recordset its
+/// zone does not hold with — a repeated `DeleteDomainEntry`, say.
+///
+/// FIXED text: AWS words this failure the same way whichever entry was
+/// addressed, so nothing of the request and nothing of the zone is interpolated
+/// into it. It belongs to the zone rather than to one operation, so every call
+/// that cannot find an addressed recordset refuses with the one sentence.
+pub const NO_SUCH_DOMAIN_RECORD_MESSAGE: &str =
+    "Input error: No such domain record found in this domain for this name/type/target \
+     combination.";
+
 /// One stored domain recordset: the DNS zone `CreateDomain` created, with the
 /// entries the account has added to it.
 #[derive(Debug, Clone)]

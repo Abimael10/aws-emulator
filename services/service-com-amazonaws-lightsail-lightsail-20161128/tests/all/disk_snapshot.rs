@@ -717,7 +717,7 @@ async fn a_source_the_account_does_not_hold_is_refused() {
         );
         assert_eq!(
             answered["message"].as_str(),
-            Some(format!("The {resource_type} does not exist: {source_name}").as_str()),
+            Some(crate::instance_lifecycle::does_not_exist_message(resource_type, source_name).as_str()),
             "case {case}: expected the resource-type/name message, got {answered:?}"
         );
 
@@ -829,7 +829,7 @@ async fn an_unknown_snapshot_does_not_exist() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(format!("The DiskSnapshot does not exist: {name}").as_str()),
+            Some(crate::instance_lifecycle::does_not_exist_message("DiskSnapshot", name).as_str()),
             "case reading {name}: expected the resource-type/name message, got {body:?}"
         );
     }

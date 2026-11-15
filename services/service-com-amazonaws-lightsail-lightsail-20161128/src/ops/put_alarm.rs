@@ -415,12 +415,17 @@ fn invalid(message: String) -> PutAlarmError {
 /// `code` `DoesNotExist`, and a message built from the request.
 ///
 /// The message names the three resource types an alarm can monitor rather than
-/// one, because the request names a resource without saying what kind it is.
+/// one, because the request names a resource without saying what kind it is, so
+/// all three are the types it was looked for among.
 fn monitored_resource_does_not_exist(name: &str) -> PutAlarmError {
-    crate::scaffolded::Scaffolded::does_not_exist(format!(
-        "monitoredResourceName '{name}' does not name an Instance, LoadBalancer or \
-         RelationalDatabase of this account"
-    ))
+    crate::scaffolded::Scaffolded::resource_does_not_exist_within(
+        &[
+            crate::state::RESOURCE_TYPE_INSTANCE,
+            crate::state::RESOURCE_TYPE_LOAD_BALANCER,
+            crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+        ],
+        name,
+    )
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

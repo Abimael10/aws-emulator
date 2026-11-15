@@ -164,18 +164,12 @@ pub fn bucket_metric_unit(metric_name: &str) -> Option<&'static str> {
         .map(|(_, unit)| *unit)
 }
 
-/// The members of the modelled `MetricStatistic` enum, as a request names them in
-/// `statistics` — each selecting one member OF a datapoint.
-/// Source: `smithy_query(query="shape",shape="MetricStatistic")`.
-const STATISTIC_MINIMUM: &str = "Minimum";
-/// See [`STATISTIC_MINIMUM`].
-const STATISTIC_MAXIMUM: &str = "Maximum";
-/// See [`STATISTIC_MINIMUM`].
-const STATISTIC_SUM: &str = "Sum";
-/// See [`STATISTIC_MINIMUM`].
-const STATISTIC_AVERAGE: &str = "Average";
-/// See [`STATISTIC_MINIMUM`].
-const STATISTIC_SAMPLE_COUNT: &str = "SampleCount";
+// The members of the modelled `MetricStatistic` enum, as a request names them in
+// `statistics` — each selecting one member OF a datapoint. They are the store's,
+// beside the series owner every metric read of this service shares.
+use crate::state::{
+    STATISTIC_AVERAGE, STATISTIC_MAXIMUM, STATISTIC_MINIMUM, STATISTIC_SAMPLE_COUNT, STATISTIC_SUM,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the

@@ -687,7 +687,7 @@ async fn an_entry_cannot_be_added_to_a_zone_that_does_not_exist() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(format!("The Domain does not exist: {name}").as_str()),
+            Some(crate::instance_lifecycle::does_not_exist_message("Domain", name).as_str()),
             "case adding to {name}: expected the resource-type/name message, got {body:?}"
         );
     }

@@ -982,16 +982,19 @@ async fn a_source_the_account_does_not_hold_is_refused() {
         (
             "a snapshot name nothing holds",
             json!({"instanceSnapshotName": "absent-snapshot"}),
-            Some("The InstanceSnapshot does not exist: absent-snapshot".to_string()),
+            Some(crate::instance_lifecycle::does_not_exist_message(
+                "InstanceSnapshot",
+                "absent-snapshot",
+            )),
         ),
         (
             // An instance is not an instance snapshot, so the snapshot member
             // finds nothing under its name.
             "the source INSTANCE's name as a snapshot name",
             json!({"instanceSnapshotName": row.source_name}),
-            Some(format!(
-                "The InstanceSnapshot does not exist: {}",
-                row.source_name
+            Some(crate::instance_lifecycle::does_not_exist_message(
+                "InstanceSnapshot",
+                row.source_name,
             )),
         ),
         (
@@ -1000,7 +1003,10 @@ async fn a_source_the_account_does_not_hold_is_refused() {
                 "sourceInstanceName": "absent-instance",
                 "useLatestRestorableAutoSnapshot": true,
             }),
-            Some("The Instance does not exist: absent-instance".to_string()),
+            Some(crate::instance_lifecycle::does_not_exist_message(
+                "Instance",
+                "absent-instance",
+            )),
         ),
         (
             "the latest automatic snapshot of an instance that exists",

@@ -4544,6 +4544,10 @@ pub use container_services::*;
 mod monitoring;
 pub use monitoring::*;
 
+/// The series a metric read answers with, and what one sample of one is.
+mod metric_series;
+pub use metric_series::*;
+
 /// Load balancers, their registrations and their attached certificates.
 mod load_balancers;
 pub use load_balancers::*;

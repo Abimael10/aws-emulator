@@ -195,11 +195,11 @@ async fn listed_names(emulator: &Emulator) -> Vec<String> {
 }
 
 /// The message Lightsail's `DoesNotExist` envelope carries for a name this
-/// account holds no resource of that type under: the resource's TYPE and the
-/// identifier the request carried
+/// account holds no resource of that type under: the identifier the request
+/// carried and the type it was looked for among
 /// (`crate::scaffolded::Scaffolded::resource_does_not_exist`).
 fn does_not_exist_message(name: &str) -> String {
-    format!("The {RESOURCE_TYPE} does not exist: {name}")
+    crate::instance_lifecycle::does_not_exist_message(RESOURCE_TYPE, name)
 }
 
 /// Require that `name` names no distribution of this account: every reader of a

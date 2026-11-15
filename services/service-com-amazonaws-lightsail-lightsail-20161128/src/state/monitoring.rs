@@ -59,24 +59,16 @@ pub fn instance_metric_unit(metric_name: &str) -> Option<&'static str> {
 ///
 /// It is also where an alarm of this store STAYS until something moves it, and
 /// the one call that moves one is `TestAlarm` — which puts an alarm into the
-/// state its caller asks to test: no
-/// metric an alarm can watch has a datapoint at all (this emulator runs no
-/// instance, container, load balancer or database workload and receives no
-/// measurement of one, which is why `GetInstanceMetricData`,
-/// `GetContainerServiceMetricData` and `GetLoadBalancerMetricData` all answer an
-/// empty `metricData`; `GetRelationalDatabaseMetricData` is still a scaffold with
-/// its own issue), and
-/// the modelled `Alarm$state`
-/// documentation defines `INSUFFICIENT_DATA` as exactly that — "the metric is not
-/// available, or not enough data is available for the metric to determine the
-/// alarm state". Nothing here invents an evaluation that no metric data could
-/// support.
+/// state its caller asks to test.
 ///
-/// A bucket's STORAGE metrics are the one series this store does measure — they
-/// are a count and a size of what the bucket itself holds, not a measurement of a
-/// running workload, so `GetBucketMetricData` computes them — and no alarm is
-/// affected: [`ALARM_METRICS`] carries no bucket row, because the modelled
-/// `PutAlarmRequest$metricName` documentation lists no bucket metric.
+/// Nothing EVALUATES an alarm here. An evaluation is work the service does on
+/// its own schedule, comparing the threshold against `evaluationPeriods` of the
+/// metric's series and deciding a verdict from them, and this store runs no such
+/// work: the state an alarm reports is the one the last call set, never a
+/// verdict nothing reached. The modelled `Alarm$state` documentation defines
+/// `INSUFFICIENT_DATA` as "the metric is not available, or not enough data is
+/// available for the metric to determine the alarm state", which is what an
+/// alarm no evaluation has run over is in.
 pub const ALARM_STATE_INSUFFICIENT_DATA: &str = "INSUFFICIENT_DATA";
 
 /// The one `AlarmState` a notification trigger list must name, from the modelled

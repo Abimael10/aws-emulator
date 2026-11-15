@@ -515,7 +515,7 @@ async fn rebooting_an_unknown_instance_answers_the_does_not_exist_envelope() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(format!("The Instance does not exist: {name}").as_str()),
+            Some(crate::instance_lifecycle::does_not_exist_message("Instance", name).as_str()),
             "case {name:?}: expected the message to name the resource type and the \
              requested name, got {body:?}"
         );

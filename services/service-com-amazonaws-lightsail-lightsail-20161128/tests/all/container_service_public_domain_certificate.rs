@@ -153,7 +153,10 @@ fn assert_certificate_does_not_exist(case: &str, certificate_name: &str, status:
     );
     assert_eq!(
         body["message"].as_str(),
-        Some(format!("The Certificate does not exist: {certificate_name}").as_str()),
+        Some(
+            crate::instance_lifecycle::does_not_exist_message("Certificate", certificate_name)
+                .as_str()
+        ),
         "case {case}: expected the resource-type/name message, got {body:?}"
     );
 }

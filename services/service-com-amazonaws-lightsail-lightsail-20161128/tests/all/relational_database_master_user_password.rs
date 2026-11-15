@@ -790,7 +790,7 @@ async fn a_name_the_account_holds_no_database_for_does_not_exist() {
                 &case,
                 status,
                 &body,
-                &[&format!("The {RESOURCE_TYPE} does not exist: {name}")],
+                &[&crate::instance_lifecycle::does_not_exist_message(RESOURCE_TYPE, name)],
             );
         }
     }

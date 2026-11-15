@@ -235,6 +235,8 @@ mod instance_metadata_ipv6_region;
 mod instance_metadata_options;
 #[path = "all/instance_metric_data.rs"]
 mod instance_metric_data;
+#[path = "all/instance_metric_series.rs"]
+mod instance_metric_series;
 #[path = "all/instance_public_ports.rs"]
 mod instance_public_ports;
 #[path = "all/instance_reboot.rs"]

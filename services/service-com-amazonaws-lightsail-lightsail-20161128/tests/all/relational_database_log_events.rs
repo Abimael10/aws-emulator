@@ -806,7 +806,7 @@ async fn a_log_nothing_publishes_is_refused() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(format!("The RelationalDatabase does not exist: {missing}").as_str()),
+            Some(crate::instance_lifecycle::does_not_exist_message("RelationalDatabase", missing).as_str()),
             "case reading the log of {missing}: expected the resource-type/name message, got \
              {body:?}"
         );

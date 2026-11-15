@@ -2590,3 +2590,8 @@ mod bedrock_agent_ingestion_populates_its_aoss_index;
 // throughout: there is no `//!` line in this file for a landing to re-type or merge below the
 // list. This file is a test-target CRATE ROOT, where a bare `mod` would resolve to a sibling of
 // it, which the layout check refuses, so the `#[path]` above each declaration is what points it
+// target, so THIS HEADER IS THE ONLY PLACE A `//!` LINE MAY STAND IN THIS FILE, and what
+// THIS HEADER IS THE ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE: past
+// every suite in this target. An inner doc comment (`//!`) is legal only BEFORE the first
+// this target. An inner doc comment (`//!`) is legal only BEFORE the first item, so these
+// lines are the only place one may stand — past the first item `//!` is `E0753` and compiles

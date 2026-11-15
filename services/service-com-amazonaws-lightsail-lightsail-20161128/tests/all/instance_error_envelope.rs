@@ -6,10 +6,11 @@
 //! The rule under test: when Lightsail cannot find what a request names — a
 //! resource of the account, or an entry of a published catalog — it answers
 //! **HTTP 400** with the wire error `NotFoundException`, the body member `code`
-//! set to `DoesNotExist`, and a `message` built from the request: the resource's
-//! `ResourceType` and the identifier the request carried (`The <ResourceType>
-//! does not exist: <name>`) for an account resource, and the rejected id for a
-//! blueprint the catalog does not hold. The model declares `@httpError(404)` on
+//! set to `DoesNotExist`, and a `message` built from the request: the identifier
+//! the request carried and the `ResourceType` list it was looked for among (`The
+//! specified resource <name> does not exist within types [<ResourceType>].
+//! Please provide a valid resource name.`) for an account resource, and the
+//! rejected id for a blueprint the catalog does not hold. The model declares `@httpError(404)` on
 //! `NotFoundException`, but a Lightsail SDK client maps the failure from the
 //! body's `code`, and the recorded endpoint answers 400 — so 400 is the wire
 //! status, and it is the same envelope on every path, reporting or mutating.
@@ -141,7 +142,7 @@ async fn every_unresolvable_identifier_answers_the_does_not_exist_envelope() {
                 &case,
                 status,
                 &body,
-                &format!("The {resource_type} does not exist: {name}"),
+                &crate::instance_lifecycle::does_not_exist_message(resource_type, name),
             );
         }
     }
@@ -158,7 +159,7 @@ async fn every_unresolvable_identifier_answers_the_does_not_exist_envelope() {
             &case,
             status,
             &body,
-            &format!("The ContainerService does not exist: {name}"),
+            &crate::instance_lifecycle::does_not_exist_message("ContainerService", name),
         );
     }
 
@@ -171,7 +172,7 @@ async fn every_unresolvable_identifier_answers_the_does_not_exist_envelope() {
             &case,
             status,
             &body,
-            &format!("The Domain does not exist: {name}"),
+            &crate::instance_lifecycle::does_not_exist_message("Domain", name),
         );
     }
 
@@ -204,7 +205,7 @@ async fn a_deleted_resource_is_refused_like_one_that_never_existed() {
             &case,
             status,
             &body,
-            &format!("The Instance does not exist: {name}"),
+            &crate::instance_lifecycle::does_not_exist_message("Instance", name),
         );
     }
 }
@@ -263,7 +264,7 @@ async fn a_blueprint_outside_the_catalog_is_refused_and_creates_nothing() {
             &format!("{case}, reading back"),
             read_status,
             &read_body,
-            "The Instance does not exist: refused",
+            &crate::instance_lifecycle::does_not_exist_message("Instance", "refused"),
         );
         let listed = emulator.ok("GetInstances", json!({})).await;
         assert_eq!(

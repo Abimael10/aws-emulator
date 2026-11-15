@@ -6,17 +6,23 @@
 //! modelled-constraint walk, the handler and the awsJson error envelope are all
 //! exercised rather than bypassed.
 //!
-//! The rule under test: reading an instance metric is a REPORT on the instance
-//! record the store holds and on the observations it holds for that metric. So
-//! for every metric the catalog publishes, asked for in the unit that metric is
-//! published in, over any window at any granularity the model admits, the answer
-//! is HTTP 200 carrying the requested `metricName` and the datapoints the store
-//! has — none, because this emulator runs no guest and measures nothing on one —
-//! the call writes nothing a later caller can see, a metric asked for in a unit
-//! it is not published in, a window whose end does not follow its start, or a
-//! request naming no statistic is refused with the modelled 400
-//! `InvalidInputException`, and a name no instance record answers to earns the
+//! The rule under test here is the ENVELOPE of the read: for every metric the
+//! catalog publishes, asked for in the unit that metric is published in, over
+//! any window at any granularity the model admits, the answer is HTTP 200
+//! carrying the requested `metricName` and the datapoints of the windows the
+//! instance has been publishing in — so a window that lies outside that span
+//! carries none; the call writes nothing a later caller can see; a metric asked
+//! for in a unit it is not published in, a window whose end does not follow its
+//! start, or a request naming no statistic is refused with the modelled 400
+//! `InvalidInputException`; and a name no instance record answers to earns the
 //! service's `DoesNotExist` envelope.
+//!
+//! What the datapoints of a window the instance HAS published in carry is the
+//! series rule, which `instance_metric_series.rs` is about.
+//!
+//! Every window here is placed relative to the instance's own `createdAt` rather
+//! than at a fixed instant, so a case means the same thing whatever the clock of
+//! the host running it reads.
 //!
 //! The harness is the one `instance_lifecycle.rs` already has.
 
@@ -40,7 +46,7 @@ const ZONE: &str = "us-east-1a";
 /// `statistics` to include in your request, and the published `unit` value"),
 /// which states one published unit per metric and covers every member of the
 /// modelled `InstanceMetricName` enum.
-const PUBLISHED_UNITS: &[(&str, &str)] = &[
+pub(crate) const PUBLISHED_UNITS: &[(&str, &str)] = &[
     ("BurstCapacityPercentage", "Percent"),
     ("BurstCapacityTime", "Seconds"),
     ("CPUUtilization", "Percent"),
@@ -65,9 +71,9 @@ const PERIODS: &[i64] = &[MIN_PERIOD, 300, 3600, MAX_PERIOD];
 
 /// The bounds of the modelled `MetricPeriod` range (`@range(min: 60, max:
 /// 86400)` on `MetricPeriod`).
-const MIN_PERIOD: i64 = 60;
+pub(crate) const MIN_PERIOD: i64 = 60;
 /// See [`MIN_PERIOD`].
-const MAX_PERIOD: i64 = 86_400;
+pub(crate) const MAX_PERIOD: i64 = 86_400;
 
 /// Statistic sets a request may ask for, differing along the count, the members
 /// and the order: one statistic, several, every member of the modelled
@@ -80,9 +86,12 @@ const STATISTIC_SETS: &[&[&str]] = &[
     &["SampleCount", "Average", "Sum", "Maximum", "Minimum"],
 ];
 
-/// The instant the windows in this suite start at, in epoch seconds — an
-/// arbitrary fixed point, so a case's window is the same on every run.
-const WINDOW_START: i64 = 1_760_000_000;
+/// One day in seconds, the unit the windows of this suite are placed by.
+const DAY: i64 = 24 * 60 * 60;
+
+/// An instant far enough from the instance's creation for a window on that side
+/// of it to be entirely outside what the instance has published: a year.
+const FAR: i64 = 365 * DAY;
 
 /// The body member `code` Lightsail sets on a rejection whose cause is that what
 /// the request names does not exist.
@@ -90,7 +99,7 @@ const DOES_NOT_EXIST: &str = "DoesNotExist";
 
 /// Create instance `name` and answer the record `GetInstance` reports for it, so
 /// every case starts from a host the store really holds.
-async fn host(emulator: &Emulator, name: &str) -> Value {
+pub(crate) async fn host(emulator: &Emulator, name: &str) -> Value {
     emulator
         .ok(
             "CreateInstances",
@@ -108,8 +117,16 @@ async fn host(emulator: &Emulator, name: &str) -> Value {
         .clone()
 }
 
+/// The instant `instance` was created, in whole epoch seconds — the anchor every
+/// window in this suite is placed relative to.
+pub(crate) fn created_at_seconds(instance: &Value) -> i64 {
+    instance["createdAt"].as_f64().unwrap_or_else(|| {
+        panic!("case reading the instance's creation instant: expected createdAt, got {instance:?}")
+    }) as i64
+}
+
 /// One `GetInstanceMetricData` request body.
-fn request(
+pub(crate) fn request(
     instance_name: &str,
     metric_name: &str,
     unit: &str,
@@ -130,7 +147,7 @@ fn request(
 }
 
 /// The datapoints an answer carries, or a panic naming `case`.
-fn metric_data(case: &str, body: &Value) -> Vec<Value> {
+pub(crate) fn metric_data(case: &str, body: &Value) -> Vec<Value> {
     body["metricData"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case}: expected a metricData array, got {body:?}"))
@@ -143,22 +160,24 @@ fn metric_data(case: &str, body: &Value) -> Vec<Value> {
 
 /// RULE: every metric the catalog publishes, asked for in the unit it is
 /// published in over a window at any granularity the model admits, is answered
-/// with the requested `metricName` and the observations the store holds for it —
-/// of which there are none, for every metric and every window.
+/// with the requested `metricName` and the datapoints of the windows the
+/// instance published in — of which a window that CLOSED before the instance was
+/// created holds none, whichever metric and granularity the request names.
 #[tokio::test]
-async fn every_published_metric_answers_its_own_name_and_the_stored_series() {
+async fn every_published_metric_answers_its_own_name_over_a_window_it_has_no_sample_for() {
     let emulator = Emulator::new();
     let instance = "metrics-host";
-    host(&emulator, instance).await;
+    let created = created_at_seconds(&host(&emulator, instance).await);
 
     for (index, (metric_name, unit)) in PUBLISHED_UNITS.iter().enumerate() {
         // The rows differ along the granularity, the statistic set and the size
-        // and placement of the window as well as the metric: the answer is the
-        // stored series whichever of them the request carries.
+        // and placement of the window as well as the metric. Every window here
+        // ends before the instance existed, so no sampling instant of the
+        // instance falls in it.
         let period = PERIODS[index % PERIODS.len()];
         let statistics = STATISTIC_SETS[index % STATISTIC_SETS.len()];
-        let start_time = WINDOW_START + (index as i64) * 900;
-        let end_time = start_time + period * (index as i64 + 1);
+        let end_time = created - DAY - (index as i64) * 900;
+        let start_time = end_time - period * (index as i64 + 1);
         let case = format!("{metric_name} in {unit} at period {period}");
 
         let (status, body) = emulator
@@ -187,29 +206,27 @@ async fn every_published_metric_answers_its_own_name_and_the_stored_series() {
         let data = metric_data(&case, &body);
         assert!(
             data.is_empty(),
-            "case {case}: this emulator measures nothing on an instance, so the series must \
-             carry no datapoints, got {data:?}"
+            "case {case}: the instance published nothing before it was created, so a window \
+             that closed then must carry no datapoint, got {data:?}"
         );
     }
 }
 
-/// RULE: a window is a window wherever it lies — before the instance was
-/// created, around now, or entirely in the future — and the series is still the
-/// stored one.
+/// RULE: a window the instance holds no sample in carries no datapoint, wherever
+/// it lies — before the instance was created, or ahead of any clock this
+/// emulator reads.
 #[tokio::test]
-async fn a_window_is_served_wherever_it_lies_relative_to_the_instance() {
+async fn a_window_outside_what_the_instance_published_carries_no_datapoint() {
     let emulator = Emulator::new();
     let instance = "window-host";
-    host(&emulator, instance).await;
+    let created = created_at_seconds(&host(&emulator, instance).await);
 
-    // Epoch seconds: a window long before this instance existed, one straddling
-    // the recent past, one entirely ahead of any clock this emulator reads, and
-    // the smallest window the ordering rule admits (one second).
+    // (case, startTime, endTime), both in epoch seconds.
     let windows: &[(&str, i64, i64)] = &[
-        ("a window years before the instance existed", 1_000_000_000, 1_000_003_600),
-        ("a window ending in the recent past", 1_760_000_000, 1_760_086_400),
-        ("a window entirely in the future", 4_000_000_000, 4_000_003_600),
-        ("the shortest window the ordering admits", 1_760_000_000, 1_760_000_001),
+        ("a window years before the instance existed", created - FAR, created - FAR + 3_600),
+        ("a window that closes a day before the create", created - 2 * DAY, created - DAY),
+        ("a window entirely in the future", created + FAR, created + FAR + 3_600),
+        ("the shortest window the ordering admits, before the create", created - DAY, created - DAY + 1),
     ];
 
     for (case, start_time, end_time) in windows {
@@ -256,6 +273,7 @@ async fn reading_metrics_changes_nothing_a_later_caller_sees() {
     let emulator = Emulator::new();
     let instance = "quiet-host";
     let before = host(&emulator, instance).await;
+    let created = created_at_seconds(&before);
     let state_before = emulator
         .ok("GetInstanceState", json!({"instanceName": instance}))
         .await;
@@ -272,16 +290,14 @@ async fn reading_metrics_changes_nothing_a_later_caller_sees() {
                         metric_name,
                         unit,
                         300,
-                        WINDOW_START,
-                        WINDOW_START + 3_600,
+                        // A window closed before the create, so the answer is
+                        // the same at any two instants this test reads at.
+                        created - 2 * DAY,
+                        created - DAY,
                         &["Average", "Sum"],
                     ),
                 )
                 .await;
-            assert!(
-                metric_data(&case, &answer).is_empty(),
-                "case {case}: expected no datapoints, got {answer:?}"
-            );
             answers.push((case, answer));
         }
     }
@@ -325,6 +341,8 @@ async fn a_request_that_describes_no_series_is_refused_as_invalid_input() {
     let emulator = Emulator::new();
     let instance = "refusal-host";
     let before = host(&emulator, instance).await;
+    let created = created_at_seconds(&before);
+    let (start, end) = (created - 2 * DAY, created - DAY);
 
     // One row per way the request fails to describe a series, crossed over the
     // units a metric is NOT published in (a unit of the wrong dimension, and a
@@ -332,35 +350,35 @@ async fn a_request_that_describes_no_series_is_refused_as_invalid_input() {
     let rows: &[(&str, Value)] = &[
         (
             "CPUUtilization asked for in Bytes",
-            request(instance, "CPUUtilization", "Bytes", 300, WINDOW_START, WINDOW_START + 3_600, &["Average"]),
+            request(instance, "CPUUtilization", "Bytes", 300, start, end, &["Average"]),
         ),
         (
             "NetworkIn asked for in Percent",
-            request(instance, "NetworkIn", "Percent", 300, WINDOW_START, WINDOW_START + 3_600, &["Sum"]),
+            request(instance, "NetworkIn", "Percent", 300, start, end, &["Sum"]),
         ),
         (
             "DiskQueueLength asked for in Seconds",
-            request(instance, "DiskQueueLength", "Seconds", 300, WINDOW_START, WINDOW_START + 3_600, &["Average"]),
+            request(instance, "DiskQueueLength", "Seconds", 300, start, end, &["Average"]),
         ),
         (
             "StatusCheckFailed asked for in None",
-            request(instance, "StatusCheckFailed", "None", MIN_PERIOD, WINDOW_START, WINDOW_START + 600, &["Sum"]),
+            request(instance, "StatusCheckFailed", "None", MIN_PERIOD, start, end, &["Sum"]),
         ),
         (
             "BurstCapacityTime asked for in Percent",
-            request(instance, "BurstCapacityTime", "Percent", 300, WINDOW_START, WINDOW_START + 3_600, &["Maximum"]),
+            request(instance, "BurstCapacityTime", "Percent", 300, start, end, &["Maximum"]),
         ),
         (
             "a window that ends where it starts",
-            request(instance, "CPUUtilization", "Percent", 300, WINDOW_START, WINDOW_START, &["Average"]),
+            request(instance, "CPUUtilization", "Percent", 300, start, start, &["Average"]),
         ),
         (
             "a window that ends before it starts",
-            request(instance, "NetworkOut", "Bytes", MAX_PERIOD, WINDOW_START + 3_600, WINDOW_START, &["Sum"]),
+            request(instance, "NetworkOut", "Bytes", MAX_PERIOD, end, start, &["Sum"]),
         ),
         (
             "a request naming no statistic",
-            request(instance, "MetadataNoToken", "Count", 300, WINDOW_START, WINDOW_START + 3_600, &[]),
+            request(instance, "MetadataNoToken", "Count", 300, start, end, &[]),
         ),
     ];
 
@@ -396,8 +414,9 @@ async fn a_request_that_describes_no_series_is_refused_as_invalid_input() {
 
 /// RULE: a name no instance record answers to — never created, or created and
 /// since deleted — earns the service's `DoesNotExist` envelope: HTTP 400, the
-/// wire error `NotFoundException`, the body `code` `DoesNotExist`, and a message
-/// naming the resource type and the requested name.
+/// wire error `NotFoundException`, the body `code` `DoesNotExist`, and the
+/// service's not-found message naming the requested identifier and the type it
+/// was looked for among.
 #[tokio::test]
 async fn a_name_no_instance_answers_to_earns_the_does_not_exist_envelope() {
     let emulator = Emulator::new();
@@ -405,7 +424,7 @@ async fn a_name_no_instance_answers_to_earns_the_does_not_exist_envelope() {
     // Names differing along what the rule generalises over — length, case,
     // digits and separators — plus one that existed and was deleted.
     let deleted = "short-lived";
-    host(&emulator, deleted).await;
+    let created = created_at_seconds(&host(&emulator, deleted).await);
     emulator
         .ok("DeleteInstance", json!({"instanceName": deleted}))
         .await;
@@ -421,8 +440,8 @@ async fn a_name_no_instance_answers_to_earns_the_does_not_exist_envelope() {
                     "CPUUtilization",
                     "Percent",
                     300,
-                    WINDOW_START,
-                    WINDOW_START + 3_600,
+                    created - 2 * DAY,
+                    created - DAY,
                     &["Average"],
                 ),
             )
@@ -443,8 +462,8 @@ async fn a_name_no_instance_answers_to_earns_the_does_not_exist_envelope() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(format!("The Instance does not exist: {name}").as_str()),
-            "case {case}: expected the resource-type/name message, got {body:?}"
+            Some(crate::instance_lifecycle::does_not_exist_message("Instance", name).as_str()),
+            "case {case}: expected the service's not-found message, got {body:?}"
         );
     }
 }
@@ -461,28 +480,29 @@ async fn a_name_no_instance_answers_to_earns_the_does_not_exist_envelope() {
 async fn a_value_outside_a_modelled_constraint_is_refused_by_the_boundary_walk() {
     let emulator = Emulator::new();
     let instance = "boundary-host";
-    host(&emulator, instance).await;
+    let created = created_at_seconds(&host(&emulator, instance).await);
+    let (start, end) = (created - 2 * DAY, created - DAY);
 
     let rows: &[(&str, Value)] = &[
         (
             "a period one second below the range",
-            request(instance, "CPUUtilization", "Percent", MIN_PERIOD - 1, WINDOW_START, WINDOW_START + 3_600, &["Average"]),
+            request(instance, "CPUUtilization", "Percent", MIN_PERIOD - 1, start, end, &["Average"]),
         ),
         (
             "a period one second above the range",
-            request(instance, "CPUUtilization", "Percent", MAX_PERIOD + 1, WINDOW_START, WINDOW_START + 90_000, &["Average"]),
+            request(instance, "CPUUtilization", "Percent", MAX_PERIOD + 1, start, end, &["Average"]),
         ),
         (
             "a metric name outside the modelled enum",
-            request(instance, "TeapotTemperature", "Percent", 300, WINDOW_START, WINDOW_START + 3_600, &["Average"]),
+            request(instance, "TeapotTemperature", "Percent", 300, start, end, &["Average"]),
         ),
         (
             "a unit outside the modelled enum",
-            request(instance, "CPUUtilization", "Furlongs", 300, WINDOW_START, WINDOW_START + 3_600, &["Average"]),
+            request(instance, "CPUUtilization", "Furlongs", 300, start, end, &["Average"]),
         ),
         (
             "a statistic outside the modelled enum",
-            request(instance, "CPUUtilization", "Percent", 300, WINDOW_START, WINDOW_START + 3_600, &["Median"]),
+            request(instance, "CPUUtilization", "Percent", 300, start, end, &["Median"]),
         ),
     ];
 
@@ -501,7 +521,8 @@ async fn a_value_outside_a_modelled_constraint_is_refused_by_the_boundary_walk()
         );
     }
 
-    // Both published bounds of the range are themselves accepted.
+    // Both published bounds of the range are themselves accepted, and over a
+    // window the instance has no sample in each answers the empty series.
     for period in [MIN_PERIOD, MAX_PERIOD] {
         let case = format!("the period bound {period}");
         let body = emulator
@@ -512,8 +533,8 @@ async fn a_value_outside_a_modelled_constraint_is_refused_by_the_boundary_walk()
                     "CPUUtilization",
                     "Percent",
                     period,
-                    WINDOW_START,
-                    WINDOW_START + period,
+                    created - FAR,
+                    created - FAR + period,
                     &["Average"],
                 ),
             )

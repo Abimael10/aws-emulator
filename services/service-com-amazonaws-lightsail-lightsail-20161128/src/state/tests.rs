@@ -546,3 +546,288 @@ fn each_named_bucket_access_setting_is_a_member_of_the_modelled_enum() {
              {generated:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The metric series
+// ---------------------------------------------------------------------------
+
+/// The instant a resource of these cases started publishing, in epoch
+/// milliseconds. A fixed instant, so every window a case names is the same on
+/// every run — which is the point of asserting the cutting rule here: a window
+/// wider than a test can live through is unobservable over the wire.
+const PUBLISHED_FROM_MS: i64 = 1_700_000_000_000;
+/// The granularity the cases below READ at (`period`): five minutes, in seconds
+/// and in milliseconds.
+const CASE_PERIOD_SECONDS: i64 = 300;
+/// See [`CASE_PERIOD_SECONDS`].
+const CASE_PERIOD_MS: i64 = CASE_PERIOD_SECONDS * 1_000;
+
+/// The granularity the metric these cases read is PUBLISHED at: one minute, the
+/// granularity of an instance's status checks.
+const CASE_PUBLISH_INTERVAL_MS: i64 = STATUS_CHECK_GRANULARITY_SECONDS * 1_000;
+
+/// What one sample of the metric these cases read measured: the cutting rule
+/// under test is about the WINDOWS, so a single stand-in measurement is enough
+/// and every statistic of a window follows from it.
+const CASE_SAMPLE: f64 = 7.5;
+
+/// The statistics the cases below ask for: every member, so each datapoint
+/// carries its sample count too.
+fn every_statistic() -> Vec<String> {
+    [
+        STATISTIC_MINIMUM,
+        STATISTIC_MAXIMUM,
+        STATISTIC_SUM,
+        STATISTIC_AVERAGE,
+        STATISTIC_SAMPLE_COUNT,
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
+/// One read of a series over `start_ms..end_ms` at `period_seconds`, as of
+/// `now_ms`, of a metric published every [`CASE_PUBLISH_INTERVAL_MS`].
+fn series_at(
+    period_seconds: i64,
+    start_ms: i64,
+    end_ms: i64,
+    now_ms: i64,
+    statistics: &[String],
+) -> Vec<crate::ops::types::MetricDatapoint> {
+    MetricSeries {
+        published_from_ms: PUBLISHED_FROM_MS,
+        publish_interval_ms: CASE_PUBLISH_INTERVAL_MS,
+        read: MetricRead {
+            metric_name: "StatusCheckFailed",
+            unit: "Count",
+            period_seconds,
+            start_ms,
+            end_ms,
+            now_ms,
+            statistics,
+        },
+    }
+    .datapoints(CASE_SAMPLE)
+}
+
+/// The epoch milliseconds of each datapoint's window.
+fn window_starts(series: &[crate::ops::types::MetricDatapoint]) -> Vec<i64> {
+    series
+        .iter()
+        .map(|datapoint| {
+            datapoint
+                .timestamp
+                .expect("every datapoint carries its window's instant")
+                .to_millis()
+                .expect("the window's instant is within epoch milliseconds")
+        })
+        .collect()
+}
+
+/// RULE: the granularity divides the time line into windows, and the answer
+/// carries one datapoint per window the resource has published in that the
+/// request overlaps — oldest first, each timestamped at its own window's start.
+///
+/// `PUBLISHED_FROM_MS` is 200 seconds into its own five-minute window
+/// (1_699_999_800_000), and the resource has been publishing for twenty minutes,
+/// so the windows are that one and the four after it.
+#[test]
+fn a_read_carries_one_datapoint_per_granularity_window_published_in() {
+    let statistics = every_statistic();
+    let now_ms = PUBLISHED_FROM_MS + 20 * 60 * 1_000;
+    let series = series_at(
+        CASE_PERIOD_SECONDS,
+        // A window reaching back an hour before the resource existed and
+        // forward to now: what the resource published is all of what it can
+        // carry.
+        PUBLISHED_FROM_MS - 60 * 60 * 1_000,
+        now_ms,
+        now_ms,
+        &statistics,
+    );
+
+    assert_eq!(
+        window_starts(&series),
+        vec![
+            1_699_999_800_000,
+            1_700_000_100_000,
+            1_700_000_400_000,
+            1_700_000_700_000,
+            1_700_001_000_000,
+        ],
+        "case a twenty-minute publishing span read at five-minute granularity: expected the \
+         window the resource started publishing in and the four after it"
+    );
+
+    // Every window the publishing span covers WHOLLY holds one sample per
+    // PUBLISHED granularity interval — the reported `sampleCount` is the
+    // metric's own granularity in the window, not an artefact of anything this
+    // store chose. The first and the last window are clipped by the start of
+    // publishing and by now, so they hold fewer — but never none, or they would
+    // not be in the answer at all.
+    let whole_window_samples = CASE_PERIOD_MS / CASE_PUBLISH_INTERVAL_MS;
+    for (index, datapoint) in series.iter().enumerate() {
+        let samples = datapoint
+            .sample_count
+            .expect("the request asked for the sample count") as i64;
+        let clipped = index == 0 || index == series.len() - 1;
+        if clipped {
+            assert!(
+                (1..=whole_window_samples).contains(&samples),
+                "case the clipped window at index {index}: expected between one and \
+                 {whole_window_samples} samples, got {samples}"
+            );
+        } else {
+            assert_eq!(
+                samples, whole_window_samples,
+                "case the whole window at index {index}: expected {whole_window_samples} \
+                 samples"
+            );
+        }
+        let (minimum, maximum, average, sum) = (
+            datapoint.minimum.expect("the minimum was asked for"),
+            datapoint.maximum.expect("the maximum was asked for"),
+            datapoint.average.expect("the average was asked for"),
+            datapoint.sum.expect("the sum was asked for"),
+        );
+        assert!(
+            (minimum - CASE_SAMPLE).abs() <= 1e-9
+                && (maximum - CASE_SAMPLE).abs() <= 1e-9
+                && (average - CASE_SAMPLE).abs() <= 1e-9,
+            "case the window at index {index}: every sample of it is {CASE_SAMPLE}, so the \
+             extremes and the mean are too, got {minimum}, {average}, {maximum}"
+        );
+        assert!(
+            (sum - average * samples as f64).abs() <= 1e-6,
+            "case the window at index {index}: expected the sum to be the average over the \
+             samples, got {sum}"
+        );
+    }
+}
+
+/// RULE: a window the resource holds no sample in carries no datapoint — one
+/// that closed before it started publishing, and one that has not happened yet.
+#[test]
+fn a_window_outside_the_publishing_span_carries_no_datapoint() {
+    let statistics = every_statistic();
+    let now_ms = PUBLISHED_FROM_MS + 20 * 60 * 1_000;
+    let hour_ms = 60 * 60 * 1_000;
+    for (case, start_ms, end_ms) in [
+        (
+            "a window that closed before the resource existed",
+            PUBLISHED_FROM_MS - 2 * hour_ms,
+            PUBLISHED_FROM_MS - hour_ms,
+        ),
+        (
+            "a window that closes at the instant publishing began",
+            PUBLISHED_FROM_MS - hour_ms,
+            PUBLISHED_FROM_MS + 1,
+        ),
+        (
+            "a window that has not happened yet",
+            now_ms + hour_ms,
+            now_ms + 2 * hour_ms,
+        ),
+    ] {
+        let series = series_at(CASE_PERIOD_SECONDS, start_ms, end_ms, now_ms, &statistics);
+        assert!(
+            series.is_empty(),
+            "case {case}: expected no datapoint, got {} of them",
+            series.len()
+        );
+    }
+}
+
+/// RULE: the answer is bounded. A window and a granularity are both
+/// caller-sized, so a request whose quotient is larger than
+/// [`MAX_METRIC_DATAPOINTS`] is answered with that many datapoints — the most
+/// RECENT windows of the requested span, which is what a caller watching a
+/// metric is reading for.
+#[test]
+fn a_series_longer_than_the_answer_cap_keeps_the_most_recent_windows() {
+    let statistics = every_statistic();
+    // Read at the granularity the metric is published at, so every window of
+    // the span holds a sample and the cap is what decides the length.
+    let period_seconds = CASE_PUBLISH_INTERVAL_MS / 1_000;
+    let period_ms = CASE_PUBLISH_INTERVAL_MS;
+    // Ten windows more than the cap, so the oldest ten are the ones left out.
+    let windows = MAX_METRIC_DATAPOINTS as i64 + 10;
+    let now_ms = PUBLISHED_FROM_MS + windows * period_ms;
+    let series = series_at(
+        period_seconds,
+        PUBLISHED_FROM_MS - period_ms,
+        now_ms + period_ms,
+        now_ms,
+        &statistics,
+    );
+
+    assert_eq!(
+        series.len(),
+        MAX_METRIC_DATAPOINTS,
+        "case a span of {windows} windows: expected the answer capped at \
+         {MAX_METRIC_DATAPOINTS}"
+    );
+    let starts = window_starts(&series);
+    assert_eq!(
+        starts.last().copied(),
+        Some(now_ms.div_euclid(period_ms) * period_ms),
+        "case the newest window: expected the one `now` falls in, got {:?}",
+        starts.last()
+    );
+    assert!(
+        starts.windows(2).all(|pair| pair[1] - pair[0] == period_ms),
+        "case the kept windows: expected one per granularity window, oldest first"
+    );
+}
+
+/// RULE: a metric is published at the granularity its own documentation states
+/// — one minute for an instance's three status checks, five minutes for every
+/// other instance metric — so that, and not anything this store chose, is what
+/// decides how many samples a window holds.
+#[test]
+fn each_instance_metric_is_published_at_its_documented_granularity() {
+    for (case, metric_name, want) in [
+        (
+            "both status checks together",
+            "StatusCheckFailed",
+            STATUS_CHECK_GRANULARITY_SECONDS,
+        ),
+        (
+            "the instance status check",
+            "StatusCheckFailed_Instance",
+            STATUS_CHECK_GRANULARITY_SECONDS,
+        ),
+        (
+            "the system status check",
+            "StatusCheckFailed_System",
+            STATUS_CHECK_GRANULARITY_SECONDS,
+        ),
+        (
+            "a utilization gauge",
+            "CPUUtilization",
+            INSTANCE_METRIC_GRANULARITY_SECONDS,
+        ),
+        (
+            "a transfer counter",
+            "NetworkIn",
+            INSTANCE_METRIC_GRANULARITY_SECONDS,
+        ),
+        (
+            "a system disk counter",
+            "DiskReadOps",
+            INSTANCE_METRIC_GRANULARITY_SECONDS,
+        ),
+        (
+            "the metadata service counter",
+            "MetadataNoToken",
+            INSTANCE_METRIC_GRANULARITY_SECONDS,
+        ),
+    ] {
+        let granularity = instance_metric_granularity_seconds(metric_name);
+        assert_eq!(
+            granularity, want,
+            "case {case}: expected {metric_name} to be published every {want} seconds"
+        );
+    }
+}

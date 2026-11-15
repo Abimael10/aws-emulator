@@ -49,7 +49,7 @@
 //! `@httpError(404)` on `NotFoundException`; a Lightsail SDK client maps the failure
 //! from the body, not the status. The generated error enum takes its status straight
 //! from the model's trait, so that envelope is [`Scaffolded::NotFound`] — built through
-//! [`Scaffolded::resource_does_not_exist`] (the resource-type/name message) or
+//! [`Scaffolded::resource_does_not_exist`] (the type-list/name message) or
 //! [`Scaffolded::does_not_exist`] (any other `DoesNotExist` wording). EVERY not-found
 //! path in this crate goes through one of those two, so one rule serves them all.
 
@@ -243,14 +243,31 @@ impl<E> Scaffolded<E> {
 
     /// Lightsail's rejection of a request that names a resource this account does not
     /// hold: HTTP 400, wire error `NotFoundException`, body `code` `DoesNotExist`, and
-    /// a message built from the request — the resource's type and the identifier the
-    /// request carried.
+    /// a message built from the request — the identifier the request carried and the
+    /// types the operation looks for it among.
     ///
     /// `resource_type` is a value of the modelled `ResourceType` enum, i.e. one of the
     /// `crate::state::RESOURCE_TYPE_*` constants, so the message names the resource the
-    /// way every other Lightsail response does.
+    /// way every other Lightsail response does. An operation that addresses a resource
+    /// WITHOUT being told which kind it is names every kind it looks among, through
+    /// [`Scaffolded::resource_does_not_exist_within`].
     pub fn resource_does_not_exist(resource_type: &str, name: &str) -> Self {
-        Self::does_not_exist(format!("The {resource_type} does not exist: {name}"))
+        Self::resource_does_not_exist_within(&[resource_type], name)
+    }
+
+    /// The same rejection for an operation that looks for `name` among SEVERAL
+    /// resource types, which the message then lists in the order the operation
+    /// resolves them in.
+    ///
+    /// The template is the service's own and is the crate's ONE not-found wording:
+    /// the fixed text is AWS's, and the variable parts are the identifier the
+    /// request carried and that bracketed type list.
+    pub fn resource_does_not_exist_within(resource_types: &[&str], name: &str) -> Self {
+        Self::does_not_exist(format!(
+            "The specified resource {name} does not exist within types [{}]. Please provide a \
+             valid resource name.",
+            resource_types.join(", ")
+        ))
     }
 
     /// The same `DoesNotExist` envelope for a rejection whose message is not the

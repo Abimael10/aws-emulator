@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .ok_or_else(|| not_found(&domain_name))?;
                 let position = address
                     .position_in(domain)
-                    .ok_or_else(|| address.operation_failure(&domain_name))?;
+                    .ok_or_else(no_such_domain_record)?;
                 (domain.location.clone(), position)
             };
 
@@ -295,48 +295,33 @@ impl Address {
             })
         })
     }
+}
 
-    /// The zone holds no entry either handle names, so there is no recordset for
-    /// this delete to remove and the operation cannot execute: the modelled
-    /// `OperationFailureException` — HTTP 400, "Lightsail throws this exception
-    /// when an operation fails to execute" — with a message naming every handle
-    /// the request carried and the zone they were looked for in.
-    ///
-    /// NOT the crate's `DoesNotExist` envelope: that one answers a request naming
-    /// a RESOURCE the account does not hold (a zone, an instance, a bucket), and a
-    /// recordset entry is not a resource of the modelled `ResourceType` enum but a
-    /// row inside one — so a delete that finds none fails as an operation, which
-    /// is what the recorded endpoint answers a repeated delete with.
-    fn operation_failure(&self, domain_name: &str) -> DeleteDomainEntryError {
-        let mut addressed = Vec::new();
-        if let Some(id) = &self.id {
-            addressed.push(id.clone());
-        }
-        if let Some(recordset) = &self.recordset {
-            addressed.push(format!(
-                "{} of type {} with target {}",
-                recordset.name, recordset.entry_type, recordset.target
-            ));
-        }
-        DeleteDomainEntryErrorModeled::OperationFailureException(OperationFailureException {
-            // The body's `code` is what a Lightsail client branches on to tell
-            // "already gone" apart from a transport failure (see
-            // `crate::scaffolded`, where the same constant carries the recorded
-            // Lightsail `DoesNotExist` envelope): the recordset this delete was
-            // to remove is not in the zone, so that is the code it answers.
-            code: Some(crate::scaffolded::DOES_NOT_EXIST_CODE.to_string()),
-            message: Some(format!(
-                "No such domain record: the domain entry {} does not exist in the \
-                 Domain {domain_name}",
-                addressed.join(", nor ")
-            )),
-            // `docs` and `tip` are members this service fills from its own
-            // catalogue of failures, and no recorded response shows what it puts
-            // there for this one — so they are left absent rather than invented.
-            ..Default::default()
-        })
-        .into()
-    }
+/// The zone holds no entry either handle names, so there is no recordset for
+/// this delete to remove and the operation cannot execute: the modelled
+/// `OperationFailureException` — HTTP 400, "Lightsail throws this exception
+/// when an operation fails to execute" — carrying the sentence the service
+/// words that failure with.
+///
+/// The sentence is FIXED text: it interpolates no handle the request carried
+/// and nothing of the zone, so a caller matching the refusal sees the same
+/// wording whichever entry it addressed and whatever this store minted for
+/// it — which is why this takes no argument. Nor does it carry the
+/// `DoesNotExist` body `code`: that code belongs to the crate's not-found
+/// envelope, which answers a request naming a RESOURCE the account does not
+/// hold (a zone, an instance, a bucket), and a recordset entry is not a
+/// resource of the modelled `ResourceType` enum but a row inside one — so a
+/// delete that finds none fails as an operation, which is what the recorded
+/// endpoint answers a repeated delete with.
+fn no_such_domain_record() -> DeleteDomainEntryError {
+    DeleteDomainEntryErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(crate::state::NO_SUCH_DOMAIN_RECORD_MESSAGE.to_string()),
+        // `code`, `docs` and `tip` are members this service fills from its own
+        // catalogue of failures, and the recorded response for this one carries
+        // none of them — so they are left absent rather than invented.
+        ..Default::default()
+    })
+    .into()
 }
 
 /// The value of an optional `DomainEntry` member, or `None` when it carries

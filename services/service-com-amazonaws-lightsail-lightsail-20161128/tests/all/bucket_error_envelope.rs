@@ -8,8 +8,9 @@
 //! for instances, applied to the bucket surface: when Lightsail cannot find what
 //! a request names it answers **HTTP 400** with the wire error
 //! `NotFoundException`, the body member `code` set to `DoesNotExist` and a
-//! `message` built from the request — `The <ResourceType> does not exist:
-//! <name>` for a resource of the account. The model declares `@httpError(404)`
+//! `message` built from the request — `The specified resource <name> does not
+//! exist within types [<ResourceType>]. Please provide a valid resource name.`
+//! for a resource of the account. The model declares `@httpError(404)`
 //! on `NotFoundException`, but a Lightsail SDK client maps the failure from the
 //! body's `code`, and the recorded endpoint answers 400 — so 400 is the wire
 //! status, and it is the same envelope on every path, reporting or mutating, for
@@ -204,7 +205,7 @@ async fn every_unresolvable_bucket_name_answers_the_does_not_exist_envelope() {
                 &case,
                 status,
                 &body,
-                &format!("The {BUCKET_RESOURCE_TYPE} does not exist: {name}"),
+                &crate::instance_lifecycle::does_not_exist_message(BUCKET_RESOURCE_TYPE, &name),
             );
         }
     }
@@ -285,7 +286,7 @@ async fn a_deleted_bucket_is_refused_like_one_that_never_existed() {
             &case,
             status,
             &body,
-            &format!("The {BUCKET_RESOURCE_TYPE} does not exist: {name}"),
+            &crate::instance_lifecycle::does_not_exist_message(BUCKET_RESOURCE_TYPE, name),
         );
     }
 }
@@ -315,7 +316,7 @@ async fn a_bucket_of_another_region_answers_the_same_envelope() {
                 &case,
                 status,
                 &body,
-                &format!("The {BUCKET_RESOURCE_TYPE} does not exist: {name}"),
+                &crate::instance_lifecycle::does_not_exist_message(BUCKET_RESOURCE_TYPE, name),
             );
         }
     }

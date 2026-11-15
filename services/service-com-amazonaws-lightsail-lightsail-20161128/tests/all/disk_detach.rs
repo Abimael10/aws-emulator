@@ -727,7 +727,7 @@ async fn detaching_a_disk_this_account_does_not_hold_is_refused() {
         );
         assert_eq!(
             message(&body),
-            format!("The Disk does not exist: {name}"),
+            crate::instance_lifecycle::does_not_exist_message("Disk", name),
             "case {case}: expected a message naming the resource type and the name, got {body:?}"
         );
     }

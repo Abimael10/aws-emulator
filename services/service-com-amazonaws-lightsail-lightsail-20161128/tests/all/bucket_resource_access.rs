@@ -489,13 +489,13 @@ async fn a_grant_is_between_two_resources_of_one_region() {
         assert_eq!(
             missing["message"].as_str(),
             Some(
-                format!(
-                    "The {resource_type} does not exist: {}",
+                crate::instance_lifecycle::does_not_exist_message(
+                    resource_type,
                     if *resource_type == "Bucket" {
                         bucket
                     } else {
                         instance
-                    }
+                    },
                 )
                 .as_str()
             ),

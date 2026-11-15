@@ -329,7 +329,7 @@ async fn deleting_the_same_disk_twice_is_refused_the_second_time() {
     );
     assert_eq!(
         message(&body),
-        "The Disk does not exist: twice-disk",
+        crate::instance_lifecycle::does_not_exist_message("Disk", "twice-disk"),
         "case delete twice: expected a message naming the resource type and the name, got \
          {body:?}"
     );
@@ -599,7 +599,7 @@ async fn deleting_a_disk_this_account_does_not_hold_is_refused() {
         );
         assert_eq!(
             message(&body),
-            format!("The Disk does not exist: {name}"),
+            crate::instance_lifecycle::does_not_exist_message("Disk", name),
             "case {case}: expected a message naming the resource type and the name, got {body:?}"
         );
     }

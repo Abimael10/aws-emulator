@@ -717,7 +717,7 @@ async fn parameters_of_an_unknown_database_cannot_be_updated() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(format!("The RelationalDatabase does not exist: {unknown}").as_str()),
+            Some(crate::instance_lifecycle::does_not_exist_message("RelationalDatabase", unknown).as_str()),
             "case {unknown}: expected the resource-type/name message, got {body:?}"
         );
     }

@@ -873,7 +873,7 @@ async fn an_update_naming_no_stored_service_does_not_exist() {
         );
         assert_eq!(
             refused["message"].as_str(),
-            Some(format!("The ContainerService does not exist: {name}").as_str()),
+            Some(crate::instance_lifecycle::does_not_exist_message("ContainerService", name).as_str()),
             "case {case}: expected the resource-type/name message, got {refused:?}"
         );
     }

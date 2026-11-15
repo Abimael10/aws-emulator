@@ -385,7 +385,7 @@ async fn an_unknown_database_has_no_log_streams_to_report() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(format!("The RelationalDatabase does not exist: {name}").as_str()),
+            Some(crate::instance_lifecycle::does_not_exist_message("RelationalDatabase", name).as_str()),
             "case reading the streams of {name}: expected the resource-type/name message, got \
              {body:?}"
         );

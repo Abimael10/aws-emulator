@@ -523,7 +523,7 @@ async fn an_unknown_domain_does_not_exist() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(format!("The Domain does not exist: {name}").as_str()),
+            Some(crate::instance_lifecycle::does_not_exist_message("Domain", name).as_str()),
             "case reading {name}: expected the resource-type/name message, got {body:?}"
         );
     }

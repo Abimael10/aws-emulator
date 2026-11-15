@@ -1214,7 +1214,7 @@ async fn an_unknown_relational_database_does_not_exist() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(format!("The RelationalDatabase does not exist: {name}").as_str()),
+            Some(crate::instance_lifecycle::does_not_exist_message("RelationalDatabase", name).as_str()),
             "case reading {name}: expected the resource-type/name message, got {body:?}"
         );
     }

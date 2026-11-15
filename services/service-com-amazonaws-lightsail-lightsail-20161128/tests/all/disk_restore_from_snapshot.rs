@@ -859,7 +859,7 @@ async fn an_automatic_snapshot_this_account_does_not_hold_cannot_be_restored() {
         )
         .await;
 
-    let cases: &[(&str, &str, Value, Option<&str>)] = &[
+    let cases: &[(&str, &str, Value, Option<String>)] = &[
         (
             "the latest restorable automatic snapshot of a plain disk",
             "latest-of-present",
@@ -876,7 +876,7 @@ async fn an_automatic_snapshot_this_account_does_not_hold_cannot_be_restored() {
             "an automatic snapshot of a disk the account does not hold",
             "latest-of-absent",
             json!({"sourceDiskName": "absent-disk", "useLatestRestorableAutoSnapshot": true}),
-            Some("The Disk does not exist: absent-disk"),
+            Some(crate::instance_lifecycle::does_not_exist_message("Disk", "absent-disk")),
         ),
     ];
 
@@ -907,7 +907,7 @@ async fn an_automatic_snapshot_this_account_does_not_hold_cannot_be_restored() {
         if let Some(message) = want_message {
             assert_eq!(
                 answered["message"].as_str(),
-                Some(*message),
+                Some(message.as_str()),
                 "case {case}: expected the resource-type/name message, got {answered:?}"
             );
         }
@@ -959,7 +959,7 @@ async fn a_snapshot_the_account_does_not_hold_is_refused() {
         );
         assert_eq!(
             answered["message"].as_str(),
-            Some(format!("The DiskSnapshot does not exist: {snapshot_name}").as_str()),
+            Some(crate::instance_lifecycle::does_not_exist_message("DiskSnapshot", snapshot_name).as_str()),
             "case restoring {snapshot_name}: expected the resource-type/name message, got \
              {answered:?}"
         );

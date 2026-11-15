@@ -545,7 +545,7 @@ async fn a_snapshot_the_account_does_not_hold_is_refused() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(format!("The RelationalDatabaseSnapshot does not exist: {name}").as_str()),
+            Some(crate::instance_lifecycle::does_not_exist_message("RelationalDatabaseSnapshot", name).as_str()),
             "case {case}: expected the resource-type/name message, got {body:?}"
         );
         assert!(
