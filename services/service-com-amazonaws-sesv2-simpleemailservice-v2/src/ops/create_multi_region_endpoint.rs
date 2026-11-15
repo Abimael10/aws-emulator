@@ -80,6 +80,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How SES refuses a `Details$RoutesDetails` that does not carry the ONE route
+/// configuration this operation accepts ("a list of route configuration details. Must
+/// contain exactly one route configuration").
+///
+/// The sentence is fixed: it states the required number of routes and nothing about the
+/// request — neither the member at fault nor how many routes were supplied — so every
+/// count other than one is refused with exactly these words.
+const ROUTE_COUNT_REFUSAL: &str = "Number of routes must be equal to 1.";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -165,13 +174,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let primary_region = crate::state::request_region(ctx.parts());
 
         // "A list of route configuration details. Must contain exactly one route
-        // configuration."
+        // configuration." Any other number of them — none, two, more — is refused with
+        // the one sentence SES words that refusal with (see [`ROUTE_COUNT_REFUSAL`]).
         let [route] = input.details.routes_details.as_slice() else {
-            return Err(bad_request(format!(
-                "Details.RoutesDetails must contain exactly one route configuration, \
-                 but {} were provided.",
-                input.details.routes_details.len()
-            )));
+            return Err(bad_request(ROUTE_COUNT_REFUSAL));
         };
         let secondary_region = route.region.trim();
         if secondary_region.is_empty() {

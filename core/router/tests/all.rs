@@ -2,6 +2,24 @@
 
 //! Single integration-test target for the router.
 //!
+//! Put a new suite at `tests/all/<name>.rs` and declare it below with a
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted so the list stays sorted by
+//! name: one pair per suite and no other line, so two branches landing at once insert two
+//! lines in two places and have no prose to duplicate, re-word or mistype.
+//!
+//! A suite no `mod` names compiles nowhere and its tests never run; a suite left at the top
+//! level of `tests/` fails the build; a suite declared twice is `E0428`; and an inner doc
+//! comment past the first item is `E0753`. Each of those fails every suite in this target,
+//! so this header is the only place a `//!` may stand, and what a suite covers belongs in
+//! that suite's own module header rather than here.
+//! `all/all_rs_declares_each_suite_once.rs`,
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check those rules, the first two for this
+//! file and for every service crate's `tests/all.rs`.
+//!
+//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of
+//! this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what
+//! points each declaration into `tests/all/`.
 //! This file is a CANONICAL DECLARATION LIST: its module doc, then one
 //! `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted by name, and no other
 //! line. Two branches landing at once then insert two lines in two places and have no prose

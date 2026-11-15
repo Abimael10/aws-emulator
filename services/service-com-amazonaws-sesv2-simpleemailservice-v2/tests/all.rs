@@ -159,6 +159,8 @@ mod list_tenants;
 mod message_insights;
 #[path = "all/metric_data.rs"]
 mod metric_data;
+#[path = "all/minted_uuid_identifier_form.rs"]
+mod minted_uuid_identifier_form;
 #[path = "all/multi_region_endpoints.rs"]
 mod multi_region_endpoints;
 #[path = "all/outbound_message_id_form.rs"]

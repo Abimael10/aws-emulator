@@ -713,6 +713,66 @@ async fn invalid_route_details_are_refused() {
     );
 }
 
+/// The sentence SES refuses a route count other than one with: a fixed sentence that
+/// states the required number of routes and nothing about the request — it neither names
+/// the member at fault nor reports how many routes were supplied — so a client matching
+/// the refusal's text recognises the error class whatever it sent.
+const ROUTE_COUNT_REFUSAL: &str = "Number of routes must be equal to 1.";
+
+/// Every count of route configurations other than the one `Details$RoutesDetails` must
+/// carry: none at all, two, and several more, so the rule is asserted across what it
+/// generalises over rather than at one count.
+const REFUSED_ROUTE_COUNTS: [usize; 5] = [0, 2, 3, 5, 12];
+
+/// RULE: whatever number of route configurations a create carries other than one, the
+/// refusal is the modelled `BadRequestException` worded with the one fixed sentence
+/// [`ROUTE_COUNT_REFUSAL`].
+#[tokio::test]
+async fn every_route_count_other_than_one_is_refused_with_the_same_sentence() {
+    let ses = Ses::new();
+    for count in REFUSED_ROUTE_COUNTS {
+        let case = format!("{count} route configurations");
+        let name = format!("routes_{count}");
+        let routes: Vec<Value> = (0..count)
+            .map(|index| json!({"Region": format!("us-west-{}", index + 1)}))
+            .collect();
+        let reply = ses
+            .create(
+                HOME,
+                json!({
+                    "EndpointName": name,
+                    "Details": {"RoutesDetails": routes},
+                }),
+            )
+            .await;
+
+        assert_eq!(
+            (reply.status, reply.error_code()),
+            (400, "BadRequestException".to_string()),
+            "case {case:?}: expected a 400 BadRequestException, got {} {:?}",
+            reply.status,
+            reply.body
+        );
+        assert_eq!(
+            reply.message(),
+            ROUTE_COUNT_REFUSAL,
+            "case {case:?}: expected the sentence this error class is worded with, got {:?}",
+            reply.body
+        );
+        assert!(
+            !reply.message().contains("RoutesDetails"),
+            "case {case:?}: the refusal states the requirement without naming the member, \
+             got {:?}",
+            reply.message()
+        );
+        assert_eq!(
+            ses.get(HOME, &name).await.status,
+            404,
+            "case {case:?}: a refused create must persist nothing"
+        );
+    }
+}
+
 /// RULE: a delete starts a tear-down and reports the non-terminal status the endpoint
 /// carries right after the request; while that tear-down runs the endpoint reads as
 /// `DELETING` and a second delete collides with the one already in flight; once the

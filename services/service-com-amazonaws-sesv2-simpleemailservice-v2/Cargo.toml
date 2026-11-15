@@ -141,6 +141,11 @@ service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # The deployment package that suite uploads is a .zip archive it writes in memory.
 zip = { version = "9", default-features = false, features = ["deflate"] }
+# `uuid`: the ONE reader of a UUID in this crate's suites — the identifiers this service
+# mints in that form are parsed back with the same crate that renders them
+# (`service_common::uuid_from_random_bytes`), so what counts as a well-formed UUID, with
+# its version and variant, is the crate's rule and not re-derived in a test.
+uuid = "1"
 
 [lints]
 workspace = true

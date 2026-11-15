@@ -57,6 +57,9 @@ mod export_job;
 /// The account's VDM metric series, which a metric query reports and a metrics export
 /// writes into its file.
 mod metric_series;
+/// The identifiers this service mints in UUID form, and the one function that writes
+/// them.
+mod minted_ids;
 /// The account's pricing plane: the plan ladder, and where a requested plan lands on
 /// the account's pricing attributes.
 mod pricing;
@@ -81,6 +84,7 @@ pub use enum_value_sets::*;
 pub use export_file::*;
 pub use export_job::*;
 pub use metric_series::*;
+pub use minted_ids::*;
 pub use pricing::*;
 pub use suppression::*;
 pub use templates::*;
@@ -1810,37 +1814,16 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
 
     /// Mint the id of a new multi-region endpoint.
     ///
-    /// `EndpointId` carries no documented format beyond being "the ID of the
-    /// multi-region endpoint", so the shape mirrors the dashed 8-4-4-4-12 hex id SES
-    /// hands back while the only guarantees this makes are the ones a client depends
-    /// on: the id is unique across endpoints and stable for as long as the endpoint
-    /// holds it (it is minted once, at create, and read back from the record
-    /// afterwards). Uniqueness is structural — the monotonic sequence number is
-    /// hashed in — so two endpoints created in the same millisecond still differ.
+    /// `EndpointId` carries no modelled pattern beyond being "the ID of the
+    /// multi-region endpoint", and SES hands it back as a UUID, so it is minted as one
+    /// ([`minted_uuid`]) while the only guarantees this makes are the ones a client
+    /// depends on: the id is unique across endpoints and stable for as long as the
+    /// endpoint holds it (it is minted once, at create, and read back from the record
+    /// afterwards). The monotonic sequence number is part of what the bytes are derived
+    /// from, so two endpoints created in the same instant still differ.
     pub fn next_endpoint_id(&mut self, name: &str, region: &str, now: SystemTime) -> String {
         self.endpoint_sequence += 1;
-        let nanos = now
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let mut hex = String::with_capacity(32);
-        for salt in [0_u64, u64::from_be_bytes(*b"Endpoint")] {
-            let mut hasher = DefaultHasher::new();
-            salt.hash(&mut hasher);
-            name.hash(&mut hasher);
-            region.hash(&mut hasher);
-            nanos.hash(&mut hasher);
-            self.endpoint_sequence.hash(&mut hasher);
-            write!(hex, "{:016x}", hasher.finish()).expect("writing to a String cannot fail");
-        }
-        format!(
-            "{}-{}-{}-{}-{}",
-            &hex[..8],
-            &hex[8..12],
-            &hex[12..16],
-            &hex[16..20],
-            &hex[20..]
-        )
+        minted_uuid(b"Endpoint", self.endpoint_sequence, now, &[name, region])
     }
 
     /// Mint the next `TenantId`.
@@ -1864,68 +1847,30 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
     /// Mint the `JobId` of a new export job.
     ///
     /// `JobId` is documented only as "a string that represents the export job ID" and
-    /// the model bounds it at one character or more, so the shape mirrors the dashed
-    /// 8-4-4-4-12 hex id SES hands back while the only guarantees this makes are the
+    /// the model bounds it at one character or more, and SES hands it back as a UUID, so
+    /// it is minted as one ([`minted_uuid`]) while the only guarantees this makes are the
     /// ones a client depends on: the id is unique across export jobs and stable for as
     /// long as the job holds it (it is minted once, at create, and read back from the
-    /// record afterwards). Uniqueness is structural — the monotonic sequence number is
-    /// hashed in — so two jobs created in the same instant still differ.
+    /// record afterwards). The monotonic sequence number is part of what the bytes are
+    /// derived from, so two jobs created in the same instant still differ.
     pub fn next_export_job_id(&mut self, now: SystemTime) -> String {
         self.export_job_sequence += 1;
-        let nanos = now
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let mut hex = String::with_capacity(32);
-        for salt in [0_u64, u64::from_be_bytes(*b"ExportJb")] {
-            let mut hasher = DefaultHasher::new();
-            salt.hash(&mut hasher);
-            nanos.hash(&mut hasher);
-            self.export_job_sequence.hash(&mut hasher);
-            write!(hex, "{:016x}", hasher.finish()).expect("writing to a String cannot fail");
-        }
-        format!(
-            "{}-{}-{}-{}-{}",
-            &hex[..8],
-            &hex[8..12],
-            &hex[12..16],
-            &hex[16..20],
-            &hex[20..]
-        )
+        minted_uuid(b"ExportJb", self.export_job_sequence, now, &[])
     }
 
     /// Mint the `JobId` of a new import job.
     ///
     /// `JobId` is documented only as "a string that represents the import job ID" and
-    /// the model bounds it at one character or more, so — exactly as
-    /// [`Self::next_export_job_id`] does for the other job kind — the shape mirrors the
-    /// dashed 8-4-4-4-12 hex id SES hands back while the only guarantees this makes are
-    /// the ones a client depends on: the id is unique across import jobs and stable for
-    /// as long as the job holds it (it is minted once, at create, and read back from the
-    /// record afterwards). Uniqueness is structural, because the monotonic sequence
-    /// number is hashed in, so two jobs created in the same instant still differ.
+    /// the model bounds it at one character or more, and SES hands it back as a UUID, so
+    /// — exactly as [`Self::next_export_job_id`] does for the other job kind — it is
+    /// minted as one ([`minted_uuid`]) while the only guarantees this makes are the ones
+    /// a client depends on: the id is unique across import jobs and stable for as long as
+    /// the job holds it (it is minted once, at create, and read back from the record
+    /// afterwards). The monotonic sequence number is part of what the bytes are derived
+    /// from, so two jobs created in the same instant still differ.
     pub fn next_import_job_id(&mut self, now: SystemTime) -> String {
         self.import_job_sequence += 1;
-        let nanos = now
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let mut hex = String::with_capacity(32);
-        for salt in [0_u64, u64::from_be_bytes(*b"ImportJb")] {
-            let mut hasher = DefaultHasher::new();
-            salt.hash(&mut hasher);
-            nanos.hash(&mut hasher);
-            self.import_job_sequence.hash(&mut hasher);
-            write!(hex, "{:016x}", hasher.finish()).expect("writing to a String cannot fail");
-        }
-        format!(
-            "{}-{}-{}-{}-{}",
-            &hex[..8],
-            &hex[8..12],
-            &hex[12..16],
-            &hex[16..20],
-            &hex[20..]
-        )
+        minted_uuid(b"ImportJb", self.import_job_sequence, now, &[])
     }
 
     /// Remove the tenant `tenant_name` holds, with the state that belongs to the
@@ -2907,14 +2852,31 @@ impl ContactRecord {
         &mut self,
         supplied: Vec<crate::ops::types::TopicPreference>,
     ) {
+        // The preferences already stated are indexed ONCE, the way
+        // `ContactListRecord::topic_default_preferences` indexes them: the work is then
+        // the number supplied PLUS the number stored, never their product. Neither
+        // collection carries a modelled bound (`TopicPreferenceList` declares no
+        // `@length`: `smithy_query(query="shape",shape="Topics,TopicPreferenceList")`),
+        // and this runs under the shared store's lock, so a product-shaped merge would
+        // let one request's list decide how long every other caller waits.
+        //
+        // The index keeps the FIRST position a name stands at, which is the entry the
+        // scan this replaces would have found, so a stored list that holds a name twice
+        // is updated in the same place as before.
+        let mut position: BTreeMap<String, usize> = BTreeMap::new();
+        for (at, stated) in self.topic_preferences.iter().enumerate() {
+            position.entry(stated.topic_name.clone()).or_insert(at);
+        }
         for preference in supplied {
-            match self
-                .topic_preferences
-                .iter_mut()
-                .find(|stated| stated.topic_name == preference.topic_name)
-            {
-                Some(stated) => stated.subscription_status = preference.subscription_status,
-                None => self.topic_preferences.push(preference),
+            match position.get(&preference.topic_name) {
+                Some(&at) => {
+                    self.topic_preferences[at].subscription_status =
+                        preference.subscription_status;
+                }
+                None => {
+                    position.insert(preference.topic_name.clone(), self.topic_preferences.len());
+                    self.topic_preferences.push(preference);
+                }
             }
         }
     }
@@ -3784,13 +3746,28 @@ pub fn apply_message_headers(
     carried: &mut Vec<(String, String)>,
     applied: impl IntoIterator<Item = (String, String)>,
 ) {
+    // The names already carried are indexed ONCE, folded to lower case because a mail
+    // header name compares without regard to case: the work is then the number applied
+    // PLUS the number carried, never their product. `MessageHeaderList` carries no
+    // modelled bound (`smithy_query(query="shape",shape="MessageHeaderList")`), so a
+    // product-shaped merge would let one message's header list decide how long the send
+    // path runs.
+    //
+    // The index keeps the FIRST position a name stands at, which is the header the scan
+    // this replaces would have found: a mail message may carry two headers of one name,
+    // and the applied value lands on the same one as before.
+    let mut position: BTreeMap<String, usize> = BTreeMap::new();
+    for (at, (written, _)) in carried.iter().enumerate() {
+        position.entry(written.to_ascii_lowercase()).or_insert(at);
+    }
     for (name, value) in applied {
-        match carried
-            .iter_mut()
-            .find(|(written, _)| written.eq_ignore_ascii_case(&name))
-        {
-            Some(header) => *header = (name, value),
-            None => carried.push((name, value)),
+        let key = name.to_ascii_lowercase();
+        match position.get(&key) {
+            Some(&at) => carried[at] = (name, value),
+            None => {
+                position.insert(key, carried.len());
+                carried.push((name, value));
+            }
         }
     }
 }
