@@ -277,7 +277,7 @@ async fn a_complete_filter_pair_still_narrows_the_reported_deployments() {
         ),
         (
             "a workload nothing was deployed for",
-            json!([{"name": "WORKLOAD_NAME", "values": ["ActiveDirectory"]}]),
+            json!([{"name": "WORKLOAD_NAME", "values": ["MicrosoftActiveDirectory"]}]),
             BTreeSet::new(),
         ),
         (

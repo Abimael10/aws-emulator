@@ -1187,8 +1187,11 @@ const FIELD_ENABLE_EBS_VOLUME_ENCRYPTION: &str = "EnableEbsVolumeEncryption";
 /// See [`FIELD_CREATE_SECURITY_GROUP`].
 const FIELD_CLUSTER_QUORUM_TYPE: &str = "ClusterQuorumType";
 
-/// The field names the required set of every seeded pattern holds: a deployment always
-/// launches EC2 instances into a VPC, whichever pattern it deploys.
+/// The field names the required set of every seeded pattern that LAUNCHES EC2 instances
+/// holds: such a deployment always launches its instances into a VPC, and they are
+/// reached with a key pair. A pattern that launches no instances of its own
+/// ([`SeededPattern::launches_instances`]) publishes neither field, so neither is in its
+/// required set — see [`seeded_specification_fields`].
 const COMMON_REQUIRED_FIELDS: [&str; 2] = ["KeyPairName", "VpcId"];
 
 /// The quorum mechanisms a clustered pattern offers, and the one that needs no witness
@@ -1209,6 +1212,16 @@ const DIRECTORY_EDITIONS: [&str; 2] = ["Standard", "Enterprise"];
 /// see [`sap_hana_single_fields`].
 const NODE_COUNTS: [&str; 3] = ["2", "3", "4"];
 
+/// The retention periods the seeded solution workload offers for the logs its deployment
+/// keeps, and the task sizes and function memory sizes its two architectures offer.
+/// EMULATOR-owned vocabularies (see [`sap_hana_single_fields`]); each retention period is
+/// one CloudWatch Logs accepts, and each task size one Amazon ECS accepts.
+const LOG_RETENTION_DAYS: [&str; 3] = ["7", "30", "90"];
+/// See [`LOG_RETENTION_DAYS`].
+const TASK_CPU_UNITS: [&str; 3] = ["512", "1024", "2048"];
+/// See [`LOG_RETENTION_DAYS`].
+const FUNCTION_MEMORY_SIZES: [&str; 3] = ["512", "1024", "2048"];
+
 /// The infrastructure fields EVERY seeded deployment pattern reads.
 ///
 /// The names are the infrastructure keys the model's own `CreateDeployment` example
@@ -1225,6 +1238,30 @@ const NODE_COUNTS: [&str; 3] = ["2", "3", "4"];
 /// which belong to the NEXT layer ([`workload_specification_fields`]), and no pattern
 /// requires it, so its position raises no clause either way.
 fn common_specification_fields() -> Vec<SpecificationField> {
+    let mut fields = deployment_level_fields();
+    fields.extend(instance_specification_fields());
+    fields.push(notification_field());
+    fields
+}
+
+/// The common layer of a pattern that launches NO EC2 instances of its own (see
+/// [`SeededPattern::launches_instances`]): the deployment-level settings and the
+/// notification topic, without the key pair, VPC and security-group settings that only
+/// mean something for a deployment that launches instances.
+///
+/// Published in the same order as [`common_specification_fields`], of which this is the
+/// instance-free part, so the two layers state one order between them.
+fn serverless_common_fields() -> Vec<SpecificationField> {
+    let mut fields = deployment_level_fields();
+    fields.push(notification_field());
+    fields
+}
+
+/// The settings that belong to the DEPLOYMENT rather than to what it launches, so every
+/// seeded pattern reads them whatever it provisions. The first two keys of the model's
+/// own `CreateDeployment` example, in the order it submits them (see
+/// [`common_specification_fields`]).
+fn deployment_level_fields() -> Vec<SpecificationField> {
     vec![
         spec_field(
             "DisableDeploymentRollback",
@@ -1236,6 +1273,16 @@ fn common_specification_fields() -> Vec<SpecificationField> {
             "Whether the deployment keeps the artifacts it generated after it finishes.",
             &[REQUIRED_YES, REQUIRED_NO],
         ),
+    ]
+}
+
+/// The settings a pattern that launches EC2 INSTANCES reads: the key pair they are
+/// reached with, the VPC they are launched into and the security group they are placed
+/// in. These are the instance-level keys of the model's own `CreateDeployment` example
+/// ([`common_specification_fields`]), and the pair of them a deployment cannot be created
+/// without is [`COMMON_REQUIRED_FIELDS`].
+fn instance_specification_fields() -> Vec<SpecificationField> {
+    vec![
         spec_field(
             "KeyPairName",
             "The name of the EC2 key pair used to access the instances this deployment \
@@ -1265,13 +1312,18 @@ fn common_specification_fields() -> Vec<SpecificationField> {
                 REQUIRED_NO,
             )],
         ),
-        spec_field(
-            "SnsTopicArn",
-            "The ARN of the Amazon SNS topic the deployment publishes its notifications \
-             to.",
-            &[],
-        ),
     ]
+}
+
+/// The topic a deployment publishes its notifications to: the last key of the model's
+/// own `CreateDeployment` example, and the end of the common layer whatever the pattern
+/// launches (see [`common_specification_fields`]).
+fn notification_field() -> SpecificationField {
+    spec_field(
+        "SnsTopicArn",
+        "The ARN of the Amazon SNS topic the deployment publishes its notifications to.",
+        &[],
+    )
 }
 
 /// The fields every pattern of `workload` reads on top of
@@ -1335,7 +1387,7 @@ fn workload_specification_fields(workload: &str) -> Vec<SpecificationField> {
                 &SQL_SERVER_EDITIONS,
             ),
         ],
-        "ActiveDirectory" => vec![
+        "MicrosoftActiveDirectory" => vec![
             spec_field(
                 "DomainDNSName",
                 "The fully qualified name of the Active Directory domain.",
@@ -1350,6 +1402,18 @@ fn workload_specification_fields(workload: &str) -> Vec<SpecificationField> {
                 "DomainAdminUser",
                 "The name of the account the deployment administers the domain with.",
                 &[],
+            ),
+        ],
+        SOLUTION_WORKLOAD => vec![
+            spec_field(
+                "SolutionVersion",
+                "The version of the solution the deployment installs.",
+                &[],
+            ),
+            spec_field(
+                "LogRetentionInDays",
+                "How long the deployment keeps the solution's CloudWatch Logs for.",
+                &LOG_RETENTION_DAYS,
             ),
         ],
         _ => Vec::new(),
@@ -1634,6 +1698,44 @@ fn self_managed_ad_fields() -> Vec<SpecificationField> {
     fields
 }
 
+/// The solution's Amazon ECS architecture pattern's own fields: how many tasks of the
+/// solution's service the cluster runs, and how large each task is. See
+/// [`sap_hana_single_fields`] for why a pattern's own fields are the EMULATOR's for the
+/// patterns it seeds.
+fn solution_ecs_fields() -> Vec<SpecificationField> {
+    vec![
+        spec_field(
+            "ClusterTaskCount",
+            "How many tasks of the solution's service the Amazon ECS cluster runs.",
+            &NODE_COUNTS,
+        ),
+        spec_field(
+            "TaskCpuUnits",
+            "The CPU units each task of the solution's service is given.",
+            &TASK_CPU_UNITS,
+        ),
+    ]
+}
+
+/// The solution's AWS Lambda architecture pattern's own fields: the size of the
+/// solution's functions and how long one invocation of them may run. See
+/// [`solution_ecs_fields`].
+fn solution_lambda_fields() -> Vec<SpecificationField> {
+    vec![
+        spec_field(
+            "FunctionMemorySizeMiB",
+            "The memory each of the solution's functions is given.",
+            &FUNCTION_MEMORY_SIZES,
+        ),
+        spec_field(
+            "FunctionTimeoutSeconds",
+            "How long one invocation of the solution's functions may run before it is \
+             stopped.",
+            &[],
+        ),
+    ]
+}
+
 /// What one pattern marks `required` beyond [`COMMON_REQUIRED_FIELDS`]: the settings a
 /// deployment of THAT pattern cannot be created without, named by its row in the
 /// catalogue table ([`seeded_workloads`]) beside the fields it publishes.
@@ -1733,6 +1835,16 @@ const SELF_MANAGED_AD_REQUIRED: &[&str] = &[
     "AvailabilityZone2",
     "PrivateSubnet2Id",
 ];
+/// The settings the solution's Amazon ECS architecture insists on, and the ones its AWS
+/// Lambda architecture does.
+///
+/// Neither architecture launches EC2 instances, so neither publishes
+/// [`COMMON_REQUIRED_FIELDS`] and each states the whole of its own required set: the size
+/// of the compute it runs the solution on, which it cannot choose for the caller. See
+/// [`SAP_HANA_SINGLE_REQUIRED`] for why requirement is stated per pattern.
+const SOLUTION_ECS_REQUIRED: &[&str] = &["ClusterTaskCount", "TaskCpuUnits"];
+/// See [`SOLUTION_ECS_REQUIRED`].
+const SOLUTION_LAMBDA_REQUIRED: &[&str] = &["FunctionMemorySizeMiB"];
 
 /// Apply one pattern's required set over its composed schema.
 ///
@@ -1768,12 +1880,24 @@ fn mark_required(fields: &mut [SpecificationField], required: &[&str]) {
 /// deploying it also reads) keeps the first layer's definition rather than being reported
 /// twice, which would publish two contradictory contracts for one key.
 fn seeded_specification_fields(workload: &str, pattern: &SeededPattern) -> Vec<SpecificationField> {
-    let mut fields = common_specification_fields();
+    // Which common layer the pattern reads follows from what it provisions: a pattern
+    // that launches no EC2 instances publishes no key pair, VPC or security-group
+    // setting, so neither does it require one.
+    let mut fields = if pattern.launches_instances {
+        common_specification_fields()
+    } else {
+        serverless_common_fields()
+    };
     fields.extend(workload_specification_fields(workload));
     fields.extend((pattern.own_fields)());
     let mut published = BTreeSet::new();
     fields.retain(|field| published.insert(field.name.clone()));
-    let required: Vec<&str> = COMMON_REQUIRED_FIELDS
+    let common_required: &[&str] = if pattern.launches_instances {
+        &COMMON_REQUIRED_FIELDS
+    } else {
+        &[]
+    };
+    let required: Vec<&str> = common_required
         .iter()
         .copied()
         .chain(pattern.own_required.iter().copied())
@@ -1795,6 +1919,10 @@ struct SeededPattern {
     name: &'static str,
     display_name: &'static str,
     description: &'static str,
+    /// Whether a deployment of this pattern launches EC2 INSTANCES, which decides the
+    /// common layer of its schema: see [`seeded_specification_fields`] and
+    /// [`COMMON_REQUIRED_FIELDS`].
+    launches_instances: bool,
     /// See [`sap_hana_single_fields`].
     own_fields: fn() -> Vec<SpecificationField>,
     /// See [`SAP_HANA_SINGLE_REQUIRED`].
@@ -1815,6 +1943,18 @@ const DOCUMENTATION_BASE: &str = "https://docs.aws.amazon.com/launchwizard/lates
 /// is DERIVED from the catalogue key rather than listed a second time, and no two
 /// entries can share one.
 const ICON_BASE: &str = "https://d1.awsstatic.com/launchwizard/workloads";
+
+/// The `WorkloadName` of the solution entry the catalogue publishes beside its
+/// application entries.
+///
+/// Launch Wizard deploys AWS Solutions Library solutions as workloads of their own, and a
+/// solution's catalogue name is its SOLUTION ID (`SO` followed by its number) rather than
+/// an application name, with one deployment pattern per architecture the solution
+/// publishes — this one offers an Amazon ECS architecture and an AWS Lambda architecture.
+/// The id is inside `WorkloadName` (len 1..100, `^[A-Za-z][a-zA-Z0-9-_]*$`), so a client
+/// takes it straight from the listing to the reads keyed by a workload name, which is
+/// exactly what an entry missing from the catalogue made impossible.
+const SOLUTION_WORKLOAD: &str = "SO0023";
 
 /// One workload of the seeded catalogue, as the table in [`seeded_workloads`] spells it.
 ///
@@ -1841,10 +1981,19 @@ struct SeededWorkload {
 /// a deployment pattern), so the emulator seeds it. The entries are the Launch Wizard
 /// applications AWS documents — SAP, Microsoft SQL Server and Microsoft Active
 /// Directory — with the deployment patterns each of those applications offers, the
-/// specification schema each pattern accepts, and the one version of each. The model
+/// specification schema each pattern accepts, and the one version of each, plus the
+/// solution entry [`SOLUTION_WORKLOAD`] describes. The model
 /// constrains the shapes of these values: `WorkloadName` is `^[A-Za-z][a-zA-Z0-9-_]*$`
 /// (len 1..100) and `DeploymentPatternName` is `^[A-Za-z0-9][a-zA-Z0-9-]*$` (len
 /// 1..256).
+///
+/// An entry's NAME, and the name of each of its deployment patterns, is the name AWS
+/// publishes that workload or pattern under, because a name is what a client takes from
+/// one catalogue read to the next call (`GetWorkload`,
+/// `ListWorkloadDeploymentPatterns`, `GetWorkloadDeploymentPattern` and
+/// `CreateDeployment` all take one as input) — so a name seeded here addresses the same
+/// resource on the real service. The display text and the schemas beside those names are
+/// the emulator's own, as the field docs below say.
 ///
 /// `description`, `documentation_page` and the entry's name are the per-workload
 /// metadata `WorkloadData` (and therefore `GetWorkload`) reports: what the entry's
@@ -1852,7 +2001,7 @@ struct SeededWorkload {
 /// catalogue publishes for it; each pattern carries its own display name, description,
 /// specification schema and version.
 fn seeded_workloads() -> BTreeMap<String, Workload> {
-    let catalogue: [SeededWorkload; 3] = [
+    let catalogue: [SeededWorkload; 4] = [
         SeededWorkload {
             name: "SAP",
             display_name: "SAP",
@@ -1864,6 +2013,7 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
                     display_name: "SAP HANA, highly available",
                     description: "Deploys an SAP HANA database as a highly available pair \
                                   across two Availability Zones.",
+                    launches_instances: true,
                     own_fields: sap_hana_ha_fields,
                     own_required: SAP_HANA_HA_REQUIRED,
                 },
@@ -1871,14 +2021,19 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
                     name: "SapHanaSingle",
                     display_name: "SAP HANA on a single instance",
                     description: "Deploys an SAP HANA database on one instance.",
+                    launches_instances: true,
                     own_fields: sap_hana_single_fields,
                     own_required: SAP_HANA_SINGLE_REQUIRED,
                 },
                 SeededPattern {
-                    name: "SapHanaMultiNode",
+                    // AWS publishes the scale-out SAP HANA pattern under this name (the
+                    // multi-instance pattern of its SAP catalogue entry), beside the
+                    // high-availability and single-instance ones above.
+                    name: "SapHanaMulti",
                     display_name: "SAP HANA on multiple nodes",
                     description: "Deploys a scale-out SAP HANA database across several \
                                   instances.",
+                    launches_instances: true,
                     own_fields: sap_hana_multi_node_fields,
                     own_required: SAP_HANA_MULTI_NODE_REQUIRED,
                 },
@@ -1887,6 +2042,7 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
                     display_name: "SAP NetWeaver on SAP HANA, highly available",
                     description: "Deploys SAP NetWeaver on an SAP HANA database across two \
                                   Availability Zones.",
+                    launches_instances: true,
                     own_fields: sap_nw_on_hana_ha_fields,
                     own_required: SAP_NW_ON_HANA_HA_REQUIRED,
                 },
@@ -1903,6 +2059,7 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
                     name: "SqlServerSingle",
                     display_name: "Microsoft SQL Server on a single instance",
                     description: "Deploys Microsoft SQL Server on one instance.",
+                    launches_instances: true,
                     own_fields: sql_server_single_fields,
                     own_required: SQL_SERVER_SINGLE_REQUIRED,
                 },
@@ -1911,13 +2068,16 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
                     display_name: "Microsoft SQL Server, highly available",
                     description: "Deploys a Microsoft SQL Server Always On availability group \
                                   across two Availability Zones.",
+                    launches_instances: true,
                     own_fields: sql_server_ha_fields,
                     own_required: SQL_SERVER_HA_REQUIRED,
                 },
             ][..],
         },
         SeededWorkload {
-            name: "ActiveDirectory",
+            // AWS publishes the Microsoft Active Directory entry of its catalogue under
+            // this name; "Microsoft Active Directory" is the display name beside it.
+            name: "MicrosoftActiveDirectory",
             display_name: "Microsoft Active Directory",
             description: "Deploy AWS Managed Microsoft AD or self-managed Active Directory on \
                            Amazon Web Services.",
@@ -1928,6 +2088,7 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
                     display_name: "AWS Managed Microsoft AD",
                     description: "Deploys an AWS Directory Service managed Microsoft AD \
                                   directory.",
+                    launches_instances: true,
                     own_fields: aws_managed_ad_fields,
                     own_required: AWS_MANAGED_AD_REQUIRED,
                 },
@@ -1936,8 +2097,42 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
                     display_name: "Self-managed Active Directory",
                     description: "Deploys Active Directory domain controllers you administer \
                                   yourself.",
+                    launches_instances: true,
                     own_fields: self_managed_ad_fields,
                     own_required: SELF_MANAGED_AD_REQUIRED,
+                },
+            ][..],
+        },
+        SeededWorkload {
+            name: SOLUTION_WORKLOAD,
+            display_name: "AWS Solutions Library solution SO0023",
+            description: "Deploy the AWS Solutions Library solution SO0023, on either the \
+                           Amazon ECS architecture or the AWS Lambda architecture it \
+                           publishes.",
+            documentation_page: "launch-wizard-solutions",
+            patterns: &[
+                SeededPattern {
+                    // The two architectures this solution publishes are an Amazon ECS one
+                    // and an AWS Lambda one; the NAMES below are the emulator's own for
+                    // them, like the display text of every seeded entry (see
+                    // [`sap_hana_single_fields`]).
+                    name: "EcsArchitecture",
+                    display_name: "Amazon ECS architecture",
+                    description: "Deploys the solution's services as tasks on an Amazon ECS \
+                                  cluster.",
+                    // A task runs on compute the cluster manages, so this pattern launches
+                    // no EC2 instance of the caller's own.
+                    launches_instances: false,
+                    own_fields: solution_ecs_fields,
+                    own_required: SOLUTION_ECS_REQUIRED,
+                },
+                SeededPattern {
+                    name: "LambdaArchitecture",
+                    display_name: "AWS Lambda architecture",
+                    description: "Deploys the solution's services as AWS Lambda functions.",
+                    launches_instances: false,
+                    own_fields: solution_lambda_fields,
+                    own_required: SOLUTION_LAMBDA_REQUIRED,
                 },
             ][..],
         },

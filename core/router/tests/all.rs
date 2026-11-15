@@ -1398,7 +1398,6 @@ mod lambda_in_function_assumed_role_session;
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling
 // of this file, which the layout check refuses: the `#[path]` is what points each
 //! This file is a canonical DECLARATION LIST: a header, then one
-//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted by name, and no other
 //! line. Put a new suite at `tests/all/<name>.rs` and insert its pair in order; what a
 //! suite covers, and why it belongs to this cross-service target, stands in that suite's own
 //! module header, and a note about THIS file belongs in `all/appended_notes.rs`, declared
@@ -1430,7 +1429,6 @@ mod lambda_in_function_assumed_role_session;
 //! `mod` is what points it into `tests/all/`.
 //! COMMENT MAY STAND IN THIS FILE: past the first item one is `E0753` and compiles
 //! nothing, so a note below must be an ordinary line comment — better still, add a
-//! `all/all_rs_declares_each_suite_once.rs` and
 // The list below is DECLARATIONS ONLY. What a suite covers, and why it belongs to this
 // cross-service target rather than to one service crate's own, is stated in that suite's own
 // module header, where it is read beside the test it explains — not here.
@@ -1658,3 +1656,14 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 // had appended here.
 // (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` above each `mod` is
 // what points the declaration into `tests/all/`.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted into the sorted list: one
+//! pair per suite and NOTHING else, so two landings insert two lines in two places and
+//! have no prose to duplicate, re-word or mistype.
+//! Declare each suite exactly ONCE — this is one crate root, so a second `mod` for one
+//! name is `E0428` and fails every suite in this target — and leave no note in the list:
+//! an inner doc comment (`//!`) is legal only BEFORE the first item, so one written
+//! further down is `E0753` and compiles nothing. What a suite covers, and why it lives in
+//! THIS target rather than in a service crate's own, belongs in that suite's own module
+//! header, where it is read beside the test it explains.
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check those three rules, for this file
+//! and for every service crate's `tests/all.rs`.

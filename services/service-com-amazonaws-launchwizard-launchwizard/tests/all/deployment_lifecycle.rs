@@ -127,6 +127,37 @@ pub(crate) async fn get(harness: &Harness, case: &str, id: &str) -> Value {
     body["deployment"].clone()
 }
 
+/// How long a poll waits for a deployment to reach the status the CLOCK owes it, and
+/// how often it re-reads. Generous, because the wait is not what any case here tests:
+/// the test waits for the CONDITION and stops as soon as it holds, so the deadline only
+/// bounds a deployment that never gets there at all.
+const POLL_DEADLINE: Duration = Duration::from_millis(30_000);
+/// See [`POLL_DEADLINE`].
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Poll `GetDeployment` until the deployment `id` reports `status`, handing back the
+/// deployment as it was read at that status.
+pub(crate) async fn poll_until_status(
+    harness: &Harness,
+    case: &str,
+    id: &str,
+    status: &str,
+) -> Value {
+    let started = std::time::Instant::now();
+    loop {
+        let deployment = get(harness, case, id).await;
+        if deployment["status"].as_str() == Some(status) {
+            return deployment;
+        }
+        assert!(
+            started.elapsed() < POLL_DEADLINE,
+            "case {case:?}: the deployment never reached {status:?} within \
+             {POLL_DEADLINE:?}, last read {deployment}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 #[tokio::test]
 async fn the_seeded_workload_catalogue_is_reported_and_paged() {
     let harness = Harness::new();
@@ -169,7 +200,7 @@ async fn the_seeded_workload_catalogue_is_reported_and_paged() {
     // The issue cited `SAP`; the rule is "the whole seeded catalogue is reported", so
     // the other entries are checked too.
     let names: Vec<String> = catalogue(&harness).await;
-    for expected in ["SAP", "SQLServer", "ActiveDirectory"] {
+    for expected in ["SAP", "SQLServer", "MicrosoftActiveDirectory", "SO0023"] {
         assert!(
             names.iter().any(|name| name == expected),
             "case {expected:?}: the seeded catalogue must report it, got {names:?}"
@@ -400,7 +431,8 @@ pub(crate) fn first_pattern(workload: &str) -> &'static str {
     match workload {
         "SAP" => "SapHanaSingle",
         "SQLServer" => "SqlServerSingle",
-        "ActiveDirectory" => "AWSManagedAD",
+        "MicrosoftActiveDirectory" => "AWSManagedAD",
+        "SO0023" => "EcsArchitecture",
         other => panic!("the test table does not know the patterns of workload {other:?}"),
     }
 }
@@ -413,7 +445,7 @@ async fn a_deployment_name_is_held_only_while_a_deployment_holds_it() {
 
     // The same name again is a client error, whatever workload or pattern it is
     // submitted against.
-    for (workload, pattern) in [("SAP", "SapHanaMultiNode"), ("SQLServer", "SqlServerHA")] {
+    for (workload, pattern) in [("SAP", "SapHanaMulti"), ("SQLServer", "SqlServerHA")] {
         let case = format!("duplicate {name} via {workload}/{pattern}");
         harness
             .refused(
@@ -433,21 +465,29 @@ async fn a_deployment_name_is_held_only_while_a_deployment_holds_it() {
         "two deployments must get distinct ids, got {first:?} twice"
     );
 
-    // Once the deployment holding the name is gone, the name is free again.
+    // Once the deployment holding the name is gone, the name is free again. The delete
+    // is accepted at once and the record reaches DELETED on the clock, so the test waits
+    // for THAT status rather than for a span of time.
     harness
         .ok("delete first", "/deleteDeployment", json!({"deploymentId": first}))
         .await;
-    std::thread::sleep(SETTLE);
+    let old = poll_until_status(&harness, "deleted deployment", &first, "DELETED").await;
     let reused = create(&harness, "reuse after delete", "SAP", "SapHanaSingle", name).await;
     assert_ne!(
         reused, first,
         "reusing the name must mint a new deployment, got the deleted one's id {first:?}"
     );
-    let old = get(&harness, "deleted deployment", &first).await;
+    let after_reuse = get(&harness, "deleted deployment", &first).await;
     assert_eq!(
-        old["status"], json!("DELETED"),
+        after_reuse["status"], old["status"],
+        "case reuse: reusing the name must leave the deleted deployment where it was, got \
+         {} after {}",
+        after_reuse["status"], old["status"]
+    );
+    assert_eq!(
+        after_reuse["status"], json!("DELETED"),
         "case reuse: the deleted deployment must stay deleted, got {}",
-        old["status"]
+        after_reuse["status"]
     );
 }
 
@@ -468,7 +508,7 @@ async fn a_dry_run_validates_and_stores_nothing() {
     for (workload, pattern, name) in [
         ("SAP", "SapHanaSingle", "dry-one"),
         ("SQLServer", "SqlServerHA", "dry-two"),
-        ("ActiveDirectory", "SelfManagedAD", "dry-three"),
+        ("MicrosoftActiveDirectory", "SelfManagedAD", "dry-three"),
     ] {
         let case = format!("dry run {workload}/{pattern}");
         let body = harness
@@ -515,8 +555,8 @@ async fn list_deployments_pages_and_filters_the_stored_deployments() {
     let rows = [
         ("SAP", "SapHanaSingle", "page-one"),
         ("SQLServer", "SqlServerSingle", "page-two"),
-        ("SAP", "SapHanaMultiNode", "page-three"),
-        ("ActiveDirectory", "AWSManagedAD", "page-four"),
+        ("SAP", "SapHanaMulti", "page-three"),
+        ("MicrosoftActiveDirectory", "AWSManagedAD", "page-four"),
         ("SQLServer", "SqlServerHA", "page-five"),
     ];
     let mut ids = Vec::new();
@@ -603,7 +643,7 @@ async fn list_deployments_pages_and_filters_the_stored_deployments() {
         ),
         (
             "two workloads, OR-joined",
-            json!([{"name": "WORKLOAD_NAME", "values": ["SAP", "ActiveDirectory"]}]),
+            json!([{"name": "WORKLOAD_NAME", "values": ["SAP", "MicrosoftActiveDirectory"]}]),
             ["page-one", "page-three", "page-four"].into_iter().collect(),
         ),
         (

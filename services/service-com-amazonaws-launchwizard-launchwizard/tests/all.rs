@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/catalogue_aws_deployment_patterns.rs"]
 mod catalogue_aws_deployment_patterns;
+#[path = "all/catalogue_published_entries.rs"]
+mod catalogue_published_entries;
 #[path = "all/catalogue_published_urls.rs"]
 mod catalogue_published_urls;
 #[path = "all/catalogue_resolution_single_source.rs"]
