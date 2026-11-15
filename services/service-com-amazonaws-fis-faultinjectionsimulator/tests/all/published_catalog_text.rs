@@ -16,18 +16,15 @@
 //! * the type listing enumerates the published set in the published ORDER, so a client that
 //!   pages it or indexes into it sees the entry the service puts at that index.
 //!
-//! SOURCE for the expected text below: the AWS FIS actions reference
-//! (<https://docs.aws.amazon.com/fis/latest/userguide/fis-actions-reference.html>), which
-//! the `Action` shape's own model documentation points at and which publishes both catalogs
-//! together with the description of every entry and parameter. The expected strings are
-//! written out here rather than imported from `src/state/catalog.rs`, so a restated entry in
-//! that table fails this suite instead of agreeing with it. The rows span the entries whose
-//! published text differs from a restatement only in punctuation, entries whose text carries
-//! a parenthetical or a documented default, and entries no issue cited at all. Three rows of
-//! the resource-type table carry text that is still the table's best reading rather than a
-//! value read off the published catalog, and say so there (`// unconfirmed`):
-//! `aws:ec2:vpc-endpoint` is one of them, pinned here so the table and this suite cannot
-//! drift apart while that reading stands.
+//! SOURCE for the expected text below: the published catalogs themselves — the action
+//! catalog the `Action` shape's own model documentation points at
+//! (<https://docs.aws.amazon.com/fis/latest/userguide/fis-actions-reference.html>) and the
+//! published type listing — which carry the description of every entry and parameter. The
+//! expected strings are written out here rather than imported from `src/state/catalog.rs`,
+//! so a restated entry in that table fails this suite instead of agreeing with it. The rows
+//! span the entries whose published text differs from a restatement only in punctuation,
+//! entries whose text carries a parenthetical or a documented default, and entries no issue
+//! cited at all.
 //!
 //! The HTTP harness below is local to this suite, as each sibling suite's is.
 
@@ -172,8 +169,8 @@ struct TypeText {
 /// whether the resource noun is a product name in title case (`aws:ec2:transit-gateway`) or
 /// a plain noun (`aws:ec2:instance`), whether it carries a parenthetical
 /// (`aws:directconnect:virtual-interface`), and which AWS service and family of resource the
-/// id names. `aws:dsql:cluster`, `aws:ecs:task`, `aws:iam:role`, `aws:ec2:spot-instance` and
-/// `aws:ec2:vpc-endpoint` are rows no issue cited.
+/// id names. `aws:dsql:cluster`, `aws:ecs:task`, `aws:iam:role` and `aws:ec2:spot-instance`
+/// are rows no issue cited.
 fn type_text() -> Vec<TypeText> {
     vec![
         TypeText {
@@ -216,12 +213,11 @@ fn type_text() -> Vec<TypeText> {
             id: "aws:ec2:transit-gateway",
             description: "An Amazon EC2 Transit Gateway.",
         },
-        // The id and the index of this row are the published ones; its TEXT is the table's
-        // own `// unconfirmed` reading, pinned here only so the table and this suite cannot
-        // drift apart while that reading stands.
+        // A row whose published text names neither the resource's AWS service nor "Amazon":
+        // the listing publishes the plain resource noun for it.
         TypeText {
             id: "aws:ec2:vpc-endpoint",
-            description: "An Amazon EC2 VPC Endpoint.",
+            description: "A Virtual Private Cloud (VPC) endpoint.",
         },
         TypeText {
             id: "aws:ecs:task",
@@ -326,9 +322,7 @@ fn type_parameter_text() -> Vec<(&'static str, &'static [(&'static str, &'static
 /// the order it enumerates them.
 ///
 /// Written out so the INDEX a client reads an entry at is asserted, not just the set: the
-/// ids ascend, with `aws:ec2:route-table` after that run, which is where the published
-/// listing carries it (the two ascending slots its position would take carry
-/// `aws:ec2:spot-instance` and `aws:ec2:subnet`).
+/// ids ascend, which is the order the published listing enumerates them in.
 const PUBLISHED_TYPE_ORDER: &[&str] = &[
     "aws:arc:zonal-shift-managed-resource",
     "aws:directconnect:virtual-interface",
@@ -348,11 +342,12 @@ const PUBLISHED_TYPE_ORDER: &[&str] = &[
     "aws:eks:pod",
     "aws:elasticache:replicationgroup",
     "aws:iam:role",
+    "aws:kinesis:stream",
     "aws:lambda:function",
+    "aws:memorydb:multi-region-cluster",
     "aws:rds:cluster",
     "aws:rds:db",
     "aws:s3:bucket",
-    "aws:ec2:route-table",
 ];
 
 #[tokio::test]

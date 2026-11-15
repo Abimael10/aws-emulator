@@ -241,7 +241,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:cloudwatch:assert-alarm-state",
-        description: "Verify that the specified alarms are in one of the specified alarm states.",
+        description: "Asserts that the CloudWatch alarms are in the expected states.",
         parameters: &[
             ActionCatalogParameter {
                 name: "alarmArns",
@@ -1413,43 +1413,34 @@ impl TargetResourceTypeCatalogEntry {
     }
 }
 
-/// The target resource types this emulator serves.
+/// The target resource types FIS PUBLISHES, as `ListTargetResourceTypes` enumerates them
+/// and `GetTargetResourceType` reports them one at a time.
 ///
-/// SOURCE: the resource types the AWS FIS actions reference
+/// SOURCE: the published type listing itself — its membership, its order and each row's
+/// description are catalog DATA the API serves and the model does not carry, so a row holds
+/// the very string the listing publishes for that id rather than a restatement of it. The
+/// text is reported character for character, punctuation included: most rows end in a
+/// period and a few publish none (`aws:dynamodb:global-table`, `aws:ec2:autoscaling-group`,
+/// `aws:ec2:ebs-volume`, `aws:s3:bucket`), and a row names its service the way the listing
+/// names it, which is not always the way another row does. The parameters a row records are
+/// the ones the AWS FIS actions reference
 /// (<https://docs.aws.amazon.com/fis/latest/userguide/fis-actions-reference.html>)
-/// publishes as the targets of its actions — the same reference [`ACTION_CATALOG`] is
-/// taken from, which is what makes the two tables agree: every resource type a catalogued
-/// action targets is published here. The converse does not hold, because the published
-/// TYPE list is its own catalog: FIS publishes a type as soon as some action of its own
-/// can target it, so a type whose action [`ACTION_CATALOG`] does not (yet) record is still
-/// a type `ListTargetResourceTypes` and `GetTargetResourceType` report — leaving it out
-/// would hide a type a client may legitimately target.
+/// documents for that type — the types whose targets cannot be named by ids, ARNs or tags
+/// alone (an ECS task is named through its cluster and service, an EKS pod through its
+/// cluster, namespace and selector) — and only where it states them, so no parameter
+/// contract here is invented for a type documented without one.
 ///
-/// Each entry records the id the reference states, the one-line description it PUBLISHES
-/// for the resource that id names (the value `TargetResourceTypeSummary$description`
-/// carries, not a paraphrase of it), and the parameters a target of that type may set —
-/// the resource types the
-/// reference documents parameters for are the ones whose targets cannot be named by ids,
-/// ARNs or tags alone (an ECS task is named through its cluster and service, an EKS pod
-/// through its cluster, namespace and selector), and a row records parameters only where
-/// that reference states them, so no parameter contract here is invented for a type
-/// documented without one.
+/// The published LISTING is its own catalog, independent of [`ACTION_CATALOG`] in both
+/// directions: it carries types no catalogued action targets (`aws:kinesis:stream` is one),
+/// and a published action can target a type the listing does not carry, which is why what
+/// makes a type TARGETABLE is this table or the action table
+/// ([`action_catalog_targets_resource_type`]) rather than this table alone.
 ///
 /// ORDER: the order the published listing enumerates the types in, which is the order
 /// `ListTargetResourceTypes` reports them in and the index a client that pages or indexes
-/// the list reads an entry at — ids ascending, with `aws:ec2:route-table` after that run
-/// rather than inside it, because the published listing carries `aws:ec2:spot-instance`
-/// and `aws:ec2:subnet` at the two indices the route-table row's ascending position would
-/// take. The order is DATA, not a consequence of the ids, which is why
-/// [`catalog_page`](super::catalog_page) pages the table as written rather than re-sorting
-/// it. Each row's parameters are kept sorted by name.
-///
-/// NOT YET SETTLED, and marked `// unconfirmed` on the row it belongs to, so a later
-/// transcription knows which text is the published value and which is still this table's
-/// best reading of it: the description of three rows, the index the `aws:ec2:route-table`
-/// row sits at (only the two indices it is NOT at are known), and one further published
-/// type, enumerated after `aws:iam:role`, whose id this table does not know and therefore
-/// does not invent.
+/// the list reads an entry at — ids ascending. The order is DATA, not a consequence of the
+/// ids, which is why [`catalog_page`](super::catalog_page) pages the table as written rather
+/// than re-sorting it. Each row's parameters are kept sorted by name.
 pub const TARGET_RESOURCE_TYPE_CATALOG: &[TargetResourceTypeCatalogEntry] = &[
     TargetResourceTypeCatalogEntry {
         id: "aws:arc:zonal-shift-managed-resource",
@@ -1515,8 +1506,7 @@ pub const TARGET_RESOURCE_TYPE_CATALOG: &[TargetResourceTypeCatalogEntry] = &[
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:ec2:vpc-endpoint",
-        // unconfirmed: the id and this index are the published ones, the text is not.
-        description: "An Amazon EC2 VPC Endpoint.",
+        description: "A Virtual Private Cloud (VPC) endpoint.",
         parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
@@ -1552,8 +1542,7 @@ pub const TARGET_RESOURCE_TYPE_CATALOG: &[TargetResourceTypeCatalogEntry] = &[
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:eks:pod",
-        // unconfirmed: the text follows the rest of the EKS rows, which are published.
-        description: "An Amazon EKS pod.",
+        description: "A Kubernetes pod.",
         parameters: &[
             TargetResourceTypeCatalogParameter {
                 name: "availabilityZoneIdentifier",
@@ -1584,8 +1573,7 @@ pub const TARGET_RESOURCE_TYPE_CATALOG: &[TargetResourceTypeCatalogEntry] = &[
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:elasticache:replicationgroup",
-        // unconfirmed: the text follows the published rows naming their service in full.
-        description: "An Amazon ElastiCache replication group.",
+        description: "An ElastiCache Replication Group.",
         parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
@@ -1594,8 +1582,18 @@ pub const TARGET_RESOURCE_TYPE_CATALOG: &[TargetResourceTypeCatalogEntry] = &[
         parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
+        id: "aws:kinesis:stream",
+        description: "AWS Kinesis Data Stream target for the FIS actions.",
+        parameters: &[],
+    },
+    TargetResourceTypeCatalogEntry {
         id: "aws:lambda:function",
-        description: "An AWS Lambda function.",
+        description: "A Lambda Function.",
+        parameters: &[],
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:memorydb:multi-region-cluster",
+        description: "A MemoryDB multi-region cluster.",
         parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
@@ -1610,15 +1608,7 @@ pub const TARGET_RESOURCE_TYPE_CATALOG: &[TargetResourceTypeCatalogEntry] = &[
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:s3:bucket",
-        description: "An Amazon S3 bucket.",
-        parameters: &[],
-    },
-    // Published after the ascending run, not inside it: see the ORDER note above.
-    // unconfirmed: that it is published after the run is known, this index is not.
-    TargetResourceTypeCatalogEntry {
-        id: "aws:ec2:route-table",
-        // unconfirmed: the text is this table's reading, not the published value.
-        description: "A route table of an Amazon VPC.",
+        description: "An Amazon S3 bucket",
         parameters: &[],
     },
 ];
@@ -1634,4 +1624,21 @@ pub fn target_resource_type_catalog_entry(
     TARGET_RESOURCE_TYPE_CATALOG
         .iter()
         .find(|entry| entry.id == id)
+}
+
+/// Whether a built-in action can be pointed at the resource type `id`.
+///
+/// A catalogued action's `ActionTarget$resourceType` names a type an experiment template's
+/// target may carry, and that is a different catalog from the published type LISTING: the
+/// listing enumerates the types FIS publishes ([`TARGET_RESOURCE_TYPE_CATALOG`]) while
+/// [`ACTION_CATALOG`] publishes the actions and the type each of them targets, so a type an
+/// action targets is targetable whether or not the listing carries it. Matched exactly, as
+/// [`target_resource_type_catalog_entry`] matches a published id.
+pub fn action_catalog_targets_resource_type(id: &str) -> bool {
+    ACTION_CATALOG.iter().any(|action| {
+        action
+            .targets
+            .iter()
+            .any(|target| target.resource_type == id)
+    })
 }

@@ -23,6 +23,10 @@ mod action_order_is_acyclic;
 // authorizes it: any one of the grants the action documents.
 #[path = "all/action_privileges_gate.rs"]
 mod action_privileges_gate;
+// The published MEMBERSHIP of both service-owned catalogs and the text each entry carries,
+// plus how the two tables stand to each other.
+#[path = "all/catalog_membership_and_text.rs"]
+mod catalog_membership_and_text;
 #[path = "all/control_plane_rules.rs"]
 mod control_plane_rules;
 #[path = "all/delete_target_account_configuration.rs"]

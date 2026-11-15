@@ -1495,3 +1495,21 @@ mod lambda_delivery_grant_is_each_sources_own;
 // `clippy::doc_lazy_continuation` asks of a doc list item, so the lint is allowed for the whole
 // target. An inner attribute, like an inner doc comment, is legal only before the first item,
 // so it stands in this header rather than in the list below.
+// file under `tests/all/`, sorted by name, and no other line — no prose between the pairs,
+// no blank line, and nothing after the last pair. Put a new suite at `tests/all/<name>.rs`
+// and insert its pair where its name sorts to: two branches landing at once then insert two
+// gone wrong here — both the tail and this header had grown hundreds of re-typed copies of
+// these paragraphs. What a suite covers, and why it drives the assembled router rather than
+// one service crate, belongs in that suite's OWN module header, where it is read beside the
+// test it explains; a note about THIS file belongs in `all/appended_notes.rs`.
+// `E0753` and compiles no suite of this target at all — and with none anywhere in the file,
+// no appended, re-typed or merged copy of one of its lines can be one. A suite file no `mod`
+// here names is compiled nowhere and its tests never run, a suite left at the top level of
+// `tests/` fails the build, and a second `mod` for one name is `E0428`. `tests/all.rs` is a
+// points it into `tests/all/`. Some of the files below are shared harnesses or probes rather
+// than suites; all of them are declared, because a file no declaration names is compiled
+// The `all/all_rs_*` suites, `all/every_suite_file_is_declared.rs`,
+// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` check every rule
+// `clippy::doc_lazy_continuation` asks of a doc list item, so the lint is allowed for the
+// whole target. An inner attribute, like an inner doc comment, is legal only before the first
+// item, so it stands in this header rather than in the list below.

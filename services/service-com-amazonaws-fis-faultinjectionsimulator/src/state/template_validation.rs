@@ -35,9 +35,9 @@ use super::*;
 /// action from [`ACTION_CATALOG`]:
 ///
 /// * `resourceType` is "the resource type", one of the target resource types FIS
-///   PUBLISHES, so a type the catalog holds no entry for — the same miss
-///   `GetTargetResourceType` refuses with its own `ValidationException` — is refused rather
-///   than stored;
+///   SUPPORTS, so a type neither the published type listing
+///   ([`TARGET_RESOURCE_TYPE_CATALOG`]) nor a published action
+///   ([`action_catalog_targets_resource_type`]) names is refused rather than stored;
 /// * the parameters that type's catalogued contract marks required are supplied, because
 ///   `TargetResourceTypeParameter$required` says a target of that type HAS TO set them and
 ///   a target without them names a resolution the published contract cannot identify.
@@ -50,15 +50,21 @@ pub fn targets_refusal(
     entries.sort_by_key(|(name, _)| *name);
     for (name, target) in entries {
         // `resourceType` is required on the create's and the update's target input alike, so
-        // a stored target always carries one; a record without one names no published
+        // a stored target always carries one; a record without one names no supported
         // resource type and is refused by this rule.
         let resource_type = target.resource_type.as_deref().unwrap_or_default();
-        let Some(entry) = target_resource_type_catalog_entry(resource_type) else {
+        // The published LISTING is not the whole of what FIS can target: an action the
+        // catalog publishes names the type it is pointed at, so such a type is targetable
+        // even where the listing does not enumerate it. A type reached that way has no
+        // listed parameter contract, so there is nothing for the parameter rule to require
+        // of it.
+        let entry = target_resource_type_catalog_entry(resource_type);
+        if entry.is_none() && !action_catalog_targets_resource_type(resource_type) {
             return Some(invalid_input(format!(
-                "targets.{name}.resourceType must be a resource type FIS publishes, \
+                "targets.{name}.resourceType must be a resource type FIS supports, \
                  got {resource_type:?}"
             )));
-        };
+        }
         let names_arns = target.resource_arns.as_ref().is_some_and(|arns| !arns.is_empty());
         let names_tags = target
             .resource_tags
@@ -86,8 +92,10 @@ pub fn targets_refusal(
                  got {selection_mode:?}"
             )));
         }
-        if let Some(refusal) = target_parameters_refusal(name, target, entry) {
-            return Some(refusal);
+        if let Some(entry) = entry {
+            if let Some(refusal) = target_parameters_refusal(name, target, entry) {
+                return Some(refusal);
+            }
         }
     }
     None

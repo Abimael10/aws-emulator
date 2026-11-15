@@ -8,10 +8,10 @@
 //! `string -> string` map — so each one is the service's own, refused with a 400
 //! `ValidationException` that persists nothing:
 //!
-//! * `resourceType` names one of the target resource types the service PUBLISHES (the same
-//!   table `ListTargetResourceTypes` and `GetTargetResourceType` report from), so an id that
-//!   table holds no entry for — exactly the id `GetTargetResourceType` refuses with its own
-//!   `ValidationException` — is refused rather than stored;
+//! * `resourceType` names a target resource type the service SUPPORTS — one the published
+//!   type listing enumerates (the same table `ListTargetResourceTypes` and
+//!   `GetTargetResourceType` report from) or one a published action targets — so an id
+//!   neither of those names is refused rather than stored;
 //! * a target supplies every parameter the published entry for its resource type marks
 //!   `required` (`TargetResourceTypeParameter$required`, "indicates whether the parameter is
 //!   required"), because a target without one names a resolution the published contract
@@ -28,8 +28,8 @@
 //!
 //! The two halves of the one table are checked against each other: for every row the
 //! template rule admits a resource type for, `GetTargetResourceType` reports that type with
-//! the same `required` flags, and for every id the template rule refuses,
-//! `GetTargetResourceType` answers 400.
+//! the same `required` flags, and for every id the rows below refuse — none of which a
+//! published action targets either — `GetTargetResourceType` answers 400.
 //!
 //! The rules belong to the TEMPLATE and not to the call that produced it, so the last test
 //! drives rows of each kind through `UpdateExperimentTemplate` and asserts it answers
@@ -403,12 +403,14 @@ const UNPUBLISHED: &[(&str, &str)] = &[
     ("an empty-ish id", "-"),
 ];
 
-/// RULE: `resourceType` names one of the target resource types the service publishes, so an
-/// id its published table holds no entry for is refused when the template is created instead
-/// of being stored as a target no resolution could identify.
+/// RULE: `resourceType` names a target resource type the service supports — one its published
+/// type listing enumerates or one a published action targets — so an id neither of them names
+/// is refused when the template is created instead of being stored as a target no resolution
+/// could identify.
 ///
-/// The same miss on the same table is what `GetTargetResourceType` refuses with
-/// `ValidationException`, so each row asserts both halves.
+/// No row below is a type a published action targets either, so the same miss on the published
+/// table is what `GetTargetResourceType` refuses with `ValidationException`, and each row
+/// asserts both halves.
 #[tokio::test]
 async fn a_resource_type_the_service_publishes_no_entry_for_is_refused() {
     let router = emulator();
