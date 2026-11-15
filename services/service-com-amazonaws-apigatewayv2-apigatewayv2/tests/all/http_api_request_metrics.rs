@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The CloudWatch series a deployed HTTP api stage publishes about the requests it ANSWERED.
+//! The CloudWatch series a deployed HTTP api stage publishes about the requests its ROUTES
+//! served.
 //!
 //! The rule under test, one level above the recorded case:
 //!
-//! > Every request a deployed HTTP api stage answers is counted in API Gateway's own
+//! > Every request a ROUTE of a deployed HTTP api stage served is counted in API Gateway's own
 //! > `AWS/ApiGateway` namespace: one observation of `Count`, and one of each error counter — `4xx` for the
 //! > client-error class and `5xx` for the server-error class — which is 1 for a request whose
-//! > status is in that class and 0 for one that is not. A request the gateway itself refused
-//! > is a request the stage answered, so a throttled route's `429` and a `404` for a path no
-//! > route matched are counted exactly like a backend's `200`; the status alone decides the
-//! > counter. The series are dimensioned by `ApiId` and by `ApiId` with `Stage`, and a route
-//! > whose serving stage sets `DetailedMetricsEnabled` gets the same observations again under
-//! > its own `Method` and `Resource` dimensions — a stage that asks for nothing publishes the
-//! > stage-level series and no route's.
+//! > status is in that class and 0 for one that is not. The matched route is what attributes a
+//! > request to the stage's series rather than the answer it ended in, so a throttled route's
+//! > `429` is counted exactly like a backend's `200` and the status alone decides the counter —
+//! > while a request NO route of the stage served, which the gateway answers itself out of the
+//! > api's records (a path no route key matches), is counted in none of these series. The series
+//! > are dimensioned by `ApiId` and by `ApiId` with `Stage`, and a route whose serving stage
+//! > sets `DetailedMetricsEnabled` gets the same observations again under its own `Method` and
+//! > `Resource` dimensions — a stage that asks for nothing publishes the stage-level series and
+//! > no route's.
 //!
 //! Only a cross-service suite can pin this: the api, its stage and its route settings are this
 //! service's, the answer a route is served with belongs to a function AWS Lambda holds and
@@ -23,11 +26,12 @@
 //! did not reach that store cannot pass.
 //!
 //! The rows differ along what the rule generalises over: the STATUS CLASS the stage answered
-//! with (a backend's success, a path no route matches, a throttled route, a backend that
-//! produced nothing), how MANY requests were made, which STAGE served them (a named one and
-//! the one that serves the api's root), the ROUTE KEY's shape, and WHERE the detailed-metrics
-//! opt-in is stated (on the route's own settings, on the stage's defaults beside a route that
-//! states only a throttle, nowhere).
+//! with (a backend's success, a throttled route, a backend that produced nothing), how MANY
+//! requests were made, how many of them reached a path NO route matches (none, some beside
+//! routed traffic, only those), which STAGE served them (a named one and the one that serves
+//! the api's root), the ROUTE KEY's shape, and WHERE the detailed-metrics opt-in is stated (on
+//! the route's own settings, on the stage's defaults beside a route that states only a
+//! throttle, nowhere).
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -238,12 +242,19 @@ struct Row {
     /// Where the detailed-metrics opt-in is stated: on the route's own settings, on the
     /// stage's defaults, or nowhere.
     detailed: Detailed,
-    /// The status each request in order is answered with.
+    /// The status each request to the row's own route path, in order, is answered with.
     statuses: &'static [u16],
+    /// Paths within the same stage that NO route of the api matches. Each is requested once,
+    /// is answered by the gateway itself, and is counted in none of the stage's series.
+    unrouted_paths: &'static [&'static str],
     /// The `Method`/`Resource` dimensions of the route series the row expects, or `None` for a
     /// row that expects none at all.
     route_series: Option<(&'static str, &'static str)>,
 }
+
+/// The status an HTTP api's endpoint answers a path no route of the served deployment matches
+/// with: `404`, the answer this data plane gives for a resource it does not have.
+const NO_ROUTE_STATUS: u16 = 404;
 
 /// Where a stage states `DetailedMetricsEnabled`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,7 +267,8 @@ enum Detailed {
     OnTheStageDefaults,
 }
 
-/// The rows: every status class, both stage forms, both places the opt-in can be stated.
+/// The rows: every status class, both stage forms, both places the opt-in can be stated, and
+/// traffic a route served beside traffic no route did.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -269,6 +281,7 @@ fn rows() -> Vec<Row> {
             throttle: None,
             detailed: Detailed::Off,
             statuses: &[200],
+            unrouted_paths: &[],
             route_series: None,
         },
         Row {
@@ -281,18 +294,35 @@ fn rows() -> Vec<Row> {
             throttle: None,
             detailed: Detailed::Off,
             statuses: &[200, 200, 200],
+            unrouted_paths: &[],
             route_series: None,
         },
         Row {
-            case: "a path no route of the api matches, which the gateway answers itself",
+            case: "only paths no route of the api matches, which the gateway answers itself \
+                   and no series counts",
             stage_name: "live",
             route_key: "GET /served",
             verb: "GET",
-            route_path: "/nothing-here",
+            route_path: "/served",
             handler: ECHO_EVENT,
             throttle: None,
             detailed: Detailed::Off,
-            statuses: &[404, 404],
+            statuses: &[],
+            unrouted_paths: &["/nothing-here", "/nothing/here/either", "/served/deeper"],
+            route_series: None,
+        },
+        Row {
+            case: "the recorded shape: requests a route served, beside requests to a path no \
+                   route matches",
+            stage_name: "busy",
+            route_key: "GET /served",
+            verb: "GET",
+            route_path: "/served",
+            handler: ECHO_EVENT,
+            throttle: None,
+            detailed: Detailed::Off,
+            statuses: &[200, 200, 200, 200],
+            unrouted_paths: &["/nothing-here", "/also-nothing"],
             route_series: None,
         },
         Row {
@@ -305,6 +335,7 @@ fn rows() -> Vec<Row> {
             throttle: Some((0.0, 1)),
             detailed: Detailed::Off,
             statuses: &[200, 429, 429, 429],
+            unrouted_paths: &[],
             route_series: None,
         },
         Row {
@@ -317,6 +348,7 @@ fn rows() -> Vec<Row> {
             throttle: None,
             detailed: Detailed::Off,
             statuses: &[500],
+            unrouted_paths: &[],
             route_series: None,
         },
         Row {
@@ -329,6 +361,21 @@ fn rows() -> Vec<Row> {
             throttle: None,
             detailed: Detailed::OnTheRoute,
             statuses: &[200, 200],
+            unrouted_paths: &[],
+            route_series: Some(("GET", "/served")),
+        },
+        Row {
+            case: "a detailed-metrics route served beside a path no route matches, which \
+                   neither series counts",
+            stage_name: "live",
+            route_key: "GET /served",
+            verb: "GET",
+            route_path: "/served",
+            handler: ECHO_EVENT,
+            throttle: None,
+            detailed: Detailed::OnTheRoute,
+            statuses: &[200, 200],
+            unrouted_paths: &["/nothing-here"],
             route_series: Some(("GET", "/served")),
         },
         Row {
@@ -342,6 +389,7 @@ fn rows() -> Vec<Row> {
             throttle: None,
             detailed: Detailed::OnTheStageDefaults,
             statuses: &[200],
+            unrouted_paths: &[],
             route_series: Some(("POST", "/orders/{id}")),
         },
         Row {
@@ -354,6 +402,7 @@ fn rows() -> Vec<Row> {
             throttle: None,
             detailed: Detailed::OnTheRoute,
             statuses: &[200],
+            unrouted_paths: &[],
             route_series: Some(("ANY", "/{proxy+}")),
         },
         Row {
@@ -367,6 +416,7 @@ fn rows() -> Vec<Row> {
             throttle: Some((0.0, 1)),
             detailed: Detailed::OnTheStageDefaults,
             statuses: &[200, 429],
+            unrouted_paths: &[],
             route_series: Some(("GET", "/metered")),
         },
     ]
@@ -402,10 +452,20 @@ fn invoke_path(row: &Row) -> String {
     format!("/{}{}", row.stage_name, row.route_path)
 }
 
-/// Every request a stage answers is counted, its status decides which counter, and the route
-/// series exist exactly for a route the stage asked for them for.
+/// The same addressing for a path WITHIN the row's stage that no route of the api matches, so
+/// the request reaches the stage and is answered by the gateway rather than by a route.
+fn unrouted_path(row: &Row, path: &str) -> String {
+    if row.stage_name == "$default" {
+        return path.to_string();
+    }
+    format!("/{}{}", row.stage_name, path)
+}
+
+/// Every request a route of the stage served is counted, its status decides which counter, a
+/// request no route served is counted nowhere, and the route series exist exactly for a route
+/// the stage asked for them for.
 #[tokio::test]
-async fn every_answered_request_is_counted_in_the_series_its_status_belongs_to() {
+async fn every_routed_request_is_counted_in_the_series_its_status_belongs_to() {
     for row in rows() {
         let case = row.case;
         // One emulator per row, so each row's series hold exactly its own traffic.
@@ -430,6 +490,18 @@ async fn every_answered_request_is_counted_in_the_series_its_status_belongs_to()
                 answered.summary()
             );
         }
+        // The traffic no route of the stage matches: served by the gateway itself, so the
+        // stage answered it and no series of the api counts it.
+        for unrouted in row.unrouted_paths {
+            let path = unrouted_path(&row, unrouted);
+            let answered = send(&router, &host, row.verb, &path, &[]).await;
+            assert_eq!(
+                answered.status, NO_ROUTE_STATUS,
+                "case {case:?}: expected the request at {path:?}, which no route matches, to be \
+                 answered {NO_ROUTE_STATUS}, got {}",
+                answered.summary()
+            );
+        }
 
         let answered = row.statuses.len() as f64;
         let client_errors = row
@@ -443,16 +515,19 @@ async fn every_answered_request_is_counted_in_the_series_its_status_belongs_to()
             .filter(|status| (500..600).contains(*status))
             .count() as f64;
 
-        // The stage-level series: the api alone, and the api with the stage that served.
+        // The stage-level series: the api alone, and the api with the stage that served. A row
+        // whose routed traffic is empty expects NO series at all: nothing the stage routed, so
+        // nothing to publish.
         let api_dimensions = vec![(API_ID, api_id.clone())];
         let stage_dimensions = vec![
             (API_ID, api_id.clone()),
             (STAGE, row.stage_name.to_string()),
         ];
-        let mut expected_dimension_sets: Vec<Vec<(String, String)>> = vec![
-            pairs(&api_dimensions),
-            pairs(&stage_dimensions),
-        ];
+        let mut expected_dimension_sets: Vec<Vec<(String, String)>> = if row.statuses.is_empty() {
+            Vec::new()
+        } else {
+            vec![pairs(&api_dimensions), pairs(&stage_dimensions)]
+        };
         let mut scopes = vec![
             ("the api's own series", api_dimensions),
             ("the stage's series", stage_dimensions.clone()),
@@ -464,7 +539,9 @@ async fn every_answered_request_is_counted_in_the_series_its_status_belongs_to()
                 (METHOD, method.to_string()),
                 (RESOURCE, resource.to_string()),
             ];
-            expected_dimension_sets.push(pairs(&route_dimensions));
+            if !row.statuses.is_empty() {
+                expected_dimension_sets.push(pairs(&route_dimensions));
+            }
             scopes.push(("the route's own series", route_dimensions));
         }
 
@@ -484,8 +561,9 @@ async fn every_answered_request_is_counted_in_the_series_its_status_belongs_to()
             }
         }
 
-        // WHICH series exist: the stage-level ones always, the route's only where the stage
-        // asked for it, and every metric of a request under each.
+        // WHICH series exist: the stage-level ones for a stage whose routes served something,
+        // the route's only where the stage asked for it, every metric of a routed request under
+        // each — and none at all for a stage no route of which served anything.
         let held = series(&router, &api_id).await;
         let mut dimension_sets: Vec<Vec<(String, String)>> =
             held.iter().map(|(_, pairs)| pairs.clone()).collect();
@@ -499,17 +577,21 @@ async fn every_answered_request_is_counted_in_the_series_its_status_belongs_to()
         let mut metrics: Vec<String> = held.iter().map(|(metric, _)| metric.clone()).collect();
         metrics.sort();
         metrics.dedup();
-        let mut expected_metrics = vec![
-            COUNT.to_string(),
-            CLIENT_ERRORS.to_string(),
-            SERVER_ERRORS.to_string(),
-            LATENCY.to_string(),
-            DATA_PROCESSED.to_string(),
-        ];
+        let mut expected_metrics = if row.statuses.is_empty() {
+            Vec::new()
+        } else {
+            vec![
+                COUNT.to_string(),
+                CLIENT_ERRORS.to_string(),
+                SERVER_ERRORS.to_string(),
+                LATENCY.to_string(),
+                DATA_PROCESSED.to_string(),
+            ]
+        };
         expected_metrics.sort();
         assert_eq!(
             metrics, expected_metrics,
-            "case {case:?}: expected every metric of an answered request, got {held:?}"
+            "case {case:?}: expected every metric of a routed request, got {held:?}"
         );
     }
 }

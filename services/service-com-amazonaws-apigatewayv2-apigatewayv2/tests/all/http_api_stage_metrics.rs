@@ -25,8 +25,8 @@
 //!
 //! The rows differ along what the rule generalises over: WHICH series the alarm watches (the
 //! server-error counter, the client-error counter, the request counter), WHAT drives the
-//! traffic into it (an integration that answers a server error, a path no route of the api
-//! matches, plain served requests), whether the alarm's actions are enabled, and whether the
+//! traffic into it (an integration that answers a server error, one that answers a client
+//! error, plain served requests), whether the alarm's actions are enabled, and whether the
 //! traffic breaches at all.
 //!
 //! What a transition then DELIVERS — the notification an enabled alarm publishes to its action
@@ -64,16 +64,19 @@ const SERVER_ERRORS: &str = "5xx";
 /// The stage every case deploys its routes to.
 const STAGE: &str = "live";
 
-/// The two routes the api serves: one the function answers `200` on, one it answers `500` on.
+/// The three routes the api serves: one the function answers `200` on, one it answers `400` on,
+/// one it answers `500` on.
 const OK_ROUTE: &str = "GET /ok";
+const BAD_ROUTE: &str = "GET /bad";
 const BOOM_ROUTE: &str = "GET /boom";
 
-/// The handler behind both routes: the status it answers is decided by the path it was reached
-/// at, so one function serves both the success and the server-error arm.
+/// The handler behind all three routes: the status it answers is decided by the path it was
+/// reached at, so one function serves the success, the client-error and the server-error arm.
 const HANDLER_SOURCE: &str = "import json\n\
                               def lambda_handler(event, context):\n\
                               \x20   path = event.get('rawPath') or ''\n\
-                              \x20   status = 500 if 'boom' in path else 200\n\
+                              \x20   status = 500 if 'boom' in path else (400 if 'bad' in path \
+                              else 200)\n\
                               \x20   return {'statusCode': status,\n\
                               \x20           'headers': {'content-type': 'application/json'},\n\
                               \x20           'body': json.dumps({'path': path})}\n";
@@ -184,7 +187,7 @@ async fn answered(
     (status, parsed)
 }
 
-/// An api whose two routes front one Lambda integration, deployed to a [`STAGE`] stage with
+/// An api whose three routes front one Lambda integration, deployed to a [`STAGE`] stage with
 /// auto-deploy on. Answers `(ApiId, the host its `ApiEndpoint` names)`.
 async fn given_api(emulator: &MultiServiceRouter, case: &str, function: &str) -> (String, String) {
     let (status, api) = control(
@@ -226,7 +229,7 @@ async fn given_api(emulator: &MultiServiceRouter, case: &str, function: &str) ->
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    for route_key in [OK_ROUTE, BOOM_ROUTE] {
+    for route_key in [OK_ROUTE, BAD_ROUTE, BOOM_ROUTE] {
         let (status, route) = control(
             emulator,
             "POST",
@@ -418,10 +421,11 @@ const ROWS: &[Row] = &[
         state: "ALARM",
     },
     Row {
-        case: "an alarm on the client-error counter, breached by a path no route matches",
+        case: "an alarm on the client-error counter, breached by an integration that answers a \
+               client error",
         metric: CLIENT_ERRORS,
-        path: "/nothing-here",
-        status: 404,
+        path: "/bad",
+        status: 400,
         requests: 3,
         actions_enabled: true,
         published: 3.0,

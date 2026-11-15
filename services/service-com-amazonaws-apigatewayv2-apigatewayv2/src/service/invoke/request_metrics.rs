@@ -3,18 +3,26 @@
 //! The CloudWatch series API Gateway publishes about the requests an HTTP api's stage
 //! ANSWERED.
 //!
-//! WHAT IS COUNTED. Every request a deployed stage answered is one observation of
+//! WHAT IS COUNTED. Every request a ROUTE of a deployed stage served is one observation of
 //! [`COUNT_METRIC`], and one observation of each error counter — [`CLIENT_ERROR_METRIC`] for
 //! the 4xx class and [`SERVER_ERROR_METRIC`] for the 5xx class (RFC 9110 §15.5, §15.6) — which
 //! is [`ONE_REQUEST`] for a request whose status is in that class and [`NO_REQUEST`] for one
-//! that is not. Both counters are published for EVERY request, which is what makes the `Sum`
-//! over a span how many requests of that class the span held and the `Average` the share of
-//! them. A request the gateway itself refused is a request the stage answered, so a route the
-//! stage's `RouteSettings` throttled, one an authorizer refused and a path no route matched are
-//! counted the same way as one a backend served — the status alone decides which counter it
-//! lands in. Beside the counters go the two measurements of the same request: how long
-//! answering it took ([`LATENCY_METRIC`]) and how many payload bytes it carried in and out
+//! that is not. Both counters are published for EVERY such request, which is what makes the
+//! `Sum` over a span how many requests of that class the span held and the `Average` the share
+//! of them. The route the stage matched is what attributes a request to the stage's series, not
+//! the answer it ended in: a route the stage's `RouteSettings` throttled, one an authorizer
+//! refused and one whose backend produced nothing were all served BY a route, so they are
+//! counted like one a backend answered and the status alone decides which counter they land in.
+//! Beside the counters go the two measurements of the same request: how long answering it took
+//! ([`LATENCY_METRIC`]) and how many payload bytes it carried in and out
 //! ([`DATA_PROCESSED_METRIC`]).
+//!
+//! WHAT IS NOT COUNTED is a request NO route of the stage served ([`routed`]): a path no route
+//! key matches, a stage the api does not hold, a stage with no deployment released to it, and
+//! an endpoint the api turned off. The gateway answers each of those itself, out of the api's
+//! own records and without selecting a route, so none of them is traffic of a stage's routes
+//! and none of them appears in any of these series — a client reading `Count` reads the
+//! requests the stage routed and no others.
 //!
 //! WHICH DIMENSIONS. The stage-level series first: [`API_ID_DIMENSION`] alone, so a reader
 //! filtering on the api sees its whole traffic, and [`API_ID_DIMENSION`] with
@@ -95,7 +103,8 @@ const MILLIS_PER_SECOND: f64 = 1_000.0;
 ///
 /// Called from the seams that serve this data plane with the ANSWER in hand: which counter a
 /// request lands in and how long answering it took are facts of the answer, so they cannot be
-/// known before it.
+/// known before it. A request no route of a stage served belongs to no series at all
+/// ([`planned`]), so nothing is published for it.
 ///
 /// Nothing here can fail the request: the stage has already answered, so an observation that
 /// could not be stored is reported where a developer can see it and nothing else.
@@ -149,8 +158,10 @@ struct Planned {
 /// which is RELEASED before the datapoints are stored: the metric store belongs to another
 /// service, and no lock of this one is held while that one is written.
 ///
-/// `None` when the request reached no api of this service at all — an endpoint that resolves
-/// to nothing is traffic of no api, so there is no series to count it in.
+/// `None` when the request was served by NO route of this service at all — an endpoint that
+/// resolves to nothing, and every request the gateway answered out of the api's records without
+/// matching a route ([`routed`]) — so there is no stage whose traffic it is and nothing to
+/// count it in.
 fn planned<Eng: Send + Sync + 'static>(
     engine: &Eng,
     req: &RtRequest,
@@ -161,29 +172,18 @@ fn planned<Eng: Send + Sync + 'static>(
     let store = state.lock();
     let resolved = super::resolve(&store, &super::Addressed::of_request(req))?;
     let api = resolved.api;
+    let (stage, route) = routed(api, resolved.invoke_path, req.method())?;
     let mut series = vec![api_series(&api.api_id)];
-    if let Some((stage, route_path)) = super::stage_of(api, resolved.invoke_path) {
-        let mut stage_series = api_series(&api.api_id);
-        stage_series.insert(STAGE_DIMENSION.to_string(), stage.stage_name.clone());
-        series.push(stage_series.clone());
-        // WHICH route answered the request, where one did: the route's own series exist only
-        // for a route the serving stage asks for them for.
-        let answering = stage
-            .deployment_id
-            .as_deref()
-            .and_then(|deployment_id| api.deployments.get(deployment_id))
-            .and_then(|deployment| {
-                super::matching_route(&deployment.configuration.routes, req.method(), &route_path)
-            });
-        let answered_by = answering
-            .filter(|route| metrics::publishes_per_route(stage, &route.route_key));
-        if let Some(route) = answered_by {
-            let (method, resource) = route_dimensions(&route.route_key);
-            let mut route_series = stage_series;
-            route_series.insert(METHOD_DIMENSION.to_string(), method);
-            route_series.insert(RESOURCE_DIMENSION.to_string(), resource);
-            series.push(route_series);
-        }
+    let mut stage_series = api_series(&api.api_id);
+    stage_series.insert(STAGE_DIMENSION.to_string(), stage.stage_name.clone());
+    series.push(stage_series.clone());
+    // The route's OWN series exist only for a route the serving stage asks for them for.
+    if metrics::publishes_per_route(stage, &route.route_key) {
+        let (method, resource) = route_dimensions(&route.route_key);
+        let mut route_series = stage_series;
+        route_series.insert(METHOD_DIMENSION.to_string(), method);
+        route_series.insert(RESOURCE_DIMENSION.to_string(), resource);
+        series.push(route_series);
     }
     Some(Planned {
         api_id: api.api_id.clone(),
@@ -194,6 +194,36 @@ fn planned<Eng: Send + Sync + 'static>(
             request_payload_bytes(req).saturating_add(response_payload_bytes(response)),
         ),
     })
+}
+
+/// The stage of `api` and the ROUTE of it that served a request addressed at `invoke_path`
+/// with `method`, or `None` for a request no route of the api served.
+///
+/// Which route matched is what attributes a request to a stage's series, so it is read the
+/// way the serving itself reads it ([`super::stage_of`], the deployment released to that
+/// stage, and [`super::matching_route`] over the routes that deployment froze) — a stage
+/// pinned to an older deployment therefore meters the routes that deployment holds. Every
+/// answer the gateway produced WITHOUT a route — an endpoint the api turned off
+/// ([`crate::service::data_plane::serves_default_endpoint`]), a path naming no stage of the
+/// api, a stage with no deployment released to it, and a path no route key matches — resolves
+/// to no route here, which is what keeps it out of the series.
+fn routed<'s>(
+    api: &'s crate::state::Api,
+    invoke_path: &str,
+    method: &str,
+) -> Option<(&'s crate::state::Stage, &'s crate::state::Route)> {
+    if !crate::service::data_plane::serves_default_endpoint(api) {
+        return None;
+    }
+    let (stage, route_path) = super::stage_of(api, invoke_path)?;
+    let route = stage
+        .deployment_id
+        .as_deref()
+        .and_then(|deployment_id| api.deployments.get(deployment_id))
+        .and_then(|deployment| {
+            super::matching_route(&deployment.configuration.routes, method, &route_path)
+        })?;
+    Some((stage, route))
 }
 
 /// The dimension set that names the api alone, which every other set of these series extends.

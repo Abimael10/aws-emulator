@@ -4736,3 +4736,4 @@ mod appended_notes;
 //! BLOCK IS THE ONLY PLACE ONE MAY STAND: past it, `//!` is `E0753` and compiles no suite of
 //! this target, so leave no note below — add a declaration, not a note about one.
 //! file — which the layout check refuses. The `#[path]` is what points each module into
+//! in this target.
