@@ -26,7 +26,6 @@
 // the account-visible inventory — who may create a volume from it and the Marketplace codes it
 // is billed through — plus what it refuses. Declared beside `prefix_lists` for the reason the
 // note above gives: the sorted neighbourhood and the tail of this file are where every new ec2
-// suite inserts its lines.
 #[path = "all/snapshot_attributes.rs"]
 mod snapshot_attributes;
 // Which resource ids a tagging call resolves, over the taggable resource kinds beside the
@@ -2379,9 +2378,6 @@ mod id_screening_verdicts;
 // token form, and what it publishes nothing for. Declared at the tail of this file, which is
 #[path = "all/instance_guest_metadata_service.rs"]
 mod instance_guest_metadata_service;
-// Which resource ids a tagging call resolves, over the taggable resource kinds beside the
-// few the other tag suites drive: the write reads back through the resource's own describe
-// and through `DescribeTags`, and an id that names nothing is refused in its kind's words.
 #[path = "all/taggable_resource_kinds.rs"]
 mod taggable_resource_kinds;
 // The code and the sentence this service answers a request the MODEL's own rules refuse: a
@@ -2408,3 +2404,8 @@ mod delete_ipam;
 // anything. Declared at the tail of this file, which is where every new ec2 suite lands.
 #[path = "all/delete_transit_gateway_metering_policy_entry.rs"]
 mod delete_transit_gateway_metering_policy_entry;
+// The per-instance-type rows the catalog publishes for a network optimized compute family —
+// its memory, EBS, network, processor, core-count and host-feature members, beside two sizes
+// of two other compute families — and the whole member set each of them carries. Declared
+#[path = "all/published_network_optimized_compute_catalog_rows.rs"]
+mod published_network_optimized_compute_catalog_rows;

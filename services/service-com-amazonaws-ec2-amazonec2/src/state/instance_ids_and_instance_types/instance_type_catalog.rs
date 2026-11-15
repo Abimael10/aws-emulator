@@ -1197,6 +1197,80 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .traffic_mirroring(true)
         .host_features(false, false)
         .boot_modes(&["legacy-bios"]),
+    // C5n — the C5 family's hardware built for the NETWORK, on the same Intel Xeon Platinum
+    // 8000 series (Skylake) processors at a sustained 3.4 GHz and with no local instance
+    // store at any size. Two columns are the family's own rather than the C5 ladder's: its
+    // memory, 5.25 GiB per two vCPUs (which is not a whole number of GiB per vCPU, so the
+    // smaller sizes are stated in MiB), and its network performance — the four smallest sizes
+    // burst up to 25 Gigabit, the `9xlarge` carries half of the host's 100 and the two
+    // full-size rows carry all of it. Its EBS figures are the family's own rows of "Amazon
+    // EBS optimized instance types": the three smallest sizes publish a baseline they burst
+    // above, up to 4,750 Mbps and 20,000 IOPS, and the bandwidth is dedicated from the
+    // `4xlarge` up. The Elastic Fabric Adapter is offered from the `9xlarge` up ("Elastic
+    // Fabric Adapter"), which is below the size an adapter is first offered at elsewhere in
+    // the catalog. The hibernation prerequisites do not name this family, so NO size of it
+    // hibernates. The published core counts go up in twos from the `xlarge` and start at four
+    // on the `18xlarge`, whose published list begins above that step, while the bare metal
+    // size publishes every count; that size's EBS volumes are attached beside the shared
+    // pool rather than out of it, so it holds the 31 volumes "Instance volume limits"
+    // publishes for a bare metal instance, it is offered the legacy BIOS boot mode alone, it
+    // supports CloudWatch action based recovery — which the sizes with no instance store
+    // already do — and it supports reboot migration, the move to another host being the
+    // HOST's to make and not the hypervisor's that a bare metal instance has none of.
+    PublishedInstanceTypeFacts::of("c5n.large")
+        .memory_mib(5_376)
+        .ebs(650, 4_000, 4_750, 20_000)
+        .network("Up to 25 Gigabit")
+        .processor("Intel", 3.4)
+        .hibernation(false),
+    PublishedInstanceTypeFacts::of("c5n.xlarge")
+        .memory_mib(10_752)
+        .cores_in_steps_of(2)
+        .ebs(1_150, 6_000, 4_750, 20_000)
+        .network("Up to 25 Gigabit")
+        .processor("Intel", 3.4)
+        .hibernation(false),
+    PublishedInstanceTypeFacts::of("c5n.2xlarge")
+        .memory_mib(21_504)
+        .cores_in_steps_of(2)
+        .ebs(2_300, 10_000, 4_750, 20_000)
+        .network("Up to 25 Gigabit")
+        .processor("Intel", 3.4)
+        .hibernation(false),
+    PublishedInstanceTypeFacts::of("c5n.4xlarge")
+        .memory_mib(43_008)
+        .cores_in_steps_of(2)
+        .ebs(4_750, 20_000, 4_750, 20_000)
+        .network("Up to 25 Gigabit")
+        .processor("Intel", 3.4)
+        .hibernation(false),
+    PublishedInstanceTypeFacts::of("c5n.9xlarge")
+        .memory_gib(96)
+        .cores_in_steps_of(2)
+        .ebs(9_500, 40_000, 9_500, 40_000)
+        .network("50 Gigabit")
+        .efa(1)
+        .processor("Intel", 3.4)
+        .hibernation(false),
+    PublishedInstanceTypeFacts::of("c5n.18xlarge")
+        .memory_gib(192)
+        .cores_in_steps_of(2)
+        .cores_from(4)
+        .ebs(19_000, 80_000, 19_000, 80_000)
+        .network("100 Gigabit")
+        .efa(1)
+        .processor("Intel", 3.4)
+        .hibernation(false),
+    PublishedInstanceTypeFacts::of("c5n.metal")
+        .memory_gib(192)
+        .ebs(19_000, 80_000, 19_000, 80_000)
+        .ebs_attachments(31)
+        .network("100 Gigabit")
+        .efa(1)
+        .processor("Intel", 3.4)
+        .auto_recovery(true)
+        .host_features(true, false)
+        .boot_modes(&["legacy-bios"]),
     // C9gd — compute optimized with local NVMe on the newest AWS Graviton hardware. The
     // family's network and EBS bandwidth is CONFIGURABLE: it publishes the bandwidth
     // weightings a launch may ask for, which the families whose split is fixed publish none
