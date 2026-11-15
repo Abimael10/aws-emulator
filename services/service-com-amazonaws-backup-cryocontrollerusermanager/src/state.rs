@@ -1209,6 +1209,26 @@ pub const MESSAGE_TIERING_CONFIGURATION_ALREADY_EXISTS: &str =
 /// ([`ERROR_CODE_VAULT_ALREADY_EXISTS`]).
 pub const ERROR_CODE_TIERING_CONFIGURATION_ALREADY_EXISTS: &str = "ERROR_1C01";
 
+/// The ONE type of resource a tiering configuration's selections may name: "the
+/// type of Amazon Web Services resource; for example, `S3` for Amazon S3. For
+/// tiering configurations, this is currently limited to `S3`" (model doc for
+/// `ResourceSelection$ResourceType`). The member's `@pattern` admits any
+/// resource-type token, so the limit is this service's to apply —
+/// [`unsupported_tiering_resource_type`] is where it is applied.
+pub const TIERING_RESOURCE_TYPE: &str = "S3";
+
+/// The sentence AWS states for "a selection names a type of resource tiering
+/// does not support" — fixed text: it names neither the type submitted nor the
+/// configuration. Its token is
+/// [`ERROR_CODE_TIERING_RESOURCE_TYPE_UNSUPPORTED`].
+pub const MESSAGE_TIERING_RESOURCE_TYPE_UNSUPPORTED: &str =
+    "Tiering configuration is only supported for S3";
+
+/// `Code` for "a selection names a type of resource tiering does not support" —
+/// the condition's own token, stated the same way by every call that stores a
+/// tiering configuration's selections.
+pub const ERROR_CODE_TIERING_RESOURCE_TYPE_UNSUPPORTED: &str = "ERROR_3C05";
+
 /// The FIXED text AWS states for "the vault named carries no resource policy to
 /// report", up to and after the one variable part: the ARN of the vault the
 /// read addressed. Composed by [`vault_access_policy_not_found`], the one place

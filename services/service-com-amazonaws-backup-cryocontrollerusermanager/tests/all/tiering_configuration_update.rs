@@ -9,8 +9,9 @@
 //!   read reports the submitted body;
 //! * the identity the create minted (the name, its ARN and the creation
 //!   instant) survives every update, and the update instant is what the call
-//!   adds: `LastUpdatedTime` is absent until an update has run, then reported by
-//!   the update, the read and the listing alike;
+//!   rewrites: `LastUpdatedTime` is the create's own instant until an update has
+//!   run, then the update's, reported by the update, the read and the listing
+//!   alike;
 //! * a name the account holds no configuration under — one never created, or
 //!   one a delete removed — is the one not-found refusal, so an update never
 //!   stores a configuration;
@@ -35,7 +36,11 @@ use crate::vault_and_backup_job::{call, create_vault, error_code, router, string
 
 /// `PUT /tiering-configurations/{TieringConfigurationName}`, as the model binds
 /// the update: the name is a label, so the body carries only what may change.
-async fn update_tiering(router: &MultiServiceRouter, name: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn update_tiering(
+    router: &MultiServiceRouter,
+    name: &str,
+    body: &Value,
+) -> (u16, Value) {
     call(
         router,
         "PUT",
@@ -47,7 +52,7 @@ async fn update_tiering(router: &MultiServiceRouter, name: &str, body: &Value) -
 
 /// An update body: the vault the configuration applies to and its selections,
 /// the two members `TieringConfigurationInputForUpdate` declares.
-fn update_body(vault: &str, selections: Value) -> Value {
+pub(crate) fn update_body(vault: &str, selections: Value) -> Value {
     json!({
         "TieringConfiguration": {
             "BackupVaultName": vault,
@@ -58,12 +63,12 @@ fn update_body(vault: &str, selections: Value) -> Value {
 
 /// A timestamp member as the wire carries it (epoch seconds, so a NUMBER), or
 /// `Value::Null` when the answer carries none.
-fn instant_at(body: &Value, member: &str) -> Value {
+pub(crate) fn instant_at(body: &Value, member: &str) -> Value {
     body.get(member).cloned().unwrap_or(Value::Null)
 }
 
 /// The stored configuration as the read reports it.
-async fn read_configuration(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
+pub(crate) async fn read_configuration(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
     let (status, read) = get_tiering(router, name).await;
     let configuration = read
         .get("TieringConfiguration")
@@ -73,7 +78,7 @@ async fn read_configuration(router: &MultiServiceRouter, name: &str) -> (u16, Va
 }
 
 /// The listing entry for one name, if the listing reports it.
-async fn listed_entry(router: &MultiServiceRouter, name: &str) -> Option<Value> {
+pub(crate) async fn listed_entry(router: &MultiServiceRouter, name: &str) -> Option<Value> {
     let (_, listed) = list_tiering(router, "").await;
     listed
         .get("TieringConfigurations")
@@ -173,13 +178,14 @@ async fn an_update_replaces_the_stored_body_and_keeps_the_created_identity() {
             "case {case:?}: the create reports when it stored the configuration, got {created:?}"
         );
 
-        // Nothing has updated the configuration yet, so there is no update
-        // instant to report.
+        // No update has rewritten the configuration yet, so the instant it last
+        // changed is the instant the create stored it.
         let (_, before) = read_configuration(&router, name).await;
-        assert!(
-            before.get("LastUpdatedTime").is_none(),
-            "case {case:?}: a configuration no update has rewritten reports no update instant, \
-             got {before:?}"
+        assert_eq!(
+            instant_at(&before, "LastUpdatedTime"),
+            creation_time.clone(),
+            "case {case:?}: a configuration no update has rewritten reports the create's own \
+             instant, got {before:?}"
         );
 
         let (status, updated) = update_tiering(

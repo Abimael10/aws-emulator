@@ -25,7 +25,18 @@
 //!
 //! The selections the request carries are stored as submitted and reported back
 //! by both reads; their modelled constraints — the `TieringDownSettingsInDays`
-//! range among them — are refused before this handler runs.
+//! range among them — are refused before this handler runs. The one constraint
+//! the model states in prose rather than in a trait is the TYPE of resource a
+//! selection may name: tiering is "currently limited to `S3`" (model doc for
+//! `ResourceSelection$ResourceType`), so a body naming any other type is
+//! refused `InvalidParameterValueException`
+//! ([`crate::state::unsupported_tiering_resource_type`]) before the store is
+//! even reached, and nothing is stored for it.
+//!
+//! A stored configuration carries a last-updated instant from the moment this
+//! create stores it — "the date and time a tiering configuration was updated"
+//! (model doc for `TieringConfiguration$LastUpdatedTime`) is the create's own
+//! instant until an update rewrites it.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -164,6 +175,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
+        // The body is judged BEFORE the store is reached and before anything is
+        // stored, so a refused create leaves the account holding no
+        // configuration under the name it asked for and consumes no
+        // idempotency token.
+        if let Some(refusal) =
+            crate::state::unsupported_tiering_resource_type(&input.tiering_configuration.resource_selection)
+        {
+            return Err(
+                CreateTieringConfigurationErrorModeled::InvalidParameterValueException(refusal)
+                    .into(),
+            );
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateTieringConfigurationErrorModeled::ServiceUnavailableException(
                 ServiceUnavailableException {
@@ -228,9 +251,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resource_selection: configuration.resource_selection,
             creator_request_id: input.creator_request_id,
             creation_time: now,
-            // Nothing has updated this configuration yet, so there is no update
-            // instant to report.
-            last_updated_time: None,
+            // Nothing has updated this configuration yet, so the instant it was
+            // last changed is the instant it was stored.
+            last_updated_time: now,
             tags: input
                 .tiering_configuration_tags
                 .unwrap_or_default()

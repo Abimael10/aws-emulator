@@ -107,6 +107,10 @@ mod state_roundtrip;
 mod supported_resource_types;
 #[path = "all/tiering_configuration.rs"]
 mod tiering_configuration;
+#[path = "all/tiering_configuration_resource_type.rs"]
+mod tiering_configuration_resource_type;
+#[path = "all/tiering_configuration_timestamps.rs"]
+mod tiering_configuration_timestamps;
 #[path = "all/tiering_configuration_update.rs"]
 mod tiering_configuration_update;
 #[path = "all/vault_and_backup_job.rs"]
@@ -115,6 +119,8 @@ mod vault_and_backup_job;
 mod vault_default_key_in_kms;
 #[path = "all/vault_access_policy.rs"]
 mod vault_access_policy;
+#[path = "all/vault_access_policy_detach.rs"]
+mod vault_access_policy_detach;
 #[path = "all/vault_lock_refusal_order.rs"]
 mod vault_lock_refusal_order;
 #[path = "all/vault_read_projection.rs"]

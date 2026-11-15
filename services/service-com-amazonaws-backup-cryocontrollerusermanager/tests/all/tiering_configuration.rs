@@ -96,9 +96,20 @@ pub(crate) fn create_body(name: &str, vault: &str, selections: Value) -> Value {
 /// One resource selection: "currently limited to `S3`" is what the model
 /// documents for a tiering configuration's `ResourceType`.
 pub(crate) fn selection(resources: Value, days: i64) -> Value {
+    selection_of_type(resources, days, TIERING_RESOURCE_TYPE)
+}
+
+/// The one `ResourceType` a tiering configuration's selections may name, as
+/// `GetSupportedResourceTypes` spells it: tiering is "currently limited to
+/// `S3`" (model doc for `ResourceSelection$ResourceType`).
+pub(crate) const TIERING_RESOURCE_TYPE: &str = "S3";
+
+/// The same selection with the type spelled out, for a case about the TYPE a
+/// selection names rather than about the resources it selects.
+pub(crate) fn selection_of_type(resources: Value, days: i64, resource_type: &str) -> Value {
     json!({
         "Resources": resources,
-        "ResourceType": "S3",
+        "ResourceType": resource_type,
         "TieringDownSettingsInDays": days,
     })
 }

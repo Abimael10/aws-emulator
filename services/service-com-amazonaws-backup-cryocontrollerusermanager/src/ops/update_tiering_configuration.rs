@@ -22,8 +22,14 @@
 //!   report a created one;
 //! * the identity the create minted (the name, the ARN derived from it and the
 //!   creation instant) survives every update, and the update instant is what
-//!   this call adds — reported here and by both reads
-//!   (`LastUpdatedTime`), which is `None` until an update has run;
+//!   this call rewrites — reported here and by both reads
+//!   (`LastUpdatedTime`), which the create set to its own instant;
+//! * the selections the body carries may only name the one type of resource
+//!   tiering supports — "currently limited to `S3`" (model doc for
+//!   `ResourceSelection$ResourceType`) — so a body naming any other type is
+//!   refused `InvalidParameterValueException`
+//!   ([`crate::state::unsupported_tiering_resource_type`]), the SAME reading the
+//!   create applies, and the stored configuration is left as it was;
 //! * however many updates of one name arrive together, each resolves the store
 //!   under the same lock, so each applies its whole body and the configuration
 //!   the reads report is one submitted body rather than a mixture of several.
@@ -165,7 +171,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `TieringConfiguration` is `@required`, as are its `BackupVaultName`
         // and `ResourceSelection` and each selection's members, and the
         // `TieringDownSettingsInDays` range is modelled, so an absent or
-        // out-of-range body is refused before this handler runs.
+        // out-of-range body is refused before this handler runs. The type of
+        // resource a selection may name is stated in prose rather than in a
+        // trait, so it is read here — before the store is reached, so a refused
+        // update rewrites nothing.
+        if let Some(refusal) = crate::state::unsupported_tiering_resource_type(
+            &input.tiering_configuration.resource_selection,
+        ) {
+            return Err(
+                UpdateTieringConfigurationErrorModeled::InvalidParameterValueException(refusal)
+                    .into(),
+            );
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateTieringConfigurationErrorModeled::ServiceUnavailableException(
                 ServiceUnavailableException {
@@ -191,9 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The create's instant, which an update leaves alone, beside the
             // instant this update stored the new body.
             creation_time: Some(::aws_smithy_types::DateTime::from(record.creation_time)),
-            last_updated_time: record
-                .last_updated_time
-                .map(::aws_smithy_types::DateTime::from),
+            last_updated_time: Some(::aws_smithy_types::DateTime::from(record.last_updated_time)),
         })
     }
 }

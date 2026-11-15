@@ -38,14 +38,14 @@ const POLICY_INVALID: &str =
 
 /// The FIXED text the policy read refuses a vault carrying no policy with: the
 /// vault's own ARN is the one variable part.
-fn no_policy_message(vault: &str) -> String {
+pub(crate) fn no_policy_message(vault: &str) -> String {
     format!("Vault arn:aws:backup:{REGION}:{ACCOUNT}:backup-vault:{vault} has no associated vault policy")
 }
 
 /// `PUT /backup-vaults/{BackupVaultName}/access-policy`, as the model binds the
 /// write. The body is built here rather than by the caller so a case can send a
 /// `Policy` that is not even JSON.
-async fn put_policy(router: &MultiServiceRouter, vault: &str, policy: &str) -> (u16, Value) {
+pub(crate) async fn put_policy(router: &MultiServiceRouter, vault: &str, policy: &str) -> (u16, Value) {
     call(
         router,
         "PUT",
@@ -57,7 +57,7 @@ async fn put_policy(router: &MultiServiceRouter, vault: &str, policy: &str) -> (
 
 /// `GET /backup-vaults/{BackupVaultName}/access-policy`, as the model binds the
 /// read.
-async fn get_policy(router: &MultiServiceRouter, vault: &str) -> (u16, Value) {
+pub(crate) async fn get_policy(router: &MultiServiceRouter, vault: &str) -> (u16, Value) {
     call(
         router,
         "GET",
@@ -69,7 +69,7 @@ async fn get_policy(router: &MultiServiceRouter, vault: &str) -> (u16, Value) {
 
 /// A well-formed resource policy whose statement names `principal` and allows
 /// `action` on this vault's recovery points.
-fn policy_allowing(principal: &str, action: &str) -> String {
+pub(crate) fn policy_allowing(principal: &str, action: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -84,12 +84,12 @@ fn policy_allowing(principal: &str, action: &str) -> String {
 }
 
 /// The ARN of a principal of this account.
-fn principal_arn(name: &str) -> String {
+pub(crate) fn principal_arn(name: &str) -> String {
     format!("arn:aws:iam::{ACCOUNT}:role/{name}")
 }
 
 /// Create the vault every case in this suite attaches a policy to.
-async fn vault_named(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn vault_named(router: &MultiServiceRouter, name: &str) {
     let (status, created) = create_vault(router, name, "{}").await;
     assert_eq!(
         status, 200,

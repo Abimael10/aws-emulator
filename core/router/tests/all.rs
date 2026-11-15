@@ -8,7 +8,6 @@
 // and why it drives the assembled router rather than one service crate, belongs in its OWN
 // module doc, where it is read beside the test it explains, and a note about THIS file
 // belongs in `all/appended_notes.rs`.
-//
 // Every comment here is an ORDINARY comment on purpose: an inner doc comment (`//!`) is
 // legal only before the first item, so a re-typed or merged copy of one past the
 // declarations is `E0753` and compiles no suite of this target at all — and with none in the
@@ -17,13 +16,11 @@
 // `all/all_rs_*` suites, `all/every_suite_file_is_declared.rs` and
 // `all/declaration_roots_are_canonical_and_complete.rs` pin all of it, for this file and for
 // every service crate's `tests/all.rs`, so check there rather than leaving a note here.
-//
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of this
 // file, which the layout check refuses: the `#[path]` above each `mod` is what points it
 // into `tests/all/`.
 // Single integration-test target for the router: the canonical DECLARATION LIST of every
 // cross-service suite under `tests/all/`, and nothing else.
-//
 // Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
 // suite file, sorted by name, and no other line — no prose between the pairs, no blank line,
 // and nothing after the last pair. Two branches landing at once then insert two lines in two
@@ -1826,8 +1823,6 @@ mod zz_probe_whole_emulator;
 // explains; a note about this file itself belongs in `all/appended_notes.rs`.
 // Single integration-test target for the router: the canonical DECLARATION LIST, and
 // nothing else.
-// `tests/all/<name>.rs` and insert its pair where its name sorts to; what that suite covers,
-// and why it drives the assembled router rather than one service crate, belongs in its OWN
 // EVERY comment in this file is an ordinary one, this header included, and that is
 // deliberate: an inner doc comment documents the module it stands in, so the language accepts
 // it only ahead of the first item, and one a landing leaves below the list is `E0753` and
@@ -1844,7 +1839,6 @@ mod zz_probe_whole_emulator;
 // mistype. Put a new suite at `tests/all/<name>.rs` and insert its pair where its name
 // sorts to; what that suite covers, and why it drives the assembled router rather than one
 // service crate, belongs in that suite's own module header, and a note about THIS file
-// belongs in `all/appended_notes.rs`.
 // `E0753` and compiles no suite of this target at all — and with none anywhere in the file,
 // no merge of two landings can leave one there. A suite file no `mod` here names is
 // compiled nowhere and its tests never run, and a second `mod` for one name is `E0428`,
@@ -1995,8 +1989,6 @@ mod zz_probe_whole_emulator;
 // comment (`//!`) is legal only before the first item, so a copy of one appended past the
 // list is `E0753` and compiles no suite of this target at all. With none anywhere in the
 // file there is no such line for a landing to copy.
-// `all/declaration_roots_are_canonical_and_complete.rs` pin all of it, for this file and for
-// every service crate's `tests/all.rs`, so check there rather than leaving a note here.
 // `tests/all.rs` is a test-target CRATE ROOT, where a bare `mod` resolves to a SIBLING
 // (`tests/<name>.rs`) that the layout check refuses: the `#[path]` above each `mod` is what
 // than a build failure.
@@ -2087,3 +2079,17 @@ mod zz_probe_whole_emulator;
 // note about THIS file belongs in `all/appended_notes.rs`, declared below like any other suite.
 // The suites `all/all_rs_carries_no_inner_doc_comment.rs`,
 // `all/every_suite_file_is_declared.rs` check the rules above, for this file and for every
+// Single integration-test target for the router: a canonical declaration list — this
+// header, then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under
+// `tests/all/`, sorted by name, and no other line. Put a new suite at
+// `tests/all/<name>.rs` and insert its pair in the one place its name sorts to; what that
+// belongs in that suite's own module doc, and a note about THIS file belongs in
+// legal only before the first item, so one appended past the declarations compiles no suite
+// of this target at all — and with none in the file, no merge of two landings can leave one
+// there. A suite no `mod` names compiles nowhere and its tests never run, a suite left at
+// the top level of `tests/` fails the build, and a second `mod` for one name is `E0428`.
+// it, which the layout check refuses: the `#[path]` above each `mod` is what points it into
+// `tests/all/`. The `all_rs_*` suites and
+// `all/declaration_roots_are_canonical_and_complete.rs` pin all of it, for this file and
+// rather than a build failure. An inner attribute, like an inner doc comment, is legal only
+// before the first item, so it stands here rather than in the list below.

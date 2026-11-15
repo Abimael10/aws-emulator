@@ -23,15 +23,22 @@
 //!   addresses — the vault it applies to and its selections — and records the
 //!   instant it did ([`TieringConfigurationRecord::apply_update`]); the name,
 //!   the ARN and the creation instant are the resource's identity and an update
-//!   never changes them.
+//!   never changes them;
+//! * a configuration carries a LAST-UPDATED instant from the moment it is
+//!   stored — the create's own instant until an update rewrites it — so both
+//!   reads report one for every stored configuration;
+//! * the selections a create or an update carries may only name the one type of
+//!   resource tiering supports ([`super::TIERING_RESOURCE_TYPE`]), and a body
+//!   naming any other is refused as a bad parameter value
+//!   ([`unsupported_tiering_resource_type`]) before anything is stored.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use super::ComAmazonawsBackupCryocontrollerusermanagerState;
 use crate::ops::types::{
-    ResourceSelection, TieringConfiguration, TieringConfigurationInputForUpdate,
-    TieringConfigurationsListMember,
+    InvalidParameterValueException, ResourceSelection, TieringConfiguration,
+    TieringConfigurationInputForUpdate, TieringConfigurationsListMember,
 };
 
 /// The most tiering configurations this emulator keeps.
@@ -58,8 +65,9 @@ pub struct TieringConfigurationRecord {
     pub resource_selection: Vec<ResourceSelection>,
     pub creator_request_id: Option<String>,
     pub creation_time: SystemTime,
-    /// When an update last rewrote this configuration; `None` until one has.
-    pub last_updated_time: Option<SystemTime>,
+    /// When this configuration last changed: the instant the create stored it
+    /// until an update rewrites it.
+    pub last_updated_time: SystemTime,
     pub tags: BTreeMap<String, String>,
 }
 
@@ -75,9 +83,7 @@ impl TieringConfigurationRecord {
             resource_selection: self.resource_selection.clone(),
             creator_request_id: self.creator_request_id.clone(),
             creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
-            last_updated_time: self
-                .last_updated_time
-                .map(::aws_smithy_types::DateTime::from),
+            last_updated_time: Some(::aws_smithy_types::DateTime::from(self.last_updated_time)),
         }
     }
 
@@ -93,7 +99,7 @@ impl TieringConfigurationRecord {
     pub fn apply_update(&mut self, body: TieringConfigurationInputForUpdate, now: SystemTime) {
         self.backup_vault_name = body.backup_vault_name;
         self.resource_selection = body.resource_selection;
-        self.last_updated_time = Some(now);
+        self.last_updated_time = now;
     }
 
     /// The same configuration as the LISTING reports it: the summary members
@@ -105,11 +111,31 @@ impl TieringConfigurationRecord {
             tiering_configuration_name: Some(self.name.clone()),
             backup_vault_name: Some(self.backup_vault_name.clone()),
             creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
-            last_updated_time: self
-                .last_updated_time
-                .map(::aws_smithy_types::DateTime::from),
+            last_updated_time: Some(::aws_smithy_types::DateTime::from(self.last_updated_time)),
         }
     }
+}
+
+/// The modelled refusal for a tiering body whose selections name a type of
+/// resource tiering does not support, or `None` when every selection names the
+/// one it does ([`super::TIERING_RESOURCE_TYPE`]).
+///
+/// The ONE reading of a submitted body's resource types, shared by the create
+/// and the update, so neither can store a configuration over resources the
+/// other would refuse. The sentence belongs to the condition, so it names
+/// neither the type submitted nor the configuration
+/// ([`super::MESSAGE_TIERING_RESOURCE_TYPE_UNSUPPORTED`]).
+pub fn unsupported_tiering_resource_type(
+    resource_selection: &[ResourceSelection],
+) -> Option<InvalidParameterValueException> {
+    resource_selection
+        .iter()
+        .any(|selection| selection.resource_type != super::TIERING_RESOURCE_TYPE)
+        .then(|| InvalidParameterValueException {
+            code: Some(super::ERROR_CODE_TIERING_RESOURCE_TYPE_UNSUPPORTED.to_string()),
+            message: Some(super::MESSAGE_TIERING_RESOURCE_TYPE_UNSUPPORTED.to_string()),
+            ..Default::default()
+        })
 }
 
 impl ComAmazonawsBackupCryocontrollerusermanagerState {
