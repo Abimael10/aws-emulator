@@ -864,7 +864,13 @@ async fn a_node_handler_cannot_reach_the_host() {
         ),
         ("a child process", "require('child_process')"),
         ("a socket", "require('net')"),
-        ("an http client", "require('http')"),
+        // The HTTP client the runtime does supply reaches only this emulator: a request to
+        // an address off it is one the host does not make, so the handler fails on it.
+        (
+            "an address off this emulator",
+            "new Promise((ok, no) => { const sent = require('https').get(\
+             'https://example.test/anything', ok); sent.on('error', no); })",
+        ),
         ("a native binding", "process.binding('fs')"),
         ("a host path", "require('/etc/passwd')"),
         ("a path above the task root", "require('../../../etc/passwd')"),

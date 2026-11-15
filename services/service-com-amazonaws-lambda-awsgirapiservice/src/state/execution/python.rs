@@ -1589,7 +1589,13 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
                 return Err(vm.new_runtime_error(Stop::Deadline.reason().to_owned()));
             }
             let answered = access.send(&method, &url, &headers, &body, remaining);
-            Ok(vm.ctx.new_str(request_answer(&answered)).into())
+            // What one request came to is the same document for every runtime's own HTTP
+            // client ([`super::guest_http::answer_document`]), which this module's
+            // `http.client` reads.
+            Ok(vm
+                .ctx
+                .new_str(super::guest_http::answer_document(&answered))
+                .into())
         },
     );
     // The URL a handler asks the SDK to PRESIGN. Nothing is sent, so this spends neither
@@ -1723,25 +1729,6 @@ fn refusal_answer_for(refused: &Refusal) -> String {
             ),
         ),
         Refusal::NotMade(detail) => refusal_answer("not_made", detail),
-    }
-}
-
-/// What the guest reads back from one request it sent itself: the service's own status,
-/// headers and body, or the reason no request was made.
-fn request_answer(answered: &Result<super::guest_http::Answered, Refusal>) -> String {
-    use ::base64::Engine;
-
-    match answered {
-        Ok(answer) => ::serde_json::json!({
-            "status": answer.status,
-            "reason": ::http::StatusCode::from_u16(answer.status)
-                .ok()
-                .and_then(|status| status.canonical_reason()),
-            "headers": answer.headers,
-            "body": ::base64::engine::general_purpose::STANDARD.encode(&answer.body),
-        })
-        .to_string(),
-        Err(refused) => refusal_answer_for(refused),
     }
 }
 

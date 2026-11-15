@@ -56,6 +56,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     var hostHkdf = globalThis.__hostHkdf;
     var hostRandomHex = globalThis.__hostRandomHex;
     var hostAwsCall = globalThis.__hostAwsCall;
+    var hostHttpSend = globalThis.__hostHttpSend;
     var hostCompileScript = globalThis.__hostCompileScript;
     var hostZoneOffsetMs = globalThis.__hostZoneOffsetMs;
     var hostEncode = globalThis.__hostEncode;
@@ -72,6 +73,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     delete globalThis.__hostHkdf;
     delete globalThis.__hostRandomHex;
     delete globalThis.__hostAwsCall;
+    delete globalThis.__hostHttpSend;
     delete globalThis.__hostCompileScript;
     delete globalThis.__hostZoneOffsetMs;
     delete globalThis.__hostEncode;
@@ -1786,6 +1788,11 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         // services are reachable, signs the request and dispatches it.
         awsCall: function (service, operation, region, body) {
             return hostAwsCall(service, operation, region, body);
+        },
+        // The ONE request the `http` and `https` core modules send: the host decides which
+        // addresses are reachable, signs the request and dispatches it.
+        httpSend: function (method, url, headers, body) {
+            return hostHttpSend(method, url, headers, body);
         },
         // The offset of a named time zone at an instant, which `Intl` and the local reading
         // of `Date` stand on.

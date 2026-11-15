@@ -435,6 +435,8 @@ mod node_handler_crypto_surface;
 mod node_handler_kms_envelope;
 #[path = "all/node_handler_error_wording.rs"]
 mod node_handler_error_wording;
+#[path = "all/node_handler_http_client.rs"]
+mod node_handler_http_client;
 #[path = "all/node_handler_sdk_aggregated_client.rs"]
 mod node_handler_sdk_aggregated_client;
 #[path = "all/node_handler_sdk_esm.rs"]

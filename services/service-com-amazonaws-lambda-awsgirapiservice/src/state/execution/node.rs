@@ -632,7 +632,11 @@ fn install_host(
     // how long one may take — are held here, where no guest code can reach them.
     let access = aws.cloned();
     let call_bounds = Arc::clone(bounds);
-    let made = AtomicU64::new(0);
+    // How many calls this run has made, shared by the two seams a call can be made on: the
+    // bound is on the RUN's calls into this emulator, so a request sent by hand spends the
+    // same count an SDK call does.
+    let made = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&made);
     globals
         .set(
             "__hostAwsCall",
@@ -644,7 +648,7 @@ fn install_host(
                     if call_bounds.stopped().is_some() {
                         return refusal_answer("not_made", "the run's budget is spent");
                     }
-                    if made.fetch_add(1, Ordering::Relaxed) >= MAX_CALLS_PER_RUN as u64 {
+                    if counted.fetch_add(1, Ordering::Relaxed) >= MAX_CALLS_PER_RUN as u64 {
                         return refusal_answer(
                             "not_made",
                             &format!(
@@ -668,6 +672,56 @@ fn install_host(
             ),
         )
         .map_err(|error| format!("the AWS SDK seam could not be installed: {error}"))?;
+    // The ONE request a handler SENDS ITSELF, which is what the `http` and `https` core
+    // modules are served by: a handler answering a callback URL or reaching a resource's own
+    // endpoint builds the request with them. The addresses a URL may name, the signature and
+    // the destination are all [`super::guest_http`]'s; the two bounds that are this run's —
+    // the call count it shares with the SDK seam above and how long one request may take —
+    // are held here, where no guest code can reach them.
+    let sending = aws.cloned();
+    let send_bounds = Arc::clone(bounds);
+    let sent = Arc::clone(&made);
+    globals
+        .set(
+            "__hostHttpSend",
+            Func::from(
+                move |method: String, url: String, headers: String, body: String| {
+                    // Every answer this seam gives is the ONE document a runtime's HTTP
+                    // client reads ([`super::guest_http::answer_document`]), including the
+                    // reason a request was not made at all.
+                    let not_made =
+                        |detail: String| super::guest_http::answer_document(&Err(Refusal::NotMade(detail)));
+                    if send_bounds.stopped().is_some() {
+                        return not_made("the run's budget is spent".to_string());
+                    }
+                    if sent.fetch_add(1, Ordering::Relaxed) >= MAX_CALLS_PER_RUN as u64 {
+                        return not_made(format!(
+                            "one invocation may make at most {MAX_CALLS_PER_RUN} calls into this \
+                             emulator"
+                        ));
+                    }
+                    let Some(access) = sending.as_ref() else {
+                        return not_made(
+                            "this invocation was given no seam to send a request on, so none was \
+                             sent"
+                                .to_string(),
+                        );
+                    };
+                    let remaining = send_bounds.remaining();
+                    if remaining.is_zero() {
+                        return super::guest_http::answer_document(&Err(Refusal::TimedOut));
+                    }
+                    super::guest_http::answer_document(&access.send(
+                        &method,
+                        &url,
+                        &headers,
+                        &body,
+                        remaining,
+                    ))
+                },
+            ),
+        )
+        .map_err(|error| format!("the HTTP seam could not be installed: {error}"))?;
     Ok(())
 }
 
@@ -2152,6 +2206,18 @@ mod tests {
                 "require('url').fileURLToPath('file:///var/task/index.mjs')",
                 r#""/var/task/index.mjs""#,
             ),
+            // The two spellings of the ONE HTTP client: what a request that states no
+            // protocol of its own is sent under is the only thing they differ in.
+            (
+                "http",
+                "require('node:http').request({ hostname: 'example.test', path: '/x' }).protocol",
+                r#""http:""#,
+            ),
+            (
+                "https",
+                "require('https').request({ hostname: 'example.test', path: '/x' }).protocol",
+                r#""https:""#,
+            ),
         ];
         for (case, expression, expected) in cases {
             let source =
@@ -2167,6 +2233,40 @@ mod tests {
                 "case {case}: expected {wanted}, got {actual}"
             );
         }
+    }
+
+    /// A request a handler sends where there is no seam to send one on is reported to that
+    /// handler as a request that was NOT MADE — the failure a node program reads off its own
+    /// request — rather than as an answer nothing ever sent.
+    #[test]
+    fn the_http_client_reports_a_request_no_seam_carried() {
+        let finished = ran(
+            "exports.handler = async () => new Promise((resolve) => {\n\
+             const sent = require('https').request(\n\
+                 { hostname: 's3.us-east-1.amazonaws.com', path: '/b/k', method: 'PUT' },\n\
+                 (answer) => resolve({ status: answer.statusCode })\n\
+             );\n\
+             sent.on('error', (error) => resolve({ failed: error.message, code: error.code }));\n\
+             sent.write('the bytes');\n\
+             sent.end();\n\
+             });",
+            "index.handler",
+            None,
+        );
+        let actual = returned(&finished, "a request with no seam to carry it");
+        assert_eq!(
+            actual.get("status"),
+            None,
+            "a request nothing carried answers no status, got {actual}"
+        );
+        let failed = actual
+            .get("failed")
+            .and_then(::serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            failed.contains("no seam"),
+            "expected the reason the request was not made, got {actual}"
+        );
     }
 
     /// `timers/promises` really waits and then settles, which is what a handler awaiting it

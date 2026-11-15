@@ -23,6 +23,8 @@ mod buffer;
 mod crypto;
 /// The in-memory filesystem a function has.
 mod fs;
+/// The HTTP client a handler sends a request of its own with.
+mod http;
 /// The stream object model and the text decoder over it.
 mod streams;
 /// The environment report, the assertions, and the two text codecs.
@@ -45,6 +47,11 @@ pub(super) const CORE_MODULES: &[(&str, &str)] = &[
     ("stream/promises", streams::STREAM_PROMISES_SOURCE),
     ("string_decoder", streams::STRING_DECODER_SOURCE),
     ("os", system::OS_SOURCE),
+    // `http` and `https` are ONE client, under each of the two schemes it is imported for
+    // ([`http`]): what a request that states no protocol of its own is sent under is the
+    // only thing the two modules differ in.
+    ("http", http::HTTP_SOURCE),
+    ("https", http::HTTP_SOURCE),
     ("assert", system::ASSERT_SOURCE),
     ("assert/strict", system::ASSERT_SOURCE),
     ("querystring", system::QUERYSTRING_SOURCE),

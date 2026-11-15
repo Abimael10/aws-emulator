@@ -406,6 +406,60 @@ async fn dispatch(
     })
 }
 
+/// What a guest reads back from ONE request it sent itself: the emulated service's own
+/// status, reason, headers and body, or the reason no request was made.
+///
+/// ONE document, read by the HTTP client of every runtime this emulator runs a handler in
+/// ([`HTTP_CLIENT_SOURCE`] for a Python handler, [`super::node`]'s `http` core module for a
+/// node one), because what a request came to does not depend on the language that sent it.
+/// The body travels base64-encoded, because the answer is bytes and this document is JSON.
+#[must_use]
+pub fn answer_document(answered: &Result<Answered, Refusal>) -> String {
+    use ::base64::Engine;
+
+    match answered {
+        Ok(answer) => ::serde_json::json!({
+            "status": answer.status,
+            "reason": ::http::StatusCode::from_u16(answer.status)
+                .ok()
+                .and_then(|status| status.canonical_reason()),
+            "headers": answer.headers,
+            "body": ::base64::engine::general_purpose::STANDARD.encode(&answer.body),
+        })
+        .to_string(),
+        Err(refused) => refusal_document(refused),
+    }
+}
+
+/// The same document for a request that was NOT made, naming which refusal it was: the
+/// client of each runtime turns it into that language's own failure, so nothing a request
+/// never made is reported as an answer.
+fn refusal_document(refused: &Refusal) -> String {
+    let stated = |refused: &str, detail: String| {
+        ::serde_json::json!({ "refused": refused, "detail": detail }).to_string()
+    };
+    match refused {
+        Refusal::UnknownService => stated(
+            "unknown_service",
+            super::aws_api::reachable_services().join(", "),
+        ),
+        Refusal::UnknownOperation => stated("unknown_operation", String::new()),
+        Refusal::TimedOut => stated("timed_out", String::new()),
+        Refusal::RequestTooLarge => stated(
+            "not_made",
+            format!("the request is larger than the {MAX_REQUEST_BYTES} bytes one request may carry"),
+        ),
+        Refusal::ResponseTooLarge => stated(
+            "not_made",
+            format!(
+                "the answer is larger than the {MAX_RESPONSE_BYTES} bytes one request may read \
+                 back"
+            ),
+        ),
+        Refusal::NotMade(detail) => stated("not_made", detail.clone()),
+    }
+}
+
 /// The modules of the standard library this RUNTIME supplies in place of the frozen ones:
 /// the socket module a Python program expects its operating system to have, the HTTP
 /// client that is built on one, and the TLS layer a program imports beside them

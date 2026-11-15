@@ -18,9 +18,10 @@
 //! the `ResponseURL`, which is what makes the row about the provider rather than about the
 //! plane.
 //!
-//! The rows differ along what the rule generalises over: how the function's own code answers
-//! (the standard library's HTTP client, and the response module CloudFormation supplies),
-//! and what it answers with (a minted physical resource id, and `Data` a template reads).
+//! The rows differ along what the rule generalises over: the RUNTIME the provider is written
+//! for, how the function's own code answers (the standard library's HTTP client of each of
+//! them, and the response module CloudFormation supplies to inline Python), and what it
+//! answers with (a minted physical resource id, and `Data` a template reads).
 
 use std::collections::BTreeMap;
 
@@ -79,6 +80,105 @@ def handler(event, context):
     )
 "#;
 
+/// A provider written for a NODE runtime, answering with that runtime's own HTTP client —
+/// the shape every provider of the CDK's own custom resources answers in: the callback URL
+/// the request carried is parsed into the options of one `PUT`, the response document is
+/// written to it, and the request is ended.
+const ANSWERS_WITH_THE_NODE_CLIENT: &str = r#"
+'use strict';
+
+const https = require('https');
+const url = require('url');
+
+exports.handler = async (event) => new Promise((resolve, reject) => {
+    const document = JSON.stringify({
+        Status: 'SUCCESS',
+        PhysicalResourceId: 'probe-' + event.LogicalResourceId,
+        StackId: event.StackId,
+        RequestId: event.RequestId,
+        LogicalResourceId: event.LogicalResourceId,
+        Data: { Echo: (event.ResourceProperties || {}).Marker || '' },
+    });
+    const parsed = url.parse(event.ResponseURL);
+    const answering = https.request({
+        hostname: parsed.hostname,
+        port: parsed.port,
+        path: parsed.path,
+        method: 'PUT',
+        headers: {
+            'content-type': '',
+            'content-length': Buffer.byteLength(document, 'utf8'),
+        },
+    }, () => resolve({}));
+    answering.on('error', reject);
+    answering.write(document);
+    answering.end();
+});
+"#;
+
+/// The same provider, sending its answer the way the CDK's provider framework does: one
+/// function that sends the document, wrapped in a retry of its own, and an address the
+/// options name without a port — so the answer goes to the scheme's own.
+const ANSWERS_WITH_A_RETRYING_NODE_CLIENT: &str = r#"
+'use strict';
+
+const https = require('https');
+const url = require('url');
+
+function sendHttpRequest(options, document) {
+    return new Promise((resolve, reject) => {
+        try {
+            const request = https.request(options, () => resolve());
+            request.on('error', reject);
+            request.write(document);
+            request.end();
+        } catch (error) {
+            reject(error);
+        }
+    });
+}
+
+function withRetries(attempts, sleep, send) {
+    return async (...args) => {
+        let left = attempts;
+        let delay = sleep;
+        while (true) {
+            try {
+                return await send(...args);
+            } catch (error) {
+                if (left-- <= 0) {
+                    throw error;
+                }
+                await new Promise((ok) => setTimeout(ok, delay));
+                delay *= 2;
+            }
+        }
+    };
+}
+
+exports.handler = async (event) => {
+    const document = JSON.stringify({
+        Status: 'SUCCESS',
+        PhysicalResourceId: 'probe-' + event.LogicalResourceId,
+        StackId: event.StackId,
+        RequestId: event.RequestId,
+        LogicalResourceId: event.LogicalResourceId,
+        Data: { Echo: (event.ResourceProperties || {}).Marker || '' },
+    });
+    const parsed = url.parse(event.ResponseURL);
+    await withRetries(3, 10, sendHttpRequest)({
+        hostname: parsed.hostname,
+        path: parsed.path,
+        method: 'PUT',
+        headers: {
+            'content-type': '',
+            'content-length': Buffer.byteLength(document, 'utf8'),
+        },
+    }, document);
+    return {};
+};
+"#;
+
 /// One row: the function's own code, and the runtime it is declared with.
 struct Row {
     case: &'static str,
@@ -112,6 +212,26 @@ fn rows() -> Vec<Row> {
             source: ANSWERS_WITH_THE_RESPONSE_MODULE,
             runtime: "python3.11",
             marker: "v2",
+        },
+        // A provider written for a NODE runtime: what ends a custom resource's wait is the
+        // provider's answer, whatever language the provider is written in, so the same rule
+        // holds for the runtime every CDK-synthesised provider is declared with.
+        Row {
+            case: "a provider answering with the node runtime's HTTP client",
+            stack_name: "lambda-custom-node-https",
+            source: ANSWERS_WITH_THE_NODE_CLIENT,
+            runtime: "nodejs20.x",
+            marker: "answered by node",
+        },
+        // The same client on another node release line, sending its answer the way the CDK's
+        // provider framework does: the client travels with every package of that family, not
+        // with one release or one shape of code.
+        Row {
+            case: "the node client on another node runtime, behind a retry of its own",
+            stack_name: "lambda-custom-node-https-18",
+            source: ANSWERS_WITH_A_RETRYING_NODE_CLIENT,
+            runtime: "nodejs18.x",
+            marker: "v3",
         },
     ]
 }
