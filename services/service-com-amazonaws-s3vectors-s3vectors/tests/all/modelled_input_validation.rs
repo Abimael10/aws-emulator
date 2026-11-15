@@ -13,7 +13,9 @@
 //!    envelope `<n> validation error(s) detected. ` over one clause per violated
 //!    member, `Value at '<json pointer>' failed to satisfy constraint: <requirement>`,
 //!    and a `fieldList` entry per violated member carrying that member's pointer and
-//!    its own clause. The requirement names the modelled constraint and BOTH its
+//!    its own clause. A `@length` clause states the LENGTH the check counted in front of
+//!    the member (`Value with length <n> at '<json pointer>' …`). The requirement names
+//!    the modelled constraint and BOTH its
 //!    declared bounds where the member declares two; the rejected value is never
 //!    quoted. The rows differ in the constraint class (`@range`, `@length`, `@enum`,
 //!    `@required`), in which operation and member carries it, in the depth the member
@@ -57,6 +59,17 @@ const BAD_REQUEST: u16 = 400;
 const QUERY_VECTOR_SENTENCE: &str =
     "Query vector contains invalid values or is invalid for this index";
 
+/// The `fieldList` path that entry names the vector by — the service's own field name for
+/// the vector it was handed, not the wire member it travelled in — and the prefix its
+/// sentence carries. Literals, for the same reason.
+const QUERY_VECTOR_FIELD: &str = "vector";
+
+/// The sentence a `fieldList` entry carries about one input the validation layer behind
+/// the API was handed: the defect, under that layer's prefix.
+fn invalid_input(defect: &str) -> String {
+    format!("Invalid input: {defect}")
+}
+
 /// A `CreateIndex` request body for `index` in `bucket`, inside every modelled bound.
 fn create_index_request(bucket: &str, index: &str) -> Value {
     json!({
@@ -86,14 +99,22 @@ fn clause(pointer: &str, requirement: &str) -> String {
     format!("Value at '{pointer}' failed to satisfy constraint: {requirement}")
 }
 
+/// The clause this service states for a `@length` violation at `pointer`: the length the
+/// check counted stands in front of the member.
+fn length_clause(pointer: &str, length: usize, requirement: &str) -> String {
+    format!("Value with length {length} at '{pointer}' failed to satisfy constraint: {requirement}")
+}
+
 /// One row of the modelled-constraint table: the request, the member the refusal must
-/// name by its JSON pointer, and the requirement that member had to satisfy.
+/// name by its JSON pointer, the requirement that member had to satisfy, and the length
+/// the clause states where the constraint is a `@length`.
 struct Refused {
     case: &'static str,
     operation: &'static str,
     request: Value,
     pointer: &'static str,
     requirement: String,
+    length: Option<usize>,
 }
 
 /// Every modelled constraint of this service is refused with the service's own clause,
@@ -125,6 +146,7 @@ async fn a_value_outside_a_modelled_constraint_is_refused_with_the_services_clau
             },
             pointer: "/dimension",
             requirement: dimension.clone(),
+            length: None,
         },
         Refused {
             case: "a dimension one above the modelled ceiling",
@@ -136,6 +158,7 @@ async fn a_value_outside_a_modelled_constraint_is_refused_with_the_services_clau
             },
             pointer: "/dimension",
             requirement: dimension.clone(),
+            length: None,
         },
         Refused {
             case: "a dimension below the modelled floor",
@@ -147,6 +170,7 @@ async fn a_value_outside_a_modelled_constraint_is_refused_with_the_services_clau
             },
             pointer: "/dimension",
             requirement: dimension.clone(),
+            length: None,
         },
         Refused {
             case: "a page size above the ceiling of a bucket listing",
@@ -154,6 +178,7 @@ async fn a_value_outside_a_modelled_constraint_is_refused_with_the_services_clau
             request: json!({ "maxResults": 501 }),
             pointer: "/maxResults",
             requirement: page(500),
+            length: None,
         },
         Refused {
             case: "a page size below the floor of a bucket listing",
@@ -161,6 +186,7 @@ async fn a_value_outside_a_modelled_constraint_is_refused_with_the_services_clau
             request: json!({ "maxResults": 0 }),
             pointer: "/maxResults",
             requirement: page(500),
+            length: None,
         },
         Refused {
             case: "a page size above the ceiling of an index listing",
@@ -168,6 +194,7 @@ async fn a_value_outside_a_modelled_constraint_is_refused_with_the_services_clau
             request: json!({ "vectorBucketName": bucket, "maxResults": 501 }),
             pointer: "/maxResults",
             requirement: page(500),
+            length: None,
         },
         Refused {
             case: "a page size above the ceiling of a vector listing, which is its own",
@@ -179,6 +206,7 @@ async fn a_value_outside_a_modelled_constraint_is_refused_with_the_services_clau
             }),
             pointer: "/maxResults",
             requirement: page(1000),
+            length: None,
         },
         Refused {
             case: "a segment count above its ceiling",
@@ -190,6 +218,7 @@ async fn a_value_outside_a_modelled_constraint_is_refused_with_the_services_clau
             }),
             pointer: "/segmentCount",
             requirement: "Member must be between 1 and 16, inclusive".to_string(),
+            length: None,
         },
         Refused {
             case: "a segment index above its ceiling, whose floor is zero",
@@ -202,6 +231,7 @@ async fn a_value_outside_a_modelled_constraint_is_refused_with_the_services_clau
             }),
             pointer: "/segmentIndex",
             requirement: "Member must be between 0 and 15, inclusive".to_string(),
+            length: None,
         },
         Refused {
             // `topK` declares a floor and no ceiling, so there is no pair to state.
@@ -215,6 +245,7 @@ async fn a_value_outside_a_modelled_constraint_is_refused_with_the_services_clau
             }),
             pointer: "/topK",
             requirement: "Member must be greater than or equal to 1".to_string(),
+            length: None,
         },
         Refused {
             case: "a vector bucket name longer than the modelled length",
@@ -222,6 +253,8 @@ async fn a_value_outside_a_modelled_constraint_is_refused_with_the_services_clau
             request: json!({ "vectorBucketName": long_name }),
             pointer: "/vectorBucketName",
             requirement: name_length.clone(),
+            // The length of the name the row submits, which is what the clause states.
+            length: Some(long_name.chars().count()),
         },
         Refused {
             case: "an index name shorter than the modelled length",
@@ -233,6 +266,7 @@ async fn a_value_outside_a_modelled_constraint_is_refused_with_the_services_clau
             },
             pointer: "/indexName",
             requirement: name_length.clone(),
+            length: Some(2),
         },
         Refused {
             case: "a required member the request leaves out",
@@ -245,6 +279,7 @@ async fn a_value_outside_a_modelled_constraint_is_refused_with_the_services_clau
             }),
             pointer: "/dimension",
             requirement: "Member must not be null".to_string(),
+            length: None,
         },
         Refused {
             case: "a value outside an enumerated member's value set",
@@ -258,6 +293,7 @@ async fn a_value_outside_a_modelled_constraint_is_refused_with_the_services_clau
             // The value set in the order the model declares it
             // (`smithy_query(query="shape", shape="DistanceMetric")`).
             requirement: "Member must satisfy enum value set: [euclidean, cosine]".to_string(),
+            length: None,
         },
         Refused {
             // Nested one level down: the pointer walks into the structure.
@@ -271,6 +307,7 @@ async fn a_value_outside_a_modelled_constraint_is_refused_with_the_services_clau
             pointer: "/encryptionConfiguration/sseType",
             // `smithy_query(query="shape", shape="SseType")`.
             requirement: "Member must satisfy enum value set: [AES256, aws:kms]".to_string(),
+            length: None,
         },
         Refused {
             // The constraint is on the LIST itself, so the pointer names the list.
@@ -283,6 +320,9 @@ async fn a_value_outside_a_modelled_constraint_is_refused_with_the_services_clau
             }),
             pointer: "/vectors",
             requirement: "Member must have length between 1 and 500, inclusive".to_string(),
+            // `@length` on a LIST counts its elements, so the clause states the number of
+            // records the batch carried.
+            length: Some(0),
         },
     ];
 
@@ -294,7 +334,10 @@ async fn a_value_outside_a_modelled_constraint_is_refused_with_the_services_clau
             Some(&row.request),
         )
         .await;
-        let expected = clause(row.pointer, &row.requirement);
+        let expected = match row.length {
+            Some(length) => length_clause(row.pointer, length, &row.requirement),
+            None => clause(row.pointer, &row.requirement),
+        };
         assert_eq!(
             (status, error_code(&body).as_str(), errortype.as_deref()),
             (BAD_REQUEST, VALIDATION_EXCEPTION, Some(VALIDATION_EXCEPTION)),
@@ -323,6 +366,10 @@ async fn a_value_outside_a_modelled_constraint_is_refused_with_the_services_clau
 /// `fieldList` naming the member by its JSON pointer — so the rule is one refusal across
 /// the whole service rather than one per operation, whichever request form carries the
 /// member.
+///
+/// The one member an operation states its OWN sentence for — `QueryVectors$queryVector` —
+/// is covered in `tests/all/read_path_refusal_contract.rs` instead, which is where that
+/// sentence is pinned.
 #[tokio::test]
 async fn every_operation_states_an_absent_required_member_the_same_way() {
     let bucket = "required-members-bucket";
@@ -410,13 +457,6 @@ async fn every_operation_states_an_absent_required_member_the_same_way() {
             "/topK",
         ),
         (
-            "QueryVectors without its query vector",
-            "POST",
-            "/QueryVectors".to_string(),
-            without(&full_query, "queryVector"),
-            "/queryVector",
-        ),
-        (
             "PutVectorBucketPolicy without its policy",
             "POST",
             "/PutVectorBucketPolicy".to_string(),
@@ -482,8 +522,9 @@ async fn a_uri_bound_member_outside_its_constraint_is_refused_the_same_way() {
         Some(&json!({ "tags": { "team": "web" } })),
     )
     .await;
-    let expected = clause(
+    let expected = length_clause(
         "/resourceArn",
+        over_long.chars().count(),
         "Member must have length less than or equal to 1011",
     );
     assert_eq!(
@@ -884,9 +925,9 @@ async fn a_vector_the_index_cannot_hold_is_refused_as_the_record_it_is() {
 }
 
 /// The same rule about a vector holds of the vector a QUERY is run with, except that the
-/// READ path keeps the defect out of the top-level sentence: `fieldList` names the member
-/// the vector travelled in and says what was wrong, while the message is the one opaque
-/// query-vector sentence.
+/// READ path keeps the defect out of the top-level sentence: `fieldList` names the FIELD
+/// the vector reached the validation layer as and says what was wrong, while the message
+/// is the one opaque query-vector sentence.
 #[tokio::test]
 async fn a_query_vector_the_index_cannot_hold_names_the_member_it_travelled_in() {
     let router = with_index("query-vector-bucket", "query-vector-index").await;
@@ -913,10 +954,10 @@ async fn a_query_vector_the_index_cannot_hold_names_the_member_it_travelled_in()
             (message_of(&body), field_list(&body)),
             (
                 QUERY_VECTOR_SENTENCE.to_string(),
-                vec![("queryVector".to_string(), defect.clone())]
+                vec![(QUERY_VECTOR_FIELD.to_string(), invalid_input(&defect))]
             ),
             "case a {length}-value query vector: must carry the opaque query-vector \
-             sentence and name the member it travelled in, got {body}"
+             sentence and name the field the vector reached the service as, got {body}"
         );
     }
 }

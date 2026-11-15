@@ -1024,7 +1024,14 @@ pub fn echo_held_to(echo: &str, max_echo: usize) -> ::std::borrow::Cow<'_, str> 
 /// `... [<n> bytes]` at the very end — and it is read as one only when the count it names is
 /// larger than the text before it, which is what makes it an elision of something longer
 /// rather than a value that happens to end in those characters.
-fn named_byte_count(echo: &str) -> Option<usize> {
+///
+/// `pub` for the same reason [`crate::validation_message::list_item_count`] is: a service
+/// that reads a stored echo to learn something about the VALUE behind it — how long the
+/// caller's value was, which only an unelided echo still carries — has to tell an elision
+/// from a value that merely ends in those characters, and two services cannot disagree
+/// about which is which.
+#[must_use]
+pub fn named_byte_count(echo: &str) -> Option<usize> {
     let digits = echo.strip_suffix(" bytes]")?;
     let at = digits.rfind("... [")?;
     let named: usize = digits[at + "... [".len()..].parse().ok()?;

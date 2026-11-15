@@ -58,6 +58,17 @@ const DUPLICATE_KEYS_SENTENCE: &str = "Request must not contain duplicate keys";
 const QUERY_VECTOR_SENTENCE: &str =
     "Query vector contains invalid values or is invalid for this index";
 
+/// The `fieldList` path that entry names the vector by — the service's own field name for
+/// the vector it was handed, rather than the wire member it travelled in. A LITERAL, for
+/// the same reason.
+const QUERY_VECTOR_FIELD: &str = "vector";
+
+/// The sentence a `fieldList` entry carries about one input the validation layer behind
+/// the API was handed: the defect, under that layer's prefix.
+fn invalid_input(defect: &str) -> String {
+    format!("Invalid input: {defect}")
+}
+
 /// The bucket and index every case below addresses.
 const BUCKET: &str = "batch-keys-bucket";
 /// See [`BUCKET`].
@@ -405,9 +416,9 @@ async fn a_query_vector_the_index_cannot_search_reports_one_opaque_sentence() {
         );
         assert_eq!(
             field_list(&body),
-            vec![("queryVector".to_string(), rule.clone())],
-            "case {case:?}: fieldList must name the member the vector travelled in and \
-             state the rule it broke, got {body}"
+            vec![(QUERY_VECTOR_FIELD.to_string(), invalid_input(&rule))],
+            "case {case:?}: fieldList must name the field the vector reached the service \
+             as and state the rule it broke, got {body}"
         );
 
         // The control: at the index's own dimension the same index answers the query.

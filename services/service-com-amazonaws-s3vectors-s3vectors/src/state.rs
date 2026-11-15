@@ -455,6 +455,17 @@ pub const TAG_WRITE_CONFLICT: &str =
 pub const SEGMENT_INDEX_OUT_OF_RANGE: &str =
     "Segment index is zero-indexed and must be smaller than segment count";
 
+/// The `fieldList` path that refusal names the broken pairing by: the SERVICE's own field
+/// name for the segment index, in the snake_case the validation layer behind the API spells
+/// its fields in, rather than the wire member name `ListVectorsInput$segmentIndex`.
+///
+/// A `ValidationExceptionField$path` is "a path about the validation exception", and which
+/// spelling a path carries belongs to the layer that refused (see
+/// [`LookupError::validation_exception`]); this is the spelling the real service answered
+/// for this cross-field rule, so a client keying remediation off `fieldList[].path` matches
+/// it.
+pub const SEGMENT_INDEX_PATH: &str = "segment_index";
+
 /// The `ValidationException` message for a batch write whose records do not each name a
 /// distinct vector key.
 ///
@@ -480,6 +491,46 @@ pub const DUPLICATE_VECTOR_KEYS: &str = "Request must not contain duplicate keys
 /// index on a caller's behalf, so it stays the same for every defect and every index.
 pub const QUERY_VECTOR_INVALID: &str =
     "Query vector contains invalid values or is invalid for this index";
+
+/// The `fieldList` path the READ path names a query vector's own defect by: the SERVICE's
+/// field name for the vector it was handed, rather than the wire member name
+/// `QueryVectorsInput$queryVector`.
+///
+/// As with [`SEGMENT_INDEX_PATH`], the spelling belongs to the layer that refused: the
+/// vector reaches that layer as the vector it is, under one field name whichever member of
+/// whichever operation carried it, and this is the spelling the real service answered.
+pub const QUERY_VECTOR_PATH: &str = "vector";
+
+/// The `ValidationException` message for a query that reaches the service without a
+/// `queryVector` at all.
+///
+/// `QueryVectorsInput$queryVector` is `@required`, so an SDK refuses such a request
+/// client-side and the ones that reach the wire are hand-built or relayed by another
+/// service. This service states what the OPERATION needed — ONE fixed sentence naming the
+/// member in prose, interpolating nothing and naming no member path — rather than the
+/// framework's generic missing-member clause, so a caller reading the text learns what the
+/// far side objected to.
+pub const QUERY_VECTOR_REQUIRED: &str = "Query must provide a queryVector";
+
+/// How the READ path states a query vector the bound index cannot be searched with: the
+/// opaque sentence at the top level, and the defect itself under
+/// [`QUERY_VECTOR_PATH`] — prefixed as the validation layer behind the API prefixes a
+/// finding about one input it was handed.
+///
+/// The ONE place a query vector's refusal is built, so the two halves of the body cannot
+/// drift: `defect` is [`vector_data_defect`]'s sentence, which the WRITE path reports as
+/// the record it belongs to instead (see [`LookupError::invalid_record`]).
+pub fn query_vector_refusal(defect: &str) -> LookupError {
+    LookupError::invalid_detail(
+        QUERY_VECTOR_PATH,
+        QUERY_VECTOR_INVALID,
+        format!("{INVALID_INPUT_PREFIX}{defect}"),
+    )
+}
+
+/// The prefix a `fieldList` entry's sentence carries where it reports a defect of ONE
+/// input the validation layer behind the API was handed — see [`query_vector_refusal`].
+pub const INVALID_INPUT_PREFIX: &str = "Invalid input: ";
 
 /// Wording for the one failure that is not about the request: the shared engine
 /// did not hand this service's store back. Every operation models
@@ -724,12 +775,19 @@ pub const INDEX_SELECTOR_REFUSED: &str =
 /// request names exactly one of them. Naming neither, and naming both — even two
 /// that agree — are the same refusal ([`BUCKET_SELECTOR_REFUSED`]); only the form
 /// that was named is then parsed.
+///
+/// A name the request DID carry is held to the form its kind of resource is named by
+/// ([`validate_resource_name`]) before it is handed back, so a name no resource of that
+/// kind could carry is refused on NAME grounds rather than looked up and reported absent.
 pub fn resolve_bucket_name(
     name: Option<&str>,
     arn: Option<&str>,
 ) -> Result<String, LookupError> {
     match (name, arn) {
-        (Some(name), None) => Ok(name.to_string()),
+        (Some(name), None) => {
+            validate_resource_name(NameKind::VectorBucket, name)?;
+            Ok(name.to_string())
+        }
         (None, Some(arn)) => bucket_from_arn("vectorBucketArn", arn),
         (Some(_), Some(_)) | (None, None) => {
             Err(LookupError::invalid_request(BUCKET_SELECTOR_REFUSED))
@@ -745,13 +803,24 @@ pub fn resolve_bucket_name(
 /// bucket selector the two forms are MUTUALLY EXCLUSIVE, so a request carries
 /// exactly one COMPLETE form. Neither form, half of the name pair, and the ARN
 /// alongside either name are the same refusal ([`INDEX_SELECTOR_REFUSED`]).
+///
+/// Both names of the pair are held to the form their kind of resource is named by
+/// ([`validate_resource_name`]) before they are handed back, exactly as
+/// [`resolve_bucket_name`] holds the one it resolves: a name no resource of that kind
+/// could carry is a defect of the NAME, refused before any lookup it would otherwise be
+/// reported absent by. The bucket is checked first, so a request that gets both wrong is
+/// told about the one it names the index within.
 pub fn resolve_index_name(
     bucket_name: Option<&str>,
     index_name: Option<&str>,
     index_arn: Option<&str>,
 ) -> Result<(String, String), LookupError> {
     match (bucket_name, index_name, index_arn) {
-        (Some(bucket), Some(index), None) => Ok((bucket.to_string(), index.to_string())),
+        (Some(bucket), Some(index), None) => {
+            validate_resource_name(NameKind::VectorBucket, bucket)?;
+            validate_resource_name(NameKind::Index, index)?;
+            Ok((bucket.to_string(), index.to_string()))
+        }
         (None, None, Some(arn)) => index_from_arn("indexArn", arn),
         _ => Err(LookupError::invalid_request(INDEX_SELECTOR_REFUSED)),
     }
@@ -1358,6 +1427,27 @@ pub const MAX_FILTER_DEPTH: u32 = 32;
 /// elements of an operand array included.
 pub const MAX_FILTER_NODES: u32 = 4096;
 
+/// The `ValidationException` message for a metadata `filter` the service will not
+/// evaluate, as the service words it: ONE fixed opaque sentence, in the top-level
+/// `message` and in the `fieldList` entry alike, saying that the filter is not valid and
+/// nothing about WHICH clause failed — no operator token, no metadata key, no operand
+/// kind, no bound.
+///
+/// `QueryVectorsInput$filter` is a free-form `Document`, so every defect it can carry is
+/// one defect of one input: an operator this service does not implement, an operand of the
+/// wrong kind, a filter that is not a filter object, a metadata key the index declares
+/// non-filterable, or a document past the bounds above. A client cannot remediate a
+/// per-defect diagnostic AWS never emits, so all of them collapse here and the sentence
+/// echoes no part of the request.
+pub const INVALID_FILTER: &str = "Invalid filter";
+
+/// The one refusal every `filter` defect takes ([`INVALID_FILTER`]), naming the member the
+/// filter travelled in. The SINGLE place a filter refusal is built, so no check can word
+/// its own.
+fn invalid_filter() -> LookupError {
+    LookupError::invalid("filter", INVALID_FILTER)
+}
+
 /// A comparison operator a metadata key's clause may carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FilterOperator {
@@ -1378,8 +1468,10 @@ impl FilterOperator {
     ///
     /// The SINGLE place the operator set and its operand rules are written:
     /// [`validate_filter`] and the evaluation both resolve an operator here, so
-    /// the up-front check and the match cannot drift apart.
-    fn parse(name: &str, key: &str, operand: &Document) -> Result<Self, LookupError> {
+    /// the up-front check and the match cannot drift apart. Every refusal it states is
+    /// the one filter sentence ([`invalid_filter`]), so the operator token and the
+    /// operand kind decide only WHETHER the filter is refused.
+    fn parse(name: &str, operand: &Document) -> Result<Self, LookupError> {
         let operator = match name {
             "$eq" => Self::Eq,
             "$ne" => Self::Ne,
@@ -1390,21 +1482,11 @@ impl FilterOperator {
             "$in" => Self::In,
             "$nin" => Self::Nin,
             "$exists" => Self::Exists,
-            other => {
-                return Err(LookupError::invalid(
-                    "filter",
-                    format!("unsupported metadata filter operator `{other}`"),
-                ))
-            }
+            _ => return Err(invalid_filter()),
         };
         match operator {
-            Self::In | Self::Nin if !matches!(operand, Document::Array(_)) => Err(
-                LookupError::invalid("filter", format!("`{name}` takes an array of values")),
-            ),
-            Self::Exists if !matches!(operand, Document::Bool(_)) => Err(LookupError::invalid(
-                "filter",
-                format!("`$exists` on metadata key `{key}` takes a boolean"),
-            )),
+            Self::In | Self::Nin if !matches!(operand, Document::Array(_)) => Err(invalid_filter()),
+            Self::Exists if !matches!(operand, Document::Bool(_)) => Err(invalid_filter()),
             _ => Ok(operator),
         }
     }
@@ -1430,10 +1512,7 @@ fn classify_clause<'a>(
 ) -> Result<FilterClause<'a>, LookupError> {
     if let operator @ ("$and" | "$or") = key {
         let Document::Array(branches) = clause else {
-            return Err(LookupError::invalid(
-                "filter",
-                format!("`{operator}` takes an array of metadata filters"),
-            ));
+            return Err(invalid_filter());
         };
         return Ok(FilterClause::Branches {
             branches,
@@ -1441,24 +1520,15 @@ fn classify_clause<'a>(
         });
     }
     if key.starts_with('$') {
-        return Err(LookupError::invalid(
-            "filter",
-            format!("unsupported metadata filter operator `{key}`"),
-        ));
+        return Err(invalid_filter());
     }
     if non_filterable.iter().any(|non| non == key) {
-        return Err(LookupError::invalid(
-            "filter",
-            format!(
-                "metadata key `{key}` is a non-filterable metadata key of this vector \
-                 index and can't be used in a filter"
-            ),
-        ));
+        return Err(invalid_filter());
     }
     match clause {
         Document::Object(operators) if operators.keys().any(|name| name.starts_with('$')) => {
             for name in sorted_keys(operators) {
-                FilterOperator::parse(name, key, &operators[name])?;
+                FilterOperator::parse(name, &operators[name])?;
             }
             Ok(FilterClause::Operators(operators))
         }
@@ -1526,12 +1596,7 @@ pub fn validate_filter(filter: &Document, non_filterable: &[String]) -> Result<(
                     }
                 }
             }
-            FilterNode::Level(_) => {
-                return Err(LookupError::invalid(
-                    "filter",
-                    "`filter` must be a metadata filter object",
-                ))
-            }
+            FilterNode::Level(_) => return Err(invalid_filter()),
             FilterNode::Value(Document::Object(members)) => pending.extend(
                 members
                     .values()
@@ -1549,6 +1614,11 @@ pub fn validate_filter(filter: &Document, non_filterable: &[String]) -> Result<(
 }
 
 /// The refusal for a filter past [`MAX_FILTER_DEPTH`].
+///
+/// NOT the one opaque sentence every filter DEFECT takes ([`INVALID_FILTER`]): this bound
+/// is this emulator's own evaluation ceiling rather than a rule the service states, so a
+/// filter it will not evaluate — one the real service may well accept — is reported as
+/// that, naming the ceiling, instead of being called invalid input.
 fn too_deep() -> LookupError {
     LookupError::invalid(
         "filter",
@@ -1556,7 +1626,8 @@ fn too_deep() -> LookupError {
     )
 }
 
-/// The refusal for a filter past [`MAX_FILTER_NODES`].
+/// The refusal for a filter past [`MAX_FILTER_NODES`]: the other half of [`too_deep`]'s
+/// ceiling, stated the same way.
 fn too_wide() -> LookupError {
     LookupError::invalid(
         "filter",
@@ -1604,12 +1675,7 @@ fn filter_matches(
     let clauses = match filter {
         Document::Null => return Ok(true),
         Document::Object(clauses) => clauses,
-        _ => {
-            return Err(LookupError::invalid(
-                "filter",
-                "`filter` must be a metadata filter object",
-            ))
-        }
+        _ => return Err(invalid_filter()),
     };
     for key in sorted_keys(clauses) {
         let matched = match classify_clause(key, &clauses[key], non_filterable)? {
@@ -1627,7 +1693,7 @@ fn filter_matches(
                 matched
             }
             FilterClause::Operators(operators) => {
-                operator_matches(key, operators, metadata_value(metadata, key))?
+                operator_matches(operators, metadata_value(metadata, key))?
             }
             FilterClause::Literal(literal) => {
                 document_equals(metadata_value(metadata, key), literal, MAX_METADATA_DEPTH)
@@ -1651,13 +1717,12 @@ fn metadata_value<'a>(metadata: &'a Document, key: &str) -> Option<&'a Document>
 /// One metadata key's operator object, against the value the vector carries.
 /// Every operator in it must hold, so an operator object is itself an AND.
 fn operator_matches(
-    key: &str,
     operators: &std::collections::HashMap<String, Document>,
     actual: Option<&Document>,
 ) -> Result<bool, LookupError> {
     for name in sorted_keys(operators) {
         let operand = &operators[name];
-        let matched = match FilterOperator::parse(name, key, operand)? {
+        let matched = match FilterOperator::parse(name, operand)? {
             FilterOperator::Eq => document_equals(actual, operand, MAX_METADATA_DEPTH),
             FilterOperator::Ne => !document_equals(actual, operand, MAX_METADATA_DEPTH),
             FilterOperator::Gt => ordering_matches(actual, operand, |ord| ord.is_gt()),

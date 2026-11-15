@@ -207,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let segment_index = usize::try_from(input.segment_index.max(0)).unwrap_or(0);
         if segment_index >= segment_count {
             return Err(refusal(crate::state::LookupError::invalid(
-                "segmentIndex",
+                crate::state::SEGMENT_INDEX_PATH,
                 crate::state::SEGMENT_INDEX_OUT_OF_RANGE,
             )));
         }

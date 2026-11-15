@@ -19,12 +19,19 @@
 //!   constraint: <requirement>` — the member named by a JSON POINTER into the request
 //!   (`/dimension`, leading slash) and the requirement naming the modelled constraint,
 //!   with BOTH declared bounds where the member declares two. The rejected value is not
-//!   quoted, so no caller input is echoed back;
+//!   quoted, so no caller input is echoed back; a `@length` clause states the LENGTH of
+//!   that value (`Value with length 129 at '/indexName' …`), which is the one thing a
+//!   caller cannot read off its own request without re-measuring it and the one number
+//!   that says by how much the value overran;
 //! * `message`, the counted envelope `<n> validation error(s) detected. ` over the
 //!   clauses;
 //! * `fieldList`, one entry per violated member: the same pointer as `path` and that
 //!   member's own clause as `message`, so the two halves of the body cannot word one
 //!   violation two ways.
+//!
+//! A `@required` member a particular operation states its OWN sentence for is the one
+//! exception ([`stated_absence`]): that sentence is the whole body, naming no member path,
+//! because the service does not use the framework's generic null clause for it.
 //!
 //! # Why this cannot live in `Service::override_refusal`
 //!
@@ -42,6 +49,7 @@
 use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use ::aws_smithy_schema::{Schema, TraitMap};
 use ::aws_smithy_schema_server::constraints::{path, LengthTrait, RangeTrait};
+use ::service_common::validation::SubmittedEcho;
 use smithy_server_runtime::{Operation, Refused, ServerHttpProtocol, Violation, ViolationKind};
 
 use crate::ops::types::{
@@ -73,9 +81,11 @@ pub(super) fn modelled_refusal<O: Operation>(
 ) -> Option<RtResponse> {
     // The framework's OWN machinery — the protocol's deserializer and
     // `constraints::validate` over the built input — so this cannot find a different
-    // violation set from the walk that runs behind it.
-    let violations = service_common::validation::refusing_violations::<O>(protocol, req);
-    let refused = refusal_for(&violations, Some(O::INPUT_SCHEMA))?;
+    // violation set from the walk that runs behind it. Each violation comes paired with
+    // how a clause can state the value it is about, which is where a `@length` clause
+    // reads the length it states from.
+    let violations = service_common::validation::refusing_violations_with_echoes::<O>(protocol, req);
+    let refused = refusal_for(O::NAME, &violations, Some(O::INPUT_SCHEMA))?;
     protocol
         .serialize_error(
             &refused,
@@ -86,13 +96,44 @@ pub(super) fn modelled_refusal<O: Operation>(
         .ok()
 }
 
+/// The sentence `operation` states ITSELF for the `@required` member `path`, instead of the
+/// framework's generic missing-member clause, or `None` where the generic clause is what
+/// the service answers.
+///
+/// A `@required` member is refused before any handler runs, so an operation whose own
+/// refusal for an absent member is a sentence about what the OPERATION needed — rather
+/// than a clause about the member's constraint — has to state it here. The sentence names
+/// no member path and interpolates nothing, so it is the whole body (no `fieldList`): there
+/// is no per-member half of it to carry.
+fn stated_absence(operation: &str, path: &str) -> Option<&'static str> {
+    match (operation, path) {
+        ("QueryVectors", "queryVector") => Some(crate::state::QUERY_VECTOR_REQUIRED),
+        _ => None,
+    }
+}
+
 /// `violations` as the modelled `ValidationException`, or `None` when there is nothing
 /// to state (an empty set, or a constraint class this service has no wording for).
 fn refusal_for(
-    violations: &[Violation],
+    operation: &str,
+    violations: &[(Violation, SubmittedEcho)],
     input_schema: Option<&Schema>,
 ) -> Option<ValidationException> {
     let violations = &violations[..violations.len().min(MAX_VIOLATIONS)];
+    // An absent member this operation words itself: that sentence is the whole body. The
+    // deserializer reports the first `@required` member it misses and stops, so such a
+    // refusal is about one member; where several violations are collected, the first one
+    // the operation words is the one stated.
+    if let Some(sentence) = violations
+        .iter()
+        .filter(|(violation, _)| violation.kind == ViolationKind::MissingRequiredMember)
+        .find_map(|(violation, _)| stated_absence(operation, &violation.path))
+    {
+        return Some(ValidationException {
+            message: sentence.to_string(),
+            field_list: None,
+        });
+    }
     let clauses = clauses_for(violations, input_schema)?;
     Some(ValidationException {
         message: envelope(&clauses),
@@ -100,7 +141,7 @@ fn refusal_for(
             violations
                 .iter()
                 .zip(&clauses)
-                .map(|(violation, clause)| ValidationExceptionField {
+                .map(|((violation, _), clause)| ValidationExceptionField {
                     path: pointer(&violation.path),
                     message: clause.clone(),
                 })
@@ -114,10 +155,18 @@ fn refusal_for(
 ///
 /// `None` declines the refusal, keeping the framework's own wording — see
 /// [`requirement_for`]. The input schema is not at hand here (the seam is given the
-/// violations alone), so a clause states the bound the violation carries.
+/// violations alone), so a clause states the bound the violation carries, and a `@length`
+/// clause states the length only where the walk's own rendering of the value still holds it
+/// ([`stated_length`]).
 pub(super) fn refused_for(violations: &[Violation]) -> Option<Refused> {
-    let violations = &violations[..violations.len().min(MAX_VIOLATIONS)];
-    let clauses = clauses_for(violations, None)?;
+    let violations: Vec<(Violation, SubmittedEcho)> = violations
+        .iter()
+        .take(MAX_VIOLATIONS)
+        // The request itself is not at hand on this seam, so there is no submitted value
+        // to read: what the framework's walk stored on the violation is all there is.
+        .map(|violation| (violation.clone(), SubmittedEcho::Unrendered))
+        .collect();
+    let clauses = clauses_for(&violations, None)?;
     Some(Refused {
         code: VALIDATION_EXCEPTION_CODE.to_string(),
         message: envelope(&clauses),
@@ -126,13 +175,16 @@ pub(super) fn refused_for(violations: &[Violation]) -> Option<Refused> {
 
 /// One clause per violation, or `None` when any of them is a class this service has no
 /// wording for.
-fn clauses_for(violations: &[Violation], input_schema: Option<&Schema>) -> Option<Vec<String>> {
+fn clauses_for(
+    violations: &[(Violation, SubmittedEcho)],
+    input_schema: Option<&Schema>,
+) -> Option<Vec<String>> {
     if violations.is_empty() {
         return None;
     }
     violations
         .iter()
-        .map(|violation| clause_for(violation, input_schema))
+        .map(|(violation, echo)| clause_for(violation, echo, input_schema))
         .collect()
 }
 
@@ -152,16 +204,74 @@ fn envelope(clauses: &[String]) -> String {
 /// One violation as this service states it: the member named by its JSON pointer and
 /// the requirement it failed, with no echo of the value the caller sent.
 ///
+/// A `@length` violation states the LENGTH of that value in front of the member
+/// (`Value with length <n> at '<pointer>' …`), which is the number the check counted and
+/// the only part of the value the clause carries; every other class names the member and
+/// the requirement alone.
+///
 /// `None` for a constraint class this service has no wording for — [`ViolationKind`] is
 /// `#[non_exhaustive]`, so a class added upstream keeps the framework's own wording
 /// rather than being dropped from the body.
-fn clause_for(violation: &Violation, input_schema: Option<&Schema>) -> Option<String> {
+fn clause_for(
+    violation: &Violation,
+    echo: &SubmittedEcho,
+    input_schema: Option<&Schema>,
+) -> Option<String> {
     let declared = input_schema.and_then(|schema| member_traits(schema, &violation.path));
     let requirement = requirement_for(violation, declared)?;
+    let subject = match stated_length(violation, echo) {
+        Some(length) => format!("Value with length {length} "),
+        None => "Value ".to_string(),
+    };
     Some(format!(
-        "Value at '{}' failed to satisfy constraint: {requirement}",
+        "{subject}at '{}' failed to satisfy constraint: {requirement}",
         pointer(&violation.path)
     ))
+}
+
+/// The length the violated `@length` check COUNTED, as the clause states it, or `None` for
+/// every other constraint class and for a value this layer cannot measure.
+///
+/// `@length` counts a string's characters, a collection's elements and a blob's bytes, so
+/// the number comes from the value itself rather than from the violation, which carries
+/// only the bound that was broken:
+///
+/// * a COLLECTION is length-checked on the member, before the walk descends into its
+///   elements, and the walk's own rendering of it states the size it counted — a list as
+///   `<n> items`, a map as `<n> entries` — which
+///   [`service_common::validation_message`] reads for every service;
+/// * a STRING is measured on the value the caller submitted, which the collecting walk
+///   re-read from the request ([`SubmittedEcho::Rendered`]).
+///
+/// `None` where neither is at hand — a value past the bounds that walk states, or a seam
+/// holding no request — and the clause then names the member and the requirement alone,
+/// rather than a length nothing measured.
+fn stated_length(violation: &Violation, echo: &SubmittedEcho) -> Option<usize> {
+    if !matches!(
+        violation.kind,
+        ViolationKind::MinLength(_) | ViolationKind::MaxLength(_)
+    ) {
+        return None;
+    }
+    if let Some(stored) = violation.value.as_deref() {
+        let size = ::service_common::validation_message::list_item_count(stored)
+            .or_else(|| ::service_common::validation_message::map_entry_count(stored));
+        if size.is_some() {
+            return size;
+        }
+    }
+    match echo {
+        SubmittedEcho::Rendered(value) => Some(value.chars().count()),
+        // The walk stored its own rendering of the value, which is the value itself up to
+        // a ceiling of its own: measurable only while it IS the value, never once it has
+        // been elided into a prefix plus the marker naming the whole value's byte count
+        // ([`service_common::validation::named_byte_count`] reads that marker).
+        _ => violation
+            .value
+            .as_deref()
+            .filter(|stored| ::service_common::validation::named_byte_count(stored).is_none())
+            .map(|stored| stored.chars().count()),
+    }
 }
 
 /// The requirement `violation` failed, as this service words it — the half of a clause
@@ -285,6 +395,11 @@ mod tests {
         }
     }
 
+    /// One violation with no submitted value to state, as [`refusal_for`] takes them.
+    fn unrendered(violation: Violation) -> (Violation, SubmittedEcho) {
+        (violation, SubmittedEcho::Unrendered)
+    }
+
     /// Every constraint class states a clause and names its member in `fieldList`, and
     /// the two halves of the body word the violation the same way.
     #[test]
@@ -300,8 +415,12 @@ mod tests {
             ViolationKind::UniqueItems,
         ];
         for kind in classes {
-            let refused = refusal_for(&[violation("dimension", kind.clone())], None)
-                .unwrap_or_else(|| panic!("case {kind:?}: must be refused"));
+            let refused = refusal_for(
+                "CreateIndex",
+                &[unrendered(violation("dimension", kind.clone()))],
+                None,
+            )
+            .unwrap_or_else(|| panic!("case {kind:?}: must be refused"));
             let fields = refused.field_list.clone().unwrap_or_default();
             assert_eq!(
                 fields.len(),
@@ -389,9 +508,13 @@ mod tests {
     #[test]
     fn several_violations_are_counted_and_stated_together() {
         let refused = refusal_for(
+            "CreateIndex",
             &[
-                violation("dimension", ViolationKind::MaxValue("4096".to_string())),
-                violation("indexName", ViolationKind::MissingRequiredMember),
+                unrendered(violation(
+                    "dimension",
+                    ViolationKind::MaxValue("4096".to_string()),
+                )),
+                unrendered(violation("indexName", ViolationKind::MissingRequiredMember)),
             ],
             None,
         )
@@ -419,12 +542,139 @@ mod tests {
     #[test]
     fn no_violation_is_no_refusal() {
         assert!(
-            refusal_for(&[], None).is_none(),
+            refusal_for("CreateIndex", &[], None).is_none(),
             "an empty violation set must not be a refusal"
         );
         assert!(
             refused_for(&[]).is_none(),
             "an empty violation set must not be worded as a refusal"
         );
+    }
+
+    /// A `@length` violation states the LENGTH the check counted, whichever shape kind
+    /// carried it and whichever bound it broke; no other class states a length.
+    #[test]
+    fn a_length_clause_states_the_length_that_was_counted() {
+        // (case, kind, the value the walk holds, the echo, the subject the clause opens
+        //  with)
+        let rows: [(&str, ViolationKind, Option<&str>, SubmittedEcho, &str); 6] = [
+            (
+                "a string over its maximum, re-read from the request",
+                ViolationKind::MaxLength(63),
+                Some("aaa"),
+                SubmittedEcho::Rendered("a".repeat(129)),
+                "Value with length 129 ",
+            ),
+            (
+                "a string under its minimum",
+                ViolationKind::MinLength(3),
+                Some("ab"),
+                SubmittedEcho::Rendered("ab".to_string()),
+                "Value with length 2 ",
+            ),
+            (
+                "a string of multi-byte characters, counted in characters",
+                ViolationKind::MaxLength(3),
+                Some("\u{e9}\u{e9}\u{e9}\u{e9}"),
+                SubmittedEcho::Rendered("\u{e9}\u{e9}\u{e9}\u{e9}".to_string()),
+                "Value with length 4 ",
+            ),
+            (
+                "an empty list, length-checked on the member",
+                ViolationKind::MinLength(1),
+                Some("0 items"),
+                SubmittedEcho::Rendered("[]".to_string()),
+                "Value with length 0 ",
+            ),
+            (
+                "a map over its entry maximum",
+                ViolationKind::MaxLength(50),
+                Some("51 entries"),
+                SubmittedEcho::Unrendered,
+                "Value with length 51 ",
+            ),
+            (
+                "a value past the ceiling the collecting walk states",
+                ViolationKind::MaxLength(63),
+                Some("aaa... [20000 bytes]"),
+                SubmittedEcho::Unrendered,
+                "Value ",
+            ),
+        ];
+
+        for (case, kind, stored, echo, subject) in rows {
+            let held = Violation {
+                value: stored.map(str::to_string),
+                ..violation("indexName", kind)
+            };
+            let clause = clause_for(&held, &echo, None)
+                .unwrap_or_else(|| panic!("case {case:?}: must state a clause"));
+            let expected = format!("{subject}at '/indexName' failed to satisfy constraint: ");
+            assert!(
+                clause.starts_with(&expected),
+                "case {case:?}: expected a clause opening {expected:?}, got {clause:?}"
+            );
+        }
+
+        // Every OTHER class states no length, whatever value the walk holds.
+        let others = [
+            ViolationKind::MissingRequiredMember,
+            ViolationKind::MaxValue("4096".to_string()),
+            ViolationKind::Pattern("^[a-z0-9]+$".to_string()),
+            ViolationKind::EnumValue(vec!["float32".to_string()]),
+        ];
+        for kind in others {
+            let held = Violation {
+                value: Some("abcdef".to_string()),
+                ..violation("indexName", kind.clone())
+            };
+            let clause = clause_for(&held, &SubmittedEcho::Rendered("abcdef".to_string()), None)
+                .unwrap_or_else(|| panic!("case {kind:?}: must state a clause"));
+            assert!(
+                clause.starts_with("Value at '/indexName' "),
+                "case {kind:?}: only a length clause states a length, got {clause:?}"
+            );
+        }
+    }
+
+    /// A `@required` member the operation words itself is answered with that sentence
+    /// alone: no counted envelope, no member path, no `fieldList`.
+    #[test]
+    fn an_operations_own_sentence_for_an_absent_member_is_the_whole_body() {
+        let refused = refusal_for(
+            "QueryVectors",
+            &[(
+                violation("queryVector", ViolationKind::MissingRequiredMember),
+                SubmittedEcho::Absent,
+            )],
+            None,
+        )
+        .expect("an absent required member is a refusal");
+        assert_eq!(
+            (refused.message.as_str(), refused.field_list.is_none()),
+            (crate::state::QUERY_VECTOR_REQUIRED, true),
+            "expected the operation's own sentence alone, got {refused:?}"
+        );
+        // The same member on another operation, and another member on this one, keep the
+        // framework's clause.
+        for (operation, member) in [("GetVectors", "keys"), ("QueryVectors", "topK")] {
+            let refused = refusal_for(
+                operation,
+                &[unrendered(violation(
+                    member,
+                    ViolationKind::MissingRequiredMember,
+                ))],
+                None,
+            )
+            .unwrap_or_else(|| panic!("case {operation}/{member}: must be refused"));
+            assert_eq!(
+                refused.message,
+                format!(
+                    "1 validation error detected. Value at '/{member}' failed to satisfy \
+                     constraint: Member must not be null"
+                ),
+                "case {operation}/{member}: expected the framework clause, got {refused:?}"
+            );
+        }
     }
 }

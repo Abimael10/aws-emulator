@@ -63,6 +63,21 @@ const ZERO_NORM_SENTENCE: &str = "cosine distance does not support vectors with 
 const QUERY_VECTOR_SENTENCE: &str =
     "Query vector contains invalid values or is invalid for this index";
 
+/// The `fieldList` path that entry names the vector by — the service's own field name for
+/// the vector it was handed — and the prefix its sentence carries. LITERALS, as
+/// [`QUERY_VECTOR_SENTENCE`] is.
+const QUERY_VECTOR_FIELD: &str = "vector";
+
+/// The sentence a `fieldList` entry carries about one input the validation layer behind
+/// the API was handed: the defect, under that layer's prefix.
+fn invalid_input(defect: &str) -> String {
+    format!("Invalid input: {defect}")
+}
+
+/// The `fieldList` path the segment-pairing refusal names: the service's own field name
+/// for the segment index, not the wire member name. A LITERAL, as the sentences are.
+const SEGMENT_FIELD: &str = "segment_index";
+
 /// The sentence the service answers for a parallel `ListVectors` whose `segmentIndex` is
 /// not inside the partition its `segmentCount` describes. All fixed text restating the
 /// rule `ListVectorsInput$segmentIndex` documents.
@@ -215,9 +230,9 @@ async fn a_zero_norm_vector_reports_the_metrics_own_rule_named_by_the_records_ke
 }
 
 /// The same rule holds of the vector a QUERY is run with, except that the read path
-/// keeps the rule it broke in the `fieldList` entry for the MEMBER the vector travelled
-/// in — there is no record to name — while the top-level sentence is the one opaque
-/// query-vector sentence.
+/// keeps the rule it broke in the `fieldList` entry for the FIELD the vector reached the
+/// validation layer as — there is no record to name — while the top-level sentence is the
+/// one opaque query-vector sentence.
 #[tokio::test]
 async fn a_zero_norm_query_vector_reports_the_same_rule_named_by_its_member() {
     for dimension in [1_usize, 3, 8] {
@@ -246,8 +261,12 @@ async fn a_zero_norm_query_vector_reports_the_same_rule_named_by_its_member() {
         );
         assert_eq!(
             field_list(&body),
-            vec![("queryVector".to_string(), ZERO_NORM_SENTENCE.to_string())],
-            "case {case:?}: fieldList must name the member it travelled in, got {body}"
+            vec![(
+                QUERY_VECTOR_FIELD.to_string(),
+                invalid_input(ZERO_NORM_SENTENCE)
+            )],
+            "case {case:?}: fieldList must name the field the vector reached the service \
+             as, got {body}"
         );
     }
 }
@@ -413,7 +432,7 @@ async fn a_segment_index_not_below_its_segment_count_reports_one_fixed_sentence(
         );
         assert_eq!(
             field_list(&body),
-            vec![("segmentIndex".to_string(), SEGMENT_SENTENCE.to_string())],
+            vec![(SEGMENT_FIELD.to_string(), SEGMENT_SENTENCE.to_string())],
             "case {case:?}: fieldList must name the member at fault, got {body}"
         );
     }

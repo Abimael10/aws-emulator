@@ -37,6 +37,8 @@ mod policy_not_found_message;
 mod query_candidate_slots;
 #[path = "all/query_pagination.rs"]
 mod query_pagination;
+#[path = "all/read_path_refusal_contract.rs"]
+mod read_path_refusal_contract;
 #[path = "all/refusal_sentence_wording.rs"]
 mod refusal_sentence_wording;
 #[path = "all/refusal_wording.rs"]

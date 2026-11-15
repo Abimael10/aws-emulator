@@ -70,13 +70,16 @@ const VECTOR_INDEX: &str = "AWS::S3Vectors::Index";
 /// are what a failed resource's reason quotes: ONE fixed sentence per resource kind for a
 /// name outside the form that kind is named by, and — for a name outside the modelled
 /// `@length` of the member it travelled in — the clause that service states for a value
-/// outside a MODELLED constraint, naming the member by its JSON pointer.
+/// outside a MODELLED constraint, naming the member by its JSON pointer and stating the
+/// length it counted.
 const INVALID_BUCKET_NAME: &str = "Invalid vector bucket name";
 /// See [`INVALID_BUCKET_NAME`].
 const INVALID_INDEX_NAME: &str = "Invalid index name";
-/// See [`INVALID_BUCKET_NAME`].
-const BUCKET_NAME_LENGTH: &str = "Value at '/vectorBucketName' failed to satisfy constraint: \
-                                  Member must have length between 3 and 63, inclusive";
+/// See [`INVALID_BUCKET_NAME`]: the clause for the two-character name the row below
+/// declares, whose counted length the clause states.
+const BUCKET_NAME_LENGTH: &str = "Value with length 2 at '/vectorBucketName' failed to \
+                                  satisfy constraint: Member must have length between 3 \
+                                  and 63, inclusive";
 
 /// One `StackEvent` as the wire reports it.
 #[derive(Debug, Clone)]
