@@ -44,6 +44,9 @@ mod group_control_plane;
 #[path = "all/group_identifier_exclusivity.rs"]
 mod group_identifier_exclusivity;
 
+#[path = "all/identity_authorization.rs"]
+mod identity_authorization;
+
 #[path = "all/indexing_rules.rs"]
 mod indexing_rules;
 

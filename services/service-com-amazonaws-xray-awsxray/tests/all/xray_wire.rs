@@ -23,6 +23,11 @@ pub struct Xray {
 /// the region the service falls back to when a request names none.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// The access key id every call is signed with unless a case names another: a key
+/// neither STS nor IAM holds a record for, which is the position the account's own
+/// published credential is in.
+pub const DEFAULT_ACCESS_KEY_ID: &str = "AKIAIOSFODNN7EXAMPLE";
+
 /// What one call answered.
 #[derive(Debug)]
 pub struct Answer {
@@ -77,6 +82,12 @@ impl Xray {
         emulator
     }
 
+    /// Mount one more service, built from the engine this emulator already shares,
+    /// for a case whose rule reaches SEVERAL other services of this emulator.
+    pub fn mount<S: smithy_server_runtime::Service>(&mut self, service: S) {
+        self.router.register_service(service);
+    }
+
     /// The in-process callback into this emulator, which is what an AWS SDK
     /// client is configured over to reach a service mounted beside this one.
     pub fn callback(&self) -> smithy_server_runtime::EmbeddedEmulator {
@@ -91,7 +102,8 @@ impl Xray {
     /// is about something a document cannot carry — the order a JSON object
     /// writes its members in, which a `Value` holds in an order of its own.
     pub async fn call_raw(&self, path: &str, body: &str) -> Answer {
-        self.dispatch(DEFAULT_REGION, path, body).await
+        self.dispatch(DEFAULT_REGION, DEFAULT_ACCESS_KEY_ID, path, body)
+            .await
     }
 
     /// The same call, signed for `region`.
@@ -101,12 +113,32 @@ impl Xray {
     /// `Authorization` header carries the scope even though signature
     /// verification is off.
     pub async fn call_in_region(&self, region: &str, path: &str, body: &Value) -> Answer {
-        self.dispatch(region, path, &body.to_string()).await
+        self.dispatch(region, DEFAULT_ACCESS_KEY_ID, path, &body.to_string())
+            .await
+    }
+
+    /// The same call signed with `access_key_id` — what names the principal the
+    /// request speaks for, which is what an authorization decision is taken on.
+    pub async fn call_as(&self, access_key_id: &str, path: &str, body: &Value) -> Answer {
+        self.dispatch(
+            DEFAULT_REGION,
+            access_key_id,
+            path,
+            &body.to_string(),
+        )
+        .await
     }
 
     /// The one request every call above makes: the signing-name host, the
-    /// credential scope of `region`, and `body` as the bytes sent.
-    async fn dispatch(&self, region: &str, path: &str, body: &str) -> Answer {
+    /// credential scope of `region` naming `access_key_id`, and `body` as the
+    /// bytes sent.
+    async fn dispatch(
+        &self,
+        region: &str,
+        access_key_id: &str,
+        path: &str,
+        body: &str,
+    ) -> Answer {
         let request = ::http::Request::builder()
             .method("POST")
             .uri(format!("https://xray.{region}.amazonaws.com{path}"))
@@ -115,7 +147,7 @@ impl Xray {
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/{region}/xray/aws4_request, \
+                    "AWS4-HMAC-SHA256 Credential={access_key_id}/20240101/{region}/xray/aws4_request, \
                      SignedHeaders=host, Signature=not-verified"
                 ),
             )

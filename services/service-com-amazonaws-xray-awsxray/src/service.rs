@@ -23,7 +23,9 @@
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. Edited here: a request whose BODY cannot be read into the
 //!   modelled input shape is answered by [`request_layer`]'s refusal, because
-//!   that failure is the deserialization layer's and not a handler's.
+//!   that failure is the deserialization layer's and not a handler's; every
+//!   other request is served through its [`Gated`] wrapper, which takes IAM's
+//!   authorization decision in front of the operation (see below).
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran, for the refusals that do not reach
 //!   [`request_layer`]'s pre-dispatch answer (an absent `@required` member is
@@ -52,15 +54,37 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
+//! # The authorization layer every handler runs under
+//!
+//! AWS decides authorization at the IAM layer, in front of the service: a caller
+//! whose identity-based policies do not grant the action — or that an explicit
+//! `Deny` covers — is refused `AccessDeniedException` (HTTP 403) and the call
+//! performs nothing, so a refused write leaves no resource behind and a refused
+//! read reports nothing. That decision is a property of the request's identity,
+//! the action it names and the resource it addresses rather than of what a
+//! handler goes on to do, so it is taken ONCE here in [`Gated`], for every
+//! operation of this service ([`authorization`] holds the lookups, the decision
+//! and the sentence), and nowhere else.
+//!
+//! It is taken on the requests this service can READ: the resource a request is
+//! judged against is the ARN its input names ([`authorization::judged_resource`]),
+//! so a body no modelled input can be read from names no request to judge and
+//! keeps the deserialization layer's own refusal ([`request_layer`]).
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+pub mod authorization;
 pub mod request_layer;
 
 use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
-use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
+use smithy_server_runtime::{
+    http, BoxFuture, ErasedOperation, Operation, OperationContext, Refusal, Refused, Service,
+};
+use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 /// `refusal` with every enumerated value set stated in the order THIS service states
@@ -160,6 +184,13 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// form an instant is read in (see [`request_layer`]). Held on the service
     /// for the same reason.
     unconvertible_time: request_layer::UnconvertibleTime<Eng>,
+    /// One [`Gated`] per modelled operation, keyed by the routing key the model
+    /// names that operation by ([`Operation::NAME`], the same key the generated
+    /// routing table uses). Built once here, never per request; each entry
+    /// carries the operation's TYPE — which is what names the action a request to
+    /// it asks for — and a handle on the one shared engine, so this is a table of
+    /// names rather than a second set of operations.
+    gated: HashMap<&'static str, Box<dyn ErasedOperation>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -168,6 +199,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
+            gated: gated_table::<Eng>(&engine),
             entry: crate::ServiceDefinition::new(engine),
             unreadable_body: request_layer::UnreadableBody::new(),
             constraint_refusal: request_layer::ConstraintRefusal::new(),
@@ -233,6 +265,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 }
                 None => {}
             }
+            // Every request this service CAN read is served behind the decision
+            // AWS takes in front of a handler: whether IAM lets the caller
+            // perform the action, taken before the operation reads or writes
+            // anything (see the module docs and [`Gated`]). Keyed on the routing
+            // key the model names each operation by, so a request that names no
+            // modelled operation resolves exactly as it did before.
+            if let Some(gated) = self.gated.get(key) {
+                return Some(&**gated);
+            }
         }
         None
     }
@@ -297,4 +338,131 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+/// One modelled operation, served behind the decision AWS takes in front of a
+/// handler: IAM's authorization of the action.
+///
+/// It carries the operation TYPE — which is what names the action the request
+/// asks for ([`Operation::NAME`]) — and a handle on the ONE shared engine, which
+/// is what the decision reads the caller's identity and its policies through
+/// ([`authorization`]). Every request it does not refuse is delegated to the one
+/// operation instance the generated routing table built from that same engine, so
+/// there is no second instance of any operation and no second store.
+struct Gated<Op, Eng> {
+    operation: PhantomData<fn() -> Op>,
+    engine: Arc<Eng>,
+}
+
+impl<Op, Eng> Gated<Op, Eng> {
+    fn new(engine: Arc<Eng>) -> Self {
+        Self {
+            operation: PhantomData,
+            engine,
+        }
+    }
+}
+
+impl<Op: Operation, Eng: Send + Sync + 'static> ErasedOperation for Gated<Op, Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            // IAM's decision, taken before the operation reads or writes
+            // anything: the action is this operation's own name under this
+            // service's prefix, and the resource is the one the REQUEST
+            // addresses. A refused request never reaches the delegate, so it
+            // mints nothing and reports nothing.
+            let resource = authorization::judged_resource(
+                svc.definition().identity().signing_name(),
+                req,
+            );
+            let denial =
+                authorization::authorize(&*self.engine, ctx, Op::NAME, &resource).err();
+            if let Some(denial) = denial {
+                return authorization::refusal_response(&denial);
+            }
+            match svc.definition().routing_table().get(Op::NAME) {
+                Some(operation) => operation.run(svc, req, ctx).await,
+                // Unreachable in practice: this wrapper is only reachable under
+                // the key the generated table registered. Answer the framework's
+                // own no-such-operation response rather than inventing one.
+                None => svc.definition().routing_error_response(req),
+            }
+        })
+    }
+
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        // The wrapper is not an operation of its own: the request is signed (or
+        // not) as the MODEL says for the operation it names, so authentication is
+        // decided by the modelled operation this wrapper stands in front of.
+        None
+    }
+}
+
+/// One [`Gated`] per modelled operation of this service, keyed by the routing key
+/// the model names that operation by.
+///
+/// Every operation is listed, because IAM takes the decision for every one of
+/// them: authorization is a property of the request rather than of the operation's
+/// own error set, so no operation is left unjudged.
+fn gated_table<Eng: Send + Sync + 'static>(
+    engine: &Arc<Eng>,
+) -> HashMap<&'static str, Box<dyn ErasedOperation>> {
+    let mut wrappers: HashMap<&'static str, Box<dyn ErasedOperation>> = HashMap::new();
+    macro_rules! gate {
+        ($($operation:ty),* $(,)?) => {
+            $(
+                wrappers.insert(
+                    <$operation as Operation>::NAME,
+                    Box::new(Gated::<$operation, Eng>::new(Arc::clone(engine)))
+                        as Box<dyn ErasedOperation>,
+                );
+            )*
+        };
+    }
+    gate!(
+        crate::ops::batch_get_traces::BatchGetTraces<Eng>,
+        crate::ops::cancel_trace_retrieval::CancelTraceRetrieval<Eng>,
+        crate::ops::create_group::CreateGroup<Eng>,
+        crate::ops::create_sampling_rule::CreateSamplingRule<Eng>,
+        crate::ops::delete_group::DeleteGroup<Eng>,
+        crate::ops::delete_resource_policy::DeleteResourcePolicy<Eng>,
+        crate::ops::delete_sampling_rule::DeleteSamplingRule<Eng>,
+        crate::ops::get_encryption_config::GetEncryptionConfig<Eng>,
+        crate::ops::get_group::GetGroup<Eng>,
+        crate::ops::get_groups::GetGroups<Eng>,
+        crate::ops::get_indexing_rules::GetIndexingRules<Eng>,
+        crate::ops::get_insight::GetInsight<Eng>,
+        crate::ops::get_insight_events::GetInsightEvents<Eng>,
+        crate::ops::get_insight_impact_graph::GetInsightImpactGraph<Eng>,
+        crate::ops::get_insight_summaries::GetInsightSummaries<Eng>,
+        crate::ops::get_retrieved_traces_graph::GetRetrievedTracesGraph<Eng>,
+        crate::ops::get_sampling_rules::GetSamplingRules<Eng>,
+        crate::ops::get_sampling_statistic_summaries::GetSamplingStatisticSummaries<Eng>,
+        crate::ops::get_sampling_targets::GetSamplingTargets<Eng>,
+        crate::ops::get_service_graph::GetServiceGraph<Eng>,
+        crate::ops::get_time_series_service_statistics::GetTimeSeriesServiceStatistics<Eng>,
+        crate::ops::get_trace_graph::GetTraceGraph<Eng>,
+        crate::ops::get_trace_segment_destination::GetTraceSegmentDestination<Eng>,
+        crate::ops::get_trace_summaries::GetTraceSummaries<Eng>,
+        crate::ops::list_resource_policies::ListResourcePolicies<Eng>,
+        crate::ops::list_retrieved_traces::ListRetrievedTraces<Eng>,
+        crate::ops::list_tags_for_resource::ListTagsForResource<Eng>,
+        crate::ops::put_encryption_config::PutEncryptionConfig<Eng>,
+        crate::ops::put_resource_policy::PutResourcePolicy<Eng>,
+        crate::ops::put_telemetry_records::PutTelemetryRecords<Eng>,
+        crate::ops::put_trace_segments::PutTraceSegments<Eng>,
+        crate::ops::start_trace_retrieval::StartTraceRetrieval<Eng>,
+        crate::ops::tag_resource::TagResource<Eng>,
+        crate::ops::untag_resource::UntagResource<Eng>,
+        crate::ops::update_group::UpdateGroup<Eng>,
+        crate::ops::update_indexing_rule::UpdateIndexingRule<Eng>,
+        crate::ops::update_sampling_rule::UpdateSamplingRule<Eng>,
+        crate::ops::update_trace_segment_destination::UpdateTraceSegmentDestination<Eng>,
+    );
+    wrappers
 }

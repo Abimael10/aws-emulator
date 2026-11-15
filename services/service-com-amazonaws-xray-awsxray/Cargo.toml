@@ -23,7 +23,18 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # `stable_hex_id`: the one deterministic mixing function a service derives a
 # wire-visible id with, rather than a copy per crate.
+# `iam_authorization`: the shared evaluation of IAM policy documents against an
+# action on a resource, so this service's authorization gate
+# (`src/service/authorization.rs`) reads a document exactly as every other
+# service does, and states a refusal in the same words.
+# `iam_role`: which IAM entity a principal ARN names. `arn`: whether a value the
+# request carries is an ARN of this service.
 service-common = { path = "../common" }
+# The STS store, for the identity an access key id speaks for: the principal
+# `sts:GetCallerIdentity` answers for the credentials a request signed with.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The IAM store, for the identity-based policy documents in force on that principal.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # The store an accepted span is DELIVERED to while the account's trace segment
 # destination is CloudWatch Logs — the one CloudWatch Logs' own readers answer
 # from, so a delivered span and `FilterLogEvents` cannot disagree.
