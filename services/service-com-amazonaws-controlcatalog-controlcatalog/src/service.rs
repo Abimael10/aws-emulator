@@ -46,6 +46,7 @@ use smithy_server_runtime::{
 use std::sync::Arc;
 
 use ::aws_smithy_schema::Schema;
+use ::service_common::relayed_refusal::{relayed_refusal_message, RelayedCall};
 use ::service_common::validation::{list_of_element, unanchored};
 use ::service_common::validation_message::{element_constraint_set, element_set_requirement};
 
@@ -96,15 +97,52 @@ const FILTER_SHAPES: &[&Schema] = {
 pub(crate) const CONTROL_NOT_FOUND_MESSAGE: &str =
     "AWS Control Tower cannot find a control with the ControlArn value that you provided.";
 
-/// What Control Catalog answers a filter it will not accept with: an entry count the
-/// filter does not take, or an entry naming no resource.
+/// The sentence Control Catalog answers a filter it will not accept with: an entry count
+/// the filter does not take, or an entry naming no resource.
 ///
 /// One sentence for the whole class, by the rule on [`CONTROL_NOT_FOUND_MESSAGE`]: the
 /// filter member at fault and the number of entries the caller sent are both absent
 /// from it, so two operations refusing two different filter members answer with
-/// identical text.
-pub(crate) const INVALID_FILTER_MESSAGE: &str =
+/// identical text. It is the FIXED part of [`invalid_filter_message`], which is the whole
+/// message.
+pub(crate) const INVALID_FILTER_SENTENCE: &str =
     "The provided filter is not valid. Ensure that each part of the filter is valid, and try again.";
+
+/// The component Control Catalog delegates the ontology taxonomy to — the catalog of
+/// domains, objectives and common controls the filtered list operations narrow — named as
+/// the envelope of a refusal that component raised reports it.
+///
+/// A filtered listing's filter semantics are evaluated by that component rather than by
+/// the catalog front door, so the exception Control Catalog answers with is one it
+/// SURFACES: the envelope names who decided the refusal. The refusals the front door
+/// decides for itself carry no envelope — an unknown control ARN
+/// ([`CONTROL_NOT_FOUND_MESSAGE`]), an unusable cursor
+/// ([`crate::state::INVALID_NEXT_TOKEN_MESSAGE`]) and the boundary constraint walk
+/// ([`constraint_envelope`]) all answer the bare text.
+const ONTOLOGY_COMPONENT: &str = "ControlCatalogOntology";
+
+/// The HTTP status a component that raised this service's modeled `ValidationException`
+/// answered the surfaced call with, and so the status its envelope reports: the `@httpError`
+/// the model declares for that shape (`smithy_query(query="operation",
+/// operation="ListObjectives,ListCommonControls")` — `ValidationException`, `errorKind`
+/// `client`, `@httpError 400`), which is also the status this service answers the caller.
+const VALIDATION_EXCEPTION_STATUS: u16 = 400;
+
+/// What Control Catalog answers a filter it will not accept with, in full: the class's one
+/// fixed sentence ([`INVALID_FILTER_SENTENCE`]), then the envelope of the exception the
+/// component that evaluated the filter raised ([`ONTOLOGY_COMPONENT`]).
+///
+/// The envelope carries that refusal's OWN request id, so the message cannot be a
+/// compile-time constant: it is assembled per refusal, here, where the error is built. The
+/// envelope's form is the workspace's single rendering of a surfaced refusal
+/// (`service_common::relayed_refusal`), so a client parses the component, the status and
+/// the request id back out of one form whichever emulated service surfaced the call.
+pub(crate) fn invalid_filter_message() -> String {
+    relayed_refusal_message(
+        INVALID_FILTER_SENTENCE,
+        RelayedCall::once(ONTOLOGY_COMPONENT, VALIDATION_EXCEPTION_STATUS),
+    )
+}
 
 /// Render one constraint violation the way Control Catalog states it: the member
 /// path and the violated constraint, and NOTHING of the value that was rejected.

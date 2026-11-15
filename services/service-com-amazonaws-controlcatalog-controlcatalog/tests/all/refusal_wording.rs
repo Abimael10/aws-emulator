@@ -4,12 +4,16 @@
 //!
 //! Sibling of `validation_messages`, which covers the refusals the boundary constraint
 //! walk reports (the `N validation error(s) detected: ` envelope). The rule here is
-//! about the refusals a handler decides for itself, where nothing about the request's
-//! shape is wrong: a control ARN the catalog does not publish, and a filter an
-//! operation will not accept. Each such class carries ONE fixed sentence — a property
-//! of the class, not of the request — so the text is byte-identical whatever ARN,
-//! filter member or element count the caller sent, and no part of the request is
-//! rendered into it.
+//! about the refusals a handler answers, where nothing about the request's shape is
+//! wrong: a control ARN the catalog does not publish, and a filter an operation will not
+//! accept. Each such class carries ONE fixed sentence — a property of the class, not of
+//! the request — so that sentence is byte-identical whatever ARN, filter member or
+//! element count the caller sent, and no part of the request is rendered into it.
+//!
+//! The invalid-filter class is one the service SURFACES from the component that evaluates
+//! the filter, so its sentence is followed by that component's exception envelope, whose
+//! request id belongs to the refusal; the sentence is the fixed head of the message and is
+//! what this suite pins. `surfaced_filter_refusal` covers the envelope itself.
 //!
 //! Both tests are therefore TABLES spanning their class: the not-found rows vary the
 //! partition, the ARN form (both forms GetControl documents), the Region segment and
@@ -35,8 +39,8 @@ use crate::validation_messages::message_of;
 const CONTROL_NOT_FOUND: &str =
     "AWS Control Tower cannot find a control with the ControlArn value that you provided.";
 
-/// The sentence Control Catalog answers a filter it will not accept with, for every
-/// such filter and on every operation that takes one.
+/// The sentence that heads what Control Catalog answers a filter it will not accept with,
+/// for every such filter and on every operation that takes one.
 const INVALID_FILTER: &str =
     "The provided filter is not valid. Ensure that each part of the filter is valid, and try again.";
 
@@ -201,7 +205,8 @@ async fn an_unpublished_control_arn_is_refused_with_the_one_fixed_sentence() {
 }
 
 /// A filter an operation will not accept is refused with the one fixed invalid-filter
-/// sentence — the same text for both filter members, whatever they hold.
+/// sentence heading the message — the same sentence for both filter members, whatever
+/// they hold.
 #[tokio::test]
 async fn an_unacceptable_filter_is_refused_with_the_one_fixed_sentence() {
     let emulator = Emulator::new();
@@ -298,7 +303,17 @@ async fn an_unacceptable_filter_is_refused_with_the_one_fixed_sentence() {
         );
         let message = message_of(&response)
             .unwrap_or_else(|| panic!("case {case:?}: the refusal carries no message: {response:?}"));
-        assert_fixed_sentence(&case, INVALID_FILTER, &message);
+        // The class's sentence is the fixed head of the message; what follows it is the
+        // envelope of the component the refusal was surfaced from.
+        let (sentence, envelope) = message.split_once(" (Service: ").unwrap_or_else(|| {
+            panic!("case {case:?}: the refusal states no surfaced component: {message:?}")
+        });
+        assert_fixed_sentence(&case, INVALID_FILTER, sentence);
+        assert!(
+            envelope.contains("Status Code: ") && envelope.contains("Request ID: "),
+            "case {case:?}: the surfaced envelope states no status and request id, got \
+             {message:?}"
+        );
         for member in ["Domains", "domains", "Objectives", "objectives"] {
             assert!(
                 !message.contains(member),
@@ -306,7 +321,7 @@ async fn an_unacceptable_filter_is_refused_with_the_one_fixed_sentence() {
                  {message:?}"
             );
         }
-        sentences.insert(message);
+        sentences.insert(sentence.to_string());
     }
 
     assert_eq!(

@@ -208,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `CommonControlFilter.Objectives` is one of this service's single-ARN resource
         // filters: it carries one objective ARN at a time and that entry must name an
-        // objective. Which entry counts and which entries are acceptable, the sentence
+        // objective. Which entry counts and which entries are acceptable, the message
         // a filter outside that is refused with, reading the accepted ARN by the
         // objective's identity rather than by the partition it is written in, the one
         // fingerprint dimension the filter contributes to a page token and the

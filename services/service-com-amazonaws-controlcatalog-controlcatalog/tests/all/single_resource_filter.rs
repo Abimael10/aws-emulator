@@ -6,8 +6,9 @@
 //! The rule under test is one rule for the class, not one per operation: a resource
 //! filter list carries at most one entry, that entry must name the resource's ARN, a
 //! list that carries neither (absent or empty) narrows nothing, and anything else is
-//! refused with the service's one fixed invalid-filter sentence. `ListObjectives`
-//! (`ObjectiveFilter.Domains`) and `ListCommonControls`
+//! refused with the service's one fixed invalid-filter sentence (which the component
+//! that evaluated the filter states its envelope after — `surfaced_filter_refusal`).
+//! `ListObjectives` (`ObjectiveFilter.Domains`) and `ListCommonControls`
 //! (`CommonControlFilter.Objectives`) both answer by it, so every row below is run
 //! against both filters and the two are compared with each other.
 //!
@@ -27,8 +28,9 @@ use service_com_amazonaws_controlcatalog_controlcatalog::state::ComAmazonawsCont
 use crate::control_catalog::{by_arn, drain, error_code, Emulator};
 use crate::validation_messages::message_of;
 
-/// The sentence this service answers a filter it does not accept with, on every
-/// operation that takes one.
+/// The sentence that heads what this service answers a filter it does not accept with, on
+/// every operation that takes one. The envelope of the component that evaluated the filter
+/// follows it (`surfaced_filter_refusal`).
 const INVALID_FILTER: &str =
     "The provided filter is not valid. Ensure that each part of the filter is valid, and try again.";
 
@@ -307,11 +309,14 @@ async fn an_unacceptable_single_entry_filter_is_refused_identically_on_both_oper
             let message = message_of(&response).unwrap_or_else(|| {
                 panic!("case {case:?}: the refusal carries no message: {response:?}")
             });
+            let (sentence, _envelope) = message.split_once(" (Service: ").unwrap_or_else(|| {
+                panic!("case {case:?}: the refusal states no surfaced component: {message:?}")
+            });
             assert_eq!(
-                message, INVALID_FILTER,
+                sentence, INVALID_FILTER,
                 "case {case:?}: expected {INVALID_FILTER:?}, got {message:?}"
             );
-            sentences.insert(message);
+            sentences.insert(sentence.to_string());
         }
     }
 

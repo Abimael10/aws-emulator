@@ -559,12 +559,13 @@ impl ResourceFilterEntry for crate::ops::types::ObjectiveResourceFilter {
 /// before it is returned, so what it names is compared with the catalog by the
 /// resource's identity rather than by the partition the caller wrote it in.
 ///
-/// The refusal is the service's one fixed invalid-filter sentence
-/// ([`crate::service::INVALID_FILTER_MESSAGE`]): it names neither the filter member
-/// at fault nor the number of entries sent, so there is nothing to word per cause or
-/// per operation and the sentence itself is the whole error. A handler lifts it into
-/// its own modeled `ValidationException` — the only part of the refusal that is
-/// per-operation.
+/// The refusal is the service's one invalid-filter message
+/// ([`crate::service::invalid_filter_message`]): its sentence names neither the filter
+/// member at fault nor the number of entries sent, so there is nothing to word per cause
+/// or per operation, and the envelope of the component that evaluated the filter follows
+/// it, assembled per refusal because it carries that refusal's own request id. A handler
+/// lifts the message into its own modeled `ValidationException` — the only part of the
+/// refusal that is per-operation.
 pub fn single_resource_filter_arn<Entry: ResourceFilterEntry>(
     kind: &str,
     entries: Option<&[Entry]>,
@@ -573,13 +574,13 @@ pub fn single_resource_filter_arn<Entry: ResourceFilterEntry>(
         return Ok(None);
     };
     if entries.len() > 1 {
-        return Err(crate::service::INVALID_FILTER_MESSAGE.to_string());
+        return Err(crate::service::invalid_filter_message());
     }
     let Some(entry) = entries.first() else {
         return Ok(None);
     };
     let Some(arn) = entry.filter_arn() else {
-        return Err(crate::service::INVALID_FILTER_MESSAGE.to_string());
+        return Err(crate::service::invalid_filter_message());
     };
     Ok(Some(canonical_catalog_arn(kind, arn)))
 }

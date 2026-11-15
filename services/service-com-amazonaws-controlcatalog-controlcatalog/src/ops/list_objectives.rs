@@ -198,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ObjectiveFilter.Domains` is one of this service's single-ARN resource
         // filters: it carries one domain ARN at a time and that entry must name a
-        // domain. Which entry counts and which entries are acceptable, the sentence a
+        // domain. Which entry counts and which entries are acceptable, the message a
         // filter outside that is refused with, reading the accepted ARN by the domain's
         // identity rather than by the partition it is written in, the one fingerprint
         // dimension the filter contributes to a page token and the narrowing of the

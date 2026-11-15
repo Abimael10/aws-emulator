@@ -63,5 +63,7 @@ mod single_resource_filter;
 mod single_resource_filter_paging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/surfaced_filter_refusal.rs"]
+mod surfaced_filter_refusal;
 #[path = "all/validation_messages.rs"]
 mod validation_messages;

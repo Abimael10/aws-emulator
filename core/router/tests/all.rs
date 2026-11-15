@@ -6904,3 +6904,8 @@ mod all_rs_is_a_canonical_declaration_list;
 //! WHY a suite lives in this target rather than in one service crate's own — it drives more
 //! where it is read beside the test it describes and stays current when the suite moves.
 //! This file is the declaration list and nothing else.
+//! in this target. An inner doc comment (`//!`) is legal only before the first item, so
+//! THESE lines are the only place one may stand — past the first item it is `E0753` and
+//! compiles no suite of this target, so a note added further down must be an ordinary `//`
+//! comment, and a note about one declaration belongs in the suite file rather than here.
+//! (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is what points each
