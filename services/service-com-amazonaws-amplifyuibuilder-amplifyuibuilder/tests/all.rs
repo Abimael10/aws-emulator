@@ -128,6 +128,9 @@ mod theme_updates;
 #[path = "all/token_refusal_draws_no_secret.rs"]
 mod token_refusal_draws_no_secret;
 
+#[path = "all/unreadable_request_refusals.rs"]
+mod unreadable_request_refusals;
+
 #[path = "all/update_absent_id_refusal_class.rs"]
 mod update_absent_id_refusal_class;
 

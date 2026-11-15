@@ -139,14 +139,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // A request that fails the model's own input rules is refused for the reason
         // [`INVALID_PARAMETER_EXCEPTION`] is declared for, so it is answered with that
         // shape rather than with the framework's `ValidationException` — a shape this
-        // service's model does not declare, and the one error this service would
-        // otherwise name on the wire (`untyped_errors` strips the discriminator of a
-        // modelled exception, so this is also what makes a boundary refusal leave in
-        // this service's own untyped form). It covers both classes the framework
+        // service's model does not declare. It covers both classes the framework
         // reports structurally — a required member that was absent, and a value
         // outside a declared `@length` / `@range` / `@pattern` / enum / uniqueness
         // bound — because to a caller both are an input parameter this service would
         // not accept, and this service declares no other 400 for one.
+        //
+        // This seam is reached only for the refusals the framework can describe
+        // structurally, so it is not what makes a refusal leave UNTYPED: a request the
+        // framework could not read at all (a body that is not well-formed JSON, a member
+        // carrying the wrong JSON type) reaches no seam and is worded by the framework
+        // itself. Removing the name every one of them arrives with is
+        // [`untyped_errors`]'s job, for every answer of this service alike.
         //
         // The MESSAGE is the one the framework renders for the same violations, so
         // only the code moves: `override_refusal` replaces the code and the message

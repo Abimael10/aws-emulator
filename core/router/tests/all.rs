@@ -1221,3 +1221,10 @@ mod cloudformation_rest_api_redeployment;
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of this
 // file, which the layout check refuses. The `#[path]` is what points each module into
 // `tests/all/`.
+//! pair, keeping the list sorted: one pair per suite and nothing else, so a landing has one
+//! place to insert and nothing to keep consistent.
+//! nothing, so a note below must be an ordinary `//` comment — better still, add a
+//! declaration rather than a note about one.
+//! every service crate's `tests/all.rs`. `tests/all.rs` is a test-target CRATE ROOT, so a
+//! bare `mod` resolves to a SIBLING (`tests/<name>.rs`) — which the layout check refuses:
+//! the `#[path]` is what points each declaration into `tests/all/`.

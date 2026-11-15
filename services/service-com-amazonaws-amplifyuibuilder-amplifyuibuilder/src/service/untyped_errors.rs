@@ -20,47 +20,60 @@
 //! places for every modelled error, so the same refusal arrives typed — and a client
 //! written against either one mishandles the other.
 //!
-//! This module removes the discriminator from the error responses of this service's own
-//! modelled exceptions. Everything else about the response is left exactly as the
-//! framework rendered it: the status, the `message`, every other member and every other
-//! header, and the whole success path.
+//! This module removes the discriminator from every failure this service answers.
+//! Everything else about the response is left exactly as the framework rendered it: the
+//! status, the `message`, every other member and every other header, and the whole success
+//! path.
 //!
-//! What it deliberately leaves typed is a code that is NOT one of this service's modelled
-//! exceptions (see [`MODELLED_EXCEPTIONS`]): the scaffold's `NotImplemented` (501) is the
+//! What it deliberately leaves typed is the one code that is NOT an AmplifyUIBuilder error
+//! at all (see [`EMULATOR_SIGNALS`]): the scaffold's `NotImplemented` (501) is the
 //! emulator's own signal for "nobody has written this operation yet" — AmplifyUIBuilder has
 //! no such error, so dressing it as one of its refusals would hide what it reports.
 //!
-//! A request the framework refused before any handler ran reaches here already naming one
-//! of this service's own exceptions, because this service's refusal seam
-//! ([`crate::service::EmulatedService`]'s `override_refusal`) answers that refusal with the
-//! shape the model declares for an invalid input value; so it loses its discriminator here
-//! like every other refusal of this service, and no response names the framework's own
-//! `ValidationException`, which this service's model does not declare.
+//! Every other code reaching here names an answer to an AmplifyUIBuilder call, whichever
+//! layer worded it, so every one of them loses its name:
+//!
+//! * one of the exception shapes this service's model declares — answered by a handler, or
+//!   by this service's refusal seam ([`crate::service::EmulatedService`]'s
+//!   `override_refusal`), which words the refusals the framework describes structurally (an
+//!   absent required member, a value outside a declared bound) as the shape the model
+//!   declares for an invalid input value; and
+//! * a shape the FRAMEWORK had to word itself because the request could not be READ, and so
+//!   reached no refusal seam: a body that is not well-formed JSON, or a member carrying the
+//!   wrong JSON type, is rendered as `ValidationException`, and a body the codec rejects for
+//!   any other reason as `SerializationException` — neither of which
+//!   `com.amazonaws.amplifyuibuilder` declares. A request AmplifyUIBuilder cannot read is
+//!   still a request AmplifyUIBuilder refuses, so it is answered the way this service
+//!   refuses: the status and a `message`, with nothing a client's modelled-exception
+//!   classes could match on.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_types::body::SdkBody;
 use serde_json::Value;
 use smithy_server_runtime::{BoxFuture, ErasedOperation, OperationContext, Service};
 
-/// Every exception shape this service's model declares — the codes an AmplifyUIBuilder
-/// error body can name, and so the ones whose discriminator is removed here.
+/// The codes that do NOT name an AmplifyUIBuilder answer, and so keep their name on the
+/// wire: the emulator's own "nobody has written this operation yet" signal, which it
+/// answers with HTTP 501 (`crate::scaffolded`). AmplifyUIBuilder declares no such error, so
+/// reporting it in this service's own untyped form would hide what the emulator is saying.
 ///
-/// Source: the exception shapes of this service's model, which are the `errors` entries of
-/// its operations, e.g.
+/// Every other code is one of this service's answers. The codes a HANDLER can name are the
+/// exception shapes the model declares, which are the `errors` entries of its operations,
+/// e.g.
 /// `smithy_query(query="operation",operation="CreateComponent,GetComponent,DeleteComponent,UpdateComponent,PutMetadataFlag",model_path="services/service-com-amazonaws-amplifyuibuilder-amplifyuibuilder/smithy-model/com-amazonaws-amplifyuibuilder-amplifyuibuilder.json")`
 /// — `InternalServerException` (500), `InvalidParameterException` (400),
 /// `ResourceConflictException` (409), `ResourceNotFoundException` (404),
 /// `ServiceQuotaExceededException` (402), `ThrottlingException` (429) and
-/// `UnauthorizedException` (401).
-const MODELLED_EXCEPTIONS: [&str; 7] = [
-    "InternalServerException",
-    "InvalidParameterException",
-    "ResourceConflictException",
-    "ResourceNotFoundException",
-    "ServiceQuotaExceededException",
-    "ThrottlingException",
-    "UnauthorizedException",
-];
+/// `UnauthorizedException` (401). A refusal the framework words BEFORE a handler runs can
+/// also name a shape the model does not declare — the framework's own `ValidationException`
+/// or `SerializationException` for a request it could not read — and that is this service's
+/// refusal of the call just the same, so it is listed nowhere here and loses its name like
+/// the rest.
+///
+/// An authentication refusal is not in either group: it is answered before this service's
+/// response path runs (the router renders it from the credential check, ahead of the
+/// operation), so no code of the signing layer reaches here to be classified.
+const EMULATOR_SIGNALS: [&str; 1] = ["NotImplemented"];
 
 /// The response header restJson1 resolves an error shape from.
 const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
@@ -81,17 +94,18 @@ fn shape_name(raw: &str) -> &str {
     after_namespace.split(':').next().unwrap_or(after_namespace)
 }
 
-/// Whether `raw` names one of this service's own modelled exceptions.
-fn is_modelled_exception(raw: &str) -> bool {
-    MODELLED_EXCEPTIONS.contains(&shape_name(raw))
+/// Whether `raw` names one of the emulator's own signals ([`EMULATOR_SIGNALS`]) rather than
+/// an answer AmplifyUIBuilder gave — i.e. whether it keeps its name on the wire.
+fn is_emulator_signal(raw: &str) -> bool {
+    EMULATOR_SIGNALS.contains(&shape_name(raw))
 }
 
 /// The error body with its discriminator removed, or `None` when there is nothing to
 /// remove: the body is not a JSON object, it carries no discriminator member, or the code
-/// it names is not one of this service's modelled exceptions.
+/// it names is one of the emulator's own signals rather than an AmplifyUIBuilder answer.
 ///
-/// `header_code` only classifies — it decides whether a code found in the BODY belongs to
-/// this service when the body's own value is ambiguous — so a body carrying no
+/// `header_code` only classifies — it decides whether a code found in the BODY is one of
+/// those signals when the body's own value is ambiguous — so a body carrying no
 /// discriminator member is left to its renderer byte for byte rather than re-serialized.
 fn without_discriminator(body: &[u8], header_code: Option<&str>) -> Option<Vec<u8>> {
     let mut document: Value = serde_json::from_slice(body).ok()?;
@@ -100,8 +114,7 @@ fn without_discriminator(body: &[u8], header_code: Option<&str>) -> Option<Vec<u
         .iter()
         .find_map(|member| object.get(*member).and_then(Value::as_str))
         .map(str::to_string)?;
-    if !is_modelled_exception(&named) && header_code.is_none_or(|code| !is_modelled_exception(code))
-    {
+    if is_emulator_signal(&named) || header_code.is_some_and(is_emulator_signal) {
         return None;
     }
     for member in DISCRIMINATOR_MEMBERS {
@@ -110,24 +123,24 @@ fn without_discriminator(body: &[u8], header_code: Option<&str>) -> Option<Vec<u
     serde_json::to_vec(&document).ok()
 }
 
-/// The response as AmplifyUIBuilder answers it: an error body of one of this service's
-/// modelled exceptions with no error-type discriminator in it, and no `x-amzn-errortype`
-/// header beside it.
+/// The response as AmplifyUIBuilder answers it: an error body with no error-type
+/// discriminator in it, and no `x-amzn-errortype` header beside it.
 ///
-/// A response that is not a failure, or whose error body this service does not own (see
-/// [`without_discriminator`]), is returned untouched — status, headers and every byte of
-/// the body exactly as the renderer wrote them.
+/// A response that is not a failure, or that reports one of the emulator's own signals
+/// rather than an answer of this service (see [`without_discriminator`]), is returned
+/// untouched — status, headers and every byte of the body exactly as the renderer wrote
+/// them.
 pub fn untyped(mut resp: RtResponse) -> RtResponse {
     if resp.status().as_u16() < 400 {
         return resp;
     }
     // The header and the body are two independent places a client reads the code from, so
     // each is removed on its own: a failure whose body is absent, streamed or not JSON
-    // still loses the header when the header names one of this service's exceptions.
+    // still loses the header when the header names an answer of this service.
     let header_code = resp.headers().get(ERROR_TYPE_HEADER).map(str::to_string);
     if header_code
         .as_deref()
-        .is_some_and(is_modelled_exception)
+        .is_some_and(|code| !is_emulator_signal(code))
     {
         resp.headers_mut().remove(ERROR_TYPE_HEADER);
     }
@@ -301,26 +314,59 @@ mod tests {
         }
     }
 
-    /// Nothing to strip: a code this service does not model — the scaffold's 501 and the
-    /// framework's own `ValidationException`, which no response of this service names any
-    /// more — a body carrying no code at all, and a body that is not a JSON object are all
-    /// left alone.
+    /// Nothing to strip: the emulator's own signal, which is not an answer of this service,
+    /// a body carrying no code at all, and a body that is not a JSON object are all left
+    /// alone — in the signal's case whichever place names it.
     #[test]
     fn a_body_this_service_does_not_own_is_left_alone() {
-        for (label, body) in [
-            ("the scaffold's 501", r#"{"__type":"NotImplemented","Message":"no"}"#),
+        for (label, body, header) in [
             (
-                "a shape this service's model does not declare",
-                r#"{"__type":"ValidationException","Message":"no"}"#,
+                "the scaffold's 501",
+                r#"{"__type":"NotImplemented","Message":"no"}"#,
+                None,
             ),
-            ("no code at all", r#"{"Message":"no"}"#),
-            ("not an object", r#"["ResourceNotFoundException"]"#),
-            ("not JSON", "<Error/>"),
+            (
+                "the scaffold's 501 named by the header alone",
+                r#"{"__type":"ValidationException","Message":"no"}"#,
+                Some("NotImplemented"),
+            ),
+            ("no code at all", r#"{"Message":"no"}"#, None),
+            ("not an object", r#"["ResourceNotFoundException"]"#, None),
+            ("not JSON", "<Error/>", None),
         ] {
             assert!(
-                without_discriminator(body.as_bytes(), None).is_none(),
+                without_discriminator(body.as_bytes(), header).is_none(),
                 "case {label:?}: expected no rewrite"
             );
+        }
+    }
+
+    /// A refusal the FRAMEWORK worded itself, because the request could not be read at all,
+    /// names a shape this service's model does not declare — and loses it here all the same,
+    /// because the call it refuses is an AmplifyUIBuilder call. One row per code the
+    /// framework's JSON renderer can pick for such a request
+    /// (`vendor/smithy-server-runtime/src/pre_dispatch.rs`), in each spelling a
+    /// discriminator can arrive in.
+    #[test]
+    fn a_refusal_the_framework_worded_itself_loses_its_discriminator_too() {
+        for code in ["ValidationException", "SerializationException"] {
+            for member in DISCRIMINATOR_MEMBERS {
+                let body = format!(r#"{{"{member}":"{code}","message":"unreadable"}}"#);
+                let rewritten = without_discriminator(body.as_bytes(), Some(code))
+                    .unwrap_or_else(|| panic!("case {code:?}/{member:?}: expected a rewrite"));
+                let document = decoded(&rewritten);
+                assert!(
+                    DISCRIMINATOR_MEMBERS
+                        .iter()
+                        .all(|member| document.get(*member).is_none()),
+                    "case {code:?}/{member:?}: no discriminator may survive, got {document:?}"
+                );
+                assert_eq!(
+                    document.get("message").and_then(Value::as_str),
+                    Some("unreadable"),
+                    "case {code:?}/{member:?}: the message must survive, got {document:?}"
+                );
+            }
         }
     }
 
@@ -368,8 +414,8 @@ mod tests {
     }
 
     /// A failure whose body carries no code — an empty one, or one that is not JSON —
-    /// still loses the header when the header names one of this service's exceptions, and
-    /// keeps it when it names something else.
+    /// still loses the header when the header names an answer of this service, and keeps it
+    /// when it names the emulator's own signal.
     #[test]
     fn the_header_is_dropped_even_when_the_body_cannot_be_rewritten() {
         for (case, body, code, kept) in [
