@@ -2821,6 +2821,11 @@ mod instance_ids_and_instance_types;
 mod availability_zone_display;
 mod instances_and_filters;
 mod vpcs_and_security_groups;
+/// The default subnet of one Availability Zone: the block of its default VPC it takes, the one
+/// a zone already has, and the refusals a request for one is answered with. Everything it
+/// declares is re-exported below, so a handler reaches it as
+/// `crate::state::default_subnet_cidr_block` like any other primitive of this module.
+mod default_subnets;
 mod store;
 /// The bundle-task store's identity and refusals: the prefix a bundle task id carries, the
 /// code EC2 answers for one it cannot resolve, and the one reading of a request-named bundle
@@ -2840,6 +2845,7 @@ pub use retired_api_actions::*;
 pub use parameter_bounds::*;
 pub use store::*;
 pub use vpcs_and_security_groups::*;
+pub use default_subnets::*;
 pub use instances_and_filters::*;
 pub use instance_ids_and_instance_types::*;
 pub use availability_zone_display::*;

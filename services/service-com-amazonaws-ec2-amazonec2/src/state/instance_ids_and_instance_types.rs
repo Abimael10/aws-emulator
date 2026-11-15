@@ -859,6 +859,18 @@ pub fn availability_zones_in_region(region: &str) -> Vec<AvailabilityZoneRecord>
         .collect()
 }
 
+/// The zone NAMES of `zones`, which is what a request naming a zone by name is compared
+/// against — and what a refusal lists as the values that Region offers for that member.
+pub fn zone_names(zones: &[AvailabilityZoneRecord]) -> Vec<String> {
+    zones.iter().map(|zone| zone.zone_name.clone()).collect()
+}
+
+/// The zone IDS of `zones`, the same reading as [`zone_names`] for the member a request names
+/// a zone by id under.
+pub fn zone_ids(zones: &[AvailabilityZoneRecord]) -> Vec<String> {
+    zones.iter().map(|zone| zone.zone_id.clone()).collect()
+}
+
 /// The Availability Zone of `zones` whose `select`ed form is `value`, or the refusal EC2
 /// answers for a zone the Region does not have.
 ///

@@ -33,10 +33,21 @@ mod volume_create_notifications;
 // address carries no public DNS name. Declared beside `prefix_lists` for the reason the note
 // above gives: the sorted neighbourhood and the tail of this file are where every new ec2
 // suite inserts its lines.
+// An account's EGRESS-ONLY internet gateways: the create that mints one for a VPC and attaches
+// it, the report that selects and pages over them, the delete that takes one away, and what
+// each of the three refuses. Declared FIRST for the reason the note above gives: the sorted
 // `DescribeSnapshotAttribute`: the one attribute a read reports of a snapshot of each side of
 // the account-visible inventory — who may create a volume from it and the Marketplace codes it
 // is billed through — plus what it refuses. Declared beside `prefix_lists` for the reason the
 // note above gives: the sorted neighbourhood and the tail of this file are where every new ec2
+// `ModifyIpamPool`: the members a modification writes onto a stored IPAM pool and the ones it
+// leaves alone, the allocation tag rules it adds and removes, and what it refuses. Declared
+// FIRST for the reason the note above gives: the sorted neighbourhood and the tail of this
+// file are where every new ec2 suite inserts its lines.
+#[path = "all/create_default_subnet.rs"]
+mod create_default_subnet;
+#[path = "all/modify_ipam_pool.rs"]
+mod modify_ipam_pool;
 #[path = "all/snapshot_attributes.rs"]
 mod snapshot_attributes;
 // Which resource ids a tagging call resolves, over the taggable resource kinds beside the
@@ -44,13 +55,8 @@ mod snapshot_attributes;
 // and through `DescribeTags`, and an id that names nothing is refused in its kind's words.
 // Declared beside `prefix_lists` for the reason the note above gives: the sorted
 // neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
-// What a refusal SAYS about the value it could not use: a customer-owned address pool id
-// answered by the FORM of the value, the one sentence every read of a prefix list words its
-// not-found with, and the LEAF member a rule missing a required port range or ICMP pair names.
-// Declared beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood
-// and the tail of this file are where every new ec2 suite inserts its lines.
-#[path = "all/refusal_names_the_shape_and_the_missing_leaf.rs"]
-mod refusal_names_the_shape_and_the_missing_leaf;
+#[path = "all/egress_only_internet_gateways.rs"]
+mod egress_only_internet_gateways;
 #[path = "all/read_optional_members.rs"]
 mod read_optional_members;
 #[path = "all/prefix_lists.rs"]
@@ -59,6 +65,8 @@ mod prefix_lists;
 // figures, the attachment limit, the local devices, the network performance, the processor's
 // sustained frequency, the core counts and the host features of each one, served from that
 // type's own published catalog row rather than scaled from the size multiplier in its name.
+// Declared beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood
+// and the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/published_nvme_compute_catalog_rows.rs"]
 mod published_nvme_compute_catalog_rows;
 // `ModifyInstanceAttribute`: the one attribute a modify writes onto the stored instance, read
@@ -840,10 +848,6 @@ mod capacity_manager_attributes;
 // concurrent ec2 landings insert their lines.
 #[path = "all/accept_capacity_reservation_billing_ownership.rs"]
 mod accept_capacity_reservation_billing_ownership;
-// What `AssociateCapacityReservationBillingOwner` writes: the pending billing assignment
-// request a Capacity Reservation owner initiates for a consumer account, and what it refuses.
-#[path = "all/associate_capacity_reservation_billing_owner.rs"]
-mod associate_capacity_reservation_billing_owner;
 #[path = "all/capacity_reservation_billing_requests.rs"]
 mod capacity_reservation_billing_requests;
 // Which Region `CreateCapacityReservationCancellationQuote` resolves the reservation it
@@ -1485,6 +1489,15 @@ mod vpc_network_lifecycle;
 // unanswered request, the overlapping-range failure, and the ids, filters and pages.
 #[path = "all/vpc_peering_connections.rs"]
 mod vpc_peering_connections;
+// What `AcceptVpcPeeringConnection` answers: the peering request the store holds written into
+// `active` with no expiry left, read back through `DescribeVpcPeeringConnections` with both
+// sides' address space — beside the connection already accepted it answers unchanged, and the
+// states, the accepter's account and Region, the ids and the dry run it refuses without
+// answering the request. Declared beside the suite of the create it answers, inside the
+// long-settled block, rather than in the tail every landing appends to: two squash merges of
+// this fix lost the tail to another suite's move and left a duplicate `mod`.
+#[path = "all/accept_vpc_peering_connection.rs"]
+mod accept_vpc_peering_connection;
 #[path = "all/vpc_resources_blocking_encryption_enforcement.rs"]
 mod vpc_resources_blocking_encryption_enforcement;
 #[path = "all/vpn_connection_device_types.rs"]
@@ -2419,6 +2432,10 @@ mod taggable_resource_kinds;
 // declared range, and the enum value it reads without regard to case.
 #[path = "all/parameter_refusal_codes.rs"]
 mod parameter_refusal_codes;
+// What `AssociateCapacityReservationBillingOwner` writes: the pending billing assignment
+// request a Capacity Reservation owner initiates for a consumer account, and what it refuses.
+#[path = "all/associate_capacity_reservation_billing_owner.rs"]
+mod associate_capacity_reservation_billing_owner;
 // What `DeleteIpam` records: the stored IPAM written into the transient delete state of its own
 // catalog with the clock owing its removal, answered with every other member unchanged, read back
 // through `DescribeIpams` and then gone with the scopes it contained and the pools created in them
@@ -2426,6 +2443,13 @@ mod parameter_refusal_codes;
 // ones with it, the second delete and the dry run it refuses without writing anything. Declared at
 #[path = "all/delete_ipam.rs"]
 mod delete_ipam;
+// What `PurchaseReservedInstancesOffering` buys: the Reserved Instance it stores out of the
+// terms the offering its id carries was published with, the `payment-pending` or `queued`
+// state it waits in with the clock owing it `active`, the round trip back through
+// `DescribeReservedInstances` — and the offering-id form, the dry-run verdict, the count and
+// the limit price it refuses without buying anything. Declared at the tail of this file,
+#[path = "all/purchase_reserved_instances_offering.rs"]
+mod purchase_reserved_instances_offering;
 // What `DeleteTransitGatewayMeteringPolicyEntry` records: the entry the metering policy the
 // request names holds at the rule number it names taken OUT of the store and reported in the
 // state its catalog gives one a delete has removed, with every other member exactly as it was
@@ -2434,16 +2458,18 @@ mod delete_ipam;
 // anything. Declared at the tail of this file, which is where every new ec2 suite lands.
 #[path = "all/delete_transit_gateway_metering_policy_entry.rs"]
 mod delete_transit_gateway_metering_policy_entry;
-// An account's EGRESS-ONLY internet gateways: the create that mints one for a VPC and attaches
-// it, the report that selects and pages over them, the delete that takes one away, and what
-// each of the three refuses. Declared FIRST for the reason the note above gives: the sorted
-#[path = "all/egress_only_internet_gateways.rs"]
-mod egress_only_internet_gateways;
 // The per-instance-type rows the catalog publishes for a network optimized compute family —
 // its memory, EBS, network, processor, core-count and host-feature members, beside two sizes
 // of two other compute families — and the whole member set each of them carries. Declared
 #[path = "all/published_network_optimized_compute_catalog_rows.rs"]
 mod published_network_optimized_compute_catalog_rows;
+#[path = "all/provision_ipam_pool_cidr.rs"]
+mod provision_ipam_pool_cidr;
+// What a refusal SAYS about the value it could not use: a customer-owned address pool id
+// answered by the FORM of the value, the one sentence every read of a prefix list words its
+// not-found with, and the LEAF member a rule missing a required port range or ICMP pair names.
+#[path = "all/refusal_names_the_shape_and_the_missing_leaf.rs"]
+mod refusal_names_the_shape_and_the_missing_leaf;
 // What `DeleteVpcEndpointServiceConfigurations` removes: every endpoint service configuration the
 // ids it resolves name, with the connections to each service, beside the ids it reports in
 // `Unsuccessful` with their own cause — a service a connection is still attached to among them —
@@ -2456,30 +2482,6 @@ mod delete_vpc_endpoint_service_configurations;
 // refused as unresolvable. Declared beside the delete above, whose round trip it closes.
 #[path = "all/modify_vpc_endpoint_service_configuration.rs"]
 mod modify_vpc_endpoint_service_configuration;
-// `ModifyIpamPool`: the members a modification writes onto a stored IPAM pool and the ones it
-// leaves alone, the allocation tag rules it adds and removes, and what it refuses. Declared
-// FIRST for the reason the note above gives: the sorted neighbourhood and the tail of this
-// file are where every new ec2 suite inserts its lines.
-#[path = "all/modify_ipam_pool.rs"]
-mod modify_ipam_pool;
-// What `AcceptVpcPeeringConnection` answers: the peering request the store holds written into
-// `active` with no expiry left, read back through `DescribeVpcPeeringConnections` with both
-// sides' address space — beside the connection already accepted it answers unchanged, and the
-// states, the accepter's account and Region, the ids and the dry run it refuses without
-// answering the request. Declared beside the suite of the create it answers, inside the
-// long-settled block, rather than in the tail every landing appends to: two squash merges of
-// this fix lost the tail to another suite's move and left a duplicate `mod`.
-#[path = "all/accept_vpc_peering_connection.rs"]
-mod accept_vpc_peering_connection;
-// What `PurchaseReservedInstancesOffering` buys: the Reserved Instance it stores out of the
-// terms the offering its id carries was published with, the `payment-pending` or `queued`
-// state it waits in with the clock owing it `active`, the round trip back through
-// `DescribeReservedInstances` — and the offering-id form, the dry-run verdict, the count and
-// the limit price it refuses without buying anything. Declared at the tail of this file,
-#[path = "all/purchase_reserved_instances_offering.rs"]
-mod purchase_reserved_instances_offering;
-#[path = "all/provision_ipam_pool_cidr.rs"]
-mod provision_ipam_pool_cidr;
 // How `DescribeVpcEndpointServiceConfigurations` selects and pages the account's own endpoint
 // services: the values of one filter joined with an OR and matched with wildcards, several
 // filters joined with an AND, `ServiceIds` naming a service once however often it is repeated,

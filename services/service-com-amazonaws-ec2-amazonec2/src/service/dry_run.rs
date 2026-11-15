@@ -76,6 +76,7 @@ pub const OPERATIONS_WHOSE_HANDLER_ANSWERS_NOT_IMPLEMENTED: &[&str] = &[
     "AssociateSubnetCidrBlock",
     "AssociateVpcCidrBlock",
     "CreateCapacityReservation",
+    "CreateDefaultSubnet",
     "CreateNatGateway",
     "CreateNetworkInterface",
     "CreateRoute",

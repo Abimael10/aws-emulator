@@ -759,9 +759,7 @@ impl ComAmazonawsEc2Amazonec2State {
             let Ok(offset) = u32::try_from(index) else {
                 break;
             };
-            let Some(cidr_block) =
-                nth_subnet_cidr_block(vpc_cidr_block, DEFAULT_SUBNET_PREFIX_LENGTH, offset)
-            else {
+            let Some(cidr_block) = default_subnet_cidr_block(vpc_cidr_block, offset) else {
                 continue;
             };
             inserted.push(self.insert_subnet(SubnetSpec {

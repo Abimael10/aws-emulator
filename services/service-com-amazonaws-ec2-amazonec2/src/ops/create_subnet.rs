@@ -252,12 +252,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .find(|zone| zone.zone_name == zone_name)
                 .cloned()
-                .ok_or_else(|| unknown_zone("availabilityZone", zone_name, zone_names(&zones)))?,
+                .ok_or_else(|| {
+                    unknown_zone("availabilityZone", zone_name, state::zone_names(&zones))
+                })?,
             (None, Some(zone_id)) => zones
                 .iter()
                 .find(|zone| zone.zone_id == zone_id)
                 .cloned()
-                .ok_or_else(|| unknown_zone("availabilityZoneId", zone_id, zone_ids(&zones)))?,
+                .ok_or_else(|| {
+                    unknown_zone("availabilityZoneId", zone_id, state::zone_ids(&zones))
+                })?,
             (Some(zone_name), Some(zone_id)) => {
                 // Both members name the same zone from two sides, so they have to agree:
                 // honouring one and ignoring the other would put the subnet somewhere the
@@ -267,7 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .find(|zone| zone.zone_name == zone_name)
                     .cloned()
                     .ok_or_else(|| {
-                        unknown_zone("availabilityZone", zone_name, zone_names(&zones))
+                        unknown_zone("availabilityZone", zone_name, state::zone_names(&zones))
                     })?;
                 if by_name.zone_id != zone_id {
                     return Err(state::invalid_parameter_combination(format!(
@@ -377,31 +381,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The zone NAMES of `zones`, which is what a request naming a zone by name is compared
-/// against.
-fn zone_names(zones: &[crate::state::AvailabilityZoneRecord]) -> Vec<String> {
-    zones.iter().map(|zone| zone.zone_name.clone()).collect()
-}
-
-/// The zone IDS of `zones`, which is what a request naming a zone by id is compared
-/// against.
-fn zone_ids(zones: &[crate::state::AvailabilityZoneRecord]) -> Vec<String> {
-    zones.iter().map(|zone| zone.zone_id.clone()).collect()
-}
-
 /// Refuse a zone the Region does not have, naming the member at fault and the values that
 /// Region offers for it — EC2 answers `InvalidParameterValue` for a zone outside the set
-/// `DescribeAvailabilityZones` reports. `known` is the zone names or the zone ids, picked
-/// by the caller to match the member it is refusing, so this helper never has to read
-/// `member` to decide what to list.
+/// `DescribeAvailabilityZones` reports. `known` is the zone names
+/// ([`crate::state::zone_names`]) or the zone ids ([`crate::state::zone_ids`]), picked by the
+/// caller to match the member it is refusing.
+///
+/// The SENTENCE is [`crate::state::subnet_zones_sentence`], the one wording site every
+/// operation that creates a subnet in a caller-named zone shares; only the error code is this
+/// operation's own.
 fn unknown_zone<E>(
     member: &str,
     requested: &str,
     known: Vec<String>,
 ) -> crate::scaffolded::Scaffolded<E> {
-    crate::state::invalid_parameter_value(format!(
-        "Value ({requested}) for parameter {member} is invalid. \
-         Subnets can currently only be created in the following Availability Zones: {known}.",
-        known = known.join(", "),
+    crate::state::invalid_parameter_value(crate::state::subnet_zones_sentence(
+        member, requested, &known,
     ))
 }

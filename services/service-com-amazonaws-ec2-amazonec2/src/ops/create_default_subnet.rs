@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDefaultSubnet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDefaultSubnet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: gives ONE Availability Zone of the Region the default subnet it is owed in
+//! that Region's default VPC — the zone's own `/20` of the VPC's block, `DefaultForAz` and
+//! public-IP-on-launch — and refuses a zone the Region does not have, a zone that already has
+//! one, and a Region whose default VPC is gone.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDefaultSubnet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +139,195 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDefaultSubnet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDefaultSubnetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state;
+
+        // "Indicates whether to create an IPv6 only subnet" (`Ipv6Native`) — a subnet with no
+        // IPv4 block at all, which this store holds no state for: `insert_subnet` writes an
+        // IPv4 subnet, so an IPv6 only one would be answered with an association it does not
+        // hold. So this MEMBER answers the scaffold's 501, which says the emulator cannot
+        // perform the work, rather than a refusal blaming the caller — the same answer
+        // `CreateSubnet` gives an IPv6 block.
+        if input.ipv6_native.unwrap_or(false) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateDefaultSubnet of an IPv6 only subnet",
+            ));
+        }
+
+        // Which Region's default VPC this subnet belongs in: the Region of the request's own
+        // credential scope, the way every other operation of this crate reads it. The zone the
+        // request names has to be a zone of THAT Region, and the subnet's ARN names it too.
+        let region = state::request_region(ctx.parts());
+        let zones = state::availability_zones_in_region(&region);
+
+        // "Either AvailabilityZone or AvailabilityZoneId must be specified, but not both"
+        // (`CreateDefaultSubnetRequest$AvailabilityZone`) — the two members name one zone from
+        // two sides, and this operation creates the subnet of ONE zone, so a request that
+        // names none says nothing about where to put it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDefaultSubnet"))
+        // The zone is read as its INDEX in the Region's own zone order, because that index is
+        // what decides which block of the default VPC this zone's subnet takes
+        // ([`state::default_subnet_cidr_block`]).
+        let (zone_index, zone) = match (
+            input
+                .availability_zone
+                .as_deref()
+                .filter(|zone_name| !zone_name.is_empty()),
+            input
+                .availability_zone_id
+                .as_deref()
+                .filter(|zone_id| !zone_id.is_empty()),
+        ) {
+            (None, None) => {
+                return Err(state::missing_parameter(
+                    "Either availabilityZone or availabilityZoneId must be specified, \
+                     but not both",
+                ))
+            }
+            (Some(_), Some(_)) => {
+                return Err(state::invalid_parameter_combination(
+                    "Either availabilityZone or availabilityZoneId must be specified, \
+                     but not both",
+                ))
+            }
+            (Some(zone_name), None) => zones
+                .iter()
+                .enumerate()
+                .find(|(_, zone)| zone.zone_name == zone_name)
+                .map(|(index, zone)| (index, zone.clone()))
+                .ok_or_else(|| {
+                    state::invalid_availability_zone(
+                        "availabilityZone",
+                        zone_name,
+                        &state::zone_names(&zones),
+                    )
+                })?,
+            (None, Some(zone_id)) => zones
+                .iter()
+                .enumerate()
+                .find(|(_, zone)| zone.zone_id == zone_id)
+                .map(|(index, zone)| (index, zone.clone()))
+                .ok_or_else(|| {
+                    state::invalid_availability_zone(
+                        "availabilityZoneId",
+                        zone_id,
+                        &state::zone_ids(&zones),
+                    )
+                })?,
+        };
+        let Ok(zone_index) = u32::try_from(zone_index) else {
+            return Err(state::internal_error(format!(
+                "the Availability Zone '{zone_name}' has no readable position in its Region",
+                zone_name = zone.zone_name,
+            )));
+        };
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "Creates a default subnet … in your default VPC" (`CreateDefaultSubnet`): the
+        // network the account has held in this Region since it existed. Only a Region whose
+        // default VPC was DELETED has none — and a Region that does not exist never had one —
+        // so that is the one case this refuses, as a READ that writes nothing.
+        if !store.holds_or_owes_default_vpc(&region) {
+            return Err(state::default_vpc_does_not_exist());
+        }
+
+        // "You can have only one default subnet per Availability Zone"
+        // (`CreateDefaultSubnet`), so a zone that still has its own is refused rather than
+        // given a second subnet. A Region whose ambient network has not been MATERIALISED yet
+        // owes every one of its zones a default subnet — "when we create a default VPC, we
+        // create a default subnet in each Availability Zone in the Region" (Amazon VPC User
+        // Guide, "Default VPCs"), and the account has held that network since it existed — so
+        // the question is answered off the Region's index rather than by writing the network
+        // first: every refusal here writes nothing.
+        let Some(vpc_id) = store.default_vpc_id(&region) else {
+            return Err(state::default_subnet_already_exists(&zone.zone_name));
+        };
+        if store
+            .default_subnet_in_zone(&vpc_id, &zone.zone_name)
+            .is_some()
+        {
+            return Err(state::default_subnet_already_exists(&zone.zone_name));
+        }
+
+        // "A default subnet with a size /20 IPv4 CIDR block in the specified Availability
+        // Zone": the block THAT zone's default subnet takes out of the default VPC's own
+        // block, from the one definition the whole network's writer uses, so a zone whose
+        // default subnet was deleted gets exactly the block it had back.
+        let Some(vpc_cidr_block) = store.vpcs.get(&vpc_id).and_then(|vpc| vpc.cidr_block.clone())
+        else {
+            return Err(state::internal_error(
+                "the Region's default VPC could not be read back",
+            ));
+        };
+        let Some(cidr_block) = state::default_subnet_cidr_block(&vpc_cidr_block, zone_index) else {
+            return Err(state::internal_error(format!(
+                "the default VPC's block {vpc_cidr_block} holds no default subnet block for \
+                 the Availability Zone '{zone_name}'",
+                zone_name = zone.zone_name,
+            )));
+        };
+
+        // That block is the zone's by the rule above, but the VPC is a network a caller can
+        // also create subnets in by hand: "a subnet CIDR block must not overlap the CIDR block
+        // of an existing subnet in the VPC" (`CreateSubnet`), so a block already taken is
+        // refused rather than served as a second, overlapping subnet.
+        let conflicts = store
+            .subnets
+            .values()
+            .filter(|subnet| subnet.vpc_id.as_deref() == Some(vpc_id.as_str()))
+            .any(|subnet| {
+                subnet
+                    .cidr_block
+                    .as_deref()
+                    .is_some_and(|held| state::ipv4_cidr_blocks_overlap(held, &cidr_block))
+            });
+        if conflicts {
+            return Err(state::invalid_subnet_conflict(&cidr_block));
+        }
+
+        // The store's own count ceiling, asked before anything is written so a store at it
+        // stores nothing. The record carries no caller-chosen bytes at all — this operation
+        // takes neither tags nor a block — so there is nothing to charge against the byte
+        // budget.
+        if !store.has_subnet_capacity() {
+            return Err(state::subnet_limit_exceeded());
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (DryRun).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The subnet itself — the only write on the success path. It is a DEFAULT subnet, so
+        // it carries what the Amazon VPC User Guide gives one ("Default VPCs"):
+        // `DefaultForAz`, and "the auto-assign public IPv4 address attribute set to `true`".
+        // It is stored `available`, the state this call ANSWERS with: creating a subnet is
+        // synchronous, so there is no non-terminal state for the clock to owe a move out of —
+        // the same reading `CreateSubnet` records.
+        let subnet_id = store.insert_subnet(state::SubnetSpec {
+            vpc_id,
+            cidr_block,
+            availability_zone: zone.zone_name,
+            availability_zone_id: zone.zone_id,
+            region,
+            state: state::SUBNET_STATE_AVAILABLE.to_string(),
+            default_for_az: true,
+            map_public_ip_on_launch: true,
+            tags: Vec::new(),
+        });
+
+        // The answer is the record as it was stored, so `CreateDefaultSubnet` and
+        // `DescribeSubnets` cannot drift apart.
+        let Some(subnet) = store.subnets.get(&subnet_id).cloned() else {
+            return Err(state::internal_error(
+                "the default subnet just created could not be read back",
+            ));
+        };
+        Ok(CreateDefaultSubnetOutput {
+            subnet: Some(subnet),
+        })
     }
 }
