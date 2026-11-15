@@ -25,6 +25,11 @@
 //! as it runs, so they are readable while it is still working, and the status a
 //! caller polls for says when the run is over.
 //!
+//! What the job REPORTS as its `JobOutputDataConfig` is its own folder under the
+//! output location the request supplied — the location derived once here, as the
+//! job's id is minted, by [`crate::state::import_job_output_location`] — so two
+//! jobs writing under one supplied location are told apart by what they report.
+//!
 //! The model documents the operation as importing "into an ACTIVE data store",
 //! and only a settled, usable one serves: a `DatastoreId` the service holds no
 //! record for is the modelled `ResourceNotFoundException`, and a record whose
@@ -265,6 +270,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // status that delivery warrants is what the clock owes the job.
         let outcome = store.deliver_import_run(&input.datastore_id, run, now);
         let id = store.next_import_job_id(now);
+        // The job writes its results into a folder of its OWN under the supplied
+        // output location, named for the data store and for this job, so the
+        // location the record holds — the one both read paths report — is
+        // derived HERE, where the job's id is minted, and never re-derived per
+        // read.
+        let output_data_config = crate::state::import_job_output_location(
+            input.job_output_data_config,
+            &input.datastore_id,
+            &id,
+        );
         let job = crate::state::ImportJob {
             id: id.clone(),
             datastore_id: input.datastore_id,
@@ -281,7 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             submitted_at: ::aws_smithy_types::DateTime::from(now),
             ended_at: None,
             input_data_config: input.input_data_config,
-            output_data_config: Some(input.job_output_data_config),
+            output_data_config: Some(output_data_config),
             data_access_role_arn: Some(input.data_access_role_arn),
             // The `Message` travels WITH the status it explains, so a job still
             // `SUBMITTED` cannot report why it ended.

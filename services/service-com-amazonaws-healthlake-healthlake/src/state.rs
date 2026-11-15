@@ -1378,7 +1378,12 @@ pub struct ImportJob {
     pub ended_at: Option<::aws_smithy_types::DateTime>,
     /// The `InputDataConfig` the request supplied, reported back verbatim.
     pub input_data_config: InputDataConfig,
-    /// The `JobOutputDataConfig` the request supplied, reported back verbatim.
+    /// `JobOutputDataConfig`: the output location this job writes its results
+    /// into, derived ONCE — when the job is minted — from the location the
+    /// request supplied and the job's own folder under it, by
+    /// [`import_job_output_location`]. Reported as held, so
+    /// `DescribeFHIRImportJob` and `ListFHIRImportJobs` cannot disagree about
+    /// where a job wrote.
     pub output_data_config: Option<OutputDataConfig>,
     /// The `DataAccessRoleArn` the request supplied.
     pub data_access_role_arn: Option<String>,

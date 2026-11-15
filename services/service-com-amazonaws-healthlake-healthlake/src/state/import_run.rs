@@ -52,13 +52,18 @@
 //! nothing — an input nothing could be read from, or an emulator retention
 //! ceiling reached — is `FAILED` with the `Message` saying which. Nothing is
 //! reported as imported that the data store does not hold.
+//!
+//! WHERE the job wrote belongs to the same report: an import's results go into a
+//! folder of the job's OWN under the output location the request supplied, so
+//! the location the job reports is derived here too, by
+//! [`import_job_output_location`].
 
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 
 use ::serde_json::Value;
 
-use crate::ops::types::{InputDataConfig, JobProgressReport};
+use crate::ops::types::{InputDataConfig, JobProgressReport, OutputDataConfig, S3Configuration};
 use crate::service::fhir_rest::{is_logical_id, is_resource_type_name, stored_content};
 
 use super::{
@@ -125,6 +130,42 @@ const RESOURCES_PER_YIELD: usize = 256;
 /// How many logical ids an imported resource that carries none offers before the
 /// delivery gives up on it.
 const MAX_ID_MINT_ATTEMPTS: usize = 8;
+
+/// The fixed infix of the folder one FHIR import job writes its results into,
+/// between the data store it imported into and the job itself.
+///
+/// The per-job output folder HealthLake writes under is named
+/// `<DatastoreId>-FHIR_IMPORT-<JobId>`, so this is the one literal text in a
+/// reported output location: everything around it comes from the request and
+/// from the job's own record.
+const IMPORT_JOB_OUTPUT_SEGMENT_INFIX: &str = "-FHIR_IMPORT-";
+
+/// The output location one FHIR import job REPORTS, derived from the location
+/// the request that started it supplied.
+///
+/// An import does not write its results into the supplied location itself: it
+/// writes them into a folder of its OWN under that location, named for the data
+/// store it imported into and for the job
+/// (`<DatastoreId>-FHIR_IMPORT-<JobId>/`), and that job-scoped location is what
+/// `ImportJobProperties$JobOutputDataConfig` states — so two jobs writing under
+/// one supplied location report two distinct locations, each naming the job that
+/// wrote it. The supplied location is joined to the segment by exactly ONE `/`
+/// whether or not it already ends in one, the trailing `/` marks the result as a
+/// folder, and `KmsKeyId` is reported exactly as supplied.
+pub fn import_job_output_location(
+    supplied: OutputDataConfig,
+    datastore_id: &str,
+    job_id: &str,
+) -> OutputDataConfig {
+    let OutputDataConfig::S3Configuration(configuration) = supplied;
+    OutputDataConfig::S3Configuration(S3Configuration {
+        s3_uri: format!(
+            "{}/{datastore_id}{IMPORT_JOB_OUTPUT_SEGMENT_INFIX}{job_id}/",
+            configuration.s3_uri.trim_end_matches('/')
+        ),
+        kms_key_id: configuration.kms_key_id,
+    })
+}
 
 /// The bytes one megabyte of the `JobProgressReport` size members stands for.
 ///
@@ -507,13 +548,34 @@ fn outcome_status(
     (JobStatus::CompletedWithErrors, Some(partial))
 }
 
+/// `JobProgressReport$Throughput`, "the transaction rate the import job is
+/// processed at", for a run that scanned `scanned_bytes`.
+///
+/// The rate is the data the run took in over the time the run OCCUPIES — the
+/// span between the job's `SubmitTime` and the `EndTime` the clock owes it,
+/// [`IMPORT_JOB_RUN`] — stated in the megabytes the report's own size members
+/// are stated in ([`BYTES_PER_MB`]) per second. It is stated to one decimal
+/// place, so an import of well under a megabyte is reported as the `0.0` such a
+/// rate rounds to rather than as a long fraction, and every run reports a rate:
+/// a run that scanned nothing is `0.0`, not an absent member.
+fn throughput(scanned_bytes: usize) -> f64 {
+    let megabytes_per_second =
+        (scanned_bytes as f64 / BYTES_PER_MB) / IMPORT_JOB_RUN.as_secs_f64();
+    (megabytes_per_second * THROUGHPUT_DECIMALS).round() / THROUGHPUT_DECIMALS
+}
+
+/// The scale that states a reported `Throughput` to one decimal place.
+const THROUGHPUT_DECIMALS: f64 = 10.0;
+
 /// The `JobProgressReport` one run produced.
 ///
-/// Every member is a count or a size the run itself measured; a member nothing
-/// measured is left ABSENT rather than reported as zero — `Throughput` is a rate
-/// nothing timed, and `TotalFilesConverted` / `TotalResourcesGenerated` are
-/// documented as populated only for an import that runs a transformation phase,
-/// which this one does not.
+/// Every member is a count, a size or a rate the run itself measured, and a
+/// member it measured is REPORTED even when what it measured is zero — the one
+/// report AWS serializes carries its `Throughput` alongside the counts. The
+/// members left absent are the ones this run has nothing to measure for:
+/// `TotalFilesConverted` / `TotalResourcesGenerated` are documented as populated
+/// only for an import that runs a transformation phase, which this one does not,
+/// and so are the non-FHIR counts a FHIR import does not convert.
 fn progress_report(
     run: &ImportRun,
     imported: usize,
@@ -530,6 +592,7 @@ fn progress_report(
         total_number_of_files_read_with_customer_error: Some(count(run.files_read_with_error)),
         total_number_of_scanned_non_fhir_files: Some(count(run.non_fhir_files)),
         total_size_of_scanned_non_fhir_files_in_mb: Some(run.non_fhir_bytes as f64 / BYTES_PER_MB),
+        throughput: Some(throughput(run.scanned_bytes)),
         ..JobProgressReport::default()
     }
 }

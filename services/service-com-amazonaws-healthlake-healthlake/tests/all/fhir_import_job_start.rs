@@ -53,10 +53,13 @@ use crate::fhir_rest_and_validate_source::HealthLake;
 
 /// The `DataAccessRoleArn` every start below carries, satisfying the modelled
 /// `IamRoleArn` pattern (`^arn:aws(-[^:]+)?:iam::[0-9]{12}:role/.+$`).
-const DATA_ACCESS_ROLE_ARN: &str = "arn:aws:iam::111122223333:role/HealthLakeImport";
+pub(crate) const DATA_ACCESS_ROLE_ARN: &str = "arn:aws:iam::111122223333:role/HealthLakeImport";
 
 /// The bucket every input below is staged in, and one no bucket is created for.
-const BUCKET: &str = "healthlake-import-bucket";
+///
+/// `pub(crate)` so the sibling suite that pins the reported output location
+/// stages its inputs in the SAME bucket through the same helpers.
+pub(crate) const BUCKET: &str = "healthlake-import-bucket";
 const UNHELD_BUCKET: &str = "healthlake-bucket-that-was-never-created";
 
 /// A well-formed `DatastoreId` no data store is held for: 32 lowercase hex
@@ -68,13 +71,17 @@ const UNHELD_DATASTORE_ID: &str = "ffffffffffffffffffffffffffffffff";
 /// import job (500 ms) has fallen due.
 const PAST_JOB_RUN: Duration = Duration::from_millis(900);
 
+/// The `KmsKeyId` the output configuration below names, within the modelled
+/// `EncryptionKeyID` bounds.
+pub(crate) const KMS_KEY_ID: &str = "1234abcd-12ab-34cd-56ef-1234567890ab";
+
 /// One `JobOutputDataConfig` the modelled union admits: the member bounds
 /// `smithy_query(query="shape", shape="S3Configuration")` states.
 fn output_data_config() -> Value {
     json!({
         "S3Configuration": {
             "S3Uri": format!("s3://{BUCKET}/output"),
-            "KmsKeyId": "1234abcd-12ab-34cd-56ef-1234567890ab",
+            "KmsKeyId": KMS_KEY_ID,
         }
     })
 }
@@ -90,7 +97,10 @@ fn start_request(datastore_id: &str, s3_uri: &str) -> Value {
 }
 
 /// Dispatch one control-plane call that must succeed, returning its body.
-async fn ok(service: &HealthLake, operation: &str, body: &Value) -> Value {
+///
+/// `pub(crate)` so the sibling import suites drive a start through the same
+/// helper rather than each growing a copy.
+pub(crate) async fn ok(service: &HealthLake, operation: &str, body: &Value) -> Value {
     let (status, payload) = service.rpc(operation, body).await;
     assert_eq!(
         status, 200,
@@ -100,7 +110,7 @@ async fn ok(service: &HealthLake, operation: &str, body: &Value) -> Value {
 }
 
 /// A required string member of a response body.
-fn string_at(body: &Value, member: &str) -> String {
+pub(crate) fn string_at(body: &Value, member: &str) -> String {
     body[member]
         .as_str()
         .unwrap_or_else(|| panic!("the response must carry a string {member}, got {body}"))
@@ -108,7 +118,7 @@ fn string_at(body: &Value, member: &str) -> String {
 }
 
 /// The `ImportJobProperties` `DescribeFHIRImportJob` reports for one job.
-async fn describe_job(service: &HealthLake, datastore_id: &str, job_id: &str) -> Value {
+pub(crate) async fn describe_job(service: &HealthLake, datastore_id: &str, job_id: &str) -> Value {
     ok(
         service,
         "DescribeFHIRImportJob",
@@ -119,7 +129,7 @@ async fn describe_job(service: &HealthLake, datastore_id: &str, job_id: &str) ->
 }
 
 /// Every import job `ListFHIRImportJobs` reports for a data store.
-async fn listed_jobs(service: &HealthLake, datastore_id: &str) -> Vec<Value> {
+pub(crate) async fn listed_jobs(service: &HealthLake, datastore_id: &str) -> Vec<Value> {
     ok(
         service,
         "ListFHIRImportJobs",
@@ -169,7 +179,7 @@ async fn read_resource(
 
 /// Create the bucket every input is staged in, through Amazon S3's own
 /// `CreateBucket`.
-async fn create_bucket(service: &HealthLake) {
+pub(crate) async fn create_bucket(service: &HealthLake) {
     let created = service.s3().create_bucket().bucket(BUCKET).send().await;
     assert!(
         created.is_ok(),
@@ -178,7 +188,7 @@ async fn create_bucket(service: &HealthLake) {
 }
 
 /// Stage one input object, through Amazon S3's own `PutObject`.
-async fn stage(service: &HealthLake, key: &str, body: &str) {
+pub(crate) async fn stage(service: &HealthLake, key: &str, body: &str) {
     let put = service
         .s3()
         .put_object()
@@ -197,7 +207,7 @@ async fn stage(service: &HealthLake, key: &str, body: &str) {
 
 /// One FHIR resource of `resource_type` at the logical id `id`, with a content
 /// member that tells one row's resources apart.
-fn resource(resource_type: &str, id: Option<&str>, marker: &str) -> Value {
+pub(crate) fn resource(resource_type: &str, id: Option<&str>, marker: &str) -> Value {
     let mut content = json!({ "resourceType": resource_type, "language": marker });
     if let Some(id) = id {
         content["id"] = json!(id);
@@ -207,7 +217,7 @@ fn resource(resource_type: &str, id: Option<&str>, marker: &str) -> Value {
 
 /// The resources of one input object as newline-delimited JSON — the bulk form
 /// HealthLake documents for import: one resource per line.
-fn ndjson(resources: &[Value]) -> String {
+pub(crate) fn ndjson(resources: &[Value]) -> String {
     resources
         .iter()
         .map(Value::to_string)
@@ -506,7 +516,20 @@ async fn a_start_persists_every_member_it_carried() {
                 "InputDataConfig",
                 json!({ "S3Uri": format!("s3://{BUCKET}/members/") }),
             ),
-            ("JobOutputDataConfig", output_data_config()),
+            (
+                // The output location a job REPORTS is its OWN folder under the
+                // supplied one; the rule is pinned over a set of supplied
+                // locations by `tests/all/fhir_import_job_output_location.rs`.
+                "JobOutputDataConfig",
+                json!({
+                    "S3Configuration": {
+                        "S3Uri": format!(
+                            "s3://{BUCKET}/output/{datastore_id}-FHIR_IMPORT-{job_id}/"
+                        ),
+                        "KmsKeyId": KMS_KEY_ID,
+                    }
+                }),
+            ),
         ] {
             assert_eq!(
                 described[member], expected,
