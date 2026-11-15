@@ -123,6 +123,10 @@ service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 # way, so what it authorizes against is the records `iam:PutUserPolicy` really wrote.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# A deployment package the notification-delivery suite uploads is a .zip archive it writes
+# in memory, so the function a bucket's notification configuration arms really holds the
+# handler that runs on the object event.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # The credential-scoped authorization suite enrols a virtual MFA device the way its holder
 # does, which means computing the one-time pass code that device emits — the HMAC-SHA-1 of its
 # time step (RFC 6238) over the base32 seed the create answered with. `hmac` is already a

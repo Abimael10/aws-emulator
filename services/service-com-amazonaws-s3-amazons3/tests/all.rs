@@ -259,6 +259,8 @@ mod notification_destination_validation;
 mod notification_document_vocabulary;
 #[path = "all/notification_filter_delivery.rs"]
 mod notification_filter_delivery;
+#[path = "all/notification_lambda_handler_run.rs"]
+mod notification_lambda_handler_run;
 #[path = "all/notification_wildcard_event_overlap.rs"]
 mod notification_wildcard_event_overlap;
 #[path = "all/object_acl.rs"]
