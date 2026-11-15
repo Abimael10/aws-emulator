@@ -196,12 +196,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &format!("group {}", input.group_name),
         )?;
 
-        let Some(group) = held else {
+        if held.is_none() {
             return Err(not_found(format!(
                 "The group with name {} cannot be found.",
                 input.group_name
             )));
-        };
+        }
         let policy = store
             .group_inline_policies
             .get(&key)
@@ -214,11 +214,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetGroupPolicyOutput {
-            // The stored entities' own names, so the response reports the group and
-            // the policy as the account holds them rather than as the request
-            // happened to spell them.
-            group_name: group.group_name.clone(),
-            policy_name: policy.policy_name.clone(),
+            // The names the REQUEST spelled: an embedded policy is not a resource of
+            // its own — it has no record, no ARN and no identity apart from the entity
+            // it is embedded in — and IAM resolves both names without regard to case,
+            // so the read restates the addressing the caller used rather than a
+            // spelling the store happens to hold. A caller that compares what it asked
+            // for with what came back therefore sees the policy it asked for.
+            group_name: input.group_name,
+            policy_name: input.policy_name,
             // The stored document, in the form every IAM response carries a policy
             // document in: "policies returned by this operation are URL-encoded compliant
             // with RFC 3986" (`crate::state::reported_policy_document`).

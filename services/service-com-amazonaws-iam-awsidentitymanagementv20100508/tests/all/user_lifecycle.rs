@@ -1459,8 +1459,8 @@ async fn an_inline_policy_set_cannot_exceed_its_aggregate_size_quota() {
 }
 
 /// RULE: an IAM name is not distinguished by case, so one spelling of a policy
-/// name reaches the policy any other spelling of it stored, and a read reports
-/// the name as the account holds it.
+/// name reaches the policy any other spelling of it stored, and a read restates
+/// the names the REQUEST spelled (`tests/all/inline_policy_name_echo.rs`).
 #[tokio::test]
 async fn an_inline_policy_name_is_not_distinguished_by_case() {
     let router = router();
@@ -1500,14 +1500,14 @@ async fn an_inline_policy_name_is_not_distinguished_by_case() {
         );
         assert_eq!(
             element(&body, "UserName"),
-            "Casey",
-            "case ({user:?}, {policy:?}): expected the stored user name, got {:?}",
+            *user,
+            "case ({user:?}, {policy:?}): expected the user name the request spelled, got {:?}",
             element(&body, "UserName")
         );
         assert_eq!(
             element(&body, "PolicyName"),
-            "S3Read",
-            "case ({user:?}, {policy:?}): expected the stored policy name, got {:?}",
+            *policy,
+            "case ({user:?}, {policy:?}): expected the policy name the request spelled, got {:?}",
             element(&body, "PolicyName")
         );
         assert_eq!(
@@ -1519,7 +1519,8 @@ async fn an_inline_policy_name_is_not_distinguished_by_case() {
     }
 
     // A put under another spelling REPLACES that one policy — it does not add a
-    // second — and the stored name becomes the spelling the last put chose.
+    // second — and the stored name becomes the spelling the last put chose, which is
+    // what the entity's own listing reports.
     let replaced = "{\"Sid\":\"two\",\"Statement\":[]}";
     let (status, body) = call(
         &router,
@@ -1546,9 +1547,15 @@ async fn an_inline_policy_name_is_not_distinguished_by_case() {
     );
     assert_eq!(
         element(&body, "PolicyName"),
-        "s3read",
-        "expected the last put's spelling to be the stored one, got {:?}",
+        "S3Read",
+        "expected the read to restate the name it was asked with, got {:?}",
         element(&body, "PolicyName")
+    );
+    let (_, listed) = call(&router, "ListUserPolicies", &[("UserName", "Casey")]).await;
+    assert_eq!(
+        elements(&listed, "member"),
+        vec!["s3read".to_string()],
+        "expected the listing to report the last put's spelling, got {listed}"
     );
 
     // Exactly one policy is embedded, so the user deletes once the one is gone.

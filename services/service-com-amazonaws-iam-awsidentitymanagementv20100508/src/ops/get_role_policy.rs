@@ -175,6 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into()
         };
 
+        // The role whose embedded policy the request addresses, if the account holds one.
         // IAM authorizes its own API: the signing principal's identity-based policies are
         // evaluated before the document is reported, so a caller that may not read a
         // role's embedded document learns that it may not, never whether that role
@@ -182,7 +183,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // in — the held role's own ARN, or, for a name the account holds no role under,
         // the ARN that name would carry at the default path, since there is no other path
         // to attribute it to. A refusal names that role as the request named it.
-        let resource = store.roles.get(&key).map_or_else(
+        let held = store.roles.get(&key);
+        let resource = held.map_or_else(
             || crate::state::role_arn(crate::state::DEFAULT_PATH, &input.role_name),
             |role| role.arn.clone(),
         );
@@ -194,12 +196,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &format!("role {}", input.role_name),
         )?;
 
-        let Some(role) = store.roles.get(&key) else {
+        if held.is_none() {
             return Err(not_found(format!(
                 "The role with name {} cannot be found.",
                 input.role_name
             )));
-        };
+        }
         let policy = store
             .role_inline_policies
             .get(&key)
@@ -212,11 +214,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetRolePolicyOutput {
-            // The stored entities' own names, so the response reports the role and
-            // the policy as the account holds them rather than as the request
-            // happened to spell them.
-            role_name: role.role_name.clone(),
-            policy_name: policy.policy_name.clone(),
+            // The names the REQUEST spelled: an embedded policy is not a resource of
+            // its own — it has no record, no ARN and no identity apart from the entity
+            // it is embedded in — and IAM resolves both names without regard to case,
+            // so the read restates the addressing the caller used rather than a
+            // spelling the store happens to hold. A caller that compares what it asked
+            // for with what came back therefore sees the policy it asked for.
+            role_name: input.role_name,
+            policy_name: input.policy_name,
             // The stored document, in the form every IAM response carries a policy
             // document in: "policies returned by this operation are URL-encoded compliant
             // with RFC 3986" (`crate::state::reported_policy_document`).

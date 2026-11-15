@@ -197,12 +197,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &format!("user {}", input.user_name),
         )?;
 
-        let Some(user) = held else {
+        if held.is_none() {
             return Err(not_found(format!(
                 "The user with name {} cannot be found.",
                 input.user_name
             )));
-        };
+        }
         let policy = store
             .user_inline_policies
             .get(&key)
@@ -215,11 +215,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetUserPolicyOutput {
-            // The stored entities' own names, so the response reports the user and
-            // the policy as the account holds them rather than as the request
-            // happened to spell them.
-            user_name: user.user_name.clone(),
-            policy_name: policy.policy_name.clone(),
+            // The names the REQUEST spelled: an embedded policy is not a resource of
+            // its own — it has no record, no ARN and no identity apart from the entity
+            // it is embedded in — and IAM resolves both names without regard to case,
+            // so the read restates the addressing the caller used rather than a
+            // spelling the store happens to hold. A caller that compares what it asked
+            // for with what came back therefore sees the policy it asked for.
+            user_name: input.user_name,
+            policy_name: input.policy_name,
             // The stored document, in the form every IAM response carries a policy
             // document in: "policies returned by this operation are URL-encoded compliant
             // with RFC 3986" (`crate::state::reported_policy_document`).

@@ -208,8 +208,8 @@ async fn an_embedded_group_policy_reads_back_verbatim() {
 
 /// IAM entity and policy names are unique within the account and "are not
 /// distinguished by case", so a put and a read reach the same policy however either
-/// request spells the names — and the response reports the group as it was created
-/// and the policy as the last put spelled it.
+/// request spells the names — and the read restates the names the REQUEST spelled,
+/// which is what `tests/all/inline_policy_name_echo.rs` is the table for.
 #[tokio::test]
 async fn names_are_matched_without_regard_to_case() {
     let spellings = [
@@ -236,19 +236,18 @@ async fn names_are_matched_without_regard_to_case() {
         );
         assert_eq!(
             element(&body, "GroupName"),
-            "CaseGroup",
-            "case {case:?}: expected the group name the account holds, got {body}"
+            group_spelling,
+            "case {case:?}: expected the group name the request spelled, got {body}"
         );
         assert_eq!(
             element(&body, "PolicyName"),
-            "Embedded",
-            "case {case:?}: expected the policy name the account holds, got {body}"
+            policy_spelling,
+            "case {case:?}: expected the policy name the request spelled, got {body}"
         );
     }
 
     // A put of the same policy name in another case REPLACES that policy rather
-    // than adding a second one, and the name it is reported under is the one the
-    // latest put chose.
+    // than adding a second one.
     let replacement = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*"}]}"#;
     let (status, body) = put_policy(&router, "CASEGROUP", "EMBEDDED", replacement).await;
     assert_eq!(status, 200, "a repeat put must succeed, got {status}: {body}");
@@ -264,8 +263,20 @@ async fn names_are_matched_without_regard_to_case() {
     );
     assert_eq!(
         element(&body, "PolicyName"),
-        "EMBEDDED",
-        "the policy must be reported under the name the latest put chose, got {body}"
+        "embedded",
+        "the read must report the name the request spelled, got {body}"
+    );
+    // The STORE still holds one policy, under the spelling the latest put chose, which is
+    // what the group's own listing reports.
+    let (status, listed) = call(&router, "ListGroupPolicies", &[("GroupName", "CaseGroup")]).await;
+    assert_eq!(
+        status, 200,
+        "ListGroupPolicies must succeed, got {status}: {listed}"
+    );
+    assert_eq!(
+        crate::user_lifecycle::elements(&listed, "member"),
+        vec!["EMBEDDED".to_string()],
+        "the listing must report the one policy under the latest put's spelling, got {listed}"
     );
 }
 
