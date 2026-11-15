@@ -4,19 +4,20 @@
 //!
 //! IMPLEMENTED. Summarises the recommended actions the store holds — the same
 //! [`crate::state::RecommendedActionStore`] `ListRecommendedActions` reports —
-//! GROUPED by `recommendedActionType` (see
-//! [`crate::state::group_by_recommended_action_type`]), narrowed by `filters`
-//! exactly as that operation narrows its list, and paged by `maxResults` with an
-//! opaque `nextToken` that resumes where the previous page stopped.
-//! `@paginated(inputToken: nextToken, outputToken: nextToken,
+//! narrowed by `filters` exactly as that operation narrows its list, and paged by
+//! `maxResults` with an opaque `nextToken` that resumes where the previous page
+//! stopped. `@paginated(inputToken: nextToken, outputToken: nextToken,
 //! items: recommendedActionSummaries)`.
 //!
-//! One summary per group the matched actions hold: its `key` is the group's
-//! `recommendedActionType` and its `total` holds how many of the matched actions
-//! are of that type and the sum of their `estimatedMonthlySavings`. A type
-//! nothing matched is no summary, so a request nothing matched — an account
-//! whose resources have not been analysed yet — is summarised as no summaries at
-//! all.
+//! The summary is the ACCOUNT-WIDE aggregate of the requested filter, so the
+//! listing reports exactly ONE row (see
+//! [`crate::state::aggregate_recommended_actions`]): its `key` is the fixed text
+//! [`crate::state::ALL_RECOMMENDED_ACTION_SUMMARY_KEY`], derived from no request
+//! member, and its `total` holds how many actions the filter matched — the count
+//! `ListRecommendedActions` reports for the same, unpaginated filter — and the
+//! sum of their `estimatedMonthlySavings`. A request nothing matched — an account
+//! whose resources have not been analysed yet — still carries that row, with a
+//! count of zero, so a caller can read the total without paging the actions.
 //!
 //! A recommended action is produced by the analysis of an account's resources
 //! that its enrollment starts, so no request carries one: this handler only
@@ -248,27 +249,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The matching actions, grouped by `recommendedActionType`: the matched
-        // actions are what gets grouped, so a type nothing matched is no group,
-        // and the groups come back in the order the store first holds an action
-        // of each type — the same order `ListRecommendedActions` walks. The
-        // actions summarised are the ones this caller may RETRIEVE — its own
-        // account's and each currently associated member account's, judged per
-        // call (`crate::state::…::retrievable_actions`) — so a group's count and
+        // The ONE aggregate row the matching actions total up to: the summary a
+        // caller reads to learn how many recommended actions the filter selects
+        // without paging them, keyed by the fixed aggregate key rather than by a
+        // value read off the actions. The actions summarised are the ones this
+        // caller may RETRIEVE — its own account's and each currently associated
+        // member account's, judged per call
+        // (`crate::state::…::retrievable_actions`) — so the row's count and
         // savings cover exactly the actions `ListRecommendedActions` reports.
-        let grouped = crate::state::group_by_recommended_action_type(
+        let grouped = crate::state::aggregate_recommended_actions(
             guard
                 .retrievable_actions()
                 .filter(|action| crate::state::recommended_action_matches_filters(action, &filters)),
         );
 
-        // The groups are what gets paged, and the page walk is the one every
+        // The rows are what gets paged, and the page walk is the one every
         // paginated listing of this service performs, entered the way a cursor
         // enters it: `crate::state::resume_page` answers nothing for a cursor
-        // naming a position this sequence of groups does not reach, which is a
-        // token this listing never minted. Each group is projected into the
-        // modelled summary afterwards, so the projection runs only for the page
-        // served.
+        // naming a position this sequence of rows does not reach, which is a
+        // token this listing never minted. One aggregate row fits any page this
+        // operation can be asked for, so the walk mints no token here. Each row
+        // is projected into the modelled summary afterwards, so the projection
+        // runs only for the page served.
         let served: Option<(Vec<crate::state::ActionGroup>, Option<String>)> =
             crate::state::resume_page(grouped, offset, page_size, filter_fingerprint);
         let Some((groups, next_token)) = served else {

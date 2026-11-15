@@ -70,6 +70,11 @@ const FILTERING_OPERATIONS: &[(&str, &str, &[&str])] = &[
     ),
 ];
 
+/// The filtering listing that reports ONE account-wide aggregate row rather than
+/// a page of the items it selected, so a selection holding nothing is that row
+/// with a total of zero.
+const AGGREGATE_SUMMARY_LISTING: &str = "ListRecommendedActionSummaries";
+
 /// Names no filter-name shape of this service declares, as `(case, name)`: one
 /// unrelated to any declared name, three that differ from the declared
 /// `AccountId` only in case, padding or separators (a value set is matched
@@ -257,12 +262,35 @@ async fn a_declared_filter_name_reaches_the_listing_it_narrows() {
                 &case,
             )
             .await;
-            let listed = answer.get(items).and_then(Value::as_array);
-            assert!(
-                listed.is_some_and(|rows| rows.is_empty()),
-                "case {case:?}: expected an empty {items} for a value nothing carries, got \
-                 {answer}"
-            );
+            let listed = answer.get(items).and_then(Value::as_array).cloned();
+            // A value nothing carries selects nothing. A listing that pages its
+            // selected items answers the empty list; the one that reports an
+            // account-wide aggregate answers that single row with a total of
+            // zero (see `crate::recommended_action_summaries`).
+            match listed {
+                None => panic!("case {case:?}: expected a {items} list, got {answer}"),
+                Some(rows) if *operation == AGGREGATE_SUMMARY_LISTING => {
+                    let counts: Vec<i64> = rows
+                        .iter()
+                        .map(|row| {
+                            row.pointer("/total/recommendedActionCount")
+                                .and_then(Value::as_i64)
+                                .unwrap_or(-1)
+                        })
+                        .collect();
+                    assert_eq!(
+                        counts,
+                        vec![0],
+                        "case {case:?}: expected the one aggregate row with a count of zero for a \
+                         value nothing carries, got {answer}"
+                    );
+                }
+                Some(rows) => assert!(
+                    rows.is_empty(),
+                    "case {case:?}: expected an empty {items} for a value nothing carries, got \
+                     {answer}"
+                ),
+            }
         }
     }
 

@@ -1868,9 +1868,10 @@ pub struct ActionGroup {
 /// item carrying it, each group tallying how many items it holds and the
 /// estimates `estimate` reads off them.
 ///
-/// The ONE grouping every summaries list of this service reports its rows with,
-/// whatever it summarises: a `key`-bearing summary row is one group of the
-/// dimension it is grouped by, so the rows are the distinct values the
+/// The ONE grouping every summaries list of this service that reports a row per
+/// DIMENSION VALUE uses — the automation-event summaries, whose dimension the
+/// model names: such a summary row is one group of the dimension it is grouped
+/// by, so the rows are the distinct values the
 /// summarised items carry for it, never a key for a dimension nothing was
 /// grouped by. The summarised items are what gets grouped, so a value nothing
 /// matched is no group and an item the store records no value for belongs to no
@@ -1934,20 +1935,41 @@ pub fn group_events_by_event_status<'a>(
 /// (generated as `SUMMARY_DIMENSION_KEY_VALUES`).
 pub const SUMMARY_DIMENSION_EVENT_STATUS: &str = "EventStatus";
 
-/// The recommended actions of `actions`, grouped by `recommendedActionType`:
-/// one group per type the set holds, in the order the set first holds an action
-/// of that type. An action the store records no type for belongs to no group.
+/// The `key` every recommended-action summary row carries: the fixed text that
+/// names the ACCOUNT-WIDE aggregate of a selection, rather than a value read off
+/// the items summarised.
 ///
-/// The grouping rule is [`group_summary_rows`]'s, which every summaries list of
-/// this service reports its rows with.
-pub fn group_by_recommended_action_type<'a>(
+/// A recommended-action summary listing reports one row per requested
+/// selection — the total over everything that selection holds — so the key is
+/// the same literal for every such row and is derived from no request member.
+pub const ALL_RECOMMENDED_ACTION_SUMMARY_KEY: &str = "ALL_Recommended_Action_Summary";
+
+/// The ONE summary row a recommended-action summary listing reports for a
+/// selection: the aggregate of `actions`, keyed
+/// [`ALL_RECOMMENDED_ACTION_SUMMARY_KEY`].
+///
+/// A recommended-action summary is the account-wide total of the selection the
+/// request names, not a breakdown of it: one row, counting EVERY selected action
+/// (so the count equals the number of actions the unsummarised listing reports
+/// for the same selection) and carrying every estimate those actions hold, which
+/// [`total_savings`] reduces to the row's `estimatedMonthlySavings`. The row is
+/// reported even for a selection that holds nothing — an account with nothing to
+/// recommend still has a total, which is zero — so a caller can always read the
+/// total without paging the items.
+pub fn aggregate_recommended_actions<'a>(
     actions: impl Iterator<Item = &'a RecommendedAction>,
 ) -> Vec<ActionGroup> {
-    group_summary_rows(
-        actions,
-        |action| action.recommended_action_type.as_deref(),
-        |action| action.estimated_monthly_savings.as_ref(),
-    )
+    let mut aggregate = ActionGroup {
+        key: ALL_RECOMMENDED_ACTION_SUMMARY_KEY.to_string(),
+        ..ActionGroup::default()
+    };
+    for action in actions {
+        aggregate.count = aggregate.count.saturating_add(1);
+        if let Some(savings) = action.estimated_monthly_savings.as_ref() {
+            aggregate.estimates.push(savings.clone());
+        }
+    }
+    vec![aggregate]
 }
 
 /// The `estimatedMonthlySavings` of a GROUP of recommended actions: the sums of

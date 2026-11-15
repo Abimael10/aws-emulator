@@ -5,20 +5,20 @@
 //! SAME set `ListAutomationRulePreview` reports one by one (the actions this service
 //! holds for the accounts the rule type and `organizationScope` cover, restricted to
 //! the requested `recommendedActionTypes` and to the `criteria` conditions), reduced
-//! to one summary per distinct `recommendedActionType` among them, each carrying how
-//! many of those actions it groups and the sum of their estimated monthly savings.
+//! to the ONE account-wide total of that selection — how many actions it holds and
+//! the sum of their estimated monthly savings.
 //!
-//! The grouping dimension is the EMULATOR's reading: `PreviewResultSummary.key` is
-//! documented only as "The key identifier for this preview result summary" and this
-//! shape, unlike `AutomationEventSummary`, carries no `dimensions` member naming it
+//! `PreviewResultSummary.key` is documented only as "The key identifier for this
+//! preview result summary" and this shape, unlike `AutomationEventSummary`, carries
+//! no `dimensions` member naming a dimension to break the selection down by
 //! (`smithy_query(query="shape",shape="PreviewResultSummary,AutomationEventSummary,SummaryDimension")`).
-//! `recommendedActionType` is the one dimension a preview request itself selects on —
-//! it is required, and `RecommendedActionType` enumerates its values — so a summary
-//! key is the action type of the actions it totals, and a summary appears only for an
-//! action type the selection actually holds (the summary reports what matched, so an
-//! action type nothing matched contributes no group). Groups come back in the order
-//! the store first holds an action of each type, the same record order the
-//! unsummarised preview pages over, cut into `maxResults`-sized pages.
+//! The summary is therefore the aggregate of the whole selection, keyed by the fixed
+//! text [`crate::state::ALL_RECOMMENDED_ACTION_SUMMARY_KEY`] that every
+//! recommended-action summary row of this service carries (see
+//! [`crate::state::aggregate_recommended_actions`]) and derived from no request
+//! member: exactly one row per request, present with a count of zero for a selection
+//! that holds nothing, so a caller can size a rule's impact before activating it and
+//! cross-check the total against the actions the unsummarised preview lists.
 //!
 //! `@readonly`, so this handler writes NOTHING: the inventory it reports over is the
 //! analysis output Compute Optimizer derives from observed resources
@@ -270,13 +270,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // One group per `recommendedActionType` the selection holds, in the
-        // order the store first holds an action of that type: the selected
-        // actions are what gets summarised, never the request's action-type
-        // list, so a type nothing matched is no group. The grouping is the one
-        // every summaries list of this service performs, so it lives in
-        // [`crate::state::group_by_recommended_action_type`].
-        let grouped = crate::state::group_by_recommended_action_type(
+        // The ONE aggregate row the selected actions total up to: the selection
+        // is what gets summarised, never the request's action-type list, and the
+        // row is reported even for a selection that holds nothing. The
+        // aggregation is the one every recommended-action summary list of this
+        // service performs, so it lives in
+        // [`crate::state::aggregate_recommended_actions`].
+        let grouped = crate::state::aggregate_recommended_actions(
             crate::state::previewed_actions(
                 &guard,
                 scope.as_deref(),
@@ -285,13 +285,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         );
 
-        // The groups are what gets paged, and the page walk is the one every
+        // The rows are what gets paged, and the page walk is the one every
         // paginated listing of this service performs, entered the way a cursor
         // enters it: `crate::state::resume_page` answers nothing for a cursor
-        // naming a position this sequence of groups does not reach, which is a
-        // token this listing never minted. Each group is projected into the
-        // modelled summary afterwards, so the projection runs only for the page
-        // served.
+        // naming a position this sequence of rows does not reach, which is a
+        // token this listing never minted. One aggregate row fits any page this
+        // operation can be asked for, so the walk mints no token here. Each row
+        // is projected into the modelled summary afterwards, so the projection
+        // runs only for the page served.
         let served: Option<(Vec<crate::state::ActionGroup>, Option<String>)> =
             crate::state::resume_page(grouped, offset, page_size, selection_fingerprint);
         let Some((groups, next_token)) = served else {

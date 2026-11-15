@@ -6,9 +6,12 @@
 //! `ListAutomationRulePreview` reports one by one — the recommended actions this
 //! service holds for the accounts the rule type and `organizationScope` cover,
 //! restricted to the requested `recommendedActionTypes` and to the `criteria`
-//! conditions — reduced to one summary per distinct `recommendedActionType`
-//! among them, each carrying how many of those actions it groups and the sums of
-//! their estimated monthly savings, paged by `maxResults`.
+//! conditions — reduced to exactly ONE row, the account-wide aggregate of that
+//! selection: the fixed aggregate key every recommended-action summary row of
+//! this service carries, a `total.recommendedActionCount` equal to the number of
+//! actions the unsummarised preview lists for the identical filter, and the sums
+//! of their estimated monthly savings. A selection that holds nothing still
+//! reports the row, with a count of zero.
 //!
 //! Every case drives the service the way a client does: an awsJson1_0 `POST /`
 //! through the same router the emulator binary mounts, over an inventory seeded
@@ -20,19 +23,31 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::ops::types::{
-    EstimatedMonthlySavings, RecommendedAction,
+    Criteria, EstimatedMonthlySavings, RecommendedAction,
 };
-use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::state::service_state;
+use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::state::{
+    encode_page_token, preview_account_scope, preview_selection_fingerprint, service_state,
+    PageCursor,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::automation_rule_lifecycle::{
-    assert_refused, call, call_ok, emulator_with_engine, is_next_token,
-    unenrolled_emulator_with_engine,
+    assert_refused, call, call_ok, emulator_with_engine, unenrolled_emulator_with_engine,
 };
 
+/// The operation under test, and the sibling that lists the same selection one
+/// action at a time.
+const OPERATION: &str = "ListAutomationRulePreviewSummaries";
+const PREVIEW: &str = "ListAutomationRulePreview";
+
+/// The `key` every recommended-action summary row carries: fixed text naming the
+/// account-wide aggregate of the requested selection, read off neither the
+/// request nor the actions totalled.
+const AGGREGATE_KEY: &str = "ALL_Recommended_Action_Summary";
+
 /// The two values of the model's `RecommendedActionType`
-/// (`smithy_query(query="shape",shape="RecommendedActionType")`), which is the
-/// dimension a preview summary groups on.
+/// (`smithy_query(query="shape",shape="RecommendedActionType")`), which is what
+/// a preview request selects on.
 const UPGRADE: &str = "UpgradeEbsVolumeType";
 const SNAPSHOT_AND_DELETE: &str = "SnapshotAndDeleteUnattachedEbsVolume";
 
@@ -68,8 +83,8 @@ struct Action<'a> {
 /// action Compute Optimizer has estimated no savings for.
 type Estimate<'a> = Option<(f64, f64, &'a str, &'a str)>;
 
-/// One row of the aggregation table: the case, the estimates of the group's
-/// actions, and the total the rule says the group reports.
+/// One row of the aggregation table: the case, the estimates of the selected
+/// actions, and the total the rule says the aggregate row reports.
 type AggregationCase<'a> = (&'a str, Vec<Estimate<'a>>, Summary);
 
 impl Action<'_> {
@@ -109,8 +124,8 @@ impl Action<'_> {
 /// actions in the calling account (one of them with no estimate at all), two
 /// `SnapshotAndDeleteUnattachedEbsVolume` ones, and one upgrade in a member
 /// account — spanning three regions, so a `criteria` condition cuts across the
-/// groups. Every figure is a multiple of 0.25, so each expected sum below is
-/// exact in binary floating point.
+/// action types. Every figure is a multiple of 0.25, so each expected sum below
+/// is exact in binary floating point.
 ///
 /// `recommendedActionId` is the model's `^[0-9A-Za-z]{16}$`.
 fn inventory() -> Vec<RecommendedAction> {
@@ -195,8 +210,8 @@ fn inventory_snapshot(engine: &engine::InMemoryEngine) -> String {
     snapshot
 }
 
-/// One summary as a response reports it: the grouping key, the group's count and
-/// its aggregated estimate.
+/// One summary as a response reports it: the row's key, its count and its
+/// aggregated estimate.
 #[derive(Debug, Clone, PartialEq)]
 struct Summary {
     key: String,
@@ -249,18 +264,12 @@ fn summaries(body: &Value) -> Vec<Summary> {
         .collect()
 }
 
-/// The group keys a response lists, in response order.
-fn keys(body: &Value) -> Vec<String> {
-    summaries(body)
-        .into_iter()
-        .map(|summary| summary.key)
-        .collect()
-}
-
-/// An expected summary, written as a tuple so a table row stays readable.
-fn expect(key: &str, count: i64, before: f64, after: f64, currency: &str, mode: &str) -> Summary {
+/// The aggregate row a case expects, written as a call so a table row stays
+/// readable. Every row carries the one fixed key, so only the totals are spelled
+/// out.
+fn aggregate(count: i64, before: f64, after: f64, currency: &str, mode: &str) -> Summary {
     Summary {
-        key: key.to_string(),
+        key: AGGREGATE_KEY.to_string(),
         count,
         before,
         after,
@@ -269,97 +278,106 @@ fn expect(key: &str, count: i64, before: f64, after: f64, currency: &str, mode: 
     }
 }
 
-/// Compare what came back against what the rule says, naming the case and the
-/// actual values. The figures are summed floating point, so they are compared
-/// within a tolerance far below the smallest amount any row carries.
-fn assert_summaries(actual: &[Summary], expected: &[Summary], case: &str) {
+/// Assert that a response carries exactly the ONE aggregate row `expected`,
+/// naming the case and the actual values. The figures are summed floating point,
+/// so they are compared within a tolerance far below the smallest amount any row
+/// carries.
+fn assert_aggregate_row(actual: &[Summary], expected: &Summary, case: &str) {
     assert_eq!(
         actual.len(),
-        expected.len(),
-        "case {case:?}: expected {} summaries {expected:?}, got {actual:?}",
-        expected.len()
+        1,
+        "case {case:?}: expected exactly one aggregate row {expected:?}, got {actual:?}"
     );
-    for (actual, expected) in actual.iter().zip(expected.iter()) {
-        assert_eq!(
-            actual.key, expected.key,
-            "case {case:?}: expected group key {:?}, got {actual:?}",
-            expected.key
-        );
-        assert_eq!(
-            actual.count, expected.count,
-            "case {case:?}: expected {} actions in group {:?}, got {actual:?}",
-            expected.count, expected.key
-        );
-        assert!(
-            (actual.before - expected.before).abs() < 1e-9,
-            "case {case:?}: expected beforeDiscountSavings {} in group {:?}, got {actual:?}",
-            expected.before,
-            expected.key
-        );
-        assert!(
-            (actual.after - expected.after).abs() < 1e-9,
-            "case {case:?}: expected afterDiscountSavings {} in group {:?}, got {actual:?}",
-            expected.after,
-            expected.key
-        );
-        assert_eq!(
-            actual.currency, expected.currency,
-            "case {case:?}: expected currency {:?} in group {:?}, got {actual:?}",
-            expected.currency, expected.key
-        );
-        assert_eq!(
-            actual.mode, expected.mode,
-            "case {case:?}: expected savingsEstimationMode {:?} in group {:?}, got {actual:?}",
-            expected.mode, expected.key
-        );
-    }
+    let actual = &actual[0];
+    assert_eq!(
+        actual.key, AGGREGATE_KEY,
+        "case {case:?}: expected the fixed aggregate key {AGGREGATE_KEY:?}, got {actual:?}"
+    );
+    assert_eq!(
+        actual.count, expected.count,
+        "case {case:?}: expected {} actions totalled, got {actual:?}",
+        expected.count
+    );
+    assert!(
+        (actual.before - expected.before).abs() < 1e-9,
+        "case {case:?}: expected beforeDiscountSavings {}, got {actual:?}",
+        expected.before
+    );
+    assert!(
+        (actual.after - expected.after).abs() < 1e-9,
+        "case {case:?}: expected afterDiscountSavings {}, got {actual:?}",
+        expected.after
+    );
+    assert_eq!(
+        actual.currency, expected.currency,
+        "case {case:?}: expected currency {:?}, got {actual:?}",
+        expected.currency
+    );
+    assert_eq!(
+        actual.mode, expected.mode,
+        "case {case:?}: expected savingsEstimationMode {:?}, got {actual:?}",
+        expected.mode
+    );
+}
+
+/// The actions the unsummarised preview lists for `request`, which is the oracle
+/// the aggregate's count has to reconcile with.
+async fn previewed_actions(router: &MultiServiceRouter, request: &Value, case: &str) -> Vec<Value> {
+    let body = call_ok(router, PREVIEW, request, case).await;
+    body.get("previewResults")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// A figure one previewed action carries under `estimatedMonthlySavings`, or
+/// zero for an action Compute Optimizer estimated no savings for.
+fn figure(action: &Value, name: &str) -> f64 {
+    action
+        .get("estimatedMonthlySavings")
+        .and_then(|estimate| estimate.get(name))
+        .and_then(Value::as_f64)
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
-// Grouping and totalling
+// The aggregate row
 // ---------------------------------------------------------------------------
 
-/// The selection a request describes, grouped by `recommendedActionType`: one
-/// summary per type the selection holds, in the order the store first holds an
-/// action of that type, each totalling exactly the actions of that type.
+/// The selection a request describes, totalled into ONE row: the fixed aggregate
+/// key, the number of actions the selection holds and the sums of their
+/// estimates. The rows differ along what the rule generalises over: how many
+/// action types the selection admits, the account scope it covers, the criteria
+/// it constrains with, and whether it holds any action at all.
 #[tokio::test]
-async fn summaries_group_the_selected_actions_by_action_type() {
+async fn the_preview_summary_is_one_aggregate_row_per_selection() {
     let (router, _engine) = emulator_with(&inventory());
 
-    // (case, request, the summaries the rule says come back)
-    let cases: Vec<(&str, Value, Vec<Summary>)> = vec![
+    // (case, request, the aggregate row the rule says comes back)
+    let cases: Vec<(&str, Value, Summary)> = vec![
         (
             "both action types, no criteria: every action of the calling account",
             json!({
                 "ruleType": "AccountRule",
                 "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
             }),
-            vec![
-                // The upgrade with no estimate is one of the three actions and
-                // adds nothing to either sum.
-                expect(UPGRADE, 3, 12.5, 7.25, "USD", "BeforeDiscount"),
-                expect(SNAPSHOT_AND_DELETE, 2, 105.0, 94.0, "USD", "AfterDiscount"),
-            ],
+            // The upgrade with no estimate is one of the five actions and adds
+            // nothing to either sum; the estimates disagree on the mode, so the
+            // total reports the conservative one.
+            aggregate(5, 117.5, 101.25, "USD", "BeforeDiscount"),
         ),
         (
-            "one action type: the other type is not selected, so it is no group",
+            "one action type: the other type is not selected, so it is not counted",
             json!({ "ruleType": "AccountRule", "recommendedActionTypes": [UPGRADE] }),
-            vec![expect(UPGRADE, 3, 12.5, 7.25, "USD", "BeforeDiscount")],
+            aggregate(3, 12.5, 7.25, "USD", "BeforeDiscount"),
         ),
         (
             "the other action type alone",
             json!({ "ruleType": "AccountRule", "recommendedActionTypes": [SNAPSHOT_AND_DELETE] }),
-            vec![expect(
-                SNAPSHOT_AND_DELETE,
-                2,
-                105.0,
-                94.0,
-                "USD",
-                "AfterDiscount",
-            )],
+            aggregate(2, 105.0, 94.0, "USD", "AfterDiscount"),
         ),
         (
-            "a criteria condition cuts across both groups",
+            "a criteria condition cuts across both action types",
             json!({
                 "ruleType": "AccountRule",
                 "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
@@ -367,10 +385,7 @@ async fn summaries_group_the_selected_actions_by_action_type() {
                     "region": [{ "comparison": "StringEquals", "values": ["us-east-1"] }]
                 },
             }),
-            vec![
-                expect(UPGRADE, 1, 10.0, 6.0, "USD", "BeforeDiscount"),
-                expect(SNAPSHOT_AND_DELETE, 2, 105.0, 94.0, "USD", "AfterDiscount"),
-            ],
+            aggregate(3, 115.0, 100.0, "USD", "BeforeDiscount"),
         ),
         (
             "an organization preview with no scope spans every account the store holds \
@@ -379,23 +394,22 @@ async fn summaries_group_the_selected_actions_by_action_type() {
                 "ruleType": "OrganizationRule",
                 "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
             }),
-            vec![
-                expect(UPGRADE, 4, 19.5, 10.25, "USD", "BeforeDiscount"),
-                expect(SNAPSHOT_AND_DELETE, 2, 105.0, 94.0, "USD", "AfterDiscount"),
-            ],
+            aggregate(6, 124.5, 104.25, "USD", "BeforeDiscount"),
         ),
         (
-            "an organization scope naming only the member account: the type it holds no \
-             action of is no group",
+            "an organization scope naming only the member account",
             json!({
                 "ruleType": "OrganizationRule",
                 "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
                 "organizationScope": { "accountIds": [MEMBER_ACCOUNT] },
             }),
-            vec![expect(UPGRADE, 1, 7.0, 3.0, "USD", "BeforeDiscount")],
+            aggregate(1, 7.0, 3.0, "USD", "BeforeDiscount"),
         ),
         (
-            "criteria nothing satisfies: no action is selected, so there is no group",
+            // The row a caller sizing a rule's impact reads before activating
+            // it: a selection that holds nothing still has a total, which is
+            // zero.
+            "criteria nothing satisfies: the row stands with a count of zero",
             json!({
                 "ruleType": "AccountRule",
                 "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
@@ -403,7 +417,7 @@ async fn summaries_group_the_selected_actions_by_action_type() {
                     "region": [{ "comparison": "StringEquals", "values": ["sa-east-1"] }]
                 },
             }),
-            vec![],
+            aggregate(0, 0.0, 0.0, "", "BeforeDiscount"),
         ),
         (
             "a criteria condition on the estimate itself",
@@ -416,45 +430,46 @@ async fn summaries_group_the_selected_actions_by_action_type() {
                     ]
                 },
             }),
-            vec![
-                expect(UPGRADE, 1, 10.0, 6.0, "USD", "BeforeDiscount"),
-                expect(SNAPSHOT_AND_DELETE, 1, 100.0, 90.0, "USD", "AfterDiscount"),
-            ],
+            aggregate(2, 110.0, 96.0, "USD", "BeforeDiscount"),
         ),
     ];
 
     for (case, request, expected) in cases {
-        let body = call_ok(
-            &router,
-            "ListAutomationRulePreviewSummaries",
-            &request,
-            case,
-        )
-        .await;
-        assert_summaries(&summaries(&body), &expected, case);
+        let body = call_ok(&router, OPERATION, &request, case).await;
+        assert_aggregate_row(&summaries(&body), &expected, case);
         assert!(
             body.get("nextToken").is_none(),
-            "case {case:?}: an unpaged selection of at most two groups has no next page, got \
-             {body}"
+            "case {case:?}: one aggregate row fits any page, so no token is issued, got {body}"
+        );
+
+        // The cross-check the preview flow exists for: the row's count is the
+        // number of actions the unsummarised preview lists for the identical
+        // filter.
+        let previewed = previewed_actions(&router, &request, case).await;
+        assert_eq!(
+            expected.count,
+            i64::try_from(previewed.len()).expect("a small fixture set"),
+            "case {case:?}: the aggregate count must equal the {} actions the preview lists",
+            previewed.len()
         );
     }
 }
 
-/// The aggregated estimate of a group: the sums of the before- and
-/// after-discount figures its estimates carry, with the currency the group
-/// agrees on and the mode it agrees on — and, where it agrees on neither, the
-/// free-form `currency` naming none while the enum-typed
+/// The aggregated estimate of the row: the sums of the before- and
+/// after-discount figures the selected actions' estimates carry, with the
+/// currency they agree on and the mode they agree on — and, where they agree on
+/// neither, the free-form `currency` naming none while the enum-typed
 /// `savingsEstimationMode` falls back to the conservative before-discount
 /// reading. A stored mode the model does not declare reads the same way: a total
 /// can only name a value of `SavingsEstimationMode`.
 #[tokio::test]
-async fn a_group_total_aggregates_the_estimates_of_its_actions() {
-    // (case, the group's estimates, the total the rule says it reports)
+async fn the_row_total_aggregates_the_estimates_of_the_selected_actions() {
+    // (case, the selection's estimates, the total the rule says it reports)
     let cases: Vec<AggregationCase> = vec![
         (
             "one estimate: the total is that estimate",
             vec![Some((10.0, 6.0, "USD", "BeforeDiscount"))],
-            expect(UPGRADE, 1, 10.0, 6.0, "USD", "BeforeDiscount"),
+            aggregate(1, 10.0, 6.0, "USD", "BeforeDiscount"),
         ),
         (
             "estimates agreeing on currency and mode",
@@ -463,18 +478,18 @@ async fn a_group_total_aggregates_the_estimates_of_its_actions() {
                 Some((0.25, 0.125, "USD", "AfterDiscount")),
                 Some((4.0, 2.0, "USD", "AfterDiscount")),
             ],
-            expect(UPGRADE, 3, 14.25, 8.125, "USD", "AfterDiscount"),
+            aggregate(3, 14.25, 8.125, "USD", "AfterDiscount"),
         ),
         (
             "an action with no estimate: counted, adding nothing",
             vec![Some((10.0, 6.0, "USD", "BeforeDiscount")), None],
-            expect(UPGRADE, 2, 10.0, 6.0, "USD", "BeforeDiscount"),
+            aggregate(2, 10.0, 6.0, "USD", "BeforeDiscount"),
         ),
         (
-            "no action of the group carries an estimate: the count stands, the sums are \
+            "no selected action carries an estimate: the count stands, the sums are \
              zero and no currency is named",
             vec![None, None],
-            expect(UPGRADE, 2, 0.0, 0.0, "", "BeforeDiscount"),
+            aggregate(2, 0.0, 0.0, "", "BeforeDiscount"),
         ),
         (
             "estimates disagreeing on mode: the before-discount reading",
@@ -482,7 +497,7 @@ async fn a_group_total_aggregates_the_estimates_of_its_actions() {
                 Some((10.0, 6.0, "USD", "BeforeDiscount")),
                 Some((2.0, 1.0, "USD", "AfterDiscount")),
             ],
-            expect(UPGRADE, 2, 12.0, 7.0, "USD", "BeforeDiscount"),
+            aggregate(2, 12.0, 7.0, "USD", "BeforeDiscount"),
         ),
         (
             "estimates disagreeing on currency: the sums are not one currency's total, so \
@@ -491,7 +506,7 @@ async fn a_group_total_aggregates_the_estimates_of_its_actions() {
                 Some((10.0, 6.0, "USD", "BeforeDiscount")),
                 Some((2.0, 1.0, "EUR", "BeforeDiscount")),
             ],
-            expect(UPGRADE, 2, 12.0, 7.0, "", "BeforeDiscount"),
+            aggregate(2, 12.0, 7.0, "", "BeforeDiscount"),
         ),
         (
             "a currency that is not the dollar, agreed on",
@@ -499,13 +514,13 @@ async fn a_group_total_aggregates_the_estimates_of_its_actions() {
                 Some((10.0, 6.0, "JPY", "AfterDiscount")),
                 Some((2.0, 1.0, "JPY", "AfterDiscount")),
             ],
-            expect(UPGRADE, 2, 12.0, 7.0, "JPY", "AfterDiscount"),
+            aggregate(2, 12.0, 7.0, "JPY", "AfterDiscount"),
         ),
         (
             "a stored mode the model's SavingsEstimationMode does not declare: the total \
              must name one of the two it does, so the conservative reading stands",
             vec![Some((10.0, 6.0, "USD", "NotAModeTheModelDeclares"))],
-            expect(UPGRADE, 1, 10.0, 6.0, "USD", "BeforeDiscount"),
+            aggregate(1, 10.0, 6.0, "USD", "BeforeDiscount"),
         ),
     ];
 
@@ -529,7 +544,7 @@ async fn a_group_total_aggregates_the_estimates_of_its_actions() {
 
         let body = call_ok(
             &router,
-            "ListAutomationRulePreviewSummaries",
+            OPERATION,
             &json!({
                 "ruleType": "AccountRule",
                 "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
@@ -537,15 +552,15 @@ async fn a_group_total_aggregates_the_estimates_of_its_actions() {
             case,
         )
         .await;
-        assert_summaries(&summaries(&body), std::slice::from_ref(&expected), case);
+        assert_aggregate_row(&summaries(&body), &expected, case);
     }
 }
 
-/// The summaries total exactly the actions the unsummarised preview lists for
-/// the same request: same group keys in the same first-appearance order, same
-/// counts, same savings sums. The two operations read one selection.
+/// The row totals exactly the actions the unsummarised preview lists for the
+/// same request: the same count and the same savings sums, whichever selection
+/// is asked for. The two operations read one selection.
 #[tokio::test]
-async fn summaries_total_the_actions_the_unsummarised_preview_lists() {
+async fn the_row_totals_the_actions_the_unsummarised_preview_lists() {
     let (router, _engine) = emulator_with(&inventory());
 
     let requests: Vec<(&str, Value)> = vec![
@@ -555,7 +570,7 @@ async fn summaries_total_the_actions_the_unsummarised_preview_lists() {
                 "ruleType": "AccountRule",
                 "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
             }),
-            ),
+        ),
         (
             "one action type",
             json!({ "ruleType": "AccountRule", "recommendedActionTypes": [SNAPSHOT_AND_DELETE] }),
@@ -585,84 +600,41 @@ async fn summaries_total_the_actions_the_unsummarised_preview_lists() {
                 },
             }),
         ),
+        (
+            "a preview nothing satisfies",
+            json!({
+                "ruleType": "AccountRule",
+                "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
+                "criteria": {
+                    "region": [{ "comparison": "StringEquals", "values": ["sa-east-1"] }]
+                },
+            }),
+        ),
     ];
 
     for (case, request) in requests {
-        let previewed = call_ok(&router, "ListAutomationRulePreview", &request, case).await;
-        let results = previewed
-            .get("previewResults")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let results = previewed_actions(&router, &request, case).await;
+        let count = i64::try_from(results.len()).expect("a small fixture set");
+        let before: f64 = results
+            .iter()
+            .map(|result| figure(result, "beforeDiscountSavings"))
+            .sum();
+        let after: f64 = results
+            .iter()
+            .map(|result| figure(result, "afterDiscountSavings"))
+            .sum();
 
-        // The same grouping, computed here from the listed actions.
-        let mut expected: Vec<Summary> = Vec::new();
-        for result in &results {
-            let action_type = result
-                .get("recommendedActionType")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let savings = result.get("estimatedMonthlySavings");
-            let before = savings
-                .and_then(|s| s.get("beforeDiscountSavings"))
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            let after = savings
-                .and_then(|s| s.get("afterDiscountSavings"))
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            match expected.iter_mut().find(|group| group.key == action_type) {
-                Some(group) => {
-                    group.count += 1;
-                    group.before += before;
-                    group.after += after;
-                }
-                None => expected.push(Summary {
-                    key: action_type,
-                    count: 1,
-                    before,
-                    after,
-                    // The currency and mode of a group are asserted by the
-                    // aggregation table above; here the counts and sums are
-                    // what must agree, so these are carried over below.
-                    currency: String::new(),
-                    mode: String::new(),
-                }),
-            }
-        }
-
-        let summarised = call_ok(
-            &router,
-            "ListAutomationRulePreviewSummaries",
-            &request,
-            case,
-        )
-        .await;
+        let summarised = call_ok(&router, OPERATION, &request, case).await;
         let actual = summaries(&summarised);
-        assert_eq!(
-            actual.len(),
-            expected.len(),
-            "case {case:?}: the {} previewed actions fall into {} groups, got {actual:?}",
-            results.len(),
-            expected.len()
-        );
-        let expected: Vec<Summary> = expected
-            .into_iter()
-            .zip(actual.iter())
-            .map(|(group, actual)| Summary {
-                currency: actual.currency.clone(),
-                mode: actual.mode.clone(),
-                ..group
-            })
-            .collect();
-        assert_summaries(&actual, &expected, case);
-        let total: i64 = actual.iter().map(|group| group.count).sum();
-        assert_eq!(
-            total,
-            results.len() as i64,
-            "case {case:?}: the group counts must total the {} previewed actions, got {actual:?}",
-            results.len()
+        // How the row names a currency and a savings mode is the aggregation
+        // table's business, so this cross-check carries the reported ones over
+        // and asserts the count and the sums.
+        let currency = actual.first().map(|row| row.currency.clone()).unwrap_or_default();
+        let mode = actual.first().map(|row| row.mode.clone()).unwrap_or_default();
+        assert_aggregate_row(
+            &actual,
+            &aggregate(count, before, after, &currency, &mode),
+            case,
         );
     }
 }
@@ -672,7 +644,7 @@ async fn summaries_total_the_actions_the_unsummarised_preview_lists() {
 #[tokio::test]
 async fn summarising_writes_nothing() {
     let (router, engine) = emulator_with(&inventory());
-    let case = "a paged summary over a seeded inventory";
+    let case = "a summary over a seeded inventory";
     let before = inventory_snapshot(&engine);
 
     let request = json!({
@@ -680,25 +652,13 @@ async fn summarising_writes_nothing() {
         "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
         "maxResults": 1,
     });
-    let first = call_ok(
-        &router,
-        "ListAutomationRulePreviewSummaries",
-        &request,
-        case,
-    )
-    .await;
-    let again = call_ok(
-        &router,
-        "ListAutomationRulePreviewSummaries",
-        &request,
-        case,
-    )
-    .await;
+    let first = call_ok(&router, OPERATION, &request, case).await;
+    let again = call_ok(&router, OPERATION, &request, case).await;
 
     assert_eq!(
         summaries(&first),
         summaries(&again),
-        "case {case:?}: two identical reads must report the same groups, got {first} then {again}"
+        "case {case:?}: two identical reads must report the same row, got {first} then {again}"
     );
     assert_eq!(
         inventory_snapshot(&engine),
@@ -721,97 +681,100 @@ async fn summarising_writes_nothing() {
 // Paging
 // ---------------------------------------------------------------------------
 
-/// Walking with any page size visits every group exactly once, in the same
-/// order, and the last page carries no token.
+/// The listing reports ONE row, so every page size serves that row and no walk
+/// is ever cut: whatever `maxResults` asks for, the answer is the aggregate and
+/// no token.
 #[tokio::test]
-async fn paging_walks_every_group_once_for_every_page_size() {
+async fn the_aggregate_row_fits_every_page_size_and_mints_no_token() {
     let (router, _engine) = emulator_with(&inventory());
     let request = json!({
         "ruleType": "OrganizationRule",
         "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
     });
-    let unpaged = call_ok(
-        &router,
-        "ListAutomationRulePreviewSummaries",
-        &request,
-        "one unpaged page",
-    )
-    .await;
+    let unpaged = call_ok(&router, OPERATION, &request, "one unpaged page").await;
     let all = summaries(&unpaged);
-    assert_eq!(
-        keys(&unpaged),
-        vec![UPGRADE.to_string(), SNAPSHOT_AND_DELETE.to_string()],
-        "the whole organization holds an action of both types, got {unpaged}"
+    assert_aggregate_row(
+        &all,
+        &aggregate(6, 124.5, 104.25, "USD", "BeforeDiscount"),
+        "one unpaged page",
     );
 
-    // Every page size from below the group count to far above it, and the
-    // modelled maximum.
+    // Every page size from the smallest the model admits to its maximum.
     for page_size in [1_u64, 2, 3, 100] {
         let case = format!("maxResults={page_size}");
-        let mut walked: Vec<Summary> = Vec::new();
-        let mut next: Option<String> = None;
-        loop {
-            let mut body = request.clone();
-            body["maxResults"] = json!(page_size);
-            if let Some(token) = next.as_deref() {
-                body["nextToken"] = json!(token);
-            }
-            let response =
-                call_ok(&router, "ListAutomationRulePreviewSummaries", &body, &case).await;
-            let page = summaries(&response);
-            assert!(
-                page.len() as u64 <= page_size,
-                "case {case:?}: a page holds at most maxResults summaries, got {page:?}"
-            );
-            walked.extend(page);
-            match response.get("nextToken").and_then(Value::as_str) {
-                Some(token) => {
-                    assert!(
-                        is_next_token(token),
-                        "case {case:?}: nextToken must match ^[A-Za-z0-9+/=]+$, got {token:?}"
-                    );
-                    next = Some(token.to_string());
-                }
-                None => break,
-            }
-            assert!(
-                walked.len() <= all.len(),
-                "case {case:?}: the walk must terminate, got {walked:?}"
-            );
-        }
-        assert_summaries(&walked, &all, &case);
+        let mut body = request.clone();
+        body["maxResults"] = json!(page_size);
+        let response = call_ok(&router, OPERATION, &body, &case).await;
+        assert_eq!(
+            summaries(&response),
+            all,
+            "case {case:?}: every page size serves the one aggregate row, got {response}"
+        );
+        assert!(
+            response.get("nextToken").is_none(),
+            "case {case:?}: nothing remains after the only row, so no token is carried, got \
+             {response}"
+        );
     }
 }
 
-/// A token is bound to the operation and the selection it was taken with:
-/// resuming with anything else would answer a page of another result set, so it
-/// is refused.
+/// A `nextToken` is accepted only where this listing could have minted it: for
+/// the same operation and the same derived selection, naming a position the row
+/// sequence reaches. Anything else — a cursor taken for another selection, the
+/// sibling preview's token, one this service never issued, or one naming a
+/// position past the only row — is refused rather than answered with a page of
+/// something else.
 #[tokio::test]
 async fn a_token_resumes_only_the_selection_it_was_taken_with() {
     let (router, _engine) = emulator_with(&inventory());
     let selection = json!({
         "ruleType": "AccountRule",
         "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
-        "maxResults": 1,
     });
-    let first = call_ok(
+
+    // The cursor this listing mints for that selection, built from the service's
+    // own fingerprint of it: one aggregate row leaves no page to resume, so the
+    // only position a cursor can name is the END of the row sequence — where a
+    // walk whose tail was removed resumes.
+    let account_scope = preview_account_scope("AccountRule", None);
+    let both_types = vec![UPGRADE.to_string(), SNAPSHOT_AND_DELETE.to_string()];
+    let cursor = |offset: usize, operation: &str| {
+        encode_page_token(&PageCursor {
+            offset,
+            filter_fingerprint: preview_selection_fingerprint(
+                operation,
+                account_scope.as_deref(),
+                &both_types,
+                &Criteria::default(),
+            ),
+        })
+    };
+
+    let mut resumed_request = selection.clone();
+    resumed_request["nextToken"] = json!(cursor(1, OPERATION));
+    let resumed = call_ok(
         &router,
-        "ListAutomationRulePreviewSummaries",
-        &selection,
-        "first page",
+        OPERATION,
+        &resumed_request,
+        "the cursor resumed with its own selection",
     )
     .await;
-    let token = first
-        .get("nextToken")
-        .and_then(Value::as_str)
-        .expect("a two-group selection paged at one group has a next page")
-        .to_string();
-    // The token of the UNSUMMARISED preview of the same request, whose pages are
-    // single actions rather than groups.
+    assert!(
+        summaries(&resumed).is_empty() && resumed.get("nextToken").is_none(),
+        "case \"the cursor resumed with its own selection\": the remainder after the only row is \
+         empty and ends the walk, got {resumed}"
+    );
+
+    // The token the UNSUMMARISED preview mints for the same request, whose pages
+    // are single actions rather than one aggregate.
     let other_operation_token = call_ok(
         &router,
-        "ListAutomationRulePreview",
-        &selection,
+        PREVIEW,
+        &json!({
+            "ruleType": "AccountRule",
+            "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
+            "maxResults": 1,
+        }),
         "the unsummarised preview's first page",
     )
     .await
@@ -822,30 +785,38 @@ async fn a_token_resumes_only_the_selection_it_was_taken_with() {
 
     let cases: Vec<(&str, Value)> = vec![
         (
-            "a token resumed with different action types",
+            "a cursor presented with different action types",
             json!({
                 "ruleType": "AccountRule",
                 "recommendedActionTypes": [UPGRADE],
-                "nextToken": token.clone(),
+                "nextToken": cursor(1, OPERATION),
             }),
         ),
         (
-            "a token resumed with different criteria",
+            "a cursor presented with different criteria",
             json!({
                 "ruleType": "AccountRule",
                 "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
                 "criteria": {
                     "region": [{ "comparison": "StringEquals", "values": ["us-east-1"] }]
                 },
-                "nextToken": token.clone(),
+                "nextToken": cursor(1, OPERATION),
             }),
         ),
         (
-            "a token resumed with a different rule type",
+            "a cursor presented with a different rule type",
             json!({
                 "ruleType": "OrganizationRule",
                 "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
-                "nextToken": token.clone(),
+                "nextToken": cursor(1, OPERATION),
+            }),
+        ),
+        (
+            "a position the row sequence never reached",
+            json!({
+                "ruleType": "AccountRule",
+                "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
+                "nextToken": cursor(2, OPERATION),
             }),
         ),
         (
@@ -867,45 +838,29 @@ async fn a_token_resumes_only_the_selection_it_was_taken_with() {
     ];
     for (case, request) in cases {
         assert_refused(
-            call(&router, "ListAutomationRulePreviewSummaries", &request).await,
+            call(&router, OPERATION, &request).await,
             400,
             "InvalidParameterValueException",
             case,
         );
     }
 
-    // And the other way round: a summaries token is not a preview token either.
+    // And the other way round: a cursor fingerprinted for the summaries is not a
+    // token of the unsummarised preview, which pages a different sequence.
     assert_refused(
         call(
             &router,
-            "ListAutomationRulePreview",
+            PREVIEW,
             &json!({
                 "ruleType": "AccountRule",
                 "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
-                "nextToken": token.clone(),
+                "nextToken": cursor(1, OPERATION),
             }),
         )
         .await,
         400,
         "InvalidParameterValueException",
-        "the summaries token on the unsummarised preview",
-    );
-
-    // The same token with the same selection still resumes, where the first page
-    // stopped.
-    let mut resumed_request = selection.clone();
-    resumed_request["nextToken"] = json!(token);
-    let resumed = call_ok(
-        &router,
-        "ListAutomationRulePreviewSummaries",
-        &resumed_request,
-        "the token resumed with its own selection",
-    )
-    .await;
-    assert_eq!(
-        keys(&resumed),
-        vec![SNAPSHOT_AND_DELETE.to_string()],
-        "the token must resume exactly where the first page stopped, got {resumed}"
+        "the summaries cursor on the unsummarised preview",
     );
 }
 
@@ -983,14 +938,14 @@ async fn a_request_the_service_cannot_evaluate_is_refused() {
     ];
     for (case, request) in &cases {
         assert_refused(
-            call(&router, "ListAutomationRulePreviewSummaries", request).await,
+            call(&router, OPERATION, request).await,
             400,
             "InvalidParameterValueException",
             case,
         );
         // The refused request is refused by the unsummarised preview too.
         assert_refused(
-            call(&router, "ListAutomationRulePreview", request).await,
+            call(&router, PREVIEW, request).await,
             400,
             "InvalidParameterValueException",
             case,
@@ -1020,28 +975,18 @@ async fn max_results_honours_its_modelled_bounds() {
 
     for max_results in [1, 100] {
         let case = format!("maxResults={max_results} is a published bound");
-        let body = call_ok(
-            &router,
-            "ListAutomationRulePreviewSummaries",
-            &request(max_results),
-            &case,
-        )
-        .await;
+        let body = call_ok(&router, OPERATION, &request(max_results), &case).await;
         let page = summaries(&body);
-        assert!(
-            !page.is_empty() && page.len() as i64 <= max_results,
-            "case {case:?}: a page holds between one and maxResults summaries, got {page:?}"
+        assert_eq!(
+            page.len(),
+            1,
+            "case {case:?}: the one aggregate row fits a page of {max_results}, got {page:?}"
         );
     }
 
     for max_results in [0, 101] {
         let case = format!("maxResults={max_results} is one past a published bound");
-        let (status, body) = call(
-            &router,
-            "ListAutomationRulePreviewSummaries",
-            &request(max_results),
-        )
-        .await;
+        let (status, body) = call(&router, OPERATION, &request(max_results)).await;
         assert_eq!(
             status, 400,
             "case {case:?}: a maxResults outside range(min: 1, max: 100) is refused, got \
@@ -1061,7 +1006,7 @@ async fn an_unenrolled_account_is_refused() {
     assert_refused(
         call(
             &router,
-            "ListAutomationRulePreviewSummaries",
+            OPERATION,
             &json!({
                 "ruleType": "AccountRule",
                 "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
@@ -1077,8 +1022,8 @@ async fn an_unenrolled_account_is_refused() {
     // inventory that was there all along. Opting in is also what records the
     // account's OWN analysed inventory (see
     // `crate::recommended_action_inventory`), so the request names the volumes
-    // this suite seeded — every one of them, and nothing else — to summarise
-    // exactly the rows the expectation below is written over.
+    // this suite seeded — every one of them, and nothing else — to total exactly
+    // the rows the expectation below is written over.
     call_ok(
         &router,
         "UpdateEnrollmentConfiguration",
@@ -1088,7 +1033,7 @@ async fn an_unenrolled_account_is_refused() {
     .await;
     let body = call_ok(
         &router,
-        "ListAutomationRulePreviewSummaries",
+        OPERATION,
         &json!({
             "ruleType": "AccountRule",
             "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
@@ -1100,12 +1045,9 @@ async fn an_unenrolled_account_is_refused() {
         "opted in",
     )
     .await;
-    assert_summaries(
+    assert_aggregate_row(
         &summaries(&body),
-        &[
-            expect(UPGRADE, 3, 12.5, 7.25, "USD", "BeforeDiscount"),
-            expect(SNAPSHOT_AND_DELETE, 2, 105.0, 94.0, "USD", "AfterDiscount"),
-        ],
+        &aggregate(5, 117.5, 101.25, "USD", "BeforeDiscount"),
         "opted in",
     );
 }

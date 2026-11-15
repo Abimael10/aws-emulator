@@ -6,30 +6,39 @@
 //! `POST /` through the same [`MultiServiceRouter`] the emulator binary mounts —
 //! so a response that is not computed from persisted state fails here.
 //!
-//! The rule under test: a summaries list reports ONE row per distinct value of
-//! the dimension it groups by — `recommendedActionType` for a recommended action
-//! — over the actions that pass the request's filters, in the order the store
-//! first holds an action of that value, each row keyed by that value and
-//! totalling only its own actions. A value nothing matched is no row, so a
-//! request nothing matched reports no rows.
+//! The rule under test: a recommended-action summary listing reports exactly ONE
+//! row for the requested selection — the ACCOUNT-WIDE aggregate — keyed by the
+//! fixed text every such row carries, whose `total.recommendedActionCount` is the
+//! number of actions `ListRecommendedActions` reports for the same unpaginated
+//! filter and whose `total.estimatedMonthlySavings` sums those actions'
+//! estimates. The row is reported even for a selection that holds nothing, with a
+//! count of zero, and its key is fixed text: it is read off neither the request
+//! nor the actions summarised.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::ops::types::{
-    EstimatedMonthlySavings, RecommendedAction, RECOMMENDED_ACTION_FILTER_NAME_VALUES,
-    RECOMMENDED_ACTION_TYPE_VALUES,
+    EstimatedMonthlySavings, RecommendedAction, RecommendedActionFilter,
+    RECOMMENDED_ACTION_FILTER_NAME_VALUES, RECOMMENDED_ACTION_TYPE_VALUES,
 };
-use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::state::DEFAULT_MAX_RESULTS;
+use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::state::{
+    encode_page_token, page_fingerprint, PageCursor, DEFAULT_MAX_RESULTS,
+};
 
 use crate::automation_rule_lifecycle::{
-    assert_refused, call, call_ok, emulator_with_engine, is_next_token, member,
-    unenrolled_emulator_with_engine,
+    assert_refused, call, call_ok, emulator_with_engine, member, unenrolled_emulator_with_engine,
 };
 use crate::recommended_actions::{record, stored, stored_count, MEMBER_ACCOUNT_ID};
 
 /// The operation under test.
 const OPERATION: &str = "ListRecommendedActionSummaries";
+
+/// The `key` every recommended-action summary row carries: fixed text naming the
+/// account-wide aggregate of the requested selection, rather than a value read
+/// off the request or off the actions totalled. It is the same literal whatever
+/// the filter and whatever the store holds, which the cases below drive it over.
+const AGGREGATE_KEY: &str = "ALL_Recommended_Action_Summary";
 
 /// The account every emulated caller presents.
 const CALLER_ACCOUNT_ID: &str = engine::EMULATOR_ACCOUNT_ID;
@@ -61,8 +70,8 @@ fn savings(
 ///
 /// Built on the one recommended-action fixture builder this crate has, with the
 /// three members these cases vary overridden: the owning account, the action
-/// type (which is the grouping dimension), and the estimate its group sums. An
-/// action the store records NO type for is written by passing `None`.
+/// type, and the estimate the aggregate sums. An action the store records NO
+/// type for is written by passing `None`.
 fn action(
     index: usize,
     account_id: Option<&str>,
@@ -87,8 +96,8 @@ fn action(
     }
 }
 
-/// One summary as a response reports it: the grouping key, the group's count and
-/// its aggregated estimate.
+/// One summary as a response reports it: the row's key, its count and its
+/// aggregated estimate.
 #[derive(Debug, Clone, PartialEq)]
 struct Summary {
     key: String,
@@ -99,10 +108,12 @@ struct Summary {
     mode: String,
 }
 
-/// An expected summary, written as a call so a table row stays readable.
-fn expect(key: &str, count: i64, before: f64, after: f64, currency: &str, mode: &str) -> Summary {
+/// The aggregate row a case expects, written as a call so a table row stays
+/// readable. Every row of every table carries the one fixed key, so only the
+/// totals are spelled out.
+fn aggregate(count: i64, before: f64, after: f64, currency: &str, mode: &str) -> Summary {
     Summary {
-        key: key.to_string(),
+        key: AGGREGATE_KEY.to_string(),
         count,
         before,
         after,
@@ -159,79 +170,109 @@ fn reported(body: &Value) -> Vec<Summary> {
         .collect()
 }
 
-/// Compare what came back against what the rule says, naming the case and the
-/// actual values. The figures are summed floating point, so they are compared
-/// within a tolerance far below the smallest amount any row carries.
-fn assert_summaries(case: &str, actual: &[Summary], expected: &[Summary]) {
+/// Assert that a response carries exactly the ONE aggregate row `expected`,
+/// naming the case and the actual values. The figures are summed floating point,
+/// so they are compared within a tolerance far below the smallest amount any row
+/// carries.
+fn assert_aggregate_row(case: &str, actual: &[Summary], expected: &Summary) {
     assert_eq!(
         actual.len(),
-        expected.len(),
-        "case {case:?}: expected {} summaries {expected:?}, got {actual:?}",
-        expected.len()
+        1,
+        "case {case:?}: expected exactly one aggregate row {expected:?}, got {actual:?}"
     );
-    for (actual, expected) in actual.iter().zip(expected.iter()) {
-        assert_eq!(
-            actual.key, expected.key,
-            "case {case:?}: expected group key {:?}, got {actual:?}",
-            expected.key
-        );
-        assert_eq!(
-            actual.count, expected.count,
-            "case {case:?}: expected {} actions in group {:?}, got {actual:?}",
-            expected.count, expected.key
-        );
-        assert!(
-            (actual.before - expected.before).abs() < 1e-9,
-            "case {case:?}: expected beforeDiscountSavings {} in group {:?}, got {actual:?}",
-            expected.before,
-            expected.key
-        );
-        assert!(
-            (actual.after - expected.after).abs() < 1e-9,
-            "case {case:?}: expected afterDiscountSavings {} in group {:?}, got {actual:?}",
-            expected.after,
-            expected.key
-        );
-        assert_eq!(
-            actual.currency, expected.currency,
-            "case {case:?}: expected currency {:?} in group {:?}, got {actual:?}",
-            expected.currency, expected.key
-        );
-        assert_eq!(
-            actual.mode, expected.mode,
-            "case {case:?}: expected savingsEstimationMode {:?} in group {:?}, got {actual:?}",
-            expected.mode, expected.key
-        );
+    let actual = &actual[0];
+    assert_eq!(
+        actual.key, AGGREGATE_KEY,
+        "case {case:?}: expected the fixed aggregate key {AGGREGATE_KEY:?}, got {actual:?}"
+    );
+    assert_eq!(
+        actual.count, expected.count,
+        "case {case:?}: expected {} actions totalled, got {actual:?}",
+        expected.count
+    );
+    assert!(
+        (actual.before - expected.before).abs() < 1e-9,
+        "case {case:?}: expected beforeDiscountSavings {}, got {actual:?}",
+        expected.before
+    );
+    assert!(
+        (actual.after - expected.after).abs() < 1e-9,
+        "case {case:?}: expected afterDiscountSavings {}, got {actual:?}",
+        expected.after
+    );
+    assert_eq!(
+        actual.currency, expected.currency,
+        "case {case:?}: expected currency {:?}, got {actual:?}",
+        expected.currency
+    );
+    assert_eq!(
+        actual.mode, expected.mode,
+        "case {case:?}: expected savingsEstimationMode {:?}, got {actual:?}",
+        expected.mode
+    );
+}
+
+/// The actions `ListRecommendedActions` reports for `request`, which is the
+/// oracle the aggregate's count has to reconcile with.
+async fn listed_actions(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    request: &Value,
+    case: &str,
+) -> Vec<Value> {
+    let body = call_ok(router, "ListRecommendedActions", request, case).await;
+    let listed = member(&body, "recommendedActions");
+    if listed.is_null() {
+        return Vec::new();
     }
+    listed
+        .as_array()
+        .unwrap_or_else(|| panic!("recommendedActions is a list, got {body}"))
+        .clone()
+}
+
+/// A figure one listed action carries under `estimatedMonthlySavings`, or zero
+/// for an action Compute Optimizer estimated no savings for.
+fn figure(action: &Value, name: &str) -> f64 {
+    action
+        .get("estimatedMonthlySavings")
+        .and_then(|estimate| estimate.get(name))
+        .and_then(Value::as_f64)
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
-// Grouping and totalling
+// The aggregate row
 // ---------------------------------------------------------------------------
 
 /// A table spanning what the rule generalises over: how many actions the store
-/// holds, how many distinct types they carry and in which order the store first
-/// holds each, which accounts own them, whether they carry an estimate at all,
-/// and whether a group's estimates agree on a currency and a savings mode.
+/// holds, how many distinct types they carry and in which order, which accounts
+/// own them, whether they carry an estimate at all, and whether the estimates
+/// agree on a currency and a savings mode. Whatever the row, the answer is ONE
+/// aggregate row keyed by the fixed text, counting every action of the
+/// selection.
 #[tokio::test]
-async fn summaries_group_the_stored_actions_by_action_type() {
-    let scenarios: Vec<(&str, Vec<RecommendedAction>, Vec<Summary>)> = vec![
-        // Nothing has been analysed yet, so there is no group to report: a row
-        // for a grouping value no action carries would be a key the service
-        // never emits.
-        ("an-empty-store", vec![], vec![]),
+async fn the_summary_is_one_account_wide_aggregate_row() {
+    let scenarios: Vec<(&str, Vec<RecommendedAction>, Summary)> = vec![
+        // Nothing has been analysed yet. The account still has a total, which is
+        // zero: a caller reading the account-wide count finds the row rather
+        // than no row at all.
         (
-            "one-action-is-one-group",
+            "an-empty-store",
+            vec![],
+            aggregate(0, 0.0, 0.0, "", "BeforeDiscount"),
+        ),
+        (
+            "one-action",
             vec![action(
                 1,
                 Some(CALLER_ACCOUNT_ID),
                 Some(UPGRADE),
                 Some(savings("USD", 12.5, 9.75, "AfterDiscount")),
             )],
-            vec![expect(UPGRADE, 1, 12.5, 9.75, "USD", "AfterDiscount")],
+            aggregate(1, 12.5, 9.75, "USD", "AfterDiscount"),
         ),
         (
-            "actions-of-one-type-are-summed-into-one-group",
+            "actions-of-one-type-are-summed",
             vec![
                 action(
                     1,
@@ -252,10 +293,12 @@ async fn summaries_group_the_stored_actions_by_action_type() {
                     Some(savings("USD", 0.25, 0.125, "AfterDiscount")),
                 ),
             ],
-            vec![expect(UPGRADE, 3, 32.75, 27.875, "USD", "AfterDiscount")],
+            aggregate(3, 32.75, 27.875, "USD", "AfterDiscount"),
         ),
         (
-            "both-modelled-types-are-two-groups",
+            // Both modelled action types, which the aggregate does NOT break
+            // apart: the row totals the account, not the type.
+            "both-modelled-types-total-into-one-row",
             vec![
                 action(
                     1,
@@ -276,16 +319,12 @@ async fn summaries_group_the_stored_actions_by_action_type() {
                     Some(savings("USD", 2.5, 2.25, "AfterDiscount")),
                 ),
             ],
-            vec![
-                expect(UPGRADE, 2, 15.0, 12.0, "USD", "AfterDiscount"),
-                expect(SNAPSHOT_AND_DELETE, 1, 7.0, 6.5, "USD", "AfterDiscount"),
-            ],
+            aggregate(3, 22.0, 18.5, "USD", "AfterDiscount"),
         ),
         (
-            // Same two groups, recorded the other way round: the rows follow the
-            // order the store first holds each type, so the key set is the same
-            // and the order is not fixed to one spelling.
-            "the-groups-follow-the-order-the-store-first-holds-each-type",
+            // Same actions, recorded the other way round: the row is an
+            // aggregate, so the record order cannot change it.
+            "the-row-does-not-depend-on-the-record-order",
             vec![
                 action(
                     1,
@@ -297,18 +336,22 @@ async fn summaries_group_the_stored_actions_by_action_type() {
                     2,
                     Some(CALLER_ACCOUNT_ID),
                     Some(UPGRADE),
+                    Some(savings("USD", 2.5, 2.25, "AfterDiscount")),
+                ),
+                action(
+                    3,
+                    Some(CALLER_ACCOUNT_ID),
+                    Some(UPGRADE),
                     Some(savings("USD", 12.5, 9.75, "AfterDiscount")),
                 ),
             ],
-            vec![
-                expect(SNAPSHOT_AND_DELETE, 1, 7.0, 6.5, "USD", "AfterDiscount"),
-                expect(UPGRADE, 1, 12.5, 9.75, "USD", "AfterDiscount"),
-            ],
+            aggregate(3, 22.0, 18.5, "USD", "AfterDiscount"),
         ),
         (
-            // A group spans every owning account: the dimension grouped by is
-            // the action type, not the account.
-            "a-group-spans-every-owning-account",
+            // The row spans every account the caller retrieves from: it is the
+            // account-wide total, including each associated member account's
+            // analysis output.
+            "every-owning-account-in-one-row",
             vec![
                 action(
                     1,
@@ -329,13 +372,10 @@ async fn summaries_group_the_stored_actions_by_action_type() {
                     Some(savings("USD", 2.5, 2.25, "AfterDiscount")),
                 ),
             ],
-            vec![
-                expect(UPGRADE, 2, 19.5, 16.25, "USD", "AfterDiscount"),
-                expect(SNAPSHOT_AND_DELETE, 1, 2.5, 2.25, "USD", "AfterDiscount"),
-            ],
+            aggregate(3, 22.0, 18.5, "USD", "AfterDiscount"),
         ),
         (
-            "an-action-the-store-holds-no-account-for-is-still-in-its-group",
+            "an-action-the-store-holds-no-account-for-is-still-counted",
             vec![
                 action(
                     1,
@@ -350,13 +390,12 @@ async fn summaries_group_the_stored_actions_by_action_type() {
                     Some(savings("USD", 12.5, 9.75, "AfterDiscount")),
                 ),
             ],
-            vec![expect(UPGRADE, 2, 13.5, 10.25, "USD", "AfterDiscount")],
+            aggregate(2, 13.5, 10.25, "USD", "AfterDiscount"),
         ),
         (
-            // The grouping value is what the row is keyed by, so an action
-            // carrying none belongs to no group — and the groups that do exist
-            // are unaffected by it.
-            "an-action-the-store-holds-no-type-for-is-in-no-group",
+            // The row is not keyed by the action type, so an action carrying no
+            // type is one action of the account's total like any other.
+            "an-action-the-store-holds-no-type-for-is-still-counted",
             vec![
                 action(
                     1,
@@ -371,7 +410,7 @@ async fn summaries_group_the_stored_actions_by_action_type() {
                     Some(savings("USD", 12.5, 9.75, "AfterDiscount")),
                 ),
             ],
-            vec![expect(UPGRADE, 1, 12.5, 9.75, "USD", "AfterDiscount")],
+            aggregate(2, 111.5, 107.75, "USD", "AfterDiscount"),
         ),
         (
             "an-action-without-an-estimate-is-counted-with-no-savings",
@@ -384,26 +423,23 @@ async fn summaries_group_the_stored_actions_by_action_type() {
                 ),
                 action(2, Some(CALLER_ACCOUNT_ID), Some(UPGRADE), None),
             ],
-            vec![expect(UPGRADE, 2, 12.5, 9.75, "USD", "AfterDiscount")],
+            aggregate(2, 12.5, 9.75, "USD", "AfterDiscount"),
         ),
         (
+            // No recorded estimate names a currency, so the row names none and
+            // every sum is zero; the mode is the conservative reading.
             "no-stored-action-carries-an-estimate",
             vec![
                 action(1, Some(CALLER_ACCOUNT_ID), Some(UPGRADE), None),
                 action(2, Some(CALLER_ACCOUNT_ID), Some(SNAPSHOT_AND_DELETE), None),
             ],
-            // No recorded estimate names a currency, so neither group names one
-            // and every sum is zero; the mode is the conservative reading.
-            vec![
-                expect(UPGRADE, 1, 0.0, 0.0, "", "BeforeDiscount"),
-                expect(SNAPSHOT_AND_DELETE, 1, 0.0, 0.0, "", "BeforeDiscount"),
-            ],
+            aggregate(2, 0.0, 0.0, "", "BeforeDiscount"),
         ),
         (
-            // Agreement is judged per GROUP: the upgrade group's estimates
-            // disagree on the mode, so it reports the conservative one, while
-            // the other group keeps the mode its own estimate names.
-            "a-groups-estimates-disagreeing-on-the-mode",
+            // Agreement is judged over the whole aggregate now that it is one
+            // row: estimates that disagree on the mode report the conservative
+            // one.
+            "estimates-disagreeing-on-the-mode",
             vec![
                 action(
                     1,
@@ -424,13 +460,10 @@ async fn summaries_group_the_stored_actions_by_action_type() {
                     Some(savings("USD", 1.0, 0.75, "AfterDiscount")),
                 ),
             ],
-            vec![
-                expect(UPGRADE, 2, 17.5, 13.75, "USD", "BeforeDiscount"),
-                expect(SNAPSHOT_AND_DELETE, 1, 1.0, 0.75, "USD", "AfterDiscount"),
-            ],
+            aggregate(3, 18.5, 14.5, "USD", "BeforeDiscount"),
         ),
         (
-            "a-groups-estimates-agreeing-on-before-discount",
+            "estimates-agreeing-on-before-discount",
             vec![
                 action(
                     1,
@@ -445,13 +478,13 @@ async fn summaries_group_the_stored_actions_by_action_type() {
                     Some(savings("USD", 5.0, 4.0, "BeforeDiscount")),
                 ),
             ],
-            vec![expect(UPGRADE, 2, 17.5, 13.75, "USD", "BeforeDiscount")],
+            aggregate(2, 17.5, 13.75, "USD", "BeforeDiscount"),
         ),
         (
-            // The emulator converts nothing, so a group whose estimates are not
+            // The emulator converts nothing, so a total whose estimates are not
             // in one currency names no currency while still summing both
-            // figures; a group that does agree names its own.
-            "a-groups-estimates-disagreeing-on-the-currency",
+            // figures.
+            "estimates-disagreeing-on-the-currency",
             vec![
                 action(
                     1,
@@ -472,28 +505,46 @@ async fn summaries_group_the_stored_actions_by_action_type() {
                     Some(savings("EUR", 4.0, 3.0, "AfterDiscount")),
                 ),
             ],
+            aggregate(3, 15.0, 11.5, "", "AfterDiscount"),
+        ),
+        (
+            "a-currency-that-is-not-the-dollar-agreed-on",
             vec![
-                expect(UPGRADE, 2, 11.0, 8.5, "", "AfterDiscount"),
-                expect(SNAPSHOT_AND_DELETE, 1, 4.0, 3.0, "EUR", "AfterDiscount"),
+                action(
+                    1,
+                    Some(CALLER_ACCOUNT_ID),
+                    Some(UPGRADE),
+                    Some(savings("JPY", 10.0, 6.0, "AfterDiscount")),
+                ),
+                action(
+                    2,
+                    Some(CALLER_ACCOUNT_ID),
+                    Some(SNAPSHOT_AND_DELETE),
+                    Some(savings("JPY", 2.0, 1.0, "AfterDiscount")),
+                ),
             ],
+            aggregate(2, 12.0, 7.0, "JPY", "AfterDiscount"),
         ),
     ];
 
-    // The table spans the whole modelled `RecommendedActionType` value set, so a
-    // type added to the model cannot be left untested — the rows are keyed by
-    // that value, so each must be reported as its own group.
-    let covered: BTreeSet<String> = scenarios
+    // The seeded inventories span the whole modelled `RecommendedActionType`
+    // value set, so a type added to the model cannot be left untested: whatever
+    // type an action carries, it is one action of the account's total.
+    let seeded: BTreeSet<String> = scenarios
         .iter()
-        .flat_map(|(_, _, expected)| expected.iter().map(|summary| summary.key.clone()))
+        .flat_map(|(_, actions, _)| {
+            actions
+                .iter()
+                .filter_map(|action| action.recommended_action_type.clone())
+        })
         .collect();
     let modelled: BTreeSet<String> = RECOMMENDED_ACTION_TYPE_VALUES
         .iter()
         .map(|name| (*name).to_string())
         .collect();
     assert_eq!(
-        covered, modelled,
-        "every modelled RecommendedActionType must be expected as its own group somewhere \
-         in the table"
+        seeded, modelled,
+        "every modelled RecommendedActionType must be recorded somewhere in the table"
     );
 
     for (case, actions, expected) in &scenarios {
@@ -502,10 +553,21 @@ async fn summaries_group_the_stored_actions_by_action_type() {
         let recorded = stored_count(&engine);
 
         let listed = call_ok(&router, OPERATION, &json!({}), case).await;
-        assert_summaries(case, &reported(&listed), expected);
+        assert_aggregate_row(case, &reported(&listed), expected);
         assert!(
             listed.get("nextToken").is_none(),
-            "case {case:?}: every group fits the default page, so no token is issued: {listed}"
+            "case {case:?}: one aggregate row fits any page, so no token is issued: {listed}"
+        );
+
+        // The reconciliation the aggregate exists for: its count is the number
+        // of actions the unpaginated listing reports for the same (absent)
+        // filter.
+        let actions_listed = listed_actions(&router, &json!({}), case).await;
+        assert_eq!(
+            expected.count,
+            i64::try_from(actions_listed.len()).expect("a small fixture set"),
+            "case {case:?}: the aggregate count must equal the {} actions the listing reports",
+            actions_listed.len()
         );
 
         // Summarising is a read: it records nothing, and a second call answers
@@ -661,12 +723,12 @@ fn filter_cases() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// For every filter list, the groups report exactly the actions
-/// `ListRecommendedActions` reports for the SAME filters, grouped by their
-/// `recommendedActionType` — so a filter nothing matches reports no group at
-/// all.
+/// For every filter list, the one aggregate row totals exactly the actions
+/// `ListRecommendedActions` reports for the SAME filters — so a filter nothing
+/// matches reports the row with a count of zero rather than no row at all, and
+/// the key is the same fixed text whatever the filter selected.
 #[tokio::test]
-async fn filters_narrow_the_actions_each_group_totals() {
+async fn filters_narrow_the_actions_the_aggregate_row_totals() {
     let (router, engine) = emulator_with_engine();
     record(&engine, fixtures());
 
@@ -692,104 +754,54 @@ async fn filters_narrow_the_actions_each_group_totals() {
         "every modelled RecommendedActionFilterName must appear in the table"
     );
 
+    // At least one row must select nothing and one must select something, so the
+    // cases cover both ends of the rule.
+    let mut selected_nothing = 0usize;
+    let mut selected_something = 0usize;
+
     for (case, filters) in filter_cases() {
         let request = json!({"filters": filters, "maxResults": DEFAULT_MAX_RESULTS});
-        let actions = call_ok(&router, "ListRecommendedActions", &request, case).await;
-        let actions = member(&actions, "recommendedActions")
-            .as_array()
-            .expect("recommendedActions is a list")
-            .clone();
+        let actions = listed_actions(&router, &request, case).await;
 
-        // The oracle: group the actions that operation reported the same way,
-        // in the order it first reported each type, keeping each group's key,
-        // count and the two sums of its estimates. How a group names a currency
-        // and a savings mode is the table above's business, so this cross-check
-        // asserts the grouping itself.
-        let mut expected: Vec<(String, i64, f64, f64)> = Vec::new();
-        for listed in &actions {
-            let key = listed
-                .get("recommendedActionType")
-                .and_then(Value::as_str)
-                .expect("every fixture action carries its type")
-                .to_string();
-            let figure = |name: &str| -> f64 {
-                listed
-                    .get("estimatedMonthlySavings")
-                    .and_then(|estimate| estimate.get(name))
-                    .and_then(Value::as_f64)
-                    .unwrap_or_default()
-            };
-            let before = figure("beforeDiscountSavings");
-            let after = figure("afterDiscountSavings");
-            match expected.iter_mut().find(|(group, ..)| group == &key) {
-                Some((_, count, summed_before, summed_after)) => {
-                    *count += 1;
-                    *summed_before += before;
-                    *summed_after += after;
-                }
-                None => expected.push((key, 1, before, after)),
-            }
+        // The oracle: the actions that operation reported for these filters,
+        // counted and summed. How the aggregate names a currency and a savings
+        // mode is the table above's business, so this cross-check carries the
+        // reported ones over.
+        let count = i64::try_from(actions.len()).expect("a small fixture set");
+        let before: f64 = actions
+            .iter()
+            .map(|action| figure(action, "beforeDiscountSavings"))
+            .sum();
+        let after: f64 = actions
+            .iter()
+            .map(|action| figure(action, "afterDiscountSavings"))
+            .sum();
+        if count == 0 {
+            selected_nothing += 1;
+        } else {
+            selected_something += 1;
         }
 
         let summarised = call_ok(&router, OPERATION, &request, case).await;
         let got = reported(&summarised);
-        assert_eq!(
-            got.len(),
-            expected.len(),
-            "case {case:?}: expected {} groups {expected:?}, got {got:?}",
-            expected.len()
+        let reported_currency = got.first().map(|row| row.currency.clone()).unwrap_or_default();
+        let reported_mode = got.first().map(|row| row.mode.clone()).unwrap_or_default();
+        assert_aggregate_row(
+            case,
+            &got,
+            &aggregate(count, before, after, &reported_currency, &reported_mode),
         );
-        for (got, (key, count, before, after)) in got.iter().zip(expected.iter()) {
-            assert_eq!(
-                &got.key, key,
-                "case {case:?}: expected group key {key:?}, got {got:?}"
-            );
-            assert_eq!(
-                got.count, *count,
-                "case {case:?}: expected {count} actions in group {key:?}, got {got:?}"
-            );
-            assert!(
-                (got.before - before).abs() < 1e-9,
-                "case {case:?}: expected beforeDiscountSavings {before} in group {key:?}, \
-                 got {got:?}"
-            );
-            assert!(
-                (got.after - after).abs() < 1e-9,
-                "case {case:?}: expected afterDiscountSavings {after} in group {key:?}, \
-                 got {got:?}"
-            );
-        }
-
-        // The invariants that hold whatever the filters are: the keys are
-        // distinct, each is a value the matched actions actually carry, and the
-        // counts partition the matched actions.
-        let keys: BTreeSet<String> = got.iter().map(|summary| summary.key.clone()).collect();
-        assert_eq!(
-            keys.len(),
-            got.len(),
-            "case {case:?}: a grouping key is reported once, got {got:?}"
-        );
-        let present: BTreeSet<String> = actions
-            .iter()
-            .filter_map(|listed| {
-                listed
-                    .get("recommendedActionType")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-            })
-            .collect();
-        assert_eq!(
-            keys, present,
-            "case {case:?}: the keys are the types the matched actions carry, got {got:?}"
-        );
-        let counted: i64 = got.iter().map(|summary| summary.count).sum();
-        assert_eq!(
-            counted,
-            i64::try_from(actions.len()).expect("a small fixture set"),
-            "case {case:?}: the group counts must add up to the {} matched actions, got {got:?}",
-            actions.len()
+        assert!(
+            summarised.get("nextToken").is_none(),
+            "case {case:?}: one aggregate row fits any page, so no token is issued: {summarised}"
         );
     }
+
+    assert!(
+        selected_nothing > 0 && selected_something > 0,
+        "the filter table must span both a selection that holds nothing and one that holds \
+         actions, got {selected_nothing} and {selected_something}"
+    );
 
     // A filter name outside the modelled value set is refused, not ignored, and
     // the refusal reports the member and the accepted set without echoing the
@@ -827,56 +839,35 @@ async fn filters_narrow_the_actions_each_group_totals() {
 // Pagination
 // ---------------------------------------------------------------------------
 
-/// Whatever the page size, a walk reports every group exactly once, in the same
-/// order, and ends without a token.
+/// The listing reports ONE row, so every page size serves that row and no walk
+/// is ever cut: whatever `maxResults` asks for, the answer is the aggregate and
+/// no token.
 #[tokio::test]
-async fn paging_walks_every_group_once_for_every_page_size() {
+async fn the_aggregate_row_fits_every_page_size_and_mints_no_token() {
     let (router, engine) = emulator_with_engine();
     record(&engine, fixtures());
 
-    // The whole result, read in one page, is what a paged walk must reassemble.
+    // The reference: the row the listing reports when nothing is asked of the
+    // page size.
     let whole = reported(&call_ok(&router, OPERATION, &json!({}), "one-page").await);
     assert_eq!(
         whole.len(),
-        2,
-        "the fixtures hold both action types, so two groups are expected, got {whole:?}"
+        1,
+        "the listing reports one aggregate row, got {whole:?}"
     );
 
     for page_size in [1_i32, 2, 3, DEFAULT_MAX_RESULTS] {
         let case = format!("maxResults-{page_size}");
-        let mut walked: Vec<Summary> = Vec::new();
-        let mut token: Option<String> = None;
-        let mut pages = 0;
-        loop {
-            let mut request = json!({"maxResults": page_size});
-            if let Some(token) = token.as_deref() {
-                request["nextToken"] = json!(token);
-            }
-            let body = call_ok(&router, OPERATION, &request, &case).await;
-            let page = reported(&body);
-            assert!(
-                page.len() <= usize::try_from(page_size).expect("a positive page size"),
-                "case {case:?}: a page holds at most {page_size} groups, got {page:?}"
-            );
-            walked.extend(page);
-            pages += 1;
-            assert!(
-                pages <= whole.len() + 1,
-                "case {case:?}: the walk must terminate, got {pages} pages and {walked:?}"
-            );
-            match body.get("nextToken").and_then(Value::as_str) {
-                Some(next) => {
-                    assert!(
-                        is_next_token(next),
-                        "case {case:?}: a token matches the modelled NextToken pattern, got \
-                         {next:?}"
-                    );
-                    token = Some(next.to_string());
-                }
-                None => break,
-            }
-        }
-        assert_summaries(&case, &walked, &whole);
+        let body = call_ok(&router, OPERATION, &json!({"maxResults": page_size}), &case).await;
+        let page = reported(&body);
+        assert_eq!(
+            page, whole,
+            "case {case:?}: every page size serves the one aggregate row, got {page:?}"
+        );
+        assert!(
+            body.get("nextToken").is_none(),
+            "case {case:?}: nothing remains after the only row, so no token is carried: {body}"
+        );
     }
 
     // `maxResults` carries a member `@range` of min 1 / max 100, which the
@@ -907,32 +898,13 @@ async fn paging_walks_every_group_once_for_every_page_size() {
             );
         }
     }
-
-    // A page of one of two groups leaves a further page, and that page holds the
-    // group the first one stopped before — the walk resumes, it does not restart.
-    let first = call_ok(&router, OPERATION, &json!({"maxResults": 1}), "resume").await;
-    assert_summaries("resume-first-page", &reported(&first), &whole[..1]);
-    let token = first
-        .get("nextToken")
-        .and_then(Value::as_str)
-        .expect("a first page of one of two groups leaves a further page")
-        .to_string();
-    let second = call_ok(
-        &router,
-        OPERATION,
-        &json!({"maxResults": 1, "nextToken": token}),
-        "resume",
-    )
-    .await;
-    assert_summaries("resume-second-page", &reported(&second), &whole[1..]);
-    assert!(
-        second.get("nextToken").is_none(),
-        "case \"resume-second-page\": the last page ends the walk: {second}"
-    );
 }
 
-/// A token this operation did not issue for this very result set is refused
-/// rather than answered with a page of something else.
+/// A `nextToken` is accepted only where this listing could have minted it: for
+/// the same filters, naming a position the row sequence reaches. Anything else —
+/// a token that decodes to nothing, one carrying another query's fingerprint,
+/// one another operation issued, or one naming a position past the only row — is
+/// refused rather than answered with a page of something else.
 #[tokio::test]
 async fn a_token_resumes_only_the_filters_it_was_taken_with() {
     let (router, engine) = emulator_with_engine();
@@ -951,58 +923,79 @@ async fn a_token_resumes_only_the_filters_it_was_taken_with() {
         "token-with-a-foreign-fingerprint",
     );
 
-    // A token taken with one filter list does not resume another: the page it
-    // would resume belongs to a different result set.
-    let taken_with_filters = call_ok(
-        &router,
+    // The fingerprint this listing digests an unfiltered walk under, and the one
+    // it digests a walk under one filter: a cursor carrying either resumes the
+    // walk it names at the end of its one row — the position a walk whose tail
+    // was removed resumes at — while the same cursor under the OTHER filter list
+    // is a token that walk never issued.
+    let account_filters = json!([{"name": "AccountId", "values": [CALLER_ACCOUNT_ID]}]);
+    let unfiltered = page_fingerprint(OPERATION, &Vec::<RecommendedActionFilter>::new());
+    let filtered = page_fingerprint(
         OPERATION,
-        &json!({
-            "maxResults": 1,
-            "filters": [{"name": "AccountId", "values": [CALLER_ACCOUNT_ID, MEMBER_ACCOUNT_ID]}]
-        }),
-        "token-of-other-filters",
-    )
-    .await;
-    let token = taken_with_filters
-        .get("nextToken")
-        .and_then(Value::as_str)
-        .expect("a page of one of two groups leaves a further page")
-        .to_string();
-    assert_refused(
-        call(
-            &router,
-            OPERATION,
-            &json!({"maxResults": 1, "nextToken": token.clone()}),
-        )
-        .await,
-        400,
-        "InvalidParameterValueException",
-        "token-of-other-filters",
+        &[RecommendedActionFilter {
+            name: "AccountId".to_string(),
+            values: vec![CALLER_ACCOUNT_ID.to_string()],
+        }],
     );
-    // The same token resumes the walk it WAS taken with.
-    let resumed = call_ok(
-        &router,
-        OPERATION,
-        &json!({
-            "maxResults": 1,
-            "nextToken": token,
-            "filters": [{"name": "AccountId", "values": [CALLER_ACCOUNT_ID, MEMBER_ACCOUNT_ID]}]
-        }),
-        "token-of-the-same-filters",
-    )
-    .await;
-    assert_summaries(
-        "token-of-the-same-filters",
-        &reported(&resumed),
-        &[expect(
-            SNAPSHOT_AND_DELETE,
-            1,
-            20.0,
-            18.0,
-            "USD",
-            "AfterDiscount",
-        )],
-    );
+    let cursor = |offset: usize, fingerprint: &str| {
+        encode_page_token(&PageCursor {
+            offset,
+            filter_fingerprint: fingerprint.to_string(),
+        })
+    };
+
+    // (case, the request the cursor is presented with, the cursor)
+    let resumes: [(&str, Value, String); 2] = [
+        (
+            "the-unfiltered-walk-resumed-at-the-end-of-its-row-sequence",
+            json!({}),
+            cursor(1, &unfiltered),
+        ),
+        (
+            "the-filtered-walk-resumed-at-the-end-of-its-row-sequence",
+            json!({"filters": account_filters.clone()}),
+            cursor(1, &filtered),
+        ),
+    ];
+    for (case, request, token) in resumes {
+        let mut resumed_request = request;
+        resumed_request["nextToken"] = json!(token);
+        let resumed = call_ok(&router, OPERATION, &resumed_request, case).await;
+        assert!(
+            reported(&resumed).is_empty() && resumed.get("nextToken").is_none(),
+            "case {case:?}: the remainder after the only row is empty and ends the walk, got \
+             {resumed}"
+        );
+    }
+
+    // (case, the request the cursor is presented with, the cursor)
+    let refusals: [(&str, Value, String); 3] = [
+        (
+            "a-position-the-row-sequence-never-reached",
+            json!({}),
+            cursor(2, &unfiltered),
+        ),
+        (
+            "a-token-taken-with-other-filters",
+            json!({}),
+            cursor(1, &filtered),
+        ),
+        (
+            "a-token-taken-without-the-filters-it-is-presented-with",
+            json!({"filters": account_filters}),
+            cursor(1, &unfiltered),
+        ),
+    ];
+    for (case, request, token) in refusals {
+        let mut refused_request = request;
+        refused_request["nextToken"] = json!(token);
+        assert_refused(
+            call(&router, OPERATION, &refused_request).await,
+            400,
+            "InvalidParameterValueException",
+            case,
+        );
+    }
 
     // The token `ListRecommendedActions` issues for its own walk fingerprints
     // that operation's name into the cursor, so it is refused here.
@@ -1059,46 +1052,37 @@ async fn an_account_that_is_not_opted_in_is_refused() {
     );
 
     // The gate is not the absence of data: once enrolled, the same store answers
-    // with one group per action type it holds.
+    // with the account-wide aggregate of everything it holds.
     let (router, engine) = emulator_with_engine();
     record(&engine, fixtures());
     let listed = call_ok(&router, OPERATION, &json!({}), "enrolled").await;
-    assert_summaries(
+    assert_aggregate_row(
         "enrolled",
         &reported(&listed),
-        &[
-            expect(UPGRADE, 3, 17.5, 13.75, "USD", "AfterDiscount"),
-            expect(SNAPSHOT_AND_DELETE, 1, 20.0, 18.0, "USD", "AfterDiscount"),
-        ],
+        &aggregate(4, 37.5, 31.75, "USD", "AfterDiscount"),
     );
 
-    // The groups partition the actions `ListRecommendedActions` reports for the
-    // same (absent) filters, so no action is lost or double counted.
-    let actions = call_ok(
-        &router,
-        "ListRecommendedActions",
-        &json!({}),
-        "enrolled-oracle",
-    )
-    .await;
+    // The row totals the actions `ListRecommendedActions` reports for the same
+    // (absent) filters, so no action is lost or double counted — the two
+    // independent reads reconcile.
+    let actions = listed_actions(&router, &json!({}), "enrolled-oracle").await;
     let mut per_type: BTreeMap<String, i64> = BTreeMap::new();
-    for listed in member(&actions, "recommendedActions")
-        .as_array()
-        .expect("recommendedActions is a list")
-    {
-        let key = listed
+    for action in &actions {
+        let key = action
             .get("recommendedActionType")
             .and_then(Value::as_str)
             .expect("every fixture action carries its type")
             .to_string();
         *per_type.entry(key).or_default() += 1;
     }
-    let summarised: BTreeMap<String, i64> = reported(&listed)
-        .into_iter()
-        .map(|summary| (summary.key, summary.count))
-        .collect();
+    assert!(
+        per_type.len() > 1,
+        "the fixtures must hold more than one action type, so the aggregate really is an \
+         aggregate, got {per_type:?}"
+    );
     assert_eq!(
-        summarised, per_type,
-        "the group counts must match the listed actions per type, got {summarised:?}"
+        reported(&listed)[0].count,
+        per_type.values().sum::<i64>(),
+        "the aggregate count must equal the actions the listing reports, got {per_type:?}"
     );
 }

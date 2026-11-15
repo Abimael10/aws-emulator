@@ -20,9 +20,10 @@
 //! filter list of each filtered listing), the kind of re-spelling (a permuted
 //! list, a repeated entry, reordered filters, a filter spelled twice) and the
 //! operation it is driven through — every paginated listing that takes such a
-//! member, the plain ones and the ones that GROUP before paging alike. Each row
-//! is driven the way a client drives it: an awsJson1_0 `POST /` through the same
-//! [`MultiServiceRouter`] the emulator binary mounts.
+//! member, the ones whose pages are the selected items and the ones that reduce
+//! them to one summary row alike. Each row is driven the way a client drives it:
+//! an awsJson1_0 `POST /` through the same [`MultiServiceRouter`] the emulator
+//! binary mounts.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::state::caller_account_id;
@@ -44,10 +45,23 @@ const EBS_VOLUME: &str = "EbsVolume";
 
 /// Every paginated preview operation, as `(operation, the output member its page
 /// lands in)`. Both are driven for every preview row, so the two cannot drift
-/// apart over which spellings continue one walk.
+/// apart over which spellings name one selection: the unsummarised one through
+/// the page walk below, the summarising one through the aggregate row it reports
+/// (one row per selection, so it has no walk to continue).
 const PREVIEWS: [(&str, &str); 2] = [
     ("ListAutomationRulePreview", "previewResults"),
     ("ListAutomationRulePreviewSummaries", "previewResultSummaries"),
+];
+
+/// The listing of `PREVIEWS` whose pages are single actions, which is the one a
+/// multi-page walk can be taken over.
+const PAGED_PREVIEW: (&str, &str) = PREVIEWS[0];
+
+/// The two summary listings that report ONE account-wide aggregate row per
+/// selection, as `(operation, the output member the row lands in)`.
+const AGGREGATE_SUMMARIES: [(&str, &str); 2] = [
+    ("ListAutomationRulePreviewSummaries", "previewResultSummaries"),
+    ("ListRecommendedActionSummaries", "recommendedActionSummaries"),
 ];
 
 /// The page size every walk below is taken at: the smallest one, so a selection
@@ -132,10 +146,13 @@ fn preview_spellings(member_account: &str) -> Vec<(&'static str, Value, Value)> 
 /// The spellings a FILTERED listing's filter list is re-spelled with, as `(case,
 /// operation, the output member its page lands in, one spelling, the other)`.
 ///
-/// Every filtered listing of this service is a row — the three kinds of filter
-/// the model declares (of a rule, of a recommended action, of an automation
-/// event) and the summaries that group before paging — and the re-spellings span
-/// a permuted value list, a reordered filter list and a filter spelled twice.
+/// Every filtered listing whose pages are the selected items is a row — the three
+/// kinds of filter the model declares (of a rule, of a recommended action, of an
+/// automation event) and the event summaries that group before paging — and the
+/// re-spellings span a permuted value list, a reordered filter list and a filter
+/// spelled twice. The listings that report ONE aggregate row rather than a page
+/// of items are driven by
+/// `one_selection_spelled_two_ways_reports_one_aggregate_row` below.
 fn filter_spellings() -> Vec<(&'static str, &'static str, &'static str, Value, Value)> {
     let action_types = |first: &str, second: &str| {
         json!([{ "name": "RecommendedActionType", "values": [first, second] }])
@@ -171,13 +188,6 @@ fn filter_spellings() -> Vec<(&'static str, &'static str, &'static str, Value, V
                 { "name": "ResourceType", "values": [EBS_VOLUME] },
                 { "name": "ResourceType", "values": [EBS_VOLUME] },
             ])),
-        ),
-        (
-            "the values of one filter permuted",
-            "ListRecommendedActionSummaries",
-            "recommendedActionSummaries",
-            filtered(action_types(UPGRADE, SNAPSHOT_AND_DELETE)),
-            filtered(action_types(SNAPSHOT_AND_DELETE, UPGRADE)),
         ),
         (
             "the values of one filter permuted",
@@ -238,20 +248,19 @@ fn filter_spellings() -> Vec<(&'static str, &'static str, &'static str, Value, V
     ]
 }
 
-/// Every row of the table: the preview spellings through both preview
-/// operations, and each filtered listing's own.
+/// Every row of the table: the preview spellings through the listing whose pages
+/// are single actions, and each filtered listing's own.
 fn rows(member_account: &str) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
+    let (operation, items) = PAGED_PREVIEW;
     for (case, one, other) in preview_spellings(member_account) {
-        for (operation, items) in PREVIEWS {
-            rows.push(Row {
-                case: format!("{operation}: {case}"),
-                operation,
-                items,
-                one: one.clone(),
-                other: other.clone(),
-            });
-        }
+        rows.push(Row {
+            case: format!("{operation}: {case}"),
+            operation,
+            items,
+            one,
+            other,
+        });
     }
     for (case, operation, items, one, other) in filter_spellings() {
         rows.push(Row {
@@ -284,7 +293,7 @@ fn different_selections(member_account: &str) -> Vec<(&'static str, &'static str
         ),
         (
             "an action type dropped",
-            "ListAutomationRulePreviewSummaries",
+            "ListAutomationRulePreview",
             account_preview(json!([UPGRADE, SNAPSHOT_AND_DELETE])),
             account_preview(json!([SNAPSHOT_AND_DELETE])),
         ),
@@ -476,6 +485,62 @@ async fn one_selection_spelled_two_ways_continues_one_page_walk() {
                  selection exactly once, in order; expected {expected:?}, got {served:?}"
             );
         }
+    }
+}
+
+/// A membership-read list re-spelled is ONE selection for the summary listings
+/// too. They report a single account-wide aggregate row per selection, so there
+/// is no second page to continue: what must not change is the row itself, which
+/// both spellings of one selection have to report identically — the same count
+/// and the same totals under the same fixed key.
+///
+/// The rows are the preview re-spellings (the action-type list and the
+/// organization scope) through the summarising preview, and a permuted filter
+/// value list through the recommended-action summaries.
+#[tokio::test]
+async fn one_selection_spelled_two_ways_reports_one_aggregate_row() {
+    let (router, _) = emulator_with_a_fixture().await;
+    let member_account = member_account_ids(1)
+        .pop()
+        .expect("the fixture enrolls at least one member account");
+
+    let (preview_summaries, preview_items) = AGGREGATE_SUMMARIES[0];
+    let (action_summaries, action_items) = AGGREGATE_SUMMARIES[1];
+    let mut rows: Vec<Row> = preview_spellings(&member_account)
+        .into_iter()
+        .map(|(case, one, other)| Row {
+            case: format!("{preview_summaries}: {case}"),
+            operation: preview_summaries,
+            items: preview_items,
+            one,
+            other,
+        })
+        .collect();
+    let action_type_filter = |first: &str, second: &str| {
+        filtered(json!([{ "name": "RecommendedActionType", "values": [first, second] }]))
+    };
+    rows.push(Row {
+        case: format!("{action_summaries}: the values of one filter permuted"),
+        operation: action_summaries,
+        items: action_items,
+        one: action_type_filter(UPGRADE, SNAPSHOT_AND_DELETE),
+        other: action_type_filter(SNAPSHOT_AND_DELETE, UPGRADE),
+    });
+
+    for row in rows {
+        let case = row.case.as_str();
+        let one = whole_selection(&router, row.operation, row.items, &row.one, case).await;
+        let other = whole_selection(&router, row.operation, row.items, &row.other, case).await;
+        assert_eq!(
+            one.len(),
+            1,
+            "case {case:?}: a summary listing reports one aggregate row per selection, got {one:?}"
+        );
+        assert_eq!(
+            one, other,
+            "case {case:?}: the two spellings name one selection, so the row must be the same; \
+             expected {one:?}, got {other:?}"
+        );
     }
 }
 

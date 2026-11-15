@@ -13,16 +13,23 @@
 //!
 //! Both preview operations are driven for every row, over the wire (an
 //! awsJson1_0 `POST /` through the same router the emulator binary mounts), so
-//! the two cannot drift apart over which requests continue one walk. The
-//! recorded case the issue reports is one row of the equivalence table; the rows
-//! differ along what the rule generalises over: which optional member is spelled
-//! two ways (`criteria`, a criterion inside it, `organizationScope`), and
-//! whether the spelling difference is an absent member, an empty object or a
-//! rule type that derives the same account scope.
+//! the two cannot drift apart over which requests name one selection: the
+//! unsummarised one through a page walk, the summarising one through the single
+//! aggregate row it reports per selection (one row, so it has no walk to
+//! continue). The recorded case the issue reports is one row of the equivalence
+//! table; the rows differ along what the rule generalises over: which optional
+//! member is spelled two ways (`criteria`, a criterion inside it,
+//! `organizationScope`), and whether the spelling difference is an absent
+//! member, an empty object or a rule type that derives the same account scope.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::ops::types::RecommendedAction;
-use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::state::caller_account_id;
+use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::ops::types::{
+    Criteria, RecommendedAction,
+};
+use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::state::{
+    caller_account_id, encode_page_token, preview_account_scope, preview_selection_fingerprint,
+    PageCursor,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::automation_rule_lifecycle::{call, call_ok, emulator_with_engine, error_code};
@@ -40,6 +47,13 @@ const PREVIEWS: [(&str, &str); 2] = [
     ("ListAutomationRulePreview", "previewResults"),
     ("ListAutomationRulePreviewSummaries", "previewResultSummaries"),
 ];
+
+/// The preview whose pages are single actions, which is the one a multi-page
+/// walk can be taken over.
+const PAGED_PREVIEW: (&str, &str) = PREVIEWS[0];
+
+/// The preview that reports ONE aggregate row per selection.
+const SUMMARISING_PREVIEW: (&str, &str) = PREVIEWS[1];
 
 /// The page size every walk below is taken at: the smallest one, so a selection
 /// of more than one item leaves a token on its first page whichever preview
@@ -349,6 +363,65 @@ fn different_selections() -> Vec<(&'static str, Value, Value)> {
     ]
 }
 
+/// The cursor `operation` would mint, at `offset`, for the selection a request
+/// of `rule_type` over `action_types` under `criteria` derives — built from the
+/// service's own fingerprint of that selection, so presenting it is presenting a
+/// token that listing could have issued.
+fn selection_cursor(
+    operation: &str,
+    rule_type: &str,
+    action_types: &[String],
+    criteria: &Criteria,
+    offset: usize,
+) -> String {
+    let scope = preview_account_scope(rule_type, None);
+    encode_page_token(&PageCursor {
+        offset,
+        filter_fingerprint: preview_selection_fingerprint(
+            operation,
+            scope.as_deref(),
+            action_types,
+            criteria,
+        ),
+    })
+}
+
+/// Assert that `operation` refuses `token` under `request` with the crate's
+/// validation report for a token taken for another selection, echoing nothing.
+async fn assert_selection_token_refused(
+    router: &MultiServiceRouter,
+    operation: &str,
+    request: &Value,
+    token: &str,
+    case: &str,
+) {
+    let mut refused = request.clone();
+    refused["nextToken"] = json!(token);
+    let (status, body) = call(router, operation, &refused).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} and {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "InvalidParameterValueException",
+        "case {case:?}: expected error code InvalidParameterValueException, got {body}"
+    );
+    let message = error_message(&body);
+    let expected = format!(
+        "1 validation error detected: Value at 'nextToken' failed to satisfy constraint: \
+         {DIFFERENT_SELECTION}"
+    );
+    assert_eq!(
+        message, expected,
+        "case {case:?}: expected message {expected:?}, got {message:?}"
+    );
+    assert!(
+        !message.contains(token),
+        "case {case:?}: the refusal must not echo the rejected token, got {message:?}"
+    );
+}
+
 /// Two spellings of one selection are one walk: a token minted under either is
 /// served by the other, and the walk that switches spelling after its first page
 /// reports exactly the items the selection holds, in order, none served twice
@@ -356,37 +429,64 @@ fn different_selections() -> Vec<(&'static str, Value, Value)> {
 #[tokio::test]
 async fn one_selection_spelled_two_ways_continues_one_page_walk() {
     let router = emulator_with_inventory();
+    let (operation, items) = PAGED_PREVIEW;
 
     for (spellings, one, other) in equivalent_spellings() {
-        for (operation, items) in PREVIEWS {
-            // Both directions: either spelling may be the one that minted the
-            // token the other resumes with.
-            for (first, resumed_with) in [(&one, &other), (&other, &one)] {
-                let case = format!("{operation}: {spellings}");
-                let case = case.as_str();
-                let expected = whole_selection(&router, operation, items, first, case).await;
-                assert!(
-                    expected.len() > 1,
-                    "case {case:?}: the fixture must leave this selection more than one item, so \
-                     its first page carries a token, got {expected:?}"
-                );
-                let also_expected =
-                    whole_selection(&router, operation, items, resumed_with, case).await;
-                assert_eq!(
-                    also_expected, expected,
-                    "case {case:?}: the two spellings must select the same items; expected \
-                     {expected:?}, got {also_expected:?}"
-                );
+        // Both directions: either spelling may be the one that minted the
+        // token the other resumes with.
+        for (first, resumed_with) in [(&one, &other), (&other, &one)] {
+            let case = format!("{operation}: {spellings}");
+            let case = case.as_str();
+            let expected = whole_selection(&router, operation, items, first, case).await;
+            assert!(
+                expected.len() > 1,
+                "case {case:?}: the fixture must leave this selection more than one item, so \
+                 its first page carries a token, got {expected:?}"
+            );
+            let also_expected =
+                whole_selection(&router, operation, items, resumed_with, case).await;
+            assert_eq!(
+                also_expected, expected,
+                "case {case:?}: the two spellings must select the same items; expected \
+                 {expected:?}, got {also_expected:?}"
+            );
 
-                let served =
-                    walk_resuming_with(&router, operation, items, first, resumed_with, case).await;
-                assert_eq!(
-                    served, expected,
-                    "case {case:?}: a walk that switches spelling after its first page must serve \
-                     the selection exactly once, in order; expected {expected:?}, got {served:?}"
-                );
-            }
+            let served =
+                walk_resuming_with(&router, operation, items, first, resumed_with, case).await;
+            assert_eq!(
+                served, expected,
+                "case {case:?}: a walk that switches spelling after its first page must serve \
+                 the selection exactly once, in order; expected {expected:?}, got {served:?}"
+            );
         }
+    }
+}
+
+/// The summarising preview reads the SAME selection, so the same two spellings
+/// are one selection for it too: it reports one account-wide aggregate row, and
+/// both spellings must report that row identically — the same count and the same
+/// totals, so neither spelling selects more or fewer actions than the other.
+#[tokio::test]
+async fn one_selection_spelled_two_ways_reports_one_aggregate_row() {
+    let router = emulator_with_inventory();
+    let (operation, items) = SUMMARISING_PREVIEW;
+
+    for (spellings, one, other) in equivalent_spellings() {
+        let case = format!("{operation}: {spellings}");
+        let case = case.as_str();
+        let reported = whole_selection(&router, operation, items, &one, case).await;
+        assert_eq!(
+            reported.len(),
+            1,
+            "case {case:?}: the summarising preview reports one aggregate row per selection, got \
+             {reported:?}"
+        );
+        let also_reported = whole_selection(&router, operation, items, &other, case).await;
+        assert_eq!(
+            also_reported, reported,
+            "case {case:?}: the two spellings must report the same row; expected {reported:?}, \
+             got {also_reported:?}"
+        );
     }
 }
 
@@ -395,83 +495,107 @@ async fn one_selection_spelled_two_ways_continues_one_page_walk() {
 #[tokio::test]
 async fn a_token_taken_for_a_different_selection_is_refused() {
     let router = emulator_with_inventory();
+    let (operation, items) = PAGED_PREVIEW;
 
     for (selections, issuing, other) in different_selections() {
-        for (operation, items) in PREVIEWS {
-            let case = format!("{operation}: {selections}");
-            let case = case.as_str();
-            let mut first = issuing.clone();
-            first["maxResults"] = json!(ONE_ITEM);
-            let first_page = call_ok(&router, operation, &first, case).await;
-            let token = token_of(&first_page).unwrap_or_else(|| {
-                panic!("case {case:?}: the first page must carry a token, got {first_page}")
-            });
-
-            let mut resumed = other.clone();
-            resumed["maxResults"] = json!(ONE_ITEM);
-            resumed["nextToken"] = json!(token);
-            let (status, body) = call(&router, operation, &resumed).await;
-            assert_eq!(
-                status, 400,
-                "case {case:?}: expected HTTP 400, got {status} and {body}"
-            );
-            assert_eq!(
-                error_code(&body),
-                "InvalidParameterValueException",
-                "case {case:?}: expected error code InvalidParameterValueException, got {body}"
-            );
-            let message = error_message(&body);
-            let expected = format!(
-                "1 validation error detected: Value at 'nextToken' failed to satisfy constraint: \
-                 {DIFFERENT_SELECTION}"
-            );
-            assert_eq!(
-                message, expected,
-                "case {case:?}: expected message {expected:?}, got {message:?}"
-            );
-            assert!(
-                !message.contains(&token),
-                "case {case:?}: the refusal must not echo the rejected token, got {message:?}"
-            );
-
-            // The same token on the selection that issued it is served, so the
-            // refusal above is the selection check and not a blanket rejection.
-            let mut resumed_by_its_own = issuing.clone();
-            resumed_by_its_own["maxResults"] = json!(ONE_ITEM);
-            resumed_by_its_own["nextToken"] = json!(token);
-            let served = call_ok(&router, operation, &resumed_by_its_own, case).await;
-            assert!(
-                !items_of(&served, items).is_empty(),
-                "case {case:?}: the issuing selection must resume with its own token, got {served}"
-            );
-        }
-    }
-}
-
-/// The two preview operations page different sequences for one selection — single
-/// actions against groups of them — so each refuses the other's token even when
-/// the selection is spelled identically.
-#[tokio::test]
-async fn the_sibling_preview_operation_refuses_a_token_for_the_same_selection() {
-    let router = emulator_with_inventory();
-
-    for (operation, _) in PREVIEWS {
-        let sibling = PREVIEWS
-            .iter()
-            .map(|(name, _)| *name)
-            .find(|name| *name != operation)
-            .expect("each preview operation has a sibling");
-        let case = format!("{operation} resuming a token minted by {sibling}");
+        let case = format!("{operation}: {selections}");
         let case = case.as_str();
-
-        let mut request = account_preview(json!({ "criteria": {} }));
-        request["maxResults"] = json!(ONE_ITEM);
-        let first_page = call_ok(&router, sibling, &request, case).await;
+        let mut first = issuing.clone();
+        first["maxResults"] = json!(ONE_ITEM);
+        let first_page = call_ok(&router, operation, &first, case).await;
         let token = token_of(&first_page).unwrap_or_else(|| {
             panic!("case {case:?}: the first page must carry a token, got {first_page}")
         });
 
+        let mut resumed = other.clone();
+        resumed["maxResults"] = json!(ONE_ITEM);
+        assert_selection_token_refused(&router, operation, &resumed, &token, case).await;
+
+        // The same token on the selection that issued it is served, so the
+        // refusal above is the selection check and not a blanket rejection.
+        let mut resumed_by_its_own = issuing.clone();
+        resumed_by_its_own["maxResults"] = json!(ONE_ITEM);
+        resumed_by_its_own["nextToken"] = json!(token);
+        let served = call_ok(&router, operation, &resumed_by_its_own, case).await;
+        assert!(
+            !items_of(&served, items).is_empty(),
+            "case {case:?}: the issuing selection must resume with its own token, got {served}"
+        );
+    }
+}
+
+/// The summarising preview binds its cursor to the DERIVED selection in the same
+/// way: a cursor fingerprinted for one selection is refused under every request
+/// that derives another, and served by the request that derives its own. One
+/// aggregate row leaves nothing after it, so the position such a cursor names is
+/// the end of that row sequence — where a walk whose tail was removed resumes.
+#[tokio::test]
+async fn a_summary_cursor_is_bound_to_the_selection_it_names() {
+    let router = emulator_with_inventory();
+    let (operation, items) = SUMMARISING_PREVIEW;
+    let both_types = vec![UPGRADE.to_string(), SNAPSHOT_AND_DELETE.to_string()];
+    let cursor = selection_cursor(
+        operation,
+        "AccountRule",
+        &both_types,
+        &Criteria::default(),
+        1,
+    );
+
+    let mut own = account_preview(json!({}));
+    own["nextToken"] = json!(cursor);
+    let served = call_ok(
+        &router,
+        operation,
+        &own,
+        "the cursor presented with the selection it names",
+    )
+    .await;
+    assert!(
+        items_of(&served, items).is_empty() && token_of(&served).is_none(),
+        "case \"the cursor presented with the selection it names\": the remainder after the only \
+         row is empty and ends the walk, got {served}"
+    );
+
+    for (selections, _, other) in different_selections() {
+        let case = format!("{operation}: {selections}");
+        assert_selection_token_refused(&router, operation, &other, &cursor, case.as_str()).await;
+    }
+}
+
+/// The two preview operations page different sequences for one selection —
+/// single actions against the one aggregate of them — so each refuses a cursor
+/// the other's walk would carry, even when the selection is spelled identically.
+#[tokio::test]
+async fn the_sibling_preview_operation_refuses_a_token_for_the_same_selection() {
+    let router = emulator_with_inventory();
+    let request = account_preview(json!({ "criteria": {} }));
+    let both_types = vec![UPGRADE.to_string(), SNAPSHOT_AND_DELETE.to_string()];
+
+    // The token the paged preview really minted, presented to the summarising
+    // one, and the cursor the summarising one's walk carries, presented to the
+    // paged one.
+    let mut minting = request.clone();
+    minting["maxResults"] = json!(ONE_ITEM);
+    let first_page = call_ok(&router, PAGED_PREVIEW.0, &minting, "minting").await;
+    let minted = token_of(&first_page).unwrap_or_else(|| {
+        panic!("case \"minting\": the first page must carry a token, got {first_page}")
+    });
+    let summary_cursor = selection_cursor(
+        SUMMARISING_PREVIEW.0,
+        "AccountRule",
+        &both_types,
+        &Criteria::default(),
+        1,
+    );
+
+    for (operation, token) in [
+        (SUMMARISING_PREVIEW.0, minted),
+        (PAGED_PREVIEW.0, summary_cursor),
+    ] {
+        let case = format!("{operation} resuming the sibling preview's cursor");
         let mut resumed = request.clone();
+        resumed["maxResults"] = json!(ONE_ITEM);
         resumed["nextToken"] = json!(token);
         let (status, body) = call(&router, operation, &resumed).await;
         assert_eq!(

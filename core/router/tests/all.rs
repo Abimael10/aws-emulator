@@ -1614,3 +1614,21 @@ mod cloudtrail_iam_credential_write_audit;
 // service crate's own, is stated in that suite's own module header, where it is read beside
 // the test it explains and cannot collide with a concurrent landing. Four suites check the
 // rules above rather than restating them: `all/all_rs_declares_each_suite_once.rs`,
+// Put a new suite at `tests/all/<name>.rs` and add its `#[path]`/`mod` pair below, into the
+// sorted list — one pair per suite and no other line, so two branches landing at once
+// insert two lines in two places and have no prose to duplicate, re-word or mistype.
+// A suite that is not declared here compiles nowhere and its tests never run; a suite left
+// at the top level of `tests/` fails the build; and a suite declared twice is `E0428`. Each
+// of those fails EVERY suite in this target, so what goes below is a declaration, never a
+// note about one. `all/all_rs_declares_each_suite_once.rs`,
+// `all/every_suite_file_is_declared.rs` check those rules, for this file and for every
+// service crate's `tests/all.rs`, so a note about them belongs there. What a suite covers,
+// and why it has to live in this target rather than in a service crate's own, belongs in
+// that suite's own module header, where it is read beside the test it explains; a note about
+// THIS file belongs in `all/appended_notes.rs`.
+// EVERY comment in this file is an ORDINARY `//` one, this header included, and no inner
+// attribute (`#![…]`) stands anywhere in it: both are legal only before the first item, so
+// one a concurrent landing leaves past the declarations compiles no suite of this target at
+// all. With none in the file, no merge of two landings can produce one.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of this
+// file, which the layout check refuses: the `#[path]` is what points each module into

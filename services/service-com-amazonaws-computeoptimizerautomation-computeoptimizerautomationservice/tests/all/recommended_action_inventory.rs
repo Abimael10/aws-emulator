@@ -13,7 +13,7 @@
 //! harness, so nothing in this suite reaches into the store. A response built
 //! from anything but persisted state fails here.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::ops::types::{
@@ -33,6 +33,10 @@ use crate::automation_rule_lifecycle::{
 /// (`^[0-9]{12}$`). Associating it is what makes this service hold it as
 /// enrolled, so its own inventory is analysis output about ANOTHER account.
 const MEMBER_ACCOUNT: &str = "444455556666";
+
+/// The fixed `key` the account-wide recommended-action summary row carries, in
+/// both summary listings of this service.
+const AGGREGATE_KEY: &str = "ALL_Recommended_Action_Summary";
 
 /// How many recommended actions the analysis reports for one enrolled account.
 fn inventory_size() -> usize {
@@ -497,27 +501,27 @@ async fn the_whole_automation_workflow_runs_from_an_opt_in_alone() {
         "case \"workflow\": the workflow starts from the account's analysed actions"
     );
 
-    // What the listed actions say the summaries must report: one group per
-    // action type, in the order the inventory first holds that type, each with
-    // its count and the sums of its estimates.
-    let mut group_order: Vec<String> = Vec::new();
-    let mut counts: BTreeMap<String, i64> = BTreeMap::new();
-    let mut before_totals: BTreeMap<String, f64> = BTreeMap::new();
-    let mut after_totals: BTreeMap<String, f64> = BTreeMap::new();
+    // What the listed actions say the summaries must report: ONE account-wide
+    // aggregate row, counting every listed action and summing their estimates.
+    let expected_count = i64::try_from(actions.len()).expect("a small inventory");
+    let mut expected_before = 0.0;
+    let mut expected_after = 0.0;
+    let mut types: BTreeSet<String> = BTreeSet::new();
     for action in &actions {
-        let key = string_member(action, "recommendedActionType");
-        if !group_order.contains(&key) {
-            group_order.push(key.clone());
-        }
-        *counts.entry(key.clone()).or_default() += 1;
+        types.insert(string_member(action, "recommendedActionType"));
         let savings = member(action, "estimatedMonthlySavings");
-        *before_totals.entry(key.clone()).or_default() += member(savings, "beforeDiscountSavings")
+        expected_before += member(savings, "beforeDiscountSavings")
             .as_f64()
             .unwrap_or_default();
-        *after_totals.entry(key).or_default() += member(savings, "afterDiscountSavings")
+        expected_after += member(savings, "afterDiscountSavings")
             .as_f64()
             .unwrap_or_default();
     }
+    assert!(
+        types.len() > 1,
+        "case \"summaries\": the inventory must hold more than one action type, so the aggregate \
+         really spans them, got {types:?}"
+    );
 
     let summarised = call_ok(
         &router,
@@ -535,30 +539,26 @@ async fn the_whole_automation_workflow_runs_from_an_opt_in_alone() {
             .iter()
             .map(|summary| string_member(summary, "key"))
             .collect::<Vec<String>>(),
-        group_order,
-        "case \"summaries\": one group per action type the inventory holds, got {summarised}"
+        vec![AGGREGATE_KEY.to_string()],
+        "case \"summaries\": the listing reports the one account-wide aggregate row, got \
+         {summarised}"
     );
-    for summary in &summaries {
-        let key = string_member(summary, "key");
-        let total = member(summary, "total");
-        let case = format!("summary-{key}");
-        assert_eq!(
-            member(total, "recommendedActionCount").as_i64(),
-            counts.get(&key).copied(),
-            "case {case:?}: the group counts the listed actions of its type, got {summary}"
+    let total = member(&summaries[0], "total");
+    assert_eq!(
+        member(total, "recommendedActionCount").as_i64(),
+        Some(expected_count),
+        "case \"summaries\": the row counts the {expected_count} listed actions, got {summarised}"
+    );
+    let savings = member(total, "estimatedMonthlySavings");
+    for (field, expected) in [
+        ("beforeDiscountSavings", expected_before),
+        ("afterDiscountSavings", expected_after),
+    ] {
+        let actual = member(savings, field).as_f64().unwrap_or_default();
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "case \"summaries\": expected {field} {expected}, got {actual} in {summarised}"
         );
-        let savings = member(total, "estimatedMonthlySavings");
-        for (field, expected) in [
-            ("beforeDiscountSavings", before_totals.get(&key)),
-            ("afterDiscountSavings", after_totals.get(&key)),
-        ] {
-            let expected = expected.copied().unwrap_or_default();
-            let actual = member(savings, field).as_f64().unwrap_or_default();
-            assert!(
-                (actual - expected).abs() < 1e-9,
-                "case {case:?}: expected {field} {expected}, got {actual} in {summary}"
-            );
-        }
     }
 
     // A rule previewed against the inventory selects the very actions the list
@@ -609,12 +609,12 @@ async fn the_whole_automation_workflow_runs_from_an_opt_in_alone() {
             .collect();
     assert_eq!(
         summarised_preview,
-        group_order
-            .iter()
-            .map(|key| (key.clone(), counts.get(key).copied()))
-            .collect::<Vec<(String, Option<i64>)>>(),
-        "case \"preview-summaries\": the preview summarises the same selection, got \
-         {preview_summaries}"
+        vec![(
+            AGGREGATE_KEY.to_string(),
+            Some(i64::try_from(preview_results.len()).expect("a small inventory"))
+        )],
+        "case \"preview-summaries\": the preview totals the same selection in one aggregate row, \
+         got {preview_summaries}"
     );
 
     // Each action can be automated, and each automation reads back.

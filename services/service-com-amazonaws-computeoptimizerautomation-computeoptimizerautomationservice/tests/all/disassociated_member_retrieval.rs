@@ -8,7 +8,7 @@
 //! inferred from the action being stored. It holds for every operation that
 //! SELECTS over the store, so the table below takes each row through all four of
 //! them: `ListRecommendedActions`, `ListRecommendedActionSummaries` (whose
-//! counts and savings cover exactly the actions the listing reports) and the two
+//! account-wide total covers exactly the actions the listing reports) and the two
 //! rule previews (whose selection is what a rule would act on, so a scope naming
 //! an account the caller may not be scoped to previews nothing of it).
 //!
@@ -25,7 +25,7 @@
 //! the caller's own analysed inventory). Nothing reaches into the store, so each
 //! row is judged on association state its own calls put there.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::ops::types::RECOMMENDED_ACTION_TYPE_VALUES;
@@ -47,6 +47,9 @@ const MEMBER_B: &str = "777788889999";
 /// How savings are compared: the figures are `Double`s the service computed from
 /// its price list, so two sums of the same set agree to within rounding.
 const SAVINGS_TOLERANCE: f64 = 1e-6;
+
+/// The fixed `key` the account-wide recommended-action summary row carries.
+const AGGREGATE_KEY: &str = "ALL_Recommended_Action_Summary";
 
 /// Every item a paginated listing reports for `request`, walked page by page so
 /// the whole result set is seen however it is paged.
@@ -137,9 +140,9 @@ fn inventory_of(accounts: &[String]) -> BTreeSet<String> {
         .collect()
 }
 
-/// Assert that `ListRecommendedActionSummaries` groups exactly the actions
-/// `ListRecommendedActions` reports: one group per reported action type, each
-/// group counting that type's reported actions and summing their estimates.
+/// Assert that `ListRecommendedActionSummaries` totals exactly the actions
+/// `ListRecommendedActions` reports: ONE aggregate row, counting those actions
+/// and summing their estimates.
 async fn assert_summaries_cover(router: &MultiServiceRouter, listed: &[Value], case: &str) {
     let summarised = walk(
         router,
@@ -150,63 +153,48 @@ async fn assert_summaries_cover(router: &MultiServiceRouter, listed: &[Value], c
     )
     .await;
 
-    let mut expected: BTreeMap<String, (i64, f64, f64)> = BTreeMap::new();
-    for action in listed {
-        let entry = expected
-            .entry(string_member(action, "recommendedActionType"))
-            .or_insert((0, 0.0, 0.0));
-        entry.0 += 1;
-        entry.1 += savings_at(action, "/estimatedMonthlySavings/beforeDiscountSavings");
-        entry.2 += savings_at(action, "/estimatedMonthlySavings/afterDiscountSavings");
-    }
-
-    let reported: BTreeMap<String, (i64, f64, f64)> = summarised
+    let count = i64::try_from(listed.len()).expect("a small fixture set");
+    let before: f64 = listed
         .iter()
-        .map(|summary| {
-            (
-                string_member(summary, "key"),
-                (
-                    summary
-                        .pointer("/total/recommendedActionCount")
-                        .and_then(Value::as_i64)
-                        .unwrap_or_default(),
-                    savings_at(
-                        summary,
-                        "/total/estimatedMonthlySavings/beforeDiscountSavings",
-                    ),
-                    savings_at(
-                        summary,
-                        "/total/estimatedMonthlySavings/afterDiscountSavings",
-                    ),
-                ),
-            )
-        })
-        .collect();
+        .map(|action| savings_at(action, "/estimatedMonthlySavings/beforeDiscountSavings"))
+        .sum();
+    let after: f64 = listed
+        .iter()
+        .map(|action| savings_at(action, "/estimatedMonthlySavings/afterDiscountSavings"))
+        .sum();
 
     assert_eq!(
-        reported.keys().collect::<Vec<_>>(),
-        expected.keys().collect::<Vec<_>>(),
-        "case {case:?}: the summaries must group exactly the action types the listing reports, \
-         got {reported:?}"
+        summarised.len(),
+        1,
+        "case {case:?}: the summaries must be the one account-wide aggregate row, got \
+         {summarised:?}"
     );
-    for (key, (count, before, after)) in &expected {
-        let (reported_count, reported_before, reported_after) = reported[key];
-        assert_eq!(
-            reported_count, *count,
-            "case {case:?}: group {key:?} must count the {count} actions the listing reports, got \
-             {reported_count}"
-        );
-        assert!(
-            (reported_before - before).abs() < SAVINGS_TOLERANCE,
-            "case {case:?}: group {key:?} must sum the reported actions' savings ({before}), got \
-             {reported_before}"
-        );
-        assert!(
-            (reported_after - after).abs() < SAVINGS_TOLERANCE,
-            "case {case:?}: group {key:?} must sum the reported actions' discounted savings \
-             ({after}), got {reported_after}"
-        );
-    }
+    let row = &summarised[0];
+    assert_eq!(
+        string_member(row, "key"),
+        AGGREGATE_KEY,
+        "case {case:?}: the aggregate row carries the fixed key, got {row}"
+    );
+    let reported_count = row
+        .pointer("/total/recommendedActionCount")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    assert_eq!(
+        reported_count, count,
+        "case {case:?}: the row must count the {count} actions the listing reports, got {row}"
+    );
+    let reported_before = savings_at(row, "/total/estimatedMonthlySavings/beforeDiscountSavings");
+    assert!(
+        (reported_before - before).abs() < SAVINGS_TOLERANCE,
+        "case {case:?}: the row must sum the reported actions' savings ({before}), got \
+         {reported_before}"
+    );
+    let reported_after = savings_at(row, "/total/estimatedMonthlySavings/afterDiscountSavings");
+    assert!(
+        (reported_after - after).abs() < SAVINGS_TOLERANCE,
+        "case {case:?}: the row must sum the reported actions' discounted savings ({after}), got \
+         {reported_after}"
+    );
 }
 
 /// Every selection over the store covers exactly the accounts the caller reaches

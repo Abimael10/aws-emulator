@@ -52,6 +52,17 @@ const UPGRADE: &str = "UpgradeEbsVolumeType";
 /// The page size that makes a listing with anything to report mint a token.
 const SMALLEST_PAGE: i32 = 1;
 
+/// The listings that report ONE account-wide aggregate row per selection
+/// (`crate::recommended_action_summaries`,
+/// `crate::automation_rule_preview_summaries`): a page can never be cut, so they
+/// mint no token at all and cannot be the ISSUER below. They are still presented
+/// every other listing's token, and the fingerprint table below asserts that
+/// each accepts only a cursor naming itself and its own query.
+const AGGREGATE_SUMMARIES: [&str; 2] = [
+    "ListRecommendedActionSummaries",
+    "ListAutomationRulePreviewSummaries",
+];
+
 /// The requirement a listing reports for a token it did not issue for this call,
 /// taken from the one table of this service's paginated operations.
 fn requirement_for(event_id: &str, operation: &str) -> &'static str {
@@ -255,15 +266,8 @@ fn fingerprint_rows(event_id: &str) -> Vec<Row> {
 
 /// The request a listing is asked to mint a token with: the one every other
 /// case of this suite presents to it, narrowed to the smallest page.
-///
-/// `ListAutomationRulePreviewSummaries` pages the GROUPS of a preview, one per
-/// `recommendedActionType`, so a selection naming a single type is one group and
-/// one page: it is minted over both modelled types, so its walk spans two pages.
-fn minting_request(operation: &str, table_request: &Value) -> Value {
+fn minting_request(table_request: &Value) -> Value {
     let mut request = table_request.clone();
-    if operation == "ListAutomationRulePreviewSummaries" {
-        request["recommendedActionTypes"] = json!([UPGRADE, SNAPSHOT_AND_DELETE]);
-    }
     request["maxResults"] = json!(SMALLEST_PAGE);
     request
 }
@@ -288,7 +292,12 @@ async fn a_minted_page_token_resumes_only_the_listing_that_issued_it() {
     let (router, event_id) = emulator_with_a_fixture().await;
 
     for (issuer, issuing_request, _) in paginated_operations(&event_id) {
-        let minting = minting_request(issuer, &issuing_request);
+        // A listing that reports one aggregate row mints no token, so it has
+        // none to present; it is a PRESENTER in the inner loop below.
+        if AGGREGATE_SUMMARIES.contains(&issuer) {
+            continue;
+        }
+        let minting = minting_request(&issuing_request);
         let first_page = call_ok(&router, issuer, &minting, issuer).await;
         let token = minted_token(&first_page, issuer);
 

@@ -22,7 +22,9 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::ops::types::RecommendedAction;
+use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::ops::types::{
+    Criteria, RecommendedAction,
+};
 use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::state;
 
 use super::automation_rule_lifecycle::{call, call_ok, emulator_with_engine, error_code, member};
@@ -351,10 +353,30 @@ async fn a_preview_page_token_is_bound_to_its_operation_and_selection() {
         "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
         "maxResults": 1,
     });
-    // Both operations page a two-row answer at one row — one result each for
-    // the preview, one group each for the summaries — so each mints a token.
+    // The unsummarised preview pages two selected actions at one action, so its
+    // first page mints a token. The summarising one reports a single
+    // account-wide aggregate row, so a page is never cut and what its walk can
+    // carry is a cursor naming the END of that one-row sequence — built here
+    // from the service's own fingerprint of the very same selection, so it is a
+    // cursor that listing could have issued.
+    let both_types = vec![UPGRADE.to_string(), SNAPSHOT_AND_DELETE.to_string()];
     let mut tokens: Vec<(&str, String)> = Vec::new();
     for operation in PREVIEW_OPERATIONS {
+        if operation == PREVIEW_OPERATIONS[1] {
+            tokens.push((
+                operation,
+                state::encode_page_token(&state::PageCursor {
+                    offset: 1,
+                    filter_fingerprint: state::preview_selection_fingerprint(
+                        operation,
+                        state::preview_account_scope("AccountRule", None).as_deref(),
+                        &both_types,
+                        &Criteria::default(),
+                    ),
+                }),
+            ));
+            continue;
+        }
         let first = call_ok(&router, operation, &selection, operation).await;
         let token = member(&first, "nextToken")
             .as_str()

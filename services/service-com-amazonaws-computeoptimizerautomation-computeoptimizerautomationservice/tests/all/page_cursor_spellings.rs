@@ -20,14 +20,18 @@
 //! uppercase digits the encoder never writes), the positions past the end
 //! (just past it, well past it, and the largest a `usize` can carry), and the
 //! operation it is driven through: EVERY paginated listing of this service, the
-//! plain ones and the ones that GROUP before paging, each driven the way a client
-//! drives it — an awsJson1_0 `POST /` through the same [`MultiServiceRouter`] the
-//! emulator binary mounts. The decoder itself is then driven over a span of
+//! ones whose pages are the selected items and the ones that reduce them to a
+//! single summary row, each driven the way a client drives it — an awsJson1_0
+//! `POST /` through the same [`MultiServiceRouter`] the emulator binary mounts.
+//! The decoder itself is then driven over a span of
 //! offsets directly, where the round trip is the property: every cursor the
 //! encoder writes decodes back to itself, and no re-spelling of one decodes at
 //! all.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::ops::types::{
+    Criteria, RecommendedActionFilter,
+};
 use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::state::{
     self, PageCursor,
 };
@@ -54,16 +58,42 @@ const SMALLEST_PAGE: i32 = 1;
 /// The request each listing is walked with: the one carrying every required
 /// member, with both modelled action types where the listing previews them.
 ///
-/// A preview SUMMARY is one group per `recommendedActionType`, so a selection
-/// naming a single type is a single group and a single page, which mints no
-/// token; naming both leaves the previews more than one item exactly as the
-/// fixture leaves every other listing.
+/// Naming both types leaves the previews more than one selected action, exactly
+/// as the fixture leaves every other listing something to page.
 fn walk_request(operation: &str, required: &Value) -> Value {
     let mut request = required.clone();
     if operation.starts_with("ListAutomationRulePreview") {
         request["recommendedActionTypes"] = json!([UPGRADE, SNAPSHOT_AND_DELETE]);
     }
     request
+}
+
+/// The listings that report ONE account-wide aggregate row per selection
+/// (`crate::recommended_action_summaries`,
+/// `crate::automation_rule_preview_summaries`): a page of theirs is never cut,
+/// so they mint no token, and the cursor their walk can carry is computed from
+/// the service's own fingerprint of the query below rather than read out of a
+/// minted one.
+const AGGREGATE_SUMMARIES: [&str; 2] = [
+    "ListRecommendedActionSummaries",
+    "ListAutomationRulePreviewSummaries",
+];
+
+/// The fingerprint one of `AGGREGATE_SUMMARIES` binds into the cursors of the
+/// walk [`walk_request`] describes for it: its filter list (which that request
+/// leaves out) for the recommended-action summaries, and the derived preview
+/// selection — the accounts an `AccountRule` covers, both action types, no
+/// criteria — for the preview summaries.
+fn aggregate_fingerprint(operation: &str) -> String {
+    if operation == AGGREGATE_SUMMARIES[0] {
+        return state::page_fingerprint(operation, &Vec::<RecommendedActionFilter>::new());
+    }
+    state::preview_selection_fingerprint(
+        operation,
+        state::preview_account_scope("AccountRule", None).as_deref(),
+        &[UPGRADE.to_string(), SNAPSHOT_AND_DELETE.to_string()],
+        &Criteria::default(),
+    )
 }
 
 /// How many items a response reports.
@@ -141,48 +171,61 @@ async fn a_cursor_this_listing_could_not_have_issued_is_refused() {
         whole["maxResults"] = json!(WHOLE_LISTING);
         let whole_page = call_ok(&router, operation, &whole, operation).await;
         let length = reported_count(&whole_page);
-        assert!(
-            length > 1,
-            "case {operation:?}: the fixture must leave this listing more than one item, so its \
-             first page mints a token, got {whole_page}"
-        );
 
-        // A token this listing really minted, and the cursor inside it: every
-        // token below is that same cursor, re-spelled or moved past the end.
-        let mut first = request.clone();
-        first["maxResults"] = json!(SMALLEST_PAGE);
-        let first_page = call_ok(&router, operation, &first, operation).await;
-        let minted = first_page
-            .get("nextToken")
-            .and_then(Value::as_str)
-            .unwrap_or_else(|| {
-                panic!("case {operation:?}: a page of one of {length} items must mint a token, got {first_page}")
-            })
-            .to_string();
-        let cursor = state::decode_page_token(&minted).unwrap_or_else(|| {
-            panic!("case {operation:?}: a minted token must decode to a cursor, got {minted:?}")
-        });
-        assert_eq!(
-            cursor.offset, 1,
-            "case {operation:?}: a first page of one item stops before the second, so its cursor \
-             resumes at 1, got {cursor:?}"
-        );
-        let fingerprint = cursor.filter_fingerprint;
+        // The cursor this listing's walk carries after its first item, and the
+        // fingerprint inside it: every token below is that same cursor,
+        // re-spelled or moved past the end.
+        let fingerprint = if AGGREGATE_SUMMARIES.contains(&operation) {
+            assert_eq!(
+                length, 1,
+                "case {operation:?}: this listing reports one aggregate row, got {whole_page}"
+            );
+            aggregate_fingerprint(operation)
+        } else {
+            assert!(
+                length > 1,
+                "case {operation:?}: the fixture must leave this listing more than one item, so \
+                 its first page mints a token, got {whole_page}"
+            );
+            let mut first = request.clone();
+            first["maxResults"] = json!(SMALLEST_PAGE);
+            let first_page = call_ok(&router, operation, &first, operation).await;
+            let minted = first_page
+                .get("nextToken")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("case {operation:?}: a page of one of {length} items must mint a token, got {first_page}")
+                })
+                .to_string();
+            let cursor = state::decode_page_token(&minted).unwrap_or_else(|| {
+                panic!("case {operation:?}: a minted token must decode to a cursor, got {minted:?}")
+            });
+            assert_eq!(
+                cursor.offset, 1,
+                "case {operation:?}: a first page of one item stops before the second, so its \
+                 cursor resumes at 1, got {cursor:?}"
+            );
 
-        // The control: the cursor as the service spelled it resumes the walk, so
-        // every refusal below is about the spelling or the position and not a
-        // blanket rejection.
-        let (status, parsed) = present(&router, operation, &request, &minted).await;
-        assert_eq!(
-            status, 200,
-            "case {operation:?}: the token this listing minted must resume it, got {status} and \
-             {parsed}"
-        );
+            // The control: the cursor as the service spelled it resumes the
+            // walk, so every refusal below is about the spelling or the position
+            // and not a blanket rejection.
+            let (status, parsed) = present(&router, operation, &request, &minted).await;
+            assert_eq!(
+                status, 200,
+                "case {operation:?}: the token this listing minted must resume it, got {status} \
+                 and {parsed}"
+            );
+            cursor.filter_fingerprint
+        };
 
-        // (case, the token presented): the minted cursor re-spelled, the same
+        // The cursor itself, as the encoder writes it: the position a walk of
+        // this listing stops at after one item.
+        let reference = token_at(1, &fingerprint);
+
+        // (case, the token presented): that cursor re-spelled, the same
         // bytes in the uppercase hex the encoder never writes, and the positions
         // no page of this sequence ever stopped at.
-        let mut rows: Vec<(String, String)> = respellings(cursor.offset)
+        let mut rows: Vec<(String, String)> = respellings(1)
             .into_iter()
             .map(|(case, spelling)| {
                 (
@@ -191,10 +234,10 @@ async fn a_cursor_this_listing_could_not_have_issued_is_refused() {
                 )
             })
             .collect();
-        if minted.to_uppercase() != minted {
+        if reference.to_uppercase() != reference {
             rows.push((
                 "the same bytes in uppercase hex".to_string(),
-                minted.to_uppercase(),
+                reference.to_uppercase(),
             ));
         }
         for beyond in [length + 1, length + 2, length * 2 + 1, 9_999, usize::MAX] {
