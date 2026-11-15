@@ -65,6 +65,8 @@ mod authentication_success_shape;
 mod case_insensitive_user_resolution;
 #[path = "all/change_password.rs"]
 mod change_password;
+#[path = "all/clause_order_states_the_expression_first.rs"]
+mod clause_order_states_the_expression_first;
 #[path = "all/client_secret_absence_sentence.rs"]
 mod client_secret_absence_sentence;
 #[path = "all/client_secret_not_found_message.rs"]
@@ -301,6 +303,8 @@ mod user_auth_event_history;
 mod user_import_job_lifecycle;
 #[path = "all/user_migration_trigger.rs"]
 mod user_migration_trigger;
+#[path = "all/username_client_pair_not_found.rs"]
+mod username_client_pair_not_found;
 #[path = "all/user_pool_auth_metrics.rs"]
 mod user_pool_auth_metrics;
 #[path = "all/user_pool_domain.rs"]

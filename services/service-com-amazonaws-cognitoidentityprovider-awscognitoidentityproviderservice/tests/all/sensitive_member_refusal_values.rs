@@ -43,7 +43,7 @@ fn one_validation_error(clause: &str) -> String {
 }
 
 /// The envelope the framework states SEVERAL broken constraints in: the count it announces
-/// and the clauses joined the way it joins them, in walk order.
+/// and the clauses joined the way it joins them, in the order this endpoint states them.
 fn validation_errors(clauses: &[String]) -> String {
     format!(
         "{} validation errors detected: {}",
@@ -135,10 +135,13 @@ async fn a_clause_quotes_the_value_the_request_carried_at_a_sensitive_member() {
                 "Username": "",
             }),
             // The empty string breaks both of the member's constraints, so the refusal
-            // states a clause for each, both quoting the value the request carried.
+            // states a clause for each, both quoting the value the request carried — the
+            // expression the value has to match ahead of the bound on it, which is the
+            // order this endpoint states a member's clauses in
+            // (`clause_order_states_the_expression_first.rs`).
             expected_message: validation_errors(&[
-                clause("", "username", at_least_1),
                 clause("", "username", username_pattern),
+                clause("", "username", at_least_1),
             ]),
         },
         Row {

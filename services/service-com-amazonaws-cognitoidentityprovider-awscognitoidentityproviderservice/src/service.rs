@@ -99,7 +99,8 @@ use service_common::validation::{
     refusing_violations_with_declared_echoes_quoting_up_to, unanchored, SubmittedEcho,
 };
 use service_common::validation_message::{
-    in_hashed_enum_order, quoting_the_submitted_collection, quoting_the_whole_submitted_value,
+    in_hashed_enum_order, in_pattern_first_order, quoting_the_submitted_collection,
+    quoting_the_whole_submitted_value,
 };
 use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, ErasedServiceDefinition, Operation,
@@ -586,6 +587,28 @@ fn requirement_as_stated(violation: &Violation) -> Violation {
     }
 }
 
+/// The clauses of one refusal in the order this endpoint states them: the members in the
+/// order the validating walk found them, and within ONE member the EXPRESSION its value has
+/// to match ahead of that member's other requirements.
+///
+/// Amazon Cognito reports the form of a value before any bound on it — a pool id that is
+/// both outside `UserPoolIdType`'s `@pattern` and past its `@length` maximum is reported as
+/// failing the expression first — where the framework's walk collects a member's violations
+/// in the order its constraints are CHECKED, which puts a length ahead of a pattern. The
+/// order is [`in_pattern_first_order`], the tree's one statement of it; only the owned
+/// vector the renderers take is rebuilt here.
+///
+/// Nothing but the order changes: each clause, its member path, the value it quotes and its
+/// requirement stay the ones [`requirement_as_stated`] and the framework's own walk wrote,
+/// and the set of clauses is the same one, so a request is never refused for more or fewer
+/// rules than it broke.
+fn in_stated_clause_order(violations: &[Violation]) -> Vec<Violation> {
+    in_pattern_first_order(violations)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
 /// The members of this model whose clause quotes the modelled `@pattern` CHARACTER FOR
 /// CHARACTER, the `^`/`$` pair included: the two that address a set of terms documents,
 /// named as a clause names a member (lowerCamel) — `TermsId`, targeting `TermsIdType`
@@ -869,11 +892,17 @@ where
             let served = collected
                 .iter()
                 .any(|(violation, _)| served_despite(O::NAME, violation));
-            let refused: Vec<Violation> = collected
-                .into_iter()
-                .filter(|(violation, _)| !served_despite(O::NAME, violation))
-                .map(|(violation, echo)| quoting_the_submitted_value(violation, echo))
-                .collect();
+            // Stated in the order this endpoint states its clauses
+            // ([`in_stated_clause_order`]), which is the order the refusal below reports
+            // them in as well, so one request's clauses cannot be ordered one way here and
+            // another there.
+            let refused: Vec<Violation> = in_stated_clause_order(
+                &collected
+                    .into_iter()
+                    .filter(|(violation, _)| !served_despite(O::NAME, violation))
+                    .map(|(violation, echo)| quoting_the_submitted_value(violation, echo))
+                    .collect::<Vec<Violation>>(),
+            );
             if let Some(message) = prose.or_else(|| constraints::envelope(&refused)) {
                 // The framework renders the refusal in this service's own envelope; the
                 // one thing it does not state on an awsJson error is the error shape in
@@ -1022,13 +1051,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             Refusal::Invalid(violations) => {
                 // The requirement rendering is the same one the wrapper states
                 // ([`requirement_as_stated`]), so one request's expression cannot be
-                // quoted two ways and one enum's set cannot be listed two ways — and the
-                // sentence a request naming no pool earns is the same one
+                // quoted two ways and one enum's set cannot be listed two ways; the clause
+                // ORDER is the same one too ([`in_stated_clause_order`]), so a member's
+                // expression is not reported before its bounds here and after them there —
+                // and the sentence a request naming no pool earns is the same one
                 // ([`absent_user_pool_id_sentence`]), so that refusal is not worded one way
                 // here and another there.
                 let message = absent_user_pool_id_sentence(violations.iter()).unwrap_or_else(|| {
-                    let violations: Vec<Violation> =
-                        violations.iter().map(requirement_as_stated).collect();
+                    let violations: Vec<Violation> = in_stated_clause_order(
+                        &violations
+                            .iter()
+                            .map(requirement_as_stated)
+                            .collect::<Vec<Violation>>(),
+                    );
                     ::aws_smithy_schema_server::constraints::envelope(&violations)
                         .unwrap_or_else(|| "invalid request".to_string())
                 });

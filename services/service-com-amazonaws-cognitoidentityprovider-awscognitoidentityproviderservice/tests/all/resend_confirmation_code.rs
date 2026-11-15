@@ -50,8 +50,10 @@ const ENDPOINT_HOST: &str = "cognito-idp.us-east-1.amazonaws.com";
 /// A password satisfying a default pool's password policy.
 const GOOD_PASSWORD: &str = "Passw0rd!2024";
 
-/// The one sentence a `UserNotFoundException` says for this operation, which resolves
-/// the user from the `Username` and the `ClientId` of the request together.
+/// The one sentence this operation says for a `Username` + `ClientId` pair that resolves
+/// to no user, whichever half of the pair does not resolve: it names the user from the
+/// two together, so an app client no pool holds is reported exactly as a username no pool
+/// of that client holds is.
 const USER_NOT_FOUND_MESSAGE: &str = "Username/client id combination not found.";
 
 /// What a resend says when the pool auto-verifies nothing the user holds a value for,
@@ -567,7 +569,7 @@ async fn a_resend_is_refused_for_a_request_it_cannot_serve() {
             Subject::UnknownClient,
             400,
             "ResourceNotFoundException",
-            format!("User pool client {ABSENT_CLIENT_ID} does not exist."),
+            USER_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "a username that never signed up",

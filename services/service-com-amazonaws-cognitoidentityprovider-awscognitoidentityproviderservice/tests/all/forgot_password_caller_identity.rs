@@ -153,8 +153,6 @@ enum Expected {
     Served,
     /// One fixed sentence, the same for every request.
     Fixed(&'static str),
-    /// The refusal that names the `ClientId` no pool holds.
-    ClientNotFound,
     /// The refusal that names the client whose secret the request did not prove.
     UnverifiedSecretHash,
     /// The refusal that names the client the request presented no hash for at
@@ -444,7 +442,7 @@ async fn forgot_password_answers_only_the_pool_its_app_client_names() {
             hash: Hash::Absent,
             status: 400,
             error: Some("ResourceNotFoundException"),
-            message: Expected::ClientNotFound,
+            message: Expected::Fixed(USERNAME_CLIENT_NOT_FOUND_MESSAGE),
         },
         Row {
             case: "a secretless client, for a user of its own pool",
@@ -675,9 +673,6 @@ async fn forgot_password_answers_only_the_pool_its_app_client_names() {
         let expected_message = match row.message {
             Expected::Served => String::new(),
             Expected::Fixed(text) => text.to_string(),
-            Expected::ClientNotFound => {
-                format!("User pool client {client_id} does not exist.")
-            }
             Expected::UnverifiedSecretHash => {
                 format!("Unable to verify secret hash for client {client_id}")
             }

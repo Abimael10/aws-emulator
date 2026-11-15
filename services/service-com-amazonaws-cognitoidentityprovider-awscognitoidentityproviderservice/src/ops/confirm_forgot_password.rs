@@ -246,12 +246,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // what resolves the pool whose user is reset.
             let pool = guard
                 .pool_of_client(&input.client_id)
-                .ok_or_else(|| client_not_found(&input.client_id))?;
+                .ok_or_else(client_not_found)?;
             let user_pool_id = pool.id.clone();
             let client = pool
                 .clients
                 .get(&input.client_id)
-                .ok_or_else(|| client_not_found(&input.client_id))?;
+                .ok_or_else(client_not_found)?;
             if let Some(defect) =
                 client.secret_hash_defect(&input.username, input.secret_hash.as_deref())
             {
@@ -398,9 +398,15 @@ fn code_rejected(rejection: crate::state::CodeRejection) -> ConfirmForgotPasswor
 }
 
 /// This operation's `ResourceNotFoundException` for a `ClientId` no stored pool holds.
-fn client_not_found(client_id: &str) -> ConfirmForgotPasswordError {
+///
+/// The user this operation acts on is resolved from the `Username` and the `ClientId` of
+/// the request TOGETHER — it models no `UserPoolId` — so an app client no stored pool
+/// holds leaves that PAIR unresolved, and the refusal is the one sentence for a pair that
+/// resolves to nothing ([`crate::state::USERNAME_CLIENT_NOT_FOUND_MESSAGE`]), which quotes
+/// neither half and says which half failed no more than [`user_not_found`] does.
+fn client_not_found() -> ConfirmForgotPasswordError {
     ConfirmForgotPasswordErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(crate::state::app_client_not_found_message(client_id)),
+        message: Some(crate::state::USERNAME_CLIENT_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

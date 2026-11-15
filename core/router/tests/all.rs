@@ -4762,3 +4762,6 @@ mod appended_notes;
 //! what the compiler, the build script and the two guard suites above read, so the list
 //! below is kept to them; what each suite covers belongs in that suite's own module doc,
 //! where it is read with the test it describes.
+//! one place to insert and nothing to keep consistent. A suite no `mod` names compiles
+//! nowhere and its tests never run; a suite left at the top level of `tests/` fails the
+//! build; and a suite declared twice is `E0428`, which fails every suite in this target.

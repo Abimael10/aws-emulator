@@ -558,15 +558,27 @@ const DEFAULT_PREVENT_USER_EXISTENCE_ERRORS: &str = "LEGACY";
 /// [`USERNAME_CLIENT_NOT_FOUND_MESSAGE`].
 pub const USER_NOT_FOUND_MESSAGE: &str = "User does not exist.";
 
-/// The message a `UserNotFoundException` carries for an operation that resolves
-/// the user from the `Username` and the `ClientId` of the request TOGETHER.
+/// The message the refusal of an operation that resolves the user it acts on
+/// from the `Username` and the `ClientId` of the request TOGETHER carries, for a
+/// pair that resolves to no user.
 ///
-/// The public sign-up and password-recovery operations — the ones whose input
-/// models a required `Username` beside a required `ClientId` and no
+/// The public password-recovery and sign-up-confirmation operations — the ones
+/// whose input models a required `Username` beside a required `ClientId` and no
 /// `UserPoolId`, so the app client is what names the pool to look in — report an
 /// unresolved user as the combination of the two not being found, rather than as
 /// a statement about the username alone. Like [`USER_NOT_FOUND_MESSAGE`] it is
 /// one fixed sentence that quotes neither the username nor the client id.
+///
+/// It is the sentence for a pair that does not resolve WHICHEVER HALF of it
+/// failed: an app client no stored pool holds leaves the pair unresolved exactly
+/// as a username no pool of that client holds does, so the refusal reports the
+/// combination rather than the half that failed — and an app client's id is
+/// `@sensitive` (`smithy_query(query="shape",shape="ClientIdType")`), so a
+/// sentence naming the id a request carried would both say which half was wrong
+/// and quote that id back. The operations that ADDRESS an app client as the
+/// resource they work on name it instead
+/// ([`app_client_not_found_message`]): there is no pair to resolve, and the app
+/// client is what the request asked for.
 pub const USERNAME_CLIENT_NOT_FOUND_MESSAGE: &str = "Username/client id combination not found.";
 
 /// The message a device operation's `ResourceNotFoundException` carries for a

@@ -391,12 +391,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ForgotPassword<En
         // what resolves the pool whose user is reset.
         let pool = guard
             .pool_of_client(&input.client_id)
-            .ok_or_else(|| client_not_found(&input.client_id))?;
+            .ok_or_else(client_not_found)?;
         let user_pool_id = pool.id.clone();
         let client = pool
             .clients
             .get(&input.client_id)
-            .ok_or_else(|| client_not_found(&input.client_id))?;
+            .ok_or_else(client_not_found)?;
         // "If your app client has a client secret and you don't provide a SECRET_HASH
         // parameter, this API returns NotAuthorizedException" (this operation's own
         // doc), and the same error class is owed to a hash another secret produced —
@@ -553,9 +553,15 @@ fn migration_failed(failure: crate::state::lambda_triggers::Failure) -> ForgotPa
 }
 
 /// This operation's `ResourceNotFoundException` for a `ClientId` no stored pool holds.
-fn client_not_found(client_id: &str) -> ForgotPasswordError {
+///
+/// The user this operation acts on is resolved from the `Username` and the `ClientId` of
+/// the request TOGETHER — it models no `UserPoolId` — so an app client no stored pool
+/// holds leaves that PAIR unresolved, and the refusal is the one sentence for a pair that
+/// resolves to nothing ([`crate::state::USERNAME_CLIENT_NOT_FOUND_MESSAGE`]), which quotes
+/// neither half and says which half failed no more than [`user_not_found`] does.
+fn client_not_found() -> ForgotPasswordError {
     ForgotPasswordErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(crate::state::app_client_not_found_message(client_id)),
+        message: Some(crate::state::USERNAME_CLIENT_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }
