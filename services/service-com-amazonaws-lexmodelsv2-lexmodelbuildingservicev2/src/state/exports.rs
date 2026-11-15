@@ -39,6 +39,11 @@ pub const EXPORT_STATUS_COMPLETED: &str = "Completed";
 /// an archive; `DescribeExport` documents `failureReasons` as carrying "one or more
 /// reasons why the export could not be completed" for exactly this status.
 pub const EXPORT_STATUS_FAILED: &str = "Failed";
+/// See [`EXPORT_STATUS_IN_PROGRESS`]. The status a `DeleteExport` call puts the job it
+/// removes into: "the current status of the deletion. When the deletion is complete, the
+/// export will no longer be returned by the `ListExports` operation and calls to the
+/// `DescribeExport` operation with the export identifier will fail."
+pub const EXPORT_STATUS_DELETING: &str = "Deleting";
 
 /// How long after a create the `InProgress` -> terminal transition of an export falls
 /// due.
@@ -355,6 +360,20 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
         let export = self.exports.get_mut(export_id)?;
         export.settle();
         Some(export)
+    }
+
+    /// Drop the one export the id names together with the archive it assembled, and answer
+    /// the record that went — `None` when the store holds no such export, which is what a
+    /// delete reports as a resource that is not there.
+    ///
+    /// "Removes a previous export and the associated files stored in an S3 bucket": the
+    /// archive a job hands out is part of the job, so it goes with the record and the
+    /// address it was served at stops serving anything. The exports the service no longer
+    /// keeps go first, so an id whose retention window has closed is reported exactly as
+    /// one nothing was ever recorded under.
+    pub fn remove_export(&mut self, export_id: &str) -> Option<Export> {
+        self.drop_expired_exports();
+        self.exports.remove(export_id)
     }
 
     /// Apply every due export transition, so a listing reports the same status a

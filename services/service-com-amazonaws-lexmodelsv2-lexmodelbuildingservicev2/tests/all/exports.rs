@@ -38,7 +38,7 @@ use crate::bot_locale::{locale_body, locales_uri};
 const EXPORTS_URI: &str = "/exports";
 
 /// `DescribeExport`'s URI: `GET /exports/{exportId}`.
-fn export_uri(export_id: &str) -> String {
+pub(crate) fn export_uri(export_id: &str) -> String {
     format!("{EXPORTS_URI}/{export_id}")
 }
 
@@ -59,7 +59,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A `CreateExport` request body: the resource to export and the file format, plus
 /// `extra`.
-fn export_body(resource_specification: Value, file_format: &str, extra: Value) -> Value {
+pub(crate) fn export_body(
+    resource_specification: Value,
+    file_format: &str,
+    extra: Value,
+) -> Value {
     let mut body = json!({
         "resourceSpecification": resource_specification,
         "fileFormat": file_format,
@@ -72,7 +76,7 @@ fn export_body(resource_specification: Value, file_format: &str, extra: Value) -
 }
 
 /// Create an export, assert it was accepted, and return the whole response.
-async fn create_export(router: &MultiServiceRouter, body: &Value) -> Value {
+pub(crate) async fn create_export(router: &MultiServiceRouter, body: &Value) -> Value {
     let (status, created) = call(router, "PUT", EXPORTS_URI, Some(body.clone())).await;
     assert_eq!(
         status, 202,
@@ -82,7 +86,7 @@ async fn create_export(router: &MultiServiceRouter, body: &Value) -> Value {
 }
 
 /// List exports with `body` as the request, assert the listing was served, and return it.
-async fn list_exports(router: &MultiServiceRouter, body: &Value) -> Value {
+pub(crate) async fn list_exports(router: &MultiServiceRouter, body: &Value) -> Value {
     let (status, listed) = call(router, "POST", EXPORTS_URI, Some(body.clone())).await;
     assert_eq!(
         status, 200,
@@ -92,7 +96,7 @@ async fn list_exports(router: &MultiServiceRouter, body: &Value) -> Value {
 }
 
 /// The `exportId` of every entry of a listing, in the order the listing returned them.
-fn listed_ids(listed: &Value) -> Vec<String> {
+pub(crate) fn listed_ids(listed: &Value) -> Vec<String> {
     member(listed, "exportSummaries")
         .as_array()
         .map(|entries| entries.iter().map(|entry| text(entry, "exportId")).collect())
@@ -116,7 +120,11 @@ fn listed_last_updated(listed: &Value) -> Vec<f64> {
 ///
 /// The transition the clock owes is materialised by the next read, so this looks AGAIN
 /// rather than waiting a fixed time for it.
-async fn settled_export(router: &MultiServiceRouter, case: &str, export_id: &str) -> Value {
+pub(crate) async fn settled_export(
+    router: &MultiServiceRouter,
+    case: &str,
+    export_id: &str,
+) -> Value {
     let deadline = Instant::now() + SETTLE_DEADLINE;
     loop {
         let (status, described) = call(router, "GET", &export_uri(export_id), None).await;
@@ -138,7 +146,7 @@ async fn settled_export(router: &MultiServiceRouter, case: &str, export_id: &str
 
 /// Create a bot carrying `locales` on its `DRAFT` version, and a numbered version taken
 /// from the first of them; answer the minted `botId` and that version's number.
-async fn exportable_bot(
+pub(crate) async fn exportable_bot(
     router: &MultiServiceRouter,
     bot_name: &str,
     locales: &[&str],
@@ -250,7 +258,7 @@ fn export_cases(bot_id: &str, bot_version: &str) -> Vec<(&'static str, Value)> {
 
 /// Is this an `exportId` of the modelled `Id` shape (len 10..10, pattern
 /// `^[0-9a-zA-Z]+$`)?
-fn is_export_id(export_id: &str) -> bool {
+pub(crate) fn is_export_id(export_id: &str) -> bool {
     export_id.len() == 10 && export_id.chars().all(char::is_alphanumeric)
 }
 

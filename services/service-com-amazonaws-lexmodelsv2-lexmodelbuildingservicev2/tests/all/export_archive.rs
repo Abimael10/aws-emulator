@@ -295,14 +295,14 @@ async fn completed_export(router: &MultiServiceRouter, case: &str, export_id: &s
 }
 
 /// What a fetch of an announced address answered.
-struct Fetched {
-    status: u16,
-    media_type: String,
-    body: Vec<u8>,
+pub(crate) struct Fetched {
+    pub(crate) status: u16,
+    pub(crate) media_type: String,
+    pub(crate) body: Vec<u8>,
 }
 
 /// Fetch one address this emulator handed out, exactly as it was handed out.
-async fn fetch(router: &MultiServiceRouter, url: &str) -> Fetched {
+pub(crate) async fn fetch(router: &MultiServiceRouter, url: &str) -> Fetched {
     let host = url
         .parse::<http::Uri>()
         .ok()

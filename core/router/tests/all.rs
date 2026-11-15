@@ -2050,3 +2050,11 @@ mod all_rs_carries_no_inner_doc_comment;
 // a note about THIS file belongs in `all/appended_notes.rs`.
 #[path = "all/s3_sourced_table_derived_key_schema.rs"]
 mod s3_sourced_table_derived_key_schema;
+// `mod <name>;` pair per suite under `tests/all/`, sorted by name, and NO other line. Put a
+// new suite at `tests/all/<name>.rs` and insert its pair in order; what a suite covers, and
+// why it belongs to this cross-service target rather than to one service crate's own, is
+// stated in that suite's own module doc, and a note about THIS file belongs in
+// `all/appended_notes.rs`, which is declared below like any other module and holds comments
+// alone.
+// `E0428`; a line between two pairs is a report from the canonical-list suite; and an inner
+// doc comment (`//!`) past the first item is `E0753`. Each of those fails EVERY suite of this

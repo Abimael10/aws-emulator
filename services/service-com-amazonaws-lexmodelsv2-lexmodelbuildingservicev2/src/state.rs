@@ -661,6 +661,10 @@ pub const EXPORTED_CUSTOM_VOCABULARY_LABEL: &str = "Custom vocabulary";
 /// How it names a test set there. See [`request_path_resource_missing`].
 pub const EXPORTED_TEST_SET_LABEL: &str = "Test set";
 
+/// How it names an export job itself there — the resource `DeleteExport` names by id. See
+/// [`request_path_resource_missing`].
+pub const EXPORT_LABEL: &str = "Export";
+
 /// What this control plane says when the resource a request names does not exist: the
 /// kind of resource, the identifiers the request carried for it, and the fixed tail the
 /// sentence ends with.

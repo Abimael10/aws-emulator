@@ -21,6 +21,8 @@ mod bot_locale;
 mod bot_versions;
 #[path = "all/export_archive.rs"]
 mod export_archive;
+#[path = "all/export_deletion.rs"]
+mod export_deletion;
 #[path = "all/exports.rs"]
 mod exports;
 #[path = "all/intent_context_lists.rs"]

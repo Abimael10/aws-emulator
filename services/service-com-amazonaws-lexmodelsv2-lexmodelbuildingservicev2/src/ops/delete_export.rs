@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteExport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteExport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteExport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the export job the `exportId` names from [`crate::state`], together with the
+//! archive that job assembled — "removes a previous export and the associated files" — and
+//! reports the status of the deletion for the id it removed
+//! ([`crate::state::EXPORT_STATUS_DELETING`]). Once the record is gone a listing no longer
+//! carries it, a read of it answers the resource this service does not hold, and the
+//! address its archive was served at serves nothing. An id no stored job carries is
+//! refused with the shape this operation models for a request field that does not resolve;
+//! it models no `ResourceNotFoundException` at all
+//! (`smithy_query(query="operation",operation="DeleteExport")`).
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +153,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteExport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteExportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteExport"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteExportErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // The record and the archive it carries go together, because the archive is what
+        // the job hands out: "removes a previous export and the associated files stored in
+        // an S3 bucket". A later read of the id resolves on nothing, which is what the
+        // modelled status of the deletion says it will.
+        let Some(removed) = store.remove_export(&input.export_id) else {
+            return Err(missing(crate::state::request_path_resource_missing(
+                crate::state::EXPORT_LABEL,
+                &[("id", &input.export_id)],
+            )));
+        };
+
+        Ok(DeleteExportOutput {
+            export_id: Some(removed.export_id),
+            export_status: Some(crate::state::EXPORT_STATUS_DELETING.to_string()),
+        })
     }
+}
+
+/// Refuse the request with the modelled `PreconditionFailedException` (HTTP 412): the
+/// resource the request path names is not one this control plane holds, and this
+/// operation models no `ResourceNotFoundException` to report it with — the same channel
+/// `DeleteBotLocale` and the other deletes of this service answer that case through.
+fn missing(message: String) -> DeleteExportError {
+    DeleteExportErrorModeled::PreconditionFailedException(PreconditionFailedException {
+        message: Some(message),
+    })
+    .into()
 }
