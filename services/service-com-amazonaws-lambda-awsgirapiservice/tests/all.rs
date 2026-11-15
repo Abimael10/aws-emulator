@@ -561,6 +561,8 @@ mod response_stream_invocation;
 mod response_stream_trailer;
 #[path = "all/runtime_api_restore.rs"]
 mod runtime_api_restore;
+#[path = "all/runtime_frame_naming.rs"]
+mod runtime_frame_naming;
 #[path = "all/runtime_management_config.rs"]
 mod runtime_management_config;
 #[path = "all/s3_package_source.rs"]

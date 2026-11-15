@@ -82,10 +82,18 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
 
     // Dynamic import is the one way a module of the package is loaded as an ES module. It
     // is compiled here, once, so a run never depends on it being available at any later
-    // point.
+    // point — and through the same seam a module of the package is compiled by, under the
+    // name node holds its own ES loader at ([`internalUnitOf`]), so a frame taken inside it
+    // names a module of the runtime rather than an anonymous compilation of the host's.
     var dynamicImport = null;
     try {
-        dynamicImport = new Function('specifier', 'return import(specifier);');
+        dynamicImport = hostCompileScript(
+            internalUnitOf('modules/esm/loader'),
+            'export default function (specifier) {\n    return import(specifier);\n};\n'
+        );
+        if (typeof dynamicImport !== 'function') {
+            dynamicImport = null;
+        }
     } catch (error) {
         dynamicImport = null;
     }
@@ -479,13 +487,23 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     }
 
     // The module scope's function, compiled as a unit the engine knows by `name`. A core
-    // module is compiled the same way, under the `node:` name it is imported by.
+    // module is compiled the same way, under the internal name [`internalUnitOf`] states.
     function compileModule(name, wrapped) {
         var compiled = hostCompileScript(name, wrapped);
         if (typeof compiled !== 'function') {
             throw new Error("Cannot compile module '" + name + "'");
         }
         return compiled;
+    }
+
+    // The unit name the runtime's own implementation of the core module `name` is compiled
+    // under: node holds the implementation of a module a handler imports by its `node:`
+    // name under its INTERNAL namespace, and that is the name a frame taken inside one
+    // carries. It is not a name any specifier resolves to — module resolution answers
+    // package files and the `node:` core names alone ([`resolveModule`]) — so it names a
+    // source of this execution environment without being a module guest code can import.
+    function internalUnitOf(name) {
+        return 'node:internal/' + name;
     }
 
     // Whether `id` is an id this runtime itself would have produced: a core module's, or a
@@ -545,25 +563,18 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
                 // line, so every line of the module keeps the number it has in the file
                 // the caller wrote and a stack frame of it names that line.
                 //
-                // A CORE module is compiled by the engine's own function constructor
-                // instead: the name a compilation unit is known by is the name a module of
-                // it is IMPORTED by, and a core module's import name is the one its own ES
-                // wrapper is declared under ([`requiredWrapper`]), which must stay that
-                // wrapper's.
-                var compiled = core
-                    ? new Function(
-                        'exports',
-                        'require',
-                        'module',
-                        '__filename',
-                        '__dirname',
-                        source + '\n'
-                    )
-                    : compileModule(
-                        filename,
-                        'export default function (exports, require, module, __filename, '
-                            + '__dirname) {' + source + '\n};\n'
-                    );
+                // A CORE module is compiled as a unit of its own too, under the INTERNAL
+                // name the runtime holds its implementation of that module by: a frame
+                // taken inside it names that module, the way a frame inside one of node's
+                // own internals does, rather than the pseudo-file the engine's function
+                // constructor would give an anonymous compilation. The name cannot be the
+                // `node:` name the module is imported by, because that one is already the
+                // unit of its own ES wrapper ([`requiredWrapper`]).
+                var compiled = compileModule(
+                    core ? internalUnitOf(id.slice(CORE_PREFIX.length)) : filename,
+                    'export default function (exports, require, module, __filename, '
+                        + '__dirname) {' + source + '\n};\n'
+                );
                 compiled.call(
                     module.exports,
                     module.exports,

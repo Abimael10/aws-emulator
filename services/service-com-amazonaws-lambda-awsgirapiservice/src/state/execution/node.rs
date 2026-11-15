@@ -139,6 +139,22 @@ const ENGINE_OUT_OF_MEMORY: &str = "out of memory";
 /// The error type the engine itself raises under, as against one of the language's own.
 const ENGINE_INTERNAL_ERROR: &str = "InternalError";
 
+/// The unit the RUNTIME's own entry source is compiled as, which is the name every stack
+/// frame taken inside it carries.
+///
+/// A managed node runtime's entry point is a module of its own runtime directory, and that
+/// is the module which requires the handler's: it is already the outermost entry of every
+/// require stack the runtime reports ([`runtime`]'s `RUNTIME_ENTRY`), and an ES module's
+/// frames name it by its file URL, the same form a package module of that kind is named by
+/// ([`super::node::RuntimeLoader`]).
+const RUNTIME_ENTRY_UNIT: &str = "file:///var/runtime/index.mjs";
+
+/// The unit the source completing the runtime's INTERNAL surface is compiled as
+/// ([`intl`]): the language facilities a managed runtime answers from its own internals
+/// rather than from any file of the deployment package, which node names under its internal
+/// module namespace.
+const RUNTIME_INTL_UNIT: &str = "node:internal/intl";
+
 /// One invocation to run: the package, the handler, and everything the runtime reports to
 /// it.
 #[derive(Debug)]
@@ -260,10 +276,10 @@ fn evaluate(request: &Run<'_>, capture: &Arc<Mutex<Capture>>, bounds: &Arc<Bound
     );
     let prepared = context.with(|ctx| -> Result<(), String> {
         install_host(&ctx, capture, &sources, bounds, request.aws)?;
-        evaluate_script(&ctx, runtime::RUNTIME_SOURCE)?;
+        evaluate_runtime_unit(&ctx, RUNTIME_ENTRY_UNIT, runtime::RUNTIME_SOURCE)?;
         // `Intl` and the local-zone reading of `Date`, which stand on the zone database the
         // host looks a zone's offset up in ([`intl`]).
-        evaluate_script(&ctx, intl::INTL_SOURCE)?;
+        evaluate_runtime_unit(&ctx, RUNTIME_INTL_UNIT, intl::INTL_SOURCE)?;
         // The runtime is installed; from here it loads the handler's module, which is the
         // rest of the INIT phase. The engine is standing and nothing of the RUN's own code
         // has been read yet, so this is where the memory the run itself takes is measured
@@ -828,11 +844,37 @@ fn compile_script<'js>(
     evaluated.get::<_, Value<'js>>("default")
 }
 
-/// Evaluate one script of THIS emulator's own in `ctx`.
-fn evaluate_script(ctx: &Ctx<'_>, source: &str) -> Result<(), String> {
-    ctx.eval::<Value<'_>, _>(source)
+/// Evaluate one source of the RUNTIME ITSELF in `ctx`, as a unit named `name`.
+///
+/// It is compiled the way a module of the package is ([`compile_script`]) rather than
+/// evaluated as a bare script, because the name a unit is compiled under is the name every
+/// stack frame taken inside it carries: a run's error document reports that stack, so a
+/// frame of the runtime has to name the runtime's own module — the file a managed runtime's
+/// entry point is ([`RUNTIME_ENTRY_UNIT`]) and the internal surface it completes
+/// ([`RUNTIME_INTL_UNIT`]) — and never the name the host's own evaluator would give an
+/// anonymous script.
+fn evaluate_runtime_unit(ctx: &Ctx<'_>, name: &str, source: &str) -> Result<(), String> {
+    let declared = Module::declare(ctx.clone(), name, source)
         .catch(ctx)
-        .map(|_| ())
+        .map_err(|caught| format!("the Lambda runtime source does not compile: {caught}"))?;
+    let (_, evaluation) = declared
+        .eval()
+        .catch(ctx)
+        .map_err(|caught| format!("the Lambda runtime source does not run: {caught}"))?;
+    // A module's evaluation answers a PROMISE, so an exception its body threw is that
+    // promise's rejection rather than this call's error. It is read here, while the host is
+    // still the one holding the answer, so a runtime source that does not run is reported as
+    // this host's own fault — rather than reaching the caller later as a failure of the
+    // function being invoked.
+    let finished: ::rquickjs::Result<()> = evaluation.finish();
+    if matches!(finished, Err(::rquickjs::Error::WouldBlock)) {
+        // Neither source awaits at its top level, and both are evaluated before a job of the
+        // run is driven, so a pending evaluation says only that this engine settles it on its
+        // own job queue.
+        return Ok(());
+    }
+    finished
+        .catch(ctx)
         .map_err(|caught| format!("the Lambda runtime source does not run: {caught}"))
 }
 
