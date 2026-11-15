@@ -323,6 +323,8 @@ mod role_tag_removal;
 mod role_tags;
 #[path = "all/role_template_acquisition.rs"]
 mod role_template_acquisition;
+#[path = "all/role_template_reacquisition.rs"]
+mod role_template_reacquisition;
 #[path = "all/role_template_version_reads.rs"]
 mod role_template_version_reads;
 #[path = "all/role_trust_policy.rs"]

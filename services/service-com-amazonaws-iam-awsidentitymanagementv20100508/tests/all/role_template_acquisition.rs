@@ -20,7 +20,7 @@
 //!   nothing is created;
 //! * every other refusal is the modelled one for what it refuses — a disabled template, a
 //!   value the template cannot be rendered with, a rendered policy that is no policy
-//!   document, a rendered name the account already holds;
+//!   document, a rendered name held by a role the addressed template version did not create;
 //! * a caller whose identity-based policies do not allow the action is refused, and a
 //!   refused call creates nothing.
 //!
@@ -55,10 +55,10 @@ const MIN_ARN_CHARACTERS: usize = 20;
 const MAX_ARN_CHARACTERS: usize = 2048;
 
 /// The ARN the fixture template is published under.
-const TEMPLATE_ARN: &str = "arn:aws:iam::aws:role-template/PartnerDeployment";
+pub(crate) const TEMPLATE_ARN: &str = "arn:aws:iam::aws:role-template/PartnerDeployment";
 
 /// The minor version the fixture template declares as its default.
-const DEFAULT_MINOR_VERSION: i32 = 3;
+pub(crate) const DEFAULT_MINOR_VERSION: i32 = 3;
 
 /// The managed policy the fixture template attaches: an AWS-managed policy, which belongs
 /// to AWS rather than to this account and so needs no fixture of its own.
@@ -122,7 +122,7 @@ fn parameters() -> Vec<ParameterDefinition> {
 }
 
 /// The fixture role template version, at the minor version `minor_version`.
-fn template(minor_version: i32) -> RoleTemplateVersion {
+pub(crate) fn template(minor_version: i32) -> RoleTemplateVersion {
     RoleTemplateVersion {
         template_arn: Some(TEMPLATE_ARN.to_string()),
         template_name: Some("PartnerDeployment".to_string()),
@@ -174,7 +174,7 @@ pub(crate) fn seed(
 
 /// The role names the account holds, read straight out of the store: what a refused call
 /// must leave exactly as it found it.
-fn held_roles(engine: &engine::InMemoryEngine) -> Vec<String> {
+pub(crate) fn held_roles(engine: &engine::InMemoryEngine) -> Vec<String> {
     let store = state::service_state(engine).expect("the IAM store");
     let held = store.lock().roles.keys().cloned().collect();
     held
@@ -833,25 +833,47 @@ async fn a_rendered_policy_that_is_no_policy_document_is_refused() {
     }
 }
 
+/// How the rendered name comes to be held before the acquisition under test: by a role that
+/// did NOT come from the addressed template version, which is each shape such a role has.
+enum Holder {
+    /// `CreateRole` under the rendered name, in the casing given — a role no template
+    /// created.
+    ByHand(&'static str),
+    /// `AcquireRole` from ANOTHER template, whose name pattern renders the same name.
+    AnotherTemplate,
+    /// `AcquireRole` from another minor version of the SAME template.
+    AnotherMinorVersion(i32),
+}
+
 /// RULE: "the resulting role name conflicts with an existing role in the account" is the
 /// modelled `NameConflictException` (HTTP 409, awsQuery code `NameConflict`), and IAM entity
-/// names "are not distinguished by case", so a rendering that lands on any casing of a held
-/// name conflicts — whichever path created the role that holds it.
+/// names "are not distinguished by case", so a rendering that lands on any casing of a name
+/// held by a role the ADDRESSED template version did not create conflicts — whichever path
+/// created that role. (The role that template version DID create is the role the call asks
+/// for, and `tests/all/role_template_reacquisition.rs` is the rule for it.)
 #[tokio::test]
-async fn a_rendered_name_the_account_already_holds_is_a_name_conflict() {
-    // Rows: the name held by a role created THROUGH this operation, and by one created with
-    // `CreateRole` under a casing that differs.
-    let rows: Vec<(&str, Option<&str>)> = vec![
-        ("a role this operation already created", None),
-        ("a role created by hand under another casing", Some("partner-alpha-deploy")),
+async fn a_rendered_name_held_by_another_role_is_a_name_conflict() {
+    let rows: Vec<(&str, Holder)> = vec![
+        (
+            "a role created by hand under another casing",
+            Holder::ByHand("partner-alpha-deploy"),
+        ),
+        (
+            "a role another template rendered the same name from",
+            Holder::AnotherTemplate,
+        ),
+        (
+            "a role another minor version of this template created",
+            Holder::AnotherMinorVersion(DEFAULT_MINOR_VERSION + 1),
+        ),
     ];
 
-    for (case, held_by_hand) in rows {
+    for (case, holder) in rows {
         let (router, engine) = router_with_engine();
         seed(&engine, TEMPLATE_ARN, &template(DEFAULT_MINOR_VERSION));
 
-        match held_by_hand {
-            Some(role_name) => {
+        match holder {
+            Holder::ByHand(role_name) => {
                 let trust = format!(
                     r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{}:root"}},"Action":"sts:AssumeRole"}}]}}"#,
                     account_id()
@@ -870,12 +892,39 @@ async fn a_rendered_name_the_account_already_holds_is_a_name_conflict() {
                     "case {case:?}: the fixture CreateRole must succeed, got {status}: {body}"
                 );
             }
-            None => {
-                let (status, body) =
-                    acquire(&router, None, TEMPLATE_ARN, None, &[("Team", &["Alpha"])]).await;
+            Holder::AnotherTemplate => {
+                // The published power-user template renders the role's name from the value
+                // the request supplies for it, so it can hold exactly the name the fixture
+                // template below renders.
+                let (status, body) = acquire(
+                    &router,
+                    None,
+                    crate::published_role_template_acquisition::POWER_USER_TEMPLATE_ARN,
+                    None,
+                    &[
+                        ("AWSServiceName", &["lambda.amazonaws.com"]),
+                        ("RoleName", &["Partner-Alpha-Deploy"]),
+                    ],
+                )
+                .await;
                 assert_eq!(
                     status, 200,
-                    "case {case:?}: the first create must succeed, got {status}: {body}"
+                    "case {case:?}: the fixture acquisition must succeed, got {status}: {body}"
+                );
+            }
+            Holder::AnotherMinorVersion(minor_version) => {
+                seed(&engine, TEMPLATE_ARN, &template(minor_version));
+                let (status, body) = acquire(
+                    &router,
+                    None,
+                    TEMPLATE_ARN,
+                    Some(minor_version),
+                    &[("Team", &["Alpha"])],
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the fixture acquisition must succeed, got {status}: {body}"
                 );
             }
         }

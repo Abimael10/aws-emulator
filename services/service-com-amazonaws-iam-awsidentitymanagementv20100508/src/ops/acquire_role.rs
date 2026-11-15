@@ -38,8 +38,12 @@
 //!   members admit: `400` `<Code>InvalidInput</Code>`.
 //! * a rendered trust or inline policy that is no IAM policy document: `400`
 //!   `<Code>MalformedPolicyDocument</Code>`.
-//! * a rendered role name the account already holds a role under: "the resulting role name
-//!   conflicts with an existing role in the account", `409` `<Code>NameConflict</Code>`.
+//! * a rendered role name the account already holds a role OTHER than the one this template
+//!   version creates under: "the resulting role name conflicts with an existing role in the
+//!   account", `409` `<Code>NameConflict</Code>`. The role this call asks for is the one the
+//!   addressed template version creates under the rendered name (`Role$SourceRoleTemplate`),
+//!   so a second call for THAT role is answered with the role the account already holds and
+//!   creates nothing.
 //! * the account's role quota, or a template naming more managed policies than a role may
 //!   carry: `409` `<Code>LimitExceeded</Code>`.
 //!
@@ -620,12 +624,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "The minor version of the role template that was used to create the role"
+        // (`SourceRoleTemplate$TemplateMinorVersion`): the version that was RESOLVED above,
+        // not the one the request spelled, which is also what the created role below
+        // records — so the two are computed once, here.
+        let acquired_minor_version = version
+            .minor_version
+            .or(input.template_minor_version)
+            .unwrap_or_default();
+
         // IAM entity names are unique within the account and "are not distinguished by
-        // case", so the case-folded rendered name is the identity — and a name the account
-        // already holds a role under is what this operation's own modelled conflict names:
-        // "the resulting role name conflicts with an existing role in the account".
+        // case", so the case-folded rendered name is the identity of the role this call
+        // asks for.
         let key = crate::state::name_key(&role_name);
-        if store.roles.contains_key(&key) {
+        if let Some(held) = store.roles.get(&key) {
+            // The role this call asks for is identified by the template it comes from, the
+            // minor version of that template and the name rendered from it — which is what
+            // a role acquired from a template RECORDS ("contains information about the role
+            // template that this role was created from. This member is present only for
+            // roles created with AcquireRole", `Role$SourceRoleTemplate`). So a call whose
+            // rendered name is already held by the role of that same template version asks
+            // for a role that is already there: the acquisition is satisfied by it, the
+            // call answers with the role the account holds, and nothing is created or
+            // changed — acquiring a role twice from one template version leaves the account
+            // with the one role, exactly as acquiring it once does.
+            if held.source_role_template.as_ref().is_some_and(|source| {
+                source.template_arn == input.template_arn
+                    && source.template_minor_version == acquired_minor_version
+            }) {
+                let held = held.clone();
+                ::tracing::info!(
+                    audit = true,
+                    operation = "AcquireRole",
+                    outcome = "already_acquired",
+                    caller_akid = %caller_akid,
+                    template_arn = %input.template_arn,
+                    role_name = %role_name,
+                    "the role this template version creates was already acquired"
+                );
+                return Ok(AcquireRoleOutput {
+                    role: crate::state::reported_role(held),
+                });
+            }
+            // Any OTHER role holding the rendered name is a role this template version did
+            // not create — one created by hand, or acquired from another template or another
+            // minor version of this one — and it is what this operation's own modelled
+            // conflict names: "the resulting role name conflicts with an existing role in
+            // the account".
             return Err(AcquireRoleErrorModeled::NameConflictException(
                 NameConflictException {
                     message: Some(format!(
@@ -689,10 +734,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // minor version that was RESOLVED rather than the one the request spelled.
             source_role_template: Some(SourceRoleTemplate {
                 template_arn: input.template_arn.clone(),
-                template_minor_version: version
-                    .minor_version
-                    .or(input.template_minor_version)
-                    .unwrap_or_default(),
+                template_minor_version: acquired_minor_version,
             }),
             role_name: role_name.clone(),
         };

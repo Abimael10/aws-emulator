@@ -46,11 +46,11 @@ use crate::user_lifecycle::{account_id, call, element, elements, error_code, rou
 /// The ARN the AWS Backup default service role template is published under, as
 /// `PublishedRoleTemplate::arn` builds one:
 /// `arn:aws:iam::aws:role-template/<managing service>/<name>:<major version>`.
-const BACKUP_TEMPLATE_ARN: &str =
+pub(crate) const BACKUP_TEMPLATE_ARN: &str =
     "arn:aws:iam::aws:role-template/backup.amazonaws.com/AWSBackupDefaultServiceRoleTemplate:1";
 
 /// The ARN the IAM power-user role template is published under.
-const POWER_USER_TEMPLATE_ARN: &str =
+pub(crate) const POWER_USER_TEMPLATE_ARN: &str =
     "arn:aws:iam::aws:role-template/iam.amazonaws.com/PowerUserRoleTemplate:1";
 
 /// The account the AWS Backup template's trust policy is rendered for in the rows below —
