@@ -142,3 +142,6 @@ mod write_stamp_under_the_store_lock;
 
 #[path = "all/wrong_scope_sentence.rs"]
 mod wrong_scope_sentence;
+
+#[path = "all/wrong_scope_sentence_every_path.rs"]
+mod wrong_scope_sentence_every_path;
