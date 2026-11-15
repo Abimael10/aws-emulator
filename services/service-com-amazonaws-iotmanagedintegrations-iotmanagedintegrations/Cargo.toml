@@ -34,6 +34,13 @@ uuid = { version = "1", features = ["v4"] }
 # destination's configured authorization server, parameters and all (src/state.rs
 # `o_auth_authorization_url`).
 url = "2"
+# Mints the real X.509 claim certificate and private key a provisioning profile provisions
+# devices with (src/state/provisioning_profiles.rs). rcgen is the generator this tree
+# already uses for certificate material.
+rcgen = "0.13"
+# The validity window rcgen stamps on that claim certificate, converted from the
+# `SystemTime`s into the date-time type rcgen takes.
+time = { version = "0.3.55", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

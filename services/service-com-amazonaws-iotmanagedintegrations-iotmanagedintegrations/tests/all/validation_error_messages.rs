@@ -530,17 +530,13 @@ async fn a_request_the_model_accepts_still_reaches_its_handler() {
     }
 
     // A scaffolded operation whose input the model accepts still answers the scaffold's
-    // 501: the wrapper refuses what the model refuses and nothing else.
-    let scaffolded = call(
-        &router,
-        "POST",
-        "/provisioning-profiles",
-        Some(json!({"ProvisioningType": "FLEET_PROVISIONING", "Name": "profile-1"})),
-    )
-    .await;
+    // 501: the wrapper refuses what the model refuses and nothing else. `ListOtaTasks` (GET
+    // `/ota-tasks`) takes no required member, so the model accepts the bare request and the
+    // answer is the scaffold's own.
+    let scaffolded = call(&router, "GET", "/ota-tasks", None).await;
     assert_eq!(
         scaffolded.status, 501,
-        "case \"CreateProvisioningProfile/valid\": a valid request must reach the operation, \
+        "case \"ListOtaTasks/valid\": a valid request must reach the operation, \
          which is still scaffolded, got {} with body {:?}",
         scaffolded.status, scaffolded.body
     );

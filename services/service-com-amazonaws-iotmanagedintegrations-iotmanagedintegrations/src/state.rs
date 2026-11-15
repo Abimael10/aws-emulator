@@ -4,6 +4,12 @@
 
 pub mod references;
 
+/// The provisioning-profile records of this store, and the certificate material a profile
+/// is created with. Re-exported, so a handler reaches them as `crate::state::…` like every
+/// other resource of this service.
+pub mod provisioning_profiles;
+pub use provisioning_profiles::*;
+
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1150,6 +1156,13 @@ pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
     /// that name it ([`RegionalName`]). `CreateDestination` inserts a record and
     /// `GetDestination` projects it onto its output shape.
     pub destinations: HashMap<RegionalName, Destination>,
+    /// The authoritative provisioning-profile store, keyed by the generated
+    /// `ProvisioningProfileId`. `CreateProvisioningProfile` inserts a record and
+    /// `GetProvisioningProfile` projects it onto its output shape.
+    pub provisioning_profiles: HashMap<String, ProvisioningProfile>,
+    /// Insertion order of provisioning-profile ids, so every operation that reports several
+    /// of them reports them in the order they were created. An id is appended on create.
+    pub provisioning_profile_order: Vec<String>,
     /// The authoritative notification-configuration store, keyed by the region and the
     /// `EventType` the configuration is for ([`RegionalName`]): one configuration per
     /// event type per region.
@@ -1583,6 +1596,10 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
                 .credential_locker_in(region, parts.id)
                 .filter(|locker| locker.arn == arn)
                 .map(|locker| &locker.tags),
+            PROVISIONING_PROFILE_ARN_SEGMENT => self
+                .provisioning_profile_in(region, parts.id, SystemTime::now())
+                .filter(|profile| profile.arn == arn)
+                .map(|profile| &profile.tags),
             _ => None,
         }
     }
@@ -1609,6 +1626,10 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
                 .get_mut(parts.id)
                 .filter(|locker| locker.region == region && locker.arn == arn)
                 .map(|locker| &mut locker.tags),
+            PROVISIONING_PROFILE_ARN_SEGMENT => self
+                .provisioning_profile_in_mut(region, parts.id, SystemTime::now())
+                .filter(|profile| profile.arn == arn)
+                .map(|profile| &mut profile.tags),
             _ => None,
         }
     }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProvisioningProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProvisioningProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProvisioningProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -157,6 +148,22 @@ pub struct CreateProvisioningProfile<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the profile was created in, and how the
+/// call ended. No `Name`, no `Tags`, and none of the certificate material: the `CaCertificate`
+/// and `Tags` the request carries are `@sensitive`, the claim certificate's private key is a
+/// secret, and a log sink needs none of them to attribute the change.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "CreateProvisioningProfile",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
 impl<Eng> CreateProvisioningProfile<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -183,18 +190,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProvisioningProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProvisioningProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProvisioningProfile"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region this profile belongs to.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            CreateProvisioningProfileErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the provisioning-profile store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // Every modelled constraint on this request (the `@length` and `@pattern` of `Name`,
+        // `ClientToken` and `CaCertificate`, the `ProvisioningType` enum, the `TagsMap` size)
+        // is refused at the boundary, so reaching here means there is nothing left to check.
+        let mut store = state.lock();
+        let created_at = ::std::time::SystemTime::now();
+
+        // Retire the idempotency records the clock already made due, before anything reads
+        // them: a token past its TTL neither replays nor occupies the map. A profile whose
+        // deletion the clock has already finished goes with them, so a store at its bound is
+        // one really holding that many profiles.
+        store.retire_expired_idempotency_tokens(created_at);
+        store.retire_deleted_provisioning_profiles(created_at);
+
+        // A retry with the same `ClientToken` answers with what the first call created,
+        // performing no further action — down to the claim certificate and its private key,
+        // which are the first call's material and are not minted again. The token is scoped
+        // to the region that minted the record, as the record itself is. Resolving the token
+        // and inserting the record happen under ONE hold of the store's lock, so concurrent
+        // retries of one token agree on a single winning profile rather than each minting
+        // its own.
+        let replayed = input.client_token.as_deref().and_then(|token| {
+            store.replayed_resource_id(crate::state::PROVISIONING_PROFILE_RESOURCE_TYPE, token)
+        });
+        if let Some(created) =
+            replayed.and_then(|id| store.provisioning_profile_in(&region, &id, created_at))
+        {
+            let replay = created_output(created);
+            drop(store);
+            audit(&akid, &region, "replayed");
+            return Ok(replay);
+        }
+
+        // The store is bounded: past its maximum a create is refused rather than grown into,
+        // so a caller cannot make this emulator's memory grow without end. This operation
+        // models no quota error, so the refusal is the modelled error closest to "this
+        // service will not take another one now".
+        if store.provisioning_profiles.len() >= crate::state::MAX_PROVISIONING_PROFILES {
+            drop(store);
+            audit(&akid, &region, "refused");
+            return Err(CreateProvisioningProfileErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(format!(
+                        "this service holds the maximum of {} provisioning profiles; delete \
+                         one before creating another",
+                        crate::state::MAX_PROVISIONING_PROFILES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let sequence = store.take_sequence();
+        // `ProvisioningProfileId` is `^[A-Za-z0-9-_]+$`, len 1..64, and the resource segment
+        // of `ProvisioningProfileArn` is `[0-9a-zA-Z]+`, which the lowercase-hex opaque id
+        // satisfies.
+        let id = crate::state::opaque_id();
+        let arn = crate::state::provisioning_profile_arn(&region, &id);
+
+        // "If a claim certificate is provided, it will be used for the provisioning profile.
+        // Otherwise, a claim certificate will be generated"
+        // (`CreateProvisioningProfileRequest$ClaimCertificate`): the caller's certificate is
+        // taken as it stands, and the private half of one it supplied stayed with the caller,
+        // so there is none to report back for it.
+        let (claim_certificate, claim_certificate_private_key) = match input.claim_certificate {
+            Some(supplied) => (supplied, None),
+            None => {
+                let Some(minted) = crate::state::mint_claim_certificate(&id, created_at) else {
+                    drop(store);
+                    audit(&akid, &region, "unavailable");
+                    // Nothing is stored: a profile with no claim certificate could provision
+                    // no device, so the call reports the failure rather than minting one.
+                    return Err(
+                        CreateProvisioningProfileErrorModeled::InternalServerException(
+                            InternalServerException {
+                                message: Some(
+                                    "the claim certificate of the provisioning profile could \
+                                     not be issued"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                (minted.certificate, Some(minted.private_key))
+            }
+        };
+
+        let profile = crate::state::ProvisioningProfile {
+            id: id.clone(),
+            arn,
+            region: region.clone(),
+            name: input.name,
+            provisioning_type: input.provisioning_type,
+            claim_certificate,
+            claim_certificate_private_key,
+            ca_certificate: input.ca_certificate,
+            tags: input.tags.unwrap_or_default(),
+            created_at,
+            // The profile this call answers is already created: its claim certificate was
+            // minted and its record stored inside the call, so the status is terminal and the
+            // clock owes it no transition.
+            status: crate::state::PROVISIONING_PROFILE_STATUS_CREATED.to_string(),
+            // Nothing has asked for this profile to be deleted.
+            gone_at: None,
+            sequence,
+        };
+
+        if let Some(token) = input.client_token {
+            store.record_idempotency_token(
+                crate::state::PROVISIONING_PROFILE_RESOURCE_TYPE,
+                &token,
+                &id,
+                created_at,
+            );
+        }
+        store.insert_provisioning_profile(profile);
+        let output = store
+            .provisioning_profile_in(&region, &id, created_at)
+            .map(created_output);
+        drop(store);
+
+        audit(&akid, &region, "created");
+        // The answer is projected from the record the store now holds, so what the create
+        // reports and what a read of the same profile reports are one value.
+        output.ok_or_else(|| {
+            CreateProvisioningProfileErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the provisioning profile could not be stored".to_string()),
+                },
+            )
+            .into()
+        })
+    }
+}
+
+/// The create's answer for the STORED profile `profile`: every member the response shape
+/// declares, projected from the record.
+///
+/// `Status` is the status the record carries rather than a value this handler names, so the
+/// create and a read of the same profile cannot disagree.
+/// `ClaimCertificatePrivateKey` is reported only where this service minted the certificate
+/// itself and therefore holds its private half.
+fn created_output(profile: &crate::state::ProvisioningProfile) -> CreateProvisioningProfileOutput {
+    CreateProvisioningProfileOutput {
+        id: Some(profile.id.clone()),
+        arn: Some(profile.arn.clone()),
+        name: profile.name.clone(),
+        provisioning_type: Some(profile.provisioning_type.clone()),
+        status: Some(profile.status.clone()),
+        claim_certificate: Some(profile.claim_certificate.clone()),
+        claim_certificate_private_key: profile.claim_certificate_private_key.clone(),
     }
 }
