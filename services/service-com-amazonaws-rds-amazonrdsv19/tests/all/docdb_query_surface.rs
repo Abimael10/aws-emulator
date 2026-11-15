@@ -155,11 +155,13 @@ async fn every_awsquery_error_envelope_carries_its_own_request_id() {
             "InvalidParameterCombination",
         ),
         (
+            // A `@required` member the request did not carry is answered under the Query
+            // API code this front door gives a parameter it was not given acceptably.
             "a framework refusal for an absent required member",
             "CreateDBInstance",
             params!["Engine" => "mysql"].to_vec(),
             400,
-            "MalformedInput",
+            "InvalidParameterValue",
         ),
         (
             "an Action this door models no operation for",

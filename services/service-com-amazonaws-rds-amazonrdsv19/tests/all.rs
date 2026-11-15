@@ -35,6 +35,8 @@ mod certificate_override;
 mod cluster_create_refusal_wording;
 #[path = "all/cluster_lifecycle_operations.rs"]
 mod cluster_lifecycle_operations;
+#[path = "all/cluster_lookup_reference_gates.rs"]
+mod cluster_lookup_reference_gates;
 #[path = "all/cluster_member_deletion.rs"]
 mod cluster_member_deletion;
 #[path = "all/cluster_parameter_engine_modes.rs"]

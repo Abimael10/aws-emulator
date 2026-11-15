@@ -21,3 +21,5 @@ mod db_cluster_lifecycle;
 mod duplicate_cluster_refusal_sentence;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/unsupported_filter_name_sentence.rs"]
+mod unsupported_filter_name_sentence;

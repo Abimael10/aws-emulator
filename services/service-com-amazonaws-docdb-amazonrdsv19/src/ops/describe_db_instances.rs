@@ -213,11 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .filter_map(|value| store.resolve_instance_key(value))
                         .collect()
                 } else {
-                    return Err(crate::scaffolded::Scaffolded::validation(format!(
-                        "Unrecognized filter name '{}' for DescribeDBInstances: the supported \
-                         filters are 'db-cluster-id' and 'db-instance-id'",
-                        filter.name
-                    )));
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        crate::state::unrecognized_filter_name_message(&filter.name),
+                    ));
                 };
             selected.retain(|key| wanted.contains(key));
         }

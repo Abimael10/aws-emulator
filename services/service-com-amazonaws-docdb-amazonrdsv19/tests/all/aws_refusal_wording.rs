@@ -19,7 +19,10 @@
 //! * a parameter name the family does not publish is refused as a parameter that could not
 //!   be found;
 //! * a reset blocked by an unapplied change is refused with the sentence that names the
-//!   PARAMETER it is waiting on.
+//!   PARAMETER it is waiting on;
+//! * a `Filters` entry whose `Name` a report does not support is refused with fixed text and
+//!   the offending name, and nothing after it — the same sentence from every report of this
+//!   view, whichever filter names that report does publish.
 //!
 //! Every call goes over the wire through the harness in `cluster_lifecycle.rs`, so the
 //! assertions read the XML the emulator itself answered with.
@@ -518,5 +521,82 @@ async fn a_reset_blocked_by_an_unapplied_change_names_the_parameter() {
                 ],
             )
             .await;
+    }
+}
+
+/// One unsupported-filter refusal: the report that answers it, and the `Filter$Name` that
+/// report does not support.
+struct FilterCase {
+    case: &'static str,
+    action: &'static str,
+    name: &'static str,
+}
+
+/// The rows span both reports that check their filter names and the shapes an unsupported
+/// name takes — a name no report of this API publishes, a case variant of one this report
+/// does, a truncation of one, and a name the OTHER report publishes — so the sentence is the
+/// one answer to "this report does not support that filter" rather than to one name.
+const FILTER_CASES: &[FilterCase] = &[
+    FilterCase {
+        case: "a name no report of this API publishes",
+        action: "DescribeDBClusters",
+        name: "not-a-filter-at-all",
+    },
+    FilterCase {
+        case: "a case variant of the name this report does publish",
+        action: "DescribeDBClusters",
+        name: "DB-Cluster-Id",
+    },
+    FilterCase {
+        case: "a truncation of the name this report publishes",
+        action: "DescribeDBClusters",
+        name: "db-cluster",
+    },
+    FilterCase {
+        case: "a name only the instance report publishes",
+        action: "DescribeDBClusters",
+        name: "db-instance-id",
+    },
+    FilterCase {
+        case: "a name neither report publishes, on the instance report",
+        action: "DescribeDBInstances",
+        name: "engine",
+    },
+    FilterCase {
+        case: "a case variant on the instance report",
+        action: "DescribeDBInstances",
+        name: "DB-Instance-Id",
+    },
+];
+
+#[tokio::test]
+async fn an_unsupported_filter_name_is_refused_with_fixed_text_and_the_name() {
+    let docdb = Docdb::new();
+
+    for row in FILTER_CASES {
+        let message = refusal_message_at(
+            &docdb,
+            row.case,
+            row.action,
+            &[
+                ("Filters.Filter.1.Name", row.name),
+                ("Filters.Filter.1.Values.Value.1", "any-value"),
+            ],
+            400,
+        )
+        .await;
+        let expected = state::unrecognized_filter_name_message(row.name);
+        assert_eq!(
+            message, expected,
+            "case {:?}: expected {expected:?}, got {message:?}",
+            row.case
+        );
+        // The sentence states the name and nothing else: a report that advertised the
+        // filters it implements would name one of them here.
+        assert!(
+            !message.contains("db-cluster-id") || row.name.contains("db-cluster-id"),
+            "case {:?}: expected no supported-filter listing in {message:?}",
+            row.case
+        );
     }
 }

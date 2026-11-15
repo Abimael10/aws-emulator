@@ -34,8 +34,10 @@ use crate::ops::types::DBClusterNotFoundFault;
 /// The `Action` whose references are resolved here.
 const CREATE_DB_INSTANCE: &str = "CreateDBInstance";
 
-/// The member naming the DB cluster a new DB instance would join.
-const DB_CLUSTER_IDENTIFIER: &str = "DBClusterIdentifier";
+/// The member naming the DB cluster a new DB instance would join, spelled once for this
+/// crate by the state module that holds every rule about that member
+/// ([`crate::state::DB_CLUSTER_IDENTIFIER_MEMBER`]).
+use crate::state::DB_CLUSTER_IDENTIFIER_MEMBER as DB_CLUSTER_IDENTIFIER;
 
 /// The members `CreateDBInstanceMessage` declares `@required` (every one of them also
 /// `@clientOptional`), from

@@ -22,7 +22,8 @@
 //!    identifier as the request spelled them. Another role for the same feature is a
 //!    different association and is recorded.
 //! 4. A role-association call whose `DBClusterIdentifier` names no cluster answers the
-//!    modelled `DBClusterNotFoundFault` with `DBCluster not found: <identifier>`.
+//!    modelled `DBClusterNotFoundFault` with `DBCluster not found: <identifier>` — the
+//!    identifier the reference carries, which an ARN form is reduced to.
 //! 5. A role whose trust policy does not let `rds.amazonaws.com` assume it is refused
 //!    `InvalidParameterValue` with ONE fixed sentence, whichever resource the request
 //!    addressed and whichever principal the policy names instead: the sentence carries no
@@ -498,7 +499,7 @@ async fn a_db_cluster_associates_one_role_once() {
 }
 
 /// Rule 4: the role-association calls word a `DBClusterIdentifier` that names no cluster
-/// as a plain lookup miss, naming the identifier the request carried.
+/// as a plain lookup miss, naming the identifier the request's reference carried.
 #[tokio::test]
 async fn a_role_association_call_words_a_missing_db_cluster_as_a_lookup_miss() {
     let (router, _engine) = emulator();
@@ -509,14 +510,19 @@ async fn a_role_association_call_words_a_missing_db_cluster_as_a_lookup_miss() {
     let absent = "emu-absent-cluster";
     let upper_cased = absent.to_ascii_uppercase();
     let cluster_arn = format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster:{absent}");
-    // The three forms a member that names a DB cluster accepts, all naming nothing.
-    let forms: Vec<(&str, &str)> = vec![
-        ("the identifier as written", absent),
-        ("the same identifier upper-cased", upper_cased.as_str()),
-        ("the cluster's ARN form", cluster_arn.as_str()),
+    // The three forms a member that names a DB cluster accepts, all naming nothing, each
+    // paired with the IDENTIFIER the fault reports for it: an ARN names its own identifier.
+    let forms: Vec<(&str, &str, &str)> = vec![
+        ("the identifier as written", absent, absent),
+        (
+            "the same identifier upper-cased",
+            upper_cased.as_str(),
+            upper_cased.as_str(),
+        ),
+        ("the cluster's ARN form", cluster_arn.as_str(), absent),
     ];
     for action in ["AddRoleToDBCluster", "RemoveRoleFromDBCluster"] {
-        for (form, named) in &forms {
+        for (form, named, reported) in &forms {
             let case = format!("{action} with {form}");
             let body = expect_error(
                 &case,
@@ -533,7 +539,7 @@ async fn a_role_association_call_words_a_missing_db_cluster_as_a_lookup_miss() {
                 404,
                 "DBClusterNotFoundFault",
             );
-            expect_message(&case, &body, &format!("DBCluster not found: {named}"));
+            expect_message(&case, &body, &format!("DBCluster not found: {reported}"));
         }
     }
 }

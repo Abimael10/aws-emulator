@@ -169,8 +169,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region =
             crate::state::request_region(ctx).map_err(BacktrackDBClusterError::validation)?;
         // "This parameter is stored as a lowercase string", and every member that names a DB
-        // cluster also accepts its ARN, so the lookup folds the way the stored key does.
-        let identifier = crate::state::db_cluster_identifier_of(&input.db_cluster_identifier)
+        // cluster also accepts its ARN, so the lookup folds the way the stored key does —
+        // and a reference no DB cluster identifier could be is refused before any record is
+        // read (`crate::state::db_cluster_lookup_identifier`).
+        let identifier = crate::state::db_cluster_lookup_identifier(&input.db_cluster_identifier)
+            .map_err(BacktrackDBClusterError::invalid_parameter_value)?
             .to_ascii_lowercase();
         // "Can't contain a timestamp set in the future": a time the cluster has not reached
         // is not a time it can be rewound to, which is a value the parameter does not accept.

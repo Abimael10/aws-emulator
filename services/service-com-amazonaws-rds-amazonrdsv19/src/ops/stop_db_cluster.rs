@@ -155,10 +155,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx).map_err(StopDBClusterError::validation)?;
         // "The DB cluster identifier … This parameter is stored as a lowercase string",
-        // and every member that names a DB cluster also accepts its ARN, so the lookup
-        // folds the way the stored key does.
-        let identifier = crate::state::db_cluster_identifier_of(&input.db_cluster_identifier)
-            .to_ascii_lowercase();
+        // and every member that names a DB cluster also accepts its ARN, so the reference is
+        // reduced to the identifier it names — which is what the fault below reports and
+        // what the lookup folds — and a reference no DB cluster identifier could be is
+        // refused before any record is read
+        // (`crate::state::db_cluster_lookup_identifier`).
+        let named = crate::state::db_cluster_lookup_identifier(&input.db_cluster_identifier)
+            .map_err(StopDBClusterError::invalid_parameter_value)?;
+        let identifier = named.to_ascii_lowercase();
 
         // No store means this service was mounted on an engine it has no state in, so it
         // cannot serve the operation at all. Unreachable with the engine the router builds;
@@ -179,9 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(cluster) = store.db_clusters.get(&key) else {
             return Err(StopDBClusterErrorModeled::DBClusterNotFoundFault(
                 DBClusterNotFoundFault {
-                    message: Some(crate::state::db_cluster_not_found_message(
-                        &input.db_cluster_identifier,
-                    )),
+                    message: Some(crate::state::db_cluster_not_found_message(named)),
                 },
             )
             .into());
@@ -232,9 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(record) = store.db_clusters.get_mut(&key) else {
                 return Err(StopDBClusterErrorModeled::DBClusterNotFoundFault(
                     DBClusterNotFoundFault {
-                        message: Some(crate::state::db_cluster_not_found_message(
-                            &input.db_cluster_identifier,
-                        )),
+                        message: Some(crate::state::db_cluster_not_found_message(named)),
                     },
                 )
                 .into());

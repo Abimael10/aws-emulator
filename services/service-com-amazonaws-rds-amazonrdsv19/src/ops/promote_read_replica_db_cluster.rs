@@ -151,9 +151,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(PromoteReadReplicaDBClusterError::validation)?;
         // "The identifier of the DB cluster read replica to promote. This parameter isn't
         // case-sensitive", and every member that names a DB cluster also accepts its ARN,
-        // so the lookup folds the way the stored key does.
-        let identifier = crate::state::db_cluster_identifier_of(&input.db_cluster_identifier)
-            .to_ascii_lowercase();
+        // so the reference is reduced to the identifier it names — which is what the
+        // refusals below report and what the lookup folds — and a reference no DB cluster
+        // identifier could be is refused before any record is read
+        // (`crate::state::db_cluster_lookup_identifier`).
+        let named = crate::state::db_cluster_lookup_identifier(&input.db_cluster_identifier)
+            .map_err(PromoteReadReplicaDBClusterError::invalid_parameter_value)?;
+        let identifier = named.to_ascii_lowercase();
 
         // No store means this service was mounted on an engine it has no state in, so it
         // cannot serve the operation at all. Unreachable with the engine the router builds;
@@ -173,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for is in scope.
         let key = (region.clone(), identifier.clone());
         let Some(cluster) = store.db_clusters.get(&key) else {
-            return Err(not_found(&input.db_cluster_identifier));
+            return Err(not_found(named));
         };
         // Only a READ REPLICA can be promoted to a standalone DB cluster:
         // `DBClusterIdentifier` "must match the identifier of an existing DB cluster read
@@ -196,11 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // after a create sees `creating` and is refused.
         if cluster.status != crate::state::DB_CLUSTER_STATUS_AVAILABLE {
             let status = cluster.status.clone();
-            // The cluster is named as the REQUEST wrote it, as the not-found refusal above
-            // names it: the members that name a DB cluster accept "the user-supplied DB
-            // cluster identifier or the Amazon Resource Name (ARN)", so a caller matching
-            // the refusal against what it sent finds it there rather than the folded key.
-            let named = &input.db_cluster_identifier;
+            // The cluster is named as the not-found refusal above names it: the members that
+            // name a DB cluster accept "the user-supplied DB cluster identifier or the
+            // Amazon Resource Name (ARN)", so the identifier the reference carries is what
+            // both refusals report.
             return Err(invalid_state(format!(
                 "DB cluster {named} is not available for a promotion (status {status})"
             )));
@@ -218,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // would take the whole emulator down with it.
         let promoted = {
             let Some(record) = store.db_clusters.get_mut(&key) else {
-                return Err(not_found(&input.db_cluster_identifier));
+                return Err(not_found(named));
             };
             record.replication_source_arn = None;
             record.status = crate::state::DB_CLUSTER_STATUS_PROMOTING.to_string();

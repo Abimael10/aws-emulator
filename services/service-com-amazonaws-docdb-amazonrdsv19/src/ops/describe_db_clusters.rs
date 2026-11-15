@@ -197,11 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for filter in input.filters.iter().flatten() {
             // `Filter$Name`: "Filter names are case sensitive."
             if filter.name != "db-cluster-id" {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "Unrecognized filter name '{}' for DescribeDBClusters: the only supported \
-                     filter is 'db-cluster-id'",
-                    filter.name
-                )));
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::unrecognized_filter_name_message(&filter.name),
+                ));
             }
             let wanted: ::std::collections::BTreeSet<String> = filter
                 .values

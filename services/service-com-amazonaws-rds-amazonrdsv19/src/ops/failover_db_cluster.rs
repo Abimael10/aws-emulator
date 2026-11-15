@@ -169,9 +169,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::request_region(ctx).map_err(FailoverDBClusterError::validation)?;
         // "The identifier of the DB cluster to force a failover for. This parameter isn't
         // case-sensitive", and every member that names a DB cluster also accepts its ARN,
-        // so the lookup folds the way the stored key does.
-        let identifier = crate::state::db_cluster_identifier_of(&input.db_cluster_identifier)
-            .to_ascii_lowercase();
+        // so the reference is reduced to the identifier it names — which is what the fault
+        // below reports and what the lookup folds — and a reference no DB cluster identifier
+        // could be is refused before any record is read
+        // (`crate::state::db_cluster_lookup_identifier`).
+        let named = crate::state::db_cluster_lookup_identifier(&input.db_cluster_identifier)
+            .map_err(FailoverDBClusterError::invalid_parameter_value)?;
+        let identifier = named.to_ascii_lowercase();
 
         // No store means this service was mounted on an engine it has no state in, so it
         // cannot serve the operation at all. Unreachable with the engine the router builds;
@@ -192,9 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(cluster) = store.db_clusters.get(&key) else {
             return Err(FailoverDBClusterErrorModeled::DBClusterNotFoundFault(
                 DBClusterNotFoundFault {
-                    message: Some(crate::state::db_cluster_cannot_be_accessed_message(
-                        &input.db_cluster_identifier,
-                    )),
+                    message: Some(crate::state::db_cluster_cannot_be_accessed_message(named)),
                 },
             )
             .into());
@@ -311,7 +313,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(FailoverDBClusterErrorModeled::DBClusterNotFoundFault(
                     DBClusterNotFoundFault {
                         message: Some(crate::state::db_cluster_cannot_be_accessed_message(
-                            &input.db_cluster_identifier,
+                            named,
                         )),
                     },
                 )

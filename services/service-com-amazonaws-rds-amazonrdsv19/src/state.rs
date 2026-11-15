@@ -313,6 +313,10 @@ mod ca_certificates;
 // operation holds a request to.
 mod refusal_wording;
 pub use refusal_wording::*;
+// How a member that NAMES an existing DB cluster is read: the identifier the reference
+// carries, and the refusal for a reference no DB cluster identifier could be.
+mod cluster_lookup;
+pub use cluster_lookup::*;
 pub use ca_certificates::*;
 pub use engine_defaults::*;
 pub use minted_values::*;

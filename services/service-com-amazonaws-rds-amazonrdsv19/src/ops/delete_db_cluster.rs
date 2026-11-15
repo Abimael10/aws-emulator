@@ -198,10 +198,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx).map_err(DeleteDBClusterError::validation)?;
         // "The DB cluster identifier for the DB cluster to be deleted. This parameter isn't
-        // case-sensitive" — folded to the identifier the store is keyed by, the same way
-        // every other member that names a DB cluster is.
-        let identifier = crate::state::db_cluster_identifier_of(&input.db_cluster_identifier)
-            .to_ascii_lowercase();
+        // case-sensitive" — the reference is reduced to the identifier it names, which is
+        // what the fault below reports and what the store is keyed by, and one no DB cluster
+        // identifier could be is refused before any record is read
+        // (`crate::state::db_cluster_lookup_identifier`).
+        let named = crate::state::db_cluster_lookup_identifier(&input.db_cluster_identifier)
+            .map_err(DeleteDBClusterError::invalid_parameter_value)?;
+        let identifier = named.to_ascii_lowercase();
 
         // No store means this service was mounted on an engine it has no state in, so it
         // cannot serve the operation at all. Unreachable with the engine the router builds;
@@ -250,9 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.db_clusters.get(&key) else {
             return Err(DeleteDBClusterErrorModeled::DBClusterNotFoundFault(
                 DBClusterNotFoundFault {
-                    message: Some(crate::state::db_cluster_cannot_be_accessed_message(
-                        &input.db_cluster_identifier,
-                    )),
+                    message: Some(crate::state::db_cluster_cannot_be_accessed_message(named)),
                 },
             )
             .into());

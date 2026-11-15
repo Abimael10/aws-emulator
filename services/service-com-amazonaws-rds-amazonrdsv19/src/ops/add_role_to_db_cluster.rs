@@ -179,10 +179,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(AddRoleToDBClusterError::invalid_parameter_value)?;
         }
         // "The name of the DB cluster to associate the IAM role with" — not case-sensitive,
-        // and every member naming a cluster also accepts its ARN, so the lookup folds the
-        // way the stored key does.
-        let identifier = crate::state::db_cluster_identifier_of(&input.db_cluster_identifier)
-            .to_ascii_lowercase();
+        // and every member naming a cluster also accepts its ARN, so the reference is reduced
+        // to the identifier it names — which is what the fault below reports and what the
+        // lookup folds — and a reference no DB cluster identifier could be is refused before
+        // any record is read (`crate::state::db_cluster_lookup_identifier`).
+        let named = crate::state::db_cluster_lookup_identifier(&input.db_cluster_identifier)
+            .map_err(AddRoleToDBClusterError::invalid_parameter_value)?;
+        let identifier = named.to_ascii_lowercase();
 
         // No store means this service was mounted on an engine it has no state in, so it
         // cannot serve the operation at all; 501 is the honest answer, never an association
@@ -201,9 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             else {
                 return Err(AddRoleToDBClusterErrorModeled::DBClusterNotFoundFault(
                     DBClusterNotFoundFault {
-                        message: Some(crate::state::db_cluster_not_found_colon_message(
-                            &input.db_cluster_identifier,
-                        )),
+                        message: Some(crate::state::db_cluster_not_found_colon_message(named)),
                     },
                 )
                 .into());
@@ -277,9 +278,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(AddRoleToDBClusterErrorModeled::DBClusterNotFoundFault(
                 DBClusterNotFoundFault {
-                    message: Some(crate::state::db_cluster_not_found_colon_message(
-                        &input.db_cluster_identifier,
-                    )),
+                    message: Some(crate::state::db_cluster_not_found_colon_message(named)),
                 },
             )
             .into());

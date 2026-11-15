@@ -155,18 +155,28 @@ async fn the_cluster_role_calls_word_their_own_not_found_fault() {
 
     // The three forms a member that names a DB cluster accepts ("the user-supplied DB
     // cluster identifier or the Amazon Resource Name (ARN)", "this parameter isn't
-    // case-sensitive"), all naming nothing.
-    let forms: [(&str, String); 3] = [
-        ("the identifier as written", ABSENT_CLUSTER.to_string()),
+    // case-sensitive"), all naming nothing, each paired with the IDENTIFIER the fault
+    // reports for it: an ARN names its own identifier.
+    let forms: [(&str, String, String); 3] = [
+        (
+            "the identifier as written",
+            ABSENT_CLUSTER.to_string(),
+            ABSENT_CLUSTER.to_string(),
+        ),
         (
             "the same identifier upper-cased",
             ABSENT_CLUSTER.to_ascii_uppercase(),
+            ABSENT_CLUSTER.to_ascii_uppercase(),
         ),
-        ("the cluster's ARN form", cluster_arn(ABSENT_CLUSTER)),
+        (
+            "the cluster's ARN form",
+            cluster_arn(ABSENT_CLUSTER),
+            ABSENT_CLUSTER.to_string(),
+        ),
     ];
 
     for row in ROLE_OPERATIONS {
-        for (form, named) in &forms {
+        for (form, named, reported) in &forms {
             let case = format!(
                 "{} with {form}{}",
                 row.action,
@@ -187,7 +197,7 @@ async fn the_cluster_role_calls_word_their_own_not_found_fault() {
                 call(&router, row.action, &params).await,
                 404,
                 "DBClusterNotFoundFault",
-                &cluster_not_found(named),
+                &cluster_not_found(reported),
             );
         }
     }

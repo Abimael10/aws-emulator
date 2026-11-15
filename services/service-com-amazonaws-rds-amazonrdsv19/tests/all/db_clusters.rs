@@ -946,6 +946,18 @@ async fn the_report_filters_and_pages_the_clusters_it_holds() {
     }
 }
 
+/// The rows of the table below whose own `DBClusterIdentifier` is a value NO lookup takes:
+/// it is outside the grammar every DB cluster identifier is assigned under ("Must contain
+/// from 1 to 63 letters, numbers, or hyphens. First character must be a letter."), so a read
+/// narrowed to it is refused the value rather than answering the not-found fault, and what the
+/// refused create left behind is read from the report of every cluster instead. The rows are
+/// named by their case, so this test decides which branch a row takes rather than asking the
+/// code under test.
+const IDENTIFIERS_NO_LOOKUP_TAKES: [&str; 2] = [
+    "an identifier that is not of the documented form",
+    "an Aurora identifier one character past the 63 it allows",
+];
+
 #[tokio::test]
 async fn a_request_outside_a_documented_constraint_is_refused_and_stores_nothing() {
     let router = emulator();
@@ -1329,7 +1341,14 @@ async fn a_request_outside_a_documented_constraint_is_refused_and_stores_nothing
             .find(|(name, _)| *name == "DBClusterIdentifier")
             .map(|(_, value)| value.clone())
             .expect("every row names an identifier");
-        if identifier != "EMU-Cluster-Taken" {
+        if identifier == "EMU-Cluster-Taken" {
+            continue;
+        }
+        // A read NARROWED to the identifier answers the modelled not-found fault — unless
+        // the row's own `DBClusterIdentifier` is a value the report will not take either
+        // ([`IDENTIFIERS_NO_LOOKUP_TAKES`]), in which case that nothing was stored is read
+        // from the report of every cluster there is instead.
+        if !IDENTIFIERS_NO_LOOKUP_TAKES.contains(&case) {
             expect_error(
                 case,
                 call(
@@ -1341,7 +1360,20 @@ async fn a_request_outside_a_documented_constraint_is_refused_and_stores_nothing
                 404,
                 "DBClusterNotFoundFault",
             );
+            continue;
         }
+        let reported = texts(
+            &expect_ok(
+                case,
+                call(&router, "DescribeDBClusters", &[] as &[(&str, &str)]).await,
+            ),
+            "DBClusterIdentifier",
+        );
+        let stored = identifier.to_ascii_lowercase();
+        assert!(
+            !reported.contains(&stored),
+            "case {case:?}: the refused create must leave nothing behind, got {reported:?}"
+        );
     }
 }
 

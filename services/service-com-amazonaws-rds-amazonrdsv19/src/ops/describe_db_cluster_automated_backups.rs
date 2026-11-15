@@ -193,10 +193,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The user-supplied DB cluster identifier" and "the resource ID of the DB
         // cluster" each narrow the report to one cluster's backup, and a value that
         // resolves to no backup is the modelled not-found fault — which is also the answer
-        // for a cluster that exists but retains no automated backups.
+        // for a cluster that exists but retains no automated backups. A reference no DB
+        // cluster identifier could be is refused instead, before any record is read, and the
+        // fault names the identifier the reference carries
+        // (`crate::state::db_cluster_lookup_identifier`).
         if let Some(requested) = &input.db_cluster_identifier {
-            let identifier =
-                crate::state::db_cluster_identifier_of(requested).to_ascii_lowercase();
+            let requested = crate::state::db_cluster_lookup_identifier(requested)
+                .map_err(DescribeDBClusterAutomatedBackupsError::invalid_parameter_value)?;
+            let identifier = requested.to_ascii_lowercase();
             candidates.retain(|cluster| cluster.identifier == identifier);
             if candidates.is_empty() {
                 return Err(not_found(requested));

@@ -812,12 +812,13 @@ async fn the_documented_request_and_group_bounds_are_enforced() {
     );
 
     // The model marks `Parameters` required, so a request carrying none is refused at the
-    // boundary rather than reaching the handler.
+    // boundary rather than reaching the handler — under the Query API code this front door
+    // answers a parameter it was not given acceptably with.
     expect_error(
         "a request carrying no Parameters at all",
         modify(&router, &group, &[]).await,
         400,
-        "MalformedInput",
+        "InvalidParameterValue",
     );
 }
 

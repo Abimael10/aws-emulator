@@ -2211,6 +2211,21 @@ pub fn invalid_event_source_type_message() -> String {
     ::service_common::rds_event_source_types::invalid_event_source_type_message()
 }
 
+/// The message a report refuses a `Filters` entry whose `Name` it does not support with.
+///
+/// ONE sentence: the fixed text, then the name the request carried, and nothing after it —
+/// no enumeration of the names the report does support, and no mention of the operation.
+/// The only variable part is `name`, read straight off the request's own `Filter$Name`, so a
+/// caller validating its filter names against the refusal reads back the value it sent, and
+/// nothing in the sentence advertises which filters this emulator happens to implement.
+///
+/// One wording for every report of this service view that checks its filter names — the ones
+/// that publish several names and the ones that publish a single name alike, since what is
+/// refused is the same thing in both cases — so none of them can drift from the others.
+pub fn unrecognized_filter_name_message(name: &str) -> String {
+    format!("Unrecognized filter name: {name}")
+}
+
 /// The sizes the memory-optimised `r5` family is published in, smallest first.
 const R5_SIZES: &[&str] = &[
     "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge",

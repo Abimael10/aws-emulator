@@ -160,6 +160,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let region =
             crate::state::request_region(ctx).map_err(DescribeDBClustersError::validation)?;
+        // The DB cluster this report is NARROWED to, read before any record is: the member
+        // takes the identifier or the cluster's ARN, so the reference is reduced to the
+        // identifier it names, and one that no DB cluster identifier could be is refused as a
+        // value this parameter does not accept rather than reported as a cluster that is not
+        // there (`crate::state::db_cluster_lookup_identifier`).
+        let requested = input
+            .db_cluster_identifier
+            .as_deref()
+            .map(crate::state::db_cluster_lookup_identifier)
+            .transpose()
+            .map_err(DescribeDBClustersError::invalid_parameter_value)?;
         let page_size = crate::state::check_max_records(input.max_records)
             .map_err(DescribeDBClustersError::invalid_parameter_value)?;
         let filters = input.filters.unwrap_or_default();
@@ -183,10 +194,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clusters shared from other Amazon Web Services accounts" — this emulator presents
         // ONE account, which owns every cluster it holds, so no cluster is a shared one and
         // the report is the same either way.
-        let candidates: Vec<&crate::state::DbClusterRecord> = match &input.db_cluster_identifier {
+        let candidates: Vec<&crate::state::DbClusterRecord> = match requested {
             Some(requested) => {
                 // "The user-supplied DB cluster identifier or the Amazon Resource Name (ARN)
-                // of the DB cluster … This parameter isn't case-sensitive."
+                // of the DB cluster … This parameter isn't case-sensitive." The fault names
+                // the IDENTIFIER the reference carries, which is what `requested` already
+                // holds — an ARN was reduced to it above, before the lookup.
                 let record = store.resolve_db_cluster(&region, requested).ok_or_else(|| {
                     DescribeDBClustersError::from(
                         DescribeDBClustersErrorModeled::DBClusterNotFoundFault(

@@ -124,8 +124,9 @@ struct ErrorCase {
 ///
 /// The codes of the rows that are NOT modelled errors are the ones this service already
 /// answers with — `ValidationException` from the scaffold's refusal channel,
-/// `InvalidParameterValue` from the same channel for a value a parameter does not accept,
-/// `MalformedInput` from the boundary validator, `InvalidAction` from the routing
+/// `InvalidParameterValue` from the same channel for a value a parameter does not accept
+/// and from the refusal seam for a request the model's own rules refused,
+/// `InvalidAction` from the routing
 /// and API-version gates. They are pinned here so a change to the envelope cannot alter
 /// them, and this suite is about the envelope.
 const ERROR_CASES: &[ErrorCase] = &[
@@ -183,12 +184,15 @@ const ERROR_CASES: &[ErrorCase] = &[
         code: "InvalidParameterValue",
     },
     ErrorCase {
+        // A `@required` member the request did not carry is a parameter this front door
+        // was not given acceptably, so it answers the same Query API code a value outside
+        // a constraint gets — not the protocol code for a body that could not be read.
         case: "absent required member, refused at the boundary",
         version: API_VERSION,
         action: "CreateOptionGroup",
         params: &[],
         status: 400,
-        code: "MalformedInput",
+        code: "InvalidParameterValue",
     },
     ErrorCase {
         case: "scaffolded operation, which answers the 501 channel",

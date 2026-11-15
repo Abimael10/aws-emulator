@@ -364,9 +364,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::request_region(ctx).map_err(ModifyDBClusterError::validation)?;
         // `DBClusterIdentifier`: "This parameter isn't case-sensitive", and a cluster's
         // identifier is stored lowercased — so both the identifier and the ARN form fold
-        // to the key the store is keyed by before anything is looked up.
-        let identifier =
-            crate::state::db_cluster_identifier_of(&input.db_cluster_identifier).to_ascii_lowercase();
+        // to the key the store is keyed by before anything is looked up, and a reference no
+        // DB cluster identifier could be is refused there
+        // (`crate::state::db_cluster_lookup_identifier`).
+        let identifier = crate::state::db_cluster_lookup_identifier(&input.db_cluster_identifier)
+            .map_err(ModifyDBClusterError::invalid_parameter_value)?
+            .to_ascii_lowercase();
         // `NewDBClusterIdentifier`: "The first character must be a letter. Can't end with a
         // hyphen or contain two consecutive hyphens. … This value is stored as a lowercase
         // string." The length bound is the one the cluster's type gives it, which is read

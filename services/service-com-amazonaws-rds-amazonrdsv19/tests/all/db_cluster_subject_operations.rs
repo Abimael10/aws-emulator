@@ -10,9 +10,11 @@
 //! is the modelled `DBClusterNotFoundFault` (HTTP 404, `text/xml`, `Error/Type` `Sender`)
 //! whose `<Message>` is the template THAT operation's API uses — this front door words the
 //! one fault by the role the cluster plays in the call — and, where that template has a
-//! variable part, names the value the REQUEST carried, in the spelling it was written in,
-//! rather than the key the store folded it to. The modification path's template has no
-//! variable part at all.
+//! variable part, names the IDENTIFIER the request's reference carried, in the letter case
+//! it was written in: the members accept "the user-supplied DB cluster identifier or the
+//! Amazon Resource Name (ARN)", and the identifier is the part of either form that names
+//! the cluster, so one cluster is reported by one name whichever form was sent.
+//! The modification path's template has no variable part at all.
 //! It is asserted over a TABLE spanning the operations that name a cluster and, for each,
 //! the three forms the members that name one accept ("the user-supplied DB cluster
 //! identifier or the Amazon Resource Name (ARN)", "this parameter isn't case-sensitive"),
@@ -189,18 +191,28 @@ async fn every_operation_that_names_a_db_cluster_words_its_own_not_found_fault()
     let router = emulator();
     create_available_cluster(&router, PRESENT, "aurora-postgresql", &[]).await;
 
-    // The three forms a member that names a DB cluster accepts, all naming nothing.
-    let forms: [(&str, String); 3] = [
-        ("the identifier as written", ABSENT.to_string()),
+    // The three forms a member that names a DB cluster accepts, all naming nothing, each
+    // paired with the identifier the fault reports for it: an ARN names its own identifier.
+    let forms: [(&str, String, String); 3] = [
+        (
+            "the identifier as written",
+            ABSENT.to_string(),
+            ABSENT.to_string(),
+        ),
         (
             "the same identifier upper-cased",
             ABSENT.to_ascii_uppercase(),
+            ABSENT.to_ascii_uppercase(),
         ),
-        ("the cluster's ARN form", cluster_arn(ABSENT)),
+        (
+            "the cluster's ARN form",
+            cluster_arn(ABSENT),
+            ABSENT.to_string(),
+        ),
     ];
 
     for row in CLUSTER_OPERATIONS {
-        for (form, named) in &forms {
+        for (form, named, reported) in &forms {
             let case = format!("{} with {form}", row.action);
             let mut params: Vec<(&str, String)> =
                 vec![("DBClusterIdentifier", named.to_string())];
@@ -216,7 +228,7 @@ async fn every_operation_that_names_a_db_cluster_words_its_own_not_found_fault()
                 "DBClusterNotFoundFault",
             );
             let message = text(&body, "Message");
-            let expected = (row.wording)(named);
+            let expected = (row.wording)(reported);
             assert_eq!(
                 message, expected,
                 "case {case:?}: expected the message {expected:?}, got {message:?}"

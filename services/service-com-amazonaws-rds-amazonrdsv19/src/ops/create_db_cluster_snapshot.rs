@@ -179,6 +179,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "This parameter is stored as a lowercase string", so the key folds the same way
         // every cluster-snapshot lookup does.
         let snapshot_key = input.db_cluster_snapshot_identifier.to_ascii_lowercase();
+        // The cluster the snapshot is taken OF: the member takes its identifier or its ARN,
+        // so the reference is reduced to the identifier it names — which is what the fault
+        // below reports and what the store is keyed by — and one no DB cluster identifier
+        // could be is refused before any record is read
+        // (`crate::state::db_cluster_lookup_identifier`).
+        let source_named = crate::state::db_cluster_lookup_identifier(
+            &input.db_cluster_identifier,
+        )
+        .map_err(CreateDBClusterSnapshotError::invalid_parameter_value)?;
+        let source_cluster = source_named.to_ascii_lowercase();
 
         // No store means this service was mounted on an engine it has no state in, so it
         // cannot serve the operation at all. Unreachable with the engine the router builds;
@@ -192,11 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // restorable; it is dropped unused when a refusal below answers the request.
         let storage = crate::state::capture_cluster_storage(
             &state,
-            &(
-                region.clone(),
-                crate::state::db_cluster_identifier_of(&input.db_cluster_identifier)
-                    .to_ascii_lowercase(),
-            ),
+            &(region.clone(), source_cluster.clone()),
         )
         .await
         .map_err(CreateDBClusterSnapshotError::internal_failure)?;
@@ -216,17 +222,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // models `DBClusterNotFoundFault` for exactly this, and a cluster that does not
         // exist has nothing to snapshot, whatever the other members say. RDS is regional,
         // so only the region the request was signed for is in scope.
-        let cluster_key = (
-            region.clone(),
-            crate::state::db_cluster_identifier_of(&input.db_cluster_identifier)
-                .to_ascii_lowercase(),
-        );
+        let cluster_key = (region.clone(), source_cluster.clone());
         let Some(cluster) = store.db_clusters.get(&cluster_key) else {
             return Err(
                 CreateDBClusterSnapshotErrorModeled::DBClusterNotFoundFault(
                     DBClusterNotFoundFault {
                         message: Some(crate::state::db_cluster_not_found_colon_message(
-                            &input.db_cluster_identifier,
+                            source_named,
                         )),
                     },
                 )

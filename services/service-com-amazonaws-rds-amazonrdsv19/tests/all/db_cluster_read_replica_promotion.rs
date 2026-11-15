@@ -153,12 +153,13 @@ async fn expect_not_a_replica_refusal(router: &MultiServiceRouter, case: &str, i
 }
 
 /// Assert the modelled state fault for a read replica whose lifecycle status cannot take a
-/// promotion: the refusal names the cluster as the request wrote it and `because`, the part
-/// of the sentence that says which status that is.
+/// promotion: the refusal names the IDENTIFIER the request's reference carried and
+/// `because`, the part of the sentence that says which status that is.
 async fn expect_status_refusal(
     router: &MultiServiceRouter,
     case: &str,
     named: &str,
+    reported: &str,
     because: &str,
 ) {
     let refused = expect_error(
@@ -169,9 +170,9 @@ async fn expect_status_refusal(
     );
     let message = text(&refused, "Message");
     assert!(
-        message.contains(named) && message.contains(because),
-        "case {case:?}: expected the refusal to name the cluster as {named:?} and {because:?}, \
-         got {message:?}"
+        message.contains(reported) && message.contains(because),
+        "case {case:?}: expected the refusal to name the cluster as {reported:?} and \
+         {because:?}, got {message:?}"
     );
 }
 
@@ -303,11 +304,12 @@ async fn a_promotion_of_a_cluster_it_cannot_be_performed_on_is_refused() {
     // nothing, which is also the first state row.
     create_available_cluster(&router, "emu-promote-standalone", "aurora-postgresql", &[]).await;
 
-    // The three forms a member that names a DB cluster accepts, all naming nothing.
-    for named in [
-        ABSENT.to_string(),
-        ABSENT.to_ascii_uppercase(),
-        cluster_arn(ABSENT),
+    // The three forms a member that names a DB cluster accepts, all naming nothing, each
+    // paired with the IDENTIFIER the fault reports for it: an ARN names its own identifier.
+    for (named, reported) in [
+        (ABSENT.to_string(), ABSENT.to_string()),
+        (ABSENT.to_ascii_uppercase(), ABSENT.to_ascii_uppercase()),
+        (cluster_arn(ABSENT), ABSENT.to_string()),
     ] {
         let case = format!("an absent cluster named {named:?}");
         let body = expect_error(
@@ -318,7 +320,7 @@ async fn a_promotion_of_a_cluster_it_cannot_be_performed_on_is_refused() {
         );
         let message = text(&body, "Message");
         let expected =
-            format!("The source cluster could not be found or cannot be accessed: {named}");
+            format!("The source cluster could not be found or cannot be accessed: {reported}");
         assert_eq!(
             message, expected,
             "case {case:?}: expected the message {expected:?}, got {message:?}"
@@ -347,6 +349,7 @@ async fn a_promotion_of_a_cluster_it_cannot_be_performed_on_is_refused() {
         &router,
         "a replica that is still coming up",
         "emu-promote-creating",
+        "emu-promote-creating",
         "status creating",
     )
     .await;
@@ -372,19 +375,27 @@ async fn a_promotion_of_a_cluster_it_cannot_be_performed_on_is_refused() {
         &router,
         "a replica that is stopped",
         "emu-promote-stopped",
+        "emu-promote-stopped",
         "status stopped",
     )
     .await;
-    // The same refusal names the cluster in the SPELLING the request carried, whichever of
-    // the forms the member accepts it used, as the not-found refusal above does.
-    for named in [
-        "EMU-Promote-Stopped".to_string(),
-        cluster_arn("emu-promote-stopped"),
+    // The same refusal names the cluster by the IDENTIFIER the reference carried, whichever
+    // of the forms the member accepts it used, as the not-found refusal above does.
+    for (named, reported) in [
+        (
+            "EMU-Promote-Stopped".to_string(),
+            "EMU-Promote-Stopped".to_string(),
+        ),
+        (
+            cluster_arn("emu-promote-stopped"),
+            "emu-promote-stopped".to_string(),
+        ),
     ] {
         expect_status_refusal(
             &router,
             &format!("the stopped replica named {named:?}"),
             &named,
+            &reported,
             "status stopped",
         )
         .await;

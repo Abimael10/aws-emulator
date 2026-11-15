@@ -863,9 +863,12 @@ pub fn cluster_role_quota_message(identifier: &str) -> String {
 }
 
 /// The refusal message for a `Describe*` filter name the API does not support.
+///
+/// ONE sentence: the fixed text, then the name the request carried, and nothing after it —
+/// no enumeration of the names this emulator implements, which is this service's own
+/// support rather than the API's and would have a caller build requests against it. The
+/// only variable part is `name`, read straight off the request's `Filter$Name`, so a caller
+/// validating its filter names against the refusal reads back the value it sent.
 pub fn unsupported_filter_message(name: &str) -> String {
-    format!(
-        "Unrecognized filter name: {name}. Supported filters are {}",
-        SUPPORTED_DESCRIBE_FILTERS.join(", ")
-    )
+    format!("Unrecognized filter name: {name}")
 }
