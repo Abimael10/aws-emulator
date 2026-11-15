@@ -2498,3 +2498,32 @@ mod declaration_roots_are_canonical_and_complete;
 //! crate's `tests/all.rs`, so a note about a rule belongs there rather than here.
 //! service crate's own, is stated in that suite's own module header, where it is read beside
 //! the test it explains; the notes landings had appended to the tail of this file live in
+// Single integration-test target for the router's cross-service suites.
+// This file is a canonical declaration list: one
+// other line. Three rules bind it, each pinned by a suite of its own:
+// * declare each suite exactly ONCE — this is one crate root, so a second `mod` for one
+//   name is `E0428` and compiles neither copy (`all/all_rs_declares_each_suite_once.rs`);
+// * an inner doc comment (`//!`) is legal only BEFORE the first item, so no comment in
+//   this file is one: past the first declaration it is `E0753` and compiles no suite of
+//   this target
+//   (`all/all_rs_inner_doc_comments_precede_the_first_item.rs`);
+// * this file is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING under
+//   `tests/`, which the layout check refuses — the `#[path]` is what points each
+//   declaration into `tests/all/`.
+// service crate's own, belongs in that suite's module header, where it is read beside
+// the test it explains. A note about this file itself belongs in `all/appended_notes.rs`;
+// `all/all_rs_is_a_canonical_declaration_list.rs` reports any other line here.
+// One `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted, and nothing else:
+// a landing has one place to insert and nothing to keep consistent.
+// is one crate root, so a second `mod` for the same name is `E0428` and fails every suite in
+// this target. An inner doc comment (`//!`) is legal only BEFORE the first item, so no
+// comment here is one — past the first item `//!` is `E0753` and compiles
+// no suite of this target, so a note further down this file must be an ordinary `//` comment,
+// and the notes landings have appended to this file's tail live in `all/appended_notes.rs`.
+// pair, keeping the list sorted: one pair per suite and NOTHING else — no prose between
+// the pairs and none after them — so a landing has one place to insert and nothing to
+// which compiles no suite of this target. NO COMMENT IN THIS FILE IS AN INNER DOC
+// COMMENT (`//!`): past the first item one is `E0753` and compiles
+// nothing, so add a declaration below rather than a note about one — the notes earlier
+// landings appended live in `all/appended_notes.rs`.
+// `all/all_rs_is_a_canonical_declaration_list.rs` check those rules — the first two for

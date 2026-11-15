@@ -47,6 +47,8 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+mod validation;
+
 /// The service key `::emulator_server::service_from_target` reads out of the
 /// `X-Amz-Target` header this service's awsJson1_0 operations carry: that reader
 /// takes the segment before the `.`, strips the `_<version>` suffix and
@@ -113,17 +115,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // One refusal of this service is worded by the service rather than by the
-        // framework: a TABLE NAME the model's own constraints do not admit. For that
-        // member the refusal is a single sentence stating the window a name has to
-        // fit, with no constraint envelope around it and nothing of the request
-        // inside it ([`table_name_refusal`]). Every other refusal — a value outside
-        // another member's bound, an absent required member, authentication — keeps
-        // the framework's wording, which is the envelope AWS answers for them.
+        // Two refusals of this service are worded by the service rather than by the
+        // framework, and neither carries anything of the request inside it. A TABLE
+        // NAME the model's own constraints do not admit draws a single sentence
+        // stating the window a name has to fit, with no constraint envelope around it
+        // ([`table_name_refusal`]), so it is asked first. Every other broken
+        // requirement draws the constraint envelope naming the member and the
+        // requirement alone ([`validation::refused`]). Authentication keeps the
+        // framework's wording: it is not an input failure, and its code and status
+        // are not this service's to change.
         let Refusal::Invalid(violations) = refusal else {
             return None;
         };
-        table_name_refusal(violations)
+        table_name_refusal(violations).or_else(|| validation::refused(refusal))
     }
 
     fn override_routing_error(
@@ -171,9 +175,9 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// value it sent, and a refusal that quotes it reflects the request back into the
 /// response.
 ///
-/// `None` for a refusal that names no table name, which keeps the framework's
-/// envelope. Only `ListStreams` carries a table name among this service's inputs, so
-/// the member resolves to one schema and one pair of bounds.
+/// `None` for a refusal that names no table name, which falls through to
+/// [`validation::refused`]. Only `ListStreams` carries a table name among this
+/// service's inputs, so the member resolves to one schema and one pair of bounds.
 fn table_name_refusal(violations: &[Violation]) -> Option<Refused> {
     let member = table_name_member()?;
     let name = member.member_name()?;
