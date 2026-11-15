@@ -333,6 +333,14 @@ pub use invoke_authorization::{
 pub mod caller_authorization;
 pub use caller_authorization::authorize_caller;
 
+/// Whether a request may address a layer that belongs to ANOTHER account — the decision every
+/// operation on a layer takes before it resolves the name it was given — lives in
+/// [`layer_authorization`], beside the two gates above whose reading of the request's
+/// principal it shares. It is re-exported here for the same reason as [`capacity_provider`]: a
+/// handler names it as `crate::state::…`.
+pub mod layer_authorization;
+pub use layer_authorization::{authorize_layer_access, GET_LAYER_VERSION_ACTION};
+
 /// The ASYNCHRONOUS-INVOCATION CONFIGURATION of a function, version or alias — the record
 /// the `…FunctionEventInvokeConfig` operations read and write, and whether the function's
 /// execution role lets Lambda deliver a record to the destinations one names — lives in
@@ -1803,10 +1811,12 @@ pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The resource you requested does no
 /// (`smithy_query(query="doc", shape="PreconditionFailedException")`): the revision
 /// supplied is not the latest one, and the caller is told which API reports the latest —
 /// "For AddPermission and RemovePermission API operations: Call `GetPolicy`"; "For all
-/// other API operations: Call `GetFunction` or `GetAlias`". So there are exactly TWO fixed
-/// sentences, one per branch of that rule, and neither carries anything of the request:
-/// not the id the caller supplied, not the resource it addressed. This is the first
-/// branch; [`CONFIGURATION_REVISION_PRECONDITION_MESSAGE`] is the second.
+/// other API operations: Call `GetFunction` or `GetAlias`". So the sentence names the API
+/// that reports the latest revision of the resource the call addressed, and carries nothing
+/// of the request: not the id the caller supplied, not the resource it addressed. This is
+/// the permission branch for a FUNCTION's policy;
+/// [`LAYER_VERSION_REVISION_PRECONDITION_MESSAGE`] is the same branch for a layer version's,
+/// and [`CONFIGURATION_REVISION_PRECONDITION_MESSAGE`] is the other branch of the rule.
 pub const POLICY_REVISION_PRECONDITION_MESSAGE: &str =
     "The Revision Id provided does not match the latest Revision Id. Call the GetPolicy \
      API to retrieve the latest Revision Id";
@@ -1818,16 +1828,18 @@ pub const CONFIGURATION_REVISION_PRECONDITION_MESSAGE: &str =
     "The Revision Id provided does not match the latest Revision Id. Call the \
      GetFunction/GetAlias API to retrieve the latest Revision Id";
 
-/// The same refusal on the operations whose resource is a LAYER VERSION
+/// The same refusal on the PERMISSION operations whose resource is a LAYER VERSION
 /// (`AddLayerVersionPermission`, `RemoveLayerVersionPermission`).
 ///
-/// The rule `PreconditionFailedException` documents is "call the API that reports the
-/// latest revision of the resource you addressed", and for a layer version's policy that
-/// API is `GetLayerVersion` rather than `GetFunction`/`GetAlias` — so the sentence names
-/// the resource it is about and that API, and carries nothing of the request.
+/// The rule `PreconditionFailedException` documents for a permission operation is "call
+/// `GetPolicy` to retrieve the latest RevisionId for your resource", and the API that
+/// reports the latest revision of a LAYER VERSION's permissions policy is the layer
+/// policy read rather than the function one — so the sentence is
+/// [`POLICY_REVISION_PRECONDITION_MESSAGE`] with that API named in it, and carries
+/// nothing of the request and nothing of the resource either.
 pub const LAYER_VERSION_REVISION_PRECONDITION_MESSAGE: &str =
-    "The Revision Id provided does not match the latest Revision Id for the layer version. \
-     Call the GetLayerVersion API to retrieve the latest Revision Id";
+    "The Revision Id provided does not match the latest Revision Id. Call the GetLayerPolicy \
+     API to retrieve the latest Revision Id";
 
 /// The qualifier a `FunctionName`/`Qualifier` pair NAMES, as opposed to the
 /// [`VERSION_LATEST`] an unqualified request resolves to. It may come from either, and

@@ -190,6 +190,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = crate::state::layer_name_in(&input.layer_name, &region)
             .map_err(invalid_parameter)?;
 
+        // Whose layer the request named is decided before anything is published: a layer of
+        // another account is reachable only through ITS OWN permissions policy, which this
+        // endpoint does not hold (see `crate::state::layer_authorization`). The call
+        // addresses the layer rather than one of its versions, which is the resource the
+        // refusal names.
+        crate::state::authorize_layer_access(&*self.engine, ctx, Self::NAME, &input.layer_name, None)?;
+
         let now = ::std::time::SystemTime::now();
 
         let mut archive = layer_archive(&input.content)?;

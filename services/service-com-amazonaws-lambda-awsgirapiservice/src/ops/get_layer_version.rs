@@ -180,6 +180,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = crate::state::layer_name_in(&input.layer_name, &region)
             .map_err(invalid_parameter)?;
 
+        // Whose layer the request named is decided before anything is looked up: a layer
+        // of another account is reachable only through ITS OWN permissions policy, which
+        // this endpoint does not hold (see `crate::state::layer_authorization`).
+        crate::state::authorize_layer_access(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.layer_name,
+            Some(input.version_number),
+        )?;
+
         let store = state.lock();
         let detail = store
             .layer(&region, &name)

@@ -2008,3 +2008,11 @@ mod ses_configuration_set_cursor_shared_across_v1_and_v2;
 // explains; a note about THIS file belongs in `all/appended_notes.rs`, declared below like any
 // other suite. `all/all_rs_carries_no_inner_doc_comment.rs`,
 // `all/all_rs_is_a_canonical_declaration_list.rs` and
+// Put a new suite at `tests/all/<name>.rs` and insert one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair into the sorted list below; the list
+// holds those pairs and no other line, and NOTHING follows the last pair. Every comment in
+// this file is an ORDINARY one, this header included, so no merge of two landings can leave
+// an inner doc comment past the first item. What a suite covers belongs in that suite's own
+// module header; `all/appended_notes.rs` records why notes do not live here, and the
+// `all_rs_*`, `all/every_suite_file_is_declared.rs` and
+// `all/declaration_roots_are_canonical_and_complete.rs` suites pin this shape.

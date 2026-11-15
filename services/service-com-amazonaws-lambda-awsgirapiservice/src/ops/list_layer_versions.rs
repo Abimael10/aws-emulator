@@ -178,6 +178,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = crate::state::layer_name_in(&input.layer_name, &region)
             .map_err(invalid_parameter)?;
 
+        // Whose layer the request named is decided before anything is read: a layer of
+        // another account is reachable only through ITS OWN permissions policy, which this
+        // endpoint does not hold (see `crate::state::layer_authorization`). The call
+        // addresses the layer rather than one of its versions, which is the resource the
+        // refusal names.
+        crate::state::authorize_layer_access(&*self.engine, ctx, Self::NAME, &input.layer_name, None)?;
+
         // The model declares `MaxItems` as `@range(min: 1, max: 50)`, so the boundary
         // validator has already refused anything outside it; this handler enforces the
         // same floor itself rather than letting a page size of zero reach the pagination

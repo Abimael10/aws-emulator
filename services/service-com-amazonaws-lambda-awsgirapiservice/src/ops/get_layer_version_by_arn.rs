@@ -196,6 +196,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(no_such_layer_version());
         }
 
+        // Whose layer the ARN names is decided before anything is looked up: a layer
+        // version of another account is reachable only through ITS OWN permissions policy,
+        // which this endpoint does not hold (see `crate::state::layer_authorization`).
+        crate::state::authorize_layer_access(&*self.engine, ctx, Self::NAME, &input.arn, None)?;
+
         let store = state.lock();
         let detail = store
             .layer(&named_region, &name)

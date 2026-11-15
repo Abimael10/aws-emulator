@@ -189,6 +189,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = crate::state::layer_name_in(&input.layer_name, &region)
             .map_err(invalid_parameter)?;
 
+        // Whose layer the request named is decided before anything is removed: a layer of
+        // another account is reachable only through ITS OWN permissions policy, which this
+        // endpoint does not hold (see `crate::state::layer_authorization`).
+        crate::state::authorize_layer_access(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.layer_name,
+            Some(input.version_number),
+        )?;
+
         let mut store = state.lock();
         if let Some(record) = store.layer_mut(&region, &name) {
             // Only the version named goes. The layer's record stays even once it holds

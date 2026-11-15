@@ -106,12 +106,11 @@ const POLICY_REVISION_REFUSAL: &str = "The Revision Id provided does not match t
 const CONFIGURATION_REVISION_REFUSAL: &str = "The Revision Id provided does not match the latest \
      Revision Id. Call the GetFunction/GetAlias API to retrieve the latest Revision Id";
 
-/// The refusal the operations whose resource is a LAYER VERSION give that precondition:
-/// the same rule, naming the resource it is about and the API that reports its latest
-/// revision, which for a layer version's policy is `GetLayerVersion`.
+/// The refusal the PERMISSION operations whose resource is a LAYER VERSION give that
+/// precondition: the same branch of the rule as [`POLICY_REVISION_REFUSAL`], naming the API
+/// that reports the latest revision of a layer version's permissions policy.
 const LAYER_VERSION_REVISION_REFUSAL: &str = "The Revision Id provided does not match the latest \
-     Revision Id for the layer version. Call the GetLayerVersion API to retrieve the latest \
-     Revision Id";
+     Revision Id. Call the GetLayerPolicy API to retrieve the latest Revision Id";
 
 /// The refusal a tag write past the quota gets.
 const TAG_QUOTA_REFUSAL: &str = "Number of tags exceeds resource tag limit.";
@@ -1212,7 +1211,11 @@ async fn a_stale_revision_is_refused_by_the_sentence_naming_the_api_that_reports
     );
     assert_ne!(
         LAYER_VERSION_REVISION_REFUSAL, CONFIGURATION_REVISION_REFUSAL,
-        "a layer version's precondition names its own resource and read"
+        "a layer version's precondition names the read that reports its own revision"
+    );
+    assert_ne!(
+        LAYER_VERSION_REVISION_REFUSAL, POLICY_REVISION_REFUSAL,
+        "a layer version's policy and a function's policy are reported by different reads"
     );
 
     // And every refused call left the policy at the revision it was already at.
