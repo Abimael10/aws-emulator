@@ -11,6 +11,7 @@
 //! policy IAM holds: nothing here reaches into a state struct, and a response that is
 //! not computed from persisted state cannot pass.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1428,4 +1429,420 @@ async fn contradictory_option_combinations_are_refused() {
         Some("Invalid SyncOption value. Option: TransferMode,OverwriteMode, Value: ALL,NEVER."),
         "case {case:?}: wrong refusal wording, got {refused}"
     );
+}
+
+/// One source object staged with everything a transfer has to carry across with its
+/// bytes: the content type, the user metadata and the tag set a later read of the
+/// destination object must report.
+struct DescribedObject {
+    key: &'static str,
+    body: &'static [u8],
+    content_type: &'static str,
+    /// The object's `x-amz-meta-*` user metadata.
+    metadata: &'static [(&'static str, &'static str)],
+    /// The object's tag set.
+    tags: &'static [(&'static str, &'static str)],
+}
+
+/// The value the staged object that carries its OWN last-modified entry holds there: a
+/// time that is not when this suite stored it, so an entry carried across verbatim is
+/// told apart from one restated from the source object's modification time.
+const STAGED_LAST_MODIFIED: &str = "Mon, 01 Jan 2024 00:00:00 GMT";
+
+/// The objects a metadata-carrying transfer is staged with: five of them, differing in
+/// content type, in how much user metadata they hold (two entries, one, none, and one
+/// that is the last-modified entry itself), in their tag sets (two tags, one, none) and in
+/// whether their key needs URL-encoding to be named as a copy source, so no assertion
+/// below can pass on one shape of object alone.
+const DESCRIBED_OBJECTS: &[DescribedObject] = &[
+    DescribedObject {
+        key: "report.txt",
+        body: b"the transferred report\n",
+        content_type: "text/plain",
+        metadata: &[("origin", "staging"), ("revision", "7")],
+        tags: &[("stage", "staged"), ("tier", "bronze")],
+    },
+    DescribedObject {
+        key: "nested/payload.json",
+        body: b"{\"payload\":true}",
+        content_type: "application/json",
+        metadata: &[("origin", "nested")],
+        tags: &[("tier", "silver")],
+    },
+    DescribedObject {
+        key: "nested/opaque.bin",
+        body: &[0, 1, 2, 3, 4],
+        content_type: "application/octet-stream",
+        metadata: &[],
+        tags: &[],
+    },
+    DescribedObject {
+        key: "data/payload.txt",
+        body: b"a payload whose own last-modified entry travels with it\n",
+        content_type: "text/plain",
+        metadata: &[("last-modified", STAGED_LAST_MODIFIED)],
+        tags: &[("tier", "gold")],
+    },
+    // A key every character of which a copy source has to carry as the object store reads
+    // it: a space, a `+`, a `%` and a `#` each mean something else in an `x-amz-copy-source`
+    // left unencoded, so an object at this key proves the transfer names the object it is.
+    DescribedObject {
+        key: "odd keys/a+b 100%25 #1.txt",
+        body: b"the object under a key that needs encoding\n",
+        content_type: "text/plain",
+        metadata: &[("origin", "odd")],
+        tags: &[("tier", "copper")],
+    },
+];
+
+/// The content type Amazon S3 stores for a write that names none — what a destination
+/// object carries when its task ignores object metadata.
+const DEFAULT_CONTENT_TYPE: &str = "binary/octet-stream";
+
+/// The user-metadata entry a transfer into an object store carries whatever the task's
+/// `ObjectMetadata` says: "even if you specify NONE, metadata for the last modified time
+/// is still preserved" (`Options$ObjectMetadata`).
+const LAST_MODIFIED_ENTRY: &str = "last-modified";
+
+/// One row of the metadata table: the task's `Options`, and which kinds of metadata that
+/// task carries across.
+struct MetadataRow {
+    case: &'static str,
+    options: Value,
+    /// Whether the destination object must report the source's content type and user
+    /// metadata.
+    carries_metadata: bool,
+    /// Whether it must report the source's tag set.
+    carries_tags: bool,
+}
+
+/// RULE: a task execution between two object-storage locations moves "the data (including
+/// metadata)" of every object it transfers, so each destination object is readable with
+/// the metadata its source carries — its content type and `x-amz-meta-*` user metadata
+/// unless the task's `ObjectMetadata` is `NONE`, its tag set unless the task's
+/// `ObjectTags` is `NONE`, and a `x-amz-meta-last-modified` entry whatever those options
+/// say: the source object's own where it has one, and the modification time the source
+/// side reports otherwise.
+///
+/// The rows span the two documented values of each of those two members plus the default
+/// a task that states neither runs under, and every row is asserted over three objects
+/// that differ in content type, user metadata and tag set.
+#[tokio::test]
+async fn a_transfer_carries_each_objects_metadata_into_the_destination() {
+    let rows = vec![
+        MetadataRow {
+            case: "a task that states neither member carries both",
+            options: json!({ "TransferMode": "ALL", "VerifyMode": "NONE" }),
+            carries_metadata: true,
+            carries_tags: true,
+        },
+        MetadataRow {
+            case: "preserving both carries both",
+            options: json!({
+                "TransferMode": "ALL",
+                "VerifyMode": "NONE",
+                "ObjectMetadata": "PRESERVE",
+                "ObjectTags": "PRESERVE",
+            }),
+            carries_metadata: true,
+            carries_tags: true,
+        },
+        MetadataRow {
+            case: "ignoring object metadata still carries the tag set",
+            options: json!({
+                "TransferMode": "ALL",
+                "VerifyMode": "NONE",
+                "ObjectMetadata": "NONE",
+            }),
+            carries_metadata: false,
+            carries_tags: true,
+        },
+        MetadataRow {
+            case: "ignoring object tags still carries the metadata",
+            options: json!({
+                "TransferMode": "ALL",
+                "VerifyMode": "NONE",
+                "ObjectTags": "NONE",
+            }),
+            carries_metadata: true,
+            carries_tags: false,
+        },
+        MetadataRow {
+            case: "ignoring both carries only the last-modified entry",
+            options: json!({
+                "TransferMode": "ALL",
+                "VerifyMode": "NONE",
+                "ObjectMetadata": "NONE",
+                "ObjectTags": "NONE",
+            }),
+            carries_metadata: false,
+            carries_tags: false,
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let aws = Aws::new();
+        let (source_bucket, destination_bucket) = ("metadata-source", "metadata-destination");
+        aws.seed_bucket(source_bucket, &[], case).await;
+        aws.seed_bucket(destination_bucket, &[], case).await;
+        for staged in DESCRIBED_OBJECTS {
+            aws.stage_described(source_bucket, staged, case).await;
+        }
+        let role_arn = aws.create_role(&[source_bucket, destination_bucket]).await;
+        let source = aws
+            .create_location(source_bucket, None, &role_arn, case)
+            .await;
+        let destination = aws
+            .create_location(destination_bucket, None, &role_arn, case)
+            .await;
+        let created = aws
+            .ok(
+                "CreateTask",
+                json!({
+                    "SourceLocationArn": source,
+                    "DestinationLocationArn": destination,
+                    "Name": "metadata-task",
+                    "Options": row.options,
+                }),
+                case,
+            )
+            .await;
+        let task_arn = created["TaskArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a TaskArn, got {created}"))
+            .to_string();
+        let execution_arn = aws.start_execution(&task_arn, case).await;
+        let finished = aws.await_terminal(&execution_arn, case).await;
+        assert_eq!(
+            finished["Status"].as_str(),
+            Some("SUCCESS"),
+            "case {case:?}: expected the execution to end SUCCESS, got {finished}"
+        );
+
+        for staged in DESCRIBED_OBJECTS {
+            let key = staged.key;
+            // The source object's own modification time, which is what the destination's
+            // last-modified entry has to state — not the moment the transfer wrote it.
+            let source_modified = aws.object_modified_at(source_bucket, key, case).await;
+
+            let read = aws
+                .s3()
+                .get_object()
+                .bucket(destination_bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "case {case:?}: the destination must serve {key:?} after the \
+                         transfer, got {error:?}"
+                    )
+                });
+            let content_type = read.content_type().unwrap_or_default().to_string();
+            let accept_ranges = read.accept_ranges().unwrap_or_default().to_string();
+            let etag = read.e_tag().unwrap_or_default().to_string();
+            let has_last_modified = read.last_modified().is_some();
+            let encryption = read
+                .server_side_encryption()
+                .map(|value| value.as_str().to_string());
+            let metadata: BTreeMap<String, String> = read
+                .metadata()
+                .map(|metadata| {
+                    metadata
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let body = read
+                .body
+                .collect()
+                .await
+                .expect("the object arrives in full")
+                .into_bytes()
+                .to_vec();
+            assert_eq!(
+                body.as_slice(),
+                staged.body,
+                "case {case:?}: wrong bytes at {key:?}, got {actual:?}",
+                actual = String::from_utf8_lossy(&body)
+            );
+
+            let expected_type = if row.carries_metadata {
+                staged.content_type
+            } else {
+                DEFAULT_CONTENT_TYPE
+            };
+            assert_eq!(
+                content_type, expected_type,
+                "case {case:?}: expected {key:?} to report Content-Type \
+                 {expected_type:?}, got {content_type:?}"
+            );
+
+            let mut expected_metadata: BTreeMap<String, String> = if row.carries_metadata {
+                staged
+                    .metadata
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .collect()
+            } else {
+                BTreeMap::new()
+            };
+            // The source object's own entry travels verbatim; an object carrying none
+            // arrives with the modification time the source side reports for it.
+            expected_metadata
+                .entry(LAST_MODIFIED_ENTRY.to_string())
+                .or_insert(source_modified.clone());
+            assert_eq!(
+                metadata, expected_metadata,
+                "case {case:?}: expected {key:?} to report the user metadata \
+                 {expected_metadata:?}, got {metadata:?}"
+            );
+
+            let mut expected_tags: Vec<(String, String)> = if row.carries_tags {
+                staged
+                    .tags
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            expected_tags.sort();
+            let actual_tags = aws.object_tags(destination_bucket, key, case).await;
+            assert_eq!(
+                actual_tags, expected_tags,
+                "case {case:?}: expected {key:?} to report the tag set \
+                 {expected_tags:?}, got {actual_tags:?}"
+            );
+
+            // The rest of the shape a read of a transferred object has: the headers every
+            // stored object is served with, the encryption the destination bucket's
+            // default applies to what is written into it, and the checksum the store
+            // computed over the transferred bytes.
+            assert_eq!(
+                accept_ranges, "bytes",
+                "case {case:?}: expected {key:?} to report accept-ranges bytes, got \
+                 {accept_ranges:?}"
+            );
+            assert!(
+                !etag.is_empty(),
+                "case {case:?}: expected {key:?} to report an ETag"
+            );
+            assert!(
+                has_last_modified,
+                "case {case:?}: expected {key:?} to report a Last-Modified"
+            );
+            assert_eq!(
+                encryption.as_deref(),
+                Some("AES256"),
+                "case {case:?}: expected {key:?} to be served under the destination \
+                 bucket's default encryption, got {encryption:?}"
+            );
+            let checked = aws
+                .s3()
+                .get_object()
+                .bucket(destination_bucket)
+                .key(key)
+                .checksum_mode(::aws_sdk_s3::types::ChecksumMode::Enabled)
+                .send()
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("case {case:?}: the destination must serve {key:?}, got {error:?}")
+                });
+            assert!(
+                checked
+                    .checksum_crc64_nvme()
+                    .is_some_and(|value| !value.is_empty()),
+                "case {case:?}: expected {key:?} to report the checksum the store computed \
+                 over its bytes, got {actual:?}",
+                actual = checked.checksum_crc64_nvme()
+            );
+            assert_eq!(
+                checked.checksum_type().map(|value| value.as_str()),
+                Some("FULL_OBJECT"),
+                "case {case:?}: expected {key:?} to report a whole-object checksum type, \
+                 got {actual:?}",
+                actual = checked.checksum_type()
+            );
+        }
+    }
+}
+
+impl Aws {
+    /// Put one staged object in `bucket`, with the content type, user metadata and tag
+    /// set it carries.
+    async fn stage_described(&self, bucket: &str, staged: &DescribedObject, case: &str) {
+        let mut write = self
+            .s3()
+            .put_object()
+            .bucket(bucket)
+            .key(staged.key)
+            .content_type(staged.content_type)
+            .body(::aws_sdk_s3::primitives::ByteStream::from(
+                staged.body.to_vec(),
+            ));
+        for (name, value) in staged.metadata {
+            write = write.metadata(*name, *value);
+        }
+        if !staged.tags.is_empty() {
+            let tagging = staged
+                .tags
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("&");
+            write = write.tagging(tagging);
+        }
+        let stored = write.send().await;
+        assert!(
+            stored.is_ok(),
+            "case {case:?}: Amazon S3 must store {key:?} with its metadata, got {stored:?}",
+            key = staged.key
+        );
+    }
+
+    /// The object's `Last-Modified`, in the form that header carries it.
+    async fn object_modified_at(&self, bucket: &str, key: &str, case: &str) -> String {
+        let head = self
+            .s3()
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: Amazon S3 must report {key:?}, got {error:?}")
+            });
+        head.last_modified()
+            .and_then(|at| {
+                at.fmt(::aws_smithy_types::date_time::Format::HttpDate)
+                    .ok()
+            })
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: Amazon S3 must report when {key:?} was last modified")
+            })
+    }
+
+    /// The object's tag set, in key order.
+    async fn object_tags(&self, bucket: &str, key: &str, case: &str) -> Vec<(String, String)> {
+        let tagged = self
+            .s3()
+            .get_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: Amazon S3 must report the tag set of {key:?}, got {error:?}")
+            });
+        let mut tags: Vec<(String, String)> = tagged
+            .tag_set()
+            .iter()
+            .map(|tag| (tag.key().to_string(), tag.value().to_string()))
+            .collect();
+        tags.sort();
+        tags
+    }
 }

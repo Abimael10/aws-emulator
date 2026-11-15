@@ -23,9 +23,9 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Encodes/decodes ListTasks' opaque NextToken cursor.
 hex = { workspace = true }
-# The tree's shared readings this service needs: the one in-process Amazon S3 client and
-# object read a task execution moves objects through, the one question put to IAM about
-# what a location's bucket access role allows, and the one ARN parse.
+# The tree's shared readings this service needs: the one in-process Amazon S3 client a
+# task execution moves objects through, the one question put to IAM about what a
+# location's bucket access role allows, and the one ARN parse.
 service-common = { path = "../common" }
 # The AWS SDK for Amazon S3, driven over the in-process callback
 # (`OperationContext::callback`): a task execution between two Amazon S3 locations lists,
@@ -33,6 +33,9 @@ service-common = { path = "../common" }
 # (`state::transfer`). Only the generated client is needed — the emulator supplies the
 # transport, so the SDK's own HTTPS stack and runtime are left out.
 aws-sdk-s3 = { version = "1", default-features = false }
+# Percent-encodes the source key of the `x-amz-copy-source` a transfer moves an object
+# with: that header's value is URL-encoded text (`state::transfer`).
+percent-encoding = "2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
