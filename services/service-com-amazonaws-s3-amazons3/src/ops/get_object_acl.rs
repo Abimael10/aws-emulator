@@ -247,10 +247,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         };
 
-        // The version this read reported the ACL OF: the id the store holds for it, and
-        // none for a version that has none (the current object of a bucket whose
-        // versioning was never enabled, and the null version of a suspended one).
-        let acted_on = object.version_id.clone();
+        // The version this read reported the ACL OF: the id the store minted for it, and
+        // `null` for the version a bucket that carries a versioning configuration stored
+        // while its status was not `Enabled`
+        // ([`crate::state::Bucket::reported_version_id`]) — none at all for a bucket whose
+        // versioning was never set.
+        let acted_on = bucket.reported_version_id(object.version_id.as_deref());
 
         let reported = GetObjectAclOutput {
             // "Container for the bucket owner's ID" (`GetObjectAclOutput$Owner`): the one

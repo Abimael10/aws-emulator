@@ -15,11 +15,16 @@
 //!    ("for objects where the ETag is the MD5 digest of the object, you can calculate the
 //!    MD5 while putting an object to Amazon S3 and compare the returned ETag to the
 //!    calculated MD5 value", `PutObjectOutput$ETag`), the version id the bucket's
-//!    versioning minted for it ("Amazon S3 automatically generates a unique version ID for
-//!    the object being stored. Amazon S3 returns this ID in the response",
-//!    `PutObjectOutput$VersionId`), and — for a copy — the checksum the destination object
+//!    versioning GENERATED for it ("If you enable versioning for a bucket, Amazon S3
+//!    automatically generates a unique version ID for the object being stored. Amazon S3
+//!    returns this ID in the response", `PutObjectOutput$VersionId` — so a bucket that
+//!    generates none reports none), and — for a copy — the checksum the destination object
 //!    carries under the member its algorithm names, beside the `ChecksumType` it was
-//!    computed under (`CopyObjectResult$ChecksumCRC32` and `…$ChecksumType`).
+//!    computed under (`CopyObjectResult$ChecksumCRC32` and `…$ChecksumType`). A later READ
+//!    of the same key reports instead the id the version it resolves is ADDRESSED by, which
+//!    is the `null` version for a bucket carrying a versioning configuration that is not
+//!    `Enabled` ("Suspended—Disables versioning for the objects in the bucket. All objects
+//!    added to the bucket receive the version ID null", `PutBucketVersioning`).
 //! 3. A read that reports a bucket reports that bucket's ARN: "the Amazon Resource Name
 //!    (ARN) of the S3 bucket" (`HeadBucketOutput$BucketArn`, `Bucket$BucketArn`), which for
 //!    a general purpose bucket carries its globally unique name and leaves the Region and
@@ -190,6 +195,14 @@ async fn a_response_that_binds_nothing_to_its_body_carries_none() {
 /// One row of the write-identity table: the case, the key written, and the bytes.
 type WriteRow<'a> = (&'a str, &'a str, &'a [u8]);
 
+/// The id of the version a bucket whose versioning configuration is not `Enabled` stores:
+/// "All objects added to the bucket receive the version ID null" (`PutBucketVersioning`).
+const NULL_VERSION_ID: &str = "null";
+
+/// The stand-in a row uses for "an id the store minted of its own", which is a value the
+/// SERVICE chooses per write and so is never written out literally.
+const MINTED: &str = "a minted id";
+
 /// The rows differ along what the ETag rule generalises over: the SIZE of the body (empty,
 /// one byte, a few bytes, 8 KiB) and what it holds (text, digits, bytes that are not UTF-8).
 const WRITE_ROWS: &[WriteRow<'static>] = &[
@@ -216,15 +229,34 @@ fn repeated_bytes() -> Vec<u8> {
 #[tokio::test]
 async fn a_write_reports_the_entity_tag_it_stored_and_the_version_id_it_minted() {
     let router = router();
-    // The same table written into a bucket in each versioning state the rule distinguishes:
-    // only `Enabled` mints a version id for a write.
-    let buckets: [(&str, Option<&str>, bool); 3] = [
-        ("a bucket no versioning was ever set on", None, false),
-        ("a versioning-ENABLED bucket", Some("Enabled"), true),
-        ("a versioning-SUSPENDED bucket", Some("Suspended"), false),
+    // The same table written into a bucket in each versioning state the rule distinguishes.
+    // The pair per row is what the WRITE reports (the id the bucket GENERATED for the object
+    // being stored, which only `Enabled` mints) and what a later READ of the same key reports
+    // (the id the version it resolves is ADDRESSED by, which is the `null` one for every
+    // bucket carrying a versioning configuration that is not `Enabled`, and none at all for a
+    // bucket carrying no configuration).
+    let buckets: [(&str, Option<&str>, bool, Option<&str>); 3] = [
+        (
+            "a bucket no versioning was ever set on",
+            None,
+            false,
+            None,
+        ),
+        (
+            "a versioning-ENABLED bucket",
+            Some("Enabled"),
+            true,
+            Some(MINTED),
+        ),
+        (
+            "a versioning-SUSPENDED bucket",
+            Some("Suspended"),
+            false,
+            Some(NULL_VERSION_ID),
+        ),
     ];
 
-    for (bucket_case, versioning, mints_a_version) in buckets {
+    for (bucket_case, versioning, generates_an_id, read_reports) in buckets {
         let name = match versioning {
             None => "etag-plain",
             Some("Enabled") => "etag-enabled",
@@ -256,16 +288,27 @@ async fn a_write_reports_the_entity_tag_it_stored_and_the_version_id_it_minted()
                 written.header("etag")
             );
             let version = written.header("x-amz-version-id");
-            assert_eq!(
-                version.is_some(),
-                mints_a_version,
-                "case {case:?}: a version id is reported exactly when the bucket's \
-                 versioning minted one, got {version:?}"
-            );
+            if generates_an_id {
+                // An `Enabled` bucket generates an id of its own, never the null one.
+                assert!(
+                    version
+                        .as_deref()
+                        .is_some_and(|id| !id.is_empty() && id != NULL_VERSION_ID),
+                    "case {case:?}: an enabled bucket generates a version id of its own, got \
+                     {version:?}"
+                );
+            } else {
+                assert_eq!(
+                    version, None,
+                    "case {case:?}: a bucket that generates no version id for the object \
+                     being stored reports none on the write, got {version:?}"
+                );
+            }
 
             // The identity the write reported addresses the object it created: a read of
-            // the key reports the same tag, and a read of the reported version id resolves
-            // to it.
+            // the key reports the same tag, and the id the version it resolves is addressed
+            // by — the one the write generated, or the `null` version where it generated
+            // none and the bucket still carries a versioning configuration.
             let read = head_object(&router, name, key, "").await;
             assert_eq!(
                 read.header("etag"),
@@ -273,7 +316,27 @@ async fn a_write_reports_the_entity_tag_it_stored_and_the_version_id_it_minted()
                 "case {case:?}: the read must report the ETag the write did, got {:?}",
                 read.header("etag")
             );
-            if let Some(version_id) = version {
+            let addressed = read.header("x-amz-version-id");
+            match read_reports {
+                None => assert_eq!(
+                    addressed, None,
+                    "case {case:?}: a bucket carrying no versioning configuration addresses \
+                     no version, got {addressed:?}"
+                ),
+                Some(NULL_VERSION_ID) => assert_eq!(
+                    addressed.as_deref(),
+                    Some(NULL_VERSION_ID),
+                    "case {case:?}: a read of the null version names it {NULL_VERSION_ID:?}, \
+                     got {addressed:?}"
+                ),
+                _ => assert_eq!(
+                    addressed, version,
+                    "case {case:?}: a read must name the version the write generated {:?}, \
+                     got {addressed:?}",
+                    version
+                ),
+            }
+            if let Some(version_id) = addressed {
                 let by_version =
                     head_object(&router, name, key, &format!("?versionId={version_id}")).await;
                 assert_eq!(
@@ -285,7 +348,7 @@ async fn a_write_reports_the_entity_tag_it_stored_and_the_version_id_it_minted()
                 assert_eq!(
                     by_version.header("etag").as_deref(),
                     Some(expected_etag(body).as_str()),
-                    "case {case:?}: the version the write reported must hold its bytes, got \
+                    "case {case:?}: the version the read reported must hold its bytes, got \
                      {:?}",
                     by_version.header("etag")
                 );

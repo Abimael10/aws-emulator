@@ -1573,3 +1573,18 @@ mod zz_probe_whole_emulator;
 // `all/every_suite_file_is_declared.rs` pin those rules, so check there rather than leaving a
 // note here; `all/appended_notes.rs` records what the notes earlier landings had appended to
 // this file said.
+// An inner attribute, like an inner doc comment, is legal only BEFORE the first item, so
+// the one this target needs stands here rather than anywhere below the list.
+// name, and no other line — so two branches landing at once insert two lines in two places
+// and have no prose to duplicate, re-word or mistype. A file no `mod` names is compiled
+// nowhere and its tests never run; a suite left at the top level of `tests/` fails the build;
+// a second `mod` for one name is `E0428`; and an inner doc comment past the first item is
+// `E0753`. Each of the last two fails every suite in this target, which is why EVERY comment
+// in this file is an ordinary `//` one, this header included: with no `//!` anywhere, no
+// merge of two landings can leave one past the first item. Nothing may stand BELOW the list
+// either, not even an ordinary comment: `all/appended_notes.rs` is where a note about this
+// file belongs.
+// test it explains. `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/every_suite_file_is_declared.rs`,
+// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` and
+// `all/declaration_roots_are_canonical_and_complete.rs` pin every rule above, for this file

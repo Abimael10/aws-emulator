@@ -376,7 +376,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjectTaggi
             Some(object) => untagged.of_object(object),
             None => untagged,
         };
-        let acted_on = untagged_object.and_then(|object| object.version_id.clone());
+        let acted_on = store.bucket(&input.bucket).and_then(|bucket| {
+            bucket.reported_version_id(
+                untagged_object.and_then(|object| object.version_id.as_deref()),
+            )
+        });
         let pending = crate::state::notifications::pending(
             &store,
             &input.bucket,
@@ -389,10 +393,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjectTaggi
 
         Ok(DeleteObjectTaggingNoContent {
             // "The versionId of the object the tag-set was removed from": the version this
-            // removal took the tag set off, which is the id the store holds for it. A
-            // version that has none — the current object of a bucket whose versioning was
-            // never enabled, and the null version of a suspended one — names no version,
-            // which is how S3 answers one too.
+            // removal took the tag set off — the id the store minted for it, and `null` for
+            // the version a bucket that carries a versioning configuration stored while its
+            // status was not `Enabled` ([`crate::state::Bucket::reported_version_id`]). A
+            // bucket whose versioning was never set addresses no version, so none is
+            // reported.
             version_id: acted_on,
         })
     }

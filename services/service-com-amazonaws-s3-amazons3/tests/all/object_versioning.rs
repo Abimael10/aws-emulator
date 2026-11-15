@@ -504,15 +504,25 @@ async fn a_versioned_write_mints_a_unique_id_and_every_version_stays_readable() 
 }
 
 #[tokio::test]
-async fn a_bucket_whose_versioning_is_not_enabled_mints_no_version_id() {
+async fn a_bucket_whose_versioning_is_not_enabled_stores_the_null_version() {
     let router = router();
 
-    // (case, bucket, the versioning statuses applied in order). The rows span every state
-    // a bucket's versioning can be in other than plain `Enabled`: never set at all, set
-    // straight to `Suspended`, and `Enabled` then suspended again.
+    // (case, bucket, the versioning statuses applied in order). The rows span every state a
+    // bucket's versioning can be in other than plain `Enabled`: never set at all, set
+    // straight to `Suspended`, and `Enabled` then suspended again. A bucket that carries no
+    // versioning configuration addresses no version at all, so nothing is reported for its
+    // objects; one that carries a configuration that is not `Enabled` stores the `null`
+    // version — "All objects added to the bucket receive the version ID null"
+    // (`PutBucketVersioning`) — which a read names by that id. The WRITE reports neither: the
+    // id it reports is the one the bucket GENERATED for the object being stored, and a bucket
+    // that is not versioning-enabled generates none.
     let rows: [(&str, &str, &[&str]); 3] = [
         ("a bucket whose versioning was never set", "plain-bucket", &[]),
-        ("a bucket suspended from the start", "suspended-bucket", &["Suspended"]),
+        (
+            "a bucket suspended from the start",
+            "suspended-bucket",
+            &["Suspended"],
+        ),
         (
             "a bucket enabled and then suspended",
             "resuspended-bucket",
@@ -541,13 +551,14 @@ async fn a_bucket_whose_versioning_is_not_enabled_mints_no_version_id() {
             set_versioning(&router, name, status).await;
         }
 
-        // The write made while the bucket is not versioning-enabled mints nothing.
+        // The write made while the bucket is not versioning-enabled generates no version id,
+        // so it reports none whatever configuration the bucket carries.
         let body: &[u8] = b"written while not enabled";
         let written = write_version(&router, name, "object.txt", case, body).await;
         assert_eq!(
             written, None,
-            "case {case:?}: a write into a bucket that is not versioning-enabled must \
-             report no {VERSION_ID_HEADER}, got {written:?}"
+            "case {case:?}: a write into a bucket that is not versioning-enabled generates \
+             no {VERSION_ID_HEADER}, got {written:?}"
         );
 
         // And the object it stored is the `null` version: a read naming no version and a

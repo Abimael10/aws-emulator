@@ -255,11 +255,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .collect(),
             // "The versionId of the object for which you got the tagging information":
-            // the version this read reported the tag set OF, which is the id the store
-            // holds for it. A version that has none — the current object of a bucket whose
-            // versioning was never enabled, and the null version of a suspended one —
-            // names no version, which is how S3 answers one too.
-            version_id: object.version_id.clone(),
+            // the version this read reported the tag set OF — the id the store minted for
+            // it, and `null` for the version a bucket that carries a versioning
+            // configuration stored while its status was not `Enabled`
+            // ([`crate::state::Bucket::reported_version_id`]). A bucket whose versioning
+            // was never set addresses no version, so none is reported.
+            version_id: bucket.reported_version_id(object.version_id.as_deref()),
         })
     }
 }

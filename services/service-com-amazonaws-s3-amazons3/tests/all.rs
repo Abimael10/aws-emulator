@@ -265,6 +265,8 @@ mod notification_filter_delivery;
 mod notification_lambda_handler_run;
 #[path = "all/notification_wildcard_event_overlap.rs"]
 mod notification_wildcard_event_overlap;
+#[path = "all/null_version_reporting.rs"]
+mod null_version_reporting;
 #[path = "all/null_version_id_reads.rs"]
 mod null_version_id_reads;
 #[path = "all/object_acl.rs"]

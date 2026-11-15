@@ -355,11 +355,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(object) = bucket.addressed_object(&input.key, version_id) else {
             return Err(no_such_object(version_id));
         };
-        // The version this write places the retention on: the id the store holds for the
-        // address resolved just above, and none for a version that has none (the current
-        // object of a bucket whose versioning was never enabled, and the null version of a
-        // suspended one). Read before the write, which changes no version's id.
-        let acted_on = object.version_id.clone();
+        // The version this write places the retention on: the id the store minted for the
+        // address resolved just above, and `null` for the version a bucket that carries a
+        // versioning configuration stored while its status was not `Enabled`
+        // ([`crate::state::Bucket::reported_version_id`]) — none at all for a bucket whose
+        // versioning was never set. Read before the write, which changes no version's id.
+        let acted_on = bucket.reported_version_id(object.version_id.as_deref());
         // The retention IN FORCE on the addressed version, read out here so the judgement
         // below works over an owned value and the store is free to be written through.
         // A retention whose date has passed has expired and restricts nothing.

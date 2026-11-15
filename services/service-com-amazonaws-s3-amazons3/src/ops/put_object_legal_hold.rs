@@ -286,13 +286,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if bucket.addressed_object(&input.key, version_id).is_none() {
             return Err(no_such_object(version_id));
         }
-        // The version this write places the hold on: the id the store holds for the address
-        // resolved just above, and none for a version that has none (the current object of
-        // a bucket whose versioning was never enabled, and the null version of a suspended
-        // one). Read before the write, which changes no version's id.
-        let acted_on = bucket
-            .addressed_object(&input.key, version_id)
-            .and_then(|object| object.version_id.clone());
+        // The version this write places the hold on: the id the store minted for the address
+        // resolved just above, and `null` for the version a bucket that carries a versioning
+        // configuration stored while its status was not `Enabled`
+        // ([`crate::state::Bucket::reported_version_id`]) — none at all for a bucket whose
+        // versioning was never set. Read before the write, which changes no version's id.
+        let acted_on = bucket.reported_version_id(
+            bucket
+                .addressed_object(&input.key, version_id)
+                .and_then(|object| object.version_id.as_deref()),
+        );
 
         // A REPLACEMENT of the whole subresource: the status the version carries afterwards
         // is exactly the one this `LegalHold` named. Nothing in force bars it — a hold

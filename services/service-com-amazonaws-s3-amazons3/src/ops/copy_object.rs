@@ -1305,15 +1305,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             }),
             // "Version ID of the source object that was copied"
             // (`CopyObjectOutput$CopySourceVersionId`) — read off the stored version the
-            // copy was taken from, so it is reported exactly when that version has an id
-            // of its own.
-            copy_source_version_id: source_object.version_id.clone(),
+            // copy was taken from, reported "if you have enabled versioning on the source
+            // bucket": the id that bucket minted for the version, and `null` for the version
+            // it stored while its status was not `Enabled`
+            // ([`crate::state::Bucket::reported_version_id`]).
+            copy_source_version_id: store
+                .bucket(&source.bucket)
+                .and_then(|bucket| bucket.reported_version_id(source_object.version_id.as_deref())),
             // "Version ID of the newly created copy": "If you enable versioning on the
             // destination bucket, Amazon S3 generates a unique version ID for the copied
             // object … If you do not enable versioning or suspend it on the destination
             // bucket, the version ID that Amazon S3 generates … is always null"
-            // (`CopyObjectRequest$CopySource`). Read back off the STORED object, so the
-            // caller is told the id the copy is addressable by and nothing else.
+            // (`CopyObjectRequest$CopySource`) — so this member is the GENERATED id, which
+            // only a versioning-enabled destination mints. Read back off the STORED object,
+            // so the caller is told the id the copy was generated with and nothing else; a
+            // later READ of the `null` version a destination that is not versioning-enabled
+            // stored names it by the id it is addressed under
+            // ([`crate::state::Bucket::reported_version_id`]).
             version_id: store
                 .bucket(&input.bucket)
                 .and_then(|bucket| bucket.object(&input.key))

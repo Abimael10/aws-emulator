@@ -394,13 +394,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObjectAcl<Eng>
                 None => PutObjectAclErrorModeled::NoSuchKey(NoSuchKey {}).into(),
             });
         }
-        // The version this write sets the ACL of: the id the store holds for the address
-        // resolved just above, and none for a version that has none (the current object of
-        // a bucket whose versioning was never enabled, and the null version of a suspended
-        // one). Read before the write, which changes no version's id.
-        let acted_on = bucket
-            .addressed_object(&input.key, version_id)
-            .and_then(|object| object.version_id.clone());
+        // The version this write sets the ACL of: the id the store minted for the address
+        // resolved just above, and `null` for the version a bucket that carries a versioning
+        // configuration stored while its status was not `Enabled`
+        // ([`crate::state::Bucket::reported_version_id`]) — none at all for a bucket whose
+        // versioning was never set. Read before the write, which changes no version's id.
+        let acted_on = bucket.reported_version_id(
+            bucket
+                .addressed_object(&input.key, version_id)
+                .and_then(|object| object.version_id.as_deref()),
+        );
 
         // The ACL the request names becomes the object version's ACL in full, whether it
         // had one already or still carried the default. The store reports what the write

@@ -29,7 +29,8 @@
 //! (`GetObjectRequest$IfNoneMatch`, and `$IfModifiedSince` names the same status);
 //! "Enabled—Enables versioning for the objects in the bucket. All objects added to the
 //! bucket receive a unique version ID. Suspended—Disables versioning for the objects in the
-//! bucket" (`PutBucketVersioning`); and a 304 "MUST generate … ETag, Last-Modified" and
+//! bucket. All objects added to the bucket receive the version ID null"
+//! (`PutBucketVersioning`); and a 304 "MUST generate … ETag, Last-Modified" and
 //! "MUST NOT generate content" (RFC 9110 §15.4.5), which every row also pins.
 //!
 //! The ids themselves are values the SERVICE mints per write, so nothing here asserts a
@@ -124,7 +125,7 @@ async fn a_not_modified_read_names_the_version_it_evaluated() {
         assert_eq!(
             written.header(VERSION_ID_HEADER),
             None,
-            "case {what:?}: such a write mints no version id, got {:?}",
+            "case {what:?}: such a write generates no version id, got {:?}",
             written.header(VERSION_ID_HEADER)
         );
     }

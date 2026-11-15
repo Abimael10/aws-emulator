@@ -753,9 +753,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 checksum_xxhash128: reported.xxhash128,
             }),
             // "The version of the source object that was copied, if you have enabled
-            // versioning on the source bucket" — read off the stored source version, so it is
-            // reported exactly when that version has an id of its own.
-            copy_source_version_id: source_object.version_id.clone(),
+            // versioning on the source bucket" — read off the stored source version: the id
+            // the source bucket minted for it, and `null` for the version it stored while
+            // its status was not `Enabled`
+            // ([`crate::state::Bucket::reported_version_id`]).
+            copy_source_version_id: store
+                .bucket(&source.bucket)
+                .and_then(|bucket| bucket.reported_version_id(source_object.version_id.as_deref())),
             // The encryption the upload was initiated under, reported back the way
             // `UploadPart` reports it for a part of the same upload.
             server_side_encryption: encryption.sse_algorithm.clone(),

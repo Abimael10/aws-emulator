@@ -9,11 +9,13 @@
 //!
 //! The rule under test: a sub-resource call on an object — its tag set, its ACL, its Object
 //! Lock legal hold or retention — acts on ONE object version, and reports the id that
-//! version carries in the `x-amz-version-id` response header; a version with no id of its
-//! own (the current object of a bucket whose versioning was never enabled, and the null
-//! version written while versioning is suspended) is reported as no version at all, so the
-//! header is absent. It holds for a read and for a write, for the 204 of a removal as much
-//! as for a 200, and for the version a request NAMED as much as for the current one.
+//! version is ADDRESSED by in the `x-amz-version-id` response header: the id the bucket
+//! minted for it, or the literal `null` for the version a bucket carrying a versioning
+//! configuration stored while its status was not `Enabled` ("All objects added to the bucket
+//! receive the version ID null", `PutBucketVersioning`). A bucket that carries no versioning
+//! configuration at all addresses no version, so the header is absent for its objects. It
+//! holds for a read and for a write, for the 204 of a removal as much as for a 200, and for
+//! the version a request NAMED as much as for the current one.
 //!
 //! The sources:
 //!
@@ -62,16 +64,24 @@ use super::object_versioning::set_versioning;
 /// The header S3 reports the version a call acted on in.
 const VERSION_ID_HEADER: &str = "x-amz-version-id";
 
+/// The id of the version a bucket whose versioning configuration is not `Enabled` stores:
+/// "All objects added to the bucket receive the version ID null" (`PutBucketVersioning`).
+const NULL_VERSION_ID: &str = "null";
+
 /// The bytes every object in this suite is written with: which version a sub-resource call
 /// acted on has nothing to do with what the version holds, so one payload serves every row.
 const BODY: &[u8] = b"subresource-subject";
 
 /// What one sub-resource call answered: the operation's name, the status it must carry, and
 /// the response.
-struct SubresourceAnswer {
-    operation: &'static str,
-    expected_status: u16,
-    answer: Answer,
+///
+/// `pub(crate)`, like [`acls_enabled`] below: the suite for the id the null version is named
+/// by ([`super::null_version_reporting`]) reports its answers through this one shape rather
+/// than declaring a second copy of it.
+pub(crate) struct SubresourceAnswer {
+    pub(crate) operation: &'static str,
+    pub(crate) expected_status: u16,
+    pub(crate) answer: Answer,
 }
 
 /// A bucket whose ACLs are ENABLED, so an ACL row is not refused for the bucket's Object
@@ -80,7 +90,9 @@ struct SubresourceAnswer {
 /// A bucket is created with the setting that DISABLES ACLs ("by default, `ObjectOwnership`
 /// is set to `BucketOwnerEnforced` and ACLs are disabled"), which is what makes this
 /// switch necessary; the ACL suite beside this one takes it for the same reason.
-async fn acls_enabled(router: &MultiServiceRouter, name: &str) {
+///
+/// `pub(crate)`: see [`SubresourceAnswer`].
+pub(crate) async fn acls_enabled(router: &MultiServiceRouter, name: &str) {
     let enabled = put_ownership_controls(router, name, &["ObjectWriter"]).await;
     assert_eq!(
         enabled.status, 200,
@@ -91,8 +103,10 @@ async fn acls_enabled(router: &MultiServiceRouter, name: &str) {
     );
 }
 
-/// An object written at `key`, reporting the version id the write minted — `None` when the
-/// bucket's versioning state made it mint none.
+/// An object written at `key`, reporting the version id the write GENERATED — `None` when
+/// the bucket's versioning state made it generate none ("If you enable versioning for a
+/// bucket, Amazon S3 automatically generates a unique version ID for the object being
+/// stored. Amazon S3 returns this ID in the response", `PutObjectOutput$VersionId`).
 async fn written_version(router: &MultiServiceRouter, name: &str, key: &str) -> Option<String> {
     let written = put_object(router, name, key, BODY, &[]).await;
     assert_eq!(
@@ -146,23 +160,24 @@ async fn current_version_answers(
 }
 
 /// One row of the bucket table: the case name and the bucket it stands up, which answers
-/// with the version id the key's current object carries — `None` when it carries none.
+/// with the version id the key's current object is ADDRESSED by — `None` for a bucket that
+/// addresses no version at all.
 type BucketRow = (&'static str, &'static str);
 
 /// The buckets the sub-resource calls are driven against, differing along the one thing the
-/// rule generalises over: whether the version a call acts on HAS an id.
+/// rule generalises over: which id the version a call acts on is addressed by.
 ///
 /// `Enabled` is the state that mints one ("if you enable versioning … Amazon S3 generates a
-/// unique version ID"), a bucket that was never configured mints none, and `Suspended`
-/// leaves the object it then stores as the null version — "if you suspend versioning …
-/// Amazon S3 generates a null version ID" — which is no id a request can name back.
+/// unique version ID"), a bucket that was never configured addresses no version at all, and
+/// `Suspended` leaves the object it then stores as the NULL version — "All objects added to
+/// the bucket receive the version ID null" — which is the id a request names it back by.
 const BUCKET_ROWS: &[BucketRow] = &[
     ("versioning enabled", "subresource-version-enabled"),
     ("versioning never enabled", "subresource-version-plain"),
     ("versioning suspended", "subresource-version-suspended"),
 ];
 
-/// Stand `row` up and answer with the version id its key's current object carries.
+/// Stand `row` up and answer with the version id its key's current object is addressed by.
 async fn stand_up(router: &MultiServiceRouter, case: &str, name: &str, key: &str) -> Option<String> {
     bucket(router, name).await;
     acls_enabled(router, name).await;
@@ -173,9 +188,9 @@ async fn stand_up(router: &MultiServiceRouter, case: &str, name: &str, key: &str
         }
         "versioning never enabled" => written_version(router, name, key).await,
         "versioning suspended" => {
-            // A version WITH an id first, so the suspended write below displaces a real
-            // version rather than being the key's only one: what the calls must report is
-            // the current object's absence of an id, not the bucket's emptiness.
+            // A version WITH a minted id first, so the suspended write below displaces a
+            // real version rather than being the key's only one: what the calls must report
+            // is the current object's NULL id, not the bucket's emptiness.
             set_versioning(router, name, "Enabled").await;
             let minted = written_version(router, name, key).await;
             assert!(
@@ -184,7 +199,15 @@ async fn stand_up(router: &MultiServiceRouter, case: &str, name: &str, key: &str
                  {minted:?}"
             );
             set_versioning(router, name, "Suspended").await;
-            written_version(router, name, key).await
+            let written = written_version(router, name, key).await;
+            assert_eq!(
+                written, None,
+                "case {case:?}: a write made while versioning is suspended generates no \
+                 version id, got {written:?}"
+            );
+            // The version it stored is the bucket's null one, which is what every call below
+            // acts on and names.
+            Some(NULL_VERSION_ID.to_string())
         }
         other => panic!("case {other:?}: the suite stands up no such bucket"),
     }

@@ -1424,10 +1424,16 @@ fn integrity_refusal(rejection: crate::state::IntegrityRejection) -> PutObjectEr
 /// of this call names.
 const PUT_OBJECT_ACTION: &str = "s3:PutObject";
 
-/// The version id the object stored at `bucket`/`key` is addressable by, or `None` when
-/// it is the `null` version — one written while the bucket's versioning status was not
-/// `Enabled`, which has no id of its own ([`crate::state::NULL_VERSION_ID`] is what a
-/// request names it by).
+/// The version id `PutObject` reports for the object it just stored at `bucket`/`key`: the
+/// id the destination bucket GENERATED for it, and `None` where it generated none.
+///
+/// "If you enable versioning for a bucket, Amazon S3 automatically generates a unique
+/// version ID for the object being stored. Amazon S3 returns this ID in the response"
+/// (`PutObjectOutput$VersionId`) — so this member is the GENERATED id, which only a
+/// versioning-enabled bucket mints. A write into a bucket that is not versioning-enabled
+/// stores the `null` version, which carries no generated id and so is reported by no
+/// `x-amz-version-id` at all here, while a later READ of that version names it by the id it
+/// is addressed under ([`crate::state::Bucket::reported_version_id`]).
 fn version_id_of(
     store: &crate::state::ComAmazonawsS3Amazons3State,
     bucket: &str,

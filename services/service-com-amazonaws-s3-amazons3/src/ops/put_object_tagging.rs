@@ -381,7 +381,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObjectTagging<
             Some(object) => tagged.of_object(object),
             None => tagged,
         };
-        let acted_on = written.and_then(|object| object.version_id.clone());
+        let acted_on = store.bucket(&input.bucket).and_then(|bucket| {
+            bucket.reported_version_id(written.and_then(|object| object.version_id.as_deref()))
+        });
         let pending = crate::state::notifications::pending(
             &store,
             &input.bucket,
@@ -394,10 +396,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObjectTagging<
 
         Ok(PutObjectTaggingOutput {
             // "The versionId of the object the tag-set was added to": the version this
-            // write placed the tag set on, which is the id the store holds for it. A
-            // version that has none — the current object of a bucket whose versioning was
-            // never enabled, and the null version of a suspended one — names no version,
-            // which is how S3 answers one too.
+            // write placed the tag set on — the id the store minted for it, and `null` for
+            // the version a bucket that carries a versioning configuration stored while its
+            // status was not `Enabled` ([`crate::state::Bucket::reported_version_id`]). A
+            // bucket whose versioning was never set addresses no version, so none is
+            // reported.
             version_id: acted_on,
         })
     }

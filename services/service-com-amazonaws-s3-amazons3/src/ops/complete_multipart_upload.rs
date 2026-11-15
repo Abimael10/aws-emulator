@@ -1009,9 +1009,13 @@ fn location_of(
     crate::service::announced_url::announced_bucket_url(ctx, bucket, &path)
 }
 
-/// The version id the object stored at `bucket`/`key` is addressable by, or `None` when it
-/// is the `null` version — one written while the bucket's versioning status was not
-/// `Enabled`, which has no id of its own.
+/// The version id this completion reports for the object it assembled at `bucket`/`key`:
+/// the id the destination bucket GENERATED for it, and `None` where it generated none —
+/// the same member `PutObject` reports for a write of the same object ("If you enable
+/// versioning for a bucket, Amazon S3 automatically generates a unique version ID for the
+/// object being stored. Amazon S3 returns this ID in the response"), so a bucket that is not
+/// versioning-enabled reports none while a later READ of the `null` version it stored names
+/// it by the id it is addressed under ([`crate::state::Bucket::reported_version_id`]).
 fn version_id_of(
     store: &crate::state::ComAmazonawsS3Amazons3State,
     bucket: &str,
