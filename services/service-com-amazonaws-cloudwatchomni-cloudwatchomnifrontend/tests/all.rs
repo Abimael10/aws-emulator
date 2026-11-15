@@ -29,6 +29,8 @@ mod omni_dashboard_lifecycle;
 mod principal_search;
 #[path = "all/probe.rs"]
 mod probe;
+#[path = "all/resource_update.rs"]
+mod resource_update;
 #[path = "all/response_shaping.rs"]
 mod response_shaping;
 #[path = "all/space_update.rs"]

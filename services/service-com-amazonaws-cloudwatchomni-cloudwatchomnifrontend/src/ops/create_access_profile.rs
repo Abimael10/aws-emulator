@@ -141,6 +141,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let region = crate::state::request_region(ctx);
+        // The principal that creates a profile owns it, and an owner may assume its own
+        // profile — which is what `assumeStatus` reports to it.
+        let created_by = crate::state::caller_principal(ctx);
         let mut store = state.lock();
 
         // @idempotencyToken: a replay returns the profile the token already created. As
@@ -155,7 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .and_then(|profile_id| store.access_profiles.get(profile_id))
             {
                 return Ok(CreateAccessProfileOutput {
-                    access_profile: crate::state::access_profile_view(existing),
+                    access_profile: crate::state::access_profile_view(existing, &created_by),
                 });
             }
         }
@@ -232,12 +235,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
                 profile_id: profile_id.clone(),
             },
-            // A create records no trust grant: nothing yet authorizes a principal to
-            // assume the new profile, which is what `assumeStatus` reports.
+            created_by: created_by.clone(),
+            // A create records no trust grant: nothing yet authorizes a principal OTHER
+            // than the owner to assume the new profile.
             assume_grant_ids: Vec::new(),
             tags: input.tags.unwrap_or_default(),
         };
-        let access_profile = crate::state::access_profile_view(&stored);
+        let access_profile = crate::state::access_profile_view(&stored, &created_by);
 
         if let Some(token) = input.client_token {
             store

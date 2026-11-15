@@ -45,7 +45,8 @@ use omni::ops::types::{
     CREATE_ACCESS_PROFILE_INPUT_SCHEMA, GET_ACCESS_PROFILE_INPUT_SCHEMA,
 };
 use omni::state::{
-    ACCESS_PROFILE_QUOTA, ACCESS_PROFILE_TYPE_CUSTOMER_MANAGED, ASSUME_STATUS_DENIED,
+    ACCESS_PROFILE_QUOTA, ACCESS_PROFILE_TYPE_CUSTOMER_MANAGED, ASSUME_STATUS_ALLOWED,
+    ASSUME_STATUS_DENIED,
 };
 
 /// The region the suite signs for; the handlers record the signed region on each
@@ -90,15 +91,16 @@ fn millis(at: aws_smithy_types::DateTime) -> (i64, u32) {
 }
 
 /// A SigV4 `Authorization` header whose credential scope names this service's signing
-/// name (the router's routing key) and the region the handlers record.
-fn signed_request_parts() -> http::request::Parts {
+/// name (the router's routing key), the region the handlers record, and `access_key_id` —
+/// which is the principal the handlers read the caller's identity from.
+fn signed_request_parts(access_key_id: &str) -> http::request::Parts {
     let (parts, ()) = http::Request::builder()
         .method("POST")
         .uri("/service/CloudWatchOmniFrontend/operation/Unused")
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEMULATOR/20260101/{REGION}/cloudwatch/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/cloudwatch/aws4_request, \
                  SignedHeaders=host, Signature=emulator"
             ),
         )
@@ -115,6 +117,9 @@ struct Omni {
     service: omni::EmulatedService<engine::InMemoryEngine>,
     router: MultiServiceRouter,
     parts: http::request::Parts,
+    /// The request metadata of a SECOND principal of the same account, which the suite
+    /// reads a profile it does not own with.
+    other_parts: http::request::Parts,
 }
 
 impl Omni {
@@ -129,13 +134,23 @@ impl Omni {
             service: omni::EmulatedService::new(Arc::clone(&engine)),
             engine,
             router,
-            parts: signed_request_parts(),
+            parts: signed_request_parts("AKIDEMULATOR"),
+            other_parts: signed_request_parts("AKIDSOMEONEELSE"),
         }
     }
 
     fn ctx(&self) -> OperationContext<'_> {
         OperationContext::new(
             &self.parts,
+            self.service.definition().identity(),
+            EmbeddedEmulator::from_router(self.router.clone()),
+        )
+    }
+
+    /// The same request metadata, signed by another principal of the account.
+    fn other_ctx(&self) -> OperationContext<'_> {
+        OperationContext::new(
+            &self.other_parts,
             self.service.definition().identity(),
             EmbeddedEmulator::from_router(self.router.clone()),
         )
@@ -194,6 +209,29 @@ impl Omni {
                 &self.ctx(),
             )
             .await
+    }
+
+    /// The `assumeStatus` a profile reports to a principal that does NOT own it — the
+    /// other half of the member's rule.
+    async fn assume_status_for_another_principal(
+        &self,
+        case: &str,
+        space_id: &str,
+        profile_id: &str,
+    ) -> String {
+        GetAccessProfile::new(Arc::clone(&self.engine))
+            .handle(
+                GetAccessProfileInput {
+                    space_id: space_id.to_string(),
+                    profile_id: profile_id.to_string(),
+                },
+                &self.other_ctx(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: GetAccessProfile failed: {error:?}"))
+            .access_profile
+            .assume_status
+            .unwrap_or_else(|| panic!("case {case:?}: the profile reported no assumeStatus"))
     }
 
     /// Dispatch one rpcv2Cbor request over HTTP and return the status and body.
@@ -418,7 +456,8 @@ async fn create_access_profile_persists_a_record_get_access_profile_returns_it()
         );
 
         // The request's own members come back as sent, and the derived ones are the
-        // documented values for a freshly created, customer-created profile.
+        // documented values for a freshly created, customer-created profile — whose
+        // creator OWNS it, so the caller that just created it may assume it.
         assert_eq!(
             (
                 created.space_id.as_str(),
@@ -432,7 +471,7 @@ async fn create_access_profile_persists_a_record_get_access_profile_returns_it()
                 row.name.as_str(),
                 row.description.as_deref(),
                 Some(ACCESS_PROFILE_TYPE_CUSTOMER_MANAGED),
-                Some(ASSUME_STATUS_DENIED),
+                Some(ASSUME_STATUS_ALLOWED),
             ),
             "case {case:?}: the created profile is {created:?}"
         );
@@ -469,6 +508,18 @@ async fn create_access_profile_persists_a_record_get_access_profile_returns_it()
                 created.name, fetched.name
             );
         }
+
+        // `assumeStatus` is the one member reported per CALLER rather than per record:
+        // another principal of the account neither owns this profile nor is reached by a
+        // trust grant on it, so the same stored profile reports DENIED to it.
+        let other = omni
+            .assume_status_for_another_principal(case, &space_id, &created.profile_id)
+            .await;
+        assert_eq!(
+            other, ASSUME_STATUS_DENIED,
+            "case {case:?}: a principal that neither owns the profile nor holds a grant on it \
+             expected {ASSUME_STATUS_DENIED}, got {other}"
+        );
     }
 }
 

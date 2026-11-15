@@ -331,7 +331,9 @@ struct DashboardCase {
 /// panel and has many; whitespace and
 /// non-ASCII text inside the document; `name` over the whole
 /// `@length(1..256)`/`^[a-zA-Z0-9_.@~()-]+$` class; a `description` absent and at
-/// `@length(max: 1024)`; and `tags` absent, one and at `@length(max: 50)`.
+/// `@length(max: 1024)`; and `tags` absent, one and at `@length(max: 50)`. Every panel
+/// carries the `type` and `layout` the schema requires of one, beside whatever else it
+/// likes.
 fn dashboard_cases() -> Vec<DashboardCase> {
     vec![
         DashboardCase {
@@ -344,7 +346,8 @@ fn dashboard_cases() -> Vec<DashboardCase> {
         DashboardCase {
             case: "one panel, pretty-printed with newlines",
             name: "Checkout_latency.p99@~(prod)-view".to_string(),
-            body: "{\n  \"panels\": [\n    {\"type\": \"timeSeries\", \"title\": \"p99\"}\n  ]\n}"
+            body: "{\n  \"panels\": [\n    {\"type\": \"timeSeries\", \"layout\": {\"x\": 0}, \
+                   \"title\": \"p99\"}\n  ]\n}"
                 .to_string(),
             description: Some("an optional description".to_string()),
             tags: Some(HashMap::from([("team".to_string(), "sre".to_string())])),
@@ -356,7 +359,7 @@ fn dashboard_cases() -> Vec<DashboardCase> {
                 r#"{{"panels":[{}]}}"#,
                 (0..24)
                     .map(|index| format!(
-                        r#"{{"id":{index},"title":"café ☕ {index}","query":{{"language":"sql","expression":"SELECT 1"}}}}"#
+                        r#"{{"type":"timeSeries","layout":{{"row":{index}}},"id":{index},"title":"café ☕ {index}","query":{{"language":"sql","expression":"SELECT 1"}}}}"#
                     ))
                     .collect::<Vec<_>>()
                     .join(",")
@@ -371,7 +374,7 @@ fn dashboard_cases() -> Vec<DashboardCase> {
         DashboardCase {
             case: "the longest name the model admits, a deeply nested panel",
             name: "n".repeat(256),
-            body: r#"{"panels":[{"rows":[{"cells":[{"widget":{"kind":"logs","filters":["a","b"]}}]}]}]}"#
+            body: r#"{"panels":[{"type":"logs","layout":{"rows":[{"cells":[{"widget":{"kind":"logs","filters":["a","b"]}}]}]}}]}"#
                 .to_string(),
             description: Some("~".to_string()),
             tags: Some(HashMap::new()),
@@ -403,9 +406,18 @@ fn rejected_bodies() -> Vec<(&'static str, &'static str)> {
         ("panels as null", r#"{"panels":null}"#),
         ("a panel that is a number", r#"{"panels":[1]}"#),
         ("a panel that is a string", r#"{"panels":["timeSeries"]}"#),
+        ("a panel carrying neither required member", r#"{"panels":[{}]}"#),
+        (
+            "a panel carrying only its type",
+            r#"{"panels":[{"type":"logs"}]}"#,
+        ),
+        (
+            "a panel carrying only its layout, after a conforming one",
+            r#"{"panels":[{"type":"logs","layout":{}},{"layout":{}}]}"#,
+        ),
         (
             "a panel that is a list, after a valid one",
-            r#"{"panels":[{"type":"logs"},[]]}"#,
+            r#"{"panels":[{"type":"logs","layout":{}},[]]}"#,
         ),
         (
             "a conforming panels list beside an undeclared top-level member",
@@ -829,7 +841,7 @@ async fn the_dashboard_lifecycle_over_the_rpcv2cbor_wire() {
             &create_input(
                 &space_id,
                 "wire-dashboard",
-                r#"{"panels":[{"type":"timeSeries"}]}"#,
+                r#"{"panels":[{"type":"timeSeries","layout":{"x":0}}]}"#,
             ),
         )
         .await;
@@ -939,6 +951,12 @@ const CLAUSE_SEPARATOR: &str = "; ";
 /// The location a constraint on the whole document is reported at.
 const DOCUMENT_ROOT: &str = "$";
 
+/// The refusal a body that is not JSON at all carries: the fixed text, the line the
+/// parse stopped on and the position in that line, counted from zero.
+fn not_valid_json(line: usize, column: usize) -> String {
+    format!("dashboard body is not valid JSON at line {line} column {column}")
+}
+
 /// The message the operation's modelled `ValidationException` carries.
 fn validation_message(
     case: &str,
@@ -965,8 +983,9 @@ async fn the_refusal_names_every_schema_constraint_the_body_violates() {
     // Rows span the schema's constraints and the number of them one document can
     // violate at once: the document's own type (text that is not JSON, and every JSON
     // type that is not an object), the required `panels` member, its type, its entries,
-    // and the closedness of the top level — each alone and in combination. The clause
-    // list is the schema's own order: the root's type, then `panels`, then closedness.
+    // the members every panel is required to carry, and the closedness of the top level —
+    // each alone and in combination. The clause list is the schema's own order: the
+    // root's type, then `panels` and the panels in index order, then closedness.
     let cases: Vec<(&str, String, Vec<String>)> = vec![
         (
             "no panels member, one undeclared member",
@@ -996,7 +1015,7 @@ async fn the_refusal_names_every_schema_constraint_the_body_violates() {
         ),
         (
             "a conforming panels list beside several undeclared members",
-            r#"{"version":"2026-01-01","panels":[{"type":"logs"}],"variables":{"env":"prod"}}"#
+            r#"{"version":"2026-01-01","panels":[{"type":"logs","layout":{}}],"variables":{"env":"prod"}}"#
                 .to_string(),
             vec![clause(DOCUMENT_ROOT, "additionalProperties")],
         ),
@@ -1020,8 +1039,30 @@ async fn the_refusal_names_every_schema_constraint_the_body_violates() {
         ),
         (
             "a panel that is a number, after a conforming one",
-            r#"{"panels":[{"type":"logs"},1]}"#.to_string(),
+            r#"{"panels":[{"type":"logs","layout":{}},1]}"#.to_string(),
             vec![clause("panels", "items")],
+        ),
+        (
+            "a panel carrying neither member the schema requires of one",
+            r#"{"panels":[{}]}"#.to_string(),
+            vec![
+                clause("panels[0].type", "required"),
+                clause("panels[0].layout", "required"),
+            ],
+        ),
+        (
+            "the second panel missing its layout",
+            r#"{"panels":[{"type":"logs","layout":{}},{"type":"timeSeries"}]}"#.to_string(),
+            vec![clause("panels[1].layout", "required")],
+        ),
+        (
+            "a panel missing both members, beside an undeclared top-level member",
+            r#"{"panels":[{"title":"p99"}],"widgets":[]}"#.to_string(),
+            vec![
+                clause("panels[0].type", "required"),
+                clause("panels[0].layout", "required"),
+                clause(DOCUMENT_ROOT, "additionalProperties"),
+            ],
         ),
         (
             "several panels that are not objects, beside an undeclared member",
@@ -1054,12 +1095,14 @@ async fn the_refusal_names_every_schema_constraint_the_body_violates() {
         (
             "not JSON at all",
             "panels".to_string(),
-            vec![clause(DOCUMENT_ROOT, "type")],
+            // Text that does not parse has no document to hold to the schema, so the
+            // refusal is the parse position rather than a schema clause.
+            vec![not_valid_json(1, 0)],
         ),
         (
             "truncated JSON",
             r#"{"panels":[{"type":"logs"}"#.to_string(),
-            vec![clause(DOCUMENT_ROOT, "type")],
+            vec![not_valid_json(1, 25)],
         ),
     ];
 
@@ -1094,15 +1137,17 @@ async fn a_conforming_body_is_not_refused_however_its_panels_are_laid_out() {
 
     // Rows span what the schema admits: `panels` alone, empty and holding one, many and
     // deeply nested panel objects, with whitespace and non-ASCII text in the document.
+    // Every panel carries the `type` and `layout` the schema requires of one, and
+    // whatever else it likes beside them.
     let bodies = [
         ("no panel yet", EMPTY_PANELS_BODY.to_string()),
         (
             "one panel, pretty-printed",
-            "{\n  \"panels\": [\n    {}\n  ]\n}".to_string(),
+            "{\n  \"panels\": [\n    {\"type\": \"logs\", \"layout\": {}}\n  ]\n}".to_string(),
         ),
         (
             "a panel carrying any members it likes",
-            r#"{"panels":[{"type":"timeSeries","title":"café ☕","query":{"sql":"SELECT 1"}}]}"#
+            r#"{"panels":[{"type":"timeSeries","layout":{"row":0,"column":1},"title":"café ☕","query":{"sql":"SELECT 1"}}]}"#
                 .to_string(),
         ),
         (
@@ -1110,7 +1155,9 @@ async fn a_conforming_body_is_not_refused_however_its_panels_are_laid_out() {
             format!(
                 r#"{{"panels":[{}]}}"#,
                 (0..16)
-                    .map(|index| format!(r#"{{"id":{index}}}"#))
+                    .map(|index| format!(
+                        r#"{{"type":"logs","layout":{{"row":{index}}},"id":{index}}}"#
+                    ))
                     .collect::<Vec<String>>()
                     .join(",")
             ),

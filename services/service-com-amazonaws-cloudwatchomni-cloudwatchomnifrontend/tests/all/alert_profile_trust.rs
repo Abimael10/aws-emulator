@@ -89,15 +89,16 @@ fn expected_refusal(profile_id: &str) -> String {
 }
 
 /// A SigV4 `Authorization` header whose credential scope names this service's signing
-/// name (the router's routing key), the region the handlers record and [`ACCESS_KEY_ID`].
-fn signed_request_parts() -> http::request::Parts {
+/// name (the router's routing key), the region the handlers record and `access_key_id` —
+/// which is the principal the handlers read the caller's identity from.
+fn signed_request_parts(access_key_id: &str) -> http::request::Parts {
     let (parts, ()) = http::Request::builder()
         .method("POST")
         .uri("/service/CloudWatchOmniFrontend/operation/Unused")
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential={ACCESS_KEY_ID}/20260101/{REGION}/cloudwatch/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/cloudwatch/aws4_request, \
                  SignedHeaders=host, Signature=emulator"
             ),
         )
@@ -149,6 +150,10 @@ struct Omni {
     service: omni::EmulatedService<engine::InMemoryEngine>,
     router: MultiServiceRouter,
     parts: http::request::Parts,
+    /// The request metadata of a SECOND principal of the same account: a profile's own
+    /// owner may always assume it, so the CALLER's `assumeStatus` is observed through a
+    /// principal that owns nothing here.
+    other_parts: http::request::Parts,
 }
 
 impl Omni {
@@ -163,7 +168,8 @@ impl Omni {
             service: omni::EmulatedService::new(Arc::clone(&engine)),
             engine,
             router,
-            parts: signed_request_parts(),
+            parts: signed_request_parts(ACCESS_KEY_ID),
+            other_parts: signed_request_parts("AKIDSOMEONEELSE"),
         }
     }
 
@@ -348,10 +354,23 @@ impl Omni {
             .await
     }
 
-    /// The `assumeStatus` the reader reports for a profile — the CALLING principal's
-    /// authorization, which is a different question from an alert's trust.
+    /// The `assumeStatus` the reader reports for a profile to a principal that does NOT
+    /// own it — the CALLING principal's authorization, which is a different question from
+    /// an alert's trust. Read as that second principal because a profile's own owner may
+    /// assume it whatever grants exist, so only a non-owner shows what a grant decides.
     async fn assume_status(&self, case: &str, space_id: &str, profile_id: &str) -> String {
-        self.read_profile(space_id, profile_id)
+        GetAccessProfile::new(Arc::clone(&self.engine))
+            .handle(
+                GetAccessProfileInput {
+                    space_id: space_id.to_string(),
+                    profile_id: profile_id.to_string(),
+                },
+                &OperationContext::new(
+                    &self.other_parts,
+                    self.service.definition().identity(),
+                    EmbeddedEmulator::from_router(self.router.clone()),
+                ),
+            )
             .await
             .unwrap_or_else(|error| panic!("case {case:?}: GetAccessProfile failed: {error:?}"))
             .access_profile
@@ -608,11 +627,12 @@ async fn an_alert_trust_grant_counts_only_where_it_is_scoped_to_that_profile() {
 #[tokio::test]
 async fn the_refusal_is_the_alerts_trust_condition_and_not_the_callers_assume_status() {
     let omni = Omni::new();
-    // Two profiles that differ in the CALLER's authorization to assume them — the first
-    // carries a grant of its own, so `assumeStatus` reports ALLOWED; the second carries
-    // none, so it reports DENIED — and agree in carrying no ALERT trust. The alert
-    // refusal is the same sentence for both, so the message reports the alert's missing
-    // trust rather than the caller's authorization, and the two conditions stay apart.
+    // Two profiles that differ in a non-owning CALLER's authorization to assume them —
+    // the first carries a grant of its own, so `assumeStatus` reports ALLOWED to that
+    // caller; the second carries none, so it reports DENIED — and agree in carrying no
+    // ALERT trust. The alert refusal is the same sentence for both, so the message reports
+    // the alert's missing trust rather than the caller's authorization, and the two
+    // conditions stay apart.
     let mut rendered = Vec::new();
     for (index, (case, scope, assume_status)) in [
         (

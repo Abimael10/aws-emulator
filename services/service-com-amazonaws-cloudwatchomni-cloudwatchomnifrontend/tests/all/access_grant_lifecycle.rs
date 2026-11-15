@@ -22,7 +22,8 @@
 //! * the member combinations the model documents as invalid are refused with
 //!   `ValidationException`;
 //! * a grant whose scoped actions apply to an access profile is recorded against that
-//!   profile, which is what `AccessProfile.assumeStatus` reports.
+//!   profile, which is what `AccessProfile.assumeStatus` reports to a principal that does
+//!   not own the profile.
 //!
 //! Each assertion names its case and the actual value, so a failure identifies the row
 //! of the table that broke.
@@ -115,15 +116,16 @@ fn millis(at: aws_smithy_types::DateTime) -> (i64, u32) {
 }
 
 /// A SigV4 `Authorization` header whose credential scope names this service's signing
-/// name (the router's routing key) and the region the handlers record.
-fn signed_request_parts() -> http::request::Parts {
+/// name (the router's routing key), the region the handlers record, and `access_key_id` —
+/// which is the principal the handlers read the caller's identity from.
+fn signed_request_parts(access_key_id: &str) -> http::request::Parts {
     let (parts, ()) = http::Request::builder()
         .method("POST")
         .uri("/service/CloudWatchOmniFrontend/operation/Unused")
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential={ACCESS_KEY_ID}/20260101/{REGION}/cloudwatch/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/cloudwatch/aws4_request, \
                  SignedHeaders=host, Signature=emulator"
             ),
         )
@@ -140,6 +142,10 @@ struct Omni {
     service: omni::EmulatedService<engine::InMemoryEngine>,
     router: MultiServiceRouter,
     parts: http::request::Parts,
+    /// The request metadata of a SECOND principal of the same account: a profile's own
+    /// owner may always assume it, so what a GRANT authorizes is observed through a
+    /// principal that owns nothing here.
+    other_parts: http::request::Parts,
 }
 
 impl Omni {
@@ -154,13 +160,23 @@ impl Omni {
             service: omni::EmulatedService::new(Arc::clone(&engine)),
             engine,
             router,
-            parts: signed_request_parts(),
+            parts: signed_request_parts(ACCESS_KEY_ID),
+            other_parts: signed_request_parts("AKIDSOMEONEELSE"),
         }
     }
 
     fn ctx(&self) -> OperationContext<'_> {
         OperationContext::new(
             &self.parts,
+            self.service.definition().identity(),
+            EmbeddedEmulator::from_router(self.router.clone()),
+        )
+    }
+
+    /// The same request metadata, signed by another principal of the account.
+    fn other_ctx(&self) -> OperationContext<'_> {
+        OperationContext::new(
+            &self.other_parts,
             self.service.definition().identity(),
             EmbeddedEmulator::from_router(self.router.clone()),
         )
@@ -225,8 +241,33 @@ impl Omni {
         (profile.profile_id, profile.arn)
     }
 
-    /// The `assumeStatus` the reader reports for a profile.
+    /// The `assumeStatus` the reader reports for a profile to a principal that does NOT
+    /// own it — which is the principal a trust grant has to authorize, since the
+    /// profile's own owner may assume it with no grant in place.
     async fn assume_status(&self, case: &str, space_id: &str, profile_id: &str) -> String {
+        GetAccessProfile::new(Arc::clone(&self.engine))
+            .handle(
+                GetAccessProfileInput {
+                    space_id: space_id.to_string(),
+                    profile_id: profile_id.to_string(),
+                },
+                &self.other_ctx(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: GetAccessProfile failed: {error:?}"))
+            .access_profile
+            .assume_status
+            .unwrap_or_else(|| panic!("case {case:?}: the profile reported no assumeStatus"))
+    }
+
+    /// The `assumeStatus` the reader reports for a profile to the principal that CREATED
+    /// it — its owner, which the member allows whatever grants exist.
+    async fn assume_status_for_the_owner(
+        &self,
+        case: &str,
+        space_id: &str,
+        profile_id: &str,
+    ) -> String {
         GetAccessProfile::new(Arc::clone(&self.engine))
             .handle(
                 GetAccessProfileInput {
@@ -926,7 +967,8 @@ async fn a_grant_scoped_to_an_access_profile_is_recorded_against_it() {
         .access_profile("trust", &elsewhere_space, "elsewhere")
         .await;
 
-    // Before any grant, no profile is assumable: nothing authorizes it.
+    // Before any grant, no profile is assumable by a principal that does not own it:
+    // nothing authorizes it.
     for (case, space, profile) in [
         ("the named profile", space_id.as_str(), first_profile.as_str()),
         ("another profile of the space", space_id.as_str(), second_profile.as_str()),
@@ -1038,6 +1080,27 @@ async fn a_grant_scoped_to_an_access_profile_is_recorded_against_it() {
         status, ASSUME_STATUS_DENIED,
         "case \"a grant naming no resource\": expected {ASSUME_STATUS_DENIED}, got {status}"
     );
+
+    // The other half of the member: the principal that CREATED a profile owns it, so every
+    // profile above reports ALLOWED to it — the grant decides for everyone else.
+    for (case, space, profile) in [
+        (
+            "the owner of a profile no grant names",
+            bare_space.as_str(),
+            bare_profile.as_str(),
+        ),
+        (
+            "the owner of a profile a grant does not reach",
+            space_id.as_str(),
+            second_profile.as_str(),
+        ),
+    ] {
+        let status = omni.assume_status_for_the_owner(case, space, profile).await;
+        assert_eq!(
+            status, ASSUME_STATUS_ALLOWED,
+            "case {case:?}: expected {ASSUME_STATUS_ALLOWED}, got {status}"
+        );
+    }
 }
 
 #[tokio::test]

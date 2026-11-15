@@ -284,9 +284,14 @@ pub struct StoredAccessProfile {
     /// CALLING principal's authorization rather than a property of the profile, so it
     /// is computed when the profile is reported ([`access_profile_view`]).
     pub profile: AccessProfile,
+    /// The principal that created the profile — its owner ([`caller_principal`]).
+    ///
+    /// `AccessProfile` declares no member for it, so it is bookkeeping beside the
+    /// record rather than something a response reports. It is what the owner half of
+    /// [`access_profile_view`]'s `assumeStatus` is read from.
+    pub created_by: String,
     /// The ids of the trust grants recorded against this profile — the grants that
-    /// authorize a principal to assume it. A create records none, which is why a
-    /// profile reports `assumeStatus` DENIED until a grant names it.
+    /// authorize a principal OTHER than its owner to assume it.
     pub assume_grant_ids: Vec<String>,
     /// The request's `tags`; no modelled operation reads them back yet.
     pub tags: HashMap<String, String>,
@@ -510,9 +515,9 @@ impl ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
     /// profile's ARN, or scopes the `AccessProfile` type without narrowing it to ARNs.
     /// Only profiles of the grant's own space are reached: a grant applies to one space.
     ///
-    /// This is what records a grant against a profile, which is what
-    /// [`access_profile_view`] reads `assumeStatus` from — a profile no grant applies to
-    /// cannot be assumed by anyone.
+    /// This is what records a grant against a profile, which is the half of
+    /// [`access_profile_view`]'s `assumeStatus` that authorizes a principal other than
+    /// the profile's own owner.
     ///
     /// Linear in the number of stored profiles, which [`ACCESS_PROFILE_QUOTA`] bounds,
     /// times the grant's resource scopes, which the model bounds at 20 groups of 10.
@@ -1095,18 +1100,22 @@ fn grant_assumes_profile(grant: &AccessGrant, profile_arn: &str) -> bool {
     })
 }
 
-/// Project a stored access profile into the `AccessProfile` an operation returns.
+/// Project a stored access profile into the `AccessProfile` an operation returns, for
+/// the principal `caller` that asked for it ([`caller_principal`]).
 ///
 /// Every member but `assumeStatus` is the persisted record verbatim. `assumeStatus`
-/// reports "the calling principal's authorization to assume this access profile", and
-/// that authorization comes from a trust grant recorded against the profile — so it is
-/// read from the grants the store holds for it: a profile no grant names cannot be
-/// assumed, and reports DENIED.
-pub fn access_profile_view(stored: &StoredAccessProfile) -> AccessProfile {
-    let assume_status = if stored.assume_grant_ids.is_empty() {
-        ASSUME_STATUS_DENIED
-    } else {
+/// reports "the calling principal's authorization to assume this access profile", so it
+/// is read from the record against THAT principal, and the store holds two things that
+/// authorize one: the profile's own owner — the principal that created it, which is why
+/// the caller that creates a profile may assume it with no grant in place — and a trust
+/// grant recorded against the profile, which authorizes a principal that does not own
+/// it. A caller that is neither reports DENIED.
+pub fn access_profile_view(stored: &StoredAccessProfile, caller: &str) -> AccessProfile {
+    let owned_by_caller = stored.created_by == caller;
+    let assume_status = if owned_by_caller || !stored.assume_grant_ids.is_empty() {
         ASSUME_STATUS_ALLOWED
+    } else {
+        ASSUME_STATUS_DENIED
     };
     AccessProfile {
         assume_status: Some(assume_status.to_string()),
@@ -1347,7 +1356,8 @@ pub use principal_search::{
 
 pub use dashboard_body::{
     dashboard_body_rejection, dashboard_body_violations, DashboardBodyViolation,
-    DASHBOARD_BODY_PANELS, DOCUMENT_ROOT,
+    DASHBOARD_BODY_PANELS, DOCUMENT_ROOT, NOT_VALID_JSON_PREFIX, PANEL_CLAUSE_BUDGET,
+    PANEL_REQUIRED_MEMBERS,
 };
 
 /// Project a stored dashboard into the `OmniDashboardSummary` the list operation
@@ -1477,9 +1487,12 @@ mod tests {
     }
 
     #[test]
-    fn a_profile_reports_assume_status_from_the_grants_recorded_against_it() {
-        // Rows: no trust grant, one, and several. The status is read from the grant
-        // list, so it is DENIED exactly when the list is empty.
+    fn a_profile_reports_assume_status_for_the_calling_principal() {
+        // Rows cross the two things the store holds that authorize a caller: whether the
+        // caller OWNS the profile, and how many trust grants are recorded against it.
+        // Either one allows; neither denies.
+        const OWNER: &str = "arn:aws:iam::000000000000:user/OWNER";
+        const SOMEONE_ELSE: &str = "arn:aws:iam::000000000000:user/OTHER";
         let at = now();
         let profile = AccessProfile {
             profile_id: "profile".to_string(),
@@ -1492,10 +1505,21 @@ mod tests {
             assume_status: None,
             profile_type: Some(ACCESS_PROFILE_TYPE_CUSTOMER_MANAGED.to_string()),
         };
-        for (grants, expected) in [
-            (vec![], ASSUME_STATUS_DENIED),
-            (vec!["grant-a".to_string()], ASSUME_STATUS_ALLOWED),
+        for (caller, grants, expected) in [
+            ("the owner, no grant", vec![], ASSUME_STATUS_ALLOWED),
             (
+                "the owner, one grant",
+                vec!["grant-a".to_string()],
+                ASSUME_STATUS_ALLOWED,
+            ),
+            ("another principal, no grant", vec![], ASSUME_STATUS_DENIED),
+            (
+                "another principal, one grant",
+                vec!["grant-a".to_string()],
+                ASSUME_STATUS_ALLOWED,
+            ),
+            (
+                "another principal, several grants",
                 vec!["grant-a".to_string(), "grant-b".to_string()],
                 ASSUME_STATUS_ALLOWED,
             ),
@@ -1503,19 +1527,25 @@ mod tests {
             let stored = StoredAccessProfile {
                 seq: 1,
                 profile: profile.clone(),
+                created_by: OWNER.to_string(),
                 assume_grant_ids: grants.clone(),
                 tags: HashMap::new(),
             };
-            let view = access_profile_view(&stored);
+            let principal = if caller.starts_with("the owner") {
+                OWNER
+            } else {
+                SOMEONE_ELSE
+            };
+            let view = access_profile_view(&stored, principal);
             assert_eq!(
                 view.assume_status.as_deref(),
                 Some(expected),
-                "case {grants:?}: expected assumeStatus {expected}, got {:?}",
+                "case {caller:?}: expected assumeStatus {expected}, got {:?}",
                 view.assume_status
             );
             assert_eq!(
                 view.profile_id, stored.profile.profile_id,
-                "case {grants:?}: the projection must not change profileId, got {:?}",
+                "case {caller:?}: the projection must not change profileId, got {:?}",
                 view.profile_id
             );
         }
