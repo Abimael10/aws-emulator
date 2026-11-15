@@ -26,6 +26,12 @@
 // the account-visible inventory — who may create a volume from it and the Marketplace codes it
 // is billed through — plus what it refuses. Declared beside `prefix_lists` for the reason the
 // note above gives: the sorted neighbourhood and the tail of this file are where every new ec2
+// `ModifyIpamPool`: the members a modification writes onto a stored IPAM pool and the ones it
+// leaves alone, the allocation tag rules it adds and removes, and what it refuses. Declared
+// FIRST for the reason the note above gives: the sorted neighbourhood and the tail of this
+// file are where every new ec2 suite inserts its lines.
+#[path = "all/modify_ipam_pool.rs"]
+mod modify_ipam_pool;
 #[path = "all/snapshot_attributes.rs"]
 mod snapshot_attributes;
 // Which resource ids a tagging call resolves, over the taggable resource kinds beside the

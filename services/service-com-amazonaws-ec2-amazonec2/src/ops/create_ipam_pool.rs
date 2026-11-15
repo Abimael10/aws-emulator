@@ -220,70 +220,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // spelling, so this is one of the two families a pool can hold.
         let family = input.address_family.as_str();
 
-        // "Possible netmask lengths for IPv4 addresses are 0 - 32. Possible netmask lengths
-        // for IPv6 addresses are 0 - 128"
-        // (`CreateIpamPoolRequest$AllocationMinNetmaskLength`): the modelled
-        // `IpamNetmaskLength` carries `range 0..128`, which the boundary validator has
-        // applied, so the per-FAMILY bound inside it is asked here — of every netmask length
-        // the request carries, not just the minimum.
-        let family_max = state::max_netmask_length_for_family(family);
-        for (member, length) in [
-            (
-                "AllocationMinNetmaskLength",
-                input.allocation_min_netmask_length,
-            ),
-            (
-                "AllocationMaxNetmaskLength",
-                input.allocation_max_netmask_length,
-            ),
-            (
-                "AllocationDefaultNetmaskLength",
-                input.allocation_default_netmask_length,
-            ),
-        ] {
-            if let Some(length) = length.filter(|length| *length > family_max) {
-                return Err(state::invalid_parameter_value(format!(
-                    "Invalid value '{length}' for {member}. A netmask length for an \
-                     {family} pool must be from 0 to {family_max}"
-                )));
-            }
-        }
+        // Every netmask length the request carries, held to the range this address family
+        // admits, by the ONE reader of that bound in this crate — which `ModifyIpamPool` holds
+        // a modification's lengths to as well.
+        state::require_netmask_lengths_for_family(
+            family,
+            &[
+                (
+                    "AllocationMinNetmaskLength",
+                    input.allocation_min_netmask_length,
+                ),
+                (
+                    "AllocationMaxNetmaskLength",
+                    input.allocation_max_netmask_length,
+                ),
+                (
+                    "AllocationDefaultNetmaskLength",
+                    input.allocation_default_netmask_length,
+                ),
+            ],
+        )?;
 
-        // "The minimum netmask length must be less than the maximum netmask length"
-        // (`CreateIpamPoolRequest$AllocationMinNetmaskLength`) — the two bounds of one range,
-        // so a minimum at or above the maximum describes no range at all.
-        if let (Some(min), Some(max)) = (
+        // The pool's allocation netmask rules, held to what AWS documents of them by the ONE
+        // reader of those rules in this crate — which `ModifyIpamPool` holds a modified pool
+        // to, so a create and a modification cannot admit different pools.
+        state::require_ipam_pool_netmask_rules(
             input.allocation_min_netmask_length,
             input.allocation_max_netmask_length,
-        ) {
-            if min >= max {
-                return Err(state::invalid_parameter_value(format!(
-                    "Invalid value '{min}' for AllocationMinNetmaskLength. The minimum \
-                     netmask length must be less than the maximum netmask length '{max}'"
-                )));
-            }
-        }
-
-        // The default is the netmask "new allocations will default to"
-        // (`CreateIpamPoolRequest$AllocationDefaultNetmaskLength`), and the minimum and the
-        // maximum are what an allocation in this pool must satisfy "to be compliant": a
-        // default outside them would make every defaulted allocation non-compliant on
-        // arrival. THIS emulator's reading of those two sentences together — AWS publishes
-        // no sentence about the combination itself.
-        if let Some(default) = input.allocation_default_netmask_length {
-            let below = input
-                .allocation_min_netmask_length
-                .is_some_and(|min| default < min);
-            let above = input
-                .allocation_max_netmask_length
-                .is_some_and(|max| default > max);
-            if below || above {
-                return Err(state::invalid_parameter_combination(format!(
-                    "Invalid value '{default}' for AllocationDefaultNetmaskLength. It must \
-                     be within the pool's minimum and maximum netmask lengths"
-                )));
-            }
-        }
+            input.allocation_default_netmask_length,
+        )?;
 
         // "Default is byoip" (`CreateIpamPoolRequest$PublicIpSource`): a request that names
         // no source asks for the default one, so the rules below read the same whether or
@@ -352,8 +317,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state::RESOURCE_TYPE_IPAM_POOL,
             Self::NAME,
         )?;
-        let allocation_resource_tags =
-            allocation_resource_tags(input.allocation_resource_tags.as_deref())?;
+        // "Tags that are required for resources that use CIDRs from this IPAM pool"
+        // (`AllocationResourceTags`), read by the ONE reader of such a list in this crate, so
+        // the tag rules this create stores on a pool are exactly the ones `ModifyIpamPool`
+        // later adds to and removes from.
+        let allocation_resource_tags = state::ipam_allocation_resource_tags(
+            input.allocation_resource_tags.as_deref(),
+            "AllocationResourceTags",
+        )?;
 
         // The caller-chosen bytes this create would retain for the process's lifetime, asked
         // of the store below: a COUNT ceiling admits megabytes on its own, because each
@@ -600,52 +571,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })
     }
-}
-
-/// The `AllocationResourceTags` of the request as the pool reports them
-/// (`IpamPool$AllocationResourceTags`), refusing a tag set the pool could not hold.
-///
-/// "Tags that are required for resources that use CIDRs from this IPAM pool. Resources that
-/// do not have these tags will not be allowed to allocate space from the pool"
-/// (`CreateIpamPoolRequest$AllocationResourceTags`): the list is a SET of required
-/// key/value pairs, so a key given twice has no defined winner, and an empty key names no
-/// tag. The payload is bounded the way [`crate::state::tags_from_specifications`] bounds a
-/// resource's own tags — the model bounds neither list — because a pool keeps it for the
-/// process's lifetime.
-fn allocation_resource_tags(
-    requested: Option<&[RequestIpamResourceTag]>,
-) -> Result<Vec<IpamResourceTag>, CreateIpamPoolError> {
-    let requested = requested.unwrap_or_default();
-    if requested.len() > crate::state::MAX_TAGS_PER_RESOURCE {
-        return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
-            "The request carries {count} allocation resource tags, above the maximum of \
-             {max} per resource",
-            count = requested.len(),
-            max = crate::state::MAX_TAGS_PER_RESOURCE,
-        )));
-    }
-    let mut keys_seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
-    let mut tags: Vec<IpamResourceTag> = Vec::with_capacity(requested.len());
-    for tag in requested {
-        let key = tag.key.as_deref().unwrap_or_default();
-        if key.is_empty() {
-            return Err(crate::state::invalid_parameter_value(
-                "An allocation resource tag key cannot be empty",
-            ));
-        }
-        if !keys_seen.insert(key) {
-            return Err(crate::state::invalid_parameter_value(format!(
-                "Allocation resource tag key '{key}' is given more than once; tag keys must \
-                 be unique"
-            )));
-        }
-        crate::state::validate_tag_size(key, tag.value.as_deref().unwrap_or_default())?;
-        tags.push(IpamResourceTag {
-            key: tag.key.clone(),
-            value: tag.value.clone(),
-        });
-    }
-    Ok(tags)
 }
 
 /// Does `pool` — the pool a replayed `ClientToken` names — hold what THIS request asks for?

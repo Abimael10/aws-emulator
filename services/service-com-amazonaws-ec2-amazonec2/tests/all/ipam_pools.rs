@@ -563,7 +563,11 @@ async fn a_create_is_refused_by_the_scope_and_the_pools_own_rules() {
                 p("AllocationDefaultNetmaskLength", "16"),
             ],
             400,
-            "InvalidParameterCombination",
+            // The code of the netmask rule itself, whichever operation asks it
+            // (`ec2::state::require_ipam_pool_netmask_rules`): a default outside the
+            // pool's bounds is a bad VALUE for that member rather than two members that
+            // cannot be given together.
+            INVALID_PARAMETER_VALUE,
         ),
         (
             "an advertisement flag on an IPv4 pool",

@@ -882,6 +882,277 @@ pub fn ipam_modifiable_bytes(ipam: &Ipam) -> usize {
     2 * (regions + description)
 }
 
+/// Each netmask length a request names, held to the range the pool's ADDRESS FAMILY admits.
+///
+/// "Possible netmask lengths for IPv4 addresses are 0 - 32. Possible netmask lengths for IPv6
+/// addresses are 0 - 128" (`IpamPool$AllocationMinNetmaskLength`): the modelled
+/// `IpamNetmaskLength` carries `range 0..128`, which the boundary validator has already
+/// applied, so this is the per-family bound INSIDE it ([`max_netmask_length_for_family`]),
+/// asked of every length the request carries rather than only of the minimum. Each entry
+/// names the request member it came from, so the refusal says which one is at fault.
+///
+/// The ONE reader of that bound, so `CreateIpamPool` and `ModifyIpamPool` cannot admit
+/// different netmask lengths for one family.
+pub fn require_netmask_lengths_for_family<E>(
+    family: &str,
+    lengths: &[(&str, Option<i32>)],
+) -> Result<(), Scaffolded<E>> {
+    let family_max = max_netmask_length_for_family(family);
+    for (member, length) in lengths {
+        if let Some(length) = (*length).filter(|length| *length > family_max) {
+            return Err(invalid_parameter_value(format!(
+                "Invalid value '{length}' for {member}. A netmask length for an \
+                 {family} pool must be from 0 to {family_max}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The allocation netmask rules a pool would hold, held to what AWS documents of them.
+///
+/// "The minimum netmask length must be less than the maximum netmask length"
+/// (`IpamPool$AllocationMinNetmaskLength`) — the two bounds of one range, so a minimum at or
+/// above the maximum describes no range at all; and the default is the netmask "new
+/// allocations will default to" (`IpamPool$AllocationDefaultNetmaskLength`) while the
+/// minimum and the maximum are what an allocation in the pool must satisfy "to be
+/// compliant", so a default outside them would make every defaulted allocation non-compliant
+/// on arrival.
+///
+/// Asked of the rules the pool would END UP with rather than of one request's members, so a
+/// call that sets one of the three is answered against the two the pool already holds. The
+/// ONE reader of those rules, so `CreateIpamPool` and `ModifyIpamPool` cannot admit different
+/// pools — and the DEFAULT is answered first, because a request that breaks both rules is
+/// told about the rule naming the member it set.
+pub fn require_ipam_pool_netmask_rules<E>(
+    min: Option<i32>,
+    max: Option<i32>,
+    default: Option<i32>,
+) -> Result<(), Scaffolded<E>> {
+    if let Some(default) = default {
+        if min.is_some_and(|min| default < min) {
+            return Err(invalid_parameter_value(
+                "The default netmask length cannot be smaller than the min.",
+            ));
+        }
+        if max.is_some_and(|max| default > max) {
+            return Err(invalid_parameter_value(
+                "The default netmask length cannot be larger than the max.",
+            ));
+        }
+    }
+    if let (Some(min), Some(max)) = (min, max) {
+        if min >= max {
+            return Err(invalid_parameter_value(format!(
+                "Invalid value '{min}' for AllocationMinNetmaskLength. The minimum netmask \
+                 length must be less than the maximum netmask length '{max}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// One requested `RequestIpamResourceTagList` as a pool reports its entries
+/// (`IpamPool$AllocationResourceTags`), refusing a list a pool could not hold.
+///
+/// "Tags that are required for resources that use CIDRs from this IPAM pool. Resources that
+/// do not have these tags will not be allowed to allocate space from the pool"
+/// (`CreateIpamPoolRequest$AllocationResourceTags`): the list is a SET of required key/value
+/// pairs identified by the tag KEY, so a key given twice in one list has no defined winner,
+/// and an empty key names no tag. The payload is bounded the way
+/// [`tags_from_specifications`] bounds a resource's own tags — the model bounds neither list
+/// — because a pool keeps it for the process's lifetime.
+///
+/// `member` is the request member the list came from, so a refusal says which of a request's
+/// lists is at fault. The ONE reader of such a list, so `CreateIpamPool` and `ModifyIpamPool`
+/// cannot disagree about which lists a pool admits.
+pub fn ipam_allocation_resource_tags<E>(
+    requested: Option<&[crate::ops::types::RequestIpamResourceTag]>,
+    member: &str,
+) -> Result<Vec<IpamResourceTag>, Scaffolded<E>> {
+    let requested = requested.unwrap_or_default();
+    if requested.len() > MAX_TAGS_PER_RESOURCE {
+        return Err(Scaffolded::tag_limit_exceeded(format!(
+            "The request carries {count} {member} entries, above the maximum of {max} tags \
+             per resource",
+            count = requested.len(),
+            max = MAX_TAGS_PER_RESOURCE,
+        )));
+    }
+    let mut keys_seen: BTreeSet<&str> = BTreeSet::new();
+    let mut tags: Vec<IpamResourceTag> = Vec::with_capacity(requested.len());
+    for tag in requested {
+        let key = tag.key.as_deref().unwrap_or_default();
+        if key.is_empty() {
+            return Err(invalid_parameter_value(format!(
+                "A {member} key cannot be empty"
+            )));
+        }
+        if !keys_seen.insert(key) {
+            return Err(invalid_parameter_value(format!(
+                "The {member} key '{key}' is given more than once; tag keys must be unique"
+            )));
+        }
+        validate_tag_size(key, tag.value.as_deref().unwrap_or_default())?;
+        tags.push(IpamResourceTag {
+            key: tag.key.clone(),
+            value: tag.value.clone(),
+        });
+    }
+    Ok(tags)
+}
+
+/// What one `ModifyIpamPool` asks to be changed about a stored IPAM pool.
+///
+/// A member left `None` here is one the REQUEST did not carry, which leaves the stored value
+/// exactly as it was rather than returning it to the default a create would have given it —
+/// the same contract [`IpamModification`] has for an IPAM. The allocation resource tags are
+/// an added list and a removed key set rather than one value, because the request names the
+/// tags to add and the ones to remove instead of the set it wants to end up with.
+#[derive(Debug, Clone, Default)]
+pub struct IpamPoolModification {
+    /// "The ID of the IPAM pool you want to modify" (`ModifyIpamPoolRequest$IpamPoolId`).
+    pub ipam_pool_id: String,
+    /// "The description of the IPAM pool you want to modify"
+    /// (`ModifyIpamPoolRequest$Description`), or `None` when the request named none.
+    pub description: Option<String>,
+    /// "If true, IPAM will continuously look for resources within the CIDR range of this
+    /// pool" (`ModifyIpamPoolRequest$AutoImport`), or `None` to leave the setting as it is.
+    pub auto_import: Option<bool>,
+    /// "The minimum netmask length required for CIDR allocations in this IPAM pool to be
+    /// compliant" (`ModifyIpamPoolRequest$AllocationMinNetmaskLength`), or `None` to leave
+    /// the rule as it is.
+    pub allocation_min_netmask_length: Option<i32>,
+    /// "The maximum netmask length possible for CIDR allocations in this IPAM pool to be
+    /// compliant" (`ModifyIpamPoolRequest$AllocationMaxNetmaskLength`), likewise.
+    pub allocation_max_netmask_length: Option<i32>,
+    /// "The default netmask length for allocations added to this pool"
+    /// (`ModifyIpamPoolRequest$AllocationDefaultNetmaskLength`), likewise.
+    pub allocation_default_netmask_length: Option<i32>,
+    /// "Clear the default netmask length allocation rule for this pool"
+    /// (`ModifyIpamPoolRequest$ClearAllocationDefaultNetmaskLength`): the one member that
+    /// asks for a rule to be taken AWAY rather than set.
+    pub clear_allocation_default_netmask_length: bool,
+    /// "Add tag allocation rules to a pool" (`ModifyIpamPoolRequest$
+    /// AddAllocationResourceTags`), already validated by
+    /// [`ipam_allocation_resource_tags`].
+    pub add_allocation_resource_tags: Vec<IpamResourceTag>,
+    /// The keys of "Remove tag allocation rules from a pool" (`ModifyIpamPoolRequest$
+    /// RemoveAllocationResourceTags`): a pool's allocation resource tags are identified by
+    /// their key, so a removal names the tag by it.
+    pub remove_allocation_resource_tag_keys: Vec<String>,
+}
+
+impl IpamPoolModification {
+    /// The IPAM pool this modification leaves behind, from the one it is applied to.
+    ///
+    /// The ONE definition of what a modification DOES to a pool, so the figure a handler
+    /// checks against the pool's own documented rules and charges to the store's byte budget
+    /// is exactly the one the write stores. Every member the request did not carry is copied
+    /// across unchanged, and every member the pool's creation derived — its id, its ARN, its
+    /// owner, the scope and IPAM it lives in, its address family, its depth and its state —
+    /// is carried over untouched, since none of them follows from this request.
+    pub fn applied_to(&self, pool: &IpamPool) -> IpamPool {
+        let mut applied = pool.clone();
+        if self.description.is_some() {
+            applied.description = self.description.clone();
+        }
+        if self.auto_import.is_some() {
+            applied.auto_import = self.auto_import;
+        }
+        if self.allocation_min_netmask_length.is_some() {
+            applied.allocation_min_netmask_length = self.allocation_min_netmask_length;
+        }
+        if self.allocation_max_netmask_length.is_some() {
+            applied.allocation_max_netmask_length = self.allocation_max_netmask_length;
+        }
+        // "Clear the default netmask length allocation rule for this pool"
+        // (`ClearAllocationDefaultNetmaskLength`) leaves the pool with no default rule at
+        // all; a request carrying both members asks for two incompatible things of one rule
+        // and is refused by the handler before this is reached.
+        if self.clear_allocation_default_netmask_length {
+            applied.allocation_default_netmask_length = None;
+        } else if self.allocation_default_netmask_length.is_some() {
+            applied.allocation_default_netmask_length = self.allocation_default_netmask_length;
+        }
+        applied.allocation_resource_tags = Some(self.allocation_resource_tags_after(pool));
+        applied
+    }
+
+    /// The allocation resource tags the pool requires once this modification is applied: the
+    /// ones it requires now, less the ones to remove, with the ones to add written over them.
+    ///
+    /// The tags are a SET of required key/value pairs keyed by the tag key, so adding a key
+    /// the pool already requires REPLACES that rule's value rather than requiring the key
+    /// twice, a key the pool does not require is removed without effect, and the tags the
+    /// pool already reports keep the order they were stored in so an addition is reported
+    /// after them.
+    pub fn allocation_resource_tags_after(&self, pool: &IpamPool) -> Vec<IpamResourceTag> {
+        let removed = |tag: &IpamResourceTag| {
+            let key = tag.key.as_deref().unwrap_or_default();
+            self.remove_allocation_resource_tag_keys
+                .iter()
+                .any(|removed| removed == key)
+        };
+        let mut tags: Vec<IpamResourceTag> = pool
+            .allocation_resource_tags
+            .iter()
+            .flatten()
+            .filter(|tag| !removed(tag))
+            .cloned()
+            .collect();
+        for added in &self.add_allocation_resource_tags {
+            let key = added.key.as_deref().unwrap_or_default();
+            match tags
+                .iter_mut()
+                .find(|held| held.key.as_deref().unwrap_or_default() == key)
+            {
+                Some(held) => held.value = added.value.clone(),
+                None => tags.push(added.clone()),
+            }
+        }
+        tags
+    }
+}
+
+/// The caller-chosen bytes of a stored IPAM pool that a `ModifyIpamPool` can change: its
+/// description and the allocation resource tags it requires — exactly the share
+/// [`ComAmazonawsEc2Amazonec2State::insert_creating_ipam_pool`] charges a create for them.
+///
+/// The ONE definition of that charge, so what
+/// [`ComAmazonawsEc2Amazonec2State::modify_ipam_pool`] gives back for the record it replaces
+/// is the same number a later modification of the replacement gives back for it. The pool's
+/// own tags, its client token and the fixed per-record overhead are deliberately NOT counted:
+/// no modification changes them, so counting them would charge and refund the same figure
+/// twice.
+pub fn ipam_pool_modifiable_bytes(pool: &IpamPool) -> usize {
+    pool.description.as_deref().unwrap_or_default().len()
+        + ipam_resource_tag_list_bytes(pool.allocation_resource_tags.as_deref().unwrap_or_default())
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Apply `modification` to the IPAM pool it names and answer the pool as the store then
+    /// holds it — `None` when the account holds no such pool.
+    ///
+    /// The ONE writer of a modified pool, the counterpart of [`Self::modify_ipam`] for a pool:
+    /// what the record becomes is [`IpamPoolModification::applied_to`]'s answer, so a handler
+    /// cannot check one pool and store another, and the store's byte budget gives back what
+    /// the replaced record held ([`ipam_pool_modifiable_bytes`]) before charging what the new
+    /// one holds, so the budget tracks exactly the bytes the store keeps.
+    ///
+    /// The pool's STATE is left as it stands: a modification is not a transition, so a pool
+    /// the clock still owes its `create-complete` move keeps that move.
+    pub fn modify_ipam_pool(&mut self, modification: &IpamPoolModification) -> Option<IpamPool> {
+        let current = self.ipam_pools.get(&modification.ipam_pool_id)?.clone();
+        let applied = modification.applied_to(&current);
+        self.release_stored_bytes(ipam_pool_modifiable_bytes(&current));
+        self.add_stored_bytes(ipam_pool_modifiable_bytes(&applied));
+        self.ipam_pools
+            .insert(modification.ipam_pool_id.clone(), applied.clone());
+        Some(applied)
+    }
+}
+
 impl ComAmazonawsEc2Amazonec2State {
     /// Whether another IPAM fits inside the store's ceiling ([`MAX_IPAMS`]).
     ///
