@@ -18,7 +18,12 @@
 //!   as the bad parameter it is before it is resolved against anything;
 //! * a group holds the subnets of ONE VPC, so a request whose subnets span two is the
 //!   modelled `InvalidSubnet`, and the VPC the group reports is the one EC2
-//!   reported for the subnets it now holds.
+//!   reported for the subnets it now holds;
+//! * the modify writes the members the request names and NOTHING else, so what is not a
+//!   member of this operation's input — the group's stored name, the ARN it was minted
+//!   with, the tags it carries — is the same after every modify, and `SubnetIds` names the
+//!   subnets the group is to HAVE rather than ones to add, so one request sent twice
+//!   leaves the group exactly as the first send did.
 //!
 //! The tests are tables: the rows span which members the request names (description only,
 //! subnets only, both), how many subnets it names, which VPC they sit in, the case the
@@ -31,6 +36,7 @@
 
 use crate::cache_cluster_lifecycle::{account_subnet_ids, subnet_group_params, subnet_pairs};
 use crate::harness::{params, Emulator, Reply, REGION};
+use crate::resource_tags::{add_tags, list_tags};
 
 /// The group every row of the tables below modifies.
 const GROUP: &str = "modify-subnets";
@@ -561,4 +567,161 @@ async fn a_subnet_group_modify_is_recorded_as_an_event() {
         "expected an event recording the modify, got {messages:?} from {}",
         events.body
     );
+}
+
+/// One row of the identity table: the case, the description the request names (if any)
+/// and the subnets it names (if any). Each row is sent twice.
+type RepeatedRow = (&'static str, Option<&'static str>, Option<Vec<String>>);
+
+/// The group a modify answers with, reduced to what a client reads off it: the members
+/// the operation can write (the description, the VPC and the subnets with their zones)
+/// beside the ones it cannot (the stored name and the ARN). Sorted, because what a group
+/// HOLDS is a set and the wire order of a set is not what this suite is about.
+fn reported_group(reply: &Reply) -> Vec<String> {
+    let mut fields = vec![
+        format!("Name={:?}", reply.text("CacheSubnetGroupName")),
+        format!("ARN={:?}", reply.text("ARN")),
+        format!("Description={:?}", reply.text("CacheSubnetGroupDescription")),
+        format!("VpcId={:?}", reply.text("VpcId")),
+    ];
+    let mut subnets: Vec<String> = reply
+        .all("Subnets/Subnet/SubnetIdentifier")
+        .into_iter()
+        .map(|id| format!("Subnet={id}"))
+        .collect();
+    subnets.sort();
+    let mut zones: Vec<String> = reply
+        .all("SubnetAvailabilityZone/Name")
+        .into_iter()
+        .map(|zone| format!("Zone={zone}"))
+        .collect();
+    zones.sort();
+    fields.append(&mut subnets);
+    fields.append(&mut zones);
+    fields
+}
+
+/// The tags `arn` carries, as sorted `key=value` pairs — read through
+/// `ListTagsForResource`, the operation that owns them.
+async fn tags_of(emulator: &Emulator, case: &str, arn: &str) -> Vec<String> {
+    let listed = list_tags(emulator, arn).await;
+    assert_eq!(
+        listed.status, 200,
+        "case {case:?}: the tag read must answer 200, got {} {}",
+        listed.status, listed.body
+    );
+    let mut pairs: Vec<String> = listed
+        .all("Key")
+        .into_iter()
+        .zip(listed.all("Value"))
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+/// The modify writes the members the request names and NOTHING else: the stored name, the
+/// ARN and the tags are not members of this operation's input, so each is the same after
+/// every modify; and `SubnetIds` names the subnets the group is to HAVE, so sending one
+/// request twice leaves the group exactly as the first send did.
+///
+/// The rows span which members a request names (description alone, subnets alone, both)
+/// and which network the subnets come from (the account's defaults, a VPC of the client's
+/// own), with each request repeated so the second send is checked against the first.
+#[tokio::test]
+async fn a_modify_touches_no_member_the_request_does_not_name() {
+    let emulator = Emulator::new();
+    let defaults = account_subnet_ids(&emulator).await;
+    let client = client_network(&emulator, "10.23", &["us-east-1a", "us-east-1b"]).await;
+    const KEPT: &str = "kept-identity";
+    create_group(&emulator, "the group under test", KEPT, &defaults[..2]).await;
+
+    let created = describe_group(&emulator, KEPT).await;
+    let arn = created
+        .text("ARN")
+        .unwrap_or_else(|| panic!("the create must mint an ARN for the group, got {}", created.body))
+        .to_string();
+    let added = add_tags(
+        &emulator,
+        &arn,
+        &[("owner", Some("the-modify-suite")), ("tier", Some("test"))],
+    )
+    .await;
+    assert_eq!(
+        added.status, 200,
+        "the tags the group carries must be stored, got {} {}",
+        added.status, added.body
+    );
+    let tags_before = tags_of(&emulator, "the group under test", &arn).await;
+
+    // Each row: the case, the description the request names (if any) and the subnets it
+    // names (if any). Every row is sent TWICE.
+    let rows: Vec<RepeatedRow> = vec![
+        ("the description alone", Some("renamed, same subnets"), None),
+        ("subnets alone, one of the account's own", None, Some(defaults[..1].to_vec())),
+        (
+            "both members, into a VPC of the client's own",
+            Some("moved into the client's VPC"),
+            Some(client.clone()),
+        ),
+        (
+            "both members, back onto the account's defaults",
+            Some("moved back"),
+            Some(defaults[..2].to_vec()),
+        ),
+    ];
+
+    for (case, description, subnets) in rows {
+        let first = modify_group(&emulator, KEPT, description, subnets.as_deref()).await;
+        assert_eq!(
+            first.status, 200,
+            "case {case:?}: the modify must answer 200, got {} {}",
+            first.status, first.body
+        );
+        let after_first = describe_group(&emulator, KEPT).await;
+
+        // The same request again: the member names the subnets the group is to HAVE, so
+        // the group does not grow and nothing else about it moves either.
+        let again = modify_group(&emulator, KEPT, description, subnets.as_deref()).await;
+        assert_eq!(
+            again.status, 200,
+            "case {case:?}: the same modify again must answer 200, got {} {}",
+            again.status, again.body
+        );
+        let after_again = describe_group(&emulator, KEPT).await;
+        assert_eq!(
+            reported_group(&after_again),
+            reported_group(&after_first),
+            "case {case:?}: the same modify sent twice must leave the same group, expected \
+             {:?}, got {:?}",
+            reported_group(&after_first),
+            reported_group(&after_again)
+        );
+
+        // What this operation cannot write is what it did not write.
+        for (where_from, reply) in [
+            ("the modify's answer", &again),
+            ("a later read", &after_again),
+        ] {
+            assert_eq!(
+                reply.text("CacheSubnetGroupName"),
+                Some(KEPT),
+                "case {case:?} ({where_from}): expected the stored name {KEPT:?}, got {:?}",
+                reply.text("CacheSubnetGroupName")
+            );
+            assert_eq!(
+                reply.text("ARN"),
+                Some(arn.as_str()),
+                "case {case:?} ({where_from}): expected the ARN the group was minted with \
+                 ({arn}), got {:?}",
+                reply.text("ARN")
+            );
+        }
+        let tags_now = tags_of(&emulator, case, &arn).await;
+        assert_eq!(
+            tags_now, tags_before,
+            "case {case:?}: expected the tags the group carries to survive the modify \
+             ({tags_before:?}), got {tags_now:?}"
+        );
+    }
 }
