@@ -25,6 +25,12 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+// The three tags CloudFormation records on every resource it provisions, which a client's own
+// read of the resource reports beside the declaration's own tags: read from the provisioning
+// module that SETS them, so the two readings cannot drift.
+use service_com_amazonaws_cloudformation_cloudformation::state::provisioning::{
+    LOGICAL_ID_TAG, STACK_ID_TAG, STACK_NAME_TAG,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request here is signed for, and so the Region the stack's secret and its
@@ -219,8 +225,8 @@ struct Row {
 const SECRET_LOGICAL_ID: &str = "AppSecret";
 
 /// The stack-level tags every row's stack is created with: one of a client's own, which the
-/// secret must carry, beside the three `aws:cloudformation:*` tags CloudFormation adds
-/// itself, which Secrets Manager refuses from a caller and which therefore reach no secret.
+/// secret must carry beside the three `aws:cloudformation:*` tags CloudFormation records
+/// itself ([`STACK_NAME_TAG`], [`STACK_ID_TAG`], [`LOGICAL_ID_TAG`]).
 const STACK_TAGS: &[(&str, &str)] = &[("Owner", "platform")];
 
 const ROWS: &[Row] = &[
@@ -365,7 +371,7 @@ async fn a_stack_provisions_the_secret_its_template_declares() {
         let case = row.case;
         let stack_name = format!("secretstack{index}");
         let template = template_for(row, &stack_name);
-        create_stack(&router, case, &stack_name, &template, STACK_TAGS).await;
+        let stack_id = create_stack(&router, case, &stack_name, &template, STACK_TAGS).await;
 
         let (status, body) = wait_for_stack_status(&router, &stack_name, "CREATE_COMPLETE").await;
         assert_eq!(
@@ -477,8 +483,9 @@ async fn a_stack_provisions_the_secret_its_template_declares() {
         }
 
         // What the service RECORDS about the secret is what the declaration stated, with the
-        // stack's own tags on it and none of CloudFormation's reserved ones (Secrets Manager
-        // refuses a caller's `aws:` key, so no deployment may send one).
+        // stack's own tags on it and the three records CloudFormation keeps about every
+        // resource it provisions: those are AWS's own tags, which the provisioning path sets
+        // from inside the emulator, so a client's `DescribeSecret` reports them too.
         let (status, described) = secretsmanager(
             &router,
             "DescribeSecret",
@@ -504,9 +511,17 @@ async fn a_stack_provisions_the_secret_its_template_declares() {
         for (key, value) in STACK_TAGS {
             expected_tags.insert((*key).to_string(), (*value).to_string());
         }
+        for (key, value) in [
+            (STACK_NAME_TAG, stack_name.as_str()),
+            (STACK_ID_TAG, stack_id.as_str()),
+            (LOGICAL_ID_TAG, SECRET_LOGICAL_ID),
+        ] {
+            expected_tags.insert(key.to_string(), value.to_string());
+        }
         assert_eq!(
             carried, expected_tags,
-            "case {case:?}: expected the declared and stack tags alone, got {carried:?}"
+            "case {case:?}: expected the declared and stack tags beside CloudFormation's own \
+             three, got {carried:?}"
         );
     }
 }

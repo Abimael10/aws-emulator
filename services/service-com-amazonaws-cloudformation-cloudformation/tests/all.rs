@@ -487,6 +487,8 @@ mod scratch_probe;
 mod search_indexing_pipeline_outputs;
 #[path = "all/section_loop_expansion.rs"]
 mod section_loop_expansion;
+#[path = "all/secretsmanager_secret_stack_provenance.rs"]
+mod secretsmanager_secret_stack_provenance;
 #[path = "all/service_role_permissions.rs"]
 mod service_role_permissions;
 #[path = "all/signalling_instance_gates.rs"]

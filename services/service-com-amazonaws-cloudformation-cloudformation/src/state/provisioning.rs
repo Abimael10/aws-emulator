@@ -364,6 +364,32 @@ pub(super) fn applicable_tags(propagated: &[(String, String)]) -> Vec<(String, S
         .collect()
 }
 
+/// The tags a declared resource's owning service will STORE, for a service that admits the
+/// reserved namespace on the in-process path this module calls it over: the ones the
+/// declaration asks for and the ones CloudFormation propagates
+/// ([`super::provisioner::tags_of`]), less every key in that namespace which is not
+/// CloudFormation's own.
+///
+/// The three records CloudFormation keeps about a resource it provisioned
+/// ([`is_stack_provenance_tag`]) TRAVEL, so the owning service's own read of the handle a
+/// stack publishes reports them; every OTHER reserved key is a caller's to have supplied and
+/// is dropped here rather than sent to a call that would refuse the resource outright,
+/// because a deployment must not fail over tags a template merely spelled.
+///
+/// The ONE reading of that split for the per-type providers beside this algorithm, so a later
+/// change to it cannot be applied to some of them and not the rest. A provider whose owning
+/// service refuses the namespace to EVERY caller drops all of it instead
+/// ([`applicable_tags`], and [`dynamodb_table`]'s own reading of the same rule).
+pub(super) fn storable_tags(
+    properties: &Value,
+    propagated: &[(String, String)],
+) -> Vec<(String, String)> {
+    crate::state::provisioner::tags_of(properties, propagated)
+        .into_iter()
+        .filter(|(key, _)| is_stack_provenance_tag(key) || !is_reserved_tag_key(key))
+        .collect()
+}
+
 /// One tag set as the `[{Key, Value}]` LIST most AWS models spell a `Tag` with — Amazon
 /// DynamoDB's `CreateTable$Tags` and AWS Secrets Manager's `CreateSecret$Tags` among them.
 ///

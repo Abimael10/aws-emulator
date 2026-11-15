@@ -69,6 +69,11 @@ pub use policy_rendering::*;
 /// request of that service is told apart from a caller's.
 pub mod service_owned;
 
+/// Which PATH a tag write arrived on, which is what decides whether a key in the namespace
+/// AWS reserves for its own tags may be stored.
+pub mod tag_key_origin;
+pub use tag_key_origin::*;
+
 /// The staging label on the current value of a secret.
 pub const STAGE_CURRENT: &str = "AWSCURRENT";
 

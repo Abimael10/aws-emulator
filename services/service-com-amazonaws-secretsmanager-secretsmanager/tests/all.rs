@@ -89,6 +89,8 @@ mod secret_rotation_span;
 mod secret_rotation_staging_ladder;
 #[path = "all/secret_service_owned_writes.rs"]
 mod secret_service_owned_writes;
+#[path = "all/secret_service_set_tag_keys.rs"]
+mod secret_service_set_tag_keys;
 #[path = "all/secret_stop_replication_refusal.rs"]
 mod secret_stop_replication_refusal;
 #[path = "all/secret_tags_and_replication.rs"]

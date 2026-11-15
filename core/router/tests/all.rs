@@ -7285,3 +7285,13 @@ mod events_lambda_target_permission_granted_after_the_rule;
 //! WHAT a suite covers, and why it belongs to this cross-service target rather than to one
 //! the test it explains. This file is the declaration list and nothing else: the notes
 //! landings once appended to its tail live in `all/appended_notes.rs`.
+//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of this
+//! file, which the layout check refuses: the `#[path]` is what points each module into
+//! `tests/all/`. What a suite covers, and why it belongs to this cross-service target rather
+//! than to one service crate's own, is stated in that suite's own module doc, where it is
+//! read beside the test it describes.
+//! An inner doc comment is legal only BEFORE the first item, so THIS block is the only one
+//! of them this file may carry: every other comment in it, wherever it stands, is an
+//! ordinary `//` comment. `all/all_rs_declares_each_suite_once.rs` and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check that and the
+//! declare-once rule, for this file and for every service crate's `tests/all.rs`.

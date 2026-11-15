@@ -295,17 +295,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // The tags the OWNING service applies to a secret it manages live in exactly that
-        // namespace, under its own service id, so a create of that service's own may write
-        // them — and nothing else may.
-        if let Some(reserved) = tags
-            .iter()
-            .filter_map(|tag| tag.key.as_deref())
-            .find(|key| {
-                key.starts_with(crate::state::RESERVED_TAG_PREFIX)
-                    && owner.as_ref().is_none_or(|owner| !owner.may_tag(key))
-            })
-        {
+        // The reserved namespace is a rule about a CALLER's request: the tags AWS applies
+        // from inside itself live in it and have no public call to be written through, so a
+        // create that arrived on the in-process path another emulated service reaches this
+        // one over may carry them ([`crate::state::tag_key_origin`]) — which is how a secret
+        // a CloudFormation stack provisions carries that service's provenance records. The
+        // tags the OWNING service applies to a secret it manages live in the same namespace
+        // under its own service id, so a create of that service's own may write them too.
+        if let Some(reserved) = crate::state::reserved_key_refused(
+            tags.iter()
+                .filter_map(|tag| tag.key.as_deref())
+                .filter(|key| owner.as_ref().is_none_or(|owner| !owner.may_tag(key))),
+            crate::state::tag_key_origin(ctx),
+        ) {
             return Err(CreateSecretErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(crate::state::system_tag_message(reserved)),

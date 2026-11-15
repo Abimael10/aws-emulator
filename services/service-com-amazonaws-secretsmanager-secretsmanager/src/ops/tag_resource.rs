@@ -212,14 +212,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // AWS reserves the `aws:` prefix for its own tags; a caller may neither
-        // create nor modify one.
-        if let Some(reserved) = input
-            .tags
-            .iter()
-            .filter_map(|tag| tag.key.as_deref())
-            .find(|key| key.starts_with(crate::state::RESERVED_TAG_PREFIX))
-        {
+        // AWS reserves the `aws:` prefix for its own tags; a CALLER may neither create nor
+        // modify one. The tags AWS applies from inside itself have no public call to be
+        // written through, so an attach that arrived on the in-process path another emulated
+        // service reaches this one over carries them ([`crate::state::tag_key_origin`]).
+        if let Some(reserved) = crate::state::reserved_key_refused(
+            input.tags.iter().filter_map(|tag| tag.key.as_deref()),
+            crate::state::tag_key_origin(ctx),
+        ) {
             return Err(TagResourceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(crate::state::system_tag_message(reserved)),

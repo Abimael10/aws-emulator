@@ -57,10 +57,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use super::{
-    applicable_tags, call_secretsmanager, key_value_tag_list, Created, Readiness, Refusal, Removal,
-};
-use crate::state::provisioner::tags_of;
+use super::{call_secretsmanager, key_value_tag_list, storable_tags, Created, Readiness, Refusal, Removal};
 use crate::state::StoredResource;
 
 /// The resource type this module provisions.
@@ -197,10 +194,12 @@ pub(super) async fn create(
         request.insert(ADD_REPLICA_REGIONS.to_string(), replicas.clone());
     }
     // The secret carries the tags its declaration asks for plus the ones CloudFormation
-    // gives the resource, as `CreateSecret`'s own `Tags` list — less the keys in AWS's
-    // reserved namespace, which this service refuses on a caller's request ("the `aws:`
-    // prefix ... is reserved for AWS use") and which no public call of it writes.
-    let tags = applicable_tags(&tags_of(&resource.properties, propagated));
+    // gives the resource, as `CreateSecret`'s own `Tags` list: the three records
+    // CloudFormation keeps about the resource travel, because this service admits AWS's own
+    // tag namespace on the in-process path this provider calls it over, and every OTHER
+    // reserved key is left off ([`super::storable_tags`]). Those three are the
+    // secret-to-stack reverse lookup a client holding only a secret id reads.
+    let tags = storable_tags(&resource.properties, propagated);
     if !tags.is_empty() {
         request.insert("Tags".to_string(), key_value_tag_list(&tags));
     }
@@ -813,11 +812,12 @@ mod tests {
         );
     }
 
-    /// RULE: the tag list carries the declaration's own tags and the ones CloudFormation
-    /// propagates, under the member names the modelled `Tag` spells — and never a key in the
-    /// reserved namespace, which this service refuses on a caller's request.
+    /// RULE: the tag list carries the declaration's own tags, the ones CloudFormation
+    /// propagates and the three records CloudFormation keeps of its own — under the member
+    /// names the modelled `Tag` spells — and never ANOTHER key in the reserved namespace,
+    /// which that service refuses on a caller's request.
     #[test]
-    fn the_tag_list_leaves_the_reserved_namespace_alone() {
+    fn the_tag_list_carries_the_stack_records_and_no_other_reserved_key() {
         let properties = serde_json::json!({"Tags": [{"Key": "Owner", "Value": "platform"}]});
         let propagated = vec![
             ("Stack".to_string(), "secrets-suite".to_string()),
@@ -825,17 +825,19 @@ mod tests {
                 "aws:cloudformation:logical-id".to_string(),
                 "Secret".to_string(),
             ),
+            ("aws:servicecatalog:provisioningPrincipalArn".to_string(), "not-ours".to_string()),
         ];
-        let tags = applicable_tags(&tags_of(&properties, &propagated));
+        let tags = storable_tags(&properties, &propagated);
         let rendered = key_value_tag_list(&tags);
         assert_eq!(
             rendered,
             serde_json::json!([
                 {"Key": "Owner", "Value": "platform"},
-                {"Key": "Stack", "Value": "secrets-suite"}
+                {"Key": "Stack", "Value": "secrets-suite"},
+                {"Key": "aws:cloudformation:logical-id", "Value": "Secret"}
             ]),
             "case \"a declaration beside the propagated tags\": expected the declared and \
-             stack keys alone, got {rendered}"
+             stack keys plus CloudFormation's own record, got {rendered}"
         );
     }
 }

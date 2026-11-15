@@ -32,8 +32,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 
-use super::{call_rest_json, percent_encoded, Created, Readiness, Refusal, Removal};
-use crate::state::provisioner::tags_of;
+use super::{call_rest_json, percent_encoded, storable_tags, Created, Readiness, Refusal, Removal};
 use crate::state::StoredResource;
 
 /// The resource type this module provisions.
@@ -74,11 +73,6 @@ const KMS_KEY_MEMBER: &str = "KMSKeyArn";
 
 /// The property whose declared pairs become the call's `Tags` map.
 const TAGS_PROPERTY: &str = "Tags";
-
-/// The tag-key namespace Lambda reserves, compared in lower case: a tag write carrying one is
-/// refused outright, whoever makes it — so the three records CloudFormation keeps about a
-/// resource it provisioned stay in CloudFormation's own records.
-const RESERVED_TAG_PREFIX: &str = "aws:";
 
 /// How long [`await_settled`] waits between asking Lambda whether the mapping has left the
 /// transitional state a further call on it is refused in, and how many times it asks.
@@ -473,20 +467,6 @@ fn function_of(properties: &Value) -> Result<String, Refusal> {
             ),
         }),
     }
-}
-
-/// The tags of a declared mapping that Lambda will STORE: the ones the declaration asks for
-/// and the ones CloudFormation propagates ([`tags_of`]), less every key in the namespace
-/// Lambda reserves that is not CloudFormation's own — the same rule a function's tags are
-/// held to ([`super::lambda_function`]), because it is the same service's tag-writing rule.
-fn storable_tags(properties: &Value, propagated: &[(String, String)]) -> Vec<(String, String)> {
-    tags_of(properties, propagated)
-        .into_iter()
-        .filter(|(key, _)| {
-            super::is_stack_provenance_tag(key)
-                || !key.to_ascii_lowercase().starts_with(RESERVED_TAG_PREFIX)
-        })
-        .collect()
 }
 
 /// The URI that addresses ONE mapping: the `@httpLabel` every mapping operation binds the id
