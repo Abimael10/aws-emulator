@@ -21,7 +21,9 @@
 //! handlers — through one shared check, so the two operations cannot drift apart on
 //! the range while each refusal keeps looking right in isolation. Each row therefore
 //! drives the SAME value through both operations and asserts both answers, including
-//! the message each reports.
+//! the message each reports — ONE sentence, which names the member and the rejected
+//! value and no bound, so the two operations state a refused value alike even where
+//! what they admit differs.
 //!
 //! The table spans the dimension the rule generalises over — the magnitude of the
 //! value — at each published bound, one step inside and one step past each, the
@@ -69,20 +71,12 @@ fn inside_the_range(minutes: i64) -> bool {
     (MIN_STEP_TIMEOUT_MINUTES..=MAX_STEP_TIMEOUT_MINUTES).contains(&minutes)
 }
 
-/// The refusal `StartNextPendingJobExecution` reports, whose member documents the
-/// range alone.
-fn range_refusal(minutes: i64) -> String {
-    format!(
-        "stepTimeoutInMinutes must be between {MIN_STEP_TIMEOUT_MINUTES} and {MAX_STEP_TIMEOUT_MINUTES}, got {minutes}"
-    )
-}
-
-/// The refusal `UpdateJobExecution` reports, whose member documents the range plus
-/// the cancelling value.
-fn range_or_cancel_refusal(minutes: i64) -> String {
-    format!(
-        "stepTimeoutInMinutes must be between {MIN_STEP_TIMEOUT_MINUTES} and {MAX_STEP_TIMEOUT_MINUTES}, or {CANCEL_STEP_TIMER_MINUTES} to cancel the step timer, got {minutes}"
-    )
+/// The refusal BOTH operations report for a value their member does not admit, stated
+/// independently of the code under test: a fixed instruction to supply a valid one, the
+/// member's name, and the rejected value, closed by a period. The sentence names no
+/// bound, so it is the same whichever member refused the value.
+fn timeout_refusal(minutes: i64) -> String {
+    format!("Provide valid timeout value, stepTimeoutInMinutes cannot be {minutes}.")
 }
 
 /// The seconds a response says are left before the execution times out, or `None`
@@ -138,7 +132,7 @@ async fn the_step_timeout_range_is_the_same_through_both_operations_that_accept_
             );
             assert_eq!(
                 error_message(&started),
-                range_refusal(minutes),
+                timeout_refusal(minutes),
                 "case {case:?} (stepTimeoutInMinutes={minutes}): unexpected refusal message from $next, got {started}"
             );
             // The refused start wrote nothing: the execution is still queued at the
@@ -176,7 +170,7 @@ async fn the_step_timeout_range_is_the_same_through_both_operations_that_accept_
             );
             assert_eq!(
                 error_message(&updated),
-                range_or_cancel_refusal(minutes),
+                timeout_refusal(minutes),
                 "case {case:?} (stepTimeoutInMinutes={minutes}): unexpected refusal message from the update, got {updated}"
             );
             continue;

@@ -57,3 +57,5 @@ mod step_timeout_bound_is_shared;
 mod support;
 #[path = "all/update_after_a_passed_deadline.rs"]
 mod update_after_a_passed_deadline;
+#[path = "all/validation_refusal_wire_form.rs"]
+mod validation_refusal_wire_form;

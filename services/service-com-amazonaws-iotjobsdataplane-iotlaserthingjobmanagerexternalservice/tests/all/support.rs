@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_common::error_type_locator::ERROR_TYPE_HEADER;
 use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::state::{
     command_registry, iot_commands::CommandFacts, service_state, JobExecutionRecord,
 };
@@ -88,6 +89,19 @@ impl Emulator {
     }
 
     async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+        let answered = self.answer(method, path, body).await;
+        (answered.status, answered.body)
+    }
+
+    /// One call answered as the wire carried it: the status, the body, AND the header a
+    /// restJson1 client resolves a failure's error shape from — for a suite that asserts
+    /// on how a refusal is NAMED as well as on how it is worded.
+    pub(crate) async fn answer(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Answered {
         let payload = body.map_or_else(Bytes::new, |body| Bytes::from(body.to_string()));
         let request = http::Request::builder()
             .method(method)
@@ -98,12 +112,21 @@ impl Emulator {
             .expect("build the request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
-        let parsed = if response.body().is_empty() {
+        let error_type = response
+            .headers()
+            .get(ERROR_TYPE_HEADER)
+            .and_then(|named| named.to_str().ok())
+            .map(str::to_string);
+        let body = if response.body().is_empty() {
             Value::Null
         } else {
             serde_json::from_slice(response.body()).unwrap_or(Value::Null)
         };
-        (status, parsed)
+        Answered {
+            status,
+            error_type,
+            body,
+        }
     }
 
     /// Start a command execution on `thing`, optionally with the
@@ -219,6 +242,15 @@ impl Emulator {
             })
             .unwrap_or_else(|| panic!("{thing} must hold the execution {job_id}"))
     }
+}
+
+/// One answer off the wire as a refusal suite asserts on it: the status, the error shape
+/// the `x-amzn-errortype` header names (absent on a success), and the body.
+#[derive(Debug, Clone)]
+pub(crate) struct Answered {
+    pub(crate) status: u16,
+    pub(crate) error_type: Option<String>,
+    pub(crate) body: Value,
 }
 
 /// A stored execution as these suites assert on it.

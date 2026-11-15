@@ -173,8 +173,11 @@ pub fn check_status_details(details: Option<&HashMap<String, String>>) -> Result
 /// `cancel_accepted`: only `UpdateJobExecution$stepTimeoutInMinutes` documents it ("A
 /// value of -1 is also valid and will cancel the current step timer"), so a start that
 /// arms a timer for the first time has no timer to cancel and the value is outside its
-/// member's documented range like any other. The message names exactly what the caller's
-/// own member admits, so each operation's refusal reads as its own.
+/// member's documented range like any other.
+///
+/// The refusal is worded by [`step_timeout_refusal`], which states the member and the
+/// value the request carried and nothing about the bound, so WHICH values the caller's
+/// own member admits does not change how the refusal reads.
 ///
 /// The model declares no `range` constraint on `StepTimeoutInMinutes`, so the framework's
 /// constraint walk reports nothing about the value and the bound is the handler's to
@@ -191,15 +194,27 @@ pub fn check_step_timeout_minutes(
     {
         return Ok(());
     }
-    if cancel_accepted {
-        return Err(format!(
-            "stepTimeoutInMinutes must be between {MIN_STEP_TIMEOUT_MINUTES} and {MAX_STEP_TIMEOUT_MINUTES}, or {CANCEL_STEP_TIMER_MINUTES} to cancel the step timer, got {minutes}"
-        ));
-    }
-    Err(format!(
-        "stepTimeoutInMinutes must be between {MIN_STEP_TIMEOUT_MINUTES} and {MAX_STEP_TIMEOUT_MINUTES}, got {minutes}"
-    ))
+    Err(step_timeout_refusal(minutes))
 }
+
+/// How this plane words a `stepTimeoutInMinutes` it will not accept: a fixed instruction
+/// to supply a valid one, the member's own name, and the value the request carried,
+/// closed by a period.
+///
+/// The sentence states no bound. The rejected value is the only part of it that comes
+/// from the request, so one wording covers every value outside what a member admits —
+/// below the range, past it, and the cancelling value on the operation whose member does
+/// not document it — and neither operation's refusal names a limit the other does not
+/// share.
+#[must_use]
+pub fn step_timeout_refusal(minutes: i64) -> String {
+    format!("Provide valid timeout value, {STEP_TIMEOUT_MEMBER} cannot be {minutes}.")
+}
+
+/// The member a step-timeout refusal names, as the model spells it on the wire
+/// (`UpdateJobExecution$stepTimeoutInMinutes`,
+/// `StartNextPendingJobExecution$stepTimeoutInMinutes`).
+const STEP_TIMEOUT_MEMBER: &str = "stepTimeoutInMinutes";
 
 /// The `versionNumber` a freshly created execution carries: "Job execution versions
 /// are incremented each time they are updated by a device"

@@ -239,7 +239,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `StartNextPendingJobExecution` applies, checked by the one shared
         // [`crate::state::check_step_timeout_minutes`]. This member additionally
         // documents -1 ("will cancel the current step timer"), which is what the
-        // `true` says, and the refusal it answers with names it.
+        // `true` says; the refusal it answers with states the member and the
+        // rejected value and no bound, so it reads the same from either operation.
         if let Err(reason) =
             crate::state::check_step_timeout_minutes(input.step_timeout_in_minutes, true)
         {

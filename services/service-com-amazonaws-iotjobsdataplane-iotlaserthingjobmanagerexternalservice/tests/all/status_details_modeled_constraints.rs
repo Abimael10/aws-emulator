@@ -13,13 +13,14 @@
 //! outside them is refused 400 and changes nothing; an admitted map is persisted and
 //! read back.
 //!
-//! Which 400 a row gets is a consequence of WHERE the rule can be applied, and the
-//! rows state it: the constraint walk the framework runs ahead of every handler
-//! treats a map's key as a path segment rather than as a constrained leaf, so it
-//! reports a bad VALUE in its own `ValidationException` envelope, while a bad NAME
-//! reaches the handler and is refused with the operation's modelled
-//! `InvalidRequestException` — as is the published ceiling on a value, which no
-//! declared constraint carries.
+//! Which LAYER applies a row's half of the rule is a consequence of WHERE the rule
+//! can be applied, and the rows state it: the constraint walk the framework runs
+//! ahead of every handler treats a map's key as a path segment rather than as a
+//! constrained leaf, so it reports a bad VALUE in its own counted envelope, while a
+//! bad NAME reaches the handler and is refused with the handler's own sentence — as
+//! is the published ceiling on a value, which no declared constraint carries. Both
+//! layers answer under the ONE client-input error this operation declares
+//! (`InvalidRequestException`), so a client sees one shape either way.
 //!
 //! The table spans both sides of a pair and, on each side, the dimensions the rule
 //! generalises over: length (the one-character minimum, the declared maximum, one
@@ -39,10 +40,11 @@ use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservic
 
 use crate::support::{error_code, Emulator};
 
-/// The operation's own modelled client error, which a handler refusal carries.
+/// The client-input error this plane answers a refused request with, whichever layer
+/// refused it: the operation's own `InvalidRequestException`, which the boundary's refusals
+/// are named under too (see `src/service/error_type_locator.rs`). WHICH layer applies a
+/// row's half of the rule is recorded by the section comments in [`rows`].
 const MODELED_REFUSAL: &str = "InvalidRequestException";
-/// The envelope the framework's pre-handler constraint walk refuses in.
-const WALKED_REFUSAL: &str = "ValidationException";
 
 /// One row: the `statusDetails` map a request carries, and either the wire error code
 /// the pair is refused with or `None` for a pair the details admit.
@@ -144,16 +146,16 @@ fn rows() -> Vec<Row> {
         ),
         // The value side, refused: the value shape's own declared length and
         // pattern, which the framework's walk reports.
-        Row::refused("an empty value", pair("step", ""), WALKED_REFUSAL),
+        Row::refused("an empty value", pair("step", ""), MODELED_REFUSAL),
         Row::refused(
             "a value carrying a control character",
             pair("step", "down\nload"),
-            WALKED_REFUSAL,
+            MODELED_REFUSAL,
         ),
         Row::refused(
             "a value carrying a zero-width space, a format character of the same excluded category",
             pair("step", "down\u{200b}load"),
-            WALKED_REFUSAL,
+            MODELED_REFUSAL,
         ),
         // The published ceiling on a value carries no declared constraint, so it is
         // the handler that holds it.

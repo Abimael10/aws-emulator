@@ -21,11 +21,14 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. EDITED HERE: the operation the generated routing table names is served
+//!   through the fleet's refusal-restating wrapper, so a boundary refusal is named under the
+//!   client-input error shape that operation DECLARES ([`refusal_shape`],
+//!   [`error_type_locator`]).
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. EDITED HERE: a refusal of a value outside an enumerated
+//!   type lists that type's admissible values in the order this plane lists them
+//!   ([`enum_value_sets`]); every other refusal keeps the framework's wording.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -40,9 +43,11 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+mod enum_value_sets;
+mod error_type_locator;
+mod refusal_shape;
+
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
 /// The `com-amazonaws-iotjobsdataplane-iotlaserthingjobmanagerexternalservice` emulated service: the generated [`ServiceDefinition`] plus
@@ -87,26 +92,32 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: the generated routing table resolves the operation and serves it,
+        // through the fleet's wrapper, which puts the served operation in scope for the run so
+        // a boundary refusal is named under the error shape THAT operation declares (see
+        // [`refusal_shape`]). A request the table cannot serve is declined here exactly as the
+        // table declines it, so the router's routing-error path is unchanged.
+        ::service_common::restated_refusal::routes(self.definition(), req)
+            .then_some(&refusal_shape::SERVED_OPERATION_LAYER as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // The ONE thing this plane states differently HERE is the ORDER an enumerated type's
+        // admissible values are listed in ([`enum_value_sets`]), which is a property of the
+        // values themselves rather than of the model's declaration. The counted envelope,
+        // the member paths, the value each clause echoes and every other requirement stay
+        // the framework's, and a refusal carrying no enum clause — an absent required
+        // member, a length or pattern bound, an unauthenticated caller — is declined whole
+        // so the framework words it.
+        //
+        // The error SHAPE such a refusal is named under is not decided here: this seam is
+        // handed the violations alone, so the shape the operation being served declares is
+        // restated on the way out, in [`refusal_shape`].
+        enum_value_sets::stated_refusal(refusal)
     }
 
     fn override_routing_error(
