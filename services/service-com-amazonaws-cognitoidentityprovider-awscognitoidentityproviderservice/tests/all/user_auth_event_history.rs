@@ -26,7 +26,9 @@
 //!   Amazon Cognito minted for that event;
 //! * a pool whose add-ons are off runs no threat protection and logs no history, so
 //!   every one of the three operations is refused on it, as is one naming a pool, a
-//!   user or an event that does not exist.
+//!   user or an event that does not exist — the feedback operations answering on the
+//!   credential or the session the request presented rather than on the user's
+//!   existence, which [`super::auth_event_feedback_refusal_masking`] states in full.
 //!
 //! Every pool, app client, user, token and event here is real: they come from
 //! `CreateUserPool`, `CreateUserPoolClient`, `AdminCreateUser`,
@@ -96,6 +98,8 @@ const USER_POOL_ADD_ONS_NOT_ENABLED_MESSAGE: &str = "This is an add on feature. 
      AdvancedSecurityMode for your user pool to access this API.";
 const FEEDBACK_TOKEN_INVALID_MESSAGE: &str = "Invalid session provided";
 const USER_NOT_FOUND_MESSAGE: &str = "User does not exist.";
+const INCORRECT_CREDENTIALS_MESSAGE: &str = "Incorrect username or password.";
+const EVENT_ID_INVALID_MESSAGE: &str = "EventId is invalid";
 const PAGINATION_TOKEN_INVALID_MESSAGE: &str = "Invalid pagination token given.";
 
 /// `QueryLimitType`'s modelled maximum, which is the page a request that asks for no
@@ -986,7 +990,9 @@ async fn feedback_is_recorded_on_the_event_it_names() {
 
 /// RULE: a pool that runs no threat protection logs no history, so each of the three
 /// operations is refused on it; so is one naming a pool, a user or an event that does
-/// not exist.
+/// not exist — the READER of the history by what the lookup did not find, and the two
+/// feedback submissions by the credential or the session the request presented for the
+/// user it named.
 ///
 /// The rows span the resource that is missing and the operation it is missing for,
 /// including the add-on modes threat protection is on and off under
@@ -1057,13 +1063,16 @@ async fn the_history_operations_are_refused_where_there_is_none() {
         .expect("a logged event carries an id")
         .to_string();
 
-    let rows: &[(&str, &str, &str, &str, &str)] = &[
+    // (case, operation, pool, username, the error class, the sentence it carries —
+    // empty where the sentence names the pool the row made up)
+    let rows: &[(&str, &str, &str, &str, &str, &str)] = &[
         (
             "a pool nothing created",
             "AdminListUserAuthEvents",
             ABSENT_USER_POOL_ID,
             USERNAME,
             "ResourceNotFoundException",
+            "",
         ),
         (
             "a user the pool does not hold",
@@ -1071,6 +1080,7 @@ async fn the_history_operations_are_refused_where_there_is_none() {
             "",
             ABSENT_USERNAME,
             "UserNotFoundException",
+            USER_NOT_FOUND_MESSAGE,
         ),
         (
             "feedback for a pool nothing created",
@@ -1078,24 +1088,27 @@ async fn the_history_operations_are_refused_where_there_is_none() {
             ABSENT_USER_POOL_ID,
             USERNAME,
             "ResourceNotFoundException",
+            "",
         ),
         (
             "feedback for a user the pool does not hold",
             "AdminUpdateAuthEventFeedback",
             "",
             ABSENT_USERNAME,
-            "UserNotFoundException",
+            "NotAuthorizedException",
+            INCORRECT_CREDENTIALS_MESSAGE,
         ),
         (
             "the user's own feedback for a user the pool does not hold",
             "UpdateAuthEventFeedback",
             "",
             ABSENT_USERNAME,
-            "UserNotFoundException",
+            "NotAuthorizedException",
+            FEEDBACK_TOKEN_INVALID_MESSAGE,
         ),
     ];
 
-    for (case, operation, user_pool_id, username, expected) in rows {
+    for (case, operation, user_pool_id, username, expected, sentence) in rows {
         let user_pool_id = if user_pool_id.is_empty() {
             fixture.user_pool_id.as_str()
         } else {
@@ -1114,18 +1127,32 @@ async fn the_history_operations_are_refused_where_there_is_none() {
             *expected,
             "case {case:?}: expected {expected}, got {payload}"
         );
-        if *expected == "UserNotFoundException" {
+        if !sentence.is_empty() {
             assert_eq!(
                 error_message(&payload),
-                USER_NOT_FOUND_MESSAGE,
-                "case {case:?}: expected the user refusal sentence, got {payload}"
+                *sentence,
+                "case {case:?}: expected {sentence:?}, got {payload}"
             );
         }
     }
 
-    // An event id that names no event of this user's history: the resource the
-    // feedback would be left on does not exist.
-    for operation in ["AdminUpdateAuthEventFeedback", "UpdateAuthEventFeedback"] {
+    // An event id that names no event of this user's history: the administrative
+    // submission reports it as the invalid parameter value it is — the id is resolved
+    // inside the user's own history rather than addressed as a resource — while the
+    // user's own one-click submission answers on the session it presented, because a
+    // request that binds to no event carries the token of none.
+    for (operation, expected, sentence) in [
+        (
+            "AdminUpdateAuthEventFeedback",
+            "InvalidParameterException",
+            EVENT_ID_INVALID_MESSAGE,
+        ),
+        (
+            "UpdateAuthEventFeedback",
+            "NotAuthorizedException",
+            FEEDBACK_TOKEN_INVALID_MESSAGE,
+        ),
+    ] {
         let payload = refused(
             &router,
             "an event nothing logged",
@@ -1141,9 +1168,15 @@ async fn the_history_operations_are_refused_where_there_is_none() {
         .await;
         assert_eq!(
             error_code(&payload),
-            "ResourceNotFoundException",
-            "case \"an event nothing logged\": {operation} must answer \
-             ResourceNotFoundException, got {payload}"
+            expected,
+            "case \"an event nothing logged\": {operation} must answer {expected}, got \
+             {payload}"
+        );
+        assert_eq!(
+            error_message(&payload),
+            sentence,
+            "case \"an event nothing logged\": {operation} must answer {sentence:?}, got \
+             {payload}"
         );
     }
 }

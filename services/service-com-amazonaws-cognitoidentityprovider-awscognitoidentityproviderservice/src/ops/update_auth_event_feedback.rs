@@ -10,6 +10,14 @@
 //! A pool whose add-ons are switched off logs no event history and holds no event to
 //! leave feedback on, which is the state `UserPoolAddOnNotEnabledException` names.
 //!
+//! Everything else about the request is judged as ONE question — does the
+//! `FeedbackToken` authorize feedback on the event the request names, of the user it
+//! names — so a request that binds to no such token is refused as the invalid session
+//! it presents ([`crate::state::auth_events::FEEDBACK_TOKEN_INVALID_MESSAGE`])
+//! whichever part of the triple failed. This is an unsigned entry point, and a user
+//! the pool does not hold can hold no token this pool minted, so the refusal reports
+//! nothing about who is a member of it.
+//!
 //! ---
 //!
 //! # Modeled contract for `UpdateAuthEventFeedback`
@@ -173,17 +181,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !pool.add_ons_enabled() {
             return Err(add_ons_not_enabled());
         }
-        let user = pool.user_mut(&input.username).ok_or_else(user_not_found)?;
-        let event = user
-            .auth_event_mut(&input.event_id)
-            .ok_or_else(|| event_not_found(&input.event_id))?;
         // "Because `FeedbackToken` is a required parameter, you can't make requests to
         // `UpdateAuthEventFeedback` without the contents of the notification email
         // message" (this operation's own doc): the token minted for THIS event is what
-        // authorizes its user's own feedback, and nothing else does.
-        if !event.authorizes_feedback(&input.feedback_token) {
+        // authorizes its user's own feedback, and nothing else does. The user and the
+        // event are therefore resolved as part of checking that token — a request
+        // that binds to no event whose token it carries is refused on the session it
+        // presented, and never on whether the user or the event it named exists.
+        let authorized = pool
+            .user_mut(&input.username)
+            .and_then(|user| user.auth_event_mut(&input.event_id))
+            .filter(|event| event.authorizes_feedback(&input.feedback_token));
+        let Some(event) = authorized else {
             return Err(feedback_token_rejected());
-        }
+        };
         event.submit_feedback(
             input.feedback_value,
             crate::state::auth_events::USER_FEEDBACK_PROVIDER,
@@ -204,27 +215,11 @@ fn user_pool_not_found(user_pool_id: &str) -> UpdateAuthEventFeedbackError {
     .into()
 }
 
-/// This operation's `UserNotFoundException` for a `Username` that names no user of
-/// the pool ([`crate::state::USER_NOT_FOUND_MESSAGE`]).
-fn user_not_found() -> UpdateAuthEventFeedbackError {
-    UpdateAuthEventFeedbackErrorModeled::UserNotFoundException(UserNotFoundException {
-        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
-    })
-    .into()
-}
-
-/// This operation's refusal of an `EventId` that names no event of this user's
-/// history: the resource the feedback was to be left on does not exist.
-fn event_not_found(event_id: &str) -> UpdateAuthEventFeedbackError {
-    UpdateAuthEventFeedbackErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(crate::state::auth_events::event_not_found_message(event_id)),
-    })
-    .into()
-}
-
-/// This operation's refusal of a `FeedbackToken` that is not the one minted for the
-/// event: the caller is not authorized to leave the user's own feedback on it. The
-/// message reports that the token was not accepted and nothing about the stored one
+/// This operation's refusal of a request whose `FeedbackToken` authorizes feedback
+/// on no event of the user it names: the token is not the one minted for that event,
+/// the user's history holds no such event, or the pool holds no such user. One
+/// sentence for all three, which reports that the session was not accepted and
+/// nothing about the stored token, the event or the user
 /// ([`crate::state::auth_events::FEEDBACK_TOKEN_INVALID_MESSAGE`]).
 fn feedback_token_rejected() -> UpdateAuthEventFeedbackError {
     UpdateAuthEventFeedbackErrorModeled::NotAuthorizedException(NotAuthorizedException {

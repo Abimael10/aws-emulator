@@ -361,7 +361,7 @@ fn token_rejected(rejection: crate::state::TokenRejection) -> ChangePasswordErro
 /// reports nothing about the stored password beyond that this is not it, which is
 /// also what a wrong password is answered with where it is presented to sign in.
 fn incorrect_credentials() -> ChangePasswordError {
-    not_authorized("Incorrect username or password.")
+    not_authorized(crate::state::INCORRECT_CREDENTIALS_MESSAGE)
 }
 
 /// The name this operation's refusal gives the previous password a request has to

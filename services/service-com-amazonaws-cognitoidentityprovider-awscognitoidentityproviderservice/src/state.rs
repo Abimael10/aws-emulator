@@ -589,6 +589,19 @@ pub const USER_NOT_FOUND_MESSAGE: &str = "User does not exist.";
 /// client is what the request asked for.
 pub const USERNAME_CLIENT_NOT_FOUND_MESSAGE: &str = "Username/client id combination not found.";
 
+/// The message a `NotAuthorizedException` carries when a call is refused on the
+/// CREDENTIAL it presented for a user rather than on what it asked for.
+///
+/// One fixed sentence that quotes neither the username nor the secret, and that
+/// does not say which of the two was wrong: the refusal is the same whether the
+/// pool holds no such user or holds one that does not hold that credential, so
+/// it reports that the pair was not accepted and discloses no pool membership.
+/// Every surface that judges a user's credential answers it — the password
+/// sign-ins, the self-service password change, and the administrative
+/// submission of threat-protection feedback, which resolves the user it leaves
+/// feedback for.
+pub const INCORRECT_CREDENTIALS_MESSAGE: &str = "Incorrect username or password.";
+
 /// The message a device operation's `ResourceNotFoundException` carries for a
 /// `DeviceKey` the signed-in user holds no confirmed device for. Like
 /// [`USER_NOT_FOUND_MESSAGE`] it names nothing the request asked for, so the

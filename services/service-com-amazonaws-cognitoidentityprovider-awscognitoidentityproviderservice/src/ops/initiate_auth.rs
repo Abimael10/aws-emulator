@@ -1229,7 +1229,7 @@ fn user_not_found() -> InitiateAuthError {
 /// The refusal for a wrong password: `NotAuthorizedException`, which is also what an
 /// absent user gets when the client hides user existence.
 fn incorrect_credentials() -> InitiateAuthError {
-    not_authorized("Incorrect username or password.")
+    not_authorized(crate::state::INCORRECT_CREDENTIALS_MESSAGE)
 }
 
 /// The refusal for a `REFRESH_TOKEN` this emulator cannot resolve to a live refresh

@@ -834,7 +834,7 @@ fn trigger_failed(
 /// The refusal for a wrong password: `NotAuthorizedException`, which is also
 /// what an absent user gets when the client hides user existence.
 fn incorrect_credentials() -> AdminInitiateAuthError {
-    not_authorized("Incorrect username or password.")
+    not_authorized(crate::state::INCORRECT_CREDENTIALS_MESSAGE)
 }
 
 /// This operation's `NotAuthorizedException`, carrying `message`.

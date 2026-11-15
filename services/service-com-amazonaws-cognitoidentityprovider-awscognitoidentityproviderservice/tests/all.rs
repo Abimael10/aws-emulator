@@ -53,6 +53,8 @@ mod app_client_and_pool_configuration;
 mod app_client_refusal_wording;
 #[path = "all/app_client_validity_defaults.rs"]
 mod app_client_validity_defaults;
+#[path = "all/auth_event_feedback_refusal_masking.rs"]
+mod auth_event_feedback_refusal_masking;
 #[path = "all/auth_flow_not_enabled.rs"]
 mod auth_flow_not_enabled;
 #[path = "all/branding_and_domain_generated_reads.rs"]

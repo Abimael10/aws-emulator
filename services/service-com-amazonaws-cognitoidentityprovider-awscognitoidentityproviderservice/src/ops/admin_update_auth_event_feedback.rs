@@ -9,6 +9,14 @@
 //! A pool whose add-ons are switched off logs no event history and holds no event to
 //! leave feedback on, which is the state `UserPoolAddOnNotEnabledException` names.
 //!
+//! A `Username` the pool holds no user for is refused on the CREDENTIAL the request
+//! names a user by rather than on that user's existence: the same
+//! `NotAuthorizedException` sentence a wrong password earns
+//! ([`crate::state::INCORRECT_CREDENTIALS_MESSAGE`]), so the refusal reports nothing
+//! about who is a member of the pool. An `EventId` that resolves to no event of that
+//! user's history is reported as the invalid parameter value it is, naming the member
+//! it arrived in ([`crate::state::auth_events::EVENT_ID_INVALID_MESSAGE`]).
+//!
 //! ---
 //!
 //! # Modeled contract for `AdminUpdateAuthEventFeedback`
@@ -167,10 +175,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !pool.add_ons_enabled() {
             return Err(add_ons_not_enabled());
         }
-        let user = pool.user_mut(&input.username).ok_or_else(user_not_found)?;
+        // Submitting feedback for a user is a call ABOUT that user's credential
+        // history, so an unresolved `Username` is refused the way every surface that
+        // judges a user's credential refuses one: the credential-shaped
+        // `NotAuthorizedException` this operation also declares, which reports the
+        // same sentence whether the pool holds the user or not and so says nothing
+        // about who is a member of it.
+        let user = pool
+            .user_mut(&input.username)
+            .ok_or_else(incorrect_credentials)?;
         let event = user
             .auth_event_mut(&input.event_id)
-            .ok_or_else(|| event_not_found(&input.event_id))?;
+            .ok_or_else(invalid_event_id)?;
         // "The `UpdateAuthEventFeedback` or `AdminUpdateAuthEventFeedback` feedback that
         // you or your user provided in response to the event"
         // (`AuthEventType.EventFeedback` in this service's model): stored on the event,
@@ -197,21 +213,26 @@ fn user_pool_not_found(user_pool_id: &str) -> AdminUpdateAuthEventFeedbackError 
     .into()
 }
 
-/// This operation's `UserNotFoundException` for a `Username` that names no user of
-/// the pool ([`crate::state::USER_NOT_FOUND_MESSAGE`]).
-fn user_not_found() -> AdminUpdateAuthEventFeedbackError {
-    AdminUpdateAuthEventFeedbackErrorModeled::UserNotFoundException(UserNotFoundException {
-        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+/// This operation's refusal of a `Username` that names no user of the pool: the
+/// credential-shaped `NotAuthorizedException`, carrying the fixed text of
+/// [`crate::state::INCORRECT_CREDENTIALS_MESSAGE`], which names neither the
+/// username nor the pool.
+fn incorrect_credentials() -> AdminUpdateAuthEventFeedbackError {
+    AdminUpdateAuthEventFeedbackErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(crate::state::INCORRECT_CREDENTIALS_MESSAGE.to_string()),
     })
     .into()
 }
 
 /// This operation's refusal of an `EventId` that names no event of this user's
-/// history: the resource the feedback was to be left on does not exist.
-fn event_not_found(event_id: &str) -> AdminUpdateAuthEventFeedbackError {
-    AdminUpdateAuthEventFeedbackErrorModeled::ResourceNotFoundException(
-        ResourceNotFoundException {
-            message: Some(crate::state::auth_events::event_not_found_message(event_id)),
+/// history: the id is resolved inside that history rather than addressed as a
+/// resource of its own, so a value it resolves nothing for is the invalid parameter
+/// value [`crate::state::auth_events::EVENT_ID_INVALID_MESSAGE`] names.
+fn invalid_event_id() -> AdminUpdateAuthEventFeedbackError {
+    AdminUpdateAuthEventFeedbackErrorModeled::InvalidParameterException(
+        InvalidParameterException {
+            message: Some(crate::state::auth_events::EVENT_ID_INVALID_MESSAGE.to_string()),
+            reason_code: None,
         },
     )
     .into()

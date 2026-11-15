@@ -301,16 +301,17 @@ impl AuthEvent {
 /// the token nor the event.
 pub const FEEDBACK_TOKEN_INVALID_MESSAGE: &str = "Invalid session provided";
 
-/// How the feedback operations report an `EventId` that names no event of the
-/// user's history.
+/// How the administrative feedback submission reports an `EventId` that names no
+/// event of the user's history.
 ///
-/// The event is the resource the feedback is left on, so a request naming one
-/// that does not exist is answered the way this service answers every absent
-/// resource: with what was asked for and that it does not exist.
-#[must_use]
-pub fn event_not_found_message(event_id: &str) -> String {
-    format!("Event {event_id} does not exist.")
-}
+/// The event is not a resource this API addresses on its own: the id is "the ID of
+/// the threat protection authentication event that you want to update"
+/// (`AdminUpdateAuthEventFeedback.EventId` in this service's model), resolved inside
+/// the history of the user the same request names. So a value that resolves to no
+/// event of that history is reported as the invalid parameter value it is, in one
+/// fixed sentence that names the MEMBER it arrived in and quotes neither the value
+/// nor the user it was looked up under.
+pub const EVENT_ID_INVALID_MESSAGE: &str = "EventId is invalid";
 
 /// What one call contributes to the log: who it was attempted for, what it
 /// attempted and what it was answered.
