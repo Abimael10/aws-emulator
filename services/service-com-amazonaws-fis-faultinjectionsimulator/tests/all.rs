@@ -100,6 +100,10 @@ mod start_experiment_token_normalization;
 mod state_roundtrip;
 #[path = "all/stop_condition_halts_the_run.rs"]
 mod stop_condition_halts_the_run;
+// WHO decides which shape a 404 names — the called operation's own model, not the record
+// that is missing: one absent record addressed through both surfaces in one case.
+#[path = "all/tagging_miss_pairs_with_the_typed_reader.rs"]
+mod tagging_miss_pairs_with_the_typed_reader;
 #[path = "all/tagging_refusal_error_shape.rs"]
 mod tagging_refusal_error_shape;
 #[path = "all/tagging_response_envelope.rs"]

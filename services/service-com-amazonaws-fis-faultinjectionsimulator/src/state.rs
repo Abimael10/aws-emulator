@@ -3115,7 +3115,7 @@ pub enum TaggedResource<'a> {
 /// that type ([`is_minted_id`]). A value failing any of those could not name a resource of
 /// this service at all, which is a bad REQUEST rather than a resource that happens to be
 /// missing — and an ARN that satisfies all of them but names no stored record is the miss
-/// [`tagged_resource_not_found`] words.
+/// [`TAGGED_RESOURCE_NOT_FOUND`] words.
 ///
 /// The ARN's `region` and `account` segments are NOT a second key: the id is what names a
 /// record here, exactly as `GetExperimentTemplate` and `GetExperiment` resolve one, and
@@ -3154,18 +3154,12 @@ pub const INVALID_RESOURCE_ARN: &str = "Invalid input resource arn";
 /// words a miss GENERICALLY — unlike each resource's own reader
 /// ([`template_not_found`], [`experiment_not_found`]), which was asked for a resource of
 /// one named kind and says so.
-pub const TAGGED_RESOURCE_NOT_FOUND: &str = "Resource was not found";
-
-/// The `ResourceNotFoundException` for a `resourceArn` this store holds no record for.
 ///
-/// Takes no argument: the message is the constant [`TAGGED_RESOURCE_NOT_FOUND`], so a tag
-/// write, a tag removal and a tag read of the same ARN cannot word one miss three ways,
-/// and nothing of the request is echoed back.
-pub fn tagged_resource_not_found() -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(TAGGED_RESOURCE_NOT_FOUND.to_string()),
-    }
-}
+/// It is carried by the shape the tagging surface's own front door answers
+/// ([`crate::scaffolded::Scaffolded::not_found`]) and by no modelled shape: an operation
+/// that declares no error has none of this service's modelled exceptions to announce, so
+/// this crate builds no `ResourceNotFoundException` for an ARN-addressed tag miss.
+pub const TAGGED_RESOURCE_NOT_FOUND: &str = "Resource was not found";
 
 /// What the model admits as ONE key of a map: the `@length` window the key's target shape
 /// declares, whether its `@pattern` admits whitespace, and what a refusal calls such a key.
