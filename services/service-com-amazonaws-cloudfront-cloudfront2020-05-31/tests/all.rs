@@ -342,6 +342,8 @@ mod resource_policy_lifecycle;
 mod response_headers_policy_config_read;
 #[path = "all/response_headers_policy_delete.rs"]
 mod response_headers_policy_delete;
+#[path = "all/response_headers_policy_delete_isolation.rs"]
+mod response_headers_policy_delete_isolation;
 #[path = "all/response_headers_policy_lifecycle.rs"]
 mod response_headers_policy_lifecycle;
 #[path = "all/response_headers_policy_refusal_message.rs"]

@@ -1283,3 +1283,10 @@ mod cloudtrail_iam_credential_write_audit;
 // A note a landing appends here wraps without the indentation
 // `clippy::doc_lazy_continuation` asks of a doc list item, so the lint is allowed below:
 // a re-appended note is then a note rather than a build failure.
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair below, in sorted order — one pair per
+// suite and no other line. A suite no `mod` names is compiled nowhere; a second `mod` for
+// one name is `E0428`; an inner doc comment past the first item is `E0753`. Each fails every
+// suite of this target, so every comment here is an ordinary one and what a suite covers
+// belongs in that suite's own module header (a note about THIS file in
+// `all/appended_notes.rs`). The `all_rs_*` suites and `all/every_suite_file_is_declared.rs`
+// check these rules, for this root and for every service crate's.

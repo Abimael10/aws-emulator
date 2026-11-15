@@ -73,7 +73,14 @@ type Spelling = fn(&str) -> String;
 
 /// `DELETE /2020-05-31/response-headers-policy/{Id}` under the version token `if_match` — the
 /// route and the header the model binds this operation to (`IfMatch` travels in `If-Match`).
-async fn delete_policy(router: &MultiServiceRouter, id: &str, if_match: Option<&str>) -> Answer {
+///
+/// `pub(crate)` so the sibling suite that asserts WHAT ELSE a delete may touch drives it over
+/// this one wire path rather than growing a copy of it.
+pub(crate) async fn delete_policy(
+    router: &MultiServiceRouter,
+    id: &str,
+    if_match: Option<&str>,
+) -> Answer {
     call(
         router,
         "DELETE",
@@ -127,7 +134,9 @@ async fn create(router: &MultiServiceRouter, row: &Policy) -> (String, String) {
 /// Assert that `id` names no response headers policy of this account any more: both readers
 /// answer `NoSuchResponseHeadersPolicy` with the modelled sentence, and the listing has
 /// stopped reporting it.
-async fn assert_gone(router: &MultiServiceRouter, id: &str, case: &str) {
+///
+/// `pub(crate)` for the reason [`delete_policy`] is.
+pub(crate) async fn assert_gone(router: &MultiServiceRouter, id: &str, case: &str) {
     for (reader, answer) in [
         ("GetResponseHeadersPolicy", get_policy(router, id).await),
         (
