@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListNotebookInstanceLifecycleConfigs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListNotebookInstanceLifecycleConfigs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListNotebookInstanceLifecycleConfigs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: filters, sorts and pages the notebook instance lifecycle configurations
+//! `CreateNotebookInstanceLifecycleConfig` stored in `crate::state`, reporting for each
+//! one the summary `DescribeNotebookInstanceLifecycleConfig` replays. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -138,6 +133,19 @@ impl<Eng> ListNotebookInstanceLifecycleConfigs<Eng> {
     }
 }
 
+/// `SortBy`'s documented default for this listing ("Sorts the list of results. The
+/// default is `CreationTime`." — the member doc reproduced above), which is also the
+/// service's own [`crate::state::DEFAULT_SORT_BY`].
+const DEFAULT_SORT_BY: &str = crate::state::DEFAULT_SORT_BY;
+
+/// `NotebookInstanceLifecycleConfigSortKey`'s time-valued members, matched by name so the
+/// sort key is never chosen by comparing a bare literal. The accepted value SET is the
+/// generated [`NOTEBOOK_INSTANCE_LIFECYCLE_CONFIG_SORT_KEY_VALUES`], so a refusal stays in
+/// step with the model.
+const SORT_BY_CREATION_TIME: &str = "CreationTime";
+/// See [`SORT_BY_CREATION_TIME`].
+const SORT_BY_LAST_MODIFIED_TIME: &str = "LastModifiedTime";
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListNotebookInstanceLifecycleConfigs<Eng>
 {
@@ -153,20 +161,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListNotebookInstanceLifecycleConfigs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListNotebookInstanceLifecycleConfigsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListNotebookInstanceLifecycleConfigs"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let sort_by = input.sort_by.as_deref().unwrap_or(DEFAULT_SORT_BY);
+        if !NOTEBOOK_INSTANCE_LIFECYCLE_CONFIG_SORT_KEY_VALUES.contains(&sort_by) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of {}; got \"{sort_by}\".",
+                NOTEBOOK_INSTANCE_LIFECYCLE_CONFIG_SORT_KEY_VALUES.join(", ")
+            )));
+        }
+        // This listing's `SortOrder` doc states no default of its own, so it takes the
+        // service-wide one stated once in `crate::state`.
+        let sort_order = input
+            .sort_order
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_ORDER);
+        if !NOTEBOOK_INSTANCE_LIFECYCLE_CONFIG_SORT_ORDER_VALUES.contains(&sort_order) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortOrder must be one of {}; got \"{sort_order}\".",
+                NOTEBOOK_INSTANCE_LIFECYCLE_CONFIG_SORT_ORDER_VALUES.join(", ")
+            )));
+        }
+        let descending = sort_order == crate::state::ORDER_DESCENDING;
+
+        let created_after = input.creation_time_after.map(crate::state::timestamp_key);
+        let created_before = input.creation_time_before.map(crate::state::timestamp_key);
+        let modified_after = input
+            .last_modified_time_after
+            .map(crate::state::timestamp_key);
+        let modified_before = input
+            .last_modified_time_before
+            .map(crate::state::timestamp_key);
+
+        // A reporting call: this listing only reads the store, so the configuration it
+        // reports is exactly the one a later `DescribeNotebookInstanceLifecycleConfig`
+        // replays.
+        let store = state.lock();
+        let mut matching: Vec<&crate::state::NotebookInstanceLifecycleConfig> = store
+            .notebook_instance_lifecycle_configs
+            .values()
+            .filter(|config| {
+                input
+                    .name_contains
+                    .as_deref()
+                    .is_none_or(|needle| config.name.contains(needle))
+            })
+            .filter(|config| {
+                // Every bound of both ranges is inclusive, as `ListModels`'
+                // `CreationTimeAfter` doc states it ("greater than or equal to the
+                // specified time") and as the other listings here apply them, so a bound
+                // landing on a stored instant still selects the configuration carrying it.
+                let created =
+                    crate::state::timestamp_key(crate::state::timestamp(config.creation_time));
+                let modified =
+                    crate::state::timestamp_key(crate::state::timestamp(config.last_modified_time));
+                created_after.is_none_or(|bound| created >= bound)
+                    && created_before.is_none_or(|bound| created <= bound)
+                    && modified_after.is_none_or(|bound| modified >= bound)
+                    && modified_before.is_none_or(|bound| modified <= bound)
+            })
+            .collect();
+        // `SortOrder` reverses the SORT KEY only. The tie-break stays the configuration
+        // name ascending in both directions, so two configurations sharing a sort key keep
+        // one order whichever way the page is sorted — and a `NextToken` resolved against
+        // a freshly computed result set lands on the same boundary.
+        matching.sort_by(|left, right| {
+            let by_key = match sort_by {
+                SORT_BY_CREATION_TIME => {
+                    crate::state::timestamp_key(crate::state::timestamp(left.creation_time)).cmp(
+                        &crate::state::timestamp_key(crate::state::timestamp(right.creation_time)),
+                    )
+                }
+                SORT_BY_LAST_MODIFIED_TIME => {
+                    crate::state::timestamp_key(crate::state::timestamp(left.last_modified_time))
+                        .cmp(&crate::state::timestamp_key(crate::state::timestamp(
+                            right.last_modified_time,
+                        )))
+                }
+                _ => left.name.cmp(&right.name),
+            };
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.name.cmp(&right.name))
+        });
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|name| matching.iter().position(|config| config.name == name))
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(crate::state::STALE_PAGE_TOKEN)
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // This operation documents no `MaxResults` default, so an absent one takes the
+        // service's own page ceiling, which also caps an explicit one: no single call can
+        // serialise the whole store. The token below is emitted whenever anything is left,
+        // so a paginating client walks the full result set exactly once either way.
+        let start = start.min(matching.len());
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_PAGE_SIZE, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        let next_token = match page.last() {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end < matching.len() => Some(crate::state::encode_page_token(&last.name)),
+            _ => None,
+        };
+
+        Ok(ListNotebookInstanceLifecycleConfigsOutput {
+            notebook_instance_lifecycle_configs: Some(
+                page.iter()
+                    .map(|config| NotebookInstanceLifecycleConfigSummary {
+                        notebook_instance_lifecycle_config_name: config.name.clone(),
+                        notebook_instance_lifecycle_config_arn: config.arn.clone(),
+                        creation_time: Some(crate::state::timestamp(config.creation_time)),
+                        last_modified_time: Some(crate::state::timestamp(
+                            config.last_modified_time,
+                        )),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
+

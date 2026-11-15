@@ -157,6 +157,8 @@ mod list_model_card_export_jobs;
 mod list_model_package_groups;
 #[path = "all/list_model_packages.rs"]
 mod list_model_packages;
+#[path = "all/list_notebook_instance_lifecycle_configs.rs"]
+mod list_notebook_instance_lifecycle_configs;
 #[path = "all/list_pipeline_execution_steps.rs"]
 mod list_pipeline_execution_steps;
 #[path = "all/list_pipelines.rs"]
