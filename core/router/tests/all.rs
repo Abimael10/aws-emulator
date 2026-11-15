@@ -1667,3 +1667,10 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 //! header, where it is read beside the test it explains.
 //! `all/all_rs_is_a_canonical_declaration_list.rs` check those three rules, for this file
 //! and for every service crate's `tests/all.rs`.
+// pair, inserted in SORTED order: one pair per suite and nothing else, so two branches
+// landing at once insert two lines in two places and have no prose to duplicate, re-word
+// or mistype.
+// deliberate: an inner doc comment (`//!`) is legal only BEFORE the first item, so one that
+// What a suite covers, and why it lives in THIS cross-service target rather than in one
+// service crate's own, belongs in that suite's own module header, where it is read beside
+// the test it explains; `all/appended_notes.rs` keeps the notes this list had collected.

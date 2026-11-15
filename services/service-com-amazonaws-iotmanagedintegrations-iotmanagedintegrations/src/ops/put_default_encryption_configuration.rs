@@ -197,24 +197,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `kmsKeyArn` is the key `CUSTOMER_KEY_ENCRYPTION` encrypts under, which no
         // modelled constraint can tie to the type, so each type admits exactly one shape
         // of request: that type needs the key, and the service-owned encryption uses no
-        // key of the caller's and so takes none. The refusal names the member and the
-        // type the request paired it with, so the caller can fix the request from the
-        // text alone.
+        // key of the caller's and so takes none.
+        //
+        // A request for customer-key encryption that names NO key reaches the service's
+        // key-authorization check with no key to authorize, and the refusal states what
+        // that check concluded, in the service's own fixed sentence for it
+        // (`crate::state::CUSTOMER_KEY_NOT_AUTHORIZED_MESSAGE`) — no member name, no type
+        // and no ARN interpolated, which is how that refusal is recorded.
         //
         // The first half is documented ("the AWS KMS key used for KMS encryption if you
         // use KMS_BASED_ENCRYPTION"); the second is INFERRED from the same sentence —
         // AWS may instead ignore a key sent with the service-owned type — so a recorded
-        // response showing that is what should correct it. The refusal is modelled and
-        // stores nothing either way.
+        // response showing that is what should correct it, and its own refusal keeps
+        // naming the two members it cannot hold together until one does. The refusal is
+        // modelled and stores nothing either way.
         let kms_key_arn = match (input.encryption_type.as_str(), input.kms_key_arn) {
             (crate::state::CUSTOMER_KEY_ENCRYPTION_TYPE, None) => {
                 audit(&akid, &region, &asked_for, "refused");
                 return Err(PutDefaultEncryptionConfigurationErrorModeled::ValidationException(
                     ValidationException {
-                        message: Some(format!(
-                            "kmsKeyArn is required when encryptionType is {:?}",
-                            crate::state::CUSTOMER_KEY_ENCRYPTION_TYPE
-                        )),
+                        message: Some(
+                            crate::state::CUSTOMER_KEY_NOT_AUTHORIZED_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());

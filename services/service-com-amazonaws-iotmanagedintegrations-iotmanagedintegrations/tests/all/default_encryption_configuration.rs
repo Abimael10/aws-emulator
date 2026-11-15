@@ -37,9 +37,9 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::state::{
     CONFIGURATION_STATE_ENABLED, CONFIGURATION_STATE_UPDATE_IN_PROGRESS,
-    CONFIGURATION_STATE_VALUES, CUSTOMER_KEY_ENCRYPTION_TYPE, DEFAULT_ENCRYPTION_TYPE,
-    ENCRYPTION_TYPE_VALUES, ENCRYPTION_UPDATE_DELAY, MAX_CONFIGURED_REGIONS,
-    MAX_REGION_NAME_LENGTH,
+    CONFIGURATION_STATE_VALUES, CUSTOMER_KEY_ENCRYPTION_TYPE,
+    CUSTOMER_KEY_NOT_AUTHORIZED_MESSAGE, DEFAULT_ENCRYPTION_TYPE, ENCRYPTION_TYPE_VALUES,
+    ENCRYPTION_UPDATE_DELAY, MAX_CONFIGURED_REGIONS, MAX_REGION_NAME_LENGTH,
 };
 use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -471,9 +471,12 @@ async fn a_request_whose_members_cannot_hold_together_is_refused_and_stores_noth
     // modelled `@length` maximum or `@pattern`. Each refusal names the member at fault.
     let refusals: Vec<(&str, Value, Vec<&str>)> = vec![
         (
+            // The service reaches its key-authorization check with no key to authorize, and
+            // states exactly that, in its own fixed sentence for the refusal: no member
+            // name, no type and no ARN interpolated.
             "customer-key encryption without a key",
             json!({"encryptionType": CUSTOMER_KEY_ENCRYPTION_TYPE}),
-            vec!["kmsKeyArn", CUSTOMER_KEY_ENCRYPTION_TYPE],
+            vec![CUSTOMER_KEY_NOT_AUTHORIZED_MESSAGE],
         ),
         (
             "the service-owned type with a key",

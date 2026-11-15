@@ -208,10 +208,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 audit(&akid, &region, "not-found");
                 return Err(
                     PutRuntimeLogConfigurationErrorModeled::ResourceNotFoundException(
-                        // A mutation states the reason from the identifier the request
-                        // carried, through the one formatter every mutating path of this
-                        // service words its 404 with.
-                        crate::state::managed_thing_not_found_on_mutation(
+                        // This operation words the absence ITSELF, around the runtime log
+                        // configuration it was installing, and quotes no value of the
+                        // request
+                        // (`crate::state::RUNTIME_LOG_CONFIGURATION_MANAGED_THING_ABSENT_MESSAGE`)
+                        // — not the shared `<Resource> for identifier ... not found`
+                        // sentence the managed thing's other mutations word.
+                        crate::state::runtime_log_configuration_managed_thing_not_found(
                             &input.managed_thing_id,
                         ),
                     )
@@ -240,7 +243,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             audit(&akid, &region, "refused");
             return Err(PutRuntimeLogConfigurationErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(crate::state::runtime_logging_unsupported_message()),
+                    message: Some(
+                        crate::state::RUNTIME_LOGGING_UNSUPPORTED_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());

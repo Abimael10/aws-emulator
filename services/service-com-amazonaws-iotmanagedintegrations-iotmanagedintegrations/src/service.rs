@@ -117,6 +117,18 @@
 //! once, nothing undeclared, the same set whichever operation, binding or rejected value
 //! reached it — rendered `[a, b, c]`.
 //!
+//! A `@pattern` clause quotes an EXPRESSION, and the expression is the one this service
+//! publishes for the member's shape: Smithy expresses "the whole value matches" by writing
+//! `^`/`$` around the service's own expression, so the pair is the model's wrapping and not
+//! part of what the service advertises. The clause therefore quotes the expression without
+//! it ([`published_pattern`], over the tree's one reading of the pair) — recorded on a
+//! `CreateManagedThing` whose `authenticationMaterial` carried a character outside the
+//! member's class, whose clause quotes the character class and the `+` with neither anchor.
+//! The CHECK is unchanged: the constraint walk keeps applying the model's trait as written,
+//! so this is what a caller is TOLD and never what was enforced. Like the listing below, it
+//! sits beside the ONE renderer every constrained member of every operation reaches
+//! ([`clause`]), so one rule serves them all.
+//!
 //! Everything else about the clause — which constraint classes exist and how each one
 //! words its requirement — stays the framework's, so a constraint class added there
 //! cannot arrive with a sentence of this service's own.
@@ -418,10 +430,11 @@ fn validation_exception(
 /// clause's own opening. A violation with no value to echo (a `@required` member absent)
 /// is left exactly as the framework words it.
 fn clause(violation: &Violation) -> String {
-    // An enum clause lists the value set in the order THIS SERVICE lists that enum's
-    // values; every other class is worded exactly as the framework words it.
-    let relisted = relisted(violation);
-    let violation = relisted.as_ref().unwrap_or(violation);
+    // A pattern clause quotes the expression this service PUBLISHES and an enum clause
+    // lists the value set in the order THIS SERVICE lists that enum's values; every other
+    // class is worded exactly as the framework words it.
+    let restated = restated(violation);
+    let violation = restated.as_ref().unwrap_or(violation);
     let clause = violation.message();
     match violation.value.as_deref() {
         Some(value) => clause.replacen(
@@ -467,26 +480,69 @@ const VALUE_LISTINGS: &[&[&str]] = &[
     &["JITR", "FLEET_PROVISIONING"],
 ];
 
-/// The same violation with its enum value set in the order this service lists that enum's
-/// values, or `None` when there is nothing to re-list: a violation of another class, or an
-/// enum this service publishes no listing for — which keeps the order the member schema
-/// carries, the model's.
+/// The same violation with the FACT its clause states put the way this service states it,
+/// or `None` when there is nothing to restate — a class this service words exactly as the
+/// framework does.
+///
+/// Two classes are restated, and each is restated for every member of every operation:
+///
+/// * a `@pattern`, whose clause quotes the expression this service PUBLISHES for the
+///   member's shape rather than the model's trait text ([`published_pattern`]);
+/// * an enum's value set, which is listed in the order this service lists that enum's
+///   values ([`listed`]) — an enum it publishes no listing for keeps the order the member
+///   schema carries, the model's.
 ///
 /// The clause itself is still rendered by the framework ([`Violation::message`]), so only
-/// the ORDER of the set is this service's; the requirement's wording, the path and the
-/// envelope stay in one place.
-fn relisted(violation: &Violation) -> Option<Violation> {
-    let ViolationKind::EnumValue(allowed) = &violation.kind else {
-        return None;
+/// the FACT is this service's; the requirement's wording, the path and the envelope stay in
+/// one place.
+fn restated(violation: &Violation) -> Option<Violation> {
+    let kind = match &violation.kind {
+        ViolationKind::EnumValue(allowed) => {
+            let declared: Vec<&str> = allowed.iter().map(String::as_str).collect();
+            let listing = listed(&declared)?;
+            ViolationKind::EnumValue(listing.iter().map(|value| (*value).to_string()).collect())
+        }
+        ViolationKind::Pattern(modelled) => {
+            let published = published_pattern(modelled);
+            if published == *modelled {
+                return None;
+            }
+            ViolationKind::Pattern(published)
+        }
+        _ => return None,
     };
-    let declared: Vec<&str> = allowed.iter().map(String::as_str).collect();
-    let listing = listed(&declared)?;
     Some(Violation {
         path: violation.path.clone(),
-        kind: ViolationKind::EnumValue(listing.iter().map(|value| (*value).to_string()).collect()),
+        kind,
         value: violation.value.clone(),
         sensitive: violation.sensitive,
     })
+}
+
+/// The `@pattern` of a member as this service PUBLISHES it: the expression itself, without
+/// the whole-value anchors the model writes around it.
+///
+/// Smithy expresses a whole-value match by anchoring the trait text, so the `^` and the `$`
+/// are the model's wrapping rather than part of the expression the service advertises — and
+/// the constraint message quotes what it advertises, which is what a caller that lifts the
+/// expression out of the message and re-validates locally compiles. Recorded on this
+/// service for a `CreateManagedThing` whose `AuthenticationMaterial` carried a character
+/// outside the member's class: the clause quotes the character class and the `+`, with
+/// neither anchor.
+///
+/// REPORTED, not ENFORCED: the constraint walk keeps applying the model's own trait as
+/// written, so nothing about which values this service accepts changes here.
+///
+/// One reading of the anchor pair for the whole tree
+/// (`service_common::validation::unanchored_keeping_inner_anchors`), rather than a copy per
+/// service: the pair is dropped positionally and only when both ends carry one, an escaped
+/// trailing dollar is a literal the expression keeps, and an expression that anchors its
+/// OWN branches (this model's `SmartHomeResourceType`, an alternation of whole-value
+/// branches) is quoted as the model declares it — dropping its ends' anchors would state a
+/// requirement of neither branch. The service's one recorded pattern clause carries no
+/// anchor of its own, so that reading and the plain drop state it identically.
+fn published_pattern(modelled: &str) -> String {
+    ::service_common::validation::unanchored_keeping_inner_anchors(modelled)
 }
 
 /// The listing this service publishes for the enum admitting exactly `declared`, or `None`

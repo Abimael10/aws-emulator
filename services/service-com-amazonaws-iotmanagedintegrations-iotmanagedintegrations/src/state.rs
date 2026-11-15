@@ -298,6 +298,18 @@ pub const DEFAULT_ENCRYPTION_TYPE: &str = "MANAGED_INTEGRATIONS_DEFAULT_ENCRYPTI
 /// `KmsKeyArn` belongs to. A member of [`ENCRYPTION_TYPE_VALUES`].
 pub const CUSTOMER_KEY_ENCRYPTION_TYPE: &str = "CUSTOMER_KEY_ENCRYPTION";
 
+/// How this service refuses a put that asks for customer-key encryption without naming a
+/// KMS key it may encrypt under.
+///
+/// FIXED text: the whole sentence is what the service answers for this refusal class, and
+/// it interpolates no value of the request — not the key, not the type. The service reaches
+/// its KEY-AUTHORIZATION check and reports what that check concluded (there is no key it is
+/// authorized to use) rather than reporting a missing member, which is how the recorded
+/// refusal of a `PutDefaultEncryptionConfiguration` carrying
+/// [`CUSTOMER_KEY_ENCRYPTION_TYPE`] and no `kmsKeyArn` words it.
+pub const CUSTOMER_KEY_NOT_AUTHORIZED_MESSAGE: &str =
+    "IoT Managed Integrations is not authorized to use the key.";
+
 /// The `ConfigurationState` a default encryption configuration carries once the
 /// encryption it names is in force. A member of [`CONFIGURATION_STATE_VALUES`].
 pub const CONFIGURATION_STATE_ENABLED: &str = "ENABLED";
@@ -728,11 +740,6 @@ pub const DEVICE_DISCOVERY_RESOURCE_NAME: &str = "Discovery";
 /// The `ResourceType` this service reports a runtime log configuration under.
 pub const RUNTIME_LOG_CONFIGURATION_RESOURCE_TYPE: &str = "RuntimeLogConfiguration";
 
-/// The runtime-log half of a managed thing, as the reason of a runtime-log read's 404 names
-/// it ([`sub_resource_not_found_message`]) — the same wording a capability read's 404 uses
-/// for the capability half ([`MANAGED_THING_CAPABILITIES_SUB_RESOURCE`]).
-pub const RUNTIME_LOG_CONFIGURATION_SUB_RESOURCE: &str = "runtime log configuration";
-
 /// Whether runtime logging is supported on `thing`.
 ///
 /// Runtime logs are the logs the managed-integrations RUNTIME writes on the device, and
@@ -741,8 +748,7 @@ pub const RUNTIME_LOG_CONFIGURATION_SUB_RESOURCE: &str = "runtime log configurat
 /// `HubNetworkMode` (one of [`HUB_NETWORK_MODE_VALUES`], settable through
 /// `UpdateManagedThing`). A managed thing that is not a hub is a third-party device, which
 /// runs no runtime of this service, so a put for one is refused with the modelled
-/// `ValidationException` — recorded from AWS as `Only 1P device or hub is supported for
-/// Runtime logging`.
+/// `ValidationException` ([`RUNTIME_LOGGING_UNSUPPORTED_MESSAGE`]).
 pub fn supports_runtime_logging(thing: &ManagedThing) -> bool {
     thing.hub_network_mode.is_some()
 }
@@ -750,13 +756,34 @@ pub fn supports_runtime_logging(thing: &ManagedThing) -> bool {
 /// How this service states that the managed thing a runtime-log put named does not run the
 /// managed-integrations runtime, so no runtime log configuration applies to it.
 ///
-/// The sentence names the rule and no value of the request, as every refusal of this
-/// service does (`crate::service`): the member at fault is the path the request addressed.
-pub fn runtime_logging_unsupported_message() -> String {
-    "Only a hub managed thing runs the managed integrations runtime, so runtime logging is \
-     not supported for this managed thing"
-        .to_string()
-}
+/// FIXED text: the sentence states which device classes runtime logging is supported for and
+/// interpolates no value of the request, the way the recorded refusal of a put against a
+/// third-party managed thing words it.
+pub const RUNTIME_LOGGING_UNSUPPORTED_MESSAGE: &str =
+    "Only 1P device or hub is supported for Runtime logging";
+
+/// How `PutRuntimeLogConfiguration` states that the `ManagedThingId` its URI carried names
+/// no managed thing of this region.
+///
+/// FIXED text, phrased around the RUNTIME LOG CONFIGURATION the call was installing rather
+/// than around the managed thing, and interpolating no value of the request — the identifier
+/// included. This operation's own absence sentence, not the one its resource's other
+/// mutations word ([`managed_thing_not_found_on_mutation`]): the recorded put for an
+/// identifier no managed thing is held under states it this way, and the read of the same
+/// URI states its own ([`RUNTIME_LOG_CONFIGURATION_ABSENT_MESSAGE`]).
+pub const RUNTIME_LOG_CONFIGURATION_MANAGED_THING_ABSENT_MESSAGE: &str =
+    "The runtime log configuration is for a managed thing resource that cannot be found.";
+
+/// How `GetRuntimeLogConfiguration` states that the managed thing its URI named holds no
+/// runtime log configuration.
+///
+/// FIXED text, naming the configuration that is missing and the MEMBER the request carried
+/// the managed thing on, and interpolating no value of the request: the recorded read of a
+/// configuration no put installed words it this way, which is this operation's own sentence
+/// rather than the one the put beside it words
+/// ([`RUNTIME_LOG_CONFIGURATION_MANAGED_THING_ABSENT_MESSAGE`]).
+pub const RUNTIME_LOG_CONFIGURATION_ABSENT_MESSAGE: &str =
+    "Runtime log configuration for the requested managedThingId doesn't exist";
 
 /// One stored account association: the authoritative record every account-association
 /// operation reads and writes. `CreateAccountAssociation` inserts it, and
@@ -2733,7 +2760,7 @@ pub fn account_association_not_found(identifier: &str) -> ResourceNotFoundExcept
 /// The text is BUILT FROM THE STORE — the state at fault is the one the record holds, so the
 /// sentence names the rule and the association's own state rather than a value of the
 /// request, as every other refusal this service words does
-/// ([`runtime_logging_unsupported_message`]).
+/// ([`RUNTIME_LOGGING_UNSUPPORTED_MESSAGE`]).
 pub fn account_association_not_refreshable_message(association_state: &str) -> String {
     format!(
         "{ACCOUNT_ASSOCIATION_RESOURCE_SUBJECT} is in {association_state} state, so its \
@@ -2799,16 +2826,26 @@ pub fn device_discovery_not_found_on_read(identifier: &str) -> ResourceNotFoundE
 }
 
 /// The modelled `ResourceNotFoundException` `GetRuntimeLogConfiguration` answers for a
-/// managed thing that has no runtime log configuration installed: the sub-resource reason
-/// ([`sub_resource_not_found_message`], as a capability read's 404 words its own), plus the
-/// `ResourceId` and `ResourceType` members every 404 of this service reports the same way.
+/// managed thing that has no runtime log configuration installed: this read's own absence
+/// sentence ([`RUNTIME_LOG_CONFIGURATION_ABSENT_MESSAGE`]), plus the `ResourceId` and
+/// `ResourceType` members every 404 of this service reports the same way.
 pub fn runtime_log_configuration_not_found_on_read(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(sub_resource_not_found_message(
-            MANAGED_THING_RESOURCE_NAME,
-            RUNTIME_LOG_CONFIGURATION_SUB_RESOURCE,
-        )),
+        message: Some(RUNTIME_LOG_CONFIGURATION_ABSENT_MESSAGE.to_string()),
         ..resource_not_found(RUNTIME_LOG_CONFIGURATION_RESOURCE_TYPE, identifier)
+    }
+}
+
+/// The modelled `ResourceNotFoundException` `PutRuntimeLogConfiguration` answers for a
+/// `ManagedThingId` this region holds no managed thing under: this operation's own absence
+/// sentence ([`RUNTIME_LOG_CONFIGURATION_MANAGED_THING_ABSENT_MESSAGE`]) with the
+/// `ResourceId` and `ResourceType` members a managed thing's 404 reports it by.
+pub fn runtime_log_configuration_managed_thing_not_found(
+    identifier: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(RUNTIME_LOG_CONFIGURATION_MANAGED_THING_ABSENT_MESSAGE.to_string()),
+        ..resource_not_found(MANAGED_THING_RESOURCE_TYPE, identifier)
     }
 }
 

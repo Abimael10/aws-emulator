@@ -81,6 +81,8 @@ mod ota_task_configuration_lifecycle;
 mod ota_task_configuration_not_found_messages;
 #[path = "all/provisioning_profile_lifecycle.rs"]
 mod provisioning_profile_lifecycle;
+#[path = "all/recorded_refusal_text.rs"]
+mod recorded_refusal_text;
 #[path = "all/referenced_resource_validation.rs"]
 mod referenced_resource_validation;
 #[path = "all/resource_tags.rs"]

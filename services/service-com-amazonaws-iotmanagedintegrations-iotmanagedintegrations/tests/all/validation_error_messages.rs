@@ -224,6 +224,8 @@ async fn a_constraint_refusal_is_the_modelled_validation_exception() {
             rejected_value: Some(too_long_name.clone()),
         },
         // `@pattern`, on the same member the length case used: two classes, one member.
+        // The quoted expression is the one the service PUBLISHES — the modelled
+        // `^[0-9A-Za-z_-]+$` without the whole-value anchors the model writes around it.
         Case {
             label: "CreateProvisioningProfile/Name outside the pattern",
             method: "POST",
@@ -233,12 +235,12 @@ async fn a_constraint_refusal_is_the_modelled_validation_exception() {
                 "Name": "not a legal name",
             })),
             member_path: "name",
-            requirement: "Member must satisfy regular expression pattern: ^[0-9A-Za-z_-]+$"
+            requirement: "Member must satisfy regular expression pattern: [0-9A-Za-z_-]+"
                 .to_string(),
             rejected_value: Some("not a legal name".to_string()),
         },
         // `@pattern` on a member the model marks `@sensitive` (`Brand`): the clause must
-        // name the member and the pattern and publish nothing of the value.
+        // name the member and the published pattern and publish nothing of the value.
         Case {
             label: "CreateManagedThing/Brand outside the pattern (a @sensitive member)",
             method: "POST",
@@ -250,7 +252,7 @@ async fn a_constraint_refusal_is_the_modelled_validation_exception() {
                 "Brand": "Acme*Secret*Brand",
             })),
             member_path: "brand",
-            requirement: "Member must satisfy regular expression pattern: ^[A-Za-z0-9-_ ]+$"
+            requirement: "Member must satisfy regular expression pattern: [A-Za-z0-9-_ ]+"
                 .to_string(),
             rejected_value: Some("Acme*Secret*Brand".to_string()),
         },
