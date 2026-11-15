@@ -110,8 +110,8 @@ async fn every_rule_form_round_trips_through_describe_insight_rules() {
             false,
         ),
         (
-            "a name with the spaces and punctuation the pattern allows",
-            "My rule (v2) / high-cardinality".to_string(),
+            "a name with the punctuation a rule name admits",
+            "My_rule(v2)/high-cardinality".to_string(),
             definition(json!({
                 "LogFormat": "CLF",
                 "Fields": {"4": "IpAddress", "7": "StatusCode"},

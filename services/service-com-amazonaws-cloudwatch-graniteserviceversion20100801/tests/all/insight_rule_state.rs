@@ -15,7 +15,7 @@
 //! Every table row is a distinct input along what the rule generalises over (which of the two
 //! operations is called, the state each rule already holds, how many names one request
 //! carries, whether a name is held or unknown or repeated, the name's length and the
-//! characters its pattern allows, and whether the rule was created by `PutInsightRule` or by
+//! characters a rule name admits, and whether the rule was created by `PutInsightRule` or by
 //! `PutManagedInsightRules`), so the recorded case is one row among many rather than the
 //! specification.
 
@@ -130,10 +130,10 @@ async fn every_named_rule_this_service_holds_moves_to_the_state_the_operation_na
     // Each row is one request: the rules that exist beforehand (name, state) and the names the
     // request carries. Rows span a single name, several names, a name already in the target
     // state, a name no rule answers to, a mixture of held and unknown names, the same name
-    // twice, a one-character name, a 128-character name and a name carrying the spaces and
-    // punctuation `^[\x20-\x7E]+$` allows.
+    // twice, a one-character name, a 128-character name and a name carrying the punctuation a
+    // rule name admits.
     let long_name = "n".repeat(128);
-    let odd_name = "My rule (v2) / high-cardinality";
+    let odd_name = "My_rule(v2)/high-cardinality";
     let rows: Vec<Row> = vec![
         row("one held rule", &[("one", "ENABLED")], &["one"]),
         row(
@@ -163,7 +163,7 @@ async fn every_named_rule_this_service_holds_moves_to_the_state_the_operation_na
         row(
             "a held name and two unknown ones",
             &[("held", "DISABLED")],
-            &["unknown one", "held", "unknown two"],
+            &["unknown-one", "held", "unknown-two"],
         ),
         row(
             "the same held name twice",
@@ -182,11 +182,11 @@ async fn every_named_rule_this_service_holds_moves_to_the_state_the_operation_na
             &[long_name.as_str()],
         ),
         row(
-            "a name with the spaces and punctuation the pattern allows",
+            "a name with the punctuation a rule name admits",
             &[(odd_name, "ENABLED")],
             &[odd_name],
         ),
-        row("no rule configured at all", &[], &["nothing here"]),
+        row("no rule configured at all", &[], &["nothing-here"]),
     ];
 
     for (operation, target_state) in STATE_OPERATIONS {

@@ -17,7 +17,7 @@
 //!
 //! Every table row is a distinct input along what the rule generalises over (how many names one
 //! request carries, whether a name is held or unknown or repeated, the state the rule holds,
-//! the name's length and the characters its pattern allows, whether the rule was created by
+//! the name's length and the characters a rule name admits, whether the rule was created by
 //! `PutInsightRule` or by `PutManagedInsightRules`, and which of the batch operations is
 //! called), so the recorded case is one row among many rather than the specification.
 
@@ -124,10 +124,10 @@ async fn every_named_rule_this_service_holds_is_deleted_and_every_other_rule_is_
     // Each row is one request: the rules that exist beforehand (name, state) and the names the
     // request carries. Rows span a single name, several names, every held name, a name no rule
     // answers to, a mixture of held and unknown names, the same name twice, a disabled rule, a
-    // one-character name, a 128-character name and a name carrying the spaces and punctuation
-    // `^[\x20-\x7E]+$` allows.
+    // one-character name, a 128-character name and a name carrying the punctuation a rule name
+    // admits.
     let long_name = "n".repeat(128);
-    let odd_name = "My rule (v2) / high-cardinality";
+    let odd_name = "My_rule(v2)/high-cardinality";
     let rows: Vec<Row> = vec![
         row("one held rule", &[("one", "ENABLED")], &["one"]),
         row("one held DISABLED rule", &[("off", "DISABLED")], &["off"]),
@@ -153,7 +153,7 @@ async fn every_named_rule_this_service_holds_is_deleted_and_every_other_rule_is_
         row(
             "a held name and two unknown ones",
             &[("held", "DISABLED")],
-            &["unknown one", "held", "unknown two"],
+            &["unknown-one", "held", "unknown-two"],
         ),
         row(
             "the same held name twice",
@@ -172,11 +172,11 @@ async fn every_named_rule_this_service_holds_is_deleted_and_every_other_rule_is_
             &[long_name.as_str()],
         ),
         row(
-            "a name with the spaces and punctuation the pattern allows",
+            "a name with the punctuation a rule name admits",
             &[(odd_name, "ENABLED"), ("other", "ENABLED")],
             &[odd_name],
         ),
-        row("no rule configured at all", &[], &["nothing here"]),
+        row("no rule configured at all", &[], &["nothing-here"]),
     ];
 
     for Row { case, held, named } in &rows {
@@ -252,7 +252,7 @@ async fn a_deleted_rule_takes_its_tags_with_it_and_its_name_can_be_created_again
         (
             "a disabled rule with one tag",
             json!({
-                "RuleName": "tagged once",
+                "RuleName": "tagged-once",
                 "RuleDefinition": definition(),
                 "RuleState": "DISABLED",
                 "Tags": [{"Key": "team", "Value": "observability"}],
@@ -261,7 +261,7 @@ async fn a_deleted_rule_takes_its_tags_with_it_and_its_name_can_be_created_again
         (
             "an enabled rule with two tags, evaluated on transformed logs",
             json!({
-                "RuleName": "tagged twice",
+                "RuleName": "tagged-twice",
                 "RuleDefinition": definition(),
                 "RuleState": "ENABLED",
                 "ApplyOnTransformedLogs": true,

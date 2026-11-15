@@ -1513,3 +1513,20 @@ mod lambda_delivery_grant_is_each_sources_own;
 // `clippy::doc_lazy_continuation` asks of a doc list item, so the lint is allowed for the
 // whole target. An inner attribute, like an inner doc comment, is legal only before the first
 // item, so it stands in this header rather than in the list below.
+// per suite file under `tests/all/`, sorted by name, and no other line: no prose between the
+// pairs, no blank line, and nothing after the last pair. Put a new suite at
+// `tests/all/<name>.rs` and insert its pair where its name sorts to, so two branches landing
+// at once insert two lines in two places and have no prose here to duplicate, re-word or
+// mistype. What a suite covers, and why it drives the assembled router rather than one
+// service crate, belongs in that suite's OWN module header, where it is read beside the test
+// it explains; a note about THIS file belongs in `all/appended_notes.rs`,
+// `all/appended_header_notes.rs`, `all/appended_notes_tail.rs` or `all/appended_prose.rs`,
+// each declared below like any other file.
+// of two landings can leave one there. A suite file no `mod` names is compiled nowhere and
+// its tests never run; a suite left at the top level of `tests/` fails the build; and a
+// second `mod` for one name is `E0428`. `tests/all.rs` is a test-target CRATE ROOT, so a
+// bare `mod` would resolve to a SIBLING of this file, which the layout check refuses: the
+// `#[path]` above each `mod` is what points the declaration into `tests/all/`. Some of the
+// files below are shared harnesses or probes rather than suites; every one of them is
+// declared, because a file no declaration names is compiled nowhere.
+// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` pin every rule

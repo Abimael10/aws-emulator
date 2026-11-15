@@ -183,7 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every rule below is prose the model carries no constraint for, so the request
         // reaches this handler having satisfied the modelled ones already: `RuleName`'s
         // 1..128 length and `^[\x20-\x7E]+$` pattern, `RuleDefinition`'s 1..8192 length and
-        // `^[\x00-\x7F]+$` pattern, and `RuleState`'s 1..32 length. None is re-checked here.
+        // `^[\x00-\x7F]+$` pattern, and `RuleState`'s 1..32 length. None is re-checked here —
+        // but the service's own rule-name syntax is NARROWER than that pattern, which is why
+        // the name is judged against it below.
+        validate_rule_name(&input.rule_name)?;
         let rule_state = rule_state_of(input.rule_state.as_deref())?;
         validate_definition(&input.rule_definition)?;
         validate_tags(input.tags.as_deref())?;
@@ -292,6 +295,21 @@ fn rule_state_of(rule_state: Option<&str>) -> Result<String, PutInsightRuleError
         crate::state::INSIGHT_RULE_ENABLED,
         crate::state::INSIGHT_RULE_DISABLED
     )))
+}
+
+/// Refuse a `RuleName` that is not a Contributor Insights rule name.
+///
+/// "A unique name for the rule." (`PutInsightRuleInput$RuleName`) — the model constrains the
+/// member to 1..128 printable-ASCII characters, a span that admits the space, while the
+/// service's own rule-name syntax does not (`crate::state::insight_rule_name_refusal`): a
+/// value outside that syntax names a rule this service can hold none under, so the write is
+/// refused as the bad parameter value it is rather than stored under a name the batch
+/// operations would then report back as unusable.
+fn validate_rule_name(rule_name: &str) -> Result<(), PutInsightRuleError> {
+    match crate::state::insight_rule_name_refusal(rule_name) {
+        None => Ok(()),
+        Some(message) => Err(invalid_parameter_value(message)),
+    }
 }
 
 /// "You can associate as many as 50 tags with a rule." (`PutInsightRuleInput$Tags`) — the

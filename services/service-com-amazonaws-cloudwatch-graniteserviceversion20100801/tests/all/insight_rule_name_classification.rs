@@ -5,8 +5,9 @@
 //! `DescribeInsightRules`.
 //!
 //! The rule under test: **an entry of a batch's rule-name array that is not a rule NAME —
-//! outside the 1..128 length or the printable-ASCII pattern `InsightRuleName` declares
-//! (`smithy_query(query="shape",shape="InsightRuleName")`) — is reported as that entry's own
+//! outside the 1..128 length or the printable-ASCII-without-the-space grammar a Contributor
+//! Insights rule name is built from (narrower than `InsightRuleName`'s own `@pattern`,
+//! `smithy_query(query="shape",shape="InsightRuleName")`) — is reported as that entry's own
 //! `Failures` entry of the invalid-parameter class on an HTTP 200, not as a refusal of the
 //! request; every other name in the same batch is still resolved, so a held rule still moves
 //! and a legal-but-unknown name is still reported as the resource that is not there.** "If the
@@ -115,13 +116,14 @@ struct IllegalName {
     fault: String,
 }
 
-/// The ways one entry can miss the grammar `InsightRuleName` declares — `length {min 1, max
-/// 128}` and `pattern ^[\x20-\x7E]+$` — each row a different one: no characters at all, one
-/// character more than the maximum, and four bytes outside the printable-ASCII span (the two
-/// control bytes either side of it, the tab and the newline a client's own input can carry, and
-/// a character above ASCII).
+/// The ways one entry can miss the grammar a rule name is built from — 1..128 characters, each
+/// of them printable ASCII other than the space — each row a different one: no characters at
+/// all, one character more than the maximum, and four bytes outside the admitted span (the two
+/// control bytes either side of printable ASCII, the tab a client's own input can carry, and a
+/// character above ASCII). The SPACE the model's pattern admits and the grammar does not has a
+/// table of its own in `insight_rule_name_grammar.rs`.
 fn illegal_names() -> Vec<IllegalName> {
-    let pattern = r"[\x20-\x7E]+";
+    let pattern = r"[\x21-\x7E]+";
     let outside_the_pattern = |case: &'static str, value: String| IllegalName {
         case,
         fault: format!("RuleName \"{value}\" does not match the pattern: {pattern}"),
@@ -208,7 +210,7 @@ async fn the_position_and_the_number_of_unusable_entries_do_not_change_the_repor
     // The same three-name batch with the unusable entry first, in the middle and last, then a
     // batch carrying two of them: each entry is reported in REQUEST order, about itself.
     let illegal = "\u{1}bad-rule";
-    let fault = format!("RuleName \"{illegal}\" does not match the pattern: [\\x20-\\x7E]+");
+    let fault = format!("RuleName \"{illegal}\" does not match the pattern: [\\x21-\\x7E]+");
     let empty_fault = "RuleName cannot be an empty string.";
     let rows: Vec<(&str, Vec<&str>, Vec<Value>)> = vec![
         (
@@ -286,15 +288,15 @@ async fn the_position_and_the_number_of_unusable_entries_do_not_change_the_repor
 #[tokio::test]
 async fn a_name_inside_the_grammar_is_resolved_rather_than_reported_as_invalid() {
     // The other side of the same bounds: the shortest and the longest name the length admits,
-    // and names built from the ends and the punctuation of the printable-ASCII span — each one
+    // and names built from the ends and the punctuation of the admitted span — each one
     // held, so a legal name must move rather than come back as an entry.
     let longest = "n".repeat(128);
-    let ends_of_the_span = format!("{}{}", '\u{20}', '\u{7e}');
+    let ends_of_the_span = format!("{}{}", '\u{21}', '\u{7e}');
     let legal_names: Vec<(&str, &str)> = vec![
         ("one character", "r"),
         ("the longest name the length admits", longest.as_str()),
-        ("the two ends of the pattern's span", ends_of_the_span.as_str()),
-        ("spaces and punctuation", "My rule (v2) / high-cardinality"),
+        ("the two ends of the admitted span", ends_of_the_span.as_str()),
+        ("punctuation between words", "My_rule(v2)/high-cardinality"),
         ("digits and symbols only", "99.9%_$#@!"),
     ];
 

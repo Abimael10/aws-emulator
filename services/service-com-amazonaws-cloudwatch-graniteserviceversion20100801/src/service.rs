@@ -268,14 +268,14 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 ),
             ),
         );
-        // The two operations that MOVE a rule's state report one entry of `Failures` per rule
-        // name they could not write the state on, so they are served through the same wrapper
-        // for its OTHER decision: a `RuleNames` entry whose characters or length the member's
-        // own constraints do not admit is a per-entry outcome of the batch
-        // ([`is_unenforced_constraint`]), judged inside the handler's walk, so the request is
-        // SERVED — the rest of the batch takes effect and the offending entry comes back
-        // classified. Every refusal they do make keeps the service-wide wording
-        // ([`the_service_wide_refusal`]), so an absent `RuleNames` reads exactly as before.
+        // The three BATCH rule operations report one entry of `Failures` per rule name they
+        // could not act on, so they are served through the same wrapper for its OTHER
+        // decision: a `RuleNames` entry whose characters or length the member's own constraints
+        // do not admit is a per-entry outcome of the batch ([`is_unenforced_constraint`]),
+        // judged inside the handler's walk, so the request is SERVED — the rest of the batch
+        // takes effect and the offending entry comes back classified. Every refusal they do
+        // make keeps the service-wide wording ([`the_service_wide_refusal`]), so an absent
+        // `RuleNames` reads exactly as before.
         overridden.add_operation(
             "EnableInsightRules",
             served(
@@ -294,6 +294,16 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                     crate::ops::disable_insight_rules::DisableInsightRules::new(Arc::clone(
                         &engine,
                     )),
+                    the_service_wide_refusal,
+                ),
+            ),
+        );
+        overridden.add_operation(
+            "DeleteInsightRules",
+            served(
+                &engine,
+                JudgingTheValuesThisServiceEnforces::new(
+                    crate::ops::delete_insight_rules::DeleteInsightRules::new(Arc::clone(&engine)),
                     the_service_wide_refusal,
                 ),
             ),
@@ -919,7 +929,7 @@ fn is_period(path: &str) -> bool {
 /// list — so each holds wherever that member is submitted: for
 /// the namespace, inside a `MetricDataQuery` as well as at the top of a publish; for the
 /// template name, at any position of the `ManagedRules` array; for the rule name, at any
-/// position of the `RuleNames` array of either operation that moves a rule's state.
+/// position of the `RuleNames` array of every batch operation that acts on rules by name.
 fn is_unenforced_constraint(violation: &aws_smithy_schema_server::Violation) -> bool {
     (matches!(
         violation.kind,

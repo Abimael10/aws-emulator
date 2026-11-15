@@ -314,22 +314,22 @@ fn delete_row(case: &'static str, held: &[&str], named: &[&str]) -> DeleteRow {
 async fn deleting_a_rule_that_is_not_there_reports_no_failure_while_moving_its_state_does() {
     // Rows span one unknown name with nothing held, an unknown name beside a held one, the same
     // unknown name twice, a one-character name, the modelled 128-character maximum, a name
-    // carrying the punctuation `^[\x20-\x7E]+$` allows, and a request naming only held rules.
+    // carrying the punctuation a rule name admits, and a request naming only held rules.
     let long_name = "n".repeat(128);
     let rows: Vec<DeleteRow> = vec![
         delete_row("one unknown name, nothing held", &[], &["no-such-rule"]),
         delete_row(
             "a held name between two unknown ones",
             &["held"],
-            &["ghost one", "held", "ghost two"],
+            &["ghost-one", "held", "ghost-two"],
         ),
         delete_row("the same unknown name twice", &[], &["ghost", "ghost"]),
         delete_row("a one-character unknown name", &["held"], &["x"]),
         delete_row("a 128-character unknown name", &[], &[long_name.as_str()]),
         delete_row(
-            "an unknown name with the punctuation the pattern allows",
+            "an unknown name with the punctuation a rule name admits",
             &[],
-            &["My rule (v2) / high-cardinality"],
+            &["My_rule(v2)/high-cardinality"],
         ),
         delete_row("every named rule held", &["alpha"], &["alpha"]),
     ];

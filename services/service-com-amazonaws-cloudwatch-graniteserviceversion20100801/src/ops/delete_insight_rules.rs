@@ -170,10 +170,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Permanently deletes the specified Contributor Insights rules."
         // (`DeleteInsightRules`) — every named rule this service holds goes away with
-        // everything stored under it, so a later read reports no such rule, and a name it
-        // holds no rule for is reported back as one entry of `Failures` rather than failing
-        // the whole request. The walk is `crate::state`'s, beside the one the operations that
-        // enable and disable rules share.
+        // everything stored under it, so a later read reports no such rule, while an entry
+        // that is not a rule NAME at all is reported back as one entry of `Failures` rather
+        // than failing the whole request ("If the operation could not process one of the
+        // rules, the following data is returned for each of those rules.", `PartialFailure`).
+        // The walk is `crate::state`'s, beside the one the operations that enable and disable
+        // rules share, so one entry is judged the same way whichever of them was called.
         let mut store = state.lock();
         let failures = store.delete_insight_rules(&input.rule_names);
 

@@ -144,9 +144,9 @@ struct NameRow {
 #[tokio::test]
 async fn a_name_no_rule_answers_to_is_reported_as_the_rule_that_is_not_there() {
     // Rows span the name's length (one character and the modelled 128-character maximum), the
-    // characters `^[\x20-\x7E]+$` allows, a name differing from a held rule only in case, a
-    // request mixing held and unknown names, one repeating an unknown name, and one naming only
-    // rules that are held.
+    // characters a rule name may be built from, a name differing from a held rule only in case,
+    // a request mixing held and unknown names, one repeating an unknown name, and one naming
+    // only rules that are held.
     let long_name = "n".repeat(128);
     let rows: Vec<NameRow> = vec![
         NameRow {
@@ -165,9 +165,9 @@ async fn a_name_no_rule_answers_to_is_reported_as_the_rule_that_is_not_there() {
             named: vec![long_name.clone()],
         },
         NameRow {
-            case: "an unknown name carrying the spaces and punctuation the pattern allows",
+            case: "an unknown name carrying the punctuation a rule name admits",
             held: Vec::new(),
-            named: vec!["My rule (v2) / high-cardinality".to_string()],
+            named: vec!["My_rule(v2)/high-cardinality".to_string()],
         },
         NameRow {
             case: "an unknown name differing from a held rule only in case",
@@ -178,9 +178,9 @@ async fn a_name_no_rule_answers_to_is_reported_as_the_rule_that_is_not_there() {
             case: "a held name between two unknown ones",
             held: vec!["held".to_string()],
             named: vec![
-                "ghost one".to_string(),
+                "ghost-one".to_string(),
                 "held".to_string(),
-                "ghost two".to_string(),
+                "ghost-two".to_string(),
             ],
         },
         NameRow {

@@ -302,11 +302,17 @@ const INVALID_INSIGHT_RULE_NAME_EXCEPTION: &str = "InvalidParameterException";
 const INVALID_INSIGHT_RULE_NAME_FAILURE_CODE: &str = "INVALID_RULE_NAME";
 
 /// The characters a Contributor Insights rule name may be built from, as the expression a
-/// client re-validates a name against: `InsightRuleName`'s modelled `@pattern`
-/// (`smithy_query(query="shape",shape="InsightRuleName")`) without the anchors Smithy wraps a
-/// whole-value match in — the rendering this service publishes an expression in
-/// (`service_common::validation::unanchored`).
-const INSIGHT_RULE_NAME_PATTERN: &str = r"^[\x20-\x7E]+$";
+/// client re-validates a name against, rendered without the anchors Smithy wraps a whole-value
+/// match in (`service_common::validation::unanchored`).
+///
+/// This is the SERVICE's own rule-name syntax, which is narrower than the member constraint
+/// `InsightRuleName` declares (`@pattern ^[\x20-\x7E]+$`,
+/// `smithy_query(query="shape",shape="InsightRuleName")`): that pattern admits `\x20`, the
+/// space, and a value carrying one is not a rule name CloudWatch holds a rule under — it is
+/// reported back as the invalid value it is rather than refused by the model's constraint. So
+/// the grammar is the printable-ASCII span the model admits with its first character, the
+/// space, taken out: `!` through `~`.
+const INSIGHT_RULE_NAME_PATTERN: &str = r"^[\x21-\x7E]+$";
 
 /// How CloudWatch states a rule name carrying no characters at all: wholly fixed text, nothing
 /// of the member interpolated — there is no value to echo.
@@ -314,10 +320,10 @@ pub const EMPTY_INSIGHT_RULE_NAME: &str = "RuleName cannot be an empty string.";
 
 /// Why `rule_name` is not a Contributor Insights rule NAME, or `None` when it is one.
 ///
-/// The legality of a rule name is the one grammar `InsightRuleName` declares — 1..128
-/// characters, each of them printable ASCII — so a value outside it is not a name this service
-/// could hold a rule under, whichever member carried it and whichever batch operation was
-/// called. Each of the three ways a value misses that grammar is stated as the class it is: no
+/// The legality of a rule name is ONE grammar — 1..128 characters, each of them printable
+/// ASCII and none of them the space ([`INSIGHT_RULE_NAME_PATTERN`]) — so a value outside it is
+/// not a name this service could hold a rule under, whichever member carried it and whichever
+/// operation was called. Each of the three ways a value misses that grammar is stated as the class it is: no
 /// characters at all ([`EMPTY_INSIGHT_RULE_NAME`]), more characters than a name may carry, and
 /// characters the grammar does not admit — the last quoting the expression a client
 /// re-validates against, which is what locates the repair.
@@ -340,11 +346,28 @@ pub fn insight_rule_name_fault(rule_name: &str) -> Option<String> {
     None
 }
 
-/// Whether `character` is one the rule-name grammar admits: printable ASCII, which is the span
-/// `^[\x20-\x7E]+$` names — the space through the tilde, and nothing else (no control byte, no
-/// character outside ASCII).
+/// Whether `character` is one the rule-name grammar admits: printable ASCII other than the
+/// space, which is the span [`INSIGHT_RULE_NAME_PATTERN`] names — `!` through `~`, and nothing
+/// else (no space, no control byte, no character outside ASCII).
 fn is_insight_rule_name_character(character: char) -> bool {
-    matches!(character, '\x20'..='\x7E')
+    matches!(character, '\x21'..='\x7E')
+}
+
+/// How CloudWatch refuses a request that WRITES a Contributor Insights rule under a value that
+/// is not a rule name ([`insight_rule_name_fault`]), or `None` when the value is one.
+///
+/// Such a write names a rule the service could never hold, so it is refused as a bad value for
+/// the member that carried the name — stated in the coded form this service's Contributor
+/// Insights refusals use ([`EMPTY_RULE_NAMES`], `INVALID_RULE_BODY`): the condition's own code,
+/// which here is the one a batch operation reports the same fault under
+/// ([`INVALID_INSIGHT_RULE_NAME_FAILURE_CODE`]), then why the value is not a name.
+///
+/// Refusing the write is what keeps the two reports consistent: no rule is ever stored under a
+/// name a batch operation would then report back as unusable.
+#[must_use]
+pub fn insight_rule_name_refusal(rule_name: &str) -> Option<String> {
+    insight_rule_name_fault(rule_name)
+        .map(|fault| format!("{INVALID_INSIGHT_RULE_NAME_FAILURE_CODE}: {fault}"))
 }
 
 /// The one `Failures` entry a batch Contributor Insights rule operation reports for a member
@@ -991,20 +1014,28 @@ impl State {
     /// for one deletion. A rule `PutManagedInsightRules` enabled is removed by the same walk:
     /// "The rules can be enabled, disabled, and deleted using EnableInsightRules,
     /// DisableInsightRules, and DeleteInsightRules." (`PutManagedInsightRules`).
+    ///
+    /// Each name is judged ON ITS OWN, exactly as the walk that moves a rule's state judges one
+    /// ([`State::set_insight_rule_state`]), which is what separates the three outcomes a
+    /// per-entry report exists to distinguish:
+    ///
+    /// * a value that is not a rule NAME at all ([`insight_rule_name_fault`]) deletes nothing
+    ///   and is reported as the invalid value it is ([`illegal_insight_rule_name_failure`]) —
+    ///   the request carries a fault the client has to repair;
+    /// * a legal name this store holds a rule under is deleted, with no entry;
+    /// * a legal name this store holds no rule for is no entry either: a name that names
+    ///   nothing is already in the end state the request asks for, which is why this walk
+    ///   reports nothing where the state-moving one reports the resource that is not there (a
+    ///   state cannot be written on a rule that is not there, while a deletion of one is done).
     pub fn delete_insight_rules(&mut self, rule_names: &[String]) -> Vec<PartialFailure> {
+        let mut failures: Vec<PartialFailure> = Vec::new();
         for rule_name in rule_names {
+            if let Some(fault) = insight_rule_name_fault(rule_name) {
+                failures.push(illegal_insight_rule_name_failure(rule_name, fault));
+                continue;
+            }
             self.insight_rules.remove(rule_name);
         }
-        // "An array listing the rules that could not be deleted. You cannot delete built-in
-        // rules." (`DeleteInsightRulesOutput$Failures`) — a DELETE is reported on by what it
-        // left behind, not by what it found: a name this store holds no rule for already names
-        // nothing, which is the end state the request asks for, so the walk above reached it
-        // and there is no failure to report. Every rule this store does hold was put by a
-        // caller or enabled from a managed-rule template, and this operation deletes all of
-        // those, so nothing a request names is a rule it could not delete. That is why the
-        // operations that MOVE a rule's state report the same name as a failure
-        // ([`State::set_insight_rule_state`]) and this one does not: a state cannot be written
-        // on a rule that is not there, while a deletion of one is already done.
-        Vec::new()
+        failures
     }
 }
