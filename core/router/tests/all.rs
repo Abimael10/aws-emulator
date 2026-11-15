@@ -1256,3 +1256,16 @@ mod zz_probe_whole_emulator;
 // `all/every_suite_file_is_declared.rs` pin those rules, for this file and for every
 // service crate's `tests/all.rs`, so check there rather than leaving a note here;
 // `all/appended_notes.rs` keeps the notes earlier landings had appended to this file.
+// cross-service suites, and nothing else. One `#[path = "all/<name>.rs"]` / `mod <name>;`
+// pair per file under `tests/all/`, sorted by name, and no other line. Put a new suite at
+// `tests/all/<name>.rs` and insert its pair in sorted position; what that suite covers
+// belongs in its own module header, and a note about THIS file in `all/appended_notes.rs`.
+// EVERY comment here is an ordinary one, this header included: a file no declaration names
+// is compiled nowhere, a name declared twice fails this target, and a doc comment for the
+// module past the first item fails it too — so with none of those anywhere in the file, no
+// appended or merged copy of one of its lines can break it. The `all_rs_*` suites,
+// `all/every_suite_file_is_declared.rs` and
+// `all/declaration_roots_are_canonical_and_complete.rs` check all of it, here and in every
+// service crate's `tests/all.rs`. An inner attribute is legal only before the first item,
+// so the one this target needs stands here rather than in the list.
+#![allow(clippy::doc_lazy_continuation)]

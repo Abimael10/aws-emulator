@@ -321,6 +321,12 @@ pub const PERMISSION_ARN_RESOURCE_PREFIX: &str = "permission/";
 /// entries the store is seeded with.
 pub const PERMISSION_TYPE_CUSTOMER_MANAGED: &str = "CUSTOMER_MANAGED";
 
+/// The `PermissionTypeFilter` value that keeps every kind of managed permission, and
+/// the one a read that names no filter is answered under: "ALL – returns both Amazon
+/// Web Services managed permissions and customer managed permissions. If you don't
+/// specify this parameter, the default is All" (`ListPermissions$permissionType`).
+pub const PERMISSION_TYPE_FILTER_ALL: &str = "ALL";
+
 /// The `PermissionFeatureSet` of a permission created through the RAM API: the one
 /// "that supports all functionality". The other two values describe a permission RAM
 /// wrote from an attached resource-based policy
@@ -1997,6 +2003,35 @@ pub fn permission_arn_rejection(member: &str, arn: &str) -> Option<String> {
             truncate(arn)
         )
     })
+}
+
+/// Whether a managed permission of this `PermissionType` passes a
+/// `PermissionTypeFilter`.
+///
+/// Worded like [`resource_region_scope_matches`]: the filter's `ALL` keeps both kinds,
+/// every other value is one of the `PermissionType` values a permission carries, and a
+/// read that names no filter keeps everything
+/// ([`PERMISSION_TYPE_FILTER_ALL`]).
+pub fn permission_type_matches(filter: Option<&str>, permission_type: &str) -> bool {
+    match filter.unwrap_or(PERMISSION_TYPE_FILTER_ALL) {
+        PERMISSION_TYPE_FILTER_ALL => true,
+        requested => requested == permission_type,
+    }
+}
+
+/// Whether the managed permission `arn` names is one a request signed for `region`
+/// sees.
+///
+/// A customer managed permission "is created in the Amazon Web Services Region in
+/// which you call the operation" (`CreatePermission$name`) and its ARN carries that
+/// Region ([`permission_arn`]), so it belongs to that Region alone. A permission Amazon
+/// Web Services manages is RAM's own and its ARN names no Region
+/// ([`aws_managed_permission_arn`]), so every Region sees it.
+pub fn permission_visible_in_region(arn: &str, region: &str) -> bool {
+    match arn_region(arn) {
+        Some("") | None => true,
+        Some(permission_region) => permission_region == region,
+    }
 }
 
 /// The message of the `UnknownResourceException` an operation on a managed permission

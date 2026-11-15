@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPermissions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPermissions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the managed permissions [`crate::state`] holds, one `@paginated` page at a
+//! time, in permission ARN order.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPermissions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every permission the store holds is reported once, at its DEFAULT version — the
+//! version a read that names none is about ([`crate::state::PermissionRecord::version`])
+//! — because what this read lists is the permissions available to a share rather than
+//! the versions of one of them (`ListPermissionVersions` lists those). The store holds
+//! both populations in one map: the customer managed permissions `CreatePermission`
+//! minted and the AWS managed catalog RAM ships
+//! ([`crate::state::AWS_MANAGED_PERMISSIONS`]), so both are listed, and a permission is
+//! kept only when it passes the request's filters:
+//!
+//! * `permissionType` keeps one kind of permission, or both under `ALL`, which is also
+//!   what a request naming no filter gets
+//!   ([`crate::state::permission_type_matches`]);
+//! * `resourceType` keeps the permissions that apply to that one resource type, matched
+//!   without regard to case or to the separators inside the resource code
+//!   ([`crate::state::resource_type_matches`]), because the member "is not case
+//!   sensitive". A well-formed type no permission applies to selects none of them, so
+//!   the page is empty rather than refused.
+//!
+//! A permission belongs to the Region it was created in, which its ARN carries, so a
+//! read reports the ones this Region holds plus the AWS managed catalog, whose ARNs name
+//! no Region at all ([`crate::state::permission_visible_in_region`]).
+//!
+//! A pure read: it reports what the store holds and writes nothing at all.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +195,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPermissions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPermissionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPermissions"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPermissionsErrorModeled::ServerInternalException(ServerInternalException {
+                message: "the managed permission store is unavailable".to_string(),
+            })
+        })?;
+
+        // The filter admits one of the modelled `PermissionTypeFilter` values, so a
+        // value that is none of them names no kind of permission to keep.
+        if let Some(requested) = input.permission_type.as_deref() {
+            if !crate::ops::types::PERMISSION_TYPE_FILTER_VALUES.contains(&requested) {
+                return Err(ListPermissionsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: format!(
+                            "permissionType must be one of [{}]",
+                            crate::ops::types::PERMISSION_TYPE_FILTER_VALUES.join(", ")
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let page_size = crate::state::page_size(input.max_results);
+        let start = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_permission_cursor(token).ok_or_else(|| {
+                ListPermissionsErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: "nextToken is not a pagination token issued by ListPermissions"
+                            .to_string(),
+                    },
+                )
+            })?),
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        let store = state.lock();
+
+        let mut permissions = Vec::with_capacity(page_size.min(store.permissions.len()));
+        let mut next_token = None;
+        // The store keys permissions by ARN, so a token naming an ARN starts this page
+        // at the first permission at or after it.
+        let listed = match &start {
+            Some(arn) => store.permissions.range(arn.clone()..),
+            None => store.permissions.range::<String, _>(..),
+        };
+        for (arn, permission) in listed {
+            if !crate::state::permission_visible_in_region(arn, &region) {
+                continue;
+            }
+            if !crate::state::permission_type_matches(
+                input.permission_type.as_deref(),
+                &permission.permission_type,
+            ) {
+                continue;
+            }
+            if input.resource_type.as_deref().is_some_and(|wanted| {
+                !crate::state::resource_type_matches(&permission.resource_type, wanted)
+            }) {
+                continue;
+            }
+            // Every permission this store holds carries its default version, so one
+            // that does not is a corrupt record rather than a permission to leave out
+            // of the page.
+            let version = permission.version(None).ok_or_else(|| {
+                ListPermissionsErrorModeled::ServerInternalException(ServerInternalException {
+                    message: format!(
+                        "the managed permission {arn} carries no version {}",
+                        permission.default_version
+                    ),
+                })
+            })?;
+            // The first permission that does not fit becomes the next page's start, and
+            // only then is a `nextToken` emitted — the last page carries none.
+            if permissions.len() == page_size {
+                next_token = Some(crate::state::encode_arn_cursor(arn));
+                break;
+            }
+            permissions.push(permission.summary(version));
+        }
+
+        Ok(ListPermissionsOutput {
+            permissions: Some(permissions),
+            next_token,
+        })
     }
 }

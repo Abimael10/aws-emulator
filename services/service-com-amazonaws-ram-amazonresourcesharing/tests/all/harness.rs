@@ -58,14 +58,25 @@ pub fn store(
 /// A request signed for `ram` in [`REGION`], the signal the router routes on and the
 /// handlers read the region from.
 pub fn request(method: &str, uri: &str, body: Option<&Value>) -> http::Request<bytes::Bytes> {
+    request_in_region(REGION, method, uri, body)
+}
+
+/// The same request signed for `region` instead, for a case that reads what one Region
+/// holds from another.
+pub fn request_in_region(
+    region: &str,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+) -> http::Request<bytes::Bytes> {
     let mut builder = http::Request::builder()
         .method(method)
         .uri(uri)
-        .header("host", format!("ram.{REGION}.amazonaws.com"))
+        .header("host", format!("ram.{region}.amazonaws.com"))
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDRAMTEST/20260101/{REGION}/ram/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDRAMTEST/20260101/{region}/ram/aws4_request, \
                  SignedHeaders=host, Signature=0000"
             ),
         );
@@ -86,7 +97,20 @@ pub async fn call(
     uri: &str,
     body: Option<&Value>,
 ) -> (u16, Value) {
-    let response = router.dispatch(request(method, uri, body)).await;
+    call_in_region(router, REGION, method, uri, body).await
+}
+
+/// [`call`], signed for `region` rather than for [`REGION`].
+pub async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+) -> (u16, Value) {
+    let response = router
+        .dispatch(request_in_region(region, method, uri, body))
+        .await;
     let status = response.status().as_u16();
     let error_type = response
         .headers()
