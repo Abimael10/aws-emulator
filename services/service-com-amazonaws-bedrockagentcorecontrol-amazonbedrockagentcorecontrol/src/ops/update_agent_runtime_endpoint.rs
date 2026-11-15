@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAgentRuntimeEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAgentRuntimeEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAgentRuntimeEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes a stored agent runtime endpoint IN PLACE on its runtime's record in
+//! [`crate::state`]: the runtime version the endpoint points at and its description, plus
+//! the `UPDATING` -> `READY` transition the clock owes the shift onto that version. The
+//! endpoint keeps serving the version it was serving until that transition is due, so
+//! `liveVersion` and `targetVersion` disagree for as long as the shift is in flight.
+//!
+//! A change is served only on a SETTLED endpoint: one whose create or whose previous
+//! shift the clock still owes a transition for is in a transient status, and a second
+//! shift asked for then is this operation's modelled 409 — the endpoint has one live
+//! version, so two shifts cannot be in flight at once. An endpoint is addressed only
+//! THROUGH its runtime, so a runtime this account does not hold, an endpoint name that
+//! runtime does not hold and an `agentRuntimeVersion` the runtime never published are
+//! each the modelled 404. A request naming no version leaves the pin where it is, and one
+//! naming no description leaves the description where it is.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +186,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAgentRuntimeEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAgentRuntimeEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAgentRuntimeEndpoint"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAgentRuntimeEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the agent runtime store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the endpoint
+        // that token already changed, rather than starting a second shift. Decided
+        // BEFORE the status gate below: a retry of the request that started the shift
+        // is the same request, not a competing one.
+        if let Some((agent_runtime_id, endpoint_name)) =
+            store.replayed_runtime_endpoint_result(Self::NAME, input.client_token.as_deref())
+        {
+            if let Some(runtime) = store.agent_runtimes.get(&agent_runtime_id) {
+                if let Some(endpoint) = runtime.endpoints.get(&endpoint_name) {
+                    return Ok(endpoint_output(&runtime.agent_runtime_arn, endpoint, now));
+                }
+            }
+        }
+
+        // An endpoint is addressed only THROUGH its runtime, so the runtime that would
+        // hold it — and the version the endpoint would point at, which only that runtime
+        // publishes — are reported as the agent they are.
+        let not_found = || {
+            UpdateAgentRuntimeEndpointErrorModeled::ResourceNotFoundException(
+                crate::state::agent_not_found_for_endpoint(&input.agent_runtime_id),
+            )
+        };
+        let runtime = store
+            .agent_runtimes
+            .get(&input.agent_runtime_id)
+            .ok_or_else(not_found)?;
+        let endpoint = runtime.endpoints.get(&input.endpoint_name).ok_or_else(|| {
+            UpdateAgentRuntimeEndpointErrorModeled::ResourceNotFoundException(
+                crate::state::agent_runtime_endpoint_not_found(&input.endpoint_name),
+            )
+        })?;
+
+        // One endpoint serves ONE version at a time, so a change is taken only while the
+        // endpoint is settled: a create or an earlier shift the clock still owes a
+        // transition for leaves it in a transient status, and a second shift asked for
+        // then is the modelled conflict rather than a shift that would overwrite the
+        // one in flight.
+        let status = endpoint.status_at(now);
+        if status != crate::state::STATUS_READY {
+            return Err(UpdateAgentRuntimeEndpointErrorModeled::ConflictException(
+                crate::state::agent_runtime_endpoint_status_conflict(status),
+            )
+            .into());
+        }
+
+        // `agentRuntimeVersion` names the version the endpoint is to serve from, so it
+        // has to be one the runtime actually published; naming none leaves the pin where
+        // it is, because an update changes what it names and nothing else.
+        let target_version = match input.agent_runtime_version.as_deref() {
+            Some(requested) => {
+                runtime
+                    .version_for(Some(requested))
+                    .ok_or_else(not_found)?
+                    .version
+            }
+            None => endpoint.target_version,
+        };
+        // Until the shift is due the endpoint keeps serving what it serves now, which a
+        // settled endpoint reports as the version it points at.
+        let live_version = endpoint.target_version;
+        // The endpoint fronts that runtime version, so it cannot be ready before the
+        // version it will serve is: its own span runs from the version's settle instant
+        // when that is still ahead.
+        let version_settles_at = runtime
+            .versions
+            .get(&target_version)
+            .map_or(now, |version| version.settles_at);
+        let agent_runtime_arn = runtime.agent_runtime_arn.clone();
+
+        // The endpoint is taken MUTABLY only here, the one borrow this call writes
+        // through, so nothing below can be reported as changed without being stored.
+        let endpoint = store
+            .agent_runtimes
+            .get_mut(&input.agent_runtime_id)
+            .and_then(|runtime| runtime.endpoints.get_mut(&input.endpoint_name))
+            .ok_or_else(not_found)?;
+        endpoint.target_version = target_version;
+        endpoint.live_version = Some(live_version);
+        if let Some(description) = input.description {
+            endpoint.description = Some(description);
+        }
+        endpoint.last_updated_at = now;
+        endpoint.transient_status = crate::state::STATUS_UPDATING.to_string();
+        endpoint.settled_status = crate::state::STATUS_READY.to_string();
+        endpoint.settles_at =
+            version_settles_at.max(now) + crate::state::AGENT_RUNTIME_ENDPOINT_SETTLE_DELAY;
+        // A shift the clock drives to READY has no failure to report, so a failure an
+        // earlier attempt left behind does not outlive it.
+        endpoint.failure_reason = None;
+        let output = endpoint_output(&agent_runtime_arn, endpoint, now);
+
+        store.remember_runtime_endpoint_client_token(
+            Self::NAME,
+            input.client_token,
+            &input.agent_runtime_id,
+            &input.endpoint_name,
+        );
+
+        Ok(output)
+    }
+}
+
+/// The endpoint as this operation reports it, rendered from the STORED record rather
+/// than from the request, so neither the answer to a fresh request nor the answer to a
+/// replay of one can report a member the record does not hold.
+fn endpoint_output(
+    agent_runtime_arn: &str,
+    endpoint: &crate::state::AgentRuntimeEndpointRecord,
+    now: ::std::time::SystemTime,
+) -> UpdateAgentRuntimeEndpointOutput {
+    UpdateAgentRuntimeEndpointOutput {
+        // The version the endpoint is SERVING: the one it was serving before the shift
+        // until the transition onto the new one is due, and the new one afterwards.
+        live_version: endpoint.live_version_at(now),
+        target_version: Some(endpoint.target_version_string()),
+        agent_runtime_endpoint_arn: endpoint.endpoint_arn.clone(),
+        agent_runtime_arn: agent_runtime_arn.to_string(),
+        status: endpoint.status_at(now).to_string(),
+        created_at: crate::state::timestamp(endpoint.created_at),
+        last_updated_at: crate::state::timestamp(endpoint.last_updated_at),
     }
 }

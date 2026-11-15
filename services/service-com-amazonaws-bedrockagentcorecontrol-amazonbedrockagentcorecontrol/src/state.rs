@@ -776,6 +776,31 @@ pub fn agent_runtime_endpoint_quota_met(agent_runtime_id: &str) -> String {
     )
 }
 
+/// How this service words the conflict a change asked for against an agent
+/// runtime endpoint that is NOT settled is: the operation that was asked for,
+/// and the status it found.
+///
+/// An endpoint reaches `READY` on the clock, so a request arriving while its
+/// create — or an earlier shift of the version it fronts — is still in flight
+/// finds a transient status, and the endpoint's own update models
+/// `ConflictException` (HTTP 409) for exactly that. The sentence is fixed; its
+/// one variable part is the status the request found, spelled as the raw token
+/// its enum declares (`smithy_query shape=AgentRuntimeEndpointStatus`), the
+/// same form the response members carry it in. Nothing of the request is
+/// echoed: the endpoint it names is its own request's, and the remedy — wait
+/// for the change in flight — is the same whichever change asked.
+///
+/// Shared by the handlers rather than written per operation, so no write path
+/// can disagree about how a busy endpoint is refused.
+pub fn agent_runtime_endpoint_status_conflict(status: &str) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "The endpoint is currently being modified by another operation. Current status: \
+             {status}. Wait and try again."
+        )),
+    }
+}
+
 /// One endpoint of an agent runtime: the stable name callers invoke, the runtime
 /// version it points to, the version it is actually serving, and the status the
 /// clock drives.
