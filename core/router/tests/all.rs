@@ -1259,3 +1259,21 @@ mod zz_probe_whole_emulator;
 //! drives the assembled router rather than one service crate, belongs in that suite's own
 //! module header, and the notes earlier landings appended here live in `all/appended_notes.rs`.
 //! every service crate's `tests/all.rs`.
+//! Single integration-test target for the router: the declaration list of its cross-service
+//! suites, and nothing else.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted INTO the sorted list — never
+//! appended past its end, and never with a note beside it. A suite no `mod` names compiles
+//! nowhere and its tests never run, a suite left at the top level of `tests/` fails the build,
+//! and a suite declared twice is `E0428`, which fails every suite in this target.
+//! only place one may stand: past it, `//!` is `E0753` and compiles nothing. Nothing else
+//! belongs below either, not even an ordinary comment — what a suite covers, and why it has
+//! to live in this target rather than in a service crate's own, is stated in that suite's OWN
+//! module header, where it is read beside the test it explains, and the notes landings had
+//! appended to this file live in `all/appended_notes.rs`.
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check those three rules — one declaration
+//! per suite, no inner doc comment past this header, and a list of pairs and nothing else —
+//! for this file and for every service crate's `tests/all.rs`, so a note about any of them
+//! belongs there rather than here.
+//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of
+//! this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what points
+//! each declaration into `tests/all/`.

@@ -110,6 +110,55 @@ pub(crate) async fn call_reporting_errortype(
     (status, errortype, parsed)
 }
 
+/// A SigV4 `Authorization` header naming `access_key_id` and `signing_name`, in [`REGION`] —
+/// [`AUTHORIZATION`] with both of those chosen by the caller.
+///
+/// The access key id is what names the principal a request speaks for, and the signing name
+/// is what the router resolves the service from, so a suite that drives one service AS one
+/// identity needs both: this is the one place either is written. The signature itself is
+/// never read (see [`AUTHORIZATION`]).
+pub(crate) fn authorization_of(access_key_id: &str, signing_name: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/{signing_name}/\
+         aws4_request, SignedHeaders=host;x-amz-date, Signature=0000"
+    )
+}
+
+/// [`call_uri`] signed by `access_key_id` rather than by the account's own published
+/// credential: the same request, naming the principal whose policies decide it.
+pub(crate) async fn call_signed_by(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&Value>,
+) -> (u16, Value) {
+    let payload = match body {
+        Some(body) => {
+            bytes::Bytes::from(serde_json::to_vec(body).expect("the request body serializes"))
+        }
+        None => bytes::Bytes::new(),
+    };
+    let request = http::Request::builder()
+        .method(method)
+        .uri(format!(
+            "https://s3vectors.{REGION}.amazonaws.com{path_and_query}"
+        ))
+        .header("authorization", authorization_of(access_key_id, "s3vectors"))
+        .header("content-type", "application/json")
+        .body(payload)
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let payload = response.into_body();
+    let parsed = if payload.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&payload).unwrap_or(Value::Null)
+    };
+    (status, parsed)
+}
+
 /// The wire error code (`__type`) of an error response, or `""`.
 pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")

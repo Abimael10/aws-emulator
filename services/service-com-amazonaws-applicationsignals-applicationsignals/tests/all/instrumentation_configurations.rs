@@ -74,14 +74,17 @@ const PROBE: &str = "PROBE";
 const MIN_EXPIRY_SECONDS: i64 = 5 * 60;
 const MAX_EXPIRY_SECONDS: i64 = 24 * 60 * 60;
 
-/// How far INSIDE a bound a row that must be served probes it.
+/// How far PAST a bound a row probes it, on the side a stall would otherwise carry it over.
 ///
 /// The service measures the window from the instant it serves the request, which is after
 /// the instant a test reads the clock; normally by a fraction of a second, but by whole
-/// seconds whenever the machine running the suite stalls in between. A margin wider than any
-/// such stall is what makes "inside the bound" mean the same thing to the test and to the
-/// service, while staying far from the bound's own value, which the refusing rows probe to
-/// the second.
+/// seconds whenever the machine running the suite stalls in between. That stall SHORTENS
+/// every offset the test asks for, which moves a row towards the floor and away from the
+/// ceiling — so the two rows it could carry across their bound are the one just inside the
+/// floor and the one just outside the CEILING, and both are probed this far from the bound
+/// instead of one second from it. The other two rows are the ones a stall can only push
+/// further from their bound (just under the floor, just inside the ceiling), which are probed
+/// to the second.
 const SERVED_MARGIN_SECONDS: i64 = 30;
 
 /// A router with just this service mounted on a fresh engine.
@@ -1117,14 +1120,16 @@ async fn expires_at_follows_the_documented_window() {
     let base = cases()[0].clone();
 
     // The window `ExpiresAt`'s doc publishes for BREAKPOINT ("must be between 5 min and 24
-    // hours"): each published bound and one second past it, plus the absent member. The
+    // hours"): each published bound and the far side of it, plus the absent member. The
     // window is measured from the instant the create is SERVED, which is AFTER this test
     // reads the clock — by a fraction of a second normally, and by whole seconds when the
-    // machine running the suite stalls between the two — so a row that must be SERVED is
-    // probed [`SERVED_MARGIN_SECONDS`] inside the floor rather than one second inside it,
-    // which is the same probe without the race. A row that must be REFUSED needs no such
-    // margin: drift moves the floor further above it, so it stays refused. PROBE supports no
-    // expiry at all.
+    // machine running the suite stalls between the two — and such a stall SHORTENS the offset
+    // the service sees. So the two rows a stall could carry across their bound — the served
+    // row just inside the FLOOR, which a stall would push under it, and the refused row just
+    // outside the CEILING, which a stall would pull inside it — are probed
+    // [`SERVED_MARGIN_SECONDS`] from the bound rather than one second from it, which is the
+    // same probe without the race. The other two rows need no margin, because a stall can only
+    // move them further from their bound. PROBE supports no expiry at all.
     let rows: Vec<(&str, &str, Option<i64>, u16)> = vec![
         ("breakpoint, no expiry", BREAKPOINT, None, 200),
         (
@@ -1146,9 +1151,9 @@ async fn expires_at_follows_the_documented_window() {
             200,
         ),
         (
-            "breakpoint, one second over the ceiling",
+            "breakpoint, past the 24 hour ceiling",
             BREAKPOINT,
-            Some(MAX_EXPIRY_SECONDS + 1),
+            Some(MAX_EXPIRY_SECONDS + SERVED_MARGIN_SECONDS),
             400,
         ),
         ("breakpoint, an hour", BREAKPOINT, Some(60 * 60), 200),

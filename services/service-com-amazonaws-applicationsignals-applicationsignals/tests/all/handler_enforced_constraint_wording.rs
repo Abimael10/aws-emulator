@@ -210,6 +210,18 @@ struct Served {
     expires_in: Option<i64>,
 }
 
+/// How far from a bound a lifetime row probes it on the side a stall would otherwise carry it
+/// across.
+///
+/// [`request_instant_seconds`] closes the sub-second part of the gap between the clock read and
+/// the instant the service measures the rule from, but not a whole-second stall, and such a
+/// stall SHORTENS the lifetime the service sees: it moves a row towards the floor and away from
+/// the ceiling. So the two rows a stall could carry across their bound — one just inside the
+/// floor and one just outside the ceiling — probe it this far away instead of one second away,
+/// which is the same probe of the same rule without the race; a row a stall can only push
+/// further from its bound probes it to the second.
+const REQUEST_MARGIN_SECONDS: i64 = 30;
+
 /// The body a row is actually sent with.
 ///
 /// A lifetime the service measures from the TIME OF THE REQUEST is rendered here, against a
@@ -395,10 +407,10 @@ fn refused_rows(now: i64, hash: &str) -> Vec<Refused> {
             rejected: Vec::new(),
         },
         Refused {
-            label: "create, an ExpiresAt one second over the ceiling".to_string(),
+            label: "create, an ExpiresAt just past the ceiling".to_string(),
             uri: CREATE,
             body: create_body(BREAKPOINT, java_location(13)),
-            expires_in: Some(ceiling + 1),
+            expires_in: Some(ceiling + REQUEST_MARGIN_SECONDS),
             member_path: "expiresAt",
             requirement: format!(
                 "Member must have value less than or equal to {ceiling} seconds after the time \
@@ -486,10 +498,10 @@ fn served_rows(now: i64, hash: &str) -> Vec<Served> {
             expires_in: None,
         },
         Served {
-            label: "create, an ExpiresAt one second inside the floor".to_string(),
+            label: "create, an ExpiresAt just inside the floor".to_string(),
             uri: CREATE,
             body: create_body(BREAKPOINT, java_location(31)),
-            expires_in: Some(floor + 1),
+            expires_in: Some(floor + REQUEST_MARGIN_SECONDS),
         },
         Served {
             label: "create, an ExpiresAt one second inside the ceiling".to_string(),

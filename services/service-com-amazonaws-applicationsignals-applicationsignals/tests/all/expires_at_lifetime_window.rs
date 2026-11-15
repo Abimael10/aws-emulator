@@ -136,6 +136,18 @@ fn now_seconds() -> i64 {
     elapsed.as_secs() as i64 + i64::from(elapsed.subsec_nanos() > 0)
 }
 
+/// How far from a bound a row probes it on the side a stall would otherwise carry it across.
+///
+/// [`now_seconds`] closes the sub-second part of the gap between the clock read and the serve
+/// instant, but not a whole-second stall, and such a stall SHORTENS every lifetime the service
+/// sees: it moves a row towards the floor and away from the ceiling. So the two rows a stall
+/// could carry across their bound — one just inside the floor, which it would push under it,
+/// and one just outside the ceiling, which it would pull inside it — are probed this far from
+/// the bound instead of one second from it, which is the same probe of the same rule without
+/// the race. The rows a stall can only push FURTHER from their bound (just under the floor,
+/// just inside the ceiling) are probed to the second.
+const SERVED_MARGIN_SECONDS: i64 = 30;
+
 /// The create body for one row: the instrumentation type under test, a location of its own (so
 /// a row is never refused as a conflict with an earlier one) and the `ExpiresAt` the row asks
 /// for, omitted when it names none.
@@ -278,9 +290,9 @@ fn rows() -> Vec<Row> {
             requirement: below_floor(),
         },
         Row {
-            label: "breakpoint, one second inside the floor",
+            label: "breakpoint, just inside the floor",
             instrumentation_type: BREAKPOINT,
-            expires_in: Some(floor + 1),
+            expires_in: Some(floor + SERVED_MARGIN_SECONDS),
             requirement: None,
         },
         Row {
@@ -314,9 +326,9 @@ fn rows() -> Vec<Row> {
             requirement: None,
         },
         Row {
-            label: "breakpoint, one second over the ceiling",
+            label: "breakpoint, just past the ceiling",
             instrumentation_type: BREAKPOINT,
-            expires_in: Some(ceiling + 1),
+            expires_in: Some(ceiling + SERVED_MARGIN_SECONDS),
             requirement: above_ceiling(),
         },
         Row {

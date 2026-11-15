@@ -25,6 +25,8 @@ mod identity_authorization;
 mod index_mode;
 #[path = "all/metadata_budget.rs"]
 mod metadata_budget;
+#[path = "all/minted_access_key_authorization.rs"]
+mod minted_access_key_authorization;
 #[path = "all/modelled_input_validation.rs"]
 mod modelled_input_validation;
 #[path = "all/policy_document_bytes.rs"]
