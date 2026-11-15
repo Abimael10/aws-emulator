@@ -47,6 +47,8 @@ mod reranking;
 mod reranking_relevance;
 #[path = "all/retrieve_and_generate.rs"]
 mod retrieve_and_generate;
+#[path = "all/retrieve_result_bounds.rs"]
+mod retrieve_result_bounds;
 #[path = "all/session_error_messages.rs"]
 mod session_error_messages;
 #[path = "all/shared_tagging_arn_claim.rs"]
