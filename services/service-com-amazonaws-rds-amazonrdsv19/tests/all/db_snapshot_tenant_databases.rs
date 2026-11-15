@@ -266,28 +266,8 @@ async fn a_snapshot_reports_the_tenant_databases_it_captured() {
 
         // "This command only applies to RDS for Oracle DB instances in the multi-tenant
         // configuration", whose engine names end in `-cdb`: a snapshot of a single-tenant
-        // instance is no subject of this report, so naming one is naming a snapshot tenant
-        // database that does not exist.
-        if !row.engine.ends_with("-cdb") {
-            let refused = expect_error(
-                case,
-                call(
-                    &router,
-                    "DescribeDBSnapshotTenantDatabases",
-                    &params!["DBSnapshotIdentifier" => row.snapshot],
-                )
-                .await,
-                404,
-                "DBSnapshotNotFound",
-            );
-            assert_eq!(
-                text(&refused, "Message"),
-                format!("DBSnapshot {} not found.", row.snapshot),
-                "case {case:?}: the fault names the snapshot the request asked for: {refused}"
-            );
-            continue;
-        }
-
+        // instance captured no tenant database, so it is reported on with an empty list —
+        // the snapshot exists, so there is nothing for the one modelled fault to report.
         let body = describe(
             &router,
             case,
@@ -696,12 +676,10 @@ async fn the_report_refuses_what_aws_refuses() {
     create_available_instance(&router, "emu-ref-single", "postgres").await;
     take_available_snapshot(&router, "emu-ref-single", "emu-ref-single-snap").await;
 
-    // A request that names a DB SNAPSHOT which is no snapshot of this report's subject, and
-    // one that names a DB instance this service does not hold, are the one fault this report
-    // models, a 404 `DBSnapshotNotFound`. The rows differ along what the rule generalises
-    // over: whether the snapshot is named by the selector or by the id filter, the case the
-    // instance is spelled in, whether the named resources exist but do not go together, and
-    // whether the snapshot they name is of the single-tenant configuration.
+    // A request that names a DB SNAPSHOT this service holds none of is the one fault this
+    // report models, a 404 `DBSnapshotNotFound` — the only error the operation declares. The
+    // rows differ along what the rule generalises over: what else the request narrows by
+    // beside the identifier that resolves to nothing.
     for (case, parameters, message) in [
         (
             "a snapshot that does not exist",
@@ -709,58 +687,18 @@ async fn the_report_refuses_what_aws_refuses() {
             "DBSnapshot emu-ref-missing not found.",
         ),
         (
-            "a DB instance that does not exist",
-            owned_params!["DBInstanceIdentifier" => "emu-ref-missing"],
-            "DBInstance emu-ref-missing not found.",
-        ),
-        (
-            "a DB instance that does not exist, named in another case",
-            owned_params!["DBInstanceIdentifier" => "EMU-REF-MISSING"],
-            "DBInstance emu-ref-missing not found.",
-        ),
-        (
-            "a snapshot that exists, under a type it was not taken with",
+            "a snapshot that does not exist, alongside a snapshot type",
             owned_params![
-                "DBSnapshotIdentifier" => "emu-ref-snap",
-                "SnapshotType" => "automated",
-            ],
-            "DBSnapshot emu-ref-snap not found.",
-        ),
-        (
-            "a snapshot that exists, under a DB resource id it was not taken from",
-            owned_params![
-                "DBSnapshotIdentifier" => "emu-ref-snap",
-                "DbiResourceId" => "db-EMUNOSUCHDBRESOURCEIDXXXXX",
-            ],
-            "DBSnapshot emu-ref-snap not found.",
-        ),
-        (
-            "a snapshot that exists, under another instance that exists too",
-            owned_params![
-                "DBSnapshotIdentifier" => "emu-ref-snap",
-                "DBInstanceIdentifier" => "emu-ref-other",
-            ],
-            "DBSnapshot emu-ref-snap not found.",
-        ),
-        (
-            "the db-snapshot-id filter naming a snapshot that does not exist",
-            owned_params![
-                "Filters.Filter.1.Name" => "db-snapshot-id",
-                "Filters.Filter.1.Values.Value.1" => "emu-ref-missing",
+                "DBSnapshotIdentifier" => "emu-ref-missing",
+                "SnapshotType" => "manual",
             ],
             "DBSnapshot emu-ref-missing not found.",
         ),
         (
-            "a snapshot of a single-tenant DB instance",
-            owned_params!["DBSnapshotIdentifier" => "emu-ref-single-snap"],
-            "DBSnapshot emu-ref-single-snap not found.",
-        ),
-        (
-            "the db-snapshot-id filter carrying a snapshot that exists and one that does not",
+            "a snapshot that does not exist, alongside a DB instance that does",
             owned_params![
-                "Filters.Filter.1.Name" => "db-snapshot-id",
-                "Filters.Filter.1.Values.Value.1" => "emu-ref-single-snap",
-                "Filters.Filter.1.Values.Value.2" => "emu-ref-missing",
+                "DBSnapshotIdentifier" => "emu-ref-missing",
+                "DBInstanceIdentifier" => "emu-ref",
             ],
             "DBSnapshot emu-ref-missing not found.",
         ),
@@ -971,5 +909,201 @@ async fn a_report_longer_than_one_page_walks_through_its_marker() {
         reported, expected,
         "the pages together report every captured tenant database exactly once, expected \
          {expected:?}, got {reported:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_selection_that_carries_no_tenant_database_is_an_empty_report() {
+    // The rule: `DBSnapshotNotFoundFault` — the one error this operation models — answers
+    // one question only, whether this service holds a DB snapshot under the identifier the
+    // request named, so every other narrowing the request carries selects which rows the
+    // report carries, and a selection that comes out with none is a 200 whose
+    // `DBSnapshotTenantDatabases` list is empty and which carries no `Marker`.
+    //
+    // The rows below span what that generalises over: which narrowing empties the report (a
+    // snapshot that captured nothing, a single-tenant engine the command "only applies" past,
+    // the source DB instance — one this service holds and one it does not — the DB resource
+    // id, the snapshot type, each documented filter name), whether the resource is named by
+    // the selector, by the filter's identifier form or by the filter's ARN form, the case the
+    // instance identifier is spelled in, and a filter value that names no snapshot at all.
+    let router = emulator();
+    create_available_instance(&router, "emu-nil-cdb", "oracle-ee-cdb").await;
+    create_tenant(
+        &router,
+        "emu-nil-cdb",
+        &Tenant {
+            name: "tenant1",
+            master_username: TENANT_MASTER_USERNAME,
+            character_set: None,
+            nchar_character_set: None,
+        },
+    )
+    .await;
+    take_available_snapshot(&router, "emu-nil-cdb", "emu-nil-cdb-snap").await;
+    // A multi-tenant instance that holds no tenant database when its snapshot is taken, so
+    // the snapshot exists and captured nothing.
+    create_available_instance(&router, "emu-nil-bare", "oracle-se2-cdb").await;
+    take_available_snapshot(&router, "emu-nil-bare", "emu-nil-bare-snap").await;
+    // A single-tenant engine: the configuration this command does not apply to.
+    create_available_instance(&router, "emu-nil-single", "postgres").await;
+    take_available_snapshot(&router, "emu-nil-single", "emu-nil-single-snap").await;
+    // A second multi-tenant instance, so a request can name two resources that both exist
+    // and still select nothing.
+    let other_resource_id =
+        create_available_instance(&router, "emu-nil-other", "oracle-ee-cdb").await;
+    take_available_snapshot(&router, "emu-nil-other", "emu-nil-other-snap").await;
+    let single_snapshot_arn =
+        format!("arn:aws:rds:{REGION}:{ACCOUNT}:snapshot:emu-nil-single-snap");
+
+    for (case, parameters) in [
+        (
+            "a multi-tenant snapshot that captured no tenant database",
+            owned_params!["DBSnapshotIdentifier" => "emu-nil-bare-snap"],
+        ),
+        (
+            "a snapshot taken off a single-tenant engine",
+            owned_params!["DBSnapshotIdentifier" => "emu-nil-single-snap"],
+        ),
+        (
+            "a snapshot taken off a single-tenant engine, named by the db-snapshot-id filter",
+            owned_params![
+                "Filters.Filter.1.Name" => "db-snapshot-id",
+                "Filters.Filter.1.Values.Value.1" => "emu-nil-single-snap",
+            ],
+        ),
+        (
+            "a snapshot taken off a single-tenant engine, named by its ARN in that filter",
+            owned_params![
+                "Filters.Filter.1.Name" => "db-snapshot-id",
+                "Filters.Filter.1.Values.Value.1" => single_snapshot_arn,
+            ],
+        ),
+        (
+            "a snapshot that exists, under a type it was not taken with",
+            owned_params![
+                "DBSnapshotIdentifier" => "emu-nil-cdb-snap",
+                "SnapshotType" => "automated",
+            ],
+        ),
+        (
+            "a snapshot that exists, under a DB resource id it was not taken from",
+            owned_params![
+                "DBSnapshotIdentifier" => "emu-nil-cdb-snap",
+                "DbiResourceId" => other_resource_id,
+            ],
+        ),
+        (
+            "a snapshot that exists, under another instance that exists too",
+            owned_params![
+                "DBSnapshotIdentifier" => "emu-nil-cdb-snap",
+                "DBInstanceIdentifier" => "emu-nil-other",
+            ],
+        ),
+        (
+            "a snapshot that exists, under a tenant name none of its tenants carries",
+            owned_params![
+                "DBSnapshotIdentifier" => "emu-nil-cdb-snap",
+                "Filters.Filter.1.Name" => "tenant-db-name",
+                "Filters.Filter.1.Values.Value.1" => "nosuchtenant",
+            ],
+        ),
+        (
+            "a snapshot that exists, under a tenant resource id none of its tenants carries",
+            owned_params![
+                "DBSnapshotIdentifier" => "emu-nil-cdb-snap",
+                "Filters.Filter.1.Name" => "tenant-database-resource-id",
+                "Filters.Filter.1.Values.Value.1" => "tenant-EMUNOSUCHTENANTRESOURCEID",
+            ],
+        ),
+        (
+            "a snapshot that exists, under a dbi-resource-id filter it was not taken from",
+            owned_params![
+                "DBSnapshotIdentifier" => "emu-nil-cdb-snap",
+                "Filters.Filter.1.Name" => "dbi-resource-id",
+                "Filters.Filter.1.Values.Value.1" => other_resource_id,
+            ],
+        ),
+        (
+            "a snapshot that exists, under a db-instance-id filter it was not taken of",
+            owned_params![
+                "DBSnapshotIdentifier" => "emu-nil-cdb-snap",
+                "Filters.Filter.1.Name" => "db-instance-id",
+                "Filters.Filter.1.Values.Value.1" => "emu-nil-other",
+            ],
+        ),
+        (
+            "a snapshot that exists, under a snapshot-type filter it was not taken with",
+            owned_params![
+                "DBSnapshotIdentifier" => "emu-nil-cdb-snap",
+                "Filters.Filter.1.Name" => "snapshot-type",
+                "Filters.Filter.1.Values.Value.1" => "automated",
+            ],
+        ),
+        (
+            "the db-snapshot-id filter naming a snapshot this service holds none of",
+            owned_params![
+                "Filters.Filter.1.Name" => "db-snapshot-id",
+                "Filters.Filter.1.Values.Value.1" => "emu-nil-missing",
+            ],
+        ),
+        (
+            "a DB instance this service holds none of",
+            owned_params!["DBInstanceIdentifier" => "emu-nil-missing"],
+        ),
+        (
+            "a DB instance this service holds none of, spelled in another case",
+            owned_params!["DBInstanceIdentifier" => "EMU-NIL-MISSING"],
+        ),
+        (
+            "a DB instance this service holds none of, alongside a snapshot that exists",
+            owned_params![
+                "DBSnapshotIdentifier" => "emu-nil-cdb-snap",
+                "DBInstanceIdentifier" => "emu-nil-missing",
+            ],
+        ),
+        (
+            "the db-instance-id filter naming an instance this service holds none of",
+            owned_params![
+                "Filters.Filter.1.Name" => "db-instance-id",
+                "Filters.Filter.1.Values.Value.1" => "emu-nil-missing",
+            ],
+        ),
+    ] {
+        let body = describe(&router, case, &parameters).await;
+        assert!(
+            reported_names(&body).is_empty(),
+            "case {case:?}: expected an empty report, got {:?} in {body}",
+            reported_names(&body)
+        );
+        // The success envelope carries the modelled list member, EMPTY, rather than leaving
+        // it out: the report selected nothing, it did not fail to report.
+        assert!(
+            body.contains("<DBSnapshotTenantDatabases/>")
+                || body.contains("<DBSnapshotTenantDatabases></DBSnapshotTenantDatabases>"),
+            "case {case:?}: the result carries an empty DBSnapshotTenantDatabases: {body}"
+        );
+        assert!(
+            optional_text(&body, "Marker").is_none(),
+            "case {case:?}: a report with nothing left to walk carries no Marker: {body}"
+        );
+    }
+
+    // And the same filter NARROWS rather than refuses: carrying one snapshot this service
+    // holds and one it does not reports the tenant databases of the one it holds.
+    let body = describe(
+        &router,
+        "the db-snapshot-id filter carrying a snapshot that exists and one that does not",
+        &params![
+            "Filters.Filter.1.Name" => "db-snapshot-id",
+            "Filters.Filter.1.Values.Value.1" => "emu-nil-cdb-snap",
+            "Filters.Filter.1.Values.Value.2" => "emu-nil-missing",
+        ],
+    )
+    .await;
+    assert_eq!(
+        reported_names(&body),
+        vec!["tenant1".to_string()],
+        "a filter value that names no snapshot narrows the report instead of refusing it: \
+         {body}"
     );
 }

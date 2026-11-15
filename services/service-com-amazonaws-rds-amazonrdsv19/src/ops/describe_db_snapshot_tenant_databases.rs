@@ -191,35 +191,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `DBInstanceIdentifier` "isn't case-sensitive" and a DB instance identifier is
         // stored as a lowercase string, so the request's spelling is folded before it is
-        // compared with the identifier the snapshot copied off its source instance.
+        // compared with the identifier the snapshot copied off its source instance. It
+        // SELECTS which snapshots are read and nothing more: this operation models no fault
+        // about a DB instance (`DBSnapshotNotFoundFault` is its only error), so an identifier
+        // this service holds no instance under selects no snapshot and is reported on with an
+        // empty list.
         let source_instance = input
             .db_instance_identifier
             .as_deref()
             .map(str::to_ascii_lowercase);
-        // A request that NAMES a specific DB SNAPSHOT — by `DBSnapshotIdentifier` or by the
-        // `db-snapshot-id` filter — is answered with the one fault this operation models
-        // when that snapshot is no snapshot of this report's subject, rather than with an
-        // empty report: the member "must match the ID of an existing DB snapshot", so a
-        // caller that named one cannot tell "that snapshot holds no tenant databases" from
-        // "no such snapshot" out of an empty list. A `DBInstanceIdentifier`, "if supplied,
-        // must match the identifier of an existing DBInstance", so one that names no stored
-        // instance is the same fault. Every other narrowing — an instance that does exist, a
-        // DB resource id, a snapshot type, a tenant database's own members — is served as a
-        // report, empty when nothing matches.
-        if let Some(identifier) = &source_instance {
-            if !store
-                .db_instances
-                .contains_key(&(region.clone(), identifier.clone()))
-            {
-                // The identifier in the folded spelling the member resolves in, the way
-                // every other front door of this service words a DB instance it could not
-                // find.
-                return Err(not_found(db_instance_not_found_message(identifier)));
-            }
-        }
 
         // RDS is regional: a request sees only the snapshots of the region it was signed
-        // for. Naming a snapshot narrows the report to that one snapshot's tenant databases.
+        // for. Naming a snapshot narrows the report to that one snapshot's tenant databases,
+        // and is the ONE question the modelled fault answers: `DBSnapshotNotFoundFault` is
+        // documented as "DBSnapshotIdentifier doesn't refer to an existing DB snapshot", so
+        // it is raised when — and only when — this service holds no DB snapshot under the
+        // identifier the request named in the signed region. A snapshot that does exist is
+        // then narrowed like any other row, exactly as `DescribeDBSnapshots` narrows its
+        // own, so a selection that comes out empty is a successful empty report.
         //
         // `DBSnapshotIdentifier` is resolved verbatim, as the identifier the snapshot was
         // taken under: the member documents "the value must match the ID of an existing DB
@@ -230,11 +219,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let candidates: Vec<&crate::state::DbSnapshotRecord> = match &input
             .db_snapshot_identifier
         {
-            Some(requested) => store
-                .db_snapshots
-                .get(&(region.clone(), requested.clone()))
-                .into_iter()
-                .collect(),
+            Some(requested) => {
+                let record = store
+                    .db_snapshots
+                    .get(&(region.clone(), requested.clone()))
+                    .ok_or_else(|| not_found(db_snapshot_not_found_message(requested)))?;
+                vec![record]
+            }
             None => store.snapshots_in(&region),
         };
 
@@ -262,10 +253,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .is_none_or(|wanted| snapshot.snapshot_type.eq_ignore_ascii_case(wanted))
             })
             // "This command only applies to RDS for Oracle DB instances in the multi-tenant
-            // configuration": a snapshot of a single-tenant instance holds no tenant
-            // database this report could read, so it is no subject of this report at all —
-            // naming one is naming a snapshot tenant database that does not exist, which the
-            // emptiness check below answers as the modelled fault.
+            // configuration": a snapshot of a single-tenant instance captured no tenant
+            // database, so it contributes no row to this report — it narrows what is
+            // REPORTED and never whether the snapshot the request named exists.
             .filter(|snapshot| crate::state::is_multi_tenant_engine(&snapshot.engine))
             .filter(|snapshot| {
                 filters
@@ -273,20 +263,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .all(|filter| matches_snapshot_filter(snapshot, filter))
             })
             .collect();
-        // The snapshot the request NAMED is no snapshot of this report's subject: it does
-        // not exist, the other selectors exclude it — a snapshot of another instance, of
-        // another DB resource or of another type is not the snapshot that was named either
-        // ("if you specify an automatic snapshot, you must also specify SnapshotType") — or
-        // it was taken of a single-tenant instance, which holds no tenant database to report.
-        if in_scope.is_empty() {
-            if let Some(named) = named_snapshot(
-                input.db_snapshot_identifier.as_deref(),
-                &filters,
-                |value| store.resolve_db_snapshot_key(&region, value).is_some(),
-            ) {
-                return Err(not_found(db_snapshot_not_found_message(named)));
-            }
-        }
 
         let matching: Vec<(String, DBSnapshotTenantDatabase)> = in_scope
             .into_iter()
@@ -326,8 +302,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled fault this report answers a selector that names a resource this service
-/// does not hold with: `DBSnapshotNotFoundFault`, the one error the operation declares.
+/// The modelled fault this report answers a request that names a DB SNAPSHOT this service
+/// holds none of with: `DBSnapshotNotFoundFault`, the one error the operation declares.
 fn not_found(message: String) -> DescribeDBSnapshotTenantDatabasesError {
     DescribeDBSnapshotTenantDatabasesErrorModeled::DBSnapshotNotFoundFault(
         DBSnapshotNotFoundFault {
@@ -353,39 +329,6 @@ const SNAPSHOT_FILTER_NAMES: [&str; 4] = [
 /// (`crate::state::db_snapshot_not_found_message`).
 fn db_snapshot_not_found_message(named: &str) -> String {
     format!("DBSnapshot {named} not found.")
-}
-
-/// The same sentence for the DB INSTANCE a request named and this service does not hold, in
-/// the folded spelling the member resolves in — the wording `DescribeTenantDatabases`, the
-/// other report over tenant databases, answers for an instance it could not find.
-fn db_instance_not_found_message(identifier: &str) -> String {
-    format!("DBInstance {identifier} not found.")
-}
-
-/// The DB SNAPSHOT the request named, in its own spelling, or `None` when the request named
-/// none. `DBSnapshotIdentifier` and the `db-snapshot-id` filter name it the same way, so
-/// both are read here.
-///
-/// A filter may carry several snapshots, of which the fault can name only one: the first
-/// that `is_held` says this service does not hold — the value the caller has to fix — and
-/// the first value when it holds them all.
-fn named_snapshot<'a>(
-    db_snapshot_identifier: Option<&'a str>,
-    filters: &'a [Filter],
-    is_held: impl Fn(&str) -> bool,
-) -> Option<&'a str> {
-    if let Some(named) = db_snapshot_identifier {
-        return Some(named);
-    }
-    let values = filters
-        .iter()
-        .find(|filter| filter.name == "db-snapshot-id")
-        .map(|filter| filter.values.as_slice())?;
-    values
-        .iter()
-        .find(|value| !is_held(value))
-        .or_else(|| values.first())
-        .map(String::as_str)
 }
 
 /// The filter names this operation's `Filters` member documents: "`tenant-db-name`",

@@ -5,7 +5,6 @@
 //! Put a new suite at `tests/all/<name>.rs` and add its `#[path]`/`mod` pair below, into the
 //! sorted list — one pair per suite and no other line, so two branches landing at once
 //! insert two lines in two places and have no prose to duplicate, re-word or mistype.
-//!
 //! A suite that is not declared here compiles nowhere and its tests never run; a suite left
 //! at the top level of `tests/` fails the build; a suite declared twice is `E0428`; and an
 //! inner doc comment (`//!`) past the first item is `E0753`. Each of those fails EVERY suite
@@ -17,13 +16,10 @@
 //! for every service crate's `tests/all.rs`, so a note about them belongs there. What a suite
 //! covers, and why it has to live in this target rather than in a service crate's own,
 //! belongs in that suite's own module header, where it is read beside the test it explains.
-//!
 //! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of this
 //! file, which the layout check refuses: the `#[path]` is what points each module into
 //! `tests/all/`.
-
 //! Single integration-test target for the router.
-//!
 //! Put a new suite at `tests/all/<name>.rs` and declare it below with a
 //! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted so the list stays sorted by
 //! name: one pair per suite and no other line, so two branches landing at once insert two
@@ -33,8 +29,6 @@
 //! comment past the first item is `E0753`. Each of those fails every suite in this target,
 //! so this header is the only place a `//!` may stand, and what a suite covers belongs in
 //! that suite's own module header rather than here.
-//! `all/all_rs_declares_each_suite_once.rs`,
-//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
 //! `all/all_rs_is_a_canonical_declaration_list.rs` check those rules, the first two for this
 //! file and for every service crate's `tests/all.rs`.
 //! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of
@@ -119,31 +113,24 @@
 // Put a new suite at `tests/all/<name>.rs` and declare it below with a `#[path]`/`mod`
 // pair, keeping the list sorted: one pair per suite and nothing else, so a landing has
 // one place to insert and nothing to keep consistent.
-//
 // A suite no `mod` names compiles nowhere and its tests never run; a suite left at the
 // top level of `tests/` fails the build; and a suite declared twice is `E0428`, which
 // fails every suite in this target.
-//
 // EVERY comment in this file is an ORDINARY one, this block included, and that is
 // deliberate: an inner doc comment is legal only before the first item, so one that
 // lands past the declarations — which is what concurrent landings appending to this file
 // kept producing — is `E0753` and compiles no suite of this target. With no inner doc
 // comment anywhere, no merge of two landings can put one past the first item.
-//
-// `all/all_rs_declares_each_suite_once.rs`,
-// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
 // `all/all_rs_is_a_canonical_declaration_list.rs` check those rules, for this file and
 // for every service crate's `tests/all.rs`, so check there rather than leaving a note
 // here. What a suite covers, and why it lives in this target rather than in one service
 // crate's own, belongs in that suite's own module header.
-//
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // pair, keeping the list sorted: one pair per suite, and nothing else that a landing has to
 // keep consistent.
 // A suite no `mod` names compiles nowhere and its tests never run; a suite left at the top
 // level of `tests/` fails the build; and a suite declared twice is `E0428`, which fails every
 // suite in this target.
-// EVERY comment in this file is an ORDINARY one, this block included, and that is
 // deliberate: an inner doc comment is legal only before the first item, so one that lands
 // past the declarations — which is what concurrent landings appending to this file kept
 // producing — is `E0753` and compiles no suite of this target. With no inner doc comment
@@ -151,14 +138,12 @@
 // `all/all_rs_is_a_canonical_declaration_list.rs` check those rules — the list holds one
 // pair per suite, sorted, and no other line — for this file and for every service crate's
 // `tests/all.rs`, so check there rather than leaving a note here.
-// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/boot_serve.rs`) — which the layout check refuses. The `#[path]` is what points
 // each declaration into `tests/all/`.
 //! Put a new suite at `tests/all/<name>.rs` and declare it below with a `#[path]`/`mod`
 //! pair, keeping the list sorted: one pair per suite and NOTHING else — no prose between
 //! the pairs and none after them — so a landing has one place to insert and nothing to
 //! keep consistent.
-//! A suite that is not declared here compiles nowhere and its tests never run; a suite left
 //! at the top level of `tests/` fails the build; and a suite declared twice is `E0428`,
 //! which compiles no suite of this target. THIS HEADER IS THE ONLY PLACE AN INNER DOC
 //! COMMENT (`//!`) MAY STAND IN THIS FILE: past the first item one is `E0753` and compiles
@@ -1536,7 +1521,6 @@ mod lambda_in_function_assumed_role_session;
 // `E0753` and compiles no suite of this target. With no inner doc comment anywhere, no merge
 // of two landings can put one past the first item. Nothing follows the last declaration.
 // `all/all_rs_is_a_canonical_declaration_list.rs` check these rules, for this file and for
-//! Single integration-test target for the router: the declaration list, and nothing else.
 //! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted in name order. The list holds
 //! those pairs and NO other line — no prose between them and none after them — so two
 //! branches landing at once insert two lines in two places and have nothing to keep
@@ -1655,7 +1639,6 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 // at the top level of `tests/` fails the build; and a suite declared twice is `E0428`,
 // which compiles no suite of this target.
 // past the declarations is `E0753` and compiles no suite of this target. With no inner doc
-// comment anywhere, no merge of two landings can put one past the first item.
 // This file is a LIST: one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted
 // by name, and no other line. A landing inserts its two lines into the sorted list and has no
 // prose here to duplicate, re-word or mistype.
@@ -1717,8 +1700,6 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 // at the top level of `tests/` fails the build; and a suite declared twice is `E0428`, which
 // compiles no suite of this target.
 // deliberate: an inner doc comment (`//!`) is legal only before the first item, so one that
-// lands past the declarations — which is what concurrent landings appending to this file
-// kept producing — is `E0753` and compiles no suite of this target. With no inner doc
 // What a suite covers, and why it belongs to this cross-service target rather than to one
 // service crate's own, stands in that suite's own module header, where it is read beside the
 // test it explains. Nothing else belongs here: `all/all_rs_declares_each_suite_once.rs`,
@@ -1814,7 +1795,6 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 // twice is `E0428`; and an inner doc comment (`//!`) past the first item is `E0753`.
 // Each of those fails every suite in this target, which is why this file carries
 // declarations only. `all/all_rs_declares_each_suite_once.rs`,
-// `all/all_rs_is_a_canonical_declaration_list.rs` check those rules, for this file and
 // for every service crate's `tests/all.rs`.
 // What a suite covers, and why it lives in this cross-service target rather than in one
 // service crate's own, belongs in that suite's own module header, where it is read
@@ -1931,3 +1911,14 @@ mod every_suite_file_is_declared;
 // landings can leave one past the first item.
 // it explains — never here. `all/all_rs_declares_each_suite_once.rs`,
 // `all/all_rs_is_a_canonical_declaration_list.rs` check all three rules, for this file and
+//! Put a new suite at `tests/all/<name>.rs` and insert its `#[path]` / `mod` pair into the
+//! sorted list below. The list holds NOTHING else — no blank line, no note and no second
+//! declaration of a name — so two branches landing at once insert two lines in two places
+//! and have no prose to duplicate, re-word or mistype.
+//! this file, which the layout check refuses: the `#[path]` is what points each declaration
+//! service crate's own, belongs in that suite's own module header, where it is read beside
+//! the test it explains.
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check this shape — one declaration per
+//! suite, no inner doc comment past this header, pairs and nothing else — for this file and
+//! for every service crate's `tests/all.rs`, so a note about any of those rules belongs
+//! there rather than here.
