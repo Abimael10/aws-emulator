@@ -254,7 +254,7 @@ async fn list_installed_components(
     .await
 }
 
-async fn list_effective_deployments(
+pub(crate) async fn list_effective_deployments(
     router: &MultiServiceRouter,
     name: &str,
     query: &str,
@@ -306,7 +306,7 @@ pub(crate) async fn disassociate(
 }
 
 /// `CreateDeployment` for `target`, optionally named; answers the new deployment's id.
-async fn create_deployment(
+pub(crate) async fn create_deployment(
     router: &MultiServiceRouter,
     target: &str,
     name: Option<&str>,
@@ -345,7 +345,7 @@ async fn cancel_deployment(router: &MultiServiceRouter, deployment_id: &str) {
 }
 
 /// An IoT thing ARN, which is what a deployment targets.
-fn thing_arn(name: &str) -> String {
+pub(crate) fn thing_arn(name: &str) -> String {
     format!("arn:aws:iot:{REGION}:{ACCOUNT}:thing/{name}")
 }
 

@@ -1422,3 +1422,17 @@ mod cloudformation_asg_launch_fault_diagnosis;
 // list item is a note rather than a build failure.
 #[path = "all/apigateway_cognito_authorizer_spares_the_proxy_lambda.rs"]
 mod apigateway_cognito_authorizer_spares_the_proxy_lambda;
+// and why it drives the assembled router rather than one service crate, belongs in the
+// suite's own module header, where it is read beside the test it explains.
+// Three rules bind this file, and each of them fails EVERY suite of this target rather than
+// one: a suite no `mod` names is compiled nowhere (this crate's build script refuses it), a
+// name declared twice is `E0428`, and an inner doc comment or an inner attribute past the
+// first item is a parse error. That is why every comment here is an ordinary one, this header
+// included, and why nothing at all stands below the list.
+// `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/every_suite_file_is_declared.rs` pin those rules, for this root and for every service
+// crate's own, so check there rather than leaving a note here; `all/appended_notes.rs`
+// records what the notes earlier landings had appended to this file said.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod <name>;` would resolve to a
+// SIBLING of this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]`
+// above each declaration is what points it into `tests/all/`.
