@@ -2,7 +2,9 @@
 
 //! @op GetInstancesHealthStatus
 //! Implemented: a real read of the health status stored on each instance record of a
-//! service, with any status change the clock already owes materialised first.
+//! service, with any status change the clock already owes materialised first. Only a
+//! service that configures health checking has statuses to report; one that configures
+//! none answers `InstanceNotFound`.
 //!
 //! ## Shape of an operation
 //!
@@ -227,6 +229,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(service) = state.services.get_mut(&service_id) else {
             return Err(instances_not_found(&requested_service_arn).into());
         };
+        // An instance has a health status only where its service configures health
+        // checking: a service that configures neither a Route 53 check
+        // (`HealthCheckConfig`) nor a custom one (`HealthCheckCustomConfig`) is in no
+        // health registry at all, so a status read scoped to it resolves to no instance
+        // whose health anything tracks — which is what an instance miss says. The
+        // precondition is read from the stored configuration, so it holds for every
+        // instance of such a service and for whatever scope the request asked about.
+        if !service.health_checked() {
+            let service_arn = service.arn.clone();
+            return Err(instances_not_found(&service_arn).into());
+        }
         service.apply_due_health_statuses(now);
         // The rest of this handler only reads, so the record is reborrowed immutably.
         let service = &*service;

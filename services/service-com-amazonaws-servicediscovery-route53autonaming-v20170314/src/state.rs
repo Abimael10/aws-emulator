@@ -17,10 +17,11 @@
 //! modelled `ResourceLimitExceeded` (`MAX_NAMESPACES`,
 //! `MAX_SERVICES_PER_NAMESPACE`, `MAX_INSTANCES_PER_SERVICE`), an attribute past the
 //! documented per-service quota with `ServiceAttributesLimitExceededException`
-//! (`MAX_SERVICE_ATTRIBUTES`), and the two stores no
-//! API can ever shrink — the operation records and the remembered idempotency tokens
-//! — evict their oldest entry instead (`MAX_RETAINED_OPERATIONS`,
-//! `MAX_RETAINED_IDEMPOTENCY_TOKENS`).
+//! (`MAX_SERVICE_ATTRIBUTES`), and the stores no
+//! API can ever shrink — the operation records, the remembered idempotency tokens and
+//! each service's memory of the instances it has removed — evict their oldest entry
+//! instead (`MAX_RETAINED_OPERATIONS`, `MAX_RETAINED_IDEMPOTENCY_TOKENS`,
+//! `MAX_DEREGISTERED_INSTANCES_PER_SERVICE`).
 
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -139,6 +140,17 @@ pub const MAX_SERVICES_PER_NAMESPACE: usize = 1_000;
 /// gives. Re-registering an instance that already exists is a replace, so it is never
 /// refused by this bound.
 pub const MAX_INSTANCES_PER_SERVICE: usize = 1_000;
+
+/// How many of the `InstanceId`s it no longer holds one service remembers, bounded for
+/// the reason [`MAX_NAMESPACES`] gives: the memory lives in the process for its lifetime
+/// and only ever grows.
+///
+/// It is what tells a deregistration repeated for an instance the service DID hold from
+/// one for an instance it never held. The oldest id is forgotten first, so a repeat that
+/// arrives after this many further instances of the same service have been deregistered
+/// is answered as a request for an instance the service never held — the same answer the
+/// real service gives once its own record of the instance is gone.
+pub const MAX_DEREGISTERED_INSTANCES_PER_SERVICE: usize = MAX_INSTANCES_PER_SERVICE;
 
 /// How many records a listing returns when the caller names no `MaxResults`.
 ///
@@ -583,6 +595,14 @@ pub struct ServiceRecord {
     /// Keyed by `InstanceId`; a `BTreeMap` so every read orders identically.
     pub instances: BTreeMap<String, InstanceRecord>,
     pub instances_revision: i64,
+    /// The `InstanceId`s this service held until a deregistration removed them, oldest
+    /// first and bounded by [`MAX_DEREGISTERED_INSTANCES_PER_SERVICE`].
+    ///
+    /// A deregistration names the instance that must END UP not registered with the
+    /// service, so this is what distinguishes a repeat of a deregistration that already
+    /// completed — which asks for a state the service is already in — from a request for
+    /// an instance this service never held, which has no instance to name.
+    pub deregistered_instances: VecDeque<String>,
     /// The service-level attributes `UpdateServiceAttributes` writes,
     /// `GetServiceAttributes` reads and `DeleteServiceAttributes` removes keys from.
     /// A `BTreeMap` so every read orders identically; bounded by
@@ -619,6 +639,30 @@ impl ServiceRecord {
     /// that don't have a health check configured, and all instances are returned".
     pub fn health_checked(&self) -> bool {
         self.health_check_config.is_some() || self.health_check_custom_config.is_some()
+    }
+
+    /// Whether a deregistration already removed `instance_id` from this service, i.e.
+    /// whether the service is already in the state a deregistration of that instance
+    /// asks for.
+    pub fn deregistered(&self, instance_id: &str) -> bool {
+        self.deregistered_instances
+            .iter()
+            .any(|remembered| remembered == instance_id)
+    }
+
+    /// Remember that `instance_id` is no longer registered with this service, keeping
+    /// the memory within [`MAX_DEREGISTERED_INSTANCES_PER_SERVICE`] by forgetting the
+    /// oldest id first. Remembering an id twice records it once and does not refresh its
+    /// place in the queue.
+    pub fn remember_deregistered(&mut self, instance_id: &str) {
+        if self.deregistered(instance_id) {
+            return;
+        }
+        self.deregistered_instances
+            .push_back(instance_id.to_string());
+        while self.deregistered_instances.len() > MAX_DEREGISTERED_INSTANCES_PER_SERVICE {
+            self.deregistered_instances.pop_front();
+        }
     }
 }
 

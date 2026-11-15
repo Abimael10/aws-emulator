@@ -94,13 +94,14 @@ impl From<UntagResourceErrorModeled> for UntagResourceError {
 }
 
 /// What this operation answers for a `ResourceARN` that names no stored resource:
-/// the modelled `ResourceNotFoundException` (HTTP 404). One function, so the lookup
-/// and the write-through branch cannot drift apart in what they report.
-fn not_found(resource_arn: &str) -> UntagResourceError {
+/// the modelled `ResourceNotFoundException` (HTTP 404), carrying no message — this
+/// write reports the class in the error code and echoes nothing of the request into
+/// the body, the same body `TagResource` and `ListTagsForResource` answer with. One
+/// function, so the lookup and the write-through branch cannot drift apart in what
+/// they report.
+fn not_found() -> UntagResourceError {
     UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!(
-            "The operation can't be completed because the resource {resource_arn} was not found."
-        )),
+        message: None,
     })
     .into()
 }
@@ -152,7 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         let Some(resource) = state.resolve_tagged_resource(&input.resource_arn) else {
-            return Err(not_found(&input.resource_arn));
+            return Err(not_found());
         };
 
         // Removing tags names KEYS: every tag whose key is named goes, every other tag
@@ -161,7 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let removed: std::collections::HashSet<&str> =
             input.tag_keys.iter().map(String::as_str).collect();
         let Some(tags) = state.tags_mut(&resource) else {
-            return Err(not_found(&input.resource_arn));
+            return Err(not_found());
         };
         tags.retain(|(key, _)| !removed.contains(key.as_str()));
 

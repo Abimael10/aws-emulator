@@ -23,6 +23,8 @@ mod custom_health_status;
 mod delete_namespace;
 #[path = "all/delete_service.rs"]
 mod delete_service;
+#[path = "all/deregister_instance_idempotence.rs"]
+mod deregister_instance_idempotence;
 #[path = "all/discover_instances_revision.rs"]
 mod discover_instances_revision;
 #[path = "all/discovery_health_views.rs"]

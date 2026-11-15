@@ -501,8 +501,9 @@ async fn the_tag_quota_counts_the_merged_set_and_a_refused_call_stores_nothing()
     }
 }
 
-/// Every tagging operation answers `ResourceNotFoundException` for an ARN that names
-/// no stored resource.
+/// Every tagging call against an ARN that names no stored resource is refused with the
+/// modelled `ResourceNotFoundException`, carrying no message text, on both resource
+/// kinds.
 #[tokio::test]
 async fn an_arn_naming_no_stored_resource_is_not_found() {
     let router = emulator();
@@ -527,12 +528,29 @@ async fn an_arn_naming_no_stored_resource_is_not_found() {
             ("ListTagsForResource", json!({ "ResourceARN": arn })),
         ];
         for (operation, body) in requests {
-            let (status, code) = failure(&router, operation, body.clone()).await;
+            let (status, answered) = call(&router, operation, body.clone()).await;
+            let code = answered["__type"]
+                .as_str()
+                .unwrap_or_default()
+                .rsplit('#')
+                .next()
+                .unwrap_or_default();
             assert_eq!(
-                (status, code.as_str()),
+                (status, code),
                 (400, "ResourceNotFoundException"),
                 "case {case:?} on {operation} with {body}: \
-                 expected 400 ResourceNotFoundException"
+                 expected 400 ResourceNotFoundException, got {answered}"
+            );
+            // Every one of the three carries NO message text: the class is in the error
+            // code and nothing of the request is echoed into the body. The awsJson
+            // envelope carries a message as `message` or `Message`.
+            let message = answered["message"]
+                .as_str()
+                .or_else(|| answered["Message"].as_str())
+                .unwrap_or_default();
+            assert_eq!(
+                message, "",
+                "case {case:?} on {operation}: the refusal carries no message, got {message:?}"
             );
         }
     }

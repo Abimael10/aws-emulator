@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for `GetInstancesHealthStatus`: the health status it reports comes
-//! from the stored instance records, the `Instances` list selects which of them are
-//! reported, `MaxResults`/`NextToken` cut the report into pages, and a request naming
-//! something that is not stored is refused with the error the model declares.
+//! from the stored instance records, only a service that configures health checking has
+//! statuses to report, the `Instances` list selects which of them are reported,
+//! `MaxResults`/`NextToken` cut the report into pages, and a request naming something
+//! that is not stored is refused with the error the model declares.
 //!
 //! Every request goes through `MultiServiceRouter::dispatch`, i.e. the same path the
 //! emulator serves in production (`awsJson1_1`: `POST /` with `X-Amz-Target`), reusing
@@ -12,13 +13,24 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_servicediscovery_route53autonaming_v20170314 as cloudmap;
 
-use crate::cloud_map_core::{call, emulator, failure, namespace, ok, service};
+use crate::cloud_map_core::{call, dns_namespace, emulator, failure, namespace, ok};
 
 /// The `HealthStatus` values this API reports, from the model's `HealthStatus` enum
 /// (`smithy_query(query="shape",shape="HealthStatus")` -> `HEALTHY`, `UNHEALTHY`,
 /// `UNKNOWN`). Every one of them is exercised by the table below.
 const HEALTH_STATUS_VALUES: [&str; 3] = ["HEALTHY", "UNHEALTHY", "UNKNOWN"];
+
+/// The health check types the model's `HealthCheckType` enum publishes, from the crate's
+/// own catalog rather than copied (`cloudmap::ops::types::HEALTH_CHECK_TYPE_VALUES`).
+const HEALTH_CHECK_TYPES: &[&str] = cloudmap::ops::types::HEALTH_CHECK_TYPE_VALUES;
+
+/// How this operation's refusal names the scope of a request that listed no `Instances`,
+/// from the documentation of `GetInstancesHealthStatusRequest$Instances`: "If you omit
+/// Instances, Cloud Map returns the health status for all the instances that are
+/// associated with the specified service."
+const ALL_INSTANCES: &str = "All instances";
 
 /// Create a service with a custom health check in `namespace_id` and return its id.
 async fn custom_health_service(
@@ -26,19 +38,70 @@ async fn custom_health_service(
     namespace_id: &str,
     name: &str,
 ) -> String {
-    let created = ok(
+    service_with(
         router,
-        "CreateService",
-        json!({
-            "Name": name,
-            "NamespaceId": namespace_id,
-            "HealthCheckCustomConfig": { "FailureThreshold": 1 },
-        }),
+        namespace_id,
+        name,
+        json!({ "HealthCheckCustomConfig": { "FailureThreshold": 1 } }),
     )
-    .await;
+    .await
+}
+
+/// Create a service in `namespace_id` from the extra request members a row needs, and
+/// return its id.
+async fn service_with(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    namespace_id: &str,
+    name: &str,
+    extra: Value,
+) -> String {
+    let mut body = json!({ "Name": name, "NamespaceId": namespace_id });
+    if let Value::Object(members) = extra {
+        for (key, value) in members {
+            body[key.as_str()] = value;
+        }
+    }
+    let created = ok(router, "CreateService", body).await;
     created["Service"]["Id"]
         .as_str()
         .expect("CreateService returns the service it stored")
+        .to_string()
+}
+
+/// The HTTP status, wire error code and message one refused request answers with.
+/// `cloud_map_core::failure` answers the first two; the message matters here because
+/// this operation's `InstanceNotFound` names the service and the scope it was asked
+/// about.
+async fn refusal(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    body: Value,
+) -> (u16, String, String) {
+    let (status, json) = call(router, "GetInstancesHealthStatus", body).await;
+    let code = json["__type"]
+        .as_str()
+        .unwrap_or_default()
+        .rsplit('#')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    // The awsJson error envelope carries the message as `message` or `Message`.
+    let message = json["message"]
+        .as_str()
+        .or_else(|| json["Message"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert_ne!(status, 200, "the read must fail, got {json}");
+    (status, code, message)
+}
+
+/// The ARN `GetService` reports for a stored service.
+async fn service_arn(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    service_id: &str,
+) -> String {
+    ok(router, "GetService", json!({ "Id": service_id })).await["Service"]["Arn"]
+        .as_str()
+        .expect("GetService reports the ARN it minted")
         .to_string()
 }
 
@@ -74,14 +137,20 @@ async fn register(
 
 /// The report is computed from the stored records: a custom health check's instance
 /// carries the status its registration stored (`AWS_INIT_HEALTH_STATUS`, defaulting to
-/// `HEALTHY`), while an instance of a service with no health check at all is `UNKNOWN`,
-/// because nothing has reported on it.
+/// `HEALTHY`), while an instance of a service checked by Route 53 is `UNKNOWN` until that
+/// check has reported on it.
 #[tokio::test]
 async fn health_status_is_reported_from_the_stored_instance_records() {
     let router = emulator();
     let (_, namespace_id) = namespace(&router, "health-status-ns").await;
     let custom_id = custom_health_service(&router, &namespace_id, "custom-svc").await;
-    let plain_id = service(&router, &namespace_id, "plain-svc").await;
+    let checked_id = service_with(
+        &router,
+        &namespace_id,
+        "route53-svc",
+        json!({ "HealthCheckConfig": { "Type": "HTTP", "ResourcePath": "/ping" } }),
+    )
+    .await;
 
     // (case, service, instance, registration attributes, expected HealthStatus)
     let rows: [(&str, &str, &str, Value, &str); 4] = [
@@ -107,9 +176,9 @@ async fn health_status_is_reported_from_the_stored_instance_records() {
             "HEALTHY",
         ),
         (
-            "no health check configured",
-            plain_id.as_str(),
-            "i-plain",
+            "a Route 53 health check that has not reported yet",
+            checked_id.as_str(),
+            "i-probed",
             json!({ "AWS_INSTANCE_IPV4": "10.0.0.4" }),
             "UNKNOWN",
         ),
@@ -166,22 +235,23 @@ async fn health_status_is_reported_from_the_stored_instance_records() {
         ]),
         "case \"omitted Instances, custom service\": got {whole_custom:?}"
     );
-    let whole_plain = status_map(
+    let whole_checked = status_map(
         &ok(
             &router,
             "GetInstancesHealthStatus",
-            json!({ "ServiceId": plain_id }),
+            json!({ "ServiceId": checked_id }),
         )
         .await,
     );
     assert_eq!(
-        whole_plain,
-        BTreeMap::from([("i-plain".to_string(), "UNKNOWN".to_string())]),
-        "case \"omitted Instances, plain service\": got {whole_plain:?}"
+        whole_checked,
+        BTreeMap::from([("i-probed".to_string(), "UNKNOWN".to_string())]),
+        "case \"omitted Instances, Route 53 checked service\": got {whole_checked:?}"
     );
 
-    // A service with no instances reports an empty map rather than failing.
-    let empty_id = service(&router, &namespace_id, "empty-svc").await;
+    // A health-checked service with no instances reports an empty map rather than
+    // failing.
+    let empty_id = custom_health_service(&router, &namespace_id, "empty-svc").await;
     let empty = status_map(
         &ok(
             &router,
@@ -529,5 +599,166 @@ async fn reporting_health_status_changes_nothing_a_later_caller_sees() {
         instance_count,
         json!(3),
         "case \"repeated reads\": the service still holds its 3 instances, got {instance_count}"
+    );
+}
+
+/// An instance has a health status only where its service configures health checking: a
+/// service that configures neither kind of check has no instance whose health anything
+/// tracks, so every scope of this read is refused with `InstanceNotFound` naming that
+/// service and the scope asked about, while a service carrying either configuration is
+/// served.
+///
+/// The table spans both health configurations the model declares for a service
+/// (`CreateServiceRequest$HealthCheckConfig` with every `HealthCheckType` the model's
+/// enum publishes, and `CreateServiceRequest$HealthCheckCustomConfig`), the absence of
+/// both, and both ways a request names its scope (the ids it lists, and the whole
+/// service when it lists none).
+#[tokio::test]
+async fn only_a_service_that_configures_health_checking_reports_a_status() {
+    let router = emulator();
+    let (_, namespace_id) = namespace(&router, "gated-ns").await;
+
+    // (case, the health configuration the service is created with, whether the read is
+    // served)
+    let mut rows: Vec<(String, Value, bool)> = vec![
+        (
+            "no health configuration at all".to_string(),
+            json!({}),
+            false,
+        ),
+        (
+            "a custom health check".to_string(),
+            json!({ "HealthCheckCustomConfig": { "FailureThreshold": 1 } }),
+            true,
+        ),
+        (
+            "a custom health check with no failure threshold".to_string(),
+            json!({ "HealthCheckCustomConfig": {} }),
+            true,
+        ),
+    ];
+    // Every check type the model publishes, so the rule is not asserted on one of them.
+    for check_type in HEALTH_CHECK_TYPES {
+        let mut configuration = json!({ "Type": check_type });
+        if *check_type != "TCP" {
+            configuration["ResourcePath"] = json!("/ping");
+        }
+        rows.push((
+            format!("a Route 53 {check_type} health check"),
+            json!({ "HealthCheckConfig": configuration }),
+            true,
+        ));
+    }
+
+    for (index, (case, health, served)) in rows.iter().enumerate() {
+        let service_id = service_with(
+            &router,
+            &namespace_id,
+            &format!("gated-svc-{index}"),
+            health.clone(),
+        )
+        .await;
+        let arn = service_arn(&router, &service_id).await;
+        register(&router, &service_id, "i-1", json!({ "stage": "prod" })).await;
+
+        // The two scopes a request can ask about, each with the way this operation's
+        // refusal names it.
+        let scopes: [(Value, &str); 2] = [
+            (json!({ "ServiceId": service_id }), ALL_INSTANCES),
+            (
+                json!({ "ServiceId": service_id, "Instances": ["i-1"] }),
+                "i-1",
+            ),
+        ];
+        for (body, scope) in scopes {
+            if *served {
+                let reported = status_map(&ok(&router, "GetInstancesHealthStatus", body).await);
+                assert!(
+                    reported.contains_key("i-1"),
+                    "case {case:?} for scope {scope:?}: a health-checked service reports its \
+                     instance, got {reported:?}"
+                );
+                continue;
+            }
+            let (status, code, message) = refusal(&router, body).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "InstanceNotFound"),
+                "case {case:?} for scope {scope:?}: expected 400 InstanceNotFound, \
+                 got {status} {code}"
+            );
+            assert_eq!(
+                message,
+                format!(
+                    "Instance(s) not found for service '{arn}' when trying to retreive: {scope}"
+                ),
+                "case {case:?} for scope {scope:?}: unexpected message {message:?}"
+            );
+        }
+    }
+}
+
+/// Adding health checking to a service makes the read it was refused for serve, and
+/// deleting it again makes the read refused once more: the refusal follows the stored
+/// configuration rather than the service's age or its instances.
+#[tokio::test]
+async fn the_refusal_follows_the_stored_health_configuration() {
+    let router = emulator();
+    let dns_id = dns_namespace(&router, "gated-dns").await;
+    let service_id = service_with(
+        &router,
+        &dns_id,
+        "gated-updatable-svc",
+        json!({ "DnsConfig": { "DnsRecords": [{ "Type": "A", "TTL": 60 }] } }),
+    )
+    .await;
+    register(&router, &service_id, "i-1", json!({ "AWS_INSTANCE_IPV4": "10.0.0.1" })).await;
+
+    let (status, code, _) = refusal(&router, json!({ "ServiceId": service_id })).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (400, "InstanceNotFound"),
+        "case \"created with no health check\": expected 400 InstanceNotFound, got {status} {code}"
+    );
+
+    ok(
+        &router,
+        "UpdateService",
+        json!({
+            "Id": service_id,
+            "Service": {
+                "DnsConfig": { "DnsRecords": [{ "Type": "A", "TTL": 60 }] },
+                "HealthCheckConfig": { "Type": "HTTP", "ResourcePath": "/ping" },
+            },
+        }),
+    )
+    .await;
+    let reported = status_map(
+        &ok(
+            &router,
+            "GetInstancesHealthStatus",
+            json!({ "ServiceId": service_id }),
+        )
+        .await,
+    );
+    assert!(
+        reported.contains_key("i-1"),
+        "case \"health check added\": the read is served, got {reported:?}"
+    );
+
+    ok(
+        &router,
+        "UpdateService",
+        json!({
+            "Id": service_id,
+            "Service": { "DnsConfig": { "DnsRecords": [{ "Type": "A", "TTL": 60 }] } },
+        }),
+    )
+    .await;
+    let (status, code, _) = refusal(&router, json!({ "ServiceId": service_id })).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (400, "InstanceNotFound"),
+        "case \"health check deleted\": expected 400 InstanceNotFound, got {status} {code}"
     );
 }

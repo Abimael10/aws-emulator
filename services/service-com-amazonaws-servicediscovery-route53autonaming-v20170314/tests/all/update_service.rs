@@ -108,6 +108,39 @@ async fn health_statuses(
         .collect()
 }
 
+/// The HTTP status and wire error code the status read answers for a service that
+/// configures no health checking, which has no instance health for it to report.
+async fn health_status_refusal(router: &MultiServiceRouter, service_id: &str) -> (u16, String) {
+    failure(
+        router,
+        "GetInstancesHealthStatus",
+        json!({ "ServiceId": service_id }),
+    )
+    .await
+}
+
+/// Read the health statuses again until they are `expected`, or a generous deadline
+/// passes.
+///
+/// The service stores the instant a check's verdict is due and materialises it on read
+/// rather than sleeping for it, so the test waits for the CONDITION instead of for a
+/// duration: it is the statuses that end the loop, and the deadline only keeps a test
+/// that will never see them from hanging.
+async fn poll_health_statuses(
+    router: &MultiServiceRouter,
+    service_id: &str,
+    expected: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let actual = health_statuses(router, service_id).await;
+        if actual == *expected || std::time::Instant::now() >= deadline {
+            return actual;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// A `DnsRecord` object.
 fn record(record_type: &str, ttl: i64) -> Value {
     json!({ "Type": record_type, "TTL": ttl })
@@ -849,9 +882,10 @@ async fn a_service_is_updatable_by_id_and_by_arn() {
 /// "When you update settings for a service, Cloud Map also updates the corresponding
 /// settings in all the records and health checks that were created by using the
 /// specified service": a change to the health check re-creates every instance's check,
-/// so each instance is back to `UNKNOWN` with the new check's verdict owed; deleting the
-/// check leaves nothing to report; and a change that leaves the check as it was does not
-/// disturb the statuses.
+/// so each instance is back to `UNKNOWN` with the new check's verdict owed; a change that
+/// leaves the check as it was does not disturb the statuses; and deleting the check takes
+/// the service out of the health registry altogether, so the status read is refused as it
+/// was before any check was configured.
 #[tokio::test]
 async fn a_health_check_change_re_creates_every_instance_health_check() {
     let router = emulator();
@@ -891,10 +925,11 @@ async fn a_health_check_change_re_creates_every_instance_health_check() {
         ),
     ]);
 
-    let actual = health_statuses(&router, &service_id).await;
+    let actual = health_status_refusal(&router, &service_id).await;
     assert_eq!(
-        actual, unknown,
-        "with no health check configured nothing reports on an instance, got {actual:?}"
+        actual,
+        (400, "InstanceNotFound".to_string()),
+        "with no health check configured nothing tracks an instance's health, got {actual:?}"
     );
 
     // Adding the check: the instances' checks are created, so nothing has reported yet.
@@ -912,9 +947,9 @@ async fn a_health_check_change_re_creates_every_instance_health_check() {
         actual, unknown,
         "a freshly created check has not reported yet, got {actual:?}"
     );
-    tokio::time::sleep(cloudmap::state::ROUTE53_HEALTH_CHECK_SPAN + Duration::from_millis(50))
-        .await;
-    let actual = health_statuses(&router, &service_id).await;
+    // The service never sleeps for the span — it stores the due instant and materialises
+    // it on read — so the test looks again until the verdict is there.
+    let actual = poll_health_statuses(&router, &service_id, &checked).await;
     assert_eq!(
         actual, checked,
         "once the check is due it reports the verdict the service computes, got {actual:?}"
@@ -936,22 +971,20 @@ async fn a_health_check_change_re_creates_every_instance_health_check() {
         "restating the stored check leaves the reported statuses alone, got {actual:?}"
     );
 
-    // Deleting the check: nothing checks the instances any more, at any later instant.
+    // Deleting the check: the service configures no health checking any more, so it is
+    // back to having no status to report — whatever verdict the deleted check reached.
     update(
         &router,
         &service_id,
         json!({ "DnsConfig": { "DnsRecords": [record("A", 120)] } }),
     )
     .await;
-    for when in ["immediately", "after the check span"] {
-        let actual = health_statuses(&router, &service_id).await;
-        assert_eq!(
-            actual, unknown,
-            "case {when:?}: a deleted health check reports nothing, got {actual:?}"
-        );
-        tokio::time::sleep(cloudmap::state::ROUTE53_HEALTH_CHECK_SPAN + Duration::from_millis(50))
-            .await;
-    }
+    let actual = health_status_refusal(&router, &service_id).await;
+    assert_eq!(
+        actual,
+        (400, "InstanceNotFound".to_string()),
+        "a deleted health check leaves no status to report, got {actual:?}"
+    );
 }
 
 /// A read is free of side effects: `GetService` repeated after an update answers the

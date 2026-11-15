@@ -1183,3 +1183,24 @@ mod zz_probe_whole_emulator;
 //! about the file itself — copies of this header re-typed with `//!` (`E0753`, so no suite
 //! of this target compiled) and bookkeeping about declarations that are no longer
 //! duplicated — and they are gone rather than re-typed.
+//! Put a new suite at `tests/all/<name>.rs` and declare it below, keeping the list
+//! sorted.
+//! A suite that is not declared here compiles nowhere and its tests never run. A
+//! suite left at the top level of `tests/` fails the build. Declare each suite exactly
+//! ONCE: this is one crate root, so a second `mod` for the same name is `E0428`, and an
+//! inner doc comment (`//!`) is legal only before the first item, so a note written with
+//! `//!` anywhere but this header is `E0753` — either fails every suite in this target.
+//! `all/all_rs_declares_each_suite_once.rs` checks the declarations and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` the notes, for this file and
+//! for every service crate's `tests/all.rs` — so check there rather than leaving a note
+//! at the end of this file, where a note must be an ordinary `//` comment.
+//! The list below is declarations only. `tests/all.rs` is a test-target CRATE ROOT, so a
+//! bare `mod` resolves to a SIBLING (`tests/boot_serve.rs`) — which the layout check
+//! refuses; the `#[path]` above each `mod` is what points it into `tests/all/`. Each
+//! suite's own module doc says what it covers and why it lives in this target rather than
+//! in one service crate, which is where that belongs: it stays correct when the suite
+//! moves, and it is read with the test it describes.
+// A new suite's declaration goes below this line, with its own `#[path]`: appending here
+// keeps a landing clear of the sorted span above, where two branches adding neighbouring
+// names collide. Keep it to the two lines of the declaration — a note belongs in the
+// suite's own module doc, and `//!` here is `E0753`.

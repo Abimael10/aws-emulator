@@ -758,20 +758,36 @@ async fn a_custom_health_status_is_accepted_only_where_a_custom_health_check_is_
         .await;
 
         // The initial status the register call stored, read through the operation that
-        // exists for it: `HEALTHY` where a custom health check is configured (the
-        // documented default for `AWS_INIT_HEALTH_STATUS`), `UNKNOWN` where nothing has
-        // reported on the instance.
-        let initial = ok(
-            &router,
-            "GetInstancesHealthStatus",
-            json!({ "ServiceId": service_id }),
-        )
-        .await;
-        assert_eq!(
-            initial["Status"]["i-1"],
-            json!(if accepted { "HEALTHY" } else { "UNKNOWN" }),
-            "case {case:?}: the registered instance's initial status, got {initial}"
-        );
+        // exists for it — but only a service that configures health checking has a
+        // status to report at all: one that configures neither kind of check is in no
+        // health registry, so every scope of that read is an instance miss.
+        let health_tracked = body.get("HealthCheckConfig").is_some()
+            || body.get("HealthCheckCustomConfig").is_some();
+        if health_tracked {
+            let initial = ok(
+                &router,
+                "GetInstancesHealthStatus",
+                json!({ "ServiceId": service_id }),
+            )
+            .await;
+            assert_eq!(
+                initial["Status"]["i-1"],
+                json!(if accepted { "HEALTHY" } else { "UNKNOWN" }),
+                "case {case:?}: the registered instance's initial status, got {initial}"
+            );
+        } else {
+            let (status, code) = failure(
+                &router,
+                "GetInstancesHealthStatus",
+                json!({ "ServiceId": service_id }),
+            )
+            .await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "InstanceNotFound"),
+                "case {case:?}: nothing tracks the health of an unchecked service's instances"
+            );
+        }
         let (status, code) = failure(
             &router,
             "GetInstancesHealthStatus",

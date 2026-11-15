@@ -3,7 +3,9 @@
 //! @op DeregisterInstance
 //! Implemented: removes the instance from its service, bumps that service's
 //! `InstancesRevision`, and files the `DEREGISTER_INSTANCE` operation this call
-//! returns the id of.
+//! returns the id of. Repeating the call for an instance the service already removed
+//! files that operation again and changes nothing; `InstanceNotFound` is kept for an
+//! instance the service never held.
 //!
 //! ## Shape of an operation
 //!
@@ -178,7 +180,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .services
                 .get_mut(&service_id)
                 .expect("the resolved service id is present");
-            if service.instances.remove(&input.instance_id).is_none() {
+            if service.instances.remove(&input.instance_id).is_some() {
+                // The instance set changed, which is what the revision reports.
+                service.instances_revision += 1;
+            } else if !service.deregistered(&input.instance_id) {
                 return Err(DeregisterInstanceErrorModeled::InstanceNotFound(
                     InstanceNotFound {
                         // This operation's own template: the instance the request named
@@ -193,7 +198,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            service.instances_revision += 1;
+            // A deregistration asks for the instance NOT to be registered with the
+            // service, so a repeat of one that already completed is a request for a
+            // state the service is already in: it changes nothing (the revision stays
+            // put) and is answered with the operation below, exactly as the first call
+            // was. Only an instance this service never held has nothing to deregister.
+            service.remember_deregistered(&input.instance_id);
             service.namespace_id.clone()
         };
 
