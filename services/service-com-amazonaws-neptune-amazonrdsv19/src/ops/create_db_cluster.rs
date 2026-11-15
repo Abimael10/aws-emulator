@@ -319,6 +319,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let created = ::std::time::SystemTime::now();
         let seed = st::record_seed(&identifier, created);
         let endpoint_token = st::mint_endpoint_token(&identifier, created);
+        // The connection endpoint and the port the cluster reports have to be an address
+        // this emulator answers on: they are the only way a neptunedata client finds the
+        // graph.
+        let address =
+            st::announced_cluster_address(ctx, &identifier, &endpoint_token, &region, input.port);
         let engine_version = input
             .engine_version
             .unwrap_or_else(|| st::DEFAULT_ENGINE_VERSION.to_string());
@@ -333,15 +338,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `State::settle` applies that transition once the span has elapsed.
             status: st::STATUS_CREATING.to_string(),
             available_at: Some(created + st::PROVISIONING_SPAN),
-            endpoint: format!(
-                "{identifier}.cluster-{endpoint_token}.{region}.neptune.amazonaws.com"
-            ),
-            reader_endpoint: format!(
-                "{identifier}.cluster-ro-{endpoint_token}.{region}.neptune.amazonaws.com"
-            ),
+            endpoint: address.endpoint,
+            reader_endpoint: address.reader_endpoint,
             endpoint_token,
             hosted_zone_id: st::hosted_zone_id(&region),
-            port: input.port.unwrap_or(st::DEFAULT_PORT),
+            port: address.port,
             availability_zones,
             db_subnet_group: input.db_subnet_group_name,
             db_cluster_parameter_group: input

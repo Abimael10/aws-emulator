@@ -75,9 +75,26 @@ pub(crate) fn emulator() -> MultiServiceRouter {
     router
 }
 
+/// The endpoint a client of this service's own AWS front door addresses, which is what
+/// every call below sends unless it names another one.
+pub(crate) const AWS_ENDPOINT: &str = "https://rds.amazonaws.com/";
+
 /// One awsQuery call against `region`, returning the HTTP status and the XML body.
 pub(crate) async fn call_in<N: AsRef<str>, V: AsRef<str>>(
     router: &MultiServiceRouter,
+    region: &str,
+    action: &str,
+    params: &[(N, V)],
+) -> (u16, String) {
+    call_addressed_to(router, AWS_ENDPOINT, region, action, params).await
+}
+
+/// [`call_in`] with the request ADDRESSED to `endpoint` — the URL a client is configured
+/// with, which is what the address a resource PUBLISHES is read off: a client talking to
+/// this emulator's own endpoint is published that endpoint.
+pub(crate) async fn call_addressed_to<N: AsRef<str>, V: AsRef<str>>(
+    router: &MultiServiceRouter,
+    endpoint: &str,
     region: &str,
     action: &str,
     params: &[(N, V)],
@@ -92,7 +109,7 @@ pub(crate) async fn call_in<N: AsRef<str>, V: AsRef<str>>(
     }
     let request = http::Request::builder()
         .method("POST")
-        .uri("https://rds.amazonaws.com/")
+        .uri(endpoint)
         .header("content-type", "application/x-www-form-urlencoded")
         .header(
             "authorization",

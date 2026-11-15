@@ -15,6 +15,8 @@
 mod account_attributes;
 #[path = "all/already_exists_refusal_sentences.rs"]
 mod already_exists_refusal_sentences;
+#[path = "all/api_plane_cluster_endpoint.rs"]
+mod api_plane_cluster_endpoint;
 #[path = "all/aurora_engine_parameterised_row_locks.rs"]
 mod aurora_engine_parameterised_row_locks;
 #[path = "all/aurora_engine_row_locks.rs"]

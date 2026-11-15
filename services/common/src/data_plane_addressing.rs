@@ -398,6 +398,41 @@ pub fn carries_a_dot_segment(request_path: &str) -> bool {
         .any(|segment| segment == "." || segment == "..")
 }
 
+/// The `host` and the `port` of the address this emulator is REACHED at, for a resource that
+/// publishes the two as SEPARATE members — a database cluster's `Endpoint` beside its `Port`,
+/// where the host member carries no port of its own, so `host + ":" + port` is the address a
+/// client dials.
+///
+/// Composed from the two readings above, so no service writes a third rule for which address
+/// is this emulator's own: the endpoint a request ADDRESSED when the caller resolves nothing
+/// else ([`reached_emulator_endpoint_of_parts`]), else the one this process is SERVED at
+/// ([`served_endpoint_authority`], the base `OperationContext::endpoint` reports). `None` for
+/// an emulator served on no port that no request addressed directly — an in-process call with
+/// no socket behind it, where there is no address of this process to publish.
+///
+/// An authority that names no port is reported with [`IMPLICIT_HTTPS_PORT`]: this emulator
+/// serves TLS, and an `https` URL without a port is dialled there.
+#[must_use]
+pub fn reached_emulator_host_and_port(
+    parts: &::http::request::Parts,
+    served_base: &str,
+) -> Option<(String, u16)> {
+    let authority = reached_emulator_endpoint_of_parts(parts)
+        .or_else(|| served_endpoint_authority(served_base))?;
+    let host = host_only(&authority).to_string();
+    if host.is_empty() {
+        return None;
+    }
+    let port = addressed_port(Some(authority.as_str()))
+        .and_then(|port| u16::try_from(port).ok())
+        .unwrap_or(IMPLICIT_HTTPS_PORT);
+    Some((host, port))
+}
+
+/// The port an authority that names none is dialled on over `https`, which RFC 9110 fixes at
+/// 443 — what [`reached_emulator_host_and_port`] reports for such an address.
+pub const IMPLICIT_HTTPS_PORT: u16 = 443;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,6 +733,49 @@ mod tests {
                 *service,
                 "case {host:?}: expected names_a_service {service}, got {}",
                 names_a_service(host)
+            );
+        }
+    }
+
+    /// The base URL a router that is served on no port at all reports.
+    const UNSERVED: &str = ::smithy_server_runtime::UNSERVED_URL_BASE;
+
+    /// One row of the own-address table: the `Host` the request carried, the base the
+    /// router is served at, and the host and port the reading must answer.
+    type OwnAddressRow = (&'static str, &'static str, Option<(&'static str, u16)>);
+
+    #[test]
+    fn the_emulators_own_address_is_read_as_a_host_and_a_port() {
+        // The rows span what the reading generalises over: the loopback literal with and
+        // without a port, the loopback NAME, a bracketed IPv6 literal (whose own colons live
+        // inside its brackets), and a request that addressed one of AWS's own hosts — the
+        // caller that resolves them, so the SERVED base answers instead, or nothing does.
+        let cases: &[OwnAddressRow] = &[
+            ("127.0.0.1:9297", UNSERVED, Some(("127.0.0.1", 9297))),
+            ("127.0.0.1", UNSERVED, Some(("127.0.0.1", IMPLICIT_HTTPS_PORT))),
+            ("localhost:41509", UNSERVED, Some(("localhost", 41509))),
+            ("[::1]:38001", UNSERVED, Some(("[::1]", 38001))),
+            (
+                "rds.us-east-1.amazonaws.com",
+                "https://127.0.0.1:35117",
+                Some(("127.0.0.1", 35117)),
+            ),
+            ("rds.us-east-1.amazonaws.com", UNSERVED, None),
+        ];
+
+        for (host, served_base, expected) in cases {
+            let request = ::http::Request::builder()
+                .uri("/")
+                .header(::http::header::HOST, *host)
+                .body(())
+                .expect("the request builds");
+            let (parts, ()) = request.into_parts();
+            let answered = reached_emulator_host_and_port(&parts, served_base);
+            let expected = expected.map(|(host, port)| (host.to_string(), port));
+            assert_eq!(
+                answered, expected,
+                "case {host:?} served at {served_base:?}: expected {expected:?}, got \
+                 {answered:?}"
             );
         }
     }

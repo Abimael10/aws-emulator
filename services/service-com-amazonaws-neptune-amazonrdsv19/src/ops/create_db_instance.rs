@@ -368,6 +368,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let engine_version = input
                 .engine_version
                 .unwrap_or_else(|| cluster.engine_version.clone());
+            // Its connection endpoint, like the cluster's, has to be an address this
+            // emulator answers on.
+            let (endpoint_address, endpoint_port) = st::announced_instance_address(
+                ctx,
+                &identifier,
+                &cluster.endpoint_token,
+                &region,
+                input.port,
+                cluster.port,
+            );
             let record = st::DbInstanceRecord {
                 arn: ::engine::emulator_arn("rds", &region, &format!("db:{identifier}")),
                 dbi_resource_id: st::mint_instance_resource_id(&identifier, created),
@@ -377,11 +387,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 status: st::STATUS_CREATING.to_string(),
                 available_at: Some(created + st::PROVISIONING_SPAN),
                 cluster_identifier: cluster.identifier.clone(),
-                endpoint_address: format!(
-                    "{identifier}.{}.{region}.neptune.amazonaws.com",
-                    cluster.endpoint_token
-                ),
-                endpoint_port: input.port.unwrap_or(cluster.port),
+                endpoint_address,
+                endpoint_port,
                 hosted_zone_id: cluster.hosted_zone_id.clone(),
                 availability_zone: input.availability_zone.unwrap_or_else(|| {
                     cluster

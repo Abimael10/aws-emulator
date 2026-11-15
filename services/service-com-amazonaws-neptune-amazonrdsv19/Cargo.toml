@@ -21,6 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `data_plane_addressing`: the tree's one reading of which host is the emulator's own, so
+# the address a cluster announces is one this process answers on.
+service-common = { path = "../common" }
 # SHA-256, used to mint the opaque resource ids and DNS labels the API reports
 # (DbClusterResourceId, DbiResourceId, endpoint shard labels) deterministically.
 sha2 = { workspace = true }

@@ -216,15 +216,53 @@ pub(crate) struct Neptune {
 
 impl Neptune {
     pub(crate) fn new() -> Self {
+        Self::build(None)
+    }
+
+    /// A harness whose emulator is SERVED at `base` — the data port's published URL, which
+    /// `OperationContext::endpoint` reports and an address a resource announces is read off
+    /// when the request itself addressed one of AWS's own hosts.
+    pub(crate) fn served_at(base: &str) -> Self {
+        Self::build(Some(
+            smithy_server_runtime::EndpointUrl::parse(base)
+                .expect("the test's served base is an absolute https URL with a host"),
+        ))
+    }
+
+    fn build(base: Option<smithy_server_runtime::EndpointUrl>) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The test asserts service behaviour, not SigV4 verification.
         router.set_request_authentication(false);
+        if let Some(base) = base {
+            router.set_url_base(base);
+        }
         router.register_service(EmulatedService::new(engine));
         Self { router }
     }
 
     pub(crate) async fn call(&self, action: &str, params: &[(&str, &str)]) -> Reply {
+        self.dispatch(None, action, params).await
+    }
+
+    /// [`Self::call`] with the request ADDRESSED to `host` — the `Host` header a client
+    /// configured with one endpoint URL sends. The address a cluster announces is read off
+    /// it, so a suite asserting on an announced address drives the service through this.
+    pub(crate) async fn call_addressed_to(
+        &self,
+        host: &str,
+        action: &str,
+        params: &[(&str, &str)],
+    ) -> Reply {
+        self.dispatch(Some(host), action, params).await
+    }
+
+    async fn dispatch(
+        &self,
+        host: Option<&str>,
+        action: &str,
+        params: &[(&str, &str)],
+    ) -> Reply {
         let mut body = format!("Action={action}&Version={API_VERSION}");
         for (key, value) in params {
             assert!(
@@ -237,7 +275,7 @@ impl Neptune {
             body.push('=');
             body.push_str(value);
         }
-        let request = http::Request::builder()
+        let mut builder = http::Request::builder()
             .method("POST")
             .uri("/")
             .header("content-type", "application/x-www-form-urlencoded")
@@ -256,7 +294,11 @@ impl Neptune {
                     "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20260101/{REGION}/neptune/aws4_request, \
                      SignedHeaders=host, Signature=not-verified"
                 ),
-            )
+            );
+        if let Some(host) = host {
+            builder = builder.header("host", host);
+        }
+        let request = builder
             .body(bytes::Bytes::from(body))
             .expect("the request builds");
         let response = self.router.dispatch(request).await;

@@ -1025,6 +1025,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.served_endpoint = endpoint
             .as_ref()
             .map(|endpoint| endpoint.endpoint.clone());
+        // An instance whose engine speaks no native wire can still be a member of a cluster
+        // whose data plane this emulator serves as an API — an Amazon Neptune instance's
+        // graph API is served on this emulator's own endpoint — so it publishes THAT
+        // address rather than a name nothing here resolves
+        // ([`crate::state::api_plane_endpoint`]).
+        if record.served_endpoint.is_none() {
+            record.served_endpoint = crate::state::api_plane_endpoint(&record.engine, ctx);
+        }
 
         // Another request may have created this identifier while this one was binding, so
         // the conflict is answered again here rather than overwriting a stored instance —

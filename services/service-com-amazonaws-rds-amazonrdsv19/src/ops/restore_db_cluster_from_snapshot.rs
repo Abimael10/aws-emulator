@@ -1176,6 +1176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.served_endpoint = endpoint.as_ref().map(|endpoint| endpoint.endpoint.clone());
         record.served_reader_endpoint =
             endpoint.as_ref().and_then(|endpoint| endpoint.reader.clone());
+        // An engine whose data plane this emulator serves as an API rather than as a native
+        // wire (Amazon Neptune's graph API) publishes this emulator's own endpoint, the
+        // address that API answers on ([`crate::state::api_plane_endpoint`]).
+        if record.served_endpoint.is_none() {
+            record.served_endpoint = crate::state::api_plane_endpoint(&record.engine, ctx);
+        }
 
         // THE RESTORE ITSELF: the data the snapshot holds is loaded into the new cluster's
         // own storage, by the engine, before the endpoint is published — so the first

@@ -1386,6 +1386,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         record.served_endpoint = endpoint.as_ref().map(|endpoint| endpoint.endpoint.clone());
         record.served_reader_endpoint = endpoint.as_ref().and_then(|endpoint| endpoint.reader.clone());
+        // A cluster whose engine speaks no native wire can still have a data plane this
+        // emulator serves: an Amazon Neptune cluster's is its graph API, served on this
+        // emulator's own endpoint, so the cluster publishes THAT address — the one a client
+        // can reach its graph at ([`crate::state::api_plane_endpoint`]).
+        if record.served_endpoint.is_none() {
+            record.served_endpoint = crate::state::api_plane_endpoint(&record.engine, ctx);
+        }
         // A cluster created with backtracking ON keeps the consistent point it starts from:
         // "Backtracks a DB cluster to a specific time", which it can only do to a time it
         // kept the data of, and the cluster's own storage as the engine just opened it is

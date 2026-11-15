@@ -46,11 +46,13 @@ pub struct DbClusterRecord {
     pub resource_id: String,
     /// The server-assigned middle label of the cluster endpoint DNS names, minted once.
     pub endpoint_host: String,
-    /// The address the cluster's own engine listener accepts connections on, for a cluster
-    /// whose engine speaks a wire this emulator serves
-    /// ([`data_plane::cluster_endpoint::cluster_engine_wire`]); `None` for one that has no
-    /// listener, which keeps the DNS-form endpoint. What [`Self::endpoint`] and
-    /// [`Self::published_port`] report.
+    /// The address a client connects to this cluster at: the cluster's own engine listener
+    /// for an engine whose native wire this emulator serves
+    /// ([`data_plane::cluster_endpoint::cluster_engine_wire`]), or this emulator's own
+    /// endpoint for an engine whose data plane it serves as an API instead
+    /// ([`crate::state::api_plane_endpoint`]); `None` for a cluster whose data plane this
+    /// emulator does not serve at all, which keeps the DNS-form endpoint. What
+    /// [`Self::endpoint`] and [`Self::published_port`] report.
     pub served_endpoint: Option<ServedEndpoint>,
     /// The address of the cluster's READER endpoint — the second listener of the same engine,
     /// whose sessions serve no writes — for a cluster that has one; `None` for a cluster with
@@ -352,9 +354,11 @@ impl DbClusterRecord {
     /// Guide, "Amazon Aurora connection management"), with the domain of the control plane
     /// that owns the cluster's engine — see [`endpoint_domain`].
     ///
-    /// A cluster whose engine this emulator SERVES publishes the host its own listener is
-    /// bound to instead: that is the address a client connects to, and a name this machine
-    /// does not resolve would be no endpoint at all.
+    /// A cluster whose data plane this emulator SERVES publishes the host that plane is
+    /// reached at instead — its own listener's, or this emulator's own endpoint for an
+    /// engine served as an API ([`crate::state::api_plane_endpoint`]): that is the address a
+    /// client connects to, and a name this machine does not resolve would be no endpoint at
+    /// all.
     pub fn endpoint(&self) -> String {
         if let Some(served) = &self.served_endpoint {
             return served.host.clone();
@@ -397,6 +401,13 @@ impl DbClusterRecord {
                 &served.host,
                 u16::try_from(served.port).unwrap_or_default(),
             );
+        }
+        if let Some(served) = &self.served_endpoint {
+            // A cluster whose whole data plane is served at ONE address — an engine served
+            // as an API on this emulator's own endpoint, which has no second read-only
+            // listener ([`crate::state::api_plane_endpoint`]) — answers reads there too, so
+            // the reader endpoint is that same host and the `Port` beside it is its port.
+            return served.host.clone();
         }
         format!(
             "{}.cluster-ro-{}.{}.{}",

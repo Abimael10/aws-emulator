@@ -288,6 +288,9 @@ pub use maintenance_window::{stored_maintenance_window, window_is_open};
 // The Data API HTTP endpoint of a DB cluster: the one write `EnableHttpEndpoint` and
 // `DisableHttpEndpoint` share, and the preconditions both hold a request to.
 mod data_api_endpoint;
+// The address a resource publishes when its data plane is an AWS API this emulator serves
+// at its own endpoint (Amazon Neptune's graph API) rather than a native engine wire.
+mod api_plane_address;
 // The Secrets Manager secret RDS manages for a resource's master user password: the
 // record a resource stores for it, and the minting a request that turns
 // `ManageMasterUserPassword` on depends on.
@@ -315,6 +318,7 @@ pub use engine_defaults::*;
 pub use minted_values::*;
 pub use published_values::*;
 pub use clusters::*;
+pub use api_plane_address::*;
 pub use data_api_endpoint::*;
 pub use instances::*;
 pub use managed_master_secret::*;

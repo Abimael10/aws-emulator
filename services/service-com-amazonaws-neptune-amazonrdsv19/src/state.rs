@@ -14,6 +14,13 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
+/// Which address a cluster and its instances announce for a client to connect to.
+mod announced_address;
+
+pub use announced_address::{
+    announced_cluster_address, announced_instance_address, served_address, ClusterAddress,
+};
+
 use crate::ops::types::{
     DBCluster, DBClusterMember, DBClusterRole, DBInstance, DBParameterGroupStatus, Endpoint,
     ServerlessV2ScalingConfigurationInfo, VpcSecurityGroupMembership,
