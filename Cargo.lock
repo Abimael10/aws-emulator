@@ -15465,6 +15465,7 @@ dependencies = [
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-kms-trentservice",
  "service-com-amazonaws-s3tables-s3tablebuckets",
+ "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",
  "sha2 0.10.9",
  "tokio",

@@ -65,7 +65,18 @@
 //! dry run — are not here: they are built by the shared helpers in [`crate::state`] so every
 //! operation states them one way.
 //!
-//! ## This service's other edited seam: the operation whose output is an event stream
+//! ## This service's second edited seam: who may perform the action at all
+//!
+//! Every request to an AWS service is decided at the IAM layer before the service acts on
+//! the stream it names, so every operation mounted below is served behind
+//! [`authorization::Authorized`]: the principal the request's credential speaks for is
+//! resolved, the documents in force on it are evaluated against
+//! `kinesis:<OperationName>` on the resource the request addresses, and a call they do not
+//! allow is refused with `AccessDeniedException` instead of reaching the handler. The gate
+//! is one wrapper rather than a call in each of the 45 handlers because the rule is the
+//! SERVICE's and not one operation's.
+//!
+//! ## This service's third edited seam: the operation whose output is an event stream
 //!
 //! `SubscribeToShard`'s output member `EventStream` targets a `@streaming` union, so the
 //! generated `ErasedOperation` shim of it declines the request (it cannot drive
@@ -76,10 +87,16 @@
 //! consults FIRST — hands back for it. That operation reads its own request, so it is not
 //! behind [`StatedPerOperation`]; it words a refused request through
 //! [`Service::override_refusal`] below, which is the same module and therefore the same
-//! sentence.
+//! sentence — and it asks the authorization gate itself, through
+//! [`authorization_refusal`], for the same reason.
 
+mod authorization;
 mod submitted_batch;
 mod validation;
+
+/// This service's authorization gate, as the one hand-authored operation asks it: every other
+/// operation is served behind [`authorization::Authorized`], which asks it for them.
+pub(crate) use authorization::refusal as authorization_refusal;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::ProtocolError;
@@ -97,10 +114,11 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// The same operations the generated table holds, each wrapped in [`StatedPerOperation`]
-    /// so a refused request is worded the way this service words it. Keyed by the routing
-    /// key the protocol resolves — the key the generated table uses — and built from the SAME
-    /// shared engine, so a wrapped operation reads and writes the one store.
+    /// The same operations the generated table holds, each wrapped in
+    /// [`authorization::Authorized`] (IAM decides the call) inside [`StatedPerOperation`] (a
+    /// refused request is worded the way this service words it). Keyed by the routing key the
+    /// protocol resolves — the key the generated table uses — and built from the SAME shared
+    /// engine, so a wrapped operation reads and writes the one store.
     stated: OperationRoutingTable,
     /// This service's one event-stream operation, `SubscribeToShard`. It is NOT in the
     /// generated table in a servable form — the shim of an operation whose output is a
@@ -115,16 +133,19 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
 const SUBSCRIBE_TO_SHARD_OPERATION: &str = "SubscribeToShard";
 
 /// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
-/// [`StatedPerOperation`] and keyed by its operation shape name — the routing key
-/// `ServerHttpProtocol::routing_key` resolves and the generated table is keyed by.
+/// [`authorization::Authorized`] (IAM decides the call) inside [`StatedPerOperation`] (a
+/// refused request is worded the way this service words it) and keyed by its operation shape
+/// name — the routing key `ServerHttpProtocol::routing_key` resolves and the generated table
+/// is keyed by.
 macro_rules! wrap_operations {
     ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
         $(
             $table.add_operation(
                 stringify!($operation),
-                ::std::boxed::Box::new(StatedPerOperation::new(
+                ::std::boxed::Box::new(StatedPerOperation::new(authorization::Authorized::new(
                     crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
-                )) as ::std::boxed::Box<dyn ErasedOperation>,
+                    ::std::sync::Arc::clone(&$engine),
+                ))) as ::std::boxed::Box<dyn ErasedOperation>,
             );
         )+
     };
@@ -401,6 +422,30 @@ mod tests {
         "/smithy-model/com-amazonaws-kinesis-kinesis-20131202.json"
     );
 
+    /// Every operation name the MODEL declares, read from the model this crate was generated
+    /// from rather than from a hand-kept list \u2014 so a rule stated over "every operation of
+    /// this service" is checked over the surface the model publishes.
+    pub(super) fn modelled_operations() -> Vec<String> {
+        let model = std::fs::read_to_string(MODEL_PATH)
+            .expect("the model that generated this crate ships beside it");
+        let model: serde_json::Value =
+            serde_json::from_str(&model).expect("the model that generated this crate is JSON");
+        let shapes = model["shapes"]
+            .as_object()
+            .expect("a Smithy model declares shapes")
+            .clone();
+        let operations: Vec<String> = shapes
+            .iter()
+            .filter(|(_, shape)| shape["type"] == "operation")
+            .filter_map(|(id, _)| id.rsplit('#').next().map(str::to_string))
+            .collect();
+        assert!(
+            operations.len() >= 45,
+            "case the model's surface: expected this service's operations, got {operations:?}"
+        );
+        operations
+    }
+
     /// RULE applied to the whole surface: every operation the generated routing table serves
     /// is also served behind [`StatedPerOperation`], under the same key that table is keyed
     /// by — except the one whose output is an event stream, which reads its own request and
@@ -415,26 +460,12 @@ mod tests {
     /// does with it.
     #[test]
     fn every_operation_this_crate_serves_is_served_with_this_services_refusal_wording() {
-        let model = std::fs::read_to_string(MODEL_PATH)
-            .expect("the model that generated this crate ships beside it");
-        let model: serde_json::Value =
-            serde_json::from_str(&model).expect("the model that generated this crate is JSON");
-        let shapes = model["shapes"]
-            .as_object()
-            .expect("a Smithy model declares shapes");
-        let operations: Vec<&str> = shapes
-            .iter()
-            .filter(|(_, shape)| shape["type"] == "operation")
-            .filter_map(|(id, _)| id.rsplit('#').next())
-            .collect();
-        assert!(
-            operations.len() >= 45,
-            "case the model's surface: expected this service's operations, got {operations:?}"
-        );
+        let operations = modelled_operations();
 
         let service = EmulatedService::new(Arc::new(engine::InMemoryEngine::new()));
         let mut served = 0usize;
         for operation in operations {
+            let operation = operation.as_str();
             if service.entry.routing_table().get(operation).is_none() {
                 continue;
             }

@@ -39,6 +39,12 @@ service-common = { path = "../common" }
 # A channel with a streaming table destination creates that table in S3 Tables, which owns
 # every table record: the create writes it through that service's own state.
 service-com-amazonaws-s3tables-s3tablebuckets = { workspace = true }
+# Who a request's credential speaks for: the session the token service minted that access key
+# id for, which is what an authorization decision is taken about.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# What that principal may do: the identity-based policy documents and the permissions
+# boundary IAM holds for it, read through IAM's own accessors.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -51,9 +57,6 @@ aws-smithy-eventstream = "0.60"
 # The encryption suites mount the KMS service beside Kinesis on one engine, because
 # `StartStreamEncryption` resolves the `KeyId` it is given by calling it.
 service-com-amazonaws-kms-trentservice = { workspace = true }
-# The channel-key suite mounts IAM beside them too: a channel's create asks IAM whether its
-# service execution role may use that key.
-service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [lints]
 workspace = true

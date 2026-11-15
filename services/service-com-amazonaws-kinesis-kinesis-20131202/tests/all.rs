@@ -75,6 +75,8 @@ mod record_distribution_strategy;
 mod record_flow;
 #[path = "all/refusal_message_templates.rs"]
 mod refusal_message_templates;
+#[path = "all/request_authorization.rs"]
+mod request_authorization;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
 #[path = "all/resource_policy_absence.rs"]

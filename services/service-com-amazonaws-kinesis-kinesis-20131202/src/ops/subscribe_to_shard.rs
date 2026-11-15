@@ -415,6 +415,26 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
             );
         };
 
+        // Who may subscribe at all is decided at the IAM layer, before anything about the
+        // consumer or the shard is read — the same gate every other operation of this service
+        // is served behind (`crate::service::authorization`), asked here because this
+        // hand-authored operation owns its whole request-to-response step and so is not
+        // mounted behind that gate's wrapper. The resource is the CONSUMER the request names,
+        // which is the resource type this operation addresses.
+        if let Some(message) = crate::service::authorization_refusal(
+            &*self.engine,
+            ctx,
+            "SubscribeToShard",
+            &input.consumer_arn,
+        ) {
+            return error_response(
+                svc.definition().protocol(),
+                &SubscribeToShardErrorModeled::AccessDeniedException(AccessDeniedException {
+                    message: Some(message),
+                }),
+            );
+        }
+
         // The stream's own CMK decides whether its data plane serves this read at all, so the
         // key is resolved against KMS first — exactly as the pull reader resolves it
         // (`crate::ops::get_records`). The store guard is taken only to read which key the
