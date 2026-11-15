@@ -402,7 +402,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
         // behind is written, under ONE lock which this block RELEASES before the pool's own
         // trigger is invoked: a function is another service's and must not be waited on
         // while every other request of this one waits for the lock.
-        let username = {
+        let answered = 'answered: {
             let guard = &mut *state.lock();
 
             // The pool and the app client the request names have to exist before the
@@ -481,6 +481,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
             if input.challenge_name != session.challenge_name {
                 return Err(invalid_challenge_state());
             }
+            // A response that names a user answers only the challenge of the
+            // user ITS OWN session was started for.
+            if let Some(named) = responses.get(USERNAME) {
+                let pool = guard
+                    .pool(&input.user_pool_id)
+                    .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+                if pool.user_storage_key(named) != pool.user_storage_key(&session.username) {
+                    return Err(invalid_session());
+                }
+            }
+
+            // Which challenge the session is waiting on decides what ANSWERS it.
+            // A second factor is answered by presenting the code that factor is
+            // read off or delivered as, the choice between several factors by
+            // naming the one to present, and the setup challenge by having
+            // registered a factor while the challenge stood.
+            if let Some(code_entry) = crate::state::mfa_code_response_key(&session.challenge_name) {
+                let presented = responses
+                    .get(code_entry)
+                    .ok_or_else(|| missing_parameter(code_entry))?
+                    .clone();
+                // The user the session names may have been disabled, reset or
+                // deleted since the challenge was started, so the sign-in is
+                // refused on the stored user's own state before the code it
+                // presented decides anything.
+                let username = usable_session_user(guard, &session)?;
+                match guard.answer_mfa_challenge(&session, &presented, now) {
+                    crate::state::MfaAnswer::Accepted => {}
+                    // A wrong code leaves the session standing — answering it is
+                    // what spends it — so the caller can present the right one
+                    // while the session lasts.
+                    crate::state::MfaAnswer::CodeMismatch => {
+                        return Err(code_mismatch(&session.challenge_name));
+                    }
+                    crate::state::MfaAnswer::CodeAlreadyUsed => return Err(code_already_used()),
+                    crate::state::MfaAnswer::FactorGone => return Err(mfa_method_not_found()),
+                }
+                // The challenge is answered, so the session is spent: the same
+                // code cannot complete a second sign-in.
+                guard.end_session(&session_token);
+                break 'answered Answered::Completed {
+                    username,
+                    generation: crate::state::lambda_triggers::TokenGeneration::Authentication,
+                };
+            }
+            if session.challenge_name == crate::state::MFA_SETUP_CHALLENGE {
+                let username = usable_session_user(guard, &session)?;
+                match guard.complete_mfa_setup(&session, now) {
+                    crate::state::MfaSetupCompletion::Activated(_) => {}
+                    crate::state::MfaSetupCompletion::NothingRegistered => {
+                        return Err(software_token_mfa_not_found());
+                    }
+                }
+                guard.end_session(&session_token);
+                break 'answered Answered::Completed {
+                    username,
+                    generation: crate::state::lambda_triggers::TokenGeneration::Authentication,
+                };
+            }
+            if session.challenge_name == crate::state::SELECT_MFA_TYPE_CHALLENGE {
+                let answer = responses
+                    .get(crate::state::ANSWER_RESPONSE)
+                    .ok_or_else(|| missing_parameter(crate::state::ANSWER_RESPONSE))?;
+                let chosen = crate::state::mfa_setting_chosen(answer)
+                    .ok_or_else(|| {
+                        invalid_parameter(crate::state::chosen_factor_refusal_message())
+                    })?;
+                let username = usable_session_user(guard, &session)?;
+                let started = guard
+                    .pool(&input.user_pool_id)
+                    .and_then(|pool| {
+                        let user = pool.user(&session.username)?;
+                        pool.start_mfa_challenge(user, chosen, now)
+                    })
+                    .ok_or_else(mfa_method_not_found)?;
+                let challenge_parameters =
+                    crate::state::mfa_challenge_parameters(&username, &started);
+                let delivered = started.code.as_ref().map(|code| code.code.clone()).filter(
+                    |_| started.challenge_name == crate::state::EMAIL_OTP_CHALLENGE,
+                );
+                let validity = guard
+                    .pool(&input.user_pool_id)
+                    .and_then(|pool| pool.clients.get(&input.client_id))
+                    .map_or(session.expires_at, |client| {
+                        now + client.auth_session_validity()
+                    });
+                let next = guard.start_session(
+                    now,
+                    crate::state::AuthSession {
+                        user_pool_id: input.user_pool_id.clone(),
+                        client_id: input.client_id.clone(),
+                        username: username.clone(),
+                        challenge_name: started.challenge_name.clone(),
+                        expires_at: validity,
+                        // Outstanding: this session has answered nothing yet.
+                        spent: false,
+                        code: started.code.clone(),
+                    },
+                );
+                // The selection answered the challenge it was outstanding for,
+                // so that session is spent and the factor the caller chose is
+                // outstanding on a session of its own.
+                guard.end_session(&session_token);
+                break 'answered Answered::Next {
+                    output: Box::new(AdminRespondToAuthChallengeOutput {
+                        challenge_name: Some(started.challenge_name),
+                        session: Some(next),
+                        challenge_parameters: Some(challenge_parameters),
+                        authentication_result: None,
+                        available_challenges: None,
+                    }),
+                    delivered: delivered.map(|code| (username, code)),
+                };
+            }
             if session.challenge_name != NEW_PASSWORD_REQUIRED {
                 // No other challenge is started with a session yet, so no stored
                 // state could decide whether a response to it is right.
@@ -515,14 +629,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
             let pool = guard
                 .pool_mut(&input.user_pool_id)
                 .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
-            // A response that names a user is answered only for the user its own
-            // session was started for.
-            if let Some(named) = responses.get(USERNAME) {
-                let session_key = pool.user_storage_key(&session.username);
-                if pool.user_storage_key(named) != session_key {
-                    return Err(invalid_session());
-                }
-            }
             if let Some(message) = pool.check_password(
                 &new_password,
                 crate::state::PasswordPolicyWording::AnswersChallenge,
@@ -599,19 +705,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
 
             // The session answered its challenge, so it is spent.
             guard.end_session(&session_token);
-            username
+            // Answering this challenge both completes the sign-in and sets the password the
+            // user chose, which is the trigger source its token generation reports.
+            Answered::Completed {
+                username,
+                generation: crate::state::lambda_triggers::TokenGeneration::NewPasswordChallenge,
+            }
+        };
+
+        let (username, generation) = match answered {
+            Answered::Completed {
+                username,
+                generation,
+            } => (username, generation),
+            Answered::Next { output, delivered } => {
+                // A pool that routes its email to a custom sender delivers the one-time
+                // password of the challenge this answer STARTED by handing it to that
+                // function instead of mailing it, as the sign-in does for the challenge it
+                // starts itself.
+                if let Some((username, code)) = delivered {
+                    crate::state::lambda_triggers::custom_email::fire_custom_email_sender(
+                        ctx,
+                        &state,
+                        &input.user_pool_id,
+                        &username,
+                        crate::state::lambda_triggers::custom_email::CustomEmailSource::Authentication,
+                        crate::state::lambda_triggers::Caller::of(ctx.parts(), None),
+                        input.client_metadata.as_ref(),
+                        &code,
+                    )
+                    .await
+                    .map_err(trigger_failed)?;
+                }
+                return Ok(*output);
+            }
         };
 
         // The challenge is answered, so the tokens the sign-in completes with are the next
         // stage, and the pool's pre-token-generation trigger gates them: "called after the
         // user is created by an admin. This flow is invoked when the user has to change a
-        // temporary password" is this generation's own documented trigger source.
+        // temporary password" and "called after user authentication flows have completed"
+        // are those generations' own documented trigger sources.
         let overrides = crate::state::lambda_triggers::fire_pre_token_generation(
             ctx,
             &state,
             &input.user_pool_id,
             &username,
-            crate::state::lambda_triggers::TokenGeneration::NewPasswordChallenge,
+            generation,
             // An `Admin*` operation is authorized by IAM credentials rather than by an app
             // client, so the event names no caller client id.
             crate::state::lambda_triggers::Caller::of(ctx.parts(), None),
@@ -620,8 +760,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
         .await
         .map_err(trigger_failed)?;
 
-        let authentication_result = state
-            .lock()
+        let guard = &mut *state.lock();
+        let mut authentication_result = guard
             .issue_tokens(
                 &input.user_pool_id,
                 &input.client_id,
@@ -631,6 +771,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
                 &overrides,
             )
             .ok_or_else(internal_error)?;
+        // The sign-in this response completed came from a device, so on a pool that
+        // remembers devices that device is now part of this user's state and the key of one
+        // the pool did not recognise is what the caller needs to confirm it:
+        // `ChallengeResponses` is where a caller "include[s] a `DEVICE_KEY` for device
+        // authentication" (this service's model).
+        authentication_result.new_device_metadata = guard.track_sign_in_device(
+            &input.user_pool_id,
+            &username,
+            responses.get(DEVICE_KEY).map(String::as_str),
+            now,
+        );
         Ok(AdminRespondToAuthChallengeOutput {
             // Authentication is complete, so there is no next challenge and no
             // session to carry into one — and the challenge parameter map is
@@ -644,9 +795,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
     }
 }
 
+/// What answering the outstanding challenge left the sign-in at.
+enum Answered {
+    /// The challenge is answered and the sign-in is COMPLETE, so the tokens the
+    /// token generation `generation` mints are what the caller gets.
+    Completed {
+        username: String,
+        generation: crate::state::lambda_triggers::TokenGeneration,
+    },
+    /// The answer satisfied one challenge and left the NEXT one outstanding, so
+    /// the caller gets that challenge rather than tokens — beside the one-time
+    /// password it delivered, if any, and the user it was delivered to.
+    Next {
+        output: Box<AdminRespondToAuthChallengeOutput>,
+        delivered: Option<(String, String)>,
+    },
+}
+
+/// The STORED user the challenge session `session` was started for, refusing one
+/// that can no longer sign in.
+///
+/// The user may have been disabled, reset or deleted since the challenge was
+/// started, so every response is refused on the stored user's own state just as
+/// the sign-in that started the challenge was ([`crate::state::UserStatus`]).
+fn usable_session_user(
+    state: &crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState,
+    session: &crate::state::AuthSession,
+) -> Result<String, AdminRespondToAuthChallengeError> {
+    let user = state
+        .pool(&session.user_pool_id)
+        .and_then(|pool| pool.user(&session.username))
+        .ok_or_else(user_not_found)?;
+    if !user.enabled {
+        return Err(not_authorized("User is disabled."));
+    }
+    match user.status {
+        crate::state::UserStatus::ResetRequired => Err(password_reset_required()),
+        crate::state::UserStatus::Unconfirmed => Err(user_not_confirmed()),
+        _ => Ok(user.username.clone()),
+    }
+}
+
 /// The challenge a user that must change its password answers
 /// (`ChallengeNameType` in this service's model).
 const NEW_PASSWORD_REQUIRED: &str = "NEW_PASSWORD_REQUIRED";
+
+/// The `ChallengeResponses` entry naming the device a response comes from:
+/// "include a `DEVICE_KEY` for device authentication" (this service's model).
+const DEVICE_KEY: &str = "DEVICE_KEY";
 
 /// The `ChallengeResponses` entry a `NEW_PASSWORD_REQUIRED` response carries the
 /// chosen password in.
@@ -809,6 +1005,80 @@ fn invalid_parameter(message: String) -> AdminRespondToAuthChallengeError {
     AdminRespondToAuthChallengeErrorModeled::InvalidParameterException(InvalidParameterException {
         message: Some(message),
         reason_code: None,
+    })
+    .into()
+}
+
+/// This operation's `CodeMismatchException`: "this exception is thrown if the
+/// provided code doesn't match what the server was expecting" (this service's
+/// model), carrying the sentence the challenge it answers owes a wrong code
+/// ([`crate::state::mfa_code_mismatch_message`]) — the one the client-side
+/// challenge response carries too, so the two cannot word it differently.
+fn code_mismatch(challenge_name: &str) -> AdminRespondToAuthChallengeError {
+    AdminRespondToAuthChallengeErrorModeled::CodeMismatchException(CodeMismatchException {
+        message: Some(crate::state::mfa_code_mismatch_message(challenge_name).to_string()),
+    })
+    .into()
+}
+
+/// This operation's `ExpiredCodeException` ("thrown if a code has expired" —
+/// this service's model) for a one-time password this user's software token
+/// already authenticated a sign-in with: one time step's password authenticates
+/// once, so a code presented again is used up rather than wrong
+/// ([`crate::state::SOFTWARE_TOKEN_CODE_USED_MESSAGE`]). The challenge it was
+/// presented to stays outstanding.
+fn code_already_used() -> AdminRespondToAuthChallengeError {
+    AdminRespondToAuthChallengeErrorModeled::ExpiredCodeException(ExpiredCodeException {
+        message: Some(crate::state::SOFTWARE_TOKEN_CODE_USED_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `MFAMethodNotFoundException`: "this exception is thrown when
+/// Amazon Cognito can't find a multi-factor authentication (MFA) method" (this
+/// service's model) — the factor the outstanding challenge asks for is not one
+/// the user holds any more, so there is nothing to check its response against.
+/// The sentence names no value from the request.
+fn mfa_method_not_found() -> AdminRespondToAuthChallengeError {
+    AdminRespondToAuthChallengeErrorModeled::MFAMethodNotFoundException(
+        MFAMethodNotFoundException {
+            message: Some("No MFA method is configured for the user.".to_string()),
+        },
+    )
+    .into()
+}
+
+/// This operation's `SoftwareTokenMFANotFoundException` for an `MFA_SETUP`
+/// response from a user that registered no software token while the challenge
+/// stood: the challenge is answered with "the session ID from
+/// `VerifySoftwareToken`" (`ChallengeResponses` in this service's model), so a
+/// user whose authenticator was never registered has not answered it. The
+/// sentence names no value from the request.
+fn software_token_mfa_not_found() -> AdminRespondToAuthChallengeError {
+    AdminRespondToAuthChallengeErrorModeled::SoftwareTokenMFANotFoundException(
+        SoftwareTokenMFANotFoundException {
+            message: Some("Software token MFA is not registered for the user.".to_string()),
+        },
+    )
+    .into()
+}
+
+/// This operation's `PasswordResetRequiredException` for a user Amazon Cognito is
+/// waiting on a new password from.
+fn password_reset_required() -> AdminRespondToAuthChallengeError {
+    AdminRespondToAuthChallengeErrorModeled::PasswordResetRequiredException(
+        PasswordResetRequiredException {
+            message: Some(crate::state::PASSWORD_RESET_REQUIRED_MESSAGE.to_string()),
+        },
+    )
+    .into()
+}
+
+/// This operation's `UserNotConfirmedException` for a user whose sign-up nothing
+/// confirmed.
+fn user_not_confirmed() -> AdminRespondToAuthChallengeError {
+    AdminRespondToAuthChallengeErrorModeled::UserNotConfirmedException(UserNotConfirmedException {
+        message: Some("User is not confirmed.".to_string()),
     })
     .into()
 }

@@ -66,7 +66,7 @@ const ENDPOINT_HOST: &str = "cognito-idp.us-east-1.amazonaws.com";
 const EMULATOR_HOST: &str = "127.0.0.1:9297";
 
 /// A password satisfying a default pool's password policy.
-const GOOD_PASSWORD: &str = "Passw0rd!2024";
+pub const GOOD_PASSWORD: &str = "Passw0rd!2024";
 
 /// The `UserMFASettingList` value TOTP MFA is reported under: "the possible values
 /// in this list are `SMS_MFA`, `EMAIL_OTP`, and `SOFTWARE_TOKEN_MFA`" (this
@@ -100,13 +100,13 @@ const TIME_STEP: Duration = Duration::from_secs(30);
 const CODE_DIGITS: usize = 6;
 
 /// The emulator under test and the engine its state is reached through.
-struct Emulator {
-    engine: Arc<engine::InMemoryEngine>,
-    router: MultiServiceRouter,
+pub struct Emulator {
+    pub engine: Arc<engine::InMemoryEngine>,
+    pub router: MultiServiceRouter,
 }
 
 /// One emulator with just this service mounted.
-fn emulator() -> Emulator {
+pub fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(cognito_idp::EmulatedService::new(Arc::clone(&engine)));
@@ -119,7 +119,7 @@ fn emulator() -> Emulator {
 /// administrative operation; an unsigned one is addressed to the emulator's own
 /// address, which is how a signed-in user's client calls the self-service half of
 /// this API.
-async fn dispatch(
+pub async fn dispatch(
     emulator: &Emulator,
     operation: &str,
     body: &Value,
@@ -161,7 +161,7 @@ async fn dispatch(
 }
 
 /// Call the signed `operation`, requiring success, and return its response body.
-async fn ok(emulator: &Emulator, operation: &str, body: &Value) -> Value {
+pub async fn ok(emulator: &Emulator, operation: &str, body: &Value) -> Value {
     let (status, payload) = dispatch(emulator, operation, body, true).await;
     assert_eq!(
         status, 200,
@@ -172,7 +172,7 @@ async fn ok(emulator: &Emulator, operation: &str, body: &Value) -> Value {
 
 /// Call the unsigned self-service `operation`, requiring success, and return its
 /// response body.
-async fn ok_self_service(emulator: &Emulator, operation: &str, body: &Value) -> Value {
+pub async fn ok_self_service(emulator: &Emulator, operation: &str, body: &Value) -> Value {
     let (status, payload) = dispatch(emulator, operation, body, false).await;
     assert_eq!(
         status, 200,
@@ -182,7 +182,7 @@ async fn ok_self_service(emulator: &Emulator, operation: &str, body: &Value) -> 
 }
 
 /// The `__type` of an error body, which is the wire error code.
-fn error_code(payload: &Value) -> &str {
+pub fn error_code(payload: &Value) -> &str {
     payload
         .get("__type")
         .and_then(Value::as_str)
@@ -190,7 +190,7 @@ fn error_code(payload: &Value) -> &str {
 }
 
 /// The `message` of an error body.
-fn error_message(payload: &Value) -> &str {
+pub fn error_message(payload: &Value) -> &str {
     payload
         .get("message")
         .and_then(Value::as_str)
@@ -199,7 +199,7 @@ fn error_message(payload: &Value) -> &str {
 
 /// Create a pool named `name`, with `extra` merged into the request, and return its
 /// minted id.
-async fn pool(emulator: &Emulator, name: &str, extra: Value) -> String {
+pub async fn pool(emulator: &Emulator, name: &str, extra: Value) -> String {
     let mut body = Map::new();
     body.insert("PoolName".to_string(), json!(name));
     if let Some(members) = extra.as_object() {
@@ -216,7 +216,12 @@ async fn pool(emulator: &Emulator, name: &str, extra: Value) -> String {
 
 /// Create an app client of `user_pool_id` that allows the password sign-in flows,
 /// with `extra` merged in, and return its minted id.
-async fn app_client(emulator: &Emulator, user_pool_id: &str, name: &str, extra: Value) -> String {
+pub async fn app_client(
+    emulator: &Emulator,
+    user_pool_id: &str,
+    name: &str,
+    extra: Value,
+) -> String {
     let mut body = Map::new();
     body.insert("UserPoolId".to_string(), json!(user_pool_id));
     body.insert("ClientName".to_string(), json!(name));
@@ -322,7 +327,7 @@ async fn signed_in(emulator: &Emulator, name: &str) -> SignedIn {
 }
 
 /// The time step the instant `at` falls in: the TOTP counter.
-fn current_step(at: SystemTime) -> u64 {
+pub fn current_step(at: SystemTime) -> u64 {
     at.duration_since(UNIX_EPOCH)
         .expect("the clock is past the epoch")
         .as_secs()
@@ -333,7 +338,7 @@ fn current_step(at: SystemTime) -> u64 {
 /// the time step `step`, computed here rather than asked of the service (see the
 /// module docs): RFC 6238's TOTP over RFC 4226's HOTP, HMAC-SHA-1 of the counter,
 /// dynamically truncated and taken to six digits.
-fn one_time_password(secret_code: &str, step: u64) -> String {
+pub fn one_time_password(secret_code: &str, step: u64) -> String {
     use hmac::Mac;
 
     let key = data_encoding::BASE32_NOPAD
@@ -860,11 +865,13 @@ const REFUSED: u16 = 400;
 /// self-service half.
 const CREDENTIAL_CASES: &[CredentialCase] = &[
     CredentialCase {
+        // A request that presents NEITHER credential presents nothing the call
+        // could be authorized with, which is an authorization failure rather
+        // than a complaint about the request's shape.
         case: "neither an access token nor a session",
         credential: Credential::None,
-        code: "InvalidParameterException",
-        message: "Invalid request. You can provide either an access token or a session ID in the \
-                  request.",
+        code: "NotAuthorizedException",
+        message: "Invalid Access Token",
     },
     CredentialCase {
         case: "both an access token and a session",

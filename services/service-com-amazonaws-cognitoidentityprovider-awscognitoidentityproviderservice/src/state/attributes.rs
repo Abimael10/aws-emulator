@@ -529,15 +529,24 @@ pub enum MfaPreferenceRejection {
 impl MfaPreferenceRejection {
     /// What the refusal reports.
     ///
-    /// An activation the user cannot receive reports the factor it asked for and
-    /// that the user holds no configuration to receive it with. A preference over a
-    /// factor the request leaves off reports that alone and names NO factor: "only
-    /// one factor can be set as preferred" (`SetUserMFAPreference` in this
-    /// service's model) and a factor that is off is not one a user prefers, so the
-    /// refusal is about the preference rather than about any one factor. Nothing
-    /// stored is disclosed either way.
+    /// An activation the user cannot receive reports what the user is missing:
+    /// the software token is received through an authenticator the user has to
+    /// REGISTER first — "users must register a TOTP authenticator before they
+    /// set this as their preferred MFA method"
+    /// (`SetUserMFAPreference.SoftwareTokenMfaSettings` in this service's
+    /// model) — so its refusal reports that registration, while a message
+    /// factor's reports the delivery configuration its message would be sent
+    /// with, naming the factor it asked for. A preference over a factor the
+    /// request leaves off reports that alone and names NO factor: "only one
+    /// factor can be set as preferred" (`SetUserMFAPreference` in this
+    /// service's model) and a factor that is off is not one a user prefers, so
+    /// the refusal is about the preference rather than about any one factor.
+    /// Nothing stored is disclosed either way.
     pub fn message(&self) -> String {
         match self {
+            Self::NoDeliveryConfig(setting) if setting == SOFTWARE_TOKEN_MFA_SETTING => {
+                "User has not verified software token mfa".to_string()
+            }
             Self::NoDeliveryConfig(setting) => {
                 format!("User does not have delivery config set to turn on {setting}")
             }

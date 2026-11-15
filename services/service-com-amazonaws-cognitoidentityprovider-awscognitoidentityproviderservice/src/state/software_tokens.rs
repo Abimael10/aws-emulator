@@ -36,20 +36,34 @@ const SOFTWARE_TOKEN_CODE_DIGITS: u32 = 6;
 /// from being rejected.
 const SOFTWARE_TOKEN_DRIFT_STEPS: u64 = 1;
 
-/// The message a software-token call owes a request that does not carry EXACTLY
-/// ONE of the two credentials it may be authorized with.
+/// The message a software-token call owes a request that carries BOTH of the two
+/// credentials it may be authorized with.
 ///
 /// Both `AccessToken` and `Session` are optional in the model and each
 /// identifies the user on its own — "you can provide either an access token or a
 /// session ID in the request" (`AssociateSoftwareToken.AccessToken` in this
-/// service's model) — so a request carrying neither names no user to set a
-/// factor up for, and one carrying both names the user twice over. Either way
-/// the request's parameters are what is wrong with it, which is what
+/// service's model) — so a request carrying both names the user twice over: the
+/// request's parameters are what is wrong with it, which is what
 /// `InvalidParameterException` reports ("thrown when the Amazon Cognito service
 /// encounters an invalid parameter"), and the sentence names no value from the
-/// request.
+/// request. A request carrying NEITHER presents no credential at all, which is an
+/// authorization failure rather than a request-shape complaint
+/// ([`NO_SOFTWARE_TOKEN_CREDENTIAL_MESSAGE`]).
 pub const ONE_SOFTWARE_TOKEN_CREDENTIAL_MESSAGE: &str =
     "Invalid request. You can provide either an access token or a session ID in the request.";
+
+/// The message a software-token call owes a request that carries NEITHER of the
+/// two credentials it may be authorized with.
+///
+/// Such a call "can [be] authorize[d] ... with either the user's access token, or
+/// a session string from a challenge response" (`AssociateSoftwareToken` in this
+/// service's model), so the access token is the credential it is authorized with
+/// unless a session stands in for it, and a request that carries neither presents
+/// no access token — the same rejection of the credential itself that an access
+/// token naming no signed-in user gets ([`TokenRejection::NotAnAccessToken`]),
+/// reported as the authorization failure it is. The sentence names no value from
+/// the request.
+pub const NO_SOFTWARE_TOKEN_CREDENTIAL_MESSAGE: &str = "Invalid Access Token";
 
 /// A fresh `SecretCode`: "a unique generated shared secret code that is used by
 /// the TOTP algorithm to generate a one-time code"
@@ -92,24 +106,25 @@ pub fn mint_software_token_secret(store: &::emulator_server::CredentialStore) ->
 }
 
 /// Whether an authenticator provisioned with `secret_code` emits `user_code`
-/// around `at`.
+/// around `at`, and which time step's one-time password it is.
 ///
 /// RFC 6238's TOTP over RFC 4226's HOTP, computed by the `totp-lite` crate rather
 /// than here: SHA-1 is the algorithm an authenticator app uses when the key it was
 /// provisioned with names none, and the code has to be byte-identical to the one
 /// that app shows. Decided against the steps within [`SOFTWARE_TOKEN_DRIFT_STEPS`]
-/// of the one `at` falls in. A key that is not base32, or an instant no counter
-/// counts from, emits nothing.
-fn software_token_emits(secret_code: &str, user_code: &str, at: SystemTime) -> bool {
-    let Some(key) = software_token_key(secret_code) else {
-        return false;
-    };
-    let Some(step) = software_token_time_step(at) else {
-        return false;
-    };
+/// of the one `at` falls in, the EARLIEST matching step first, so a code is
+/// attributed to the step it was generated in. A key that is not base32, or an
+/// instant no counter counts from, emits nothing.
+fn software_token_emitting_step(
+    secret_code: &str,
+    user_code: &str,
+    at: SystemTime,
+) -> Option<u64> {
+    let key = software_token_key(secret_code)?;
+    let step = software_token_time_step(at)?;
     (step.saturating_sub(SOFTWARE_TOKEN_DRIFT_STEPS)
         ..=step.saturating_add(SOFTWARE_TOKEN_DRIFT_STEPS))
-        .any(|step| software_token_code(&key, step) == user_code)
+        .find(|step| software_token_code(&key, *step) == user_code)
 }
 
 /// The key material a `SecretCode` spells, or `None` for text that is not base32
@@ -170,10 +185,18 @@ impl SoftwareTokenKey {
     }
 
     /// Whether the authenticator provisioned with this key emits `user_code`
-    /// around `at` ([`software_token_emits`]).
+    /// around `at` ([`software_token_emitting_step`]).
     #[must_use]
     pub fn emits(&self, user_code: &str, at: SystemTime) -> bool {
-        software_token_emits(&self.0, user_code, at)
+        self.emitting_step(user_code, at).is_some()
+    }
+
+    /// The time step whose one-time password `user_code` is, for the
+    /// authenticator provisioned with this key as of `at`
+    /// ([`software_token_emitting_step`]).
+    #[must_use]
+    pub fn emitting_step(&self, user_code: &str, at: SystemTime) -> Option<u64> {
+        software_token_emitting_step(&self.0, user_code, at)
     }
 }
 
@@ -196,9 +219,13 @@ pub struct SoftwareTokenCaller {
 /// The operation that asked maps each one to a modelled error IT declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SoftwareTokenRefusal {
-    /// The request carries neither credential, or both
+    /// The request carries NEITHER credential, so it presents nothing this call
+    /// could be authorized with
+    /// ([`NO_SOFTWARE_TOKEN_CREDENTIAL_MESSAGE`]).
+    NoCredential,
+    /// The request carries BOTH credentials, which names the user twice over
     /// ([`ONE_SOFTWARE_TOKEN_CREDENTIAL_MESSAGE`]).
-    NotOneCredential,
+    BothCredentials,
     /// The `AccessToken` identifies no signed-in user, for the reason the
     /// rejection names.
     AccessToken(TokenRejection),
@@ -235,9 +262,17 @@ impl User {
     /// `user_code` around `at`. A user that has associated none emits no code,
     /// so nothing presented for it matches.
     pub fn software_token_emits(&self, user_code: &str, at: SystemTime) -> bool {
+        self.software_token_step_of(user_code, at).is_some()
+    }
+
+    /// The time step whose one-time password `user_code` is, for the
+    /// authenticator this user associated a private key for as of `at`, and
+    /// `None` for a code that key emits in no step of the window — a user that
+    /// has associated no key emits none at all.
+    pub fn software_token_step_of(&self, user_code: &str, at: SystemTime) -> Option<u64> {
         self.software_token_key
             .as_ref()
-            .is_some_and(|key| key.emits(user_code, at))
+            .and_then(|key| key.emitting_step(user_code, at))
     }
 }
 
@@ -300,7 +335,8 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
                     session: Some(stored),
                 })
             }
-            _ => Err(SoftwareTokenRefusal::NotOneCredential),
+            (None, None) => Err(SoftwareTokenRefusal::NoCredential),
+            (Some(_), Some(_)) => Err(SoftwareTokenRefusal::BothCredentials),
         }
     }
 
@@ -325,6 +361,11 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         {
             Some(user) => {
                 user.software_token_key = Some(SoftwareTokenKey::spelled(secret_code));
+                // The key the one-time passwords are read from is a NEW one, so
+                // no step of it has authenticated anything yet: what the user's
+                // previous key spent is not spent on this one
+                // ([`User::software_token_authenticated_step`]).
+                user.software_token_authenticated_step = None;
                 true
             }
             None => false,
@@ -335,13 +376,17 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// one-time password `user_code` presented as proof the authenticator holds
     /// that key, as of `now`.
     ///
-    /// A code the key emits around `now` ([`User::software_token_emits`]) "marks
-    /// the user's software token MFA status as verified" (`VerifySoftwareToken` in
-    /// this service's model), which is the delivery configuration TOTP MFA is
-    /// delivered with ([`User::holds_mfa_delivery_config`]), so from here the user
-    /// can activate `SOFTWARE_TOKEN_MFA`. Any other code registers nothing and
-    /// leaves the user exactly as it was, so the setup can be completed with the
-    /// next code the authenticator shows.
+    /// A code the key emits around `now` ([`User::software_token_step_of`])
+    /// "marks the user's software token MFA status as verified"
+    /// (`VerifySoftwareToken` in this service's model), which is the delivery
+    /// configuration TOTP MFA is delivered with
+    /// ([`User::holds_mfa_delivery_config`]), so from here the user can activate
+    /// `SOFTWARE_TOKEN_MFA`. The registration proves the authenticator holds the
+    /// key rather than authenticating a sign-in, so the code it presents is not
+    /// one of the sign-in passwords a later challenge response may not reuse
+    /// ([`User::software_token_authenticated_step`]). Any other code registers
+    /// nothing and leaves the user exactly as it was, so the setup can be
+    /// completed with the next code the authenticator shows.
     pub fn register_software_token(
         &mut self,
         caller: &SoftwareTokenCaller,

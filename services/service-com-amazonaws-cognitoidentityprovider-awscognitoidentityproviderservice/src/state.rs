@@ -59,10 +59,14 @@ mod token_validity;
 /// The software token a user sets up as a TOTP authenticator: the private key an
 /// association mints for it and the one-time password a registration presents.
 mod software_tokens;
+/// The second factor a sign-in presents: which MFA challenge a user owes, what
+/// answers it, and what satisfying it leaves behind.
+mod mfa_challenge;
 pub use attributes::*;
 pub use csv_header::*;
 pub use presented_tokens::*;
 pub use identity_providers::*;
+pub use mfa_challenge::*;
 pub use openid_discovery::*;
 pub use pool_preconditions::*;
 pub use pool_resources::*;
@@ -348,19 +352,7 @@ pub fn mfa_setup_challenge_parameters(
     username: &str,
     settings_can_setup: &[String],
 ) -> HashMap<String, String> {
-    let mut parameters = HashMap::new();
-    parameters.insert(USER_ID_FOR_SRP.to_string(), username.to_string());
-    parameters.insert(
-        MFAS_CAN_SETUP.to_string(),
-        ::serde_json::Value::Array(
-            settings_can_setup
-                .iter()
-                .map(|setting| ::serde_json::Value::String(setting.clone()))
-                .collect(),
-        )
-        .to_string(),
-    );
-    parameters
+    challenge_parameters_listing(username, MFAS_CAN_SETUP, settings_can_setup)
 }
 
 /// the user it is for, the attributes the challenge response must supply, and the

@@ -247,10 +247,13 @@ const VERIFICATION_SUCCEEDED: &str = "SUCCESS";
 ///
 /// `EnableSoftwareTokenMFAException` "is thrown when there is a code mismatch and
 /// the service fails to configure the software token TOTP multi-factor
-/// authentication" (this service's model): the presented code is what failed, so
-/// nothing is registered and the user keeps the software token MFA status it
-/// already had. The sentence names no value from the request.
-const CODE_MISMATCH_MESSAGE: &str = "Code mismatch and fail enable Software Token MFA";
+/// authentication" (this service's model), and Amazon Cognito reports it in ONE
+/// fixed sentence: the presented code is what failed, so nothing is registered and
+/// the user keeps the software token MFA status it already had, and the sentence
+/// interpolates no value from the request and nothing about the user or the pool.
+/// A code that is plainly wrong and one read from a time step the window has
+/// passed are the same mismatch, so both carry it.
+const CODE_MISMATCH_MESSAGE: &str = "Code mismatch";
 
 /// This operation's answer to a `UserCode` that is none the associated key emits —
 /// a user that has associated no key emits none at all, so a code presented before
@@ -268,14 +271,19 @@ fn code_mismatch() -> VerifySoftwareTokenError {
 /// register an authenticator for.
 ///
 /// Every rejection of a credential itself answers `NotAuthorizedException`, which
-/// "is thrown when a user isn't authorized" (this service's model), while a request
-/// that carries the wrong NUMBER of credentials is refused for the parameters it
-/// carries and one whose pool or user is gone answers for the resource that is
-/// gone — each of which this operation declares its own error for. No message names
-/// a stored value.
+/// "is thrown when a user isn't authorized" (this service's model) — and a request
+/// that presents NO credential at all is such a rejection, since the verification is
+/// authorized by the user's access token or by a session from an association and
+/// this one presents neither. A request that names the user TWICE over is refused
+/// for the parameters it carries, and one whose pool or user is gone answers for the
+/// resource that is gone — each of which this operation declares its own error for.
+/// No message names a stored value.
 fn caller_rejected(refusal: crate::state::SoftwareTokenRefusal) -> VerifySoftwareTokenError {
     match refusal {
-        crate::state::SoftwareTokenRefusal::NotOneCredential => {
+        crate::state::SoftwareTokenRefusal::NoCredential => {
+            not_authorized(crate::state::NO_SOFTWARE_TOKEN_CREDENTIAL_MESSAGE)
+        }
+        crate::state::SoftwareTokenRefusal::BothCredentials => {
             invalid_parameter(crate::state::ONE_SOFTWARE_TOKEN_CREDENTIAL_MESSAGE.to_string())
         }
         crate::state::SoftwareTokenRefusal::AccessToken(rejection) => match rejection {

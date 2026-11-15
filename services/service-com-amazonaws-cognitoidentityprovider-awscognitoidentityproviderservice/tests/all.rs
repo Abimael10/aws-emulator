@@ -189,6 +189,8 @@ mod log_delivery_configuration;
 mod log_delivery_destinations;
 #[path = "all/message_delivery_and_live_codes.rs"]
 mod message_delivery_and_live_codes;
+#[path = "all/mfa_sign_in_challenge.rs"]
+mod mfa_sign_in_challenge;
 #[path = "all/not_found_sentence_per_operation.rs"]
 mod not_found_sentence_per_operation;
 #[path = "all/per_operation_refusal_wording.rs"]

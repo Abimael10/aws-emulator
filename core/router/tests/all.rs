@@ -1865,3 +1865,8 @@ mod default_vpc_internet_path_runs_ecs_tasks;
 // belongs in that suite's OWN module doc, where it is read beside the test it explains; a note
 // about this file belongs in `all/appended_notes.rs`.
 // This file is a test-target CRATE ROOT, where a bare `mod` resolves to a SIBLING of it
+// An inner attribute is legal only BEFORE the first item, so the one this target needs
+// stands here, ahead of the declaration list
+// (`all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs`).
+#[path = "all/cognito_user_pool_replica_over_a_multi_region_key.rs"]
+mod cognito_user_pool_replica_over_a_multi_region_key;

@@ -540,10 +540,6 @@ const ADMIN_NO_SRP_AUTH: &str = "ADMIN_NO_SRP_AUTH";
 /// (`ChallengeNameType` in this service's model).
 const NEW_PASSWORD_REQUIRED: &str = "NEW_PASSWORD_REQUIRED";
 
-/// The challenge a user that must set up an MFA factor before it can sign in is
-/// answered with (`ChallengeNameType` in this service's model).
-const MFA_SETUP: &str = "MFA_SETUP";
-
 /// `AuthFlowType`'s choice-based entry point: "USER_AUTH — The entry point for
 /// choice-based authentication" (`InitiateAuth.AuthFlow` in this service's model).
 const USER_AUTH: &str = "USER_AUTH";
@@ -555,15 +551,16 @@ const PREFERRED_CHALLENGE: &str = "PREFERRED_CHALLENGE";
 
 /// The email one-time-password challenge (`ChallengeNameType`), which is also the
 /// `SignInPolicyType.AllowedFirstAuthFactors` value that admits it.
-const EMAIL_OTP: &str = "EMAIL_OTP";
+const EMAIL_OTP: &str = crate::state::EMAIL_OTP_CHALLENGE;
 
 /// The attribute an email one-time password is delivered to.
-const EMAIL: &str = "email";
+const EMAIL: &str = crate::state::EMAIL_ATTRIBUTE;
 
 /// The `ChallengeParameters` entries a delivered challenge reports its delivery
-/// under, the same two values `CodeDeliveryDetailsType` carries.
-const CODE_DELIVERY_DELIVERY_MEDIUM: &str = "CODE_DELIVERY_DELIVERY_MEDIUM";
-const CODE_DELIVERY_DESTINATION: &str = "CODE_DELIVERY_DESTINATION";
+/// under, the same two values `CodeDeliveryDetailsType` carries, read off the
+/// store so every challenge of this service reports a delivery identically.
+const CODE_DELIVERY_DELIVERY_MEDIUM: &str = crate::state::CODE_DELIVERY_DELIVERY_MEDIUM;
+const CODE_DELIVERY_DESTINATION: &str = crate::state::CODE_DELIVERY_DESTINATION;
 
 /// The `AuthParameters` entry that names the device the sign-in comes from:
 /// "Add `DEVICE_KEY` if you want to bypass multi-factor authentication with a
@@ -599,7 +596,15 @@ async fn password_sign_in(
         .ok_or_else(|| missing_auth_parameter("PASSWORD", USER_PASSWORD_AUTH))?;
 
     let outcome = {
-        let mut decided = decide_password_sign_in(store, client_id, username, password, now, true)?;
+        let mut decided = decide_password_sign_in(
+            store,
+            client_id,
+            username,
+            password,
+            auth_parameters.get(DEVICE_KEY).map(String::as_str),
+            now,
+            true,
+        )?;
         // A pool whose `LambdaConfig` names a migrate-user function has not decided a
         // username it does not hold yet: that trigger "can create user profiles when users
         // sign in ... with credentials that don't exist yet"
@@ -621,8 +626,15 @@ async fn password_sign_in(
             )
             .await
             .map_err(trigger_failed)?;
-            decided =
-                decide_password_sign_in(store, client_id, username, password, now, false)?;
+            decided = decide_password_sign_in(
+                store,
+                client_id,
+                username,
+                password,
+                auth_parameters.get(DEVICE_KEY).map(String::as_str),
+                now,
+                false,
+            )?;
         }
         match decided {
             Decided::Outcome(outcome) => outcome,
@@ -641,7 +653,7 @@ async fn password_sign_in(
             username,
             ..
         }
-        | Outcome::MfaSetup {
+        | Outcome::SecondFactor {
             user_pool_id,
             username,
             ..
@@ -698,34 +710,59 @@ async fn password_sign_in(
                 available_challenges: None,
             })
         }
-        Outcome::MfaSetup {
+        Outcome::SecondFactor {
             user_pool_id,
             username,
-            settings_can_setup,
+            factor,
             session_validity,
         } => {
+            // Which challenge the outstanding factor is presented through, what
+            // it reports about itself and the code it delivered are the store's
+            // own rule, so this sign-in and the administrative one cannot report
+            // the same factor differently.
+            let (challenge_name, challenge_parameters, code) =
+                crate::state::second_factor_challenge(&username, &factor)
+                    .ok_or_else(internal_error)?;
+            let delivered = code.as_ref().map(|code| code.code.clone());
             let session = store.lock().start_session(
                 now,
                 crate::state::AuthSession {
-                    user_pool_id,
+                    user_pool_id: user_pool_id.clone(),
                     client_id: client_id.to_string(),
                     username: username.clone(),
-                    challenge_name: MFA_SETUP.to_string(),
+                    challenge_name: challenge_name.clone(),
                     expires_at: now + session_validity,
                     // Outstanding: this session has answered nothing yet.
                     spent: false,
-                    // This challenge is answered by registering a factor, not
-                    // with a code anything delivered.
-                    code: None,
+                    // The code the challenge delivered, for a factor that is
+                    // delivered as a message, and none for a factor the user
+                    // reads its code off itself.
+                    code,
                 },
             );
-            Ok(InitiateAuthOutput {
-                challenge_name: Some(MFA_SETUP.to_string()),
-                session: Some(session),
-                challenge_parameters: Some(crate::state::mfa_setup_challenge_parameters(
+            // A pool that routes its email to a custom sender delivers an emailed
+            // one-time password by handing it to that function instead of mailing
+            // it, as the email challenge of the choice-based flow does.
+            if let Some(delivered) =
+                delivered.filter(|_| challenge_name == crate::state::EMAIL_OTP_CHALLENGE)
+            {
+                crate::state::lambda_triggers::custom_email::fire_custom_email_sender(
+                    ctx,
+                    store,
+                    &user_pool_id,
                     &username,
-                    &settings_can_setup,
-                )),
+                    crate::state::lambda_triggers::custom_email::CustomEmailSource::Authentication,
+                    caller,
+                    client_metadata,
+                    &delivered,
+                )
+                .await
+                .map_err(trigger_failed)?;
+            }
+            Ok(InitiateAuthOutput {
+                challenge_name: Some(challenge_name),
+                session: Some(session),
+                challenge_parameters: Some(challenge_parameters),
                 authentication_result: None,
                 available_challenges: None,
             })
@@ -798,11 +835,13 @@ enum Decided {
 /// Everything here happens under this service's lock, which this call OWNS: the lock is
 /// taken and released inside it, so its caller holds none of it while it invokes a trigger
 /// function.
+#[allow(clippy::too_many_arguments)]
 fn decide_password_sign_in(
     store: &Store,
     client_id: &str,
     username: &str,
     password: &str,
+    presented_device_key: Option<&str>,
     now: ::std::time::SystemTime,
     may_migrate: bool,
 ) -> Result<Decided, InitiateAuthError> {
@@ -868,21 +907,22 @@ fn decide_password_sign_in(
                 user_attributes: user.attributes.clone(),
                 session_validity,
             }
-        } else if pool.requires_mfa() && user.mfa_setting_list.is_empty() {
-            // The pool requires a second factor from every sign-in and this user
-            // has activated none, so the sign-in cannot complete: it is answered
-            // with the challenge to SET one up, naming the methods the pool
-            // offers for it, and no token is minted until that is done.
-            Outcome::MfaSetup {
-                user_pool_id,
-                username: user.username.clone(),
-                settings_can_setup: pool.mfa_settings_available_for_setup(user),
-                session_validity,
-            }
         } else {
-            Outcome::Authenticate {
-                user_pool_id,
-                username: user.username.clone(),
+            // The password is checked, so what is left is the SECOND factor this
+            // sign-in owes: the factor the user has activated, the choice between
+            // several, or the one the pool requires it to set up first — and no
+            // token is minted until that challenge is answered.
+            match pool.second_factor(user, presented_device_key, now) {
+                crate::state::SecondFactor::Complete => Outcome::Authenticate {
+                    user_pool_id,
+                    username: user.username.clone(),
+                },
+                factor => Outcome::SecondFactor {
+                    user_pool_id,
+                    username: user.username.clone(),
+                    factor,
+                    session_validity,
+                },
             }
         },
     ))
@@ -1198,12 +1238,13 @@ enum Outcome {
         user_pool_id: String,
         username: String,
     },
-    /// The password is right, the pool requires a second factor and the user has
-    /// activated none, so one has to be set up before the sign-in completes.
-    MfaSetup {
+    /// The password is right and a SECOND factor stands between this sign-in and
+    /// its tokens ([`crate::state::SecondFactor`]): the factor to present, the
+    /// choice between several, or the one that has to be set up first.
+    SecondFactor {
         user_pool_id: String,
         username: String,
-        settings_can_setup: Vec<String>,
+        factor: crate::state::SecondFactor,
         session_validity: ::std::time::Duration,
     },
 }

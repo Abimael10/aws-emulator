@@ -219,16 +219,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// factor up for.
 ///
 /// Every rejection of a credential itself answers `NotAuthorizedException`, which
-/// "is thrown when a user isn't authorized" (this service's model), while a request
-/// that carries the wrong NUMBER of credentials is refused for the parameters it
-/// carries and one whose pool or user is gone answers for the resource that is
-/// gone. This operation models neither `PasswordResetRequiredException` nor
-/// `UserNotFoundException`, so a user Amazon Cognito is waiting on a new password
-/// from is refused as unauthorized and one its pool no longer holds as a resource
-/// that cannot be found. No message names a stored value.
+/// "is thrown when a user isn't authorized" (this service's model) — and a request
+/// that presents NO credential at all is such a rejection, since the operation "can
+/// [be] authorize[d] ... with either the user's access token, or a session string
+/// from a challenge response" and this one presents neither. A request that names
+/// the user TWICE over is refused for the parameters it carries, and one whose pool
+/// or user is gone answers for the resource that is gone. This operation models
+/// neither `PasswordResetRequiredException` nor `UserNotFoundException`, so a user
+/// Amazon Cognito is waiting on a new password from is refused as unauthorized and
+/// one its pool no longer holds as a resource that cannot be found. No message names
+/// a stored value.
 fn caller_rejected(refusal: crate::state::SoftwareTokenRefusal) -> AssociateSoftwareTokenError {
     match refusal {
-        crate::state::SoftwareTokenRefusal::NotOneCredential => {
+        crate::state::SoftwareTokenRefusal::NoCredential => {
+            not_authorized(crate::state::NO_SOFTWARE_TOKEN_CREDENTIAL_MESSAGE)
+        }
+        crate::state::SoftwareTokenRefusal::BothCredentials => {
             invalid_parameter(crate::state::ONE_SOFTWARE_TOKEN_CREDENTIAL_MESSAGE.to_string())
         }
         crate::state::SoftwareTokenRefusal::AccessToken(rejection) => match rejection {
