@@ -761,7 +761,6 @@ async fn the_trace_graph_is_per_trace_and_an_unstored_trace_id_is_refused() {
             vec![fanned.clone()],
             vec!["cache", "frontend", "frontend"],
         ),
-        ("no trace at all", vec![], vec![]),
     ];
     for (label, ids, expected) in rows {
         let answer = xray.call("/TraceGraph", &json!({"TraceIds": ids})).await;
@@ -777,6 +776,16 @@ async fn the_trace_graph_is_per_trace_and_an_unstored_trace_id_is_refused() {
             "case {label:?}: the graph must carry exactly the named traces' services, got {names:?}"
         );
     }
+
+    // A request naming NO trace at all is refused rather than answered as an
+    // empty graph: an empty id list names nothing to graph (see
+    // `trace_id_list_reads.rs` for that rule over both reads that take one).
+    let none = xray.call("/TraceGraph", &json!({"TraceIds": []})).await;
+    assert_eq!(
+        (none.status, none.error_type.as_deref()),
+        (400, Some("InvalidRequestException")),
+        "no trace at all must be refused, got {none:?}"
+    );
 
     // The frontend served one request in the chain trace and two across both, so
     // the counts are the named traces' own.

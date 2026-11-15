@@ -9,6 +9,13 @@
 //! answered for; `UnprocessedTraceIds` reports ids the service failed to
 //! process, which a miss is not.
 //!
+//! The `TraceIds` list is read through the one reading every read of one makes
+//! ([`crate::state::trace_ids_fault`]) \u2014 except that a list naming NO id is
+//! answered with an empty batch rather than refused, which is this read's own
+//! answer to it \u2014 and the pagination this operation MODELS is not available on
+//! it: one call answers for every id it carries, so no `NextToken` is ever
+//! issued and any supplied one is refused.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -154,84 +161,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `TraceIds` carries no modelled length bound, so the bound is the
-        // service's own: at most `MAX_TRACE_IDS_PER_CALL` ids per call, and a
-        // longer list is an invalid request rather than a partly served one.
-        // The refusal states that limit, because the model does not.
-        let requested = input.trace_ids.len();
-        if requested > crate::state::MAX_TRACE_IDS_PER_CALL {
+        // The pagination this operation MODELS is not available on it: one call
+        // answers for every id it may carry, so this read hands out no cursor
+        // and can resume from none — ANY token is refused, for being a token at
+        // all rather than for not being recognised.
+        if input.next_token.is_some() {
             return Err(BatchGetTracesErrorModeled::InvalidRequestException(
                 InvalidRequestException {
-                    message: Some(crate::state::exceeding_maximum_query_size_message()),
+                    message: Some(crate::state::PAGINATION_UNSUPPORTED_MESSAGE.to_string()),
                 },
             )
             .into());
         }
 
-        // An id that is not of the documented `1-<8 hex>-<24 hex>` form names no
-        // trace this service could ever hold, so the request is refused rather
-        // than answered as though the trace merely did not exist.
-        if let Some(malformed) = input
-            .trace_ids
-            .iter()
-            .find(|trace_id| !crate::state::is_trace_id(trace_id))
-        {
-            return Err(BatchGetTracesErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(crate::state::malformed_trace_id_message(malformed)),
-                },
-            )
-            .into());
+        // Everything the requested list itself has to satisfy is found by the
+        // one reading every read of a `TraceIds` list makes
+        // ([`crate::state::trace_ids_fault`]). This read refuses every fault it
+        // finds but ONE: a list naming no id at all names no trace to answer
+        // for, and this read HAS somewhere to report that — `Traces` and
+        // `UnprocessedTraceIds`, both empty — so it answers rather than refuses.
+        // The id of the wrong form it states in its own words
+        // ([`crate::state::malformed_trace_id_message`]), which is not the
+        // sentence the graph read states for the same fault.
+        if let Some(fault) = crate::state::trace_ids_fault(&input.trace_ids) {
+            if !matches!(fault, crate::state::TraceIdsFault::NoIds) {
+                return Err(BatchGetTracesErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            fault.stated_with(crate::state::malformed_trace_id_message),
+                        ),
+                    },
+                )
+                .into());
+            }
         }
-
-        // The token names how far into `TraceIds` the last page got, so a resumed
-        // call continues through the SAME requested list. One this service never
-        // issued — unparseable, or past the end of the list — is refused.
-        let offset = match input.next_token.as_deref() {
-            None => 0usize,
-            Some(token) => match token.parse::<usize>() {
-                Ok(offset) if offset < input.trace_ids.len() => offset,
-                _ => {
-                    return Err(BatchGetTracesErrorModeled::InvalidRequestException(
-                        InvalidRequestException {
-                            message: Some(crate::state::invalid_next_token_message(token)),
-                        },
-                    )
-                    .into())
-                }
-            },
-        };
 
         let store = state.lock();
         let mut traces = Vec::new();
-        // The page caps the number of traces; this budget caps the number of
-        // segment documents they carry, so a short request cannot pull the whole
-        // accumulated store into one response. A trace that does not fit in what
-        // is left is deferred to the next page, not truncated.
+        // The requested list is bounded, so the count of traces needs no bound
+        // of its own; this budget caps the number of segment DOCUMENTS the
+        // response carries. It is the most a well-formed call can ask for
+        // ([`crate::state::MAX_SEGMENTS_PER_BATCH_RESPONSE`]), so a trace the
+        // store holds in full is answered in full — there is no next page to
+        // defer one to — while the cap still bounds what one response carries.
         let mut segment_budget = crate::state::MAX_SEGMENTS_PER_BATCH_RESPONSE;
-        let mut consumed = offset;
-        for trace_id in input.trace_ids.iter().skip(consumed) {
-            if traces.len() == TRACES_PAGE_SIZE {
-                break;
-            }
+        for trace_id in &input.trace_ids {
             // A requested id with nothing stored under it is a MISS: it is
             // neither answered for in `Traces` nor reported in
             // `UnprocessedTraceIds`, which is for ids the service failed to
             // process — a client reading it as a retry signal would otherwise
             // retry an id that simply does not exist for ever.
             if let Some(trace) = store.traces.get(trace_id) {
-                if trace.segments.len() > segment_budget && !traces.is_empty() {
-                    break;
-                }
                 let (wire, carried) = trace_of(trace, segment_budget);
                 segment_budget -= carried;
                 traces.push(wire);
             }
-            consumed += 1;
         }
-
-        // A token only when requested ids are still unread.
-        let next_token = (consumed < input.trace_ids.len()).then(|| consumed.to_string());
 
         Ok(BatchGetTracesOutput {
             traces: Some(traces),
@@ -239,19 +224,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // well formed and its trace is stored, so this list is empty rather
             // than carrying the misses.
             unprocessed_trace_ids: Some(Vec::new()),
-            next_token,
+            // No cursor is ever handed out: this read serves every id the one
+            // call carried, and the token it would resume from is refused above.
+            next_token: None,
         })
     }
 }
-
-/// How many `Trace` values one page carries.
-///
-/// The model declares no page size for `BatchGetTraces`, so this is the
-/// emulator's: one page serves every id a call may carry
-/// ([`crate::state::MAX_TRACE_IDS_PER_CALL`]), and a `NextToken` is emitted only
-/// when a trace was deferred because the response's segment budget could not
-/// carry it.
-pub const TRACES_PAGE_SIZE: usize = crate::state::MAX_TRACE_IDS_PER_CALL;
 
 /// Rebuild one `Trace` from its stored segments, carrying at most `budget`
 /// segment documents. Returns the trace and how many it carried.
@@ -263,8 +241,7 @@ pub const TRACES_PAGE_SIZE: usize = crate::state::MAX_TRACE_IDS_PER_CALL;
 ///
 /// `LimitExceeded` is true when the trace dropped a segment at ingest because it
 /// was full, or when this response could not carry all of them — never a
-/// hardcoded `false`. The caller defers a trace that does not fit, so the
-/// truncating branch is reached only by a trace larger than a whole page budget.
+/// hardcoded `false`.
 fn trace_of(trace: &crate::state::TraceRecord, budget: usize) -> (Trace, usize) {
     let assembled = crate::state::assembled_documents(trace);
     let carried = assembled.len().min(budget);

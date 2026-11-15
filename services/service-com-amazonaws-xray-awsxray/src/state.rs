@@ -97,6 +97,7 @@ pub mod retrievals;
 pub mod sampling_rules;
 pub mod sampling_statistics;
 pub mod span_delivery;
+pub mod trace_id_reads;
 // The two parts of the trace tree a reader is answered with: the nodes this
 // service infers for the calls a trace's documents made, and how those documents
 // are assembled into one tree. Reached only through the re-exports below, as
@@ -116,6 +117,7 @@ pub use query_window::*;
 pub use retrievals::*;
 pub use sampling_rules::*;
 pub use sampling_statistics::*;
+pub use trace_id_reads::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -394,15 +396,21 @@ pub fn is_trace_id(value: &str) -> bool {
     ::service_common::xray_trace::is_trace_id(value)
 }
 
-/// What a READ asked for a trace id that is not of [`is_trace_id`]'s form is
-/// refused with: X-Ray's template, naming the value the request carried and the
-/// rule it broke, and nothing else.
+/// What the BATCH read refuses a trace id that is not of [`is_trace_id`]'s form
+/// with: X-Ray's template for that read, naming the value the request carried
+/// and the rule it broke, and nothing else.
 ///
-/// Written once because every reader that takes a `TraceId` refuses the same
-/// malformed id the same way, whichever member carried it.
+/// The trace GRAPH read states the same fault in its own fixed sentence
+/// ([`INVALID_TRACE_ID_MESSAGE`]): the two reads are two queries over the same
+/// ids and X-Ray words this refusal differently in each, so the wording is the
+/// read's while the CHECK ([`trace_ids_fault`]) is shared.
 pub fn malformed_trace_id_message(trace_id: &str) -> String {
     format!("Invalid trace id {trace_id}: incorrect id format")
 }
+
+// The rest of the reading of a submitted `TraceIds` list — every other fault a
+// list can carry, and the sentence each is refused with — lives in
+// [`trace_id_reads`], which every read that takes one goes through.
 
 /// What a read naming more trace ids than [`MAX_TRACE_IDS_PER_CALL`] is refused
 /// with: X-Ray's fixed phrase, which states the limit itself — the model
@@ -542,11 +550,17 @@ pub const MAX_SAMPLING_PERCENTAGE: f64 = 100.0;
 /// rather than partly served.
 pub const MAX_TRACE_IDS_PER_CALL: usize = 5;
 
-/// The most segment documents one `BatchGetTraces` response carries. A trace
-/// that does not fit in what is left of the budget is deferred to the next page
-/// rather than truncated, so a page always makes progress and a whole trace is
-/// always readable ([`MAX_SEGMENTS_PER_TRACE`] segments fit the budget exactly).
-pub const MAX_SEGMENTS_PER_BATCH_RESPONSE: usize = MAX_SEGMENTS_PER_TRACE;
+/// The most segment documents one `BatchGetTraces` response carries.
+///
+/// The response is bounded by the REQUEST's own bounds: one call names at most
+/// [`MAX_TRACE_IDS_PER_CALL`] ids and a trace holds at most
+/// [`MAX_SEGMENTS_PER_TRACE`] segments, so this is the most a well-formed call
+/// can ask for — and a trace the store holds in full is therefore answered in
+/// full, since that read hands out no page to defer one to. The cap is still
+/// enforced per response, so `Trace$LimitExceeded` reports a trace that lost a
+/// segment at ingest rather than one this answer could not carry.
+pub const MAX_SEGMENTS_PER_BATCH_RESPONSE: usize =
+    MAX_TRACE_IDS_PER_CALL * MAX_SEGMENTS_PER_TRACE;
 
 /// The deepest `subsegments` nesting one segment document may carry.
 ///

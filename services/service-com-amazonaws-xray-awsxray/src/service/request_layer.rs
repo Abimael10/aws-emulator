@@ -62,8 +62,22 @@
 //! order. So a clause about a map member is quoted from the body
 //! ([`quoting_submitted_maps`]), under the same bounds and in the order this
 //! service states one ([`in_this_services_entry_order`]).
+//!
+//! # The member a constraint broken by a collection's ELEMENTS is stated at
+//!
+//! The same seam owns one more thing it is the only place that can: the
+//! framework's walk reports a constraint the ELEMENTS of a collection broke once
+//! per offending element, at `<collection>.<position>.member`, naming only the
+//! bound that element broke, while AWS states ONE clause at `<collection>` —
+//! quoting the whole collection and listing every requirement the element shape
+//! DECLARES, satisfied ones included. That set is read off the operation's input
+//! schema, because the refusal carries only what failed, and the collection
+//! comes from the request; a seam handed the violations alone has neither. The
+//! grouping, the set and the clause are `service_common`'s
+//! ([`stated_refusal`]), so nothing about the wording lives here.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
@@ -75,7 +89,7 @@ use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::{BigDecimal, BigInteger, Blob, DateTime, Document};
 use smithy_server_runtime::{
     BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refusal,
-    ServerHttpProtocol, Service,
+    Refused, ServerHttpProtocol, Service,
 };
 
 /// The error code a request body that cannot be deserialized is refused with.
@@ -108,7 +122,31 @@ pub enum PreDispatchRefusal {
     UnconvertibleTime(String),
     /// Every value of the request the model's own constraints refuse, each with
     /// its clause's value echo restored to the bytes the caller submitted.
-    Invalid(Vec<Violation>),
+    Invalid(RefusedValues),
+}
+
+/// A constraint refusal of one request, with the two things wording it needs
+/// that no [`Violation`] carries.
+///
+/// A constraint the ELEMENTS of a collection broke is reported by the
+/// framework's walk once per offending element, at
+/// `<collection>.<position>.member`, naming only the bound that element broke.
+/// AWS states ONE clause at `<collection>`, quoting the whole collection and
+/// listing every requirement the ELEMENT shape declares — so the wording needs
+/// the element shape's declared set, which is read off the operation's input
+/// SCHEMA (the refusal carries only what failed), and the collection the request
+/// carried, which only the request can answer. Both are collected here, where
+/// the operation and the request are still in hand.
+#[derive(Debug)]
+pub struct RefusedValues {
+    /// What the request broke, in the framework's own structural form.
+    pub violations: Vec<Violation>,
+    /// The input shape of the operation the violations were found against,
+    /// which a collection member's element constraint set is read off.
+    pub input_schema: &'static Schema,
+    /// Every list of scalars the request submitted, keyed by the member path a
+    /// clause about it is stated at and rendered as AWS quotes one.
+    pub submitted_lists: HashMap<String, String>,
 }
 
 /// The media type every response of this restJson1 service carries.
@@ -429,9 +467,15 @@ fn probe<O: Operation>(
     }
     let restored =
         service_common::validation::with_submitted_values(violations, &input, O::INPUT_SCHEMA);
-    Some(PreDispatchRefusal::Invalid(quoting_submitted_maps(
-        restored, req,
-    )))
+    Some(PreDispatchRefusal::Invalid(RefusedValues {
+        violations: quoting_submitted_maps(restored, req),
+        input_schema: O::INPUT_SCHEMA,
+        // The LISTS the request carried, collected by the same shared walk over
+        // the same built input, under its own bounds: a clause stated at a
+        // collection for a constraint its elements broke quotes the whole
+        // collection, which no violation carries.
+        submitted_lists: service_common::validation::submitted_lists(&input, O::INPUT_SCHEMA),
+    }))
 }
 
 /// `violations` with every clause about a MAP member quoting the map the request
@@ -575,26 +619,53 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for ConstraintRefusal<Eng> {
             // set leaves the framework to render its own default, which is the
             // fail-safe direction.
             let protocol: &dyn ServerHttpProtocol = svc.definition().protocol();
-            let violations = match protocol
+            let refused = match protocol
                 .routing_key(req)
                 .ok()
                 .and_then(|key| refusal_for::<Eng>(key, protocol, req))
             {
-                Some(PreDispatchRefusal::Invalid(violations)) => violations,
-                _ => Vec::new(),
+                Some(PreDispatchRefusal::Invalid(refused)) => Some(refused),
+                _ => None,
             };
-            // Worded by the same `service_common` entry point
-            // `Service::override_refusal` delegates to, over the violations in the
-            // ORDER this service states an enumerated value set in
-            // (`crate::service::in_stated_value_order`) — the one owner of that
-            // order, so the two seams cannot word one set two ways.
-            let chosen = service_common::aws_validation_refusal(
-                &crate::service::in_stated_value_order(&Refusal::Invalid(violations.clone())),
-            );
+            // Worded over the violations in the ORDER this service states an
+            // enumerated value set in (`crate::service::in_stated_value_order`)
+            // — the one owner of that order, so the two seams cannot word one
+            // set two ways — and through the `service_common` entry point that
+            // adds the one thing the other seam cannot state: a constraint
+            // broken by a COLLECTION's elements, grouped into the single clause
+            // AWS states at the collection member ([`stated_refusal`]).
+            let violations = refused
+                .as_ref()
+                .map(|refused| refused.violations.clone())
+                .unwrap_or_default();
+            let chosen = refused.as_ref().and_then(stated_refusal);
             svc.definition()
                 .refusal_response(ProtocolError::Invalid(violations), chosen, req)
         })
     }
+}
+
+/// How this service words a constraint refusal of a request it READ: the
+/// framework's envelope over the framework's clauses, with a constraint broken
+/// by a collection's ELEMENTS stated as AWS states it — one clause at the
+/// collection member, quoting the collection the request carried and listing
+/// every requirement the element shape declares, rather than one clause per
+/// offending element at a `<position>.member` path naming only the bound that
+/// element broke.
+///
+/// Everything else is `service_common`'s and the framework's: the same
+/// `@pattern` rendering `Service::override_refusal` delegates to
+/// (`service_common::validation::unanchored`), the same envelope, the same
+/// member paths, the same requirements and the same code. The grouping is made
+/// HERE rather than at that seam because it needs the operation's input schema
+/// and the request, neither of which reaches a seam handed the violations alone.
+fn stated_refusal(refused: &RefusedValues) -> Option<Refused> {
+    service_common::validation_message::aws_validation_refusal_over_elements_quoting(
+        &crate::service::in_stated_value_order(&Refusal::Invalid(refused.violations.clone())),
+        std::slice::from_ref(&refused.input_schema),
+        service_common::validation::unanchored,
+        |member| refused.submitted_lists.get(member).cloned(),
+    )
 }
 
 /// The framework's deserializer, watched.

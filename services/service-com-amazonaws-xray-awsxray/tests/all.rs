@@ -140,6 +140,9 @@ mod trace_data_plane_rules;
 #[path = "all/trace_graph.rs"]
 mod trace_graph;
 
+#[path = "all/trace_id_list_reads.rs"]
+mod trace_id_list_reads;
+
 #[path = "all/trace_ingest_and_groups.rs"]
 mod trace_ingest_and_groups;
 

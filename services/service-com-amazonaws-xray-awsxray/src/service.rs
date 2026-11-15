@@ -257,6 +257,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // What this service chooses beyond that is the ORDER an enumerated value
         // set is stated in ([`in_stated_value_order`]), which is not the order
         // the model declares it in.
+        //
+        // One rendering is NOT stated here: a constraint broken by a
+        // COLLECTION's elements is stated by AWS as one clause at the collection
+        // member, over the element shape's whole declared set and the collection
+        // the request carried — neither of which is recoverable from the
+        // violations this seam is handed, so that clause is worded by the
+        // pre-dispatch layer ([`request_layer`]), which has the operation's
+        // input schema and the request. Every refusal of a request this service
+        // could READ goes through that layer, so this seam answers the refusals
+        // found while reading the body, where no element clause can arise.
         service_common::aws_validation_refusal(&in_stated_value_order(refusal))
     }
 

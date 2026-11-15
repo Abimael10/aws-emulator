@@ -2388,3 +2388,14 @@ mod cloudformation_provisions_glue_table_optimizers;
 // Three suites of this target pin that shape rather than restating it:
 // `all/all_rs_is_a_canonical_declaration_list.rs` (pairs, sorted, nothing else). A note about
 // this file belongs in `all/appended_notes.rs`, declared below like any other suite.
+// Single integration-test target for the router: the canonical DECLARATION LIST of its
+// `tests/all/<name>.rs` and insert its pair in the one place its name sorts to: two branches
+// landing at once then insert two lines in two places and have no prose to duplicate, re-word
+// or mistype.
+// the declarations compiles no suite of this target — and with none anywhere in the file,
+// no merge of two landings can leave one there.
+// what points the declaration into `tests/all/`. Declare each suite exactly ONCE, and declare
+// every suite file: a name declared twice compiles neither copy, and a file no declaration
+// belongs in that suite's OWN module doc, where it is read beside the test it explains; a
+// `all/every_suite_file_is_declared.rs` check the rules above rather than restating them,
+// for this file and for every service crate's `tests/all.rs`.

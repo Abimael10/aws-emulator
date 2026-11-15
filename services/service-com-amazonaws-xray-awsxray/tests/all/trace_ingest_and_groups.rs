@@ -1300,13 +1300,13 @@ async fn a_request_the_service_cannot_satisfy_is_refused_as_invalid() {
             "ValidationException",
         ),
         (
-            "a NextToken this service never issued",
+            "a NextToken on a read that serves no pagination",
             "/Traces",
             json!({"TraceIds": [trace_id(1)], "NextToken": "not-a-token"}),
             "InvalidRequestException",
         ),
         (
-            "a NextToken past the end of the requested TraceIds",
+            "a cursor-shaped NextToken on that same read",
             "/Traces",
             json!({"TraceIds": [trace_id(1)], "NextToken": "7"}),
             "InvalidRequestException",

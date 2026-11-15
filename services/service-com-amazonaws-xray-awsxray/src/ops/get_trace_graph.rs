@@ -158,25 +158,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `TraceIdList` carries no modelled bound, so the request is bounded
-        // here, by the same cap `BatchGetTraces` puts on a requested-id list,
-        // and refused with the same phrase, which is where that limit is stated.
-        if input.trace_ids.len() > crate::state::MAX_TRACE_IDS_PER_CALL {
-            return Err(refuse(
-                crate::state::exceeding_maximum_query_size_message(),
-            ));
-        }
-
-        // An id that is not of the documented trace-id form names no trace this
-        // service could ever hold, so it is refused for its FORM — the same
-        // refusal every reader of a trace id gives — before the lookup that
-        // would otherwise report it as merely absent.
-        if let Some(malformed) = input
-            .trace_ids
-            .iter()
-            .find(|trace_id| !crate::state::is_trace_id(trace_id))
-        {
-            return Err(refuse(crate::state::malformed_trace_id_message(malformed)));
+        // Everything the requested list itself has to satisfy is found by the
+        // one reading every read of a `TraceIds` list makes
+        // ([`crate::state::trace_ids_fault`]), and this read refuses every fault
+        // it finds — a list naming no id at all included, because this read has
+        // nowhere to report an id it could not graph and a graph of nothing
+        // would claim the traces had no services. It is read before the lookup
+        // that would otherwise report a refusable id as merely absent, and an id
+        // of the wrong form is stated in this read's own fixed sentence.
+        if let Some(fault) = crate::state::trace_ids_fault(&input.trace_ids) {
+            return Err(refuse(fault.stated_with(|_| {
+                crate::state::INVALID_TRACE_ID_MESSAGE.to_string()
+            })));
         }
 
         // The derivation is linear in the stored segments of the named traces

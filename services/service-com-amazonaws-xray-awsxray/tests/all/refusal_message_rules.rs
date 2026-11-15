@@ -452,9 +452,13 @@ async fn a_malformed_trace_id_is_refused_with_the_services_template() {
     let stored = trace_id(42);
 
     for (label, malformed) in malformed_trace_ids() {
-        let expected = format!("Invalid trace id {malformed}: incorrect id format");
-        // The refusal names the OFFENDING id, so a list whose malformed id sits
-        // beside a well-formed one reports the malformed one.
+        // The batch read's template NAMES the offending id, so a list whose
+        // malformed id sits beside a well-formed one reports the malformed one;
+        // the graph read states the same fault in its own fixed sentence, which
+        // interpolates nothing (see `trace_id_list_reads.rs` for that rule over
+        // a table).
+        let batch = format!("Invalid trace id {malformed}: incorrect id format");
+        let graph = "Invalid traceId. ErrorCode: InvalidId".to_string();
         for (where_in_list, ids) in [
             ("alone", vec![malformed.clone()]),
             (
@@ -462,8 +466,10 @@ async fn a_malformed_trace_id_is_refused_with_the_services_template() {
                 vec![stored.clone(), malformed.clone()],
             ),
         ] {
-            for (operation, path) in [("BatchGetTraces", "/Traces"), ("GetTraceGraph", "/TraceGraph")]
-            {
+            for (operation, path, expected) in [
+                ("BatchGetTraces", "/Traces", &batch),
+                ("GetTraceGraph", "/TraceGraph", &graph),
+            ] {
                 let refused = xray.call(path, &json!({"TraceIds": ids})).await;
                 assert_eq!(
                     (refused.status, refused.error_type.as_deref()),

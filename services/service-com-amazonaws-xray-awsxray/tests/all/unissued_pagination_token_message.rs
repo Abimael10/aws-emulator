@@ -20,6 +20,10 @@
 //! spaces and punctuation, the longest token the model admits, the empty
 //! string). A token the service DID issue still pages, so the refusal is about
 //! tokens this service cannot interpret and not about paging at all.
+//!
+//! `BatchGetTraces` is not a row: it serves every id one call carries, so it
+//! hands out no cursor and refuses ANY token for being a token at all rather
+//! than for not being one it issued (see `trace_id_list_reads.rs`).
 
 use serde_json::{json, Value};
 
@@ -158,11 +162,6 @@ fn paginated_reads() -> Vec<(&'static str, &'static str, Box<dyn Fn(&str) -> Val
             Box::new(|token: &str| json!({"NextToken": token})),
         ),
         (
-            "BatchGetTraces",
-            "/Traces",
-            Box::new(|token: &str| json!({"TraceIds": [trace_id(1)], "NextToken": token})),
-        ),
-        (
             "GetIndexingRules",
             "/GetIndexingRules",
             Box::new(|token: &str| json!({"NextToken": token})),
@@ -273,24 +272,11 @@ async fn a_tag_listing_refuses_an_uninterpretable_token_the_same_way() {
 async fn a_cursor_shaped_token_outside_the_query_is_worded_the_same_way() {
     let xray = seeded().await;
 
-    // Rows: an offset at the end of the requested list, an offset past it, a
-    // number too large for the cursor's own type, a number that is not whole,
-    // a trace id past every stored one, and the empty string — which is a token
-    // no response ever hands out, and whose message is therefore the fixed text
-    // and nothing more.
+    // Rows: a number too large for the cursor's own type, a number that is not
+    // whole, a trace id past every stored one, and the empty string — which is a
+    // token no response ever hands out, and whose message is therefore the fixed
+    // text and nothing more.
     let rows: Vec<(&str, &str, Value, &str)> = vec![
-        (
-            "BatchGetTraces resumed at the end of its own list",
-            "/Traces",
-            json!({"TraceIds": [trace_id(1)], "NextToken": "1"}),
-            "1",
-        ),
-        (
-            "BatchGetTraces resumed past the end of its own list",
-            "/Traces",
-            json!({"TraceIds": [trace_id(1)], "NextToken": "7"}),
-            "7",
-        ),
         (
             "GetServiceGraph resumed past the widest ReferenceId",
             "/ServiceGraph",
