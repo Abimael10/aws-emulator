@@ -135,6 +135,25 @@ pub fn refusal<Eng: Send + Sync + 'static>(
     Some(not_authorized(&caller.arn, &action, resource, &reason))
 }
 
+/// `Some(message)` when IAM does not allow `ssm:<operation>` on the PARAMETER `name` for the
+/// calling principal, and `None` when it does — [`refusal`] asked about the one resource a
+/// Parameter Store call addresses.
+///
+/// The resource is that parameter's own ARN ([`super::parameter_arn`]), computed from the name
+/// the request carries and the Region it was signed for and before anything is looked up, so a
+/// caller holding no grant is refused whether or not the store holds the parameter: a refusal
+/// that depended on the record existing would tell a caller with no permissions what the
+/// account holds.
+pub fn parameter_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    region: &str,
+    name: &str,
+) -> Option<String> {
+    refusal(engine, ctx, operation, &super::parameter_arn(region, name))
+}
+
 /// The sentence IAM states an authorization failure with: who was refused, which action, on
 /// which resource, and which rule withheld the grant. Every value in it comes from the
 /// request and the stored policies.

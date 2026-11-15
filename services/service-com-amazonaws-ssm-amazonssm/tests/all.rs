@@ -111,6 +111,8 @@ mod parameter_not_found_payload;
 mod parameter_page_tokens;
 #[path = "all/parameter_path_requirements.rs"]
 mod parameter_path_requirements;
+#[path = "all/parameter_read_authorization.rs"]
+mod parameter_read_authorization;
 #[path = "all/parameter_read_payload_shape.rs"]
 mod parameter_read_payload_shape;
 #[path = "all/parameter_refusal_messages.rs"]

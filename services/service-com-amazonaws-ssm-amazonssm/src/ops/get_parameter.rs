@@ -23,6 +23,18 @@
 //! nothing, as it does for the service too ("This flag is ignored for String and
 //! StringList parameter types").
 //!
+//! ## Who may read it
+//!
+//! AWS decides a signed call against the calling principal's identity-based policies before
+//! the service resolves what the request names, so a caller whose policies do not allow
+//! `ssm:GetParameter` on the parameter the request addresses is refused
+//! `AccessDeniedException` (HTTP 400) carrying IAM's own sentence — before the store is read,
+//! so the refusal says nothing about whether that parameter exists. The decision is the
+//! shared one every operation of this service takes
+//! ([`crate::state::identity_authorization`]); the caller this emulator cannot bound (the
+//! account's own published credential, a principal holding a grant it cannot read) is allowed,
+//! as that module records.
+//!
 //! ## Parameters nobody created
 //!
 //! A name this Region and account hold no parameter for is the modelled
@@ -271,6 +283,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         if !query.names_this_endpoint(&region) {
             return Err(not_found().into());
+        }
+
+        // AWS decides a signed call against the calling principal's identity-based policies
+        // before the service resolves what the request names, so a caller holding no grant
+        // for this action on this parameter is refused rather than served — and rather than
+        // told whether the parameter exists
+        // ([`crate::state::identity_authorization`]). Asked with no store guard held.
+        if let Some(message) = crate::state::identity_authorization::parameter_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &region,
+            query.name,
+        ) {
+            return Err(
+                GetParameterErrorModeled::AccessDeniedException(AccessDeniedException {
+                    message,
+                })
+                .into(),
+            );
         }
 
         // A name in the hierarchy reserved for Secrets Manager references names a SECRET

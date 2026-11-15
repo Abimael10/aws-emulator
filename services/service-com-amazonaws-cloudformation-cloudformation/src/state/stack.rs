@@ -2098,10 +2098,11 @@ impl StoredStack {
     /// asked for the failed state to be kept (`DisableRollback`, `OnFailure=DO_NOTHING`) gets
     /// neither: it said what it wanted left behind.
     ///
-    /// What that removal asks the owning services about is what was really created, and a
-    /// resource whose create was never carried out at all is not in it: a CUSTOM RESOURCE is
-    /// brought into being by the answer its provider gives, so a `Create` no provider
-    /// answered left nothing to remove ([`Self::discard_uncreated_resource`]).
+    /// What that removal asks the owning services about is every resource the operation had
+    /// made itself responsible for, which includes a CUSTOM RESOURCE whose provider was sent
+    /// a request and never answered it: CloudFormation does not know what that provider did
+    /// before it stopped answering, so the rollback asks it to delete the resource rather
+    /// than assuming there is nothing there ([`provisioning::delete`] sends that `Delete`).
     pub fn fail_stabilisation(
         &mut self,
         now: SystemTime,
@@ -2112,16 +2113,10 @@ impl StoredStack {
         // operation has already concluded: a failure is the OPERATION's, so it is recorded
         // exactly once however many barriers an earlier pass read off the stack — the same
         // guard [`Self::settle_wait_conditions`] makes before it fails one.
-        let held = self
-            .stabilisations
+        self.stabilisations
             .iter()
             .find(|held| held.is_the_same_wait(barrier) && !held.released())
             .filter(|_| self.pending.is_some())?;
-        // Whether the wait was for a PROVIDER's answer that never came, read off the
-        // barrier the stack itself holds rather than the reading handed in: the answer is
-        // recorded on the stack's own copy ([`Self::record_provider_response`]).
-        let unanswered_provider_request =
-            held.provider_request.is_some() && held.provider_response.is_none();
         let logical_id = barrier.logical_id.as_str();
         let failed_status = failed_status_of(&self.status);
         let updating = self.status == status::UPDATE_IN_PROGRESS;
@@ -2148,11 +2143,6 @@ impl StoredStack {
                     resource_status::CREATE_FAILED,
                     reason,
                 );
-                // A create whose PROVIDER never answered created nothing at all, so the
-                // rollback below owes nobody a call about this resource.
-                if unanswered_provider_request {
-                    self.discard_uncreated_resource(logical_id);
-                }
                 (failed_action::CREATE, resource_status::CREATE_FAILED)
             }
             // The resource's creation had not STARTED: it was waiting for the resources it
@@ -2859,24 +2849,6 @@ impl StoredStack {
                 .iter_mut()
                 .map(|deployed| &mut deployed.resource)
                 .find(|resource| resource.logical_id == logical_id),
-        }
-    }
-
-    /// Record that NOTHING was created anywhere for the resource `logical_id`, so no teardown
-    /// of it owes anybody a call.
-    ///
-    /// A CUSTOM RESOURCE is brought into being by the answer its provider PUTs to the request
-    /// CloudFormation sent it and by nothing else — "a required custom resource
-    /// provider-defined physical ID that is unique for that provider" is what the resource
-    /// IS — so a request no provider ever answered leaves nothing behind: the only identifier
-    /// the record carries is the stand-in CloudFormation computed for it, which addresses no
-    /// resource any provider minted. The record stops claiming the resource was created, and
-    /// the teardown of the failed operation then reports its removal exactly as it does for
-    /// every other resource nothing was created for ([`provisioning::delete`]) rather than
-    /// asking a provider to delete a resource that does not exist.
-    fn discard_uncreated_resource(&mut self, logical_id: &str) {
-        if let Some(held) = self.recorded_resource_mut(logical_id) {
-            held.materialised = false;
         }
     }
 

@@ -346,6 +346,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is what makes the resume cursor total.
         let recursive = input.recursive.unwrap_or(false);
         let region = request_region(ctx.parts());
+        // AWS decides a signed call against the calling principal's identity-based policies
+        // before the service resolves what the request names, so a caller holding no grant
+        // for this action on the hierarchy the request addresses is refused rather than
+        // served a page of it ([`crate::state::identity_authorization`]). The resource is
+        // the PATH's own ARN, which is what a statement scoped to a hierarchy names.
+        if let Some(message) = crate::state::identity_authorization::parameter_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &region,
+            path,
+        ) {
+            return Err(GetParametersByPathErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
         // AWS's own published parameters are read by naming the hierarchy AWS owns: no
         // parameter of this account can live in it (`PutParameter` refuses such a name)
         // and AWS publishes nothing in the account's own hierarchy, so a read of AWS's

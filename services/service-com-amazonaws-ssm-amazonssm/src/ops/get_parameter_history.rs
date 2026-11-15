@@ -256,6 +256,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found().into());
         }
 
+        // AWS decides a signed call against the calling principal's identity-based policies
+        // before the service resolves what the request names, so a caller holding no grant
+        // for this action on this parameter is refused rather than served its history — and
+        // rather than told whether the parameter exists
+        // ([`crate::state::identity_authorization`]).
+        if let Some(message) = crate::state::identity_authorization::parameter_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &region,
+            query.name,
+        ) {
+            return Err(
+                GetParameterHistoryErrorModeled::AccessDeniedException(AccessDeniedException {
+                    message,
+                })
+                .into(),
+            );
+        }
+
         let page_size = parameter_history_page_size(input.max_results)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 

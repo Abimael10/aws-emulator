@@ -58,7 +58,9 @@ enum Cause {
     /// The custom resource's provider answered `FAILED`, stating the reason carried here, or
     /// stating none.
     ProviderFailed(Option<&'static str>),
-    /// The custom resource's provider never answered, so the wait for its answer ran out.
+    /// The custom resource's provider never answered the CREATE, so the wait for its answer
+    /// ran out. It answers the rollback's own `Delete`, which is what carries the rollback
+    /// through to the status this suite reads.
     ProviderSilent,
     /// CloudFormation refused a declaration itself, before asking any provider or any owning
     /// service — so no custom resource is involved at all.
@@ -109,7 +111,7 @@ fn rows() -> Vec<Row> {
             names_a_failed_resource: true,
         },
         Row {
-            case: "a provider that never answered, so the wait for its answer ran out",
+            case: "a provider that never answered the create, so the wait for it ran out",
             stack: "rolled-back-unanswered",
             template: custom_resource_template("Custom::SilentProvisioner"),
             cause: Cause::ProviderSilent,
@@ -175,7 +177,14 @@ async fn settle_the_failed_create(
         }
         Cause::ProviderSilent => {
             age_the_provider_wait(engine, row.stack, past_the_window());
-            settled(router, case, row.stack).await
+            // The rollback the failure owes sends the provider the `Delete` of the resource
+            // it was asked to create — CloudFormation does not know what that provider did
+            // before it stopped answering — and this provider answers that one, so the
+            // rollback is carried through to the complete status this suite reads. A `Delete`
+            // it would not answer either is the sibling suite's case
+            // (`uncreated_custom_resource_rollback`), where it leaves the stack
+            // `ROLLBACK_FAILED`.
+            settled_with_a_responsive_provider(router, engine, case, row.stack, FAILED_ID).await
         }
         Cause::RefusedDeclaration => settled(router, case, row.stack).await,
     }

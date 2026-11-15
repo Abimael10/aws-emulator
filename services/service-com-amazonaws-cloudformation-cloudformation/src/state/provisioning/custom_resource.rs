@@ -406,6 +406,23 @@ pub fn new_request_id() -> String {
     )
 }
 
+/// Why a resource failed because the provider never answered the request `request_id`: the
+/// sentence CloudFormation words for a custom resource whose provider did not PUT a response
+/// to the `ResponseURL` it was sent, with the request it was waiting for named in it.
+///
+/// The sentence is the service's own, so it is reproduced as CloudFormation words it; the one
+/// value in it is the `RequestId` of the request that went unanswered, which is what the
+/// provider's own log is searched by. It is worded for every request type, because the thing
+/// that did not happen is the same one each time: the answer the provider owed.
+pub fn unanswered_request_reason(request_id: &str) -> String {
+    format!(
+        "CloudFormation did not receive a response from your Custom Resource. Please check your \
+         logs for requestId [{request_id}]. If you are using the Python cfn-response module, you \
+         may need to update your Lambda function code so that CloudFormation can attach the \
+         updated version."
+    )
+}
+
 /// What a write to a published `ResponseURL` names: the stack the resource belongs to, the
 /// resource it is about and the request it answers.
 #[derive(Debug, Clone, PartialEq, Eq)]

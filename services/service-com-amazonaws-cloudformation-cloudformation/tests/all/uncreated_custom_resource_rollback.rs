@@ -1,21 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! A CUSTOM RESOURCE whose provider never answered its `Create` was never created, so the
-//! ROLLBACK of that failed create has nothing to remove for it.
+//! A CUSTOM RESOURCE whose provider never answered its `Create`, and what the ROLLBACK of
+//! that failed create then asks that provider for.
 //!
-//! RULE: a custom resource is brought into being by the answer its provider PUTs to the
-//! request CloudFormation sent it and by nothing else — until that answer arrives the only
-//! identifier the resource has is the stand-in CloudFormation computed for it, which
-//! addresses no resource any provider minted — so a `Create` no provider answered creates
-//! nothing: the rollback of that failed create asks the provider to delete nothing, takes the
-//! record down, and the stack reaches `ROLLBACK_COMPLETE`. `ROLLBACK_FAILED` is the status of
-//! a rollback that could NOT be carried out, which a resource nothing ever created cannot
-//! make true.
+//! RULE: a custom resource is held at the request CloudFormation sent its provider until the
+//! provider PUTs an answer to the request's `ResponseURL`, and a request that goes unanswered
+//! inside the wait fails that resource with CloudFormation's own sentence for it — the one
+//! naming the `RequestId` the provider's log is searched by. CloudFormation does not know what
+//! that provider did before it stopped answering, so the rollback of such a create asks it to
+//! DELETE the resource rather than assuming there is nothing there: a `Delete` the provider
+//! answers carries the rollback through (`ROLLBACK_COMPLETE`), and one it does not answer
+//! either is a rollback that could not be carried out, which leaves the stack in the failed
+//! rollback status (`ROLLBACK_FAILED`) — the state an operator has to clean up from, never the
+//! complete one.
 //!
-//! The complement is here too: a custom resource the provider DID answer exists, so the same
-//! rollback sends that provider the `Delete` it owes and is held open until it answers —
-//! which is what says the rule turns on the provider's ANSWER and not on the resource being
-//! a custom one.
+//! A `DeletionPolicy` of `Retain` is the one declaration that asks nothing of the provider at
+//! all ("CloudFormation keeps the resource without deleting the resource or its contents"), so
+//! its rollback has no request to be answered and completes.
+//!
+//! The complement is here too: a custom resource the provider DID answer is deleted by the same
+//! `Delete`, which is what says the rollback's own request is owed for the resource and not for
+//! the answer.
 //!
 //! SECOND RULE, which is what makes the first one about an answer that never came rather than
 //! about one there was no time for: **the window a wait gives whoever was asked runs from the
@@ -33,24 +38,26 @@
 //! resource's type (the author's own `Custom::<Name>` namespace and the generic
 //! `AWS::CloudFormation::CustomResource`), how much the create had really made beside it that
 //! the rollback has to remove (nothing, one resource, two), what the resource's own
-//! `DeletionPolicy` says about a physical resource that was never created (the default, and
-//! `Retain`), and how long the operation had been walking by the time it reached the resource
-//! (just past one window, and many windows).
+//! `DeletionPolicy` says (the default, and `Retain`), whether the provider answers the
+//! rollback's own `Delete`, and how long the operation had been walking by the time it reached
+//! the resource (just past one window, and many windows).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
+use service_com_amazonaws_cloudformation_cloudformation::state::provisioning::custom_resource;
 use service_com_amazonaws_cloudformation_cloudformation::state::stabilising::CREATE_STABILISATION_WINDOW;
 use service_com_amazonaws_cloudformation_cloudformation::state::{resource_status, status};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::custom_resource_providers::{
-    emulator, provider_token, put_response, POLL_ATTEMPTS, POLL_INTERVAL,
+    awaited_request, emulator, provider_token, put_response, POLL_ATTEMPTS, POLL_INTERVAL,
 };
 use crate::harness::{call, create_stack, member, store, xml_text, REGION};
 use crate::update_rollback_recovery::{
-    parameter, parameter_value, stack_events, template, template_with_an_unsignalled_gate,
+    parameter, parameter_value, reason_of, stack_events, template,
+    template_with_an_unsignalled_gate,
 };
 
 /// The logical id every row declares its custom resource under.
@@ -62,8 +69,26 @@ const MINTED: &str = "waiter-instance-1";
 /// The suffix every status a stack operation in flight carries ends in.
 const IN_PROGRESS: &str = "_IN_PROGRESS";
 
-/// One row: how the stack declares the custom resource whose provider never answers, and
-/// what the create had really made beside it.
+/// The request types a provider is sent, as the request document spells them.
+const CREATE_REQUEST: &str = "Create";
+const DELETE_REQUEST: &str = "Delete";
+
+/// What the provider of one case does with the requests CloudFormation sends it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provider {
+    /// It answers nothing at all, so every wait for it runs out — reached by moving each
+    /// wait past its own window rather than by sleeping it out.
+    Silent,
+    /// It answers only the `Delete` the rollback sends, which is the request a provider that
+    /// crashed on the create can still be running for.
+    AnswersTheDeletes,
+    /// It answers whatever it is sent, minting the id carried here for a `Create`.
+    AnswersEverything(&'static str),
+}
+
+/// One row: how the stack declares the custom resource whose provider never answers the
+/// create, what the create had really made beside it, and whether the rollback's own `Delete`
+/// is answered.
 struct Row {
     case: &'static str,
     stack: &'static str,
@@ -78,6 +103,9 @@ struct Row {
     /// "the resource is kept without deleting the resource or its contents" — the same
     /// reporting as for every other resource the teardown asks nobody about.
     teardown: &'static str,
+    /// Whether the rollback owes the provider a `Delete` for this declaration: it does for
+    /// every policy but `Retain`, which releases the resource instead of removing it.
+    owes_a_delete: bool,
     /// The Parameter Store names the create really made beside the custom resource, which
     /// the rollback has to delete: what proves the rollback RAN rather than merely reporting
     /// a status.
@@ -93,6 +121,7 @@ const ROWS: &[Row] = &[
         resource_type: "AWS::CloudFormation::CustomResource",
         deletion_policy: None,
         teardown: resource_status::DELETE_COMPLETE,
+        owes_a_delete: true,
         siblings: &["/uncreated-generic/sibling"],
     },
     Row {
@@ -101,6 +130,7 @@ const ROWS: &[Row] = &[
         resource_type: "Custom::SlowProvisioner",
         deletion_policy: None,
         teardown: resource_status::DELETE_COMPLETE,
+        owes_a_delete: true,
         siblings: &["/uncreated-namespaced/first", "/uncreated-namespaced/second"],
     },
     Row {
@@ -109,14 +139,16 @@ const ROWS: &[Row] = &[
         resource_type: "Custom::Waiter",
         deletion_policy: None,
         teardown: resource_status::DELETE_COMPLETE,
+        owes_a_delete: true,
         siblings: &[],
     },
     Row {
-        case: "a Retain policy on a physical resource that was never created",
+        case: "a Retain policy, which asks the provider for nothing at all",
         stack: "uncreated-retained",
         resource_type: "Custom::RetainedWaiter",
         deletion_policy: Some("Retain"),
         teardown: resource_status::DELETE_SKIPPED,
+        owes_a_delete: false,
         siblings: &["/uncreated-retained/sibling"],
     },
 ];
@@ -227,27 +259,37 @@ pub(crate) fn age_the_provider_wait(
     stack_name: &str,
     by: Duration,
 ) {
-    let held = store(engine);
-    let mut locked = held.lock();
-    let stack = locked
-        .resolve_mut(REGION, stack_name)
-        .unwrap_or_else(|| panic!("the stack {stack_name:?} this case created"));
     assert!(
-        stack
-            .stabilisations
-            .iter()
-            .any(|barrier| barrier.provider_request.is_some()),
-        "case {stack_name:?}: expected the create to be waiting for the provider's answer, \
+        aged_provider_waits(engine, stack_name, by) > 0,
+        "case {stack_name:?}: expected the operation to be waiting for the provider's answer, \
          got no such wait at all"
     );
+}
+
+/// Move every wait the stack is holding for a provider's answer `by` further into the past,
+/// and answer how many there were — the same move [`age_the_provider_wait`] asserts one of.
+fn aged_provider_waits(
+    engine: &Arc<engine::InMemoryEngine>,
+    stack_name: &str,
+    by: Duration,
+) -> usize {
+    let held = store(engine);
+    let mut locked = held.lock();
+    let Some(stack) = locked.resolve_mut(REGION, stack_name) else {
+        return 0;
+    };
+    let mut aged = 0;
     for barrier in &mut stack.stabilisations {
-        barrier.asked_at -= by;
+        if barrier.provider_request.is_some() && !barrier.released() {
+            barrier.asked_at -= by;
+            aged += 1;
+        }
     }
+    aged
 }
 
 /// Poll the stack until it leaves every `*_IN_PROGRESS` status, collecting every provider
-/// request its waits carried on the way — and answering each one with `SUCCESS` where
-/// `minted` names the identifier a responsive provider mints.
+/// request its waits carried on the way — with `provider` deciding what answers those requests.
 ///
 /// A read is what asks a wait about, so polling is what a client does. The collected requests
 /// are what the provider was really SENT, in the order the operation sent them.
@@ -256,7 +298,7 @@ async fn settled_watching_the_provider(
     engine: &Arc<engine::InMemoryEngine>,
     case: &str,
     stack_name: &str,
-    minted: Option<&str>,
+    provider: Provider,
 ) -> (String, Vec<(String, String)>) {
     let mut seen: Vec<(String, String)> = Vec::new();
     let mut last = String::new();
@@ -276,8 +318,18 @@ async fn settled_watching_the_provider(
         if !last.ends_with(IN_PROGRESS) {
             return (last, seen);
         }
-        if let Some(minted) = minted {
-            answer_every_awaited_request(router, engine, stack_name, minted).await;
+        match provider {
+            // Nothing answers, so every wait this operation holds reaches the instant its
+            // own window had run out.
+            Provider::Silent => {
+                aged_provider_waits(engine, stack_name, past_the_window());
+            }
+            Provider::AnswersTheDeletes => {
+                answer_awaited_requests(router, engine, stack_name, None).await;
+            }
+            Provider::AnswersEverything(minted) => {
+                answer_awaited_requests(router, engine, stack_name, Some(minted)).await;
+            }
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -287,13 +339,16 @@ async fn settled_watching_the_provider(
     );
 }
 
-/// Answer every request the stack is waiting for with `SUCCESS`, under the id the request
+/// Answer the requests the stack is waiting for with `SUCCESS`, under the id each request
 /// names where it names one (a `Delete`) and under `minted` for a `Create`.
-async fn answer_every_awaited_request(
+///
+/// `minted` is `None` for a provider that answers only what the ROLLBACK sends it: a `Create`
+/// is then left unanswered, which is the request its own run never came back from.
+async fn answer_awaited_requests(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     stack_name: &str,
-    minted: &str,
+    minted: Option<&str>,
 ) {
     let unanswered = {
         let held = store(engine);
@@ -323,7 +378,13 @@ async fn answer_every_awaited_request(
     };
     let (stack_id, requests) = unanswered;
     for (logical_id, request_id, physical_resource_id) in requests {
-        let id = physical_resource_id.unwrap_or_else(|| minted.to_string());
+        let id = match (physical_resource_id, minted) {
+            (Some(named), _) => named,
+            (None, Some(minted)) => minted.to_string(),
+            // A request naming no physical resource is the `Create`, which this provider
+            // leaves unanswered.
+            (None, None) => continue,
+        };
         put_response(
             router,
             engine,
@@ -346,8 +407,42 @@ pub(crate) fn past_the_window() -> Duration {
     CREATE_STABILISATION_WINDOW + Duration::from_secs(1)
 }
 
+/// The whole `DescribeStackEvents` body of one stack: what the REASONS its events carry are
+/// read from, which the status pairs [`stack_events`] reports do not carry.
+async fn events_body(router: &MultiServiceRouter, case: &str, stack_name: &str) -> String {
+    let (http_status, body) = call(
+        router,
+        "DescribeStackEvents",
+        &[member("StackName", stack_name)],
+    )
+    .await;
+    assert_eq!(
+        http_status, 200,
+        "case {case:?}: expected DescribeStackEvents to answer, got {http_status} {body}"
+    );
+    body
+}
+
+/// The request CloudFormation is waiting for an answer to about the custom resource, as the
+/// `RequestId` it is answered under — what the sentence a wait that ran out carries names.
+fn awaited_request_id(
+    engine: &Arc<engine::InMemoryEngine>,
+    case: &str,
+    stack_name: &str,
+) -> String {
+    awaited_request(engine, stack_name, CUSTOM)
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected a provider request about {CUSTOM} of {stack_name:?}, \
+                 got none"
+            )
+        })
+        .1
+        .request_id
+}
+
 #[tokio::test]
-async fn a_create_no_provider_answered_rolls_the_stack_back_to_rollback_complete() {
+async fn a_create_no_provider_answered_is_rolled_back_by_a_delete_to_that_provider() {
     for row in ROWS {
         let case = row.case;
         let (router, engine) = emulator(case).await;
@@ -362,43 +457,58 @@ async fn a_create_no_provider_answered_rolls_the_stack_back_to_rollback_complete
         let awaited = awaited_requests(&engine, row.stack);
         assert_eq!(
             awaited,
-            vec![("Create".to_string(), CUSTOM.to_string())],
+            vec![(CREATE_REQUEST.to_string(), CUSTOM.to_string())],
             "case {case:?}: expected the create to be waiting for one Create answer about \
              {CUSTOM}, got {awaited:?}"
         );
+        let create_request = awaited_request_id(&engine, case, row.stack);
 
         // The wait runs out. What the clock then owes is the failed create and the rollback
-        // its `OnFailure` default asks for — and the rollback has nothing to remove for a
-        // resource no provider ever created, so it CONCLUDES.
+        // its `OnFailure` default asks for — and this provider answers the `Delete` that
+        // rollback sends it, so the rollback is carried through.
         age_the_provider_wait(&engine, row.stack, past_the_window());
-        let (settled, seen) =
-            settled_watching_the_provider(&router, &engine, case, row.stack, None).await;
+        let (settled, seen) = settled_watching_the_provider(
+            &router,
+            &engine,
+            case,
+            row.stack,
+            Provider::AnswersTheDeletes,
+        )
+        .await;
         assert_eq!(
             settled,
             status::ROLLBACK_COMPLETE,
-            "case {case:?}: expected the create whose provider never answered to roll back, \
-             got {settled:?} with the provider requests {seen:?}"
+            "case {case:?}: expected the rollback whose Delete the provider answered to \
+             complete, got {settled:?} with the provider requests {seen:?}"
         );
 
-        // ...and the provider was asked NOTHING about the resource it never created: a
-        // `Delete` for a resource that does not exist is a call no rollback owes, and a
-        // rollback that made it would be held open by it.
-        assert!(
-            !seen
-                .iter()
-                .any(|(request_type, _)| request_type == "Delete"),
-            "case {case:?}: expected the provider to have been sent no Delete at all, got \
-             {seen:?}"
+        // ...and the provider WAS asked to delete the resource it never answered for:
+        // CloudFormation does not know what it did before it stopped answering. A `Retain`
+        // declaration is the one that asks it for nothing.
+        let delete = (DELETE_REQUEST.to_string(), CUSTOM.to_string());
+        assert_eq!(
+            seen.contains(&delete),
+            row.owes_a_delete,
+            "case {case:?}: expected the provider to have been sent a Delete: \
+             {}, got {seen:?}",
+            row.owes_a_delete
         );
 
-        // The event stream says what became of the resource: its create FAILED, the teardown
-        // of its record is reported as for every other resource nothing was created for, and
-        // the stack's rollback completed.
+        // The event stream says what became of the resource: its create FAILED, carrying
+        // CloudFormation's own sentence for a provider that did not answer — with the request
+        // id that answer was owed for — the teardown of its record is reported as for every
+        // other resource of this policy, and the stack's rollback completed.
         let events = stack_events(case, &router, row.stack).await;
         let failed = (CUSTOM.to_string(), resource_status::CREATE_FAILED.to_string());
         assert!(
             events.contains(&failed),
             "case {case:?}: expected the custom resource to report {failed:?}, got {events:?}"
+        );
+        let reason = custom_resource::unanswered_request_reason(&create_request);
+        let reported = events_body(&router, case, row.stack).await;
+        assert!(
+            reported.contains(&reason),
+            "case {case:?}: expected the failed create to report {reason:?}, got {reported}"
         );
         let taken_down = (CUSTOM.to_string(), row.teardown.to_string());
         assert!(
@@ -423,6 +533,67 @@ async fn a_create_no_provider_answered_rolls_the_stack_back_to_rollback_complete
                  create had made, got {held:?}"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn a_delete_the_provider_does_not_answer_either_leaves_the_stack_rollback_failed() {
+    // The same provider, now silent about the rollback's own `Delete` as well — the shape of
+    // a provider whose every run fails before it answers. The rollback could not be carried
+    // out, so the stack rests in the FAILED rollback status rather than reporting a clean one.
+    for row in ROWS.iter().filter(|row| row.owes_a_delete) {
+        let case = row.case;
+        let (router, engine) = emulator(case).await;
+        let (http_status, body) = create_stack(&router, row.stack, &template_of(row), &[]).await;
+        assert_eq!(
+            http_status, 200,
+            "case {case:?}: expected CreateStack to succeed, got {http_status} {body}"
+        );
+
+        let (settled, seen) =
+            settled_watching_the_provider(&router, &engine, case, row.stack, Provider::Silent)
+                .await;
+        assert_eq!(
+            settled,
+            status::ROLLBACK_FAILED,
+            "case {case:?}: expected a rollback whose own Delete went unanswered to leave the \
+             stack {}, got {settled:?} with the provider requests {seen:?}",
+            status::ROLLBACK_FAILED
+        );
+
+        // Both requests were really sent: the create's, and the rollback's own.
+        for expected in [
+            (CREATE_REQUEST.to_string(), CUSTOM.to_string()),
+            (DELETE_REQUEST.to_string(), CUSTOM.to_string()),
+        ] {
+            assert!(
+                seen.contains(&expected),
+                "case {case:?}: expected the provider to have been sent {expected:?}, got \
+                 {seen:?}"
+            );
+        }
+
+        // ...and the stack says WHICH resource it could not delete, which is what an operator
+        // cleaning up after a stuck rollback reads, with the sentence for a provider that did
+        // not answer on the resource's own event.
+        let summary = reason_of(&router, row.stack).await;
+        assert!(
+            summary.contains(CUSTOM),
+            "case {case:?}: expected the stack's reason to name {CUSTOM} as the resource the \
+             rollback could not delete, got {summary:?}"
+        );
+        let events = stack_events(case, &router, row.stack).await;
+        let rollback_failed = (row.stack.to_string(), status::ROLLBACK_FAILED.to_string());
+        assert!(
+            events.contains(&rollback_failed),
+            "case {case:?}: expected the stack's own {rollback_failed:?} event, got {events:?}"
+        );
+        let reported = events_body(&router, case, row.stack).await;
+        let sentence = "CloudFormation did not receive a response from your Custom Resource";
+        assert!(
+            reported.contains(sentence),
+            "case {case:?}: expected the failed rollback to report {sentence:?}, got {reported}"
+        );
     }
 }
 
@@ -496,13 +667,15 @@ async fn the_wait_for_an_answer_runs_from_the_call_and_not_from_the_operations_s
         }
 
         // ...and the wait does END — from the instant of the call, which is what aging THAT
-        // instant reaches.
+        // instant reaches. This provider answers nothing, so the rollback's own `Delete` goes
+        // unanswered too and the stack rests in the failed rollback status.
         age_the_provider_wait(&engine, row.stack, past_the_window());
         let (settled, seen) =
-            settled_watching_the_provider(&router, &engine, case, row.stack, None).await;
+            settled_watching_the_provider(&router, &engine, case, row.stack, Provider::Silent)
+                .await;
         assert_eq!(
             settled,
-            status::ROLLBACK_COMPLETE,
+            status::ROLLBACK_FAILED,
             "case {case:?}: expected the wait measured from the call to run out and the create \
              to roll back, got {settled:?} with the provider requests {seen:?}"
         );
@@ -535,8 +708,14 @@ async fn a_create_the_provider_answered_is_deleted_by_the_rollback() {
         "case {case:?}: expected CreateStack to succeed, got {http_status} {body}"
     );
 
-    let (settled, seen) =
-        settled_watching_the_provider(&router, &engine, case, stack, Some(MINTED)).await;
+    let (settled, seen) = settled_watching_the_provider(
+        &router,
+        &engine,
+        case,
+        stack,
+        Provider::AnswersEverything(MINTED),
+    )
+    .await;
     assert_eq!(
         settled,
         status::ROLLBACK_COMPLETE,
@@ -544,8 +723,8 @@ async fn a_create_the_provider_answered_is_deleted_by_the_rollback() {
          with the provider requests {seen:?}"
     );
     for expected in [
-        ("Create".to_string(), CUSTOM.to_string()),
-        ("Delete".to_string(), CUSTOM.to_string()),
+        (CREATE_REQUEST.to_string(), CUSTOM.to_string()),
+        (DELETE_REQUEST.to_string(), CUSTOM.to_string()),
     ] {
         assert!(
             seen.contains(&expected),

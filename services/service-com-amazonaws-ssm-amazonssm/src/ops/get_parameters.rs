@@ -249,6 +249,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // [`request_region`] constrains.
         let region = crate::state::request_region(ctx.parts());
 
+        // AWS decides a signed call against the calling principal's identity-based policies
+        // before the service resolves what the request names, and a batch read asks for
+        // every name it carries — so a caller holding no grant for one of them is refused
+        // the whole call rather than served the rest
+        // ([`crate::state::identity_authorization`]). A name that resolves to no parameter
+        // query at all addresses no parameter, so the decision is taken on the ones that do;
+        // those names are reported among the unresolvable ones below.
+        for name in &asked {
+            let Some(query) = crate::state::parse_parameter_query(name) else {
+                continue;
+            };
+            if let Some(message) = crate::state::identity_authorization::parameter_refusal(
+                &*self.engine,
+                ctx,
+                Self::NAME,
+                &region,
+                query.name,
+            ) {
+                return Err(
+                    GetParametersErrorModeled::AccessDeniedException(AccessDeniedException {
+                        message,
+                    })
+                    .into(),
+                );
+            }
+        }
+
         // AWS's own published parameters ([`crate::state::public_parameters`]) are resolved
         // beside the account's: a name in the hierarchy AWS owns is in no account's store,
         // so it is resolved against the catalog and only a name NEITHER holds is reported

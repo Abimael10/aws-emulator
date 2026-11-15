@@ -269,7 +269,22 @@ impl StabilisationBarrier {
     ///
     /// `state` is that service's latest answer, which is not always the one the call left
     /// ([`Self::reported_state`]).
+    ///
+    /// A wait for a CUSTOM RESOURCE's own provider is worded as CloudFormation words that
+    /// one ([`super::provisioning::custom_resource::unanswered_request_reason`]): what did
+    /// not happen is the answer the provider owed the request this wait carries, and the
+    /// sentence names that request so the provider's own log can be searched by it. No owning
+    /// service was asked about such a resource at all, so there is no state of one to report.
     pub fn not_stabilised_reason(&self, state: &str) -> String {
+        if let Some(request) = self
+            .provider_request
+            .as_ref()
+            .filter(|_| self.provider_response.is_none())
+        {
+            return super::provisioning::custom_resource::unanswered_request_reason(
+                &request.request_id,
+            );
+        }
         let state = if state.is_empty() {
             self.reported_state.as_str()
         } else {

@@ -107,6 +107,8 @@ mod continue_update_rollback_status_gate;
 mod cross_stack_imports;
 #[path = "all/cross_stack_name_collision.rs"]
 mod cross_stack_name_collision;
+#[path = "all/custom_resource_provider_denied_rollback.rs"]
+mod custom_resource_provider_denied_rollback;
 #[path = "all/custom_resource_providers.rs"]
 mod custom_resource_providers;
 #[path = "all/custom_resource_response_identity.rs"]

@@ -71,7 +71,11 @@ pub(crate) struct Principal {
 
 /// A router with this service beside the IAM and STS services the principals and their
 /// policies are made with, all on one shared engine.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` for the reason [`assumed_role`] and [`call_as`] are: the sibling suite
+/// `parameter_read_authorization.rs` makes principals the same way, and one spelling of "this
+/// service beside the stores its callers live in" keeps the two from drifting.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The suite signs nothing: the `Authorization` header carries only the credential scope,
