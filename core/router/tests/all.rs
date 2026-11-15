@@ -2201,3 +2201,6 @@ mod ses_configuration_set_cursor_shared_across_v1_and_v2;
 // appended to this file.
 #[path = "all/cloudformation_provisions_glue_table_optimizers.rs"]
 mod cloudformation_provisions_glue_table_optimizers;
+// past the declarations is `E0753` and compiles no suite of this target. With none
+// the top level of `tests/` fails the build; and a second `mod` for one name is `E0428`.
+// Three suites of this target pin the rules above rather than restating them:

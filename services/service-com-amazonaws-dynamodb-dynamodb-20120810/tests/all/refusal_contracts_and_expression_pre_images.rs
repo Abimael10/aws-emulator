@@ -1065,10 +1065,9 @@ async fn a_table_is_addressed_by_its_arn_wherever_a_name_does() {
     // An ARN of THIS service whose resource is not a table addresses some other kind of
     // resource: what is wrong with it is the resource TYPE, which is what the refusal
     // states, over the whole value.
-    for case in [
-        format!("arn:aws:dynamodb:{REGION}:000000000000:backup/Addressed"),
-        format!("arn:aws:dynamodb:{REGION}:000000000000:table/Addressed/index/idx"),
-    ] {
+    for case in [format!(
+        "arn:aws:dynamodb:{REGION}:000000000000:backup/Addressed"
+    )] {
         let stated = refusal(
             &router,
             &case,
@@ -1081,6 +1080,35 @@ async fn a_table_is_addressed_by_its_arn_wherever_a_name_does() {
             stated,
             format!("1 validation error detected: Invalid resource type in '{case}'"),
             "case {case:?}: expected the resource-type sentence, got {stated:?}"
+        );
+    }
+
+    // An ARN of this service whose resource NAME is a path addresses something deeper
+    // than a table, so the name is what is wrong with it: the ARN-format clause states
+    // the form that name must take (`tests/all/table_arn_resource_name_refusals.rs`
+    // asserts the whole clause).
+    for case in [format!(
+        "arn:aws:dynamodb:{REGION}:000000000000:table/Addressed/index/idx"
+    )] {
+        let stated = refusal(
+            &router,
+            &case,
+            "GetItem",
+            json!({"TableName": case, "Key": {"pk": {"S": "one"}}}),
+            "ValidationException",
+        )
+        .await;
+        assert_eq!(
+            stated,
+            format!(
+                "1 validation error detected: Value '{case}' at 'tableName' failed to satisfy \
+                 constraint: Valid ARN format is \
+                 'arn:<awsPartition>:<vendor>:<region>:<subscriber>:resourceType/resourceName', \
+                 where Resource name must have length less than or equal to 255, Resource name \
+                 must have length greater than or equal to 3, Resource name must satisfy \
+                 regular expression pattern: [a-zA-Z0-9_.-]+"
+            ),
+            "case {case:?}: expected the ARN-format clause over the resource name, got {stated:?}"
         );
     }
 }

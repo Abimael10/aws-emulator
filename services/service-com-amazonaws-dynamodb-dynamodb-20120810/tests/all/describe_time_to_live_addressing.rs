@@ -235,7 +235,7 @@ async fn a_table_name_the_ttl_reader_cannot_address_is_refused_as_the_table_read
             "an index sub-resource ARN",
             format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/{present}/index/by-part"),
             "ValidationException",
-            "Invalid resource type in".to_string(),
+            "Resource name must satisfy regular expression pattern".to_string(),
         ),
         (
             "an ARN of another region",

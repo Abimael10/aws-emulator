@@ -3671,8 +3671,23 @@ pub use streams_seam::{
 /// `TableName` members target) states the ARN FORM rather than the name's pattern when
 /// the value it refused was an attempt at an ARN: the pattern a bare table name must
 /// satisfy says nothing about which ARN field was wrong.
-pub const ARN_FORM_REQUIREMENT: &str = "Valid ARN format is \
-     'arn:<awsPartition>:<vendor>:<region>:<awsAccountId>:<resourceType>/<resourceId>'";
+///
+/// The clause states the ARN template AND the form its RESOURCE NAME must take, which
+/// is the table name's own ([`MIN_TABLE_NAME_LENGTH`], [`MAX_TABLE_NAME_LENGTH`],
+/// [`TABLE_NAME_PATTERN`]) — so the one clause covers every way the resource name can
+/// be unacceptable, a resource name spelled as a PATH (`<table>/index/<i>`,
+/// `<table>/stream/<label>`) included, and a caller reading it is told that ARN parsing
+/// is what refused the value.
+pub fn arn_form_requirement() -> String {
+    format!(
+        "Valid ARN format is \
+         'arn:<awsPartition>:<vendor>:<region>:<subscriber>:resourceType/resourceName', where \
+         Resource name must have length less than or equal to {MAX_TABLE_NAME_LENGTH}, \
+         Resource name must have length greater than or equal to {MIN_TABLE_NAME_LENGTH}, \
+         Resource name must satisfy regular expression pattern: {}",
+        unanchored(TABLE_NAME_PATTERN)
+    )
+}
 
 /// The form a table name must take: 3..=255 characters of
 /// `[a-zA-Z0-9_.-]` (the `CreateTable$TableName` doc's own length and pattern —
@@ -3736,15 +3751,17 @@ pub fn resolve_table_name_of(member: &str, table_name: &str) -> Result<String, R
     // A value spelled as an ARN is refused in one of THREE ways, and which one depends
     // on what is wrong with it:
     //
-    //   * a string that is NOT a well-formed ARN — a required field missing or empty —
-    //     is refused by the ARN FORM, because that is what is wrong with it;
+    //   * a string that is NOT a well-formed table ARN — a required field missing or
+    //     empty, or a resource name outside the form a table name takes — is refused by
+    //     the ARN FORM, because that is what is wrong with it: the value was parsed as
+    //     an ARN and the ARN is what it failed as;
     //   * an ARN OF THIS SERVICE whose resource type is not a table's names a resource
     //     of another kind, and the refusal says so over the ARN that was sent
     //     ([`invalid_resource_type`]);
     //   * any other well-formed ARN that does not name a table of this service is no way
     //     of naming a table, so it is refused as the table NAME it would have to be,
     //     by the pattern a table name must satisfy.
-    let malformed_arn = || invalid_member(member, Some(table_name), ARN_FORM_REQUIREMENT);
+    let malformed_arn = || invalid_member(member, Some(table_name), &arn_form_requirement());
     let not_a_table_arn = || {
         invalid_member(
             member,
@@ -3779,42 +3796,52 @@ pub fn resolve_table_name_of(member: &str, table_name: &str) -> Result<String, R
             if resource_type != TABLE_RESOURCE_TYPE {
                 return Err(invalid_resource_type(table_name));
             }
-            // A sub-resource ARN (`.../index/<i>`, `.../stream/<label>`) names
-            // something other than the table, so what is wrong with it is the resource
-            // type as well.
-            if path.is_empty() || path.contains('/') {
-                return Err(invalid_resource_type(table_name));
+            // The resource NAME of a table's ARN is the table name, so it is held to
+            // the table name's own form — and a value spelled as an ARN that breaks it
+            // is refused by the ARN FORM clause, which states that form, over the whole
+            // ARN that was sent: what is unacceptable is the ARN's resource name, not
+            // the characters of a bare name the caller never sent. A resource name that
+            // is a PATH (`<table>/index/<i>`, `<table>/stream/<label>`) addresses
+            // something deeper than the table and breaks it on the separator, as does
+            // an ARN with no resource name at all.
+            if table_name_violation(path).is_some() {
+                return Err(malformed_arn());
             }
             path
         }
         None => table_name,
     };
+    // A BARE name is refused by the clause for the bound it broke, naming the member
+    // and echoing the name itself: there is no ARN to blame.
+    match table_name_violation(name) {
+        Some(requirement) => Err(invalid_member(member, Some(name), &requirement)),
+        None => Ok(name.to_string()),
+    }
+}
+
+/// The form a table NAME must take ([`MIN_TABLE_NAME_LENGTH`]..=[`MAX_TABLE_NAME_LENGTH`]
+/// characters of [`TABLE_NAME_PATTERN`]), as the requirement phrase the value broke, or
+/// `None` for a name that takes it.
+///
+/// The one place the three rules are stated, so a name the request sent as itself and a
+/// name carried inside an ARN's resource field are held to exactly the same form — only
+/// the clause that reports a violation differs ([`arn_form_requirement`] states all
+/// three at once, which is how AWS words an ARN-shaped value's refusal).
+fn table_name_violation(name: &str) -> Option<String> {
     let length = name.chars().count();
     if length < MIN_TABLE_NAME_LENGTH {
-        return Err(invalid_member(
-            member,
-            Some(name),
-            &min_length_requirement(MIN_TABLE_NAME_LENGTH),
-        ));
+        return Some(min_length_requirement(MIN_TABLE_NAME_LENGTH));
     }
     if length > MAX_TABLE_NAME_LENGTH {
-        return Err(invalid_member(
-            member,
-            Some(name),
-            &max_length_requirement(MAX_TABLE_NAME_LENGTH),
-        ));
+        return Some(max_length_requirement(MAX_TABLE_NAME_LENGTH));
     }
     if !name
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
     {
-        return Err(invalid_member(
-            member,
-            Some(name),
-            &pattern_requirement(TABLE_NAME_PATTERN),
-        ));
+        return Some(pattern_requirement(TABLE_NAME_PATTERN));
     }
-    Ok(name.to_string())
+    None
 }
 
 /// The clause AWS states for an ARN that addresses a REGION other than the one the
