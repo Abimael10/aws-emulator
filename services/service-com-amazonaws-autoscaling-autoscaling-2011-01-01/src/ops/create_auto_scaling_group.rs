@@ -773,7 +773,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             new_instances_protected_from_scale_in: input
                 .new_instances_protected_from_scale_in
                 .unwrap_or(false),
-            service_linked_role_arn: input.service_linked_role_arn,
+            // The role Amazon EC2 Auto Scaling calls other services under for this
+            // group: the one this request named, or the account's default service-linked
+            // role for this service when it named none — "by default, Amazon EC2 Auto
+            // Scaling uses a service-linked role named AWSServiceRoleForAutoScaling". The
+            // group is bound to it HERE, once, so every read reports the role in force.
+            service_linked_role_arn: crate::state::service_linked_role::bound_arn(
+                input.service_linked_role_arn,
+            ),
             max_instance_lifetime: input.max_instance_lifetime,
             capacity_rebalance: input.capacity_rebalance,
             context: input.context,

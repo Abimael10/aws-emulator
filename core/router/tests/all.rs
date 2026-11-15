@@ -2242,3 +2242,15 @@ mod cloudformation_provisions_glue_table_optimizers;
 // comment is legal only before the first item, so with none anywhere in the file no merge
 // of two landings can leave one past the first declaration.
 // it under `tests/`, which the layout check refuses: the `#[path]` above each `mod` is what
+// This header, then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file under
+// `tests/all/`, sorted by name, and no other line — so two branches landing at once insert
+// two lines in two places and have no prose to duplicate, re-word or mistype. EVERY comment
+// in this file is an ordinary `//` one, this header included: an inner doc comment is legal
+// only before the first item, so a re-typed copy of one appended past the list is `E0753` and
+// compiles no suite of this target, and with none in the file there is no such line to copy.
+// A second `mod` for one name is `E0428`, and a suite file no `mod` names compiles nowhere.
+// `all/all_rs_is_a_canonical_declaration_list.rs`, `all/all_rs_declares_each_suite_once.rs`,
+// `all/every_suite_file_is_declared.rs` pin those rules, so a note about any of them belongs
+// there; the notes earlier landings appended to the tail of this file live in
+// `all/appended_notes.rs` and `all/appended_notes_tail.rs`. What a suite covers, and why it
+// module header.

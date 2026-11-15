@@ -681,7 +681,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             group.new_instances_protected_from_scale_in = value;
         }
         if let Some(value) = input.service_linked_role_arn {
-            group.service_linked_role_arn = Some(value);
+            group.service_linked_role_arn = value;
         }
         if let Some(value) = input.max_instance_lifetime {
             group.max_instance_lifetime = Some(value);

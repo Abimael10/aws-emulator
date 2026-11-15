@@ -85,6 +85,10 @@ pub mod elbv2_targets;
 /// the consumer of the template, is what resolves.
 pub mod iam_instance_profiles;
 
+/// The service-linked role a group calls other Amazon Web Services under: the role the
+/// request named, or the one this service binds the group to when it named none.
+pub mod service_linked_role;
+
 /// The security groups the launch templates of a group name, read against the VPC of the
 /// subnets the group places its instances in: a group and a subnet of two VPCs could never
 /// meet on one instance, so the request that names them is refused.
@@ -574,7 +578,11 @@ pub struct StoredGroup {
     pub vpc_zone_identifier: Option<String>,
     pub termination_policies: Vec<String>,
     pub new_instances_protected_from_scale_in: bool,
-    pub service_linked_role_arn: Option<String>,
+    /// The service-linked role the group calls other Amazon Web Services under. Every
+    /// group has one — the request's own, or the account's default service-linked role
+    /// for this service when the request named none ([`service_linked_role`]) — so this
+    /// is a value rather than an option, and every read reports the role in force.
+    pub service_linked_role_arn: String,
     pub max_instance_lifetime: Option<i32>,
     pub capacity_rebalance: Option<bool>,
     pub context: Option<String>,

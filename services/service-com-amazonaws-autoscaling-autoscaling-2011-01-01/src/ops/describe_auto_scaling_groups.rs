@@ -377,7 +377,10 @@ fn group_view(group: &crate::state::StoredGroup, include_instances: bool) -> Aut
         tags: Some(group.tag_descriptions()),
         termination_policies: Some(group.termination_policies.clone()),
         new_instances_protected_from_scale_in: Some(group.new_instances_protected_from_scale_in),
-        service_linked_role_arn: group.service_linked_role_arn.clone(),
+        // The role the group calls other Amazon Web Services under, which every group
+        // has: the one its create or a later update named, or the account's default
+        // service-linked role for this service ([`crate::state::service_linked_role`]).
+        service_linked_role_arn: Some(group.service_linked_role_arn.clone()),
         max_instance_lifetime: group.max_instance_lifetime,
         capacity_rebalance: group.capacity_rebalance,
         // The warm pool the group maintains, once `PutWarmPool` has given it one: the
