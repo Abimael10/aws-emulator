@@ -883,6 +883,51 @@ pub const APIS: &[Api] = &[
         },
         answer_model: Some(&KINESIS),
     },
+    // `services/service-com-amazonaws-cognitoidentityprovider-
+    // awscognitoidentityproviderservice/smithy-model/
+    // com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice.json`:
+    // awsJson1_1, sigv4Name `cognito-idp`, endpointPrefix `cognito-idp`, sdkId `Cognito
+    // Identity Provider`, service shape `AWSCognitoIdentityProviderService`.
+    //
+    // A USER POOL is on both sides of a function. It is one of the event sources that invokes
+    // a function at all — every user-pool Lambda trigger hands its event to one — and a
+    // handler that administers the pool it serves is the other half: the user an invitation
+    // flow creates, the user a handler reads back or lists, and the password or the
+    // enabled/disabled state it sets are all written and read through these Admin operations.
+    // A handler that cannot reach this service can neither carry a sign-up flow on nor report
+    // anything about the identity it was invoked for, so the effect of such an invocation is
+    // observable nowhere.
+    //
+    // The token is the one the AWS SDK for Python builds a client for this service with
+    // (`boto3.client("cognito-idp")`), which is its endpoint prefix.
+    Api {
+        sdk_token: "cognito-idp",
+        signing_name: "cognito-idp",
+        endpoint_prefix: "cognito-idp",
+        model: Some(COGNITO_IDP_MODEL),
+        protocol: Protocol::AwsJson {
+            target_prefix: "AWSCognitoIdentityProviderService",
+            json_version: "1.1",
+            query_compatible: false,
+        },
+        answer_model: Some(&COGNITO_IDP),
+    },
+    // The same service under the token its own SDK id gives it, as EventBridge and CloudWatch
+    // Logs are above: `Cognito Identity Provider` hyphenated is the name the JavaScript SDK
+    // publishes its client package under, and run together it is `cognitoidentityprovider` —
+    // one token under the comparison a client's own is matched by ([`same_service_token`]).
+    Api {
+        sdk_token: "cognito-identity-provider",
+        signing_name: "cognito-idp",
+        endpoint_prefix: "cognito-idp",
+        model: Some(COGNITO_IDP_MODEL),
+        protocol: Protocol::AwsJson {
+            target_prefix: "AWSCognitoIdentityProviderService",
+            json_version: "1.1",
+            query_compatible: false,
+        },
+        answer_model: Some(&COGNITO_IDP),
+    },
 ];
 
 /// Whether `named` and `asked` name the ONE service.
@@ -1059,6 +1104,11 @@ pub(super) const KINESIS_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-kinesis-kinesis-20131202/smithy-model/\
      com-amazonaws-kinesis-kinesis-20131202.json"
 );
+pub(super) const COGNITO_IDP_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-cognitoidentityprovider-\
+     awscognitoidentityproviderservice/smithy-model/\
+     com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice.json"
+);
 /// THIS service's own model, read the same way as every other entry's: a call a handler makes
 /// to Lambda is bound by the model this crate is generated from, so the surface a running
 /// function reaches is the surface this emulator serves.
@@ -1204,6 +1254,10 @@ static OPENSEARCHSERVERLESS_ANSWERS: super::blob_members::ServiceModel =
     };
 static KINESIS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
     source: KINESIS_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
+static COGNITO_IDP: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: COGNITO_IDP_MODEL,
     plan: ::std::sync::OnceLock::new(),
 };
 
@@ -2155,6 +2209,21 @@ mod tests {
                 "step-functions",
                 Some("states"),
             ),
+            (
+                "the user pool service, by the token the Python SDK names it",
+                "cognito-idp",
+                Some("cognito-idp"),
+            ),
+            (
+                "the same service by the JavaScript package's token for it",
+                "cognito-identity-provider",
+                Some("cognito-idp"),
+            ),
+            (
+                "the same service with the words of that id run together",
+                "cognitoidentityprovider",
+                Some("cognito-idp"),
+            ),
             ("a single-word id", "s3", Some("s3")),
             ("a service no entry answers to", "polly", None),
             ("the empty token", "", None),
@@ -2183,6 +2252,12 @@ mod tests {
             ("Step Functions", "stepfunctions", "sfn", true),
             ("EventBridge", "events", "eventbridge", true),
             ("Secrets Manager", "secretsmanager", "secrets-manager", true),
+            (
+                "Cognito Identity Provider",
+                "cognito-identity-provider",
+                "cognitoidentityprovider",
+                true,
+            ),
             // The one question asked out of OpenSearch's model is how a request to it is
             // bound, which its protocol entry carries, so no model is held on the entry.
             ("OpenSearch", "opensearch", "es", false),

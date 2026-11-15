@@ -372,6 +372,10 @@ service-com-amazonaws-opensearchserverless-opensearchserverless = { workspace = 
 # retrieves — are created and ingested through this plane's own API, so what the handler gets
 # back is read out of the records those creates really wrote.
 service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda = { workspace = true }
+# The USER POOL a handler's own Amazon Cognito calls administer, mounted beside lambda on ONE
+# engine: the user a handler created, read, listed or disabled is asserted where a client reads
+# it — through that service's own AdminGetUser and ListUsers.
+service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice = { workspace = true }
 # The search DOMAIN whose REST data plane a handler's own signed requests are decided by,
 # mounted beside lambda on ONE engine: the write a handler signs is admitted or refused by
 # that service's own authorization, and the document it stored is read back through its own

@@ -15739,6 +15739,7 @@ dependencies = [
  "service-com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
+ "service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice",
  "service-com-amazonaws-dynamodb-dynamodb-20120810",
  "service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810",
  "service-com-amazonaws-ec2-amazonec2",

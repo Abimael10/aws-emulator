@@ -63,6 +63,7 @@ const KEY: &str = "orders/one.txt";
 const MUST_REACH: &[&str] = &[
     "apigateway",
     "apigatewaymanagementapi",
+    "cognito-idp",
     "dynamodb",
     "events",
     "kinesis",
@@ -149,6 +150,16 @@ fn rows() -> Vec<Row> {
         Row {
             case: "a search service, by its endpoint prefix",
             token: "es",
+            reachable: true,
+        },
+        Row {
+            case: "the user pool service, by the token the Python SDK names it",
+            token: "cognito-idp",
+            reachable: true,
+        },
+        Row {
+            case: "the same service by the hyphenated token the JavaScript SDK publishes",
+            token: "cognito-identity-provider",
             reachable: true,
         },
         Row {
