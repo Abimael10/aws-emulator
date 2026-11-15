@@ -181,7 +181,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // ONE sequence, stated once in `crate::state`: judge the `resourceArn` as an
         // input, judge the rest of the request on its own content, take the store,
         // materialise the expiry the clock has already made due, then resolve the
@@ -209,8 +208,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // model states belongs to the constrained map another member targets. An
         // absent `tags` member carries no entries to judge, which is what the empty
         // map it reads as says.
+        //
+        // The expiry that sequence materialises takes the parameter's own Secrets
+        // Manager secret with it, and that deletion cannot be made under the store
+        // guard, so it is carried out here — on both paths, because the deletion is
+        // one the clock owed whatever this request is answered with.
         let incoming = input.tags.unwrap_or_default();
-        crate::state::write_tagged_parameter(
+        let answered = crate::state::write_tagged_parameter(
             &*self.engine,
             &input.resource_arn,
             TagResourceErrorModeled::InternalServerException,
@@ -240,6 +244,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 record.tags = merged;
                 Ok(TagResourceOutput {})
             },
+        );
+        crate::state::deployment_secret::release_expired_secrets(
+            &*self.engine,
+            ctx,
+            &crate::state::request_region(ctx.parts()),
         )
+        .await;
+        answered
     }
 }

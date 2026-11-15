@@ -176,7 +176,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // ONE sequence, stated once in `crate::state`: judge the `resourceArn` as an
         // input, judge the rest of the request on its own content, take the store,
         // materialise the expiry the clock has already made due, then resolve the
@@ -192,9 +191,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // own generated tags cannot be removed by a caller, and a string outside the
         // length bound a tag key may hold names no tag key at all, so neither is a
         // removal this service can perform and the request removes nothing. A record
-        // whose `expirationDate` has passed is scheduled for deletion, so a tag removal
+        // A record whose `expirationDate` has passed is scheduled for deletion, so a tag removal
         // against it is a write to a resource that no longer exists.
-        crate::state::write_tagged_parameter(
+        //
+        // The expiry that sequence materialises takes the parameter's own Secrets
+        // Manager secret with it, and that deletion cannot be made under the store
+        // guard, so it is carried out here — on both paths, because the deletion is
+        // one the clock owed whatever this request is answered with.
+        let answered = crate::state::write_tagged_parameter(
             &*self.engine,
             &input.resource_arn,
             UntagResourceErrorModeled::InternalServerException,
@@ -213,6 +217,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 Ok(UntagResourceOutput {})
             },
+        );
+        crate::state::deployment_secret::release_expired_secrets(
+            &*self.engine,
+            ctx,
+            &crate::state::request_region(ctx.parts()),
         )
+        .await;
+        answered
     }
 }

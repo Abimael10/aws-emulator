@@ -166,7 +166,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // ONE sequence, stated once in `crate::state`: judge the `resourceArn` as an
         // input, take the store, materialise the expiry the clock has already made
         // due, then resolve the record or answer the service's not-found failure.
@@ -179,8 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `expirationDate` is scheduled for deletion, and that deletion was owed at
         // the sequence's own clock sample whether or not anybody called — so this
         // reporting operation may apply it, and must not report a resource the clock
-        // has already taken.
-        crate::state::with_tagged_parameter(
+        // has already taken. The secret such a parameter held goes with it: that
+        // deletion belongs to Secrets Manager and cannot be made under the store
+        // guard, so it is carried out here, on both paths — it is a deletion the clock
+        // owed, not a step of reporting anything.
+        let answered = crate::state::with_tagged_parameter(
             &*self.engine,
             &input.resource_arn,
             ListTagsForResourceErrorModeled::InternalServerException,
@@ -190,6 +192,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     tags: Some(record.tags_map()),
                 })
             },
+        );
+        crate::state::deployment_secret::release_expired_secrets(
+            &*self.engine,
+            ctx,
+            &crate::state::request_region(ctx.parts()),
         )
+        .await;
+        answered
     }
 }

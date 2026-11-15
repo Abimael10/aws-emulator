@@ -23,6 +23,8 @@ mod contended_writes_stamp_under_the_store_lock;
 mod deployment_parameter_expiry;
 #[path = "all/deployment_parameter_identity_key.rs"]
 mod deployment_parameter_identity_key;
+#[path = "all/deployment_parameter_secret.rs"]
+mod deployment_parameter_secret;
 #[path = "all/deployment_parameters.rs"]
 mod deployment_parameters;
 #[path = "all/enforced_character_classes.rs"]

@@ -1,5 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: the declaration list of its cross-service
+// suites, and nothing else.
+//
+// One `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`, sorted
+// by name, and no other line — so two branches landing at once insert two lines in two
+// places and have no prose to duplicate, re-word or mistype. A file no `mod` names is
+// compiled nowhere and its tests never run; a suite left at the top level of `tests/` fails
+// the build; a second `mod` for one name is `E0428`; and an inner doc comment past the first
+// item is `E0753`. Each of the last two fails every suite in this target, which is why EVERY
+// comment in this file is an ordinary `//` one, this header included: with no `//!` anywhere,
+// no merge of two landings can leave one past the first item.
+//
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING
+// (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each declaration
+// is what points it into `tests/all/`.
+//
+// What a suite covers, and why it belongs to this cross-service target rather than to one
+// service crate's own, is stated in that suite's own module doc, where it is read beside the
+// test it explains; the notes earlier landings appended to the tail of this file live in
+// `all/appended_notes.rs`.
 // Single integration-test target for the router: the canonical declaration list of every
 // cross-service suite under `tests/all/`, and nothing else.
 //

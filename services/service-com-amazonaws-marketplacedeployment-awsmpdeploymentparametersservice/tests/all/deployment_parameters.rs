@@ -70,12 +70,22 @@ const ALTERNATE_NAME: &str = "AlternateParameter";
 /// The engine is handed back so a test can [`provision`] the agreements a write
 /// targets: `PutDeploymentParameter` writes against an agreement of the account,
 /// and this API models no operation that creates one.
+///
+/// AWS Secrets Manager is mounted beside this service because a deployment
+/// parameter's `secretString` is held in a secret of that service — the write
+/// `PutDeploymentParameter` performs — so a router without it is a deployment in
+/// which this service cannot store the value it is given at all. It is reached
+/// over the router's own in-process callback, exactly as the production router
+/// mounts both.
 pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
         service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::EmulatedService::new(engine.clone()),
+    );
+    router.register_service(
+        service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService::new(engine.clone()),
     );
     (router, engine)
 }

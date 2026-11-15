@@ -28,6 +28,10 @@ tracing = { workspace = true }
 # matched from the single constant that states it rather than from a second,
 # hand-written statement of the same class.
 regex = "1.13"
+# The AWS SDK for Secrets Manager, driven over the emulator's own in-process
+# transport: a deployment parameter's `secretString` is held in a Secrets Manager
+# secret, which is the service that owns secret values.
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -35,6 +39,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The emulated Secrets Manager, mounted beside this service in the test router so a
+# test reads a written deployment parameter back through the service that holds it.
+service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
 
 [lints]
 workspace = true

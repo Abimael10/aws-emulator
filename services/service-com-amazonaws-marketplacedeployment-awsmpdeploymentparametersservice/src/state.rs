@@ -11,7 +11,18 @@
 //! (`expirationDate`), and that date is enforced here: every operation that
 //! resolves a deployment parameter first materialises the deletion the clock has
 //! made due ([`ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::purge_expired`]),
-//! so no caller ever sees a parameter past its expiration date. For the
+//! so no caller ever sees a parameter past its expiration date.
+//!
+//! What a record does NOT carry is the parameter's own text: `secretString` is "the
+//! text to encrypt and store in the secret", and the secret is AWS Secrets Manager's
+//! — so the value lives there ([`deployment_secret`]) and a record keeps only the
+//! identity of the secret holding it. The deletion the expiry makes due therefore has
+//! two halves as well: the record is dropped here, and the secret it named is queued
+//! for the deleting call Secrets Manager owns
+//! ([`deployment_secret::release_expired_secrets`]), which every operation makes as
+//! soon as it is no longer holding this store's guard.
+//!
+//! For the
 //! operations that resolve a parameter by the `resourceArn` the CALLER supplied,
 //! that whole sequence — judge the ARN as an input, take the store, materialise
 //! the due expiry, then resolve the record or answer the service's not-found
@@ -48,6 +59,10 @@ use crate::ops::types::{
     ConflictException, InternalServerException, ResourceNotFoundException,
     ServiceQuotaExceededException, ValidationException,
 };
+
+/// The AWS Secrets Manager secret a deployment parameter IS: the one place its
+/// `secretString` is held, and the only place any caller can read it.
+pub mod deployment_secret;
 
 /// This service's ARN namespace and sigv4 signing name
 /// (`aws.api#service$arnNamespace` / `aws.auth#sigv4$name` are both
@@ -368,10 +383,27 @@ fn system_time_epoch_nanos(at: SystemTime) -> i128 {
     }
 }
 
+/// How many expired parameters' secrets the deletion queue
+/// ([`ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::expired_secrets`])
+/// holds at once.
+///
+/// An EMULATOR ceiling, not an AWS quota. One purge queues at most one entry per
+/// stored parameter, and the call whose purge filled the queue drains it
+/// ([`deployment_secret::release_expired_secrets`]), so the queue holds at most the
+/// secrets of a store's worth of parameters — which is the figure below, not a
+/// second number. At the ceiling a further entry is not queued: the record is gone
+/// either way, and a queue that grew without bound would be a leak of its own.
+pub const MAX_EXPIRED_SECRETS: usize = MAX_DEPLOYMENT_PARAMETERS;
+
 /// One deployment parameter, as written by `PutDeploymentParameter`.
 ///
-/// `Debug` is hand-written so the secret never reaches a log or a panic message:
-/// `DeploymentParameterInput$secretString` is `@sensitive`.
+/// The VALUE the parameter carries is not here: `secretString` is "the text to
+/// encrypt and store in the secret", and the secret is Secrets Manager's
+/// ([`deployment_secret`]), so what this record keeps is the identity of that
+/// secret and never a copy of what is in it.
+///
+/// `Debug` is hand-written so this record prints the same way the rest of the
+/// crate's state does, field by field.
 #[derive(Clone)]
 pub struct DeploymentParameterRecord {
     /// The ARN minted for this record; the key both tagging operations resolve by.
@@ -387,9 +419,14 @@ pub struct DeploymentParameterRecord {
     /// The parameter name: the identifier deployment parameters are keyed on for
     /// a given buyer and product.
     pub name: String,
-    /// The secret text last written for this parameter. `@sensitive`: no
-    /// operation reports it and nothing logs it.
-    pub secret_string: String,
+    /// The name of the AWS Secrets Manager secret this parameter's text is held
+    /// in ([`deployment_secret::deployment_parameter_secret_name`]).
+    pub secret_name: String,
+    /// The ARN Secrets Manager allocated for that secret, as that service
+    /// answered it — the id every later write and the expiry's delete address it
+    /// by. A stored reference, not a claim: what the secret HOLDS is read from
+    /// Secrets Manager, which owns it.
+    pub secret_arn: String,
     /// When the parameter expires and is scheduled for deletion, when the last
     /// write named a date. ENFORCED: at that instant the record is dropped
     /// ([`ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::purge_expired`]),
@@ -412,8 +449,8 @@ impl std::fmt::Debug for DeploymentParameterRecord {
             .field("product_id", &self.product_id)
             .field("agreement_id", &self.agreement_id)
             .field("name", &self.name)
-            // `secretString` is @sensitive: its length is enough to debug with.
-            .field("secret_string", &format_args!("<{} bytes>", self.secret_string.len()))
+            .field("secret_name", &self.secret_name)
+            .field("secret_arn", &self.secret_arn)
             .field("expiration_date", &self.expiration_date)
             .field("tags", &self.tags)
             .field("created_at", &self.created_at)
@@ -570,6 +607,12 @@ pub struct ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceStat
     /// The `client_tokens` keys in insertion order, so the ledger evicts the oldest
     /// token first once it is at [`MAX_CLIENT_TOKENS`].
     pub client_token_order: VecDeque<String>,
+    /// The secrets of the parameters the clock has taken, waiting to be deleted in
+    /// Secrets Manager: [`Self::purge_expired`] runs under this guard and cannot
+    /// await, so it queues here and the call it is serving drains the queue
+    /// ([`deployment_secret::release_expired_secrets`]). Bounded by
+    /// [`MAX_EXPIRED_SECRETS`]; write it only through [`Self::queue_expired_secret`].
+    pub expired_secrets: VecDeque<String>,
     /// Source of the unique `dp-…` identifiers.
     pub next_id: u64,
 }
@@ -587,6 +630,7 @@ impl Default for ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersservi
             client_tokens: BTreeMap::new(),
             agreements: BTreeMap::new(),
             client_token_order: VecDeque::new(),
+            expired_secrets: VecDeque::new(),
             next_id: 0,
         };
         for catalog in SUPPORTED_CATALOGS {
@@ -726,6 +770,12 @@ impl ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState {
     /// The index is pruned in step with [`Self::parameters`] — the two are written
     /// together — and so is the `clientToken` ledger, whose entries for a dropped
     /// record could otherwise only ever replay a resource that is gone.
+    ///
+    /// The parameter's VALUE goes with it: a dropped record's secret is queued for
+    /// deletion in Secrets Manager ([`Self::queue_expired_secret`]), which the call
+    /// whose purge this is carries out as soon as it is not holding this guard
+    /// ([`deployment_secret::release_expired_secrets`]) — the deletion is owed at the
+    /// same instant, and the text the parameter held must not outlive the parameter.
     pub fn purge_expired(&mut self, now: SystemTime) {
         let expired: BTreeSet<String> = self
             .parameters
@@ -735,6 +785,14 @@ impl ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState {
             .collect();
         if expired.is_empty() {
             return;
+        }
+        let dropped: Vec<String> = expired
+            .iter()
+            .filter_map(|resource_arn| self.parameters.get(resource_arn))
+            .map(|record| record.secret_arn.clone())
+            .collect();
+        for secret_arn in dropped {
+            self.queue_expired_secret(secret_arn);
         }
         self.parameters
             .retain(|resource_arn, _| !expired.contains(resource_arn));
@@ -746,6 +804,22 @@ impl ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState {
         let live_tokens = &self.client_tokens;
         self.client_token_order
             .retain(|token| live_tokens.contains_key(token));
+    }
+
+    /// Queue the secret `secret_arn` names for deletion, unless the queue is already
+    /// at [`MAX_EXPIRED_SECRETS`] entries — in which case nothing is queued, for the
+    /// reason that constant gives. An empty id names no secret and is not queued.
+    pub fn queue_expired_secret(&mut self, secret_arn: String) {
+        if secret_arn.is_empty() || self.expired_secrets.len() >= MAX_EXPIRED_SECRETS {
+            return;
+        }
+        self.expired_secrets.push_back(secret_arn);
+    }
+
+    /// Take every queued secret deletion, leaving the queue empty: the caller is the
+    /// one that carries them out, so an entry is handed over once.
+    pub fn take_expired_secrets(&mut self) -> Vec<String> {
+        self.expired_secrets.drain(..).collect()
     }
 
     /// Record that `client_token` wrote the parameter at `resource_arn`, evicting the
@@ -1190,6 +1264,26 @@ pub fn client_token_conflict(
              {bound_parameter_id}; a token identifies exactly one write"
         ),
         resource_id: bound_parameter_id.to_string(),
+    }
+}
+
+/// The modelled `ConflictException` (HTTP 409) for a write that another write of the
+/// same identity kept taking out from under it.
+///
+/// A deployment-parameter write has two parts — the secret the value goes into, which
+/// belongs to Secrets Manager, and this service's own record — so it cannot hold this
+/// store's guard across the whole of itself. It therefore decides what to write, writes
+/// the secret, and then commits; a commit the store no longer admits is retried against
+/// what the store holds now, and this is what is answered when even that is overtaken.
+/// `resourceId` names the product the identity belongs to, which satisfies the modelled
+/// `ResourceId` pattern by construction (it is the one the request addressed).
+pub fn concurrent_write_conflict(product_id: &str, name: &str) -> ConflictException {
+    ConflictException {
+        message: format!(
+            "the deployment parameter {name} is being written concurrently for product \
+             {product_id}; retry the request"
+        ),
+        resource_id: product_id.to_string(),
     }
 }
 
