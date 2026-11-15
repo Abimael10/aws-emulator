@@ -4819,3 +4819,9 @@ mod appended_notes;
 // it into `tests/all/`.
 // The list below is sorted and holds nothing but one `#[path]`/`mod` pair per suite, so a
 // landing has one place to insert and nothing else to keep consistent.
+//! file is one crate root, so a second `mod` for the same name is `E0428` and fails every
+//! suite in this target.
+//! the first item one is `E0753` and compiles no suite of this target either. Below, add a
+//! declaration — never a note about one. `all/all_rs_declares_each_suite_once.rs` and
+//! this file and for every service crate's `tests/all.rs`, so leave a note THERE rather than
+//! here.

@@ -9,16 +9,23 @@
 //! `GetBucketInventoryConfiguration` reports it back. Success is
 //! [`PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS`] with an empty body. Refused before
 //! anything is written
-//! when the request is not one S3 records: an id outside the published length, an id that
-//! disagrees with the payload's own `Id`, or a member naming a value outside its enum's
-//! published set (`InvalidArgument`), a destination whose `AccountId` is written EMPTY
-//! (`MalformedXML`), and a NEW configuration past
-//! [`crate::state::MAX_INVENTORY_CONFIGURATIONS_PER_BUCKET`] (`TooManyConfigurations`).
+//! when the request is not one S3 records: a document whose `Id` is outside the id rule, an
+//! empty filter prefix, a destination whose `AccountId` is written EMPTY, or a member naming
+//! a value outside its enum's published set does not validate against the schema the API
+//! publishes for an `InventoryConfiguration` and is [`crate::state::MALFORMED_XML_CODE`], as
+//! is a document that schema cannot READ at all (`crate::service::readable_document`); a
+//! destination that is not a regionless bucket ARN is
+//! [`crate::state::INVALID_S3_DESTINATION_BUCKET_CODE`] and a destination SSE-KMS key that is
+//! not a KMS key ARN is [`crate::state::INVALID_KMS_KEY_ID_CODE`]
+//! ([`inventory_document_fault`] is the one reading of all of them); an `id`
+//! argument that states another configuration's id is
+//! [`crate::state::ID_MISMATCH_CODE`]; a request that states no id for the document it
+//! carries is [`crate::state::INTERNAL_ERROR_CODE`] (HTTP 500); and a NEW configuration past
+//! [`crate::state::MAX_INVENTORY_CONFIGURATIONS_PER_BUCKET`] is `TooManyConfigurations`.
 //!
-//! The read side is `GetBucketInventoryConfiguration`, implemented in the same change so a
-//! put can be read back; `DeleteBucketInventoryConfiguration` and
-//! `ListBucketInventoryConfigurations` are still the scaffold's 501 and are their own stub
-//! issues.
+//! The read side is `GetBucketInventoryConfiguration`, and the delete and the listing of
+//! this same configuration are implemented beside it, so a put is read back, listed and
+//! removed through this service's own operations.
 //!
 //! ## Shape of an operation
 //!
@@ -273,90 +280,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // An id is what the configuration is addressable by, bounded by the length every
-        // bucket configuration id shares: a value outside it identifies no configuration the
-        // service can record, which is what this operation's own `InvalidArgument` reports.
-        if !crate::state::is_valid_inventory_id(&input.id) {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::INVALID_ARGUMENT_CODE,
-                crate::state::INVALID_ARGUMENT_STATUS,
-                format!(
-                    "Id {:?} is not an inventory configuration id: between 1 and {} characters",
-                    input.id,
-                    crate::state::MAX_INVENTORY_ID_CHARS
-                ),
-            ));
-        }
-
         let configuration = &input.inventory_configuration;
+
+        // The DOCUMENT is judged first and as a whole: a member of it whose value is outside
+        // the form the published schema requires describes no inventory configuration S3 can
+        // record ([`inventory_document_fault`] is the one reading of that schema, and each
+        // fault carries the refusal S3 publishes for it). Judged before the id comparison
+        // below, because a document S3 cannot take can never be the configuration the
+        // request addresses, whatever id it states.
+        if let Some(fault) = inventory_document_fault(configuration) {
+            return Err(fault.refusal());
+        }
 
         // The configuration a put adds is the one "identified by the inventory ID" and the
         // `Id` that "identifies the inventory configuration" in the payload name ONE
-        // configuration, so two different values name no configuration the service can
-        // record. S3 publishes a code of its own for exactly that disagreement
-        // ([`crate::state::ID_MISMATCH_CODE`]), which is what a client branching on it reads.
+        // configuration, so a request whose `id` argument is not the id the document states
+        // addresses no configuration this payload describes. Recorded behaviour tells the two
+        // ways that happens apart: two ids that are BOTH stated and differ are the
+        // disagreement S3 names ([`crate::state::ID_MISMATCH_CODE`], HTTP 400), while a
+        // request that states NO id — no argument at all, or an empty one
+        // ([`crate::state::ConfigurationIdFault::Unstated`]) — addresses nothing and is a
+        // request S3 could not carry out ([`crate::state::INTERNAL_ERROR_CODE`], HTTP 500).
+        // The second is also what the boundary answers a request that carries no `id`
+        // argument at all, which is refused before this handler runs
+        // (`crate::service::inventory_configuration_id_wording`), so the two cannot disagree.
         if configuration.id != input.id {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::ID_MISMATCH_CODE,
-                crate::state::ID_MISMATCH_STATUS,
-                crate::state::ID_MISMATCH_MESSAGE,
-            ));
-        }
-
-        // Each of these members is an ENUM, so a value outside its published set describes a
-        // configuration the service cannot apply. The boundary validator refuses such a
-        // value before this handler runs, so these checks are what keep the handler TOTAL
-        // rather than a second statement of the bound — the reading
-        // `PutBucketIntelligentTieringConfiguration` gives its own status check. The sets
-        // come from the crate's own generated catalogs, so they cannot drift from the model.
-        for (member, value, published) in [
-            (
-                "InventoryConfiguration.IncludedObjectVersions",
-                configuration.included_object_versions.as_str(),
-                INVENTORY_INCLUDED_OBJECT_VERSIONS_VALUES,
-            ),
-            (
-                "InventoryConfiguration.Schedule.Frequency",
-                configuration.schedule.frequency.as_str(),
-                INVENTORY_FREQUENCY_VALUES,
-            ),
-            (
-                "InventoryConfiguration.Destination.S3BucketDestination.Format",
-                configuration.destination.s3_bucket_destination.format.as_str(),
-                INVENTORY_FORMAT_VALUES,
-            ),
-        ] {
-            if !published.contains(&value) {
-                return Err(invalid_enum_value(member, value, published));
-            }
-        }
-        for field in configuration.optional_fields.iter().flatten() {
-            if !INVENTORY_OPTIONAL_FIELD_VALUES.contains(&field.as_str()) {
-                return Err(invalid_enum_value(
-                    "InventoryConfiguration.OptionalFields",
-                    field,
-                    INVENTORY_OPTIONAL_FIELD_VALUES,
-                ));
-            }
-        }
-
-        // "The account ID that owns the destination S3 bucket. If no account ID is provided,
-        // the owner is not validated before exporting data"
-        // (`InventoryS3BucketDestination$AccountId`): the member may be left OUT, and then
-        // the owner is not validated — but one the document WROTE EMPTY names no account at
-        // all, which is a document that did not validate against the published schema
-        // ([`crate::state::is_present_and_empty`]), as the same member of an analytics export
-        // is read ([`super::put_bucket_analytics_configuration`]). A value that DOES name an
-        // account is stored as submitted, whichever account it names: S3 verifies the owner
-        // when it writes an export, not when it records the configuration.
-        if crate::state::is_present_and_empty(
-            configuration
-                .destination
-                .s3_bucket_destination
-                .account_id
-                .as_ref(),
-        ) {
-            return Err(malformed_inventory_configuration());
+            return Err(match crate::state::configuration_id_fault(&input.id) {
+                Some(crate::state::ConfigurationIdFault::Unstated) => {
+                    unaddressed_inventory_configuration()
+                }
+                _ => mismatched_inventory_configuration_id(),
+            });
         }
 
         let Some(bucket) = store.bucket_mut(&input.bucket) else {
@@ -371,7 +325,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         match bucket.put_inventory_configuration(input.id, input.inventory_configuration) {
             crate::state::BucketConfigurationWrite::Stored
             | crate::state::BucketConfigurationWrite::Replaced => Ok(
-                // `Unit` output: success is the modelled 200 and an empty body.
+                // `Unit` output: success is
+                // [`PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS`] and an empty body.
                 PutBucketInventoryConfigurationOutput,
             ),
             // `TooManyConfigurations` — this operation's own special error, with the status
@@ -389,33 +344,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The refusal for a member whose value is not one its enum publishes, naming the member,
-/// the value and the set it had to come from — what a caller has to fix the request from.
-fn invalid_enum_value(
-    member: &str,
-    value: &str,
-    published: &[&str],
-) -> PutBucketInventoryConfigurationError {
+/// Why `configuration` is not an S3 Inventory configuration S3 records, or `None` when it is
+/// one.
+///
+/// ONE reading of the schema this API publishes for an `InventoryConfiguration`, with the
+/// rules each taken from the member that publishes it:
+///
+/// * `Id` — "the ID used to identify the inventory configuration", which is an id a bucket
+///   configuration may be identified by: the one reading every family of them shares
+///   ([`crate::state::configuration_id_fault`]), so the families cannot drift apart on which
+///   values identify a configuration. A document whose `Id` is outside it does not validate
+///   against the published schema, which is the refusal the sibling
+///   `PutBucketMetricsConfiguration` answers its own `Id` rule with.
+/// * `InventoryS3BucketDestination$Bucket` — "the Amazon Resource Name (ARN) of the bucket
+///   where inventory results will be published", judged through the crate's one
+///   destination-bucket reading ([`crate::state::bucket_arn_fault`]): a bare bucket name is
+///   not an ARN, and a bucket ARN names no Region. The document itself validates — the member
+///   is a string and it is there — so S3 reports it against the DESTINATION
+///   ([`crate::state::INVALID_S3_DESTINATION_BUCKET_CODE`]) with the sentence that fault
+///   publishes. What the ARN NAMES is not resolved: this write records a reference, the way
+///   `PutBucketAnalyticsConfiguration` records its own export destination.
+/// * `SSEKMS$KeyId` — "the ID of the Key Management Service (KMS) symmetric encryption
+///   customer managed key to use for encrypting inventory reports", which S3 Inventory takes
+///   as the key's ARN ([`crate::state::is_kms_key_arn`]); the SSE-S3 alternative takes no key
+///   at all. The document itself validates here too, so S3 reports the KEY
+///   ([`crate::state::INVALID_KMS_KEY_ID_CODE`]); and the key is not resolved against KMS
+///   either — what is judged is the value's form.
+/// * `InventoryFilter$Prefix` — "the prefix that an object must have to be included in the
+///   inventory results": a filter is present only to state one, so an empty prefix states no
+///   prefix an object could have.
+/// * `IncludedObjectVersions`, `Schedule$Frequency`, the destination's `Format` and each
+///   `OptionalFields` entry — ENUM members, so a value outside the published set names
+///   nothing the service can apply. The boundary refuses those before this handler runs (and
+///   answers the same refusal, since the value arrived inside the document), so these keep
+///   this reading TOTAL rather than stating a second rule; the sets come from the crate's own
+///   generated catalogs, so they cannot drift from the model.
+///
+/// * `InventoryS3BucketDestination$AccountId` — "the account ID that owns the destination S3
+///   bucket. If no account ID is provided, the owner is not validated before exporting data":
+///   the member may be left OUT, and then the owner is not validated — but one the document
+///   WROTE EMPTY names no account at all, which the published schema does not admit
+///   ([`crate::state::is_present_and_empty`]), as the same member of an analytics export is
+///   read ([`super::put_bucket_analytics_configuration`]). A value that DOES name an account
+///   is stored as submitted, whichever account it names: S3 verifies the OWNER when it writes
+///   an export, not when it records the configuration, which is why nothing here resolves
+///   what the value names.
+fn inventory_document_fault(
+    configuration: &InventoryConfiguration,
+) -> Option<InventoryDocumentFault> {
+    let destination = &configuration.destination.s3_bucket_destination;
+    if crate::state::configuration_id_fault(&configuration.id).is_some()
+        || crate::state::is_present_and_empty(destination.account_id.as_ref())
+    {
+        return Some(InventoryDocumentFault::Malformed);
+    }
+    if let Some(fault) = crate::state::bucket_arn_fault(&destination.bucket) {
+        return Some(InventoryDocumentFault::Destination(fault));
+    }
+    if let Some(InventoryEncryption {
+        ssekms: Some(kms), ..
+    }) = &destination.encryption
+    {
+        if !crate::state::is_kms_key_arn(&kms.key_id) {
+            return Some(InventoryDocumentFault::EncryptionKey);
+        }
+    }
+    if configuration
+        .filter
+        .as_ref()
+        .is_some_and(|filter| filter.prefix.is_empty())
+    {
+        return Some(InventoryDocumentFault::Malformed);
+    }
+    let published_values = [
+        (
+            configuration.included_object_versions.as_str(),
+            INVENTORY_INCLUDED_OBJECT_VERSIONS_VALUES,
+        ),
+        (
+            configuration.schedule.frequency.as_str(),
+            INVENTORY_FREQUENCY_VALUES,
+        ),
+        (destination.format.as_str(), INVENTORY_FORMAT_VALUES),
+    ];
+    let outside_an_enum = published_values
+        .iter()
+        .any(|(value, published)| !published.contains(value))
+        || !configuration
+            .optional_fields
+            .iter()
+            .flatten()
+            .all(|field| INVENTORY_OPTIONAL_FIELD_VALUES.contains(&field.as_str()));
+    outside_an_enum.then_some(InventoryDocumentFault::Malformed)
+}
+
+/// Why an S3 Inventory configuration document is not one S3 records — which is what decides
+/// the refusal a put carrying it answers with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InventoryDocumentFault {
+    /// A member of the document carries a value the schema the API publishes for it does not
+    /// admit, so the document "did not validate against our published schema".
+    Malformed,
+    /// The document validates, and its export destination is not a bucket inventory reports
+    /// could be published to.
+    Destination(crate::state::BucketArnFault),
+    /// The document validates, and the key its destination encryption names is not a KMS
+    /// key.
+    EncryptionKey,
+}
+
+impl InventoryDocumentFault {
+    /// The refusal a put carrying such a document answers with: the code, the status and the
+    /// sentence S3 publishes for the rule the document broke, with nothing of the request
+    /// interpolated into either — the schema refusal carries that code's own fixed text
+    /// ([`crate::state::MALFORMED_XML_MESSAGE`], for the reason the sibling
+    /// `PutBucketMetricsConfiguration` gives its own payload: the code says the document did
+    /// not validate against the published schema, and the schema is the same for every
+    /// document), the destination refusal the fixed sentence its own fault publishes, and the
+    /// encryption-key refusal the one S3 publishes for a key that is not a key ARN.
+    fn refusal(self) -> PutBucketInventoryConfigurationError {
+        match self {
+            Self::Malformed => crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MALFORMED_XML_CODE,
+                crate::state::MALFORMED_XML_STATUS,
+                crate::state::MALFORMED_XML_MESSAGE,
+            ),
+            Self::Destination(fault) => crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_S3_DESTINATION_BUCKET_CODE,
+                crate::state::INVALID_S3_DESTINATION_BUCKET_STATUS,
+                fault.message(),
+            ),
+            Self::EncryptionKey => crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_KMS_KEY_ID_CODE,
+                crate::state::INVALID_KMS_KEY_ID_STATUS,
+                crate::state::INVALID_KMS_KEY_ID_MESSAGE,
+            ),
+        }
+    }
+}
+
+/// The refusal for a put whose `id` argument states a configuration id and the document
+/// states another: the code S3 names that disagreement with
+/// ([`crate::state::ID_MISMATCH_CODE`]) and its fixed sentence, which states the rule rather
+/// than echoing either id back.
+fn mismatched_inventory_configuration_id() -> PutBucketInventoryConfigurationError {
     crate::scaffolded::Scaffolded::unmodeled(
-        crate::state::INVALID_ARGUMENT_CODE,
-        crate::state::INVALID_ARGUMENT_STATUS,
-        format!("{member} must name one of {published:?}, got {value:?}"),
+        crate::state::ID_MISMATCH_CODE,
+        crate::state::ID_MISMATCH_STATUS,
+        crate::state::ID_MISMATCH_MESSAGE,
     )
 }
 
-/// The refusal for an `InventoryConfiguration` document that does not validate against the
-/// schema the API publishes for it.
+/// The refusal for a put that states NO configuration id for the document it carries.
 ///
-/// It carries that code's own FIXED published text
-/// ([`crate::state::MALFORMED_XML_MESSAGE`]) rather than anything about this request, the
-/// reading the sibling analytics put gives its own payload
-/// ([`super::put_bucket_analytics_configuration`]): the code says the document did not
-/// validate against the published schema, and the schema is the same for every document.
-fn malformed_inventory_configuration() -> PutBucketInventoryConfigurationError {
+/// Recorded behaviour: S3 answers that with the code it answers a request it could not carry
+/// out at all ([`crate::state::INTERNAL_ERROR_CODE`], HTTP 500) and that code's own fixed
+/// sentence, rather than with an argument refusal — the operation publishes no error of its
+/// own for it (`smithy_query(query="operation",
+/// operation="PutBucketInventoryConfiguration")` reports `errors: []`).
+fn unaddressed_inventory_configuration() -> PutBucketInventoryConfigurationError {
     crate::scaffolded::Scaffolded::unmodeled(
-        crate::state::MALFORMED_XML_CODE,
-        crate::state::MALFORMED_XML_STATUS,
-        crate::state::MALFORMED_XML_MESSAGE,
+        crate::state::INTERNAL_ERROR_CODE,
+        crate::state::INTERNAL_ERROR_STATUS,
+        crate::state::INTERNAL_ERROR_MESSAGE,
     )
 }
 

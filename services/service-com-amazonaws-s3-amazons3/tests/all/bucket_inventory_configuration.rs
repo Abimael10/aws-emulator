@@ -26,9 +26,14 @@
 //!   one past [`MAX_INVENTORY_CONFIGURATIONS_PER_BUCKET`] is refused, while replacing an id
 //!   already stored creates nothing and is not.
 //! * The request's `Id` and the payload's `Id` identify ONE configuration, and an id is
-//!   bounded by [`MAX_INVENTORY_ID_CHARS`]: a value outside that bound, or two values that
-//!   disagree, is refused with `InvalidArgument` (HTTP 400). A member whose value is outside
-//!   its enum's published set is refused with HTTP 400 as well.
+//!   bounded by [`MAX_INVENTORY_ID_CHARS`]: a payload whose own `Id` is outside the id rule
+//!   is a document that does not validate against the published schema (`MalformedXML`, HTTP
+//!   400), two ids that are both stated and disagree are `IdMismatch` (HTTP 400), and a
+//!   request that states no id for the document it carries is `InternalError` (HTTP 500). A
+//!   member whose value is outside its enum's published set is refused with HTTP 400 as well.
+//!   The DOCUMENT rules this write judges a configuration by — the id rule, the destination,
+//!   the encryption key, the filter prefix — are pinned over a table of their own by
+//!   [`super::inventory_probe`].
 //! * A call naming a bucket this emulator does not hold answers `NoSuchBucket` (HTTP 404);
 //!   one naming an `ExpectedBucketOwner` that is not the account's answers HTTP 403
 //!   `AccessDenied`. Every refusal leaves the stored configurations exactly as they were.
@@ -41,8 +46,9 @@ use service_com_amazonaws_s3_amazons3::ops::types::{
     INVENTORY_INCLUDED_OBJECT_VERSIONS_VALUES, INVENTORY_OPTIONAL_FIELD_VALUES,
 };
 use service_com_amazonaws_s3_amazons3::state::{
-    INVALID_ARGUMENT_CODE, MAX_INVENTORY_CONFIGURATIONS_PER_BUCKET, MAX_INVENTORY_ID_CHARS,
-    NO_SUCH_BUCKET_CODE, NO_SUCH_CONFIGURATION_CODE, TOO_MANY_CONFIGURATIONS_CODE,
+    ID_MISMATCH_CODE, INTERNAL_ERROR_CODE, MALFORMED_XML_CODE,
+    MAX_INVENTORY_CONFIGURATIONS_PER_BUCKET, MAX_INVENTORY_ID_CHARS, NO_SUCH_BUCKET_CODE,
+    NO_SUCH_CONFIGURATION_CODE, TOO_MANY_CONFIGURATIONS_CODE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -243,7 +249,11 @@ pub(crate) async fn put_inventory(
 
 /// `PutBucketInventoryConfiguration` with the payload spelled out — for a container no
 /// [`Configuration`] can express — and with any extra bound headers.
-async fn put_inventory_payload(
+///
+/// `pub(crate)`: the suite that drives the DOCUMENT rules of this write
+/// ([`super::inventory_probe`]) spells its own documents and sends them through this one
+/// helper rather than a second one.
+pub(crate) async fn put_inventory_payload(
     router: &MultiServiceRouter,
     bucket: &str,
     id: &str,
@@ -464,14 +474,14 @@ fn round_trip_rows() -> Vec<(String, Configuration)> {
         .filtered("documents/"),
     ));
     rows.push((
-        "an empty filter prefix, which selects every object".to_string(),
+        "a one-character filter prefix, the shortest a filter states".to_string(),
         Configuration::new(
-            "empty-prefix",
+            "short-prefix",
             INVENTORY_INCLUDED_OBJECT_VERSIONS_VALUES[1],
             INVENTORY_FREQUENCY_VALUES[1],
             Destination::new(INVENTORY_FORMAT_VALUES[0]),
         )
-        .filtered(""),
+        .filtered("r"),
     ));
     rows.push((
         "a disabled configuration with one optional field".to_string(),
@@ -813,21 +823,28 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
             too_long.clone(),
             configuration_of(&too_long).xml(),
             400,
-            Some(INVALID_ARGUMENT_CODE),
+            Some(MALFORMED_XML_CODE),
         ),
         (
             "an empty id, which identifies no configuration",
             String::new(),
             configuration_of("").xml(),
             400,
-            Some(INVALID_ARGUMENT_CODE),
+            Some(MALFORMED_XML_CODE),
         ),
         (
             "a payload Id that is not the configuration the request names",
             "query-id".to_string(),
             configuration_of("payload-id").xml(),
             400,
-            Some("IdMismatch"),
+            Some(ID_MISMATCH_CODE),
+        ),
+        (
+            "a request that states no id for the payload it carries",
+            String::new(),
+            configuration_of("payload-id").xml(),
+            500,
+            Some(INTERNAL_ERROR_CODE),
         ),
         (
             "an IncludedObjectVersions outside its enum",

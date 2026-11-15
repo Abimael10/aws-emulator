@@ -25,9 +25,12 @@
 //!   id the request states empty (or does not state at all) is refused with
 //!   `InvalidConfigurationId` / "The specified configuration id is invalid." on the write,
 //!   the read and the delete alike, since none of the three identifies a configuration at
-//!   all. The PATTERN and the LENGTH bound are a different rule: they bound what a WRITE
-//!   may record, so an id spelled with a character outside [`CONFIGURATION_ID_PATTERN`] is
-//!   refused `InvalidConfigId` quoting that pattern and one longer than
+//!   all — except the S3 INVENTORY write, whose recorded behaviour for a document it is
+//!   given no id for is the code S3 answers a request it could not carry out with
+//!   ([`INTERNAL_ERROR_CODE`], HTTP 500), which is the one thing that differs between the
+//!   families here. The PATTERN and the LENGTH bound are a different rule: they bound what a
+//!   WRITE may record, so an id spelled with a character outside [`CONFIGURATION_ID_PATTERN`]
+//!   is refused `InvalidConfigId` quoting that pattern and one longer than
 //!   [`MAX_CONFIGURATION_ID_CHARS`] `InvalidConfigId` stating that bound — on the PUT only,
 //!   while the read and the delete report what the bucket holds under that id, which for an
 //!   id no put could have recorded is `NoSuchConfiguration`.
@@ -38,9 +41,10 @@
 
 use service_com_amazonaws_s3_amazons3::ops::put_bucket_analytics_configuration::PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS;
 use service_com_amazonaws_s3_amazons3::state::{
-    CONFIGURATION_ID_PATTERN, INVALID_CONFIGURATION_ID_CODE, INVALID_CONFIGURATION_ID_MESSAGE,
-    INVALID_CONFIG_ID_CODE, INVALID_CONFIG_ID_MESSAGE, INVALID_CONFIG_ID_PATTERN_MESSAGE,
-    MAX_CONFIGURATION_ID_CHARS, NO_SUCH_CONFIGURATION_CODE,
+    CONFIGURATION_ID_PATTERN, INTERNAL_ERROR_CODE, INTERNAL_ERROR_MESSAGE,
+    INVALID_CONFIGURATION_ID_CODE, INVALID_CONFIGURATION_ID_MESSAGE, INVALID_CONFIG_ID_CODE,
+    INVALID_CONFIG_ID_MESSAGE, INVALID_CONFIG_ID_PATTERN_MESSAGE, MAX_CONFIGURATION_ID_CHARS,
+    NO_SUCH_CONFIGURATION_CODE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -63,6 +67,25 @@ const ANALYTICS_LISTING_RESULT: &str = "ListBucketAnalyticsConfigurationsResult"
 struct Family {
     subresource: &'static str,
     document: String,
+}
+
+impl Family {
+    /// What a call on this family that states NO id answers: the status, the code and the
+    /// message.
+    ///
+    /// The same refusal for every family and every method but one — the S3 INVENTORY `PUT`,
+    /// whose recorded behaviour for a document it is given no id for is
+    /// [`INTERNAL_ERROR_CODE`] under HTTP 500 rather than a refusal naming the id.
+    fn without_id_refusal(&self, method: &str) -> (u16, &'static str, &'static str) {
+        match (self.subresource, method) {
+            ("inventory", "PUT") => (500, INTERNAL_ERROR_CODE, INTERNAL_ERROR_MESSAGE),
+            _ => (
+                400,
+                INVALID_CONFIGURATION_ID_CODE,
+                INVALID_CONFIGURATION_ID_MESSAGE,
+            ),
+        }
+    }
 }
 
 /// The four families a bucket holds per-id configurations of, each with a document its own
@@ -188,24 +211,25 @@ async fn a_subresource_call_without_an_id_is_not_a_call_on_the_bucket() {
             ("DELETE", String::new(), unheld),
         ] {
             let case = format!("{method} ?{} on {named:?}", family.subresource);
+            let (status, code, message) = family.without_id_refusal(method);
             let answer = without_id(&router, method, named, family.subresource, &body).await;
             assert_eq!(
                 answer.status,
-                400,
-                "case {case:?}: expected HTTP 400, got {} ({})",
+                status,
+                "case {case:?}: expected HTTP {status}, got {} ({})",
                 answer.status,
                 String::from_utf8_lossy(&answer.body)
             );
             assert_eq!(
                 answer.error_code(),
-                INVALID_CONFIGURATION_ID_CODE,
-                "case {case:?}: expected the code {INVALID_CONFIGURATION_ID_CODE}, got {}",
+                code,
+                "case {case:?}: expected the code {code}, got {}",
                 answer.error_code()
             );
             assert_eq!(
                 answer.error_message(),
-                INVALID_CONFIGURATION_ID_MESSAGE,
-                "case {case:?}: expected the message {INVALID_CONFIGURATION_ID_MESSAGE:?}, got \
+                message,
+                "case {case:?}: expected the message {message:?}, got \
                  {:?}",
                 answer.error_message()
             );

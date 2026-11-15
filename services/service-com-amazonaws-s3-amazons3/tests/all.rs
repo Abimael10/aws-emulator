@@ -195,6 +195,10 @@ mod identity_authorization;
 mod idempotent_object_deletes;
 #[path = "all/inline_tagging_header_grammar.rs"]
 mod inline_tagging_header_grammar;
+// The DOCUMENT rules of `PutBucketInventoryConfiguration`, which the three
+// `bucket_inventory_configuration*` suites above leave to this one.
+#[path = "all/inventory_probe.rs"]
+mod inventory_probe;
 #[path = "all/json_payload_media_type.rs"]
 mod json_payload_media_type;
 #[path = "all/kms_key_references.rs"]

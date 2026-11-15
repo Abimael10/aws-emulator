@@ -1154,9 +1154,47 @@ pub const INVALID_DESTINATION_CODE: &str = "InvalidDestination";
 /// The HTTP status [`INVALID_DESTINATION_CODE`] is rendered with: 400.
 pub const INVALID_DESTINATION_STATUS: u16 = 400;
 
+/// The code S3 answers an S3 INVENTORY configuration whose destination is not a bucket
+/// inventory reports could be published to with: `InvalidS3DestinationBucket`, under HTTP
+/// 400.
+///
+/// The inventory family names its own destination condition rather than sharing the
+/// [`INVALID_DESTINATION_CODE`] of the analytics export, and for the same reason that one is
+/// not [`MALFORMED_XML_CODE`]: the document validates against the published schema — the
+/// member is a string and it is there — and what S3 cannot act on is the VALUE of the
+/// destination, so the refusal names the destination. Which SENTENCE it carries is why the
+/// value is not a destination bucket ([`BucketArnFault::message`]).
+pub const INVALID_S3_DESTINATION_BUCKET_CODE: &str = "InvalidS3DestinationBucket";
+
+/// The HTTP status [`INVALID_S3_DESTINATION_BUCKET_CODE`] is rendered with: 400.
+pub const INVALID_S3_DESTINATION_BUCKET_STATUS: u16 = 400;
+
+/// The code S3 answers an S3 INVENTORY configuration whose destination encryption names a
+/// KMS key that is not one with: `InvalidKmskeyId`, under HTTP 400 — spelled as the service
+/// sends it on the wire.
+///
+/// The same class as [`INVALID_S3_DESTINATION_BUCKET_CODE`] and for the same reason: the
+/// document validates against the published schema and what S3 cannot act on is the VALUE,
+/// so the refusal names the key rather than the document.
+pub const INVALID_KMS_KEY_ID_CODE: &str = "InvalidKmskeyId";
+
+/// See [`INVALID_KMS_KEY_ID_CODE`] — the fixed sentence S3 sends with it, which states what
+/// the value had to be and echoes nothing of the request: the key id is `@sensitive`
+/// (`smithy_query(query="shape",shape="SSEKMSKeyId")`), so a refusal does not quote it back.
+pub const INVALID_KMS_KEY_ID_MESSAGE: &str = "Invalid kms key id ARN.";
+
+/// The HTTP status [`INVALID_KMS_KEY_ID_CODE`] is rendered with: 400.
+pub const INVALID_KMS_KEY_ID_STATUS: u16 = 400;
+
 /// The code S3 answers a bucket-configuration write whose DOCUMENT `Id` is not the id the
-/// request addresses with, where the operation publishes a code naming that disagreement:
-/// `IdMismatch`, under HTTP 400.
+/// request addresses it by: `IdMismatch`, under HTTP 400 — the two name ONE configuration,
+/// so a document naming another one describes no configuration the request addresses.
+///
+/// Recorded behaviour of the S3 Inventory write, which publishes no error of its own for it
+/// (`smithy_query(query="operation",operation="PutBucketInventoryConfiguration")` reports
+/// `errors: []`). It is the refusal for two ids that are BOTH stated and differ; a request
+/// that states no id at all addresses nothing, which S3 answers
+/// [`INTERNAL_ERROR_CODE`] instead.
 pub const ID_MISMATCH_CODE: &str = "IdMismatch";
 
 /// See [`ID_MISMATCH_CODE`] — the fixed text S3 sends for that condition, which states the
@@ -1335,10 +1373,10 @@ pub const MALFORMED_CONTINUATION_TOKEN_STATUS: u16 = 400;
 /// ([`configuration_id_fault`]); the CODE a refusal carries is each family's own, since AWS
 /// answers an id outside the rule per family — [`INVALID_CONFIG_ID_CODE`] for an analytics
 /// or S3 Intelligent-Tiering id, which those operations report against the id itself, and
-/// [`MALFORMED_XML_CODE`] for a metrics configuration's `Id`, whose rule the metrics
-/// operation reports as the document failing to validate against the published schema
-/// (`PutBucketMetricsConfiguration` publishes no error of its own for a document it cannot
-/// take).
+/// [`MALFORMED_XML_CODE`] for a metrics or an S3 Inventory configuration's `Id`, whose rule
+/// those operations report as the document failing to validate against the published schema
+/// (neither `PutBucketMetricsConfiguration` nor `PutBucketInventoryConfiguration` publishes
+/// an error of its own for a document it cannot take).
 pub const MAX_CONFIGURATION_ID_CHARS: usize = 64;
 
 /// The code S3 answers a `GetBucketReplication` for a bucket that has no replication
@@ -1407,18 +1445,6 @@ pub const MAX_METRICS_CONFIGURATIONS_PER_BUCKET: usize = 1_000;
 /// half is [`MAX_CONFIGURATION_ID_CHARS`], the bound every bucket configuration id shares;
 /// the character set is this family's own.
 pub const MAX_METRICS_ID_CHARS: usize = MAX_CONFIGURATION_ID_CHARS;
-
-/// Whether `value` is long enough and short enough to identify a bucket configuration:
-/// between one and [`MAX_CONFIGURATION_ID_CHARS`] characters.
-///
-/// The LENGTH half every bucket configuration id shares, so the families cannot drift apart
-/// on it: [`configuration_id_fault`] composes it with the character set the id members
-/// document, and [`is_valid_inventory_id`] is it alone. An EMPTY id identifies no
-/// configuration, so it is never one.
-pub fn is_valid_configuration_id(value: &str) -> bool {
-    let characters = value.chars().count();
-    characters > 0 && characters <= MAX_CONFIGURATION_ID_CHARS
-}
 
 /// The code S3 answers a read that names a bucket subresource configuration the bucket
 /// carries none of under that id: "NoSuchConfiguration - The specified configuration does
@@ -1553,15 +1579,10 @@ pub const MAX_INVENTORY_CONFIGURATIONS_PER_BUCKET: usize = 1_000;
 /// [`MAX_CONFIGURATION_ID_CHARS`], the bound every bucket configuration id shares: the model
 /// constrains `InventoryId` no further — `smithy_query(query="shape",shape="InventoryId")`
 /// reports a plain string with no `length` or `pattern` — so nothing refuses a longer id
-/// before a handler does, and an id is what one bucket's inventory map keys on.
+/// before a handler does, and an id is what one bucket's inventory map keys on. WHICH values
+/// identify a configuration is [`configuration_id_fault`]'s one reading, this length among
+/// them.
 pub const MAX_INVENTORY_ID_CHARS: usize = MAX_CONFIGURATION_ID_CHARS;
-
-/// Whether `value` is an id an S3 Inventory configuration may be identified by: a
-/// configuration id by length ([`is_valid_configuration_id`], i.e. between one and
-/// [`MAX_INVENTORY_ID_CHARS`] characters), which is all `InventoryId` constrains.
-pub fn is_valid_inventory_id(value: &str) -> bool {
-    is_valid_configuration_id(value)
-}
 
 /// The HTTP status [`INVALID_REQUEST_CODE`] is rendered with: 400, from Amazon S3's "Error
 /// responses" list of error codes. It is the status the replication prerequisite is refused

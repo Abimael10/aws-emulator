@@ -2640,6 +2640,28 @@ pub fn is_s3_access_point_arn(value: &str) -> bool {
 /// (`arn:aws:s3:<region>:<account-id>:accesspoint/<name>`).
 const ACCESS_POINT_RESOURCE_PREFIX: &str = "accesspoint/";
 
+/// Whether `value` is the ARN of a KMS KEY:
+/// `arn:<partition>:kms:<region>:<account-id>:key/<key-id>`.
+///
+/// A KMS key is a REGIONAL, account-owned resource whose ARN names the resource kind before
+/// the key's own id, so neither an alias ARN nor a bare key id is one however well formed it
+/// is. Read through [`is_arn_of`], the crate's one ARN grammar, so a member that takes a key
+/// ARN is not judged by a rule of its own.
+pub fn is_kms_key_arn(value: &str) -> bool {
+    is_arn_of(
+        value,
+        "kms",
+        ArnField::Present,
+        ArnField::Present,
+        KMS_KEY_RESOURCE_PREFIX,
+    )
+}
+
+/// What a KMS key ARN's resource part begins with, before the key's own id: the resource
+/// kind, as AWS spells it in the ARN of a key
+/// (`arn:aws:kms:<region>:<account-id>:key/<key-id>`).
+const KMS_KEY_RESOURCE_PREFIX: &str = "key/";
+
 /// Why `value` is not an ARN, as AWS states it where a refusal quotes the reason.
 ///
 /// The ARN grammar is the published one [`is_arn_of`] reads —

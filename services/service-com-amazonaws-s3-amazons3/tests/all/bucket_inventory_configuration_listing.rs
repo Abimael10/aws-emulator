@@ -149,7 +149,7 @@ fn listing_rows() -> Vec<(&'static str, Vec<Configuration>)> {
             vec![
                 plain("a_plain"),
                 plain("b.disabled").disabled(),
-                plain("c-empty-filter-prefix").filtered(""),
+                plain("c-one-character-filter-prefix").filtered("c"),
                 Configuration::new(
                     "d_other-catalog-values",
                     // The LAST entry of each catalog, so the row spans the published sets

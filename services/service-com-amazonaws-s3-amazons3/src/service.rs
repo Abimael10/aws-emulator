@@ -92,6 +92,9 @@ pub mod post_object;
 // principal and the bucket's own policy let it perform the action it asks for — see
 // `service/request_authorization.rs`.
 pub mod request_authorization;
+// The refusal a request DOCUMENT this service's published schema cannot READ earns, ahead of
+// the framework's own sequence — see `service/readable_document.rs`.
+pub mod readable_document;
 // The `AWS/S3` request metrics a bucket's own metrics configurations publish about the
 // requests this service serves on its objects — see `service/request_metrics.rs`.
 pub mod request_metrics;
@@ -1082,6 +1085,39 @@ fn configuration_id_wording(
     Some(s3_refusal(&restored))
 }
 
+/// The refusal the S3 INVENTORY write words for an `id` argument the boundary rejected —
+/// the one it rejects being an `id` the request states none of, which the model makes a
+/// required `@httpQuery` member.
+///
+/// The inventory write does not report that as an argument refusal: the `id` argument and
+/// the document's own `Id` name ONE configuration, so a request that states no id addresses
+/// no configuration the payload describes, and recorded behaviour of that disagreement is
+/// the code S3 answers a request it could not carry out with
+/// ([`crate::state::INTERNAL_ERROR_CODE`], HTTP 500) — the same answer the handler gives an
+/// `id` that states ANOTHER configuration's id
+/// (`crate::ops::put_bucket_inventory_configuration`), so the two cannot disagree about one
+/// rule. Every other value this operation carries outside its document keeps the wording
+/// [`s3_refusal`] gives it.
+fn inventory_configuration_id_wording(
+    refused: &[(Violation, ::service_common::validation::SubmittedEcho)],
+) -> Option<Refused> {
+    let (violation, echo) = refused.first()?;
+    // The violation path names the INPUT MEMBER the value arrived on, lowerCamel — which for
+    // `Id` is the parameter's own name ([`CONFIGURATION_ID_PARAMETER`]), the spelling
+    // [`published_refusal`] reads it under as well.
+    if violation.path.split('.').next() == Some(CONFIGURATION_ID_PARAMETER) {
+        return Some(Refused {
+            code: crate::state::INTERNAL_ERROR_CODE.to_string(),
+            message: crate::state::INTERNAL_ERROR_MESSAGE.to_string(),
+        });
+    }
+    let restored = ::service_common::validation_message::quoting_the_whole_submitted_value(
+        violation.clone(),
+        echo,
+    );
+    Some(s3_refusal(&restored))
+}
+
 /// The `<ArgumentName>` / `<ArgumentValue>` pair S3's document carries for the request field
 /// `violation` names, or `None` for a field whose refusal carries no member of its own.
 ///
@@ -1163,6 +1199,14 @@ const TAGGING_DIRECTIVE_HEADER: &str = "x-amz-tagging-directive";
 ///   answer of this service carries, named by the pair of ids S3 mints
 ///   ([`EmulatedService::worded_refusal`]); the framework's own renderer mints ids of a
 ///   different shape, which a client, a log correlator and a support request all read.
+/// * `PutBucketInventoryConfiguration` — the one call whose refusal of a value outside its
+///   document S3 answers at another STATUS: a put that states no configuration id addresses
+///   no configuration its document describes, which S3 reports as a request it could not
+///   carry out ([`inventory_configuration_id_wording`]). A service-level seam is handed the
+///   violations alone, so only a door can place that refusal on this one operation. It is
+///   also served behind [`readable_document::ReadableDocument`], so an inventory document
+///   this service's published schema cannot READ answers the same refusal as one it reads and
+///   does not validate.
 /// * The four listings of what a bucket holds — `ListObjects`, `ListObjectsV2`,
 ///   `ListObjectVersions` and `ListMultipartUploads` — each of which binds the
 ///   `encoding-type` whose refusal names the parameter and echoes its value
@@ -1213,6 +1257,21 @@ fn front_door<Eng: Send + Sync + 'static>(
             )
             .wording_uri(configuration_id_wording),
         ),
+    );
+    table.add_operation(
+        crate::ops::put_bucket_inventory_configuration::PutBucketInventoryConfiguration::<Eng>::NAME,
+        Box::new(readable_document::ReadableDocument::<
+            crate::ops::put_bucket_inventory_configuration::PutBucketInventoryConfiguration<Eng>,
+            _,
+        >::new(
+            FrontDoor::worded(
+                crate::ops::put_bucket_inventory_configuration::PutBucketInventoryConfiguration::new(
+                    Arc::clone(engine),
+                ),
+                submitted_value_wording,
+            )
+            .wording_uri(inventory_configuration_id_wording),
+        )),
     );
     // The two copies are the operations this service serves BOTH behind a door and with
     // their answers counted into the addressed bucket's request metrics: a copy writes the
@@ -1838,9 +1897,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     }
 
     /// `refused` rendered with the DETAIL members S3's document carries for it
-    /// ([`refused_argument`]), in the same envelope and at the same status a constraint
-    /// refusal is rendered with: HTTP 400, the status every protocol answers a value outside
-    /// its declared constraints with.
+    /// ([`refused_argument`]), in the same envelope as every other answer of this service and
+    /// at the status S3 publishes for the chosen code ([`refusal_status`]) — the same reading
+    /// [`EmulatedService::worded_refusal`] makes, so the two renderers cannot answer one code
+    /// at two statuses.
     ///
     /// This is the one renderer a BOUNDARY refusal can carry members through: the wording
     /// seam ([`Service::override_refusal`]) chooses the code and the message and nothing
@@ -1865,7 +1925,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 &refusal,
                 &crate::scaffolded::UNMODELED_SCHEMA,
                 &refused.code,
-                crate::state::INVALID_ARGUMENT_STATUS,
+                refusal_status(&refused.code),
             )
             .ok()
     }
@@ -1879,12 +1939,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// Reached for EVERY refusal of a value the model declares a rule for, on every
     /// operation of this service and not only the ones served behind the door: what the ids
     /// are is a property of an S3 response, not of one operation. The code and the message
-    /// are the ones the wording seam already chose, and the status is the 400 every protocol
-    /// answers a value outside its declared rules with — which is the status of every code
-    /// [`s3_refusal`] and [`published_refusal`] can choose, and the only class of refusal
-    /// routed through here (see [`ErasedServiceDefinition::refusal_response`]). A published
-    /// refusal at another status would need the status to travel with the code, which
-    /// [`Refused`] does not carry.
+    /// are the ones the wording seam already chose, and the STATUS is the one S3 publishes
+    /// for that code ([`refusal_status`]): the 400 every protocol answers a value outside
+    /// its declared rules with for every code [`s3_refusal`] and [`published_refusal`] can
+    /// choose, and that code's own status for a wording that names another.
     ///
     /// `None` on the serializer failure a code and a sentence cannot actually provoke, which
     /// leaves the entry's renderer to answer rather than panicking in the request path.
@@ -1897,9 +1955,26 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 &refusal,
                 &crate::scaffolded::UNMODELED_SCHEMA,
                 &refused.code,
-                crate::state::INVALID_ARGUMENT_STATUS,
+                refusal_status(&refused.code),
             )
             .ok()
+    }
+}
+
+/// The HTTP status S3 renders the refusal code `code` with.
+///
+/// A status travels WITH a code in S3's error-responses list rather than with the layer that
+/// raised the refusal, so the status of a worded refusal is read off its code here: a value
+/// outside its declared rules is the 400 every protocol answers such a value with
+/// ([`crate::state::INVALID_ARGUMENT_STATUS`]), which is what every code [`s3_refusal`] and
+/// [`published_refusal`] choose carries, and a wording naming the code S3 answers a request
+/// it could not carry out with carries that code's own 500
+/// ([`crate::state::INTERNAL_ERROR_STATUS`], which
+/// [`inventory_configuration_id_wording`] chooses).
+fn refusal_status(code: &str) -> u16 {
+    match code {
+        crate::state::INTERNAL_ERROR_CODE => crate::state::INTERNAL_ERROR_STATUS,
+        _ => crate::state::INVALID_ARGUMENT_STATUS,
     }
 }
 
@@ -2237,12 +2312,19 @@ impl<Eng: Send + Sync + 'static> ErasedServiceDefinition for EmulatedService<Eng
         // names the refused argument by ([`refused_argument`]); everything else keeps the
         // entry's rendering of the code and message alone.
         if let ProtocolError::Invalid(violations) = &error {
-            if let Some(violation) = violations.first() {
-                // The wording this service chose for the refusal, derived ONCE: both
-                // renderers below carry the same code and message, and only the document's
-                // members differ.
-                let refused = chosen.clone().unwrap_or_else(|| s3_refusal(violation));
-                if let Some(detail) = refused_argument(violation) {
+            // The wording this service chose for the refusal, derived ONCE: both renderers
+            // below carry the same code and message, and only the document's members differ.
+            // A wording that came with the refusal is what it carries — including one that
+            // names no violation at all, which is how a refusal made before any member was
+            // built travels (`readable_document`) — and a refusal that came with none is
+            // worded from the first violation it did find.
+            let refused = match (&chosen, violations.first()) {
+                (Some(chosen), _) => Some(chosen.clone()),
+                (None, Some(violation)) => Some(s3_refusal(violation)),
+                (None, None) => None,
+            };
+            if let Some(refused) = refused {
+                if let Some(detail) = violations.first().and_then(refused_argument) {
                     if let Some(response) = self.detailed_refusal(&refused, detail) {
                         return response;
                     }
@@ -2254,8 +2336,8 @@ impl<Eng: Send + Sync + 'static> ErasedServiceDefinition for EmulatedService<Eng
                 // every other answer of this service — a served response and a handler's
                 // refusal alike — is named by S3's ([`crate::state::request_ids`]), and
                 // the SHAPE is what a client, a log correlator or a support request reads.
-                // The status is the 400 every protocol answers a value outside its declared
-                // rules with (see [`EmulatedService::worded_refusal`]).
+                // The status is the one S3 publishes for the chosen code
+                // (see [`EmulatedService::worded_refusal`]).
                 if let Some(response) = self.worded_refusal(&refused) {
                     return response;
                 }
