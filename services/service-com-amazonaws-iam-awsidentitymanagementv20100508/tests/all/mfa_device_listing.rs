@@ -51,7 +51,7 @@ const OTHER_USER: &str = "device-bystander";
 
 /// Provision a virtual MFA device named `name` and enable it for `user_name`, answering its
 /// serial number.
-async fn given_enabled_device(
+pub(crate) async fn given_enabled_device(
     router: &MultiServiceRouter,
     case: &str,
     user_name: &str,

@@ -171,6 +171,8 @@ mod management_event_recording;
 mod member_format_refusal_wording;
 #[path = "all/mfa_device_listing.rs"]
 mod mfa_device_listing;
+#[path = "all/mfa_device_listing_invariants.rs"]
+mod mfa_device_listing_invariants;
 #[path = "all/mfa_device_reads.rs"]
 mod mfa_device_reads;
 #[path = "all/missing_entity_message_wording.rs"]
