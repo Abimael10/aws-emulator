@@ -27,9 +27,7 @@ use std::sync::Arc;
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
-use service_com_amazonaws_securityagent_securityagent::state::{
-    service_state, AWS_MANAGED_PACKS, MAX_PAGE_SIZE,
-};
+use service_com_amazonaws_securityagent_securityagent::state::{service_state, MAX_PAGE_SIZE};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::support::{call, emulator_on, member, ok};
@@ -417,23 +415,38 @@ async fn a_listing_reports_only_the_named_packs_requirements() {
     }
 }
 
-/// RULE: every pack the account holds answers a listing — a pack that holds no
-/// requirement answers an empty page and no cursor, never a refusal.
+/// RULE: a pack the account holds that holds no requirement answers an empty page and no
+/// cursor, never a refusal.
 ///
-/// The rows are the AWS managed catalog a fresh account holds
-/// (`service_com_amazonaws_securityagent_securityagent::state::AWS_MANAGED_PACKS`,
-/// whose ids this suite does not name one by one) plus a pack created over the wire.
+/// The rows are the two ways a pack of the account can hold nothing: one just created,
+/// and one whose requirements were all deleted again — beside a pack that DOES hold
+/// requirements, so an empty page is the pack's own emptiness and not a listing that
+/// reports nothing. The packs AWS manages are not rows: a pack AWS ships carries the
+/// requirements AWS ships with it, which the `aws_managed_pack_requirements` suite
+/// covers.
 #[tokio::test]
 async fn a_pack_holding_no_requirement_answers_an_empty_page() {
     let (router, _engine) = harness();
-    let created = create_pack(&router, "empty pack", "an empty created pack").await;
-    let mut pack_ids: Vec<String> = AWS_MANAGED_PACKS
-        .iter()
-        .map(|entry| entry.pack_id.to_string())
-        .collect();
-    pack_ids.push(created);
+    let case = "an empty created pack";
+    let fresh = create_pack(&router, "empty pack", case).await;
+    let emptied = create_pack(&router, "emptied pack", case).await;
+    create_requirements(&router, &emptied, &["encryption", "logging"], case).await;
+    ok(
+        &router,
+        "BatchDeleteSecurityRequirements",
+        &json!({
+            "packId": emptied,
+            "securityRequirementNames": ["encryption", "logging"]
+        }),
+        case,
+    )
+    .await;
+    // A pack that is NOT empty, so the cases below distinguish an empty pack from a
+    // listing that reports nothing at all.
+    let populated = create_pack(&router, "populated pack", case).await;
+    create_requirements(&router, &populated, &["encryption"], case).await;
 
-    for pack_id in pack_ids {
+    for pack_id in [fresh, emptied] {
         let case = format!("the empty pack {pack_id}");
         let page = list_page(&router, &pack_id, None, None, &case).await;
         assert!(
@@ -447,6 +460,15 @@ async fn a_pack_holding_no_requirement_answers_an_empty_page() {
             page.next_token
         );
     }
+
+    let case = format!("the populated pack {populated}");
+    let page = list_page(&router, &populated, None, None, &case).await;
+    assert_eq!(
+        page.summaries.len(),
+        1,
+        "case {case:?}: a pack that holds a requirement must report it, got {:?}",
+        page.summaries
+    );
 }
 
 /// RULE: an input the service cannot act on is refused with the modelled error for it —

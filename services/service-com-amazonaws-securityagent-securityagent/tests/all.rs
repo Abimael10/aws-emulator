@@ -33,6 +33,8 @@ mod artifact_listing;
 mod artifact_storage;
 #[path = "all/aws_managed_pack_catalog.rs"]
 mod aws_managed_pack_catalog;
+#[path = "all/aws_managed_pack_requirements.rs"]
+mod aws_managed_pack_requirements;
 #[path = "all/error_message_wording.rs"]
 mod error_message_wording;
 #[path = "all/minted_identifier_forms.rs"]

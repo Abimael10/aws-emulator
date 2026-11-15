@@ -194,15 +194,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // "Batch deletes security requirements from a CUSTOMER MANAGED pack": the
-        // contents of a pack AWS ships are the service's, so removing anything from one
-        // conflicts with the current state of that pack — the operation's modelled
-        // `ConflictException` (409), for the whole call, since every name of the request
-        // names the same pack.
+        // contents of a pack AWS ships are the service's, so there is no delete to
+        // perform against one — the request is refused at the CALL level, for every name
+        // it carries, since every name of the request names the same pack. The recorded
+        // refusal is the operation's modelled `ValidationException` (400) rather than a
+        // conflict: what is wrong is which pack the request names, not a transient state
+        // of that pack, so no later moment makes the same request valid. It carries no
+        // `fieldList`: `packId` is well formed and names a pack the account holds, so no
+        // member of the request failed a constraint of its own.
         if pack.management_type == crate::state::MANAGEMENT_TYPE_AWS_MANAGED {
             return Err(
-                BatchDeleteSecurityRequirementsErrorModeled::ConflictException(
-                    ConflictException {
-                        message: crate::state::aws_managed_pack_conflict_message(&input.pack_id),
+                BatchDeleteSecurityRequirementsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::aws_managed_pack_delete_refusal_message(
+                            &input.pack_id,
+                        ),
+                        field_list: None,
                     },
                 )
                 .into(),

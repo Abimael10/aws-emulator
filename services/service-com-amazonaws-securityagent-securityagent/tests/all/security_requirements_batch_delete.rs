@@ -19,7 +19,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_securityagent_securityagent::state::{
-    AWS_MANAGED_PACKS, BATCH_REQUIREMENT_ERROR_NOT_FOUND, BATCH_REQUIREMENT_ERROR_NOT_PROCESSED,
+    aws_managed_pack_delete_refusal_message, AWS_MANAGED_PACKS, BATCH_REQUIREMENT_ERROR_NOT_FOUND,
+    BATCH_REQUIREMENT_ERROR_NOT_PROCESSED,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -529,26 +530,66 @@ async fn whole_request_refusals() {
         "case {case:?}: the refusal did not name the pack it could not find: {refusal}"
     );
 
-    // The contents of a pack AWS ships are the service's, not a caller's to remove: the
-    // delete conflicts with that pack's state. The row is every entry of the seeded
-    // catalog, so the rule is not asserted on one.
+    // The contents of a pack AWS ships are the service's, not a caller's to remove: only
+    // a customer managed pack supports the delete, so the call is refused whatever it
+    // names. The row is every entry of the seeded catalog, so the rule is not asserted on
+    // one, and each row names a requirement the pack really ships beside one it does not,
+    // so the refusal is the pack's and not a missing name's.
     for managed in AWS_MANAGED_PACKS {
-        let case = managed.pack_id;
-        let refusal = expect_refusal(
+        let shipped = managed
+            .requirements
+            .first()
+            .map(|requirement| requirement.name)
+            .unwrap_or_else(|| panic!("the catalog pack {} ships no requirement", managed.pack_id));
+        for (names, case) in [
+            (vec![shipped], format!("{} shipped content", managed.pack_id)),
+            (
+                vec!["no-such-requirement"],
+                format!("{} a name it does not hold", managed.pack_id),
+            ),
+        ] {
+            let refusal = expect_refusal(
+                &router,
+                "BatchDeleteSecurityRequirements",
+                &json!({
+                    "packId": managed.pack_id,
+                    "securityRequirementNames": names
+                }),
+                400,
+                "ValidationException",
+                &case,
+            )
+            .await;
+            assert_eq!(
+                member(&refusal, "message"),
+                Some(aws_managed_pack_delete_refusal_message(managed.pack_id)),
+                "case {case:?}: the refusal must state that only customer managed packs \
+                 support the delete and name the pack: {refusal}"
+            );
+        }
+
+        // And nothing of the shipped pack was removed by the refused calls.
+        let read = expect_status(
             &router,
-            "BatchDeleteSecurityRequirements",
+            "BatchGetSecurityRequirements",
             &json!({
                 "packId": managed.pack_id,
-                "securityRequirementNames": ["anything"]
+                "securityRequirementNames": [shipped]
             }),
-            409,
-            "ConflictException",
-            case,
+            200,
+            managed.pack_id,
         )
         .await;
-        assert!(
-            member(&refusal, "message").is_some_and(|message| message.contains(managed.pack_id)),
-            "case {case:?}: the refusal did not name the pack: {refusal}"
+        let held = read
+            .get("securityRequirements")
+            .and_then(Value::as_array)
+            .map(|found| found.len())
+            .unwrap_or_default();
+        assert_eq!(
+            held, 1,
+            "case {:?}: the refused delete must leave the shipped requirement \
+             {shipped:?} in place, got {read}",
+            managed.pack_id
         );
     }
 }

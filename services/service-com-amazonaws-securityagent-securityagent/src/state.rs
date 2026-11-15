@@ -42,6 +42,13 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
+/// The content every AWS managed pack ships with, which the catalog table below points
+/// each of its entries at. Re-exported, so a caller that reads the catalog reads the
+/// requirements beside it through this one module.
+mod aws_managed_requirements;
+
+pub use aws_managed_requirements::*;
+
 use crate::ops::types::{
     AWSResources, AgentSpace, ApplicationSummary, Artifact, ArtifactMetadataItem, ArtifactSummary,
     BatchCreateSecurityRequirementResult, BatchGetSecurityRequirementResult, CodeReviewSettings,
@@ -342,6 +349,21 @@ pub fn aws_managed_pack_conflict_message(pack_id: &str) -> String {
     format!("Security requirements cannot be modified for AWS managed pack: {pack_id}")
 }
 
+/// The sentence a refusal to DELETE security requirements from a pack AWS manages
+/// states, for the pack the request named.
+///
+/// RECORDED, not modelled: `BatchDeleteSecurityRequirements` documents itself as deleting
+/// requirements from a customer managed pack but says nothing about how a request
+/// addressed to a managed one is refused. The recorded refusal states this sentence —
+/// fixed text naming what the operation supports, plus the `packId` taken from the
+/// request, which is the sentence's only variable part.
+pub fn aws_managed_pack_delete_refusal_message(pack_id: &str) -> String {
+    format!(
+        "Only customer managed packs support deleting security requirements. \
+         Pack ID: {pack_id}"
+    )
+}
+
 /// The `managementType` every pack this API creates carries.
 ///
 /// Source: `CreateSecurityRequirementPack`'s own documentation — "Creates a *customer
@@ -377,6 +399,27 @@ pub struct AwsManagedPack {
     /// rather than something a caller supplies.
     pub description: &'static str,
     pub status: &'static str,
+    /// The security requirements this pack SHIPS WITH: a pack AWS manages is one AWS
+    /// itself ships, content included, so its requirements are part of the catalog
+    /// entry rather than something a caller creates. They are seeded into the one
+    /// requirement store every requirement operation uses (see
+    /// [`ComAmazonawsSecurityagentSecurityagentState::default`]).
+    pub requirements: &'static [AwsManagedRequirement],
+    /// When this pack's requirement CONTENT was published, as seconds since the Unix
+    /// epoch: both stamps of every requirement the pack ships. A pack's content carries
+    /// its own revision instant, which is not necessarily the catalog's
+    /// ([`AWS_MANAGED_PACK_PUBLISHED_AT_EPOCH_SECONDS`]) — a framework pack's content
+    /// moves when the framework revision it tracks does.
+    pub content_published_at_epoch_seconds: u64,
+}
+
+impl AwsManagedPack {
+    /// [`Self::content_published_at_epoch_seconds`] as the `SystemTime` the seeded
+    /// requirement records carry, so every stamp of a pack's shipped content comes from
+    /// one place.
+    pub fn content_published_at(&self) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(self.content_published_at_epoch_seconds)
+    }
 }
 
 /// When the AWS managed security requirement pack catalog was published, as seconds
@@ -407,24 +450,35 @@ pub fn aws_managed_pack_published_at() -> SystemTime {
 /// base pack enabled by default and the three framework packs shipped disabled. Every
 /// entry is read back through the same projection as a created pack, so nothing here is a
 /// response the handlers synthesise.
+///
+/// Each entry also names the security requirements that pack SHIPS WITH
+/// ([`AwsManagedRequirement`]) and when that content was published: a pack AWS manages is
+/// one AWS itself ships, so its requirement contents are catalog content too, and they
+/// are seeded into the one requirement store every requirement operation reads.
 pub const AWS_MANAGED_PACKS: [AwsManagedPack; 4] = [
     AwsManagedPack {
         pack_id: "srp-am-base",
         name: "ASA Base Pack",
         description: "Default security requirements shipped with AWS Security Agent",
         status: PACK_STATUS_ENABLED,
+        requirements: &BASE_PACK_REQUIREMENTS,
+        content_published_at_epoch_seconds: BASE_CONTENT_PUBLISHED_AT_EPOCH_SECONDS,
     },
     AwsManagedPack {
         pack_id: "srp-am-nist-csf",
         name: "NIST CSF Pack",
         description: "Security requirements derived from the NIST Cybersecurity Framework",
         status: PACK_STATUS_DISABLED,
+        requirements: &NIST_CSF_PACK_REQUIREMENTS,
+        content_published_at_epoch_seconds: NIST_CSF_CONTENT_PUBLISHED_AT_EPOCH_SECONDS,
     },
     AwsManagedPack {
         pack_id: "srp-am-pci-dss",
         name: "PCI DSS Pack",
         description: "Security requirements derived from the PCI DSS v4.0.1 standard",
         status: PACK_STATUS_DISABLED,
+        requirements: &PCI_DSS_PACK_REQUIREMENTS,
+        content_published_at_epoch_seconds: PCI_DSS_CONTENT_PUBLISHED_AT_EPOCH_SECONDS,
     },
     AwsManagedPack {
         pack_id: "srp-am-well-architected",
@@ -432,6 +486,8 @@ pub const AWS_MANAGED_PACKS: [AwsManagedPack; 4] = [
         description:
             "Security requirements derived from the AWS Well-Architected Framework Security Pillar",
         status: PACK_STATUS_DISABLED,
+        requirements: &WELL_ARCHITECTED_PACK_REQUIREMENTS,
+        content_published_at_epoch_seconds: WELL_ARCHITECTED_CONTENT_PUBLISHED_AT_EPOCH_SECONDS,
     },
 ];
 
@@ -868,6 +924,25 @@ impl SecurityRequirement {
             remediation,
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    /// One entry of a shipped pack's content as a stored record: the catalog entry's own
+    /// name, description, domain, evaluation and remediation, the pack that ships it, and
+    /// that pack's content publication instant as both stamps — nothing has updated a
+    /// requirement the account was created with, and when AWS published the content is
+    /// not when this process started.
+    pub fn aws_managed(pack: &AwsManagedPack, entry: &AwsManagedRequirement) -> Self {
+        let published_at = pack.content_published_at();
+        Self {
+            pack_id: pack.pack_id.to_string(),
+            name: entry.name.to_string(),
+            description: entry.description.to_string(),
+            domain: entry.domain.to_string(),
+            evaluation: entry.evaluation.to_string(),
+            remediation: entry.remediation.map(str::to_string),
+            created_at: published_at,
+            updated_at: published_at,
         }
     }
 
@@ -1602,9 +1677,11 @@ pub struct MintedIdentifier {
 /// Per-service state for com-amazonaws-securityagent-securityagent. A handler reaches it through [`service_state`].
 ///
 /// `Default` is hand-written rather than derived because the account does not start
-/// empty: the pack store is SEEDED with the AWS managed catalog ([`AWS_MANAGED_PACKS`]),
-/// which a fresh account already holds. The engine builds this state with `Default` the
-/// first time a handler asks for it, so that is the one place the seed can live.
+/// empty: the pack store is SEEDED with the AWS managed catalog ([`AWS_MANAGED_PACKS`])
+/// and the requirement store with the requirements each of those packs ships
+/// ([`AwsManagedRequirement`]), which a fresh account already holds. The engine builds
+/// this state with `Default` the first time a handler asks for it, so that is the one
+/// place the seed can live.
 #[derive(Debug)]
 pub struct ComAmazonawsSecurityagentSecurityagentState {
     /// Every stored application, keyed by its `applicationId`. A `BTreeMap` so
@@ -1647,13 +1724,16 @@ pub struct ComAmazonawsSecurityagentSecurityagentState {
 }
 
 impl Default for ComAmazonawsSecurityagentSecurityagentState {
-    /// The state of a fresh account: every store empty EXCEPT the pack store, which
-    /// already holds the AWS managed catalog.
+    /// The state of a fresh account: every store empty EXCEPT the pack store and the
+    /// requirement store, which already hold the AWS managed catalog and the requirements
+    /// each of its packs ships with.
     ///
-    /// The seeded packs are stored records like any other, so
-    /// `ListSecurityRequirementPacks` and `GetSecurityRequirementPack` project them
-    /// through exactly the same path as a created pack, and
-    /// `UpdateSecurityRequirementPack` writes their status in place.
+    /// The seeded packs and requirements are stored records like any other, so
+    /// `ListSecurityRequirementPacks` and `GetSecurityRequirementPack` project the packs
+    /// through exactly the same path as a created pack,
+    /// `UpdateSecurityRequirementPack` writes their status in place, and
+    /// `ListSecurityRequirements` and `BatchGetSecurityRequirements` project their
+    /// requirements through exactly the same path as a created requirement.
     fn default() -> Self {
         Self {
             applications: BTreeMap::new(),
@@ -1669,7 +1749,15 @@ impl Default for ComAmazonawsSecurityagentSecurityagentState {
                     )
                 })
                 .collect(),
-            security_requirements: BTreeMap::new(),
+            security_requirements: AWS_MANAGED_PACKS
+                .iter()
+                .flat_map(|pack| {
+                    pack.requirements.iter().map(move |entry| {
+                        let record = SecurityRequirement::aws_managed(pack, entry);
+                        ((record.pack_id.clone(), record.name.clone()), record)
+                    })
+                })
+                .collect(),
             artifacts: BTreeMap::new(),
             identifiers: IdentifierMint::default(),
         }

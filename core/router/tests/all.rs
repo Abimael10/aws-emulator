@@ -1441,3 +1441,21 @@ mod zz_probe_whole_emulator;
 // What a suite covers belongs in that suite's own module header, beside the test it
 // explains; a note about this file belongs in `all/appended_notes.rs`. The suites
 // `all/every_suite_file_is_declared.rs` check the rules above rather than restating them.
+// Put a new suite at `tests/all/<name>.rs` and insert one `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair below, in the one place its name sorts to. Nothing else belongs in
+// this file: no prose between the pairs, no blank line, and nothing after the last pair —
+// EVERY comment here is an ordinary `//` one, this header included. An inner doc comment
+// is legal only before the first item, so one appended past the declarations compiles no
+// suite of this target at all; with none anywhere in the file, no landing can copy one
+// into that position. A second declaration of one name, and a suite file no declaration
+// names, each fail every suite of this target too.
+// crate, belongs in that suite's own module header, where it is read beside the test it
+// explains; a note about this file itself belongs in `all/appended_notes.rs`, declared
+// below like any other module.
+// The `#[path]` above each `mod` is what points it into `tests/all/`: this file is a
+// test-target crate root, where a bare `mod` would resolve to a sibling of it, which the
+// layout check refuses.
+// The lint allowed below is for the suite files this root compiles: a wrapped paragraph in
+// a module header is a note rather than a build failure. An inner attribute, like an inner
+// doc comment, is legal only before the first item, so it stands here rather than in the
+// list.
