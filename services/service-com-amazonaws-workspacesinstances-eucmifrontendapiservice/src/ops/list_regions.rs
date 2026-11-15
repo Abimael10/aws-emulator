@@ -165,24 +165,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The `NextToken` member is modelled and the operation carries `@paginated`,
-        // but the real service does not split this list: the recorded corpus unit
-        // `workspaces-instances.list-regions-returns-supported-regions` shows a call
-        // carrying `MaxResults: 1` answering the WHOLE supported-Region catalog, so
+        // but the real service does not split this list: the recorded corpus shows a
+        // call carrying `MaxResults: 1` answering the WHOLE supported-Region catalog, so
         // `MaxResults` does not truncate the answer and no `NextToken` is ever minted.
-        // Nothing a caller can hold is therefore a token this service issued, and a
-        // request that carries one is a bad request — a 400, never a guessed-at page.
-        // That failure is the same one the service's other lists refuse, so it is
-        // refused through the crate's single builder
-        // ([`crate::state::invalid_next_token`]) rather than worded again here: the
-        // sentence it states names the member and the constraint and nothing
-        // operation-specific on purpose, so one bad token cannot come back worded one
-        // way from this list and another way from a sibling.
-        if input.next_token.is_some() {
-            return Err(ListRegionsErrorModeled::ValidationException(
-                crate::state::invalid_next_token(),
-            )
-            .into());
-        }
+        // A list that serves its whole collection in one response has no page for a
+        // token to name, so the token is not read at all: a caller or SDK paginator that
+        // carries a stale or foreign token over is answered the first — and only — page,
+        // which is the answer the recorded corpus shows for a token this service never
+        // issued. That is why this operation does NOT share the sibling lists'
+        // bad-token refusal ([`crate::state::invalid_next_token`]): those lists DO mint
+        // tokens, so a token they cannot resume at is a bad request, while here there is
+        // nothing a token could have meant.
+        let _ = input.next_token;
 
         // `MaxResults` is modelled `range 1..25` and the boundary validator has already
         // refused anything outside it; past that it bounds nothing here, per the

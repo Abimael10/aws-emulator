@@ -21,6 +21,8 @@ mod catalog_fidelity;
 mod client_token_single_use;
 #[path = "all/create_tag_specifications.rs"]
 mod create_tag_specifications;
+#[path = "all/ebs_volume_propagation.rs"]
+mod ebs_volume_propagation;
 #[path = "all/ec2_managed_instance_propagation.rs"]
 mod ec2_managed_instance_propagation;
 #[path = "all/idempotency_token_reuse.rs"]

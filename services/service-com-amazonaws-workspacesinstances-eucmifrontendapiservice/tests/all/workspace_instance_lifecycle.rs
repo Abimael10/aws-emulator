@@ -134,6 +134,31 @@ pub(crate) fn seed_account_network(engine: &Arc<engine::InMemoryEngine>) {
     }
 }
 
+/// A snapshot the account's own Amazon EC2 holds, of `volume_size` GiB, returning the
+/// `SnapshotId` that service minted for it.
+///
+/// `CreateVolume` restores a volume from the snapshot its `SnapshotId` names, so a fixture
+/// that names a snapshot names one the account really holds. Written through EC2's own
+/// snapshot writer (`insert_snapshot`, which mints the id and the timestamps), for the same
+/// reason [`seed_account_network`] writes through that store: the snapshot belongs to the
+/// service that owns snapshots.
+///
+/// `pub(crate)` because the suites whose volume fixtures restore a snapshot
+/// (`volume_lifecycle`, `volume_configuration_validation`, `volume_modification`) all need
+/// one.
+pub(crate) fn seed_snapshot(engine: &Arc<engine::InMemoryEngine>, volume_size: i32) -> String {
+    let store = ec2::state::service_state(&**engine)
+        .expect("the in-memory engine carries the account's EC2 store");
+    let mut store = store.lock();
+    store.insert_snapshot(
+        ec2::state::SnapshotView {
+            volume_size: Some(volume_size),
+            ..Default::default()
+        },
+        std::time::SystemTime::now(),
+    )
+}
+
 /// A router carrying this service and the service that OWNS the EC2 instance a WorkSpace
 /// Instance is, over one shared engine — the same `EmulatedService::new(engine)` seam
 /// `core/router` mounts both through. The engine is returned alongside so a test can read

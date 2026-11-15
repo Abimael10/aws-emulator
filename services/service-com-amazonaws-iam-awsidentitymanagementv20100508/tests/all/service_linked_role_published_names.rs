@@ -36,8 +36,8 @@ use crate::user_lifecycle::{account_id, call, element, error_code, router};
 /// one-word hyphenated label (Compute Optimizer), a label carrying the service's API
 /// version (`resource-explorer-2`), a hyphenated label whose name is prefixed with
 /// `Amazon` and names the feature it serves (EKS on Fargate), a label whose words
-/// are re-capitalised (CodeStar Notifications), and an acronym the name spells
-/// differently (AWS SSM for SAP).
+/// are re-capitalised (CodeStar Notifications and WorkSpaces Instances), and an acronym
+/// the name spells differently (AWS SSM for SAP).
 const ASSIGNED_NAMES: &[(&str, &str)] = &[
     (
         "migrationhub-strategy.amazonaws.com",
@@ -53,6 +53,10 @@ const ASSIGNED_NAMES: &[(&str, &str)] = &[
     (
         "codestar-notifications.amazonaws.com",
         "AWSServiceRoleForCodeStarNotifications",
+    ),
+    (
+        "workspaces-instances.amazonaws.com",
+        "AWSServiceRoleForWorkspacesInstances",
     ),
     ("ssm-sap.amazonaws.com", "AWSServiceRoleForAWSSSMForSAP"),
 ];

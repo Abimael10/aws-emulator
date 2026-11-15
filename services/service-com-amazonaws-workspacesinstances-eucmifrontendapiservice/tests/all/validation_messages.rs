@@ -397,8 +397,8 @@ async fn a_refused_value_is_never_echoed_into_the_response() {
 async fn a_refused_collection_element_is_reported_against_the_collection_member() {
     let router = router();
     // The nested form, asserted in halves: the wrapper and the path exactly, and
-    // the enum value SET for the values it must enumerate. The ORDER the set is
-    // listed in is not pinned — nothing in the model or the docs fixes it.
+    // the enum value set for the values it must enumerate — as a SEQUENCE, because the
+    // order the service lists the set in is part of the sentence a client reads.
     let opening = "1 validation error detected: Value at 'provisionStates' failed to satisfy \
                    constraint: Member must satisfy constraint: [Member must satisfy enum value \
                    set: [";
@@ -408,6 +408,16 @@ async fn a_refused_collection_element_is_reported_against_the_collection_member(
         .iter()
         .copied()
         .collect();
+    // The order AWS lists that set in, which is NOT the model's declaration order.
+    // SOURCE: the refusal AWS answers for a `ProvisionStates` value outside the set.
+    let published: Vec<&str> = vec![
+        "DEALLOCATED",
+        "ALLOCATED",
+        "ERROR_ALLOCATING",
+        "ERROR_DEALLOCATING",
+        "ALLOCATING",
+        "DEALLOCATING",
+    ];
 
     for (name, states) in [
         ("one bad element", vec!["NOT_A_REAL_STATE"]),
@@ -432,10 +442,16 @@ async fn a_refused_collection_element_is_reported_against_the_collection_member(
             .unwrap_or_else(|| {
                 panic!("case {name:?}: expected a message opening {opening:?}, got {message:?}")
             });
-        let listed: BTreeSet<&str> = listed.split(", ").collect();
+        let listed: Vec<&str> = listed.split(", ").collect();
         assert_eq!(
-            listed, modelled,
-            "case {name:?}: expected the modelled value set {modelled:?}, got {listed:?}"
+            listed, published,
+            "case {name:?}: expected the value set in the order the service publishes it, \
+             got {listed:?}"
+        );
+        let as_set: BTreeSet<&str> = listed.iter().copied().collect();
+        assert_eq!(
+            as_set, modelled,
+            "case {name:?}: expected the modelled value set {modelled:?}, got {as_set:?}"
         );
         // No element index, and no step into the element, anywhere in the path.
         for spelling in ["provisionStates.", ".member", "1.member"] {

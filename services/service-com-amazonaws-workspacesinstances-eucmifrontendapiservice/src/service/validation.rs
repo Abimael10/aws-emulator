@@ -57,6 +57,52 @@ pub(crate) const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// 1-based position followed by this segment (`provisionStates.1.member`).
 const COLLECTION_STEP: &str = ".member";
 
+/// The order the service lists an enum's value set in when it refuses a value outside
+/// it, for each enum whose published order is known.
+///
+/// The bracketed set in an enum refusal is the order the SERVICE publishes, which is not
+/// the order the model declares the members in and is not derivable from them: AWS lists
+/// `ProvisionStateEnum` as the row below, while the model declares it `ALLOCATING,
+/// ALLOCATED, DEALLOCATING, DEALLOCATED, ERROR_ALLOCATING, ERROR_DEALLOCATING`
+/// (`smithy_query(query="shape",shape="ProvisionStateEnum")`). The message is part of the
+/// error contract — a client that logs, diffs or asserts on it reads this sentence — so the
+/// published order is recorded here.
+///
+/// SOURCE: the refusal AWS answers for a value outside each set. A row is matched by its
+/// VALUES, not by the member or the operation the violation came from
+/// ([`published_value_order`]), so every member of an enum listed here is refused with the
+/// one order the service publishes for it, and an enum with no row keeps the order the
+/// model declares.
+const PUBLISHED_ENUM_VALUE_ORDERS: &[&[&str]] = &[&[
+    // `ProvisionStateEnum`, the enum of `ListWorkspaceInstances$ProvisionStates` and
+    // `WorkspaceInstance$ProvisionState`.
+    "DEALLOCATED",
+    "ALLOCATED",
+    "ERROR_ALLOCATING",
+    "ERROR_DEALLOCATING",
+    "ALLOCATING",
+    "DEALLOCATING",
+]];
+
+/// `allowed` in the order the service publishes that value set
+/// ([`PUBLISHED_ENUM_VALUE_ORDERS`]), or in the order it came for a set no row carries.
+///
+/// A row applies when it holds exactly the same values as the set the walk reported — the
+/// same enum, whichever member of whichever operation was refused — so no row can reorder a
+/// different enum's values or drop one the model admits.
+fn published_value_order(allowed: &[String]) -> Vec<&str> {
+    let published = PUBLISHED_ENUM_VALUE_ORDERS.iter().copied().find(|order| {
+        order.len() == allowed.len()
+            && order
+                .iter()
+                .all(|value| allowed.iter().any(|admitted| admitted == value))
+    });
+    match published {
+        Some(order) => order.to_vec(),
+        None => allowed.iter().map(String::as_str).collect(),
+    }
+}
+
 /// The requirement a violation states, worded as a service words it. `None` for
 /// a class this service has no wording for.
 fn requirement(kind: &ViolationKind) -> Option<String> {
@@ -78,9 +124,10 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
             "Member must satisfy regular expression pattern: {}",
             unanchored(pattern)
         ),
-        ViolationKind::EnumValue(allowed) => {
-            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
-        }
+        ViolationKind::EnumValue(allowed) => format!(
+            "Member must satisfy enum value set: [{}]",
+            published_value_order(allowed).join(", ")
+        ),
         ViolationKind::UniqueItems => "Member must have unique values".to_string(),
         _ => return None,
     };

@@ -1983,3 +1983,19 @@ mod ses_configuration_set_cursor_shared_across_v1_and_v2;
 // `E0753` and compiles no suite of this target. With no `//!` in the file at all, no landing
 // name is `E0428` and fails every suite in this target too.
 // service crate's own, is stated in that suite's own module header, beside the test it
+// Put a new suite at `tests/all/<name>.rs` and declare it below with one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted so the list stays sorted by
+// name. Why a suite belongs to this cross-service target rather than to one service
+// crate's own is stated in that suite's own module doc, which is where it stays readable:
+// a note here is prose two landing branches duplicate, re-word and mistype.
+// Three rules this file lives or dies by, each pinned by a suite of its own
+// (`all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_carries_no_inner_doc_comment.rs` and
+// `all/all_rs_is_a_canonical_declaration_list.rs`): one declaration per suite (a second
+// is `E0428`), every comment an ORDINARY `//` one (an inner `//!` past the first item is
+// `E0753`), and nothing in the list but declaration pairs. Each failure compiles no suite
+// of this target at all, so the list holds pairs only — and with no `//!` anywhere in this
+// file, no merge of two landings can leave a doc comment past the first item.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
+// (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is what points each
+// declaration into `tests/all/`.

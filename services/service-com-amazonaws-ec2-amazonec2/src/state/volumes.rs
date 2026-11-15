@@ -604,6 +604,49 @@ pub fn volume_payload_bytes(
 /// refusal names the form it expected.
 pub const VOLUME_ID_PREFIX: &str = "vol";
 
+/// One EBS volume as a writer OTHER THAN `CreateVolume` asks for it: the members a creator
+/// chooses.
+///
+/// Everything the service derives — the `VolumeId`, the ARN, the owning account, the
+/// creation instant, the zone's id, the attachments and the `State` the clock moves — is
+/// minted by [`ComAmazonawsEc2Amazonec2State::insert_volume`], the way [`SubnetSpec`] is
+/// completed by `insert_subnet`: a writer names what a create NAMES and nothing a create
+/// would have been answered with.
+#[derive(Debug, Clone, Default)]
+pub struct VolumeSpec {
+    /// The zone name (`us-east-1a`) the volume is created in. The Region it belongs to is
+    /// this zone's ([`region_of_zone_name`]), so no writer can place a volume and its zone
+    /// in two Regions.
+    pub availability_zone: String,
+    /// The volume's size in GiB, or `None` for one that takes the size of the snapshot it
+    /// is restored from.
+    pub size: Option<i32>,
+    /// One value of the `VolumeType` enum, or `None` for the service's own default
+    /// ([`DEFAULT_VOLUME_TYPE`]).
+    pub volume_type: Option<String>,
+    /// The IOPS the volume provisions, or `None` to take the type's documented default.
+    pub iops: Option<i32>,
+    /// The throughput the volume provisions, or `None` to take the type's documented
+    /// default.
+    pub throughput: Option<i32>,
+    /// Whether the volume is encrypted. The Region's encryption-by-default setting can
+    /// only RAISE this ([`ComAmazonawsEc2Amazonec2State::ebs_encryption_by_default`]).
+    pub encrypted: Option<bool>,
+    /// The KMS key the volume is encrypted under, for one that names a key.
+    pub kms_key_id: Option<String>,
+    /// The snapshot the volume is restored from, for one that is.
+    pub snapshot_id: Option<String>,
+    /// Whether the volume is Multi-Attach enabled. `None` is the `false` a writer that does
+    /// not ask for it gets.
+    pub multi_attach_enabled: Option<bool>,
+    /// The `ClientToken` the call that created the volume carried, for a create that is
+    /// idempotent: it is kept against the minted id, so a replay of that call answers with
+    /// this volume instead of creating a second one.
+    pub client_token: Option<String>,
+    /// The tags the volume carries from the moment it is created.
+    pub tags: Vec<Tag>,
+}
+
 /// The name EC2 gives `DescribeVolumesRequest$VolumeIds` when it refuses one of its entries
 /// at the PARAMETER layer: "Value (…) for parameter volumes is invalid. Expected:
 /// 'vol-...'." — the member's wire name is `VolumeId.N`, and `volumes` is what the service
@@ -895,6 +938,138 @@ pub fn invalid_attachment_not_found<E>(
 }
 
 impl ComAmazonawsEc2Amazonec2State {
+    /// Store the volume `spec` describes and answer the `VolumeId` EC2 minted for it, or
+    /// `None` when this store holds as many volumes ([`MAX_STORED_VOLUMES`]) or as many
+    /// caller-supplied bytes ([`MAX_STORED_BYTES`]) as it stores.
+    ///
+    /// The ONE writer of a stored EBS volume: `ec2:CreateVolume` reaches it with what the
+    /// REQUEST decided, and so does a service of this account that provisions an EBS volume
+    /// for a resource of its own — so the record both store the volume as is the same one,
+    /// and a member or default added here cannot be missing from the other. The id comes out
+    /// of this store's mint, the ARN and the owning account are the ones every resource of
+    /// this store reports, the Region is the zone's, the type's documented IOPS and
+    /// throughput defaults are applied, the Region's EBS encryption-by-default setting raises
+    /// the encryption state, the size of a volume that names none is the restored snapshot's,
+    /// and the volume is answered `creating` and reaches `available` the clock-owed
+    /// [`TRANSITION_DELAY`] later.
+    ///
+    /// The caller-chosen bytes the record retains are charged against this store's budget
+    /// here, so no path can store them uncharged and [`Self::remove_volume`] gives back
+    /// exactly what was taken; a `ClientToken` the spec carries is kept against the minted id
+    /// by the same write, so no path can store a volume whose token is not retired with it.
+    pub fn insert_volume(&mut self, spec: VolumeSpec) -> Option<String> {
+        let payload_bytes = volume_payload_bytes(
+            &spec.tags,
+            spec.kms_key_id.as_deref(),
+            spec.client_token.as_deref(),
+        );
+        if self.volumes.len() >= MAX_STORED_VOLUMES || self.would_exceed_stored_bytes(payload_bytes)
+        {
+            return None;
+        }
+        let region = region_of_zone_name(&spec.availability_zone).to_string();
+        // "Default: gp2" (`CreateVolumeRequest$VolumeType`).
+        let volume_type = spec
+            .volume_type
+            .clone()
+            .unwrap_or_else(|| DEFAULT_VOLUME_TYPE.to_string());
+        let takes_gp3_defaults = volume_type == THROUGHPUT_VOLUME_TYPE;
+        // "If you create a volume from a snapshot and you don't specify a volume size, the
+        // default is the snapshot size" (`CreateVolumeRequest$Size`) — read off the snapshot
+        // this store holds, so the volume reports the size of the data it really restores.
+        let size = spec.size.or_else(|| {
+            spec.snapshot_id
+                .as_deref()
+                .and_then(|snapshot_id| self.snapshots.get(snapshot_id))
+                .and_then(|snapshot| snapshot.view.volume_size)
+        });
+        let volume_id = self.next_id(VOLUME_ID_PREFIX);
+        let now = Instant::now();
+        let view = VolumeView {
+            volume_id: Some(volume_id.clone()),
+            volume_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &region,
+                &format!("volume/{volume_id}"),
+            )),
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            availability_zone: Some(spec.availability_zone.clone()),
+            availability_zone_id: zone_id_for_zone_name(&spec.availability_zone),
+            create_time: Some(system_time_to_date_time(SystemTime::now())),
+            size,
+            volume_type: Some(volume_type),
+            // "gp3: 3,000 (default)" (`CreateVolumeRequest$Iops`) and the bottom of the gp3
+            // throughput range, for the one type AWS documents a default for; every other
+            // type provisions neither.
+            iops: spec.iops.or(if takes_gp3_defaults {
+                Some(DEFAULT_GP3_IOPS)
+            } else {
+                None
+            }),
+            throughput: spec.throughput.or(if takes_gp3_defaults {
+                Some(DEFAULT_GP3_THROUGHPUT)
+            } else {
+                None
+            }),
+            // "This parameter is supported with io1 and io2 volumes only"
+            // (`CreateVolumeRequest$MultiAttachEnabled`): a writer that does not ask for
+            // Multi-Attach gets a volume without it.
+            multi_attach_enabled: Some(spec.multi_attach_enabled.unwrap_or(false)),
+            // "After you enable encryption by default, the EBS volumes that you create are
+            // always encrypted" (`EnableEbsEncryptionByDefault`): the Region's setting
+            // raises the state the writer asked for and never lowers it, the same reading
+            // `CreateVolume` gives its own request.
+            encrypted: Some(
+                spec.encrypted.unwrap_or(false) || self.ebs_encryption_by_default(&region),
+            ),
+            kms_key_id: spec.kms_key_id.clone(),
+            tags: Some(spec.tags.clone()),
+            // "The snapshot from which the volume was created, if applicable"
+            // (`Volume$SnapshotId`): the member carries no snapshot rather than being
+            // absent for a volume created empty, as a caller's own create reports it.
+            snapshot_id: Some(spec.snapshot_id.clone().unwrap_or_default()),
+            source_volume_id: None,
+            // "Indicates whether the volume was created using fast snapshot restore"
+            // (`Volume$FastRestored`): nothing enabled one for this volume's snapshot.
+            fast_restored: Some(false),
+            // "Reserved for future use" (`Volume$SseType`).
+            sse_type: None,
+            // No service provider manages a volume of the account's own.
+            operator: Some(unmanaged_operator()),
+            // An Outpost volume is one created on an Outpost, which this emulator has none
+            // of.
+            outpost_arn: None,
+            // "If no volume initialization rate was specified, the value is null"
+            // (`Volume$VolumeInitializationRate`).
+            volume_initialization_rate: None,
+            // A fresh volume is attached to nothing, and its `State` is derived from
+            // `available_at` on every read.
+            attachments: Some(Vec::new()),
+            state: None,
+        };
+        self.add_stored_bytes(payload_bytes);
+        if let Some(token) = spec.client_token {
+            self.volume_client_tokens.insert(token, volume_id.clone());
+        }
+        self.volumes.insert(
+            volume_id.clone(),
+            // A volume AWS hands back is `creating` and reaches `available` without anyone
+            // asking.
+            VolumeRecord::created(view, now + TRANSITION_DELAY),
+        );
+        Some(volume_id)
+    }
+
+    /// Whether the account holds an EBS snapshot under `snapshot_id`.
+    ///
+    /// The ONE reading of "does this snapshot exist" for a validator that only has to
+    /// RESOLVE the id — this service owns the account's snapshots, so a caller elsewhere
+    /// asks this rather than keeping a snapshot registry of its own. A snapshot in the
+    /// Recycle Bin has been deleted, so it is not one the account holds.
+    pub fn holds_snapshot(&self, snapshot_id: &str) -> bool {
+        self.snapshots.contains_key(snapshot_id)
+    }
+
     /// Whether the volume `volume_id` has already been withdrawn at `now`: the account holds
     /// no record for it, or the record it holds is one whose encryption key refused its data
     /// key and whose withdrawal the clock has made due

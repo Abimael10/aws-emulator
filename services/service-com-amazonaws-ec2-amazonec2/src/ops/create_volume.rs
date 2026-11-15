@@ -235,15 +235,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            availability_zones_in_region, request_region, require_service_state,
-            system_time_to_date_time, tag_list, unmanaged_operator, unresolvable_snapshot_id,
-            validate_tag_size,
+            availability_zones_in_region, request_region, require_service_state, tag_list,
+            unresolvable_snapshot_id, validate_tag_size,
             volume_iops_range, volume_limit_exceeded, volume_payload_bytes, volume_size_range,
-            VolumeRecord, VolumeView, DEFAULT_GP3_IOPS,
+            DEFAULT_GP3_IOPS,
             DEFAULT_GP3_THROUGHPUT, DEFAULT_VOLUME_TYPE, GP3_THROUGHPUT_RANGE,
             MAX_CLIENT_TOKEN_CHARS, MAX_KMS_KEY_ID_CHARS, MAX_STORED_BYTES, MAX_STORED_VOLUMES,
             MAX_TAGS_PER_RESOURCE, PROVISIONED_IOPS_VOLUME_TYPES, THROUGHPUT_VOLUME_TYPE,
-            TRANSITION_DELAY, VOLUME_TAGGABLE_RESOURCE,
+            VOLUME_TAGGABLE_RESOURCE,
         };
 
         let region = request_region(ctx.parts());
@@ -569,67 +568,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
         }
 
-        let volume_id = store.next_id("vol");
-        let mut record = VolumeRecord::created(
-            VolumeView {
-                volume_id: Some(volume_id.clone()),
-                volume_arn: Some(::engine::emulator_arn(
-                    "ec2",
-                    &region,
-                    &format!("volume/{volume_id}"),
-                )),
-                owner_id: Some(::engine::emulator_account_id().to_string()),
-                availability_zone: Some(zone.zone_name.clone()),
-                availability_zone_id: Some(zone.zone_id.clone()),
-                create_time: Some(system_time_to_date_time(::std::time::SystemTime::now())),
+        // The volume this call stores is built by the store's ONE volume writer, so a
+        // caller's create and a volume another service of this account provisions for a
+        // resource of its own are the same record: the id, the ARN, the owning account, the
+        // zone's id, the creation instant, the `creating` -> `available` span and the
+        // encryption-by-default raise are all its, and what the REQUEST decided travels in
+        // the spec. The bytes and the `ClientToken` are charged and kept by that same write.
+        let volume_id = store
+            .insert_volume(crate::state::VolumeSpec {
+                availability_zone: zone.zone_name.clone(),
                 size: Some(size),
                 volume_type: Some(volume_type),
                 iops,
                 throughput,
-                multi_attach_enabled: Some(multi_attach_enabled),
                 encrypted: Some(encrypted),
                 kms_key_id: input.kms_key_id.clone(),
-                tags: Some(tag_list(&tags)),
-                // A fresh volume is attached to nothing; `AttachVolume` is the operation
-                // that would add an attachment, and it is still a stub.
-                attachments: Some(Vec::new()),
-                // The volume was created empty, not from a snapshot (a request naming
-                // one is refused above), and not as a copy of another volume. "The
-                // snapshot from which the volume was created, if applicable"
-                // (`Volume$SnapshotId`): not applicable here, which a describe of the
-                // volume reports as the member carrying no snapshot rather than as the
-                // member being absent.
-                snapshot_id: Some(String::new()),
-                source_volume_id: None,
-                // "Indicates whether the volume was created using fast snapshot
-                // restore" (`Volume$FastRestored`): there is no snapshot to restore
-                // from, so it was not.
-                fast_restored: Some(false),
-                // "Reserved for future use" (`Volume$SseType`), and not returned by
-                // CreateVolume at all.
-                sse_type: None,
-                // No service provider manages a volume the caller created for itself,
-                // which is the answer every resource of this store gives for its
-                // `Operator` ([`state::unmanaged_operator`]).
-                operator: Some(unmanaged_operator()),
-                // An Outpost volume is one created on an Outpost, which this emulator
-                // has none of.
-                outpost_arn: None,
-                // "If no volume initialization rate was specified, the value is null"
-                // (`Volume$VolumeInitializationRate`). The member is only supported for
-                // a volume created from a snapshot, which this is not.
-                volume_initialization_rate: None,
-                // Derived from `available_at` on every read.
-                state: None,
-            },
-            // A volume AWS hands back is `creating` and reaches `available` without
-            // anyone asking: the same clock-owed span an instance's `pending` ->
-            // `running` move takes in this crate.
-            now + TRANSITION_DELAY,
-        );
-        // A volume whose encryption key refused its data key never gets there: the clock owes
-        // it the withdrawal instead, at the same instant, so the caller still sees the
-        // `creating` volume it was answered with and then sees it gone.
+                // "You must specify either a snapshot ID or a volume size": a request
+                // naming a snapshot is refused above, so this volume restores none.
+                snapshot_id: None,
+                multi_attach_enabled: Some(multi_attach_enabled),
+                client_token: input.client_token.clone(),
+                tags: tag_list(&tags),
+            })
+            .ok_or_else(|| {
+                // Unreachable: both ceilings were asked above, and a replay returned.
+                Scaffolded::internal_error(
+                    "the volume this store had room for a moment ago could not be stored",
+                )
+            })?;
+        // A volume whose encryption key refused its data key never reaches `available`: the
+        // clock owes it the withdrawal instead, at the same instant, so the caller still sees
+        // the `creating` volume it was answered with and then sees it gone.
         if let Some(refusal) = key_refusal {
             ::tracing::debug!(
                 volume_id = %volume_id,
@@ -637,17 +606,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "this volume's encryption key would not produce its data key, so the volume \
                  is withdrawn rather than created"
             );
-            record.withdrawn_at = Some(now + TRANSITION_DELAY);
+            if let Some(record) = store.volumes.get_mut(&volume_id) {
+                record.withdrawn_at = Some(record.available_at);
+            }
         }
-        if let Some(token) = input.client_token.clone() {
-            store.volume_client_tokens.insert(token, volume_id.clone());
-        }
-        // The bytes this record and its token retain are charged against the store's
-        // budget at the insert, so no path can store them uncharged; a removal path must
-        // give them back with `release_stored_bytes`, the way `remove_launch_template`
-        // does.
-        store.add_stored_bytes(payload_bytes);
-        store.volumes.insert(volume_id.clone(), record);
 
         // Read the response back OUT of the store, so the caller sees what a later
         // DescribeVolumes will see rather than the request object.

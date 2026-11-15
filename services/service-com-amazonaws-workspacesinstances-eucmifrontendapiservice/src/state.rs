@@ -30,6 +30,11 @@ use crate::ops::types::{
 mod managed_ec2_instance;
 pub use managed_ec2_instance::*;
 
+/// The seam this service creates and deletes the Amazon EBS volume a volume of this
+/// service IS through.
+mod managed_ebs_volume;
+pub use managed_ebs_volume::*;
+
 /// The `ResourceType` this service reports for a WorkSpace Instance in its
 /// resource-scoped errors.
 ///
@@ -267,6 +272,12 @@ pub const VALIDATION_REASON_FIELD_VALIDATION_FAILED: &str = "FIELD_VALIDATION_FA
 /// serve — a create addressed to a Region the service is not available in. A value of
 /// the same modelled enum as [`VALIDATION_REASON_FIELD_VALIDATION_FAILED`].
 pub const VALIDATION_REASON_UNSUPPORTED_OPERATION: &str = "UNSUPPORTED_OPERATION";
+
+/// The `ValidationExceptionReason` this service reports when the call was refused by a
+/// service it depends on rather than by a rule of its own — the backing Amazon EBS
+/// service refusing the volume a `CreateVolume` asked for. A value of the same modelled
+/// enum as [`VALIDATION_REASON_FIELD_VALIDATION_FAILED`].
+pub const VALIDATION_REASON_DEPENDENCY_FAILURE: &str = "DEPENDENCY_FAILURE";
 
 // ---------------------------------------------------------------------------
 // The instance-type catalog
@@ -2292,17 +2303,6 @@ impl ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
             && self.held_instance_count(region) < MAX_HELD_INSTANCES
     }
 
-    /// Mint the next `vol-…` volume id.
-    ///
-    /// The `vol-` prefix is 4 characters and the model requires 1..63 further
-    /// `[0-9a-zA-Z]`, so a 17-hex-digit counter is well inside the pattern. The
-    /// counter is the one [`Self::mint_instance_id`] draws from, so no two resources of this
-    /// service ever share a number.
-    pub fn mint_volume_id(&mut self) -> String {
-        self.id_counter += 1;
-        format!("vol-{:017x}", self.id_counter)
-    }
-
     /// Whether another volume fits inside [`MAX_VOLUMES`] for Region `region`.
     pub fn has_volume_capacity(&self, region: &str) -> bool {
         self.volume_count(region) < MAX_VOLUMES
@@ -2462,12 +2462,15 @@ pub fn decode_next_token(token: &str) -> Option<String> {
 }
 
 /// The modelled `ValidationException` (HTTP 400) for a `NextToken` this service did
-/// not issue: one that does not decode, that decodes to a resume point this
-/// service's pagination cannot name, or one sent to a list that mints no token at all.
+/// not issue: one that does not decode, or that decodes to a resume point this
+/// service's pagination cannot name.
 ///
-/// Shared by every paginated operation here, so one bad token is refused the same way
-/// whichever list produced it. `Reason` is the modelled enum value for a single bad
-/// member, and `FieldList` names that member.
+/// Shared by every paginated operation that MINTS a token, so one bad token is refused
+/// the same way whichever list produced it. `Reason` is the modelled enum value for a
+/// single bad member, and `FieldList` names that member.
+///
+/// A list that serves its whole collection in one response mints no token and has no page
+/// a token could name, so it does not refuse one at all — see `crate::ops::list_regions`.
 pub fn invalid_next_token() -> ValidationException {
     field_validation_failed("NextToken", "NextToken is not a token this service issued")
 }
@@ -2924,6 +2927,25 @@ pub fn volume_quota_exceeded(held: usize) -> ServiceQuotaExceededException {
         message: format!(
             "the account already holds {held} volumes in this Region, the maximum for this quota"
         ),
+        resource_id: ::engine::emulator_account_id().to_string(),
+        resource_type: VOLUME_RESOURCE_TYPE.to_string(),
+        service_code: SERVICE_CODE.to_string(),
+        quota_code: VOLUME_QUOTA_CODE.to_string(),
+    }
+}
+
+/// The modelled `ServiceQuotaExceededException` (HTTP 402) for a create the BACKING
+/// Amazon EBS volume service cannot hold another volume for.
+///
+/// A distinct sentence from [`volume_quota_exceeded`]: that one reports this service's own
+/// per-Region count, which on this path is below its maximum — what is full is the backing
+/// service's store, which holds the account's volumes across every Region. No volume was
+/// created, so `ResourceId` names the subject the quota applies to.
+pub fn backing_volume_capacity_exceeded() -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: "the backing Amazon EBS volume service cannot hold another volume for this \
+                  account"
+            .to_string(),
         resource_id: ::engine::emulator_account_id().to_string(),
         resource_type: VOLUME_RESOURCE_TYPE.to_string(),
         service_code: SERVICE_CODE.to_string(),

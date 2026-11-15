@@ -196,6 +196,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already resolved the id in this Region, so the removal cannot miss.
         let _ = state.remove_volume(&region, &input.volume_id);
 
+        // "Deletes a specified volume": the volume this service reported IS an Amazon EBS
+        // volume of the account, so the delete reaches the service that OWNS it and the
+        // volume disappears from there too — no EBS read resolves it afterwards. Done after
+        // this store's own removal, so a delete this service refuses (an id it does not
+        // hold, a volume still attached) leaves the EBS volume exactly as it was.
+        let _ = crate::state::delete_ebs_volume(&*self.engine, &input.volume_id);
+
         Ok(DeleteVolumeOutput {})
     }
 }

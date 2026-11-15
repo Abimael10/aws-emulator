@@ -34,7 +34,7 @@
 //! (a later `ModifyVolume` is refused, or accepted, only for the configuration the
 //! volume has by then).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_workspacesinstances_eucmifrontendapiservice as wsinst;
@@ -42,7 +42,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::volume_lifecycle::{create_volume, simple_create};
 use crate::workspace_instance_lifecycle::{
-    call, call_in_region, error_code, harness, ok, DEFAULT_TEST_REGION,
+    call, call_in_region, error_code, harness, ok, seed_snapshot, DEFAULT_TEST_REGION,
 };
 
 /// The `ValidationExceptionReason` a bad member is reported with, as the modelled enum
@@ -53,6 +53,15 @@ const FIELD_VALIDATION_FAILED: &str = "FIELD_VALIDATION_FAILED";
 /// `tokio::time::sleep` never wakes early, so this only has to cover timer
 /// resolution.
 const SLACK: Duration = Duration::from_millis(250);
+
+/// How long the service is given to materialise a modification the clock has made due —
+/// generous room past [`wsinst::state::VOLUME_MODIFICATION_SPAN`], so a loaded host cannot
+/// fail a case. Nothing waits this long: it is only the point past which the condition is
+/// taken to be unreachable.
+const MATERIALISATION_BUDGET: Duration = Duration::from_secs(30);
+
+/// How long this suite waits between looks while polling for a condition.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The volume `id` as Region `region`'s store holds it, or `None` for a volume that
 /// Region does not hold — the engine the router was built from, read the one legal way.
@@ -129,7 +138,11 @@ struct TargetRow {
 /// Every type of the modelled `VolumeTypeEnum` appears as a source or a target; the
 /// per-type ranges the rows sit inside are the service's own published table
 /// (`wsinst::state::VOLUME_TYPE_SPECS`).
-fn target_rows() -> Vec<TargetRow> {
+///
+/// `snapshot_id` is a snapshot the account's own Amazon EC2 holds, for the row whose
+/// volume has no size of its own: `CreateVolume` restores the volume from the snapshot its
+/// `SnapshotId` names, so that row names a snapshot that exists.
+fn target_rows(snapshot_id: &str) -> Vec<TargetRow> {
     vec![
         TargetRow {
             case: "SizeInGB alone, with the type and its members retained",
@@ -230,7 +243,7 @@ fn target_rows() -> Vec<TargetRow> {
             case: "a volume with no size of its own, restored from a snapshot",
             create: json!({
                 "AvailabilityZone": "us-east-1b",
-                "SnapshotId": "snap-0123456789abcdef",
+                "SnapshotId": snapshot_id,
             }),
             modify: json!({ "VolumeType": "gp3" }),
             target_size: None,
@@ -284,7 +297,7 @@ fn target_rows() -> Vec<TargetRow> {
 #[tokio::test]
 async fn the_target_is_resolved_per_member_and_becomes_the_volumes_configuration() {
     let (router, engine) = harness();
-    let rows = target_rows();
+    let rows = target_rows(&seed_snapshot(&engine, 20));
 
     // Every published volume type takes part, so no row set can pass while a type is
     // left without rules: the list is the model's own
@@ -381,9 +394,40 @@ async fn the_target_is_resolved_per_member_and_becomes_the_volumes_configuration
     }
 
     // Past the span, the target IS the configuration — materialised the way every
-    // other clock-due transition of this service is, through the next call.
-    tokio::time::sleep(wsinst::state::VOLUME_MODIFICATION_SPAN + SLACK).await;
-    settle_through_the_wire(&router).await;
+    // other clock-due transition of this service is, through the next call. The test waits
+    // for THAT, not for a span: it settles and looks again until every row's volume reports
+    // its target, or a deadline generous enough that a loaded host cannot fail it.
+    let deadline = Instant::now() + MATERIALISATION_BUDGET;
+    loop {
+        settle_through_the_wire(&router).await;
+        let pending: Vec<&str> = modified
+            .iter()
+            .filter(|(row, id)| {
+                let stored = stored_volume(&engine, id);
+                (
+                    stored.size_in_gb.map(i64::from),
+                    stored.effective_volume_type(),
+                    stored.iops.map(i64::from),
+                    stored.throughput.map(i64::from),
+                ) != (
+                    row.target_size,
+                    row.target_volume_type,
+                    row.target_iops,
+                    row.target_throughput,
+                )
+            })
+            .map(|(row, _)| row.case)
+            .collect();
+        if pending.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {pending:?}: expected each finished modification's target to be its \
+             volume's configuration"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
     for (row, id) in &modified {
         let stored = stored_volume(&engine, id);
         assert_eq!(

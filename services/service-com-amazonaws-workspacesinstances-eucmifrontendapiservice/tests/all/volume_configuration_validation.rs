@@ -31,7 +31,9 @@ use service_com_amazonaws_workspacesinstances_eucmifrontendapiservice as wsinst;
 use smithy_server_runtime::MultiServiceRouter;
 use wsinst::state::VolumeTypeSpec;
 
-use crate::workspace_instance_lifecycle::{call_in_region, error_code, harness, DEFAULT_TEST_REGION};
+use crate::workspace_instance_lifecycle::{
+    call_in_region, error_code, harness, seed_snapshot, DEFAULT_TEST_REGION,
+};
 
 /// The `ValidationExceptionReason` a single bad member is reported with, as the
 /// modelled enum value (`smithy_query(query="shape",shape="ValidationExceptionReason")`).
@@ -271,7 +273,11 @@ async fn a_volume_needs_a_capacity_source() {
     )
     .await;
 
-    // Either source alone is enough, and both together are consistent.
+    // Either source alone is enough, and both together are consistent. The snapshot the
+    // rows name is one the account's own Amazon EC2 holds: `CreateVolume` restores the
+    // volume from it, so an id naming no snapshot is a different case (see
+    // `ebs_volume_propagation`).
+    let snapshot_id = seed_snapshot(&engine, 20);
     for (case, body) in [
         (
             "SizeInGB alone",
@@ -279,13 +285,13 @@ async fn a_volume_needs_a_capacity_source() {
         ),
         (
             "SnapshotId alone, which carries the size",
-            json!({ "AvailabilityZone": &zone, "SnapshotId": "snap-0123456789abcdef" }),
+            json!({ "AvailabilityZone": &zone, "SnapshotId": &snapshot_id }),
         ),
         (
             "both a snapshot and a size",
             json!({
                 "AvailabilityZone": &zone,
-                "SnapshotId": "snap-0123456789abcdef",
+                "SnapshotId": &snapshot_id,
                 "SizeInGB": 40,
             }),
         ),
@@ -293,7 +299,7 @@ async fn a_volume_needs_a_capacity_source() {
             "a snapshot restored onto a type with a higher minimum",
             json!({
                 "AvailabilityZone": &zone,
-                "SnapshotId": "snap-0123456789abcdef",
+                "SnapshotId": &snapshot_id,
                 "VolumeType": "st1",
             }),
         ),

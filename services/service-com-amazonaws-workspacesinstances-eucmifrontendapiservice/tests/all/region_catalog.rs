@@ -11,8 +11,8 @@
 //! `MaxResults` the caller asks for, and issues no pagination token — so the table
 //! below spans the `MaxResults` values a caller can send rather than asserting one
 //! recorded response. `MaxResults` is accepted inside its modelled `range 1..25` and
-//! refused outside it, and a `NextToken` — which this operation never issues — is
-//! refused as a token this service did not hand out.
+//! refused outside it, and a `NextToken` — which this operation never issues, so no page
+//! it could name exists — is IGNORED, leaving the whole catalog to be served.
 
 use std::sync::Arc;
 
@@ -273,13 +273,14 @@ async fn max_results_outside_the_modelled_range_is_refused() {
 }
 
 #[tokio::test]
-async fn a_next_token_is_refused_because_this_operation_issues_none() {
+async fn a_next_token_is_ignored_because_this_operation_issues_none() {
     let router = router();
 
-    // The catalog comes back whole, so the operation hands out no `NextToken`: every
-    // token a caller could send is therefore one this service did not issue, whatever
-    // it looks like. The rows span a well-formed Region name, a plausible opaque
-    // token, and malformed bytes.
+    // The catalog comes back whole, so the operation hands out no `NextToken` and no
+    // page a token could name exists: a token is therefore not read at all, and the
+    // request is answered the first — and only — page. The rows span a well-formed
+    // Region name, a plausible opaque token, and malformed bytes.
+    let whole = list_regions(&router, "no NextToken", json!({})).await;
     let rows: Vec<(&str, String)> = vec![
         ("hex of a Region name in the catalog", hex::encode("us-east-1")),
         (
@@ -295,24 +296,33 @@ async fn a_next_token_is_refused_because_this_operation_issues_none() {
             "2048 characters, the modelled maximum",
             "a".repeat(2048),
         ),
+        (
+            "a token beside a MaxResults inside the modelled range",
+            "not-a-token".to_string(),
+        ),
     ];
 
     for (case, token) in rows {
-        let (status, payload) = call(&router, "ListRegions", json!({ "NextToken": token })).await;
+        let body = if case.contains("beside a MaxResults") {
+            json!({ "NextToken": token, "MaxResults": 5 })
+        } else {
+            json!({ "NextToken": token })
+        };
+        let (status, payload) = call(&router, "ListRegions", body).await;
         assert_eq!(
-            status, 400,
-            "case {case:?}: a NextToken must be refused with HTTP 400, got {status} \
-             with {payload}"
+            status, 200,
+            "case {case:?}: a NextToken this operation never issued must be ignored and \
+             the catalog served, got {status} with {payload}"
         );
+        let reported = reported_regions(case, &payload);
         assert_eq!(
-            error_code(&payload),
-            "ValidationException",
-            "case {case:?}: expected ValidationException, got {payload}"
+            reported, whole,
+            "case {case:?}: expected the whole catalog, got {reported:?}"
         );
     }
 
-    // And a token past the modelled `len 1..2048` is refused at the boundary, with the
-    // same status and code.
+    // And a token past the modelled `len 1..2048` is still refused at the boundary: the
+    // constraint on the member is the model's, whatever the handler does with the value.
     let case = "2049 characters, one past the modelled maximum";
     let (status, payload) = call(
         &router,

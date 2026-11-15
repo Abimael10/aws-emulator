@@ -21,7 +21,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_workspacesinstances_eucmifrontendapiservice as wsinst;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::workspace_instance_lifecycle::{call, create, error_code, minimal_create, ok, router};
+use crate::workspace_instance_lifecycle::{
+    call, create, error_code, harness, minimal_create, ok, router, seed_snapshot,
+};
 
 /// `VolumeId`'s modelled shape: `^vol-[0-9a-zA-Z]{1,63}$`
 /// (`smithy_query(query="shape",shape="VolumeId")`).
@@ -124,9 +126,13 @@ fn minimal_for(volume_type: &str) -> Value {
 /// admits, the performance members, encryption, a snapshot source, tags, and an
 /// idempotency token.
 ///
+/// `snapshot_id` is a snapshot the account's own Amazon EC2 holds: `CreateVolume` restores
+/// the volume from the snapshot its `SnapshotId` names, so the row that names one names a
+/// snapshot that exists.
+///
 /// Every row is a configuration the backing EBS volume service would accept; the
 /// sibling `volume_configuration_validation` suite asserts the refusals.
-fn create_rows() -> Vec<CreateRow> {
+fn create_rows(snapshot_id: &str) -> Vec<CreateRow> {
     // `VolumeTypeEnum`'s full value list, from the model
     // (`smithy_query(query="shape",shape="VolumeTypeEnum")`); the `VOLUME_TYPE_ENUM_VALUES`
     // constant the crate generates from it is the same list.
@@ -166,7 +172,7 @@ fn create_rows() -> Vec<CreateRow> {
         },
         CreateRow {
             case: "restored from a snapshot, which carries the size",
-            body: json!({ "AvailabilityZone": "us-east-1b", "SnapshotId": "snap-0123456789abcdef" }),
+            body: json!({ "AvailabilityZone": "us-east-1b", "SnapshotId": snapshot_id }),
         },
         CreateRow {
             case: "tagged for the volume resource type",
@@ -201,9 +207,9 @@ fn create_rows() -> Vec<CreateRow> {
 
 #[tokio::test]
 async fn delete_removes_the_volume_the_id_names_and_a_second_delete_is_not_found() {
-    let router = router();
+    let (router, engine) = harness();
 
-    let rows = create_rows();
+    let rows = create_rows(&seed_snapshot(&engine, 20));
     let mut created = Vec::new();
     for row in &rows {
         let id = create_volume(&router, row.body.clone()).await;

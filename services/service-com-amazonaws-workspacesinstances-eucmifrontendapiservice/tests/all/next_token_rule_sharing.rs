@@ -12,12 +12,17 @@
 //! > `FieldList` naming the `NextToken` member and the same `Message`.
 //!
 //! The rows differ along what that rule generalises over: the operation the token is
-//! presented to (all three the service publishes as `@paginated` — `ListRegions`,
-//! `ListWorkspaceInstances`, `ListInstanceTypes`), the token's form (not this service's
-//! encoding at all, odd-length, bytes that are not text, an encoding that decodes to a
-//! resume point no list of this service can name), and its length (each published bound
-//! of the modelled `NextToken` and one past the top one). The other request members are
-//! varied too, so the refusal cannot depend on a page size or a filter.
+//! presented to (every list of the service that MINTS tokens — `ListWorkspaceInstances`
+//! and `ListInstanceTypes`), the token's form (not this service's encoding at all,
+//! odd-length, bytes that are not text, an encoding that decodes to a resume point no
+//! list of this service can name), and its length (each published bound of the modelled
+//! `NextToken` and one past the top one). The other request members are varied too, so
+//! the refusal cannot depend on a page size or a filter.
+//!
+//! `ListRegions` is NOT one of the rows: it serves its whole collection in one response
+//! and hands out no token, so there is no page a token could name and nothing for it to
+//! fail to resume at — a token presented to it is ignored rather than refused, which is
+//! `region_catalog`'s own rule.
 //!
 //! Nothing here can pass against text written in this file: the refusals are compared
 //! field by field BETWEEN the operations, and each is also checked against the structure
@@ -28,11 +33,11 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::workspace_instance_lifecycle::{call, error_code, router};
 
-/// The service's `@paginated` operations, with the `items` member each one reports —
-/// `OPERATIONS.md`, the `Traits:` line of each (`@paginated(inputToken=NextToken,
-/// outputToken=NextToken, items=...)`).
+/// The service's `@paginated` operations that MINT a `NextToken`, with the `items` member
+/// each one reports — `OPERATIONS.md`, the `Traits:` line of each
+/// (`@paginated(inputToken=NextToken, outputToken=NextToken, items=...)`), less
+/// `ListRegions`, which issues none (see the module docs).
 const PAGINATED: &[(&str, &str)] = &[
-    ("ListRegions", "Regions"),
     ("ListWorkspaceInstances", "WorkspaceInstances"),
     ("ListInstanceTypes", "InstanceTypes"),
 ];
@@ -138,8 +143,7 @@ pub(crate) fn requests(operation: &str, token: &str) -> Vec<Value> {
     let mut bodies = vec![
         json!({ "NextToken": token }),
         json!({ "NextToken": token, "MaxResults": 1 }),
-        // `MaxResults` ceilings differ per operation (25, 25 and 600); 25 is inside
-        // every one of them.
+        // `MaxResults` ceilings differ per operation (25 and 600); 25 is inside both.
         json!({ "NextToken": token, "MaxResults": 25 }),
     ];
     if operation == "ListWorkspaceInstances" {

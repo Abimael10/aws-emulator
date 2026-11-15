@@ -323,7 +323,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.tag_specifications.iter().flatten(),
         );
 
-        let volume_id = state.mint_volume_id();
+        // "Source snapshot for volume creation" (`CreateVolumeInput$SnapshotId`): the volume
+        // is RESTORED from that snapshot, so an id that names no snapshot the account holds
+        // names nothing to restore, and the backing Amazon EBS service refuses the create —
+        // which this service reports as the modelled `ValidationException` carrying that
+        // service's own code and sentence ([`crate::state::unresolvable_snapshot`]). The
+        // question goes to the service that OWNS the account's snapshots, and it is asked
+        // where the create would be MADE: after the duplicate-submission guard above, which
+        // answers before the service attempts a create at all, and before the first write,
+        // so a create refused here spends no token, is charged against no quota and leaves
+        // nothing behind to retry around.
+        if let Some(snapshot_id) = input.snapshot_id.as_deref() {
+            if !crate::state::account_holds_snapshot(&*self.engine, snapshot_id) {
+                return Err(CreateVolumeErrorModeled::ValidationException(
+                    crate::state::unresolvable_snapshot(snapshot_id),
+                )
+                .into());
+            }
+        }
+
+        // The volume this call creates is an Amazon EBS volume of the caller's own account,
+        // so the service that OWNS EBS volumes creates it and MINTS its id: the id answered
+        // below is the id that store holds, which is what makes every EBS read of it — a
+        // describe, a tag, an attach — resolve the volume this service reports.
+        // `None` means no volume came into being, so there is no id to answer with: the
+        // backing service cannot hold another volume, which is the quota this operation
+        // models — worded for THAT store rather than for this service's own count, which is
+        // below its own maximum on this path.
+        let Some(volume_id) = crate::state::create_ebs_volume(&*self.engine, &input, &tags) else {
+            return Err(CreateVolumeErrorModeled::ServiceQuotaExceededException(
+                crate::state::backing_volume_capacity_exceeded(),
+            )
+            .into());
+        };
         let record = crate::state::VolumeRecord {
             id: volume_id.clone(),
             // The Region the create was signed for: the volume belongs to it, and
