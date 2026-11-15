@@ -57,6 +57,9 @@ pub mod request_quota;
 /// accepted, the messages its subscriptions' filter policies withheld, and the
 /// notifications the subscribed endpoints took or refused.
 pub mod topic_metrics;
+/// What makes a value a DESTINATION phone number an SMS could be sent to, and how the
+/// SMS service a number is handed on to refuses one that is not.
+pub mod destination_number;
 mod message_structure;
 /// The rules a topic's TAG set is held to, shared by the operations that write one.
 mod tags;
@@ -3347,13 +3350,12 @@ pub const MIN_E164_DIGITS: usize = 8;
 /// phone number of an SMS-enabled device", while these members say E.164 and nothing
 /// else. The two floors differ for the same reason — this one is the digit count SNS
 /// publishes for an E.164 destination number.
+///
+/// The yes/no form of [`destination_number::destination_number_fault`], which is where
+/// the clauses live and which fault a value broke is told apart — what an operation
+/// whose refusal sentence depends on the fault asks instead.
 pub fn is_e164(value: &str) -> bool {
-    let Some(digits) = value.strip_prefix('+') else {
-        return false;
-    };
-    (MIN_E164_DIGITS..=MAX_E164_DIGITS).contains(&digits.len())
-        && !digits.starts_with('0')
-        && digits.bytes().all(|byte| byte.is_ascii_digit())
+    destination_number::destination_number_fault(value).is_none()
 }
 
 /// The opening every refusal of a phone-number parameter carries: `Invalid

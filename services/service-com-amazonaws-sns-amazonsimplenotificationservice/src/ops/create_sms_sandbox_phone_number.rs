@@ -207,7 +207,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // pattern admits forms E.164 does not (bare national digits, a country code
         // beginning with zero). Argument validation, so it is judged before the store is
         // consulted and nothing is registered for a number SNS would never send to.
-        if let Some(message) = state::phone_number_refusal(&input.phone_number) {
+        //
+        // This call asks for a message to be SENT to the number ("sends a one-time
+        // password (OTP) to that phone number"), so the number is handed on to the SMS
+        // service that would carry it and the refusal is that service's own, worded per
+        // fault ([`state::destination_number::sent_to_refusal`]).
+        if let Some(message) = state::destination_number::sent_to_refusal(&input.phone_number) {
             return Err(invalid_parameter(message));
         }
 

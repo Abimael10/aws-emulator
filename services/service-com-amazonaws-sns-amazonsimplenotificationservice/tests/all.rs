@@ -214,6 +214,9 @@ mod sms_sandbox_account_status;
 #[path = "all/sms_sandbox_destination_numbers.rs"]
 mod sms_sandbox_destination_numbers;
 
+#[path = "all/sms_sandbox_downstream_refusal.rs"]
+mod sms_sandbox_downstream_refusal;
+
 #[path = "all/sms_sandbox_phone_numbers.rs"]
 mod sms_sandbox_phone_numbers;
 

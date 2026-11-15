@@ -6,7 +6,11 @@
 //! number takes only a number in E.164 format — a `+`, a country code that does not begin
 //! with zero, and digits — and refuses anything else with the modelled
 //! `InvalidParameterException` (awsQuery `InvalidParameter`, HTTP 400) before it reads any
-//! state. The sandbox trio names one: "The destination phone number to verify … that you
+//! state. WHOSE sentence the refusal states depends on the operation: one that only reads
+//! or clears the account's own sandbox record states SNS's own member sentence, while one
+//! that asks for a message to be SENT to the number surfaces the SMS service's own
+//! refusal, which `sms_sandbox_downstream_refusal.rs` holds. The sandbox trio names one:
+//! "The destination phone number to verify … that you
 //! can send SMS messages to"
 //! (`smithy_query(query="doc",shape="CreateSMSSandboxPhoneNumberInput",member="PhoneNumber")`),
 //! and the modelled pattern of the shape they share
@@ -23,6 +27,7 @@
 
 use service_com_amazonaws_sns_amazonsimplenotificationservice::state::invalid_phone_number_message;
 
+use super::sms_sandbox_downstream_refusal::stated_sms_service_refusal;
 use super::sms_sandbox_phone_numbers::{
     accepted_number_forms, given_an_origination_number, refused_number_forms,
 };
@@ -34,16 +39,37 @@ use super::topics_subscriptions_publish::Sns;
 /// validator and the number is what is judged.
 const SOME_OTP: &str = "12345";
 
-/// The operations that carry a destination phone number, and the parameters each needs
-/// beside it.
-fn operations() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+/// One operation that carries a destination phone number.
+struct SandboxOperation {
+    /// The awsQuery action name.
+    action: &'static str,
+    /// The parameters the call needs beside the number.
+    extra: Vec<(&'static str, &'static str)>,
+    /// Whether the operation hands the number ON to the SMS service — which is what
+    /// decides whose sentence the refusal states.
+    hands_on: bool,
+}
+
+/// The operations that carry a destination phone number.
+fn operations() -> Vec<SandboxOperation> {
     vec![
-        ("CreateSMSSandboxPhoneNumber", vec![]),
-        (
-            "VerifySMSSandboxPhoneNumber",
-            vec![("OneTimePassword", SOME_OTP)],
-        ),
-        ("DeleteSMSSandboxPhoneNumber", vec![]),
+        // The registration "sends a one-time password (OTP) to that phone number", so the
+        // number travels on and the sentence is the SMS service's.
+        SandboxOperation {
+            action: "CreateSMSSandboxPhoneNumber",
+            extra: vec![],
+            hands_on: true,
+        },
+        SandboxOperation {
+            action: "VerifySMSSandboxPhoneNumber",
+            extra: vec![("OneTimePassword", SOME_OTP)],
+            hands_on: false,
+        },
+        SandboxOperation {
+            action: "DeleteSMSSandboxPhoneNumber",
+            extra: vec![],
+            hands_on: false,
+        },
     ]
 }
 
@@ -51,7 +77,12 @@ fn operations() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
 async fn a_destination_number_that_is_not_e164_is_refused_by_every_sandbox_operation() {
     let sns = Sns::new();
 
-    for (action, extra) in operations() {
+    for SandboxOperation {
+        action,
+        extra,
+        hands_on,
+    } in operations()
+    {
         for (case, number) in refused_number_forms() {
             let mut params: Vec<(&str, &str)> = vec![("PhoneNumber", number.as_str())];
             params.extend(extra.iter().copied());
@@ -68,12 +99,20 @@ async fn a_destination_number_that_is_not_e164_is_refused_by_every_sandbox_opera
                 answer.body
             );
             let stated = answer.element("Message");
-            assert_eq!(
-                stated.as_deref(),
-                Some(invalid_phone_number_message().as_str()),
-                "case {case:?} on {action}: expected the parameter refusal sentence, got \
-                 {stated:?}"
-            );
+            if hands_on {
+                // The number travels on to the SMS service, so SNS states THAT service's
+                // whole refusal rather than its own member sentence; which sentence goes
+                // with which class is pinned in `sms_sandbox_downstream_refusal.rs`.
+                let case = format!("{case} on {action}");
+                stated_sms_service_refusal(&case, &answer);
+            } else {
+                assert_eq!(
+                    stated.as_deref(),
+                    Some(invalid_phone_number_message().as_str()),
+                    "case {case:?} on {action}: expected the parameter refusal sentence, \
+                     got {stated:?}"
+                );
+            }
             assert!(
                 !answer.body.contains(number.as_str()) || number.is_empty(),
                 "case {case:?} on {action}: the number is a sensitive member, so the refusal \
