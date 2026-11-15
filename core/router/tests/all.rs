@@ -2159,3 +2159,13 @@ mod s3_notification_lambda_invoke_grant_gates_delivery;
 // one service crate's own, is stated in that suite's own module doc, where it is read
 // beside the test it explains. A note about this file itself belongs in
 // `all/appended_notes.rs`. Four suites pin the rules above rather than restating
+// name. One pair per suite and no other line, so two branches landing at once insert two
+// the file, no merge of two landings can leave one past the first item.
+// Five suites pin the rules rather than restating them here:
+// `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs` (pairs, sorted, no other line) and
+// `all/every_suite_file_is_declared.rs` (a suite file no `mod` names compiles nowhere).
+// service crate's own, is stated in that suite's OWN module doc, beside the test it
+// explains; `all/appended_notes.rs` keeps the notes earlier landings had appended here.
+#[path = "all/cloudformation_cloudfront_published_edge_address.rs"]
+mod cloudformation_cloudfront_published_edge_address;
