@@ -33,6 +33,12 @@ mod identity_providers;
 mod attributes;
 /// The column order a pool's user-import CSV template carries.
 mod csv_header;
+/// Consuming the CSV file a user import job was handed: the import format's own
+/// columns, and the rule that turns one uploaded file into users of the pool.
+mod user_import;
+/// The CloudWatch Logs role a user import job runs under, and whether this
+/// service can take it on.
+mod user_import_role;
 /// The tokens a pool issues, and the key its JWTs are signed with.
 mod tokens;
 /// The X.509 certificate a pool signs its SAML 2.0 federation traffic with, and
@@ -65,6 +71,8 @@ pub use saml_signing_certificate::*;
 pub use software_tokens::*;
 pub use token_validity::*;
 pub use tokens::*;
+pub use user_import::*;
+pub use user_import_role::*;
 pub use user_pool::*;
 pub use users::*;
 
@@ -1486,6 +1494,14 @@ pub const JOB_STATUS_STOPPING: &str = "Stopping";
 /// users" (`UserImportJobType.Status`).
 pub const JOB_STATUS_STOPPED: &str = "Stopped";
 
+/// "`Succeeded` - The job has completed successfully"
+/// (`UserImportJobType.Status`).
+pub const JOB_STATUS_SUCCEEDED: &str = "Succeeded";
+
+/// "`Failed` - The job has stopped due to an error"
+/// (`UserImportJobType.Status`).
+pub const JOB_STATUS_FAILED: &str = "Failed";
+
 /// "`Expired` - You created a job, but did not start the job within 24-48
 /// hours" (`UserImportJobType.Status`).
 pub const JOB_STATUS_EXPIRED: &str = "Expired";
@@ -1499,6 +1515,51 @@ pub const JOB_STATUS_EXPIRED: &str = "Expired";
 /// `StartUserImportJob` returns. Never zero, so a caller reading the job right
 /// after starting it still sees the transient status.
 pub const JOB_START_SPAN: Duration = Duration::from_millis(500);
+
+/// How long after the start the clock owes a started job its TERMINAL status —
+/// `Succeeded` for a run that read the uploaded file, `Failed` for one that could
+/// not ([`ImportOutcome::terminal_status`]).
+///
+/// A chosen span, not a documented duration: `InProgress` is "the job has
+/// started, and users are being imported" (`UserImportJobType.Status`), so a job
+/// is still importing for a while after it was started. Longer than
+/// [`JOB_START_SPAN`], so a started job passes through `Pending` and `InProgress`
+/// in that order, and never zero, so a caller reading the job right after
+/// starting it still sees a transient status.
+pub const JOB_IMPORT_SPAN: Duration = Duration::from_secs(3);
+
+/// The most bytes of one upload a user import job holds, so the file this
+/// emulator keeps in memory for a job is bounded. A larger body is not a file a
+/// job can hold, so the upload target refuses it rather than keeping part of it.
+///
+/// One import places at most [`MAX_USERS_PER_POOL`] users, and a CSV row naming
+/// one user is a few hundred bytes of the pool's columns, so a file past this
+/// bound cannot name more users than the pool can hold anyway. The job RELEASES
+/// the file once the import has read it ([`run_user_import`]), so the bound is
+/// what one job holds between its upload and its start.
+pub const MAX_USER_IMPORT_CSV_BYTES: usize = 4 * 1024 * 1024;
+
+/// The sentence the CSV upload target answers a body larger than
+/// [`MAX_USER_IMPORT_CSV_BYTES`] with, which states the bound it broke.
+pub fn csv_upload_too_large_message() -> String {
+    format!("A user import job holds a CSV file of at most {MAX_USER_IMPORT_CSV_BYTES} bytes.")
+}
+
+/// The most bytes of UNIMPORTED CSV one user pool retains across all of its
+/// import jobs, which bounds what the pool holds rather than only what one
+/// upload carries: a pool's jobs are started one at a time, so one maximal file
+/// waiting to be imported is what a pool needs to hold, and an upload that would
+/// take it past this is refused rather than kept beside the files already there.
+pub const MAX_USER_IMPORT_CSV_BYTES_PER_POOL: usize = MAX_USER_IMPORT_CSV_BYTES;
+
+/// The sentence the CSV upload target answers a body that would take the pool
+/// past [`MAX_USER_IMPORT_CSV_BYTES_PER_POOL`] with, which states that bound.
+pub fn pool_csv_retention_exceeded_message() -> String {
+    format!(
+        "A user pool holds at most {MAX_USER_IMPORT_CSV_BYTES_PER_POOL} bytes of uploaded CSV \
+         across its user import jobs; start or let expire a job before uploading another file."
+    )
+}
 
 /// The sentence a start refused because the job's CSV file was never uploaded
 /// carries: a job "imports users from a CSV file" that the client writes to the
@@ -3534,9 +3595,9 @@ fn schema_attribute_constraints(
 /// not attributes of the pool's schema, so they are not reported by any other
 /// read of it.
 const CSV_HEADER_TRAILING_COLUMNS: [&str; 3] = [
-    "cognito:mfa_enabled",
-    "cognito:username",
-    "password_hash",
+    CSV_MFA_ENABLED_COLUMN,
+    CSV_USERNAME_COLUMN,
+    CSV_PASSWORD_HASH_COLUMN,
 ];
 
 /// How many digits a minted verification code carries: Amazon Cognito's

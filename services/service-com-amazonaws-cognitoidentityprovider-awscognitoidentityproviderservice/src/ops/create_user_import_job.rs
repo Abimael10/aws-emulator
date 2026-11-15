@@ -11,6 +11,11 @@
 //! [`crate::state::MAX_USER_IMPORT_JOBS_PER_POOL`] jobs with
 //! `LimitExceededException`.
 //!
+//! The `CloudWatchLogsRoleArn` is stored as submitted and not resolved here:
+//! Amazon Cognito validates the role when the import is STARTED (`StartUserImportJob`,
+//! `crate::state::import_logs_role_is_unassumable`), so a job naming a role it
+//! cannot assume is created and then refused its start.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -210,8 +215,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The role is kept exactly as submitted: the caller "must specify an IAM
         // role that has permission to log import-job results to Amazon
         // CloudWatch Logs" (`CreateUserImportJob.CloudWatchLogsRoleArn`), and
-        // whether that role exists is decided where the import logs, not here,
-        // so a well-formed ARN is accepted.
+        // whether Amazon Cognito can take it on is decided where the import runs
+        // (`StartUserImportJob`), not here, so a well-formed ARN is accepted.
         let job = crate::state::UserImportJob::new(
             job_id.clone(),
             input.job_name.clone(),

@@ -1108,20 +1108,60 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             let (user_pool_id, job_id) = user_import_csv_route(req.uri())?;
             let state = crate::state::service_state(&*self.engine)?;
             // The router materialises a request before it dispatches one, so the
-            // body is already in memory here; only its LENGTH is recorded, so
-            // nothing proportional to the upload is retained.
+            // body is already in memory here; the job KEEPS it, because
+            // `StartUserImportJob` imports the users this file names, and the
+            // file this emulator can hold is bounded
+            // (`crate::state::MAX_USER_IMPORT_CSV_BYTES`).
             let body = req.body().bytes()?;
+            if body.len() > crate::state::MAX_USER_IMPORT_CSV_BYTES {
+                let refusal = ::serde_json::json!({
+                    "message": crate::state::csv_upload_too_large_message(),
+                });
+                return json_response(400, &refusal.to_string());
+            }
             let now = ::std::time::SystemTime::now();
-            {
+            // Whether the pool can hold this file at all, decided under the lock
+            // and BEFORE the body is copied into the job, so nothing proportional
+            // to a refused upload is retained.
+            let refusal = {
                 let mut guard = state.lock();
+                let pool = guard.pool_mut(user_pool_id)?;
+                // The file of a job the clock has expired is gone with the job's
+                // data ([`crate::state::UserImportJob::release_expired_csv`]), so
+                // the bytes this pool retains are those of the jobs a start can
+                // still read.
+                for job in pool.user_import_jobs.values_mut() {
+                    job.release_expired_csv(now);
+                }
                 // A path naming no stored job is not this route: it falls
                 // through to the framework's refusal rather than accepting an
                 // upload nothing will import.
-                let job = guard
-                    .pool_mut(user_pool_id)?
+                if !pool.user_import_jobs.contains_key(job_id) {
+                    return None;
+                }
+                // What the pool would retain once this upload replaced the file
+                // its own job holds: the aggregate bound, so the bytes a pool
+                // holds are capped however many jobs it has
+                // (`crate::state::MAX_USER_IMPORT_CSV_BYTES_PER_POOL`).
+                let held_by_other_jobs: usize = pool
                     .user_import_jobs
-                    .get_mut(job_id)?;
-                job.record_csv_upload(body.len(), now);
+                    .iter()
+                    .filter(|(held_job_id, _)| held_job_id.as_str() != job_id)
+                    .map(|(_, job)| job.csv.len())
+                    .sum();
+                if held_by_other_jobs.saturating_add(body.len())
+                    > crate::state::MAX_USER_IMPORT_CSV_BYTES_PER_POOL
+                {
+                    Some(crate::state::pool_csv_retention_exceeded_message())
+                } else {
+                    let job = pool.user_import_jobs.get_mut(job_id)?;
+                    job.record_csv_upload(body, now);
+                    None
+                }
+            };
+            if let Some(message) = refusal {
+                let refusal = ::serde_json::json!({ "message": message });
+                return json_response(400, &refusal.to_string());
             }
             // The answer a pre-signed S3 PUT gives once the object is written:
             // 200 with no body.

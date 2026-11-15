@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartUserImportJob
-//! Starts the STORED user import job the request names and returns the stored
-//! job, so a later `DescribeUserImportJob` renders the same resource: a started
-//! job is `Pending` and the clock makes its `InProgress` move due a moment
-//! later. Only a job that was created and not yet started can be started, so a
-//! job in any other status — including one the clock has `Expired`, which "can't
-//! be started" (`UserImportJobType.Status`) — is refused with
+//! Starts the STORED user import job the request names: it CONSUMES the CSV file
+//! uploaded to the job's `PreSignedUrl`, creating one user of the pool per row it
+//! can place, and returns the stored job, so a later `DescribeUserImportJob`
+//! renders the same resource. A started job is `Pending`, the clock makes its
+//! `InProgress` move due a moment later and its terminal status (`Succeeded`, or
+//! `Failed` for a file this pool's import cannot read) due a moment after that,
+//! with `ImportedUsers`, `SkippedUsers`, `FailedUsers` and `CompletionMessage`
+//! reporting that run. Only a job that was created and not yet started can be
+//! started, so a job in any other status — including one the clock has `Expired`,
+//! which "can't be started" (`UserImportJobType.Status`) — is refused with
 //! `PreconditionNotMetException`, as is one whose CSV file was never uploaded to
-//! the job's `PreSignedUrl`. A `UserPoolId` or `JobId` that names no stored
+//! the job's `PreSignedUrl` and one whose `CloudWatchLogsRoleArn` names a role
+//! Amazon Cognito cannot assume. A `UserPoolId` or `JobId` that names no stored
 //! resource is refused with `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
@@ -159,52 +164,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
 
-        let mut guard = state.lock();
-        let pool = guard
-            .pool_mut(&input.user_pool_id)
-            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
-        let job = pool
-            .user_import_jobs
-            .get_mut(&input.job_id)
-            .ok_or_else(|| job_not_found(&input.job_id))?;
-
-        // "The ID of a user import job that you previously created"
-        // (`StartUserImportJob.JobId`): only a job still waiting to be started
-        // can be started, so one already started, stopped or expired keeps the
-        // status and the dates it has.
-        let status = job.status(now);
-        if status != crate::state::JOB_STATUS_CREATED {
-            return Err(precondition_not_met(format!(
-                "User import job {} is in status {status} and cannot be started.",
-                input.job_id
-            )));
-        }
-
-        // "Instructs your user pool to start importing users from a CSV file"
-        // (this operation's own documentation), and the file is the one uploaded
-        // to the job's `PreSignedUrl` — so a job whose upload target was never
-        // written to has nothing to import, and the precondition for starting it
-        // is not met. Asked before the status move is stored, so a refused start
-        // leaves the job `Created` and startable once its CSV arrives.
-        if !job.has_uploaded_csv() {
+        // The role this job logs its import through, read off the STORED job: the
+        // precondition below is about the role the job carries, not one this
+        // request names.
+        let role_arn = {
+            let guard = state.lock();
+            let pool = guard
+                .pool(&input.user_pool_id)
+                .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+            let job = pool
+                .user_import_jobs
+                .get(&input.job_id)
+                .ok_or_else(|| job_not_found(&input.job_id))?;
+            job.cloud_watch_logs_role_arn.clone()
+        };
+        // Amazon Cognito re-validates the job's CloudWatch Logs role when the job
+        // is started: it takes that role on to log the import, so a role whose
+        // trust policy does not let it is a precondition this job does not meet
+        // and the import is refused rather than started
+        // ([`crate::state::import_logs_role_is_unassumable`]). Awaited with no
+        // state guard held, and asked before the status move is stored, so a
+        // refused start leaves the job `Created` and startable once the trust
+        // policy is corrected.
+        if crate::state::import_logs_role_is_unassumable(ctx, &region, &role_arn).await {
             return Err(precondition_not_met(
-                crate::state::no_csv_uploaded_message(&input.job_id),
+                crate::state::IMPORT_LOGS_ROLE_TRUST_MESSAGE.to_string(),
             ));
         }
 
-        // Written first, then rendered from the stored record, so the response is
-        // exactly what a later read sees.
-        job.start(now);
+        // The start is ACCEPTED under one short lock, which checks the rest of the
+        // preconditions, takes the uploaded file out of the job and moves the job
+        // to `Pending` so a second start cannot begin a second import
+        // ([`crate::state::begin_user_import`]).
+        let accepted = crate::state::begin_user_import(&state, &input.user_pool_id, &input.job_id, now)
+            .map_err(|refusal| refused(&input, refusal))?;
+        // The import itself: the file is parsed and its rows placed in passes that
+        // release this service's store between them, and the job records what the
+        // run did ([`crate::state::run_user_import`]). Rendered from the stored
+        // record, so the response is exactly what a later read sees.
+        let rendered = crate::state::run_user_import(
+            &state,
+            &input.user_pool_id,
+            &input.job_id,
+            accepted,
+            now,
+        )
+        .await;
         Ok(StartUserImportJobOutput {
-            user_import_job: Some(job.to_user_import_job_type(now)),
+            user_import_job: Some(rendered.ok_or_else(|| job_not_found(&input.job_id))?),
         })
+    }
+}
+
+/// This operation's wording for each reason the start was refused
+/// ([`crate::state::ImportRefusal`]).
+fn refused(
+    input: &StartUserImportJobInput,
+    refusal: crate::state::ImportRefusal,
+) -> StartUserImportJobError {
+    match refusal {
+        crate::state::ImportRefusal::PoolNotFound => user_pool_not_found(&input.user_pool_id),
+        crate::state::ImportRefusal::JobNotFound => job_not_found(&input.job_id),
+        crate::state::ImportRefusal::NotWaiting(status) => precondition_not_met(format!(
+            "User import job {} is in status {status} and cannot be started.",
+            input.job_id
+        )),
+        crate::state::ImportRefusal::NoCsvUploaded => {
+            precondition_not_met(crate::state::no_csv_uploaded_message(&input.job_id))
+        }
     }
 }
 

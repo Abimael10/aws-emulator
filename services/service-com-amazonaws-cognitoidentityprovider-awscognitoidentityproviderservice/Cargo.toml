@@ -92,6 +92,10 @@ data-encoding = "2"
 # to be byte-identical to the one the app shows, so it comes from a library of that
 # algorithm rather than from an implementation of it here.
 totp-lite = "2.0"
+# Reads the CSV file a user import job was handed (`src/state/user_import.rs`): the
+# delimited-text reader this workspace already parses CSV with, so a quoted field or an
+# embedded separator is read the way every other reader of that format reads it.
+csv = "1.3"
 # The validity window rcgen stamps on that certificate is the one the model documents
 # for an issued signing certificate, so the two instants are converted from the pool's
 # `SystemTime`s into the date-time type rcgen takes.

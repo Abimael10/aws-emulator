@@ -15,7 +15,8 @@
 //!   create arrived at (and none at all when the request named no endpoint);
 //! * a job's `Status` is computed from the stored lifecycle instants and the
 //!   clock: `Created` until started, `Pending` until the import is due,
-//!   `InProgress` from then on, `Stopping` until the stop is due and `Stopped`
+//!   `InProgress` from then on, the terminal status its import run earned once
+//!   the completion is due, `Stopping` until the stop is due and `Stopped`
 //!   from then on, and `Expired` for a job left unstarted past its window;
 //! * only a job waiting to be started, with the CSV file uploaded to its
 //!   `PreSignedUrl`, can be started and only a running job can be stopped, so
@@ -41,12 +42,13 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/us-east-1/cognito-idp/aws4_request, \
      SignedHeaders=host;x-amz-date, Signature=0000";
 
-/// Long enough that the clock has made a started job's import due.
-const PAST_THE_START: Duration =
-    state::JOB_START_SPAN.saturating_add(Duration::from_millis(250));
+/// How long a poll for a status the clock owes keeps looking before it gives up.
+/// Generous: the spans it waits out are sub-second, so no host this runs on needs
+/// anything near this, and the loop stops as soon as the status holds.
+const POLL_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Long enough that the clock has made a stopping job's stop due.
-const PAST_THE_STOP: Duration = state::JOB_STOP_SPAN.saturating_add(Duration::from_millis(250));
+/// How long one look at the stored job waits before the next one.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// A CloudWatch Logs role in the account every emulated resource reports.
 const LOCAL_ROLE: &str = "arn:aws:iam::000000000000:role/cognito-import";
@@ -150,6 +152,34 @@ async fn status(router: &MultiServiceRouter, user_pool_id: &str, job_id: &str) -
         .and_then(Value::as_str)
         .unwrap_or("<no Status>")
         .to_string()
+}
+
+/// Read the stored job until its `Status` is one of `wanted`, and return the job
+/// as it read then.
+///
+/// The CONDITION is what this waits for, not a span of time: the clock owes the
+/// move, so the loop looks again until the job reports it or [`POLL_DEADLINE`]
+/// passes.
+async fn poll_until_status(
+    router: &MultiServiceRouter,
+    case: &str,
+    user_pool_id: &str,
+    job_id: &str,
+    wanted: &[&str],
+) -> Value {
+    let deadline = std::time::Instant::now() + POLL_DEADLINE;
+    loop {
+        let job = describe(router, user_pool_id, job_id).await;
+        let reported = job.get("Status").and_then(Value::as_str).unwrap_or_default();
+        if wanted.contains(&reported) {
+            return job;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the job to reach one of {wanted:?}, last read {job}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// A CSV file with the pool's header row and one user, which a client uploads to
@@ -466,10 +496,17 @@ async fn a_job_reaches_the_status_the_clock_owes_it() {
         );
 
         if stop_once_in_progress {
-            tokio::time::sleep(PAST_THE_START).await;
-            let in_progress = status(&router, &user_pool_id, &job_id).await;
+            let in_progress = poll_until_status(
+                &router,
+                case,
+                &user_pool_id,
+                &job_id,
+                &["InProgress"],
+            )
+            .await;
             assert_eq!(
-                in_progress, "InProgress",
+                in_progress["Status"],
+                json!("InProgress"),
                 "case {case:?}: expected InProgress once the clock owes it, got {in_progress}"
             );
         }
@@ -490,8 +527,8 @@ async fn a_job_reaches_the_status_the_clock_owes_it() {
             "case {case:?}: a job that has not stopped yet reports no CompletionDate, got {stopped}"
         );
 
-        tokio::time::sleep(PAST_THE_STOP).await;
-        let final_read = describe(&router, &user_pool_id, &job_id).await;
+        let final_read =
+            poll_until_status(&router, case, &user_pool_id, &job_id, &["Stopped"]).await;
         assert_eq!(
             final_read["Status"],
             json!("Stopped"),
@@ -505,11 +542,13 @@ async fn a_job_reaches_the_status_the_clock_owes_it() {
             final_read.get("StartDate").is_some(),
             "case {case:?}: a stopped job keeps the StartDate it was given, got {final_read}"
         );
-        for counter in ["ImportedUsers", "SkippedUsers", "FailedUsers"] {
+        // The start consumed the CSV uploaded to this job's target, which carries
+        // one user, so the counters report that run.
+        for (counter, expected) in [("ImportedUsers", 1), ("SkippedUsers", 0), ("FailedUsers", 0)] {
             assert_eq!(
                 final_read[counter],
-                json!(0),
-                "case {case:?}: no CSV was imported, so {counter} is zero, got {final_read}"
+                json!(expected),
+                "case {case:?}: expected {counter} {expected} from the import of {CSV_FILE:?}, got {final_read}"
             );
         }
     }
@@ -563,7 +602,7 @@ async fn only_a_waiting_job_starts_and_only_a_running_job_stops() {
             }
             "InProgress" => {
                 ok(&router, "StartUserImportJob", &start).await;
-                tokio::time::sleep(PAST_THE_START).await;
+                poll_until_status(&router, label, &user_pool_id, &job_id, &["InProgress"]).await;
             }
             "Stopping" => {
                 ok(&router, "StartUserImportJob", &start).await;
@@ -910,7 +949,9 @@ async fn an_unstarted_job_expires_only_once_its_window_is_past() {
             case: "started before the window ended, read long after",
             created_ago: 30 * window,
             started: true,
-            expected: "InProgress",
+            // A started job never expires: it reached the terminal status its
+            // import run earned and keeps it.
+            expected: "Succeeded",
         },
     ];
 

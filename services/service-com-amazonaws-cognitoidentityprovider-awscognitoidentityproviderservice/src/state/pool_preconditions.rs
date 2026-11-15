@@ -108,10 +108,12 @@ pub fn admin_only_recovery_combined(setting: &AccountRecoverySettingType) -> boo
             .any(|mechanism| mechanism.name == RECOVERY_ADMIN_ONLY)
 }
 
-/// The service principal a user pool sends SMS messages as: Amazon Cognito
-/// assumes the role an `SmsConfiguration` names, so that role's trust policy has
-/// to admit this principal.
-const SMS_CALLER_SERVICE_PRINCIPAL: &str = "cognito-idp.amazonaws.com";
+/// The service principal THIS service assumes a caller-supplied role as, so that
+/// role's trust policy has to admit it: a pool's SMS caller role
+/// ([`sms_caller_role_is_unassumable`]) and a user import job's CloudWatch Logs
+/// role ([`crate::state::IMPORT_LOGS_SERVICE_PRINCIPAL`]) are taken on by one
+/// service, so the gates that read them cannot disagree about who is assuming.
+pub const COGNITO_IDP_SERVICE_PRINCIPAL: &str = "cognito-idp.amazonaws.com";
 
 /// The message a user-pool write is refused with when the role its
 /// `SmsConfiguration` names does not let Amazon Cognito assume it
@@ -218,7 +220,7 @@ pub async fn sms_caller_role_is_unassumable(
         ctx.callback(),
         region,
         role_arn,
-        SMS_CALLER_SERVICE_PRINCIPAL,
+        COGNITO_IDP_SERVICE_PRINCIPAL,
         &context,
     )
     .await

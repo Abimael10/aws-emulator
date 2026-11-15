@@ -1159,10 +1159,12 @@ pub struct UserImportJob {
     /// users from a CSV file" (`StartUserImportJob`), so a job whose upload
     /// target was never written to has nothing to import.
     pub csv_uploaded_at: Option<SystemTime>,
-    /// How many bytes the uploaded CSV carried. The bytes themselves are not
-    /// held: this emulator imports no users from them, so the record is the
-    /// upload's size and instant rather than a copy of the file.
-    pub csv_bytes: usize,
+    /// The CSV file that arrived at this job's upload target and has not been
+    /// imported yet: the file a start READS to create the pool's users
+    /// ([`run_user_import`]), which the start then RELEASES, since nothing
+    /// reads it again. Bounded by [`MAX_USER_IMPORT_CSV_BYTES`], which the upload
+    /// target enforces.
+    pub csv: Vec<u8>,
     pub creation_date: SystemTime,
     /// When `StartUserImportJob` accepted this job, absent until it does.
     pub start_date: Option<SystemTime>,
@@ -1172,6 +1174,13 @@ pub struct UserImportJob {
     /// The instant the clock owes this job's `Stopping` -> `Stopped` move,
     /// absent until `StopUserImportJob` accepted it.
     pub stopped_at: Option<SystemTime>,
+    /// The instant the clock owes this job its TERMINAL status, absent until the
+    /// job is started. Stored, never slept on: a read computes the status from it.
+    pub completed_at: Option<SystemTime>,
+    /// What the import run this job's start made did, absent until it was
+    /// started: the counters the job reports and the terminal status it earned
+    /// ([`ImportOutcome`]).
+    pub outcome: Option<ImportOutcome>,
 }
 
 impl UserImportJob {
@@ -1194,19 +1203,23 @@ impl UserImportJob {
             password_hashing_algorithm,
             pre_signed_url,
             csv_uploaded_at: None,
-            csv_bytes: 0,
+            csv: Vec::new(),
             creation_date: now,
             start_date: None,
             in_progress_at: None,
             stopped_at: None,
+            completed_at: None,
+            outcome: None,
         }
     }
 
     /// This job's `UserImportJobStatusType` as of `now`, computed from the
     /// stored instants: a stopped job is `Stopping` until the clock has made its
     /// stop due and `Stopped` from then on, a started one `Pending` until the
-    /// clock has made the import due and `InProgress` from then on, and one that
-    /// was never started `Created` until its expiry is due.
+    /// clock has made the import due, `InProgress` from then on and its terminal
+    /// status once the clock has made the import's completion due
+    /// ([`ImportOutcome::terminal_status`]), and one that was never started
+    /// `Created` until its expiry is due.
     pub fn status(&self, now: SystemTime) -> &'static str {
         if let Some(stopped_at) = self.stopped_at {
             return if now >= stopped_at {
@@ -1214,6 +1227,11 @@ impl UserImportJob {
             } else {
                 JOB_STATUS_STOPPING
             };
+        }
+        if let Some(outcome) = self.outcome.as_ref() {
+            if self.completed_at.is_some_and(|due| now >= due) {
+                return outcome.terminal_status();
+            }
         }
         if let Some(in_progress_at) = self.in_progress_at {
             return if now >= in_progress_at {
@@ -1238,27 +1256,55 @@ impl UserImportJob {
         )
     }
 
-    /// Record that a CSV of `bytes` bytes arrived at this job's upload target at
-    /// `now`. The latest upload is what the job holds: a client that writes the
-    /// target twice has replaced the file the job is going to import.
-    pub fn record_csv_upload(&mut self, bytes: usize, now: SystemTime) {
-        self.csv_uploaded_at = Some(now);
-        self.csv_bytes = bytes;
+    /// Release the file this job holds once the clock has EXPIRED it: "you created
+    /// a job, but did not start the job within 24-48 hours. All data associated
+    /// with the job was deleted, and the job can't be started"
+    /// (`UserImportJobType.Status`), so an expired job holds no file to import.
+    ///
+    /// A change the clock already made due, materialised rather than decided here,
+    /// which is what bounds the bytes a pool retains for files no start will ever
+    /// read.
+    pub fn release_expired_csv(&mut self, now: SystemTime) {
+        if self.status(now) == JOB_STATUS_EXPIRED {
+            self.csv = Vec::new();
+        }
     }
 
-    /// Whether a CSV file has been uploaded to this job's target, which is what
-    /// a start has to import. An EMPTY body uploads no CSV: a file of no bytes
-    /// carries neither the header row nor a user.
+    /// Record that a CSV of `body` arrived at this job's upload target at `now`.
+    /// The latest upload is what the job holds: a client that writes the target
+    /// twice has replaced the file the job is going to import.
+    pub fn record_csv_upload(&mut self, body: &[u8], now: SystemTime) {
+        self.csv_uploaded_at = Some(now);
+        self.csv = body.to_vec();
+    }
+
+    /// Whether a CSV file is waiting at this job's target for a start to import.
+    /// An EMPTY body uploads no CSV: a file of no bytes carries neither the header
+    /// row nor a user. A start CONSUMES the file, so this reports `false` for a job
+    /// whose import has already read it.
     #[must_use]
     pub fn has_uploaded_csv(&self) -> bool {
-        self.csv_uploaded_at.is_some() && self.csv_bytes > 0
+        self.csv_uploaded_at.is_some() && !self.csv.is_empty()
     }
 
-    /// Record that the import was started at `now`, which makes the job
-    /// `Pending` and the `InProgress` move due one [`JOB_START_SPAN`] later.
+    /// Record that the import was started at `now`, which makes the job `Pending`,
+    /// the `InProgress` move due one [`JOB_START_SPAN`] later and the terminal
+    /// status due one [`JOB_IMPORT_SPAN`] after the start.
+    ///
+    /// The run's own result arrives with [`UserImportJob::record_import`] once the
+    /// import has placed its rows; until then the job reports the outcome of a run
+    /// that has placed none.
     pub fn start(&mut self, now: SystemTime) {
         self.start_date = Some(now);
         self.in_progress_at = Some(now + JOB_START_SPAN);
+        self.completed_at = Some(now + JOB_IMPORT_SPAN);
+        self.outcome = Some(ImportOutcome::default());
+    }
+
+    /// Record what the import run this job's start made did, which is what every
+    /// later read of the job reports ([`ImportOutcome`]).
+    pub fn record_import(&mut self, outcome: ImportOutcome) {
+        self.outcome = Some(outcome);
     }
 
     /// Record that the stop was asked for at `now`, which makes the job
@@ -1270,6 +1316,13 @@ impl UserImportJob {
     /// The modelled view of this job as of `now`, rendered from what is stored.
     pub fn to_user_import_job_type(&self, now: SystemTime) -> UserImportJobType {
         let status = self.status(now);
+        // The run this job's start made, once the clock has made its completion
+        // due: a job that has not completed reports no result of a run that is
+        // still going.
+        let completed = self
+            .outcome
+            .as_ref()
+            .filter(|_| status == JOB_STATUS_SUCCEEDED || status == JOB_STATUS_FAILED);
         UserImportJobType {
             job_name: Some(self.job_name.clone()),
             job_id: Some(self.job_id.clone()),
@@ -1281,20 +1334,41 @@ impl UserImportJob {
             start_date: self.start_date.map(to_date_time),
             // "The date when the user import job was completed"
             // (`UserImportJobType.CompletionDate`): the instant the job stopped
-            // importing users, reported once the clock has made that move due.
+            // importing users, reported once the clock has made that move due —
+            // the stop for a job a caller stopped, the completion of the run for
+            // one that ran to its terminal status.
             completion_date: self
                 .stopped_at
                 .filter(|_| status == JOB_STATUS_STOPPED)
+                .or_else(|| self.completed_at.filter(|_| completed.is_some()))
                 .map(to_date_time),
             status: Some(status.to_string()),
             cloud_watch_logs_role_arn: Some(self.cloud_watch_logs_role_arn.clone()),
-            // No CSV was imported, so the three counters stay at the zero the
-            // model defaults them to, and `CompletionMessage` — "The message
-            // returned when the user import job is completed" — is not invented.
-            imported_users: 0,
-            skipped_users: 0,
-            failed_users: 0,
-            completion_message: None,
+            // The three counters of the run this job's start made, which are the
+            // zero the model defaults them to until a run has placed a row. They
+            // are reported from the instant the run exists rather than only once
+            // the job has completed: "the number of users that were successfully
+            // imported" is a count of what the run did, which a client watches
+            // while the job "has started, and users are being imported"
+            // (`UserImportJobType.Status`). `CompletionMessage` and
+            // `CompletionDate` are the completion's own, so they wait for it.
+            imported_users: self
+                .outcome
+                .as_ref()
+                .map_or(0, |outcome| outcome.imported_users),
+            skipped_users: self
+                .outcome
+                .as_ref()
+                .map_or(0, |outcome| outcome.skipped_users),
+            failed_users: self
+                .outcome
+                .as_ref()
+                .map_or(0, |outcome| outcome.failed_users),
+            // "The message returned when the user import job is completed"
+            // (`UserImportJobType.CompletionMessage`), so a job that has not
+            // completed reports none.
+            completion_message: completed
+                .map(|outcome| outcome.completion_message().to_string()),
             password_hashing_algorithm: self.password_hashing_algorithm.clone(),
         }
     }
