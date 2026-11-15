@@ -1655,3 +1655,20 @@ mod zz_probe_whole_emulator;
 // the file at all, no landing can put one past the first item.
 // `all/all_rs_is_a_canonical_declaration_list.rs` check the rules above rather than
 // restating them.
+// Single integration-test target for the router: the DECLARATION LIST of its cross-service
+// suites, and nothing else. Below this header the file holds one `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair per suite file under `tests/all/`, sorted by name, and no other line, so
+// two branches landing at once insert two lines in two places and have no prose to duplicate,
+// re-word or mistype. Put a new suite at `tests/all/<name>.rs` and insert its pair where its
+// name sorts to; what that suite covers belongs in its OWN module header, and a note about
+// THIS file in `all/appended_notes.rs`, declared below like any other suite.
+// EVERY comment here is an ordinary one, this header included: an inner doc comment is legal
+// only before the first item, so with none anywhere in the file no appended, re-typed or
+// merged copy of a line of it can land past the declarations, where it is `E0753` and compiles
+// no suite of this target. A suite file no `mod` names is compiled nowhere, a suite left at the
+// top level of `tests/` fails the build, and a second `mod` for one name is `E0428`. The
+// `all/all_rs_*.rs` suites, `all/every_suite_file_is_declared.rs` and
+// `all/declaration_roots_are_canonical_and_complete.rs` pin all of that, for this root and for
+// The lint allowed below is for the suite files this root compiles: a wrapped paragraph in one
+// of their module headers is then a note rather than a build failure. An inner attribute, like
+// an inner doc comment, is legal only before the first item, so it stands here.

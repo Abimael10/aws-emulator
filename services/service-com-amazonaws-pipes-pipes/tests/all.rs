@@ -77,6 +77,8 @@ mod pipe_source_checkout;
 mod pipe_state_machine_target;
 #[path = "all/pipe_state_reason.rs"]
 mod pipe_state_reason;
+#[path = "all/pipe_state_reason_after_recovery.rs"]
+mod pipe_state_reason_after_recovery;
 #[path = "all/pipe_tagging.rs"]
 mod pipe_tagging;
 #[path = "all/pipe_target_parameter_refusal.rs"]

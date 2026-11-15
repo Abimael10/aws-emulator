@@ -32,10 +32,17 @@ use crate::pipe_state_reason::listed_reasons;
 /// How many `Limit=1` pages the paged walk reads before it gives up, so a listing that
 /// never stops handing out tokens fails the case instead of looping for ever. Well above
 /// the number of pipes the fixture holds.
-const PAGE_BUDGET: usize = 16;
+///
+/// `pub(crate)` because `tests/all/pipe_state_reason_after_recovery.rs` walks the pages of its
+/// own fixture under the same ceiling rather than a second one of its own.
+pub(crate) const PAGE_BUDGET: usize = 16;
 
 /// What a pipe's `StateReason` has to say, as the state it rests in was reached.
-enum Reason {
+///
+/// `pub(crate)` with [`assert_reason`] because
+/// `tests/all/pipe_state_reason_after_recovery.rs` asks the same question of a pipe whose
+/// reason had to CHANGE, through this one reading of what a reason has to say.
+pub(crate) enum Reason {
     /// The pipe rests where its caller asked it to: the fixed user-initiated token.
     UserInitiated,
     /// A move that could not be completed: the sentence names the source the pipe could not
@@ -56,7 +63,7 @@ struct Listed {
 
 /// Assert the `StateReason` `read` reported for the pipe `case` is the one the state it
 /// rests in was reached by.
-fn assert_reason(case: &str, read: &str, reported: Option<&str>, expected: &Reason) {
+pub(crate) fn assert_reason(case: &str, read: &str, reported: Option<&str>, expected: &Reason) {
     let Some(reason) = reported else {
         panic!("case {case:?}: {read} returned the pipe with no StateReason at all");
     };
@@ -91,7 +98,11 @@ fn assert_reason(case: &str, read: &str, reported: Option<&str>, expected: &Reas
 /// The `StateReason` the entries of one listing reported for the pipe `case`, or `None` when
 /// the entry carried none. Which pipes a listing returned at all is asserted separately, off
 /// the same entries, so `None` here is the member missing and not the pipe missing.
-fn reason_for<'entries>(
+///
+/// `pub(crate)` with [`assert_reason`], because
+/// `tests/all/pipe_state_reason_after_recovery.rs` reads the entry of a listed pipe the same
+/// way.
+pub(crate) fn reason_for<'entries>(
     entries: &'entries [(String, Option<String>)],
     case: &str,
 ) -> Option<&'entries str> {
