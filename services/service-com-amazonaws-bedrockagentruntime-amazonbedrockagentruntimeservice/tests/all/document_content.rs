@@ -69,16 +69,16 @@ const VECTOR_DATA_TYPE: &str = "float32";
 const BUCKET: &str = "document-content-sources";
 
 /// A `knowledgeBaseId` the plane never minted (`^[0-9a-zA-Z]{10}$`).
-const UNKNOWN_KNOWLEDGE_BASE: &str = "ABCDEFGHIJ";
+pub(crate) const UNKNOWN_KNOWLEDGE_BASE: &str = "ABCDEFGHIJ";
 
 /// A `dataSourceId` the plane never minted.
-const UNKNOWN_DATA_SOURCE: &str = "DATASRC001";
+pub(crate) const UNKNOWN_DATA_SOURCE: &str = "DATASRC001";
 
 /// One custom data source holding documents whose content is in S3, and the ids they were
 /// ingested under.
-struct Ingested {
-    knowledge_base_id: String,
-    data_source_id: String,
+pub(crate) struct Ingested {
+    pub(crate) knowledge_base_id: String,
+    pub(crate) data_source_id: String,
 }
 
 impl Emulator {
@@ -193,7 +193,7 @@ impl Emulator {
     /// write — the state a caller's `CreateBucket` + `PutObject` leaves behind, written
     /// through S3's own store so the object a content read describes is the object S3
     /// serves.
-    fn put_object(&self, key: &str, body: &[u8], content_type: Option<&str>) {
+    pub(crate) fn put_object(&self, key: &str, body: &[u8], content_type: Option<&str>) {
         let state = s3_state::service_state(&*self.engine).expect("the S3 store is on this engine");
         let mut store = state.lock();
         let _ = store.create_bucket(BUCKET, REGION);
@@ -210,7 +210,7 @@ impl Emulator {
 
     /// Push `documents` into a custom data source through the build-time plane's own
     /// `IngestKnowledgeBaseDocuments`.
-    async fn ingest_documents(&self, case: &str, ingested: &Ingested, documents: Value) {
+    pub(crate) async fn ingest_documents(&self, case: &str, ingested: &Ingested, documents: Value) {
         let reply = self
             .bedrock(
                 ACCOUNT_KEY,
@@ -231,7 +231,7 @@ impl Emulator {
     }
 
     /// `GetDocumentContent` over one document of one data source.
-    async fn document_content(
+    pub(crate) async fn document_content(
         &self,
         key: &str,
         knowledge_base_id: &str,
@@ -253,7 +253,7 @@ impl Emulator {
 
     /// Fetch a URL this emulator signed, the way a client does: the whole URL, through the
     /// same router, with no credential of its own.
-    async fn follow(&self, case: &str, url: &str) -> (u16, bytes::Bytes) {
+    pub(crate) async fn follow(&self, case: &str, url: &str) -> (u16, bytes::Bytes) {
         let request = http::Request::builder()
             .method("GET")
             .uri(url)
@@ -264,7 +264,7 @@ impl Emulator {
     }
 
     /// A knowledge base with one custom data source, ready to be pushed documents.
-    async fn custom_source(&self, name: &str) -> Ingested {
+    pub(crate) async fn custom_source(&self, name: &str) -> Ingested {
         let knowledge_base_id = self.knowledge_base(name).await;
         let data_source_id = self.custom_data_source(&knowledge_base_id, name).await;
         Ingested {
@@ -275,7 +275,7 @@ impl Emulator {
 }
 
 /// One document pushed in with its content in S3.
-fn s3_document(id: &str, key: &str) -> Value {
+pub(crate) fn s3_document(id: &str, key: &str) -> Value {
     json!({
         "content": {
             "dataSourceType": "CUSTOM",
@@ -299,7 +299,8 @@ fn document_label(id: &str) -> String {
 }
 
 /// One document pushed in with its content defined inline in TEXT.
-fn inline_text_document(id: &str, text: &str) -> Value {    json!({
+pub(crate) fn inline_text_document(id: &str, text: &str) -> Value {
+    json!({
         "content": {
             "dataSourceType": "CUSTOM",
             "custom": {
@@ -317,7 +318,7 @@ fn inline_text_document(id: &str, text: &str) -> Value {    json!({
 /// One document pushed in with its content defined inline in BYTES, which travel
 /// base64-encoded on the wire (`ByteContentDoc$data` is a `@blob`), under the media type
 /// the ingestion declares for them.
-fn inline_byte_document(id: &str, mime_type: &str, bytes: &[u8]) -> Value {
+pub(crate) fn inline_byte_document(id: &str, mime_type: &str, bytes: &[u8]) -> Value {
     json!({
         "content": {
             "dataSourceType": "CUSTOM",

@@ -1967,3 +1967,13 @@ mod cloudtrail_iam_credential_write_audit;
 // one service crate, belongs in that suite's own module header; the notes earlier landings
 // appended to the end of this file live in `all/appended_notes.rs`.
 // explains; a note about this file itself belongs in `all/appended_notes.rs`.
+// lines in two places and have no prose to duplicate, re-word or mistype. Put a new suite
+// at `tests/all/<name>.rs` and insert its pair in order; what that suite covers, and why it
+// drives the assembled router rather than one service crate, belongs in its own module
+// header, beside the test it explains.
+// EVERY comment in this file is an ORDINARY `//` one, this header included: an inner doc
+// comment (`//!`) is legal only before the first item, so one appended past the list is
+// `E0753` and compiles no suite of this target. A second `mod` for one name is `E0428`, and
+// a suite no `mod` names compiles nowhere and its tests never run. Each of those fails every
+// suite in this target, and `all/all_rs_declares_each_suite_once.rs`,
+// declaration is what points it into `tests/all/`.

@@ -21,6 +21,8 @@ mod collection_length_refusals;
 mod date_time_wire_form;
 #[path = "all/document_content.rs"]
 mod document_content;
+#[path = "all/document_content_repeated_reads.rs"]
+mod document_content_repeated_reads;
 #[path = "all/inline_agent_invocations.rs"]
 mod inline_agent_invocations;
 #[path = "all/inline_agent_return_control.rs"]
