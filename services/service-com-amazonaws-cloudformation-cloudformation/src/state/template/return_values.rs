@@ -201,6 +201,10 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         EC2_DHCP_OPTIONS => &["DhcpOptionsId"],
         EC2_VPN_GATEWAY => &["VPNGatewayId"],
         EC2_NETWORK_ACL | EC2_NETWORK_INTERFACE | EC2_VPC_ENDPOINT => &["Id"],
+        // Source: each rule type's own "Return values" section — "Id: the ID of the security
+        // group rule", which is the `sgr-…` identifier Amazon EC2 mints for the rule the
+        // authorize call added and what that type's `Ref` returns as well.
+        EC2_SECURITY_GROUP_INGRESS | EC2_SECURITY_GROUP_EGRESS => &["Id"],
         EC2_VOLUME => &["VolumeId"],
         // Source: `AWS::EC2::LaunchTemplate`'s own "Return values" section — the id EC2
         // assigned the template, and the default and latest version numbers of it.
@@ -645,6 +649,14 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == EC2_VPN_GATEWAY
         || resource_type == EC2_NAT_GATEWAY
         || resource_type == EC2_EIP
+        // The two types that declare ONE security-group rule as a resource of its own are in
+        // the same position: neither create takes an identifier for the rule — the declaration
+        // states the group it is on and the permission it grants — Amazon EC2 mints the
+        // `sgr-` id for the rule it added, and "Ref returns the ID of the security group
+        // rule", so the identifier in force is the one that service answered the authorize
+        // with and is what the revoke on the way out names the rule by.
+        || resource_type == EC2_SECURITY_GROUP_INGRESS
+        || resource_type == EC2_SECURITY_GROUP_EGRESS
         // A LAUNCH TEMPLATE is one more: `CreateLaunchTemplate` takes the template's NAME and
         // no identifier — Amazon EC2 assigns the `lt-` id — and "Ref returns the launch
         // template ID", so the identifier in force is the one that service answered the
@@ -1706,6 +1718,15 @@ pub const EC2_SUBNET_ROUTE_TABLE_ASSOCIATION: &str = "AWS::EC2::SubnetRouteTable
 /// identity is an Amazon EC2 `<prefix>-` id — "Ref returns the Elastic IP address" — but its
 /// `AllocationId` return value is one, which is why it is read here.
 pub const EC2_EIP: &str = "AWS::EC2::EIP";
+
+/// `AWS::EC2::SecurityGroupIngress` and `AWS::EC2::SecurityGroupEgress`: ONE rule of a security
+/// group, declared as a resource of its own rather than inline on the group
+/// ([`EC2_SECURITY_GROUP`]'s `SecurityGroupIngress` / `SecurityGroupEgress` properties). The
+/// resource IS the rule, and its identity is the `sgr-…` id Amazon EC2 mints for the rule the
+/// authorize call adds — which is why [`identity_is_service_assigned`] names both types: a
+/// declaration states the group and the permission, never that id.
+pub const EC2_SECURITY_GROUP_INGRESS: &str = "AWS::EC2::SecurityGroupIngress";
+pub const EC2_SECURITY_GROUP_EGRESS: &str = "AWS::EC2::SecurityGroupEgress";
 
 /// `AWS::EC2::Volume`: an Amazon EBS volume. It is not a VPC-network type, but its identity
 /// is read exactly the same way — `CreateVolume` takes no name, Amazon EC2 assigns the

@@ -45,6 +45,11 @@ use ::std::collections::{BTreeMap, BTreeSet};
 
 use super::template::{self, DeclaredParameter};
 
+/// The AWS-specific parameter types, whose value names an EXISTING resource of the account:
+/// the one constraint a declaration's `Type` states that is resolved against another service
+/// rather than decided from the value alone.
+pub mod aws_specific_types;
+
 /// `Some(message)` when the parameter set a stack operation puts in force does not MATCH the
 /// set the template declares; `None` when the two agree.
 ///

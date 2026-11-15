@@ -63,6 +63,11 @@
 //!   address EC2 allocated, and the allocation id it answers beside that address is the
 //!   type's `AllocationId` attribute — the value every VPC use of the address is made with,
 //!   and the one the release this module sends on the way out names.
+//! * `AWS::EC2::SecurityGroupIngress`'s and `AWS::EC2::SecurityGroupEgress`'s are the group the
+//!   rule is on plus the ONE permission it is, which is the same permission an inline rule of
+//!   `AWS::EC2::SecurityGroup` declares — so each is one `AuthorizeSecurityGroupIngress` /
+//!   `AuthorizeSecurityGroupEgress` call, and the `sgr-…` id EC2 mints for the rule it added is
+//!   the resource's identity, which the revoke on the way out addresses the rule by.
 //!
 //! Each create carries only members of the call it is made with: a declared property this
 //! module does not apply is REFUSED ([`refuse_unmapped_properties`]), so a resource is never
@@ -82,7 +87,15 @@ use super::{
     call_query, xml_element, xml_elements, xml_scalar_children, Created, Readiness, Refusal,
     Removal,
 };
-use crate::state::provisioner::tags_of;
+// One inline rule of a security group is read into the `IpPermission` parameters an authorize
+// call takes by the group's own arm, against the published members of that rule property type
+// — and a rule declared as a RESOURCE of its own is the same permission under the same member
+// names, so the arms below are built from that reading rather than from a second copy of it.
+use crate::state::provisioner::{
+    security_group_rule_parameters, tags_of, EC2_SECURITY_GROUP_EGRESS_MEMBERS,
+    EC2_SECURITY_GROUP_INGRESS_MEMBERS,
+};
+use crate::state::template::{EC2_SECURITY_GROUP_EGRESS, EC2_SECURITY_GROUP_INGRESS};
 use crate::state::StoredResource;
 
 /// The resource types this module provisions.
@@ -145,6 +158,10 @@ pub(in crate::state) enum Kind {
     Route,
     /// `AWS::EC2::NatGateway`.
     NatGateway,
+    /// `AWS::EC2::SecurityGroupIngress`.
+    SecurityGroupIngress,
+    /// `AWS::EC2::SecurityGroupEgress`.
+    SecurityGroupEgress,
 }
 
 /// The kind `resource_type` names, or `None` for a type this module does not own.
@@ -159,6 +176,8 @@ pub(super) fn kind_of(resource_type: &str) -> Option<Kind> {
         EC2_EIP => Some(Kind::ElasticIp),
         EC2_ROUTE => Some(Kind::Route),
         EC2_NAT_GATEWAY => Some(Kind::NatGateway),
+        EC2_SECURITY_GROUP_INGRESS => Some(Kind::SecurityGroupIngress),
+        EC2_SECURITY_GROUP_EGRESS => Some(Kind::SecurityGroupEgress),
         _ => None,
     }
 }
@@ -367,6 +386,11 @@ pub(super) async fn create(
         Kind::ElasticIp => allocate_address(ctx, region, resource, propagated).await,
         Kind::Route => create_route(ctx, region, resource).await,
         Kind::NatGateway => create_nat_gateway(ctx, region, resource, propagated).await,
+        // Neither rule type publishes a `Tags` property, so CloudFormation propagates no tag
+        // to one: the rule is the permission its declaration states and nothing else.
+        Kind::SecurityGroupIngress | Kind::SecurityGroupEgress => {
+            authorize_security_group_rule(ctx, region, kind, resource).await
+        }
     }
 }
 
@@ -508,7 +532,217 @@ pub(super) async fn delete(
         // resource was created from.
         Kind::Route => delete_route(ctx, region, resource).await,
         Kind::NatGateway => delete_nat_gateway(ctx, region, &id).await,
+        Kind::SecurityGroupIngress | Kind::SecurityGroupEgress => {
+            revoke_security_group_rule(ctx, region, kind, resource).await
+        }
     }
+}
+
+/// Every property `AWS::EC2::SecurityGroupIngress` publishes, from AWS's CloudFormation
+/// resource reference for the type read against `AuthorizeSecurityGroupIngress`'s member list
+/// (`smithy_query(query="operation",operation="AuthorizeSecurityGroupIngress")`).
+///
+/// `GroupId` and `GroupName` name the GROUP the rule is added to, which that call takes beside
+/// the permission ([`named_group`]); every other property is a member of the ONE permission the
+/// rule is — the same members an inline rule of `AWS::EC2::SecurityGroup` declares
+/// ([`EC2_SECURITY_GROUP_INGRESS_MEMBERS`]), with `Description` carried on the source the rule
+/// references.
+const SECURITY_GROUP_INGRESS_PROPERTIES: &[&str] = &[
+    "CidrIp",
+    "CidrIpv6",
+    "Description",
+    "FromPort",
+    "GroupId",
+    "GroupName",
+    "IpProtocol",
+    "SourcePrefixListId",
+    "SourceSecurityGroupId",
+    "SourceSecurityGroupName",
+    "SourceSecurityGroupOwnerId",
+    "ToPort",
+];
+
+/// Every property `AWS::EC2::SecurityGroupEgress` publishes, read the same way against
+/// `AuthorizeSecurityGroupEgress`: an outbound rule names a DESTINATION rather than a source,
+/// and that call takes the group by id alone (`$GroupId` is its one required member), which is
+/// what the type requires too.
+const SECURITY_GROUP_EGRESS_PROPERTIES: &[&str] = &[
+    "CidrIp",
+    "CidrIpv6",
+    "Description",
+    "DestinationPrefixListId",
+    "DestinationSecurityGroupId",
+    "FromPort",
+    "GroupId",
+    "IpProtocol",
+    "ToPort",
+];
+
+/// The properties of either rule type that name the GROUP rather than the permission: they
+/// travel as the authorize call's own group member, not inside its `IpPermissions` entry.
+const RULE_GROUP_PROPERTIES: &[&str] = &["GroupId", "GroupName"];
+
+/// Add the ONE security-group rule an `AWS::EC2::SecurityGroupIngress` or an
+/// `AWS::EC2::SecurityGroupEgress` declares to the group it names, in Amazon EC2 — so the group
+/// a stack deployed really lets through what the template allowed, and
+/// `DescribeSecurityGroups` reports the rule among that group's `IpPermissions`.
+///
+/// A rule declared as a resource of its own is ONE permission of the authorize call for its
+/// direction, exactly as an inline rule of the group is: "each entry of either rule property is
+/// one permission of `AuthorizeSecurityGroupIngress` / `AuthorizeSecurityGroupEgress`", and the
+/// members are the same. Unlike an inline OUTBOUND declaration, a standalone egress rule leaves
+/// the all-traffic rule Amazon EC2 gives a new group where it is: that rule is removed when the
+/// GROUP's own declaration states outbound rules, which is a statement about the group's
+/// `SecurityGroupEgress` property rather than about a rule resource added later.
+///
+/// "Ref returns the ID of the security group rule", which Amazon EC2 MINTS for the rule it
+/// added (`SecurityGroupRule$SecurityGroupRuleId`) — so that id is what this answers as the
+/// resource's physical id and as its one published attribute, the stack publishing an `sgr-…`
+/// identifier that service really holds a rule for and that the revoke on the way out addresses
+/// the rule by.
+async fn authorize_security_group_rule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    kind: Kind,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let outbound = kind == Kind::SecurityGroupEgress;
+    let (published, members, action) = if outbound {
+        (
+            SECURITY_GROUP_EGRESS_PROPERTIES,
+            EC2_SECURITY_GROUP_EGRESS_MEMBERS,
+            "AuthorizeSecurityGroupEgress",
+        )
+    } else {
+        (
+            SECURITY_GROUP_INGRESS_PROPERTIES,
+            EC2_SECURITY_GROUP_INGRESS_MEMBERS,
+            "AuthorizeSecurityGroupIngress",
+        )
+    };
+    refuse_unmapped_properties(resource, published)?;
+    let mut parameters = vec![named_group(resource, outbound)?];
+    parameters.extend(security_group_rule_parameters(
+        &declared_permission(resource),
+        members,
+    )?);
+    let answered = call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        action,
+        &parameters,
+    )
+    .await?;
+    // "Information about the inbound (ingress) security group rules that were added"
+    // (`$SecurityGroupRules`): one rule per source the permission grants, and this permission
+    // grants one — so the set carries the rule this resource IS.
+    let rule_id = set_entry(&answered, "securityGroupRuleSet", "securityGroupRuleId")
+        .ok_or_else(|| Refusal {
+            code: "InvalidRequest".to_string(),
+            message: format!("{action} answered no securityGroupRuleId"),
+        })?;
+    // The one attribute the type publishes: "Id — the ID of the security group rule", which IS
+    // the id EC2 minted.
+    let mut attributes = BTreeMap::new();
+    attributes.insert("Id".to_string(), rule_id.clone());
+    Ok(Created {
+        physical_resource_id: Some(rule_id),
+        attributes,
+    })
+}
+
+/// Take the rule one of those resources added back off its group, addressed by the
+/// `sgr-…` id Amazon EC2 minted for it — this resource's physical id — on the group its
+/// declaration named.
+///
+/// A rule that group no longer holds, and a group EC2 no longer holds at all, are each already
+/// in the state this delete asks for ([`NOT_FOUND_SUFFIX`] covers both
+/// `InvalidPermission.NotFound` and `InvalidGroup.NotFound`).
+async fn revoke_security_group_rule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    kind: Kind,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let outbound = kind == Kind::SecurityGroupEgress;
+    let action = if outbound {
+        "RevokeSecurityGroupEgress"
+    } else {
+        "RevokeSecurityGroupIngress"
+    };
+    let parameters = vec![
+        named_group(resource, outbound)?,
+        (
+            "SecurityGroupRuleId.1".to_string(),
+            resource.physical_resource_id.clone(),
+        ),
+    ];
+    forgiving(
+        call_query(
+            ctx,
+            EC2_SIGNING_NAME,
+            region,
+            EC2_API_VERSION,
+            action,
+            &parameters,
+        )
+        .await,
+    )
+    .map(|_| ())
+}
+
+/// The group a rule resource is on, as the parameter the authorize and the revoke for its
+/// direction name that group by.
+///
+/// An OUTBOUND rule names it by id alone — `$GroupId` is the one member either outbound call
+/// takes for it, and the type requires the property — while an inbound one may name it by
+/// either, "[Default VPC] the name of the security group" being the other spelling
+/// (`AuthorizeSecurityGroupIngress$GroupName`). A declaration naming the group nowhere is
+/// REFUSED rather than sent without it: the rule would be added to no group at all.
+fn named_group(
+    resource: &StoredResource,
+    outbound: bool,
+) -> Result<(String, String), Refusal> {
+    if let Some(group_id) = scalar(resource, "GroupId") {
+        return Ok(("GroupId".to_string(), group_id));
+    }
+    if !outbound {
+        if let Some(group_name) = scalar(resource, "GroupName") {
+            return Ok(("GroupName".to_string(), group_name));
+        }
+    }
+    // Amazon EC2's own code for a request that left out a member it cannot be served without
+    // (`MissingParameter`), naming the property that was needed — both acceptable spellings
+    // where the declaration had the choice.
+    let needed = if outbound {
+        "GroupId".to_string()
+    } else {
+        "GroupId or GroupName".to_string()
+    };
+    Err(Refusal {
+        code: "MissingParameter".to_string(),
+        message: format!(
+            "{} requires the {needed} property",
+            resource.resource_type
+        ),
+    })
+}
+
+/// The PERMISSION a rule resource declares: its properties but the ones that name the group,
+/// read as the one inline rule the shared reader turns into `IpPermissions.1.…` parameters.
+fn declared_permission(resource: &StoredResource) -> Value {
+    let Value::Object(properties) = &resource.properties else {
+        return Value::Object(serde_json::Map::new());
+    };
+    Value::Object(
+        properties
+            .iter()
+            .filter(|(property, _)| !RULE_GROUP_PROPERTIES.contains(&property.as_str()))
+            .map(|(property, value)| (property.clone(), value.clone()))
+            .collect(),
+    )
 }
 
 /// Create the route table an `AWS::EC2::RouteTable` declares, in Amazon EC2.
@@ -1181,7 +1415,12 @@ async fn nat_gateway_state(
 /// entries in and then to that set's first `<item>`'s own direct children, so a member of the
 /// same name nested deeper cannot be mistaken for it. Every read through this names ONE id, so
 /// the set holds one entry.
-pub(super) fn set_entry(document: &str, set: &str, member: &str) -> Option<String> {
+///
+/// Visible to the rest of this service's state because what a describe REPORTED for one
+/// identifier is also the question an AWS-specifically typed template parameter is resolved by
+/// ([`crate::state::parameter_constraints::aws_specific_types`]), which reads an answer of the
+/// same shape and must read it the same way.
+pub(in crate::state) fn set_entry(document: &str, set: &str, member: &str) -> Option<String> {
     let entries = document
         .find(&format!("<{set}>"))
         .map(|start| &document[start..])?;
@@ -1420,6 +1659,108 @@ mod tests {
                  {EC2_ROUTE}, got none"
             );
         }
+        // Every member of the permission a rule RESOURCE sends is a published property of that
+        // rule type, and so is each of the two that name the group it is on.
+        for (property, _) in EC2_SECURITY_GROUP_INGRESS_MEMBERS {
+            assert!(
+                SECURITY_GROUP_INGRESS_PROPERTIES.contains(property),
+                "case {property:?}: expected the sent member to be a published property of \
+                 {EC2_SECURITY_GROUP_INGRESS}, got none"
+            );
+        }
+        for (property, _) in EC2_SECURITY_GROUP_EGRESS_MEMBERS {
+            assert!(
+                SECURITY_GROUP_EGRESS_PROPERTIES.contains(property),
+                "case {property:?}: expected the sent member to be a published property of \
+                 {EC2_SECURITY_GROUP_EGRESS}, got none"
+            );
+        }
+        for property in RULE_GROUP_PROPERTIES {
+            assert!(
+                SECURITY_GROUP_INGRESS_PROPERTIES.contains(property),
+                "case {property:?}: expected the group member to be a published property of \
+                 {EC2_SECURITY_GROUP_INGRESS}, got none"
+            );
+        }
+    }
+
+    /// RULE: a rule resource is the group it names plus the ONE permission the rest of its
+    /// properties are — so the group travels as the authorize call's own member and never
+    /// inside the permission, an outbound rule names its group by id alone, and a declaration
+    /// naming no group at all is refused rather than authorized onto nothing.
+    #[test]
+    fn a_rule_resource_names_its_group_and_one_permission() {
+        let inbound = declared(
+            EC2_SECURITY_GROUP_INGRESS,
+            serde_json::json!({
+                "GroupId": "sg-0123456789abcdef0",
+                "IpProtocol": "tcp",
+                "FromPort": 443,
+                "ToPort": 443,
+                "SourceSecurityGroupId": "sg-00112233445566778",
+                "Description": "https from the peer",
+            }),
+        );
+        let group = named_group(&inbound, false).expect("the group the rule is on");
+        assert_eq!(
+            group,
+            ("GroupId".to_string(), "sg-0123456789abcdef0".to_string()),
+            "case \"a rule on a group by id\": expected the group member, got {group:?}"
+        );
+        let permission = security_group_rule_parameters(
+            &declared_permission(&inbound),
+            EC2_SECURITY_GROUP_INGRESS_MEMBERS,
+        )
+        .expect("the permission the rule is");
+        // In the order the declaration states its members, each against the `IpPermission`
+        // member it is: the group's own property is not among them.
+        let expected: Vec<(String, String)> = vec![
+            ("IpPermissions.1.IpProtocol".to_string(), "tcp".to_string()),
+            ("IpPermissions.1.FromPort".to_string(), "443".to_string()),
+            ("IpPermissions.1.ToPort".to_string(), "443".to_string()),
+            (
+                "IpPermissions.1.Groups.1.GroupId".to_string(),
+                "sg-00112233445566778".to_string(),
+            ),
+            (
+                "IpPermissions.1.Groups.1.Description".to_string(),
+                "https from the peer".to_string(),
+            ),
+        ];
+        assert_eq!(
+            permission, expected,
+            "case \"a rule referencing another group\": expected {expected:?}, got \
+             {permission:?}"
+        );
+        let by_name = declared(
+            EC2_SECURITY_GROUP_INGRESS,
+            serde_json::json!({ "GroupName": "default", "IpProtocol": "-1" }),
+        );
+        let named = named_group(&by_name, false).expect("the group the rule is on");
+        assert_eq!(
+            named,
+            ("GroupName".to_string(), "default".to_string()),
+            "case \"an inbound rule on a group by name\": expected the name member, got \
+             {named:?}"
+        );
+        let outbound_by_name = named_group(&by_name, true);
+        assert!(
+            outbound_by_name.is_err(),
+            "case \"an outbound rule on a group by name\": expected a refusal naming the \
+             required property, got {outbound_by_name:?}"
+        );
+        let groupless = named_group(
+            &declared(
+                EC2_SECURITY_GROUP_EGRESS,
+                serde_json::json!({ "IpProtocol": "-1", "CidrIp": "0.0.0.0/0" }),
+            ),
+            true,
+        );
+        assert!(
+            groupless.is_err(),
+            "case \"a rule naming no group\": expected a refusal naming the required \
+             property, got {groupless:?}"
+        );
     }
 
     /// Each of the three types is owned by this module, and nothing else is.
@@ -1441,6 +1782,11 @@ mod tests {
             (EC2_EIP, Some(Kind::ElasticIp)),
             (EC2_ROUTE, Some(Kind::Route)),
             (EC2_NAT_GATEWAY, Some(Kind::NatGateway)),
+            (
+                EC2_SECURITY_GROUP_INGRESS,
+                Some(Kind::SecurityGroupIngress),
+            ),
+            (EC2_SECURITY_GROUP_EGRESS, Some(Kind::SecurityGroupEgress)),
             ("AWS::EC2::VPC", None),
             ("AWS::EC2::EIPAssociation", None),
         ];

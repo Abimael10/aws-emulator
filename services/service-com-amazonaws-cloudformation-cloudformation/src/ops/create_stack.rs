@@ -636,6 +636,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &template_body,
             &parameter_values,
         );
+        // "AWS-specific parameter types […] help ensure that the values are valid": a
+        // parameter whose declared `Type` is one of them carries the identifier of an
+        // EXISTING resource of this account and Region, so each such value is resolved
+        // against the service that owns the resource HERE — before anything is created, and
+        // with no store lock held. A value that names none is no value of that parameter, so
+        // the create this call opens fails with that diagnosis and rolls back, exactly as a
+        // `Rules` assertion the values do not satisfy does
+        // (`crate::state::parameter_constraints::aws_specific_types`).
+        let parameter_failure =
+            crate::state::parameter_constraints::aws_specific_types::deployment_failure(
+                ctx,
+                &crate::state::request_region(ctx.parts()),
+                &template_body,
+                &parameters,
+            )
+            .await;
 
         // "CloudFormation uses the role's credentials to make calls on your behalf": a
         // role whose trust policy does not let cloudformation.amazonaws.com assume it is
@@ -761,8 +777,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A `Rules` assertion the values in force do not satisfy, or a directive the
             // declared transform cannot apply where it stands, fails this create the same
             // way: the stack is created, deploys nothing, and settles into the rollback
-            // below carrying that reason.
-            .or(deployment_failure);
+            // below carrying that reason. So does an AWS-specifically typed parameter whose
+            // value names no resource of this account, which is a value the template could
+            // never have been deployed with.
+            .or(deployment_failure)
+            .or(parameter_failure);
 
         // Everything the template's resources and outputs are computed from is now in
         // place: materialise the resources its PROCESSED stage declares and evaluate its

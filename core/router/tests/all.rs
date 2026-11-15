@@ -1231,3 +1231,16 @@ mod zz_probe_whole_emulator;
 //! not a note about one. `all/all_rs_declares_each_suite_once.rs` and
 //! this file and for every service crate's `tests/all.rs`, so check there rather than leaving
 //! a note here.
+//! sorted. A suite that is not declared here compiles nowhere and its tests never run, and
+//! a suite left at the top level of `tests/` is a test target of its own, which fails the
+//! build.
+//! Declare each suite exactly ONCE: this is one crate root, so a second `mod` for the same
+//! name is `E0428` and fails every suite in this target.
+//! `all/all_rs_declares_each_suite_once.rs` checks that, for this file and for every service
+//! crate's `tests/all.rs`, and `all/all_rs_inner_doc_comments_precede_the_first_item.rs`
+//! checks that a note like this one stays HERE: an inner doc comment past the first item is
+//! `E0753`, so the same note appended to the tail of this file compiles no suite of this
+//! target.
+//! WHY a suite lives in this target rather than in a service crate's own — it drives more
+//! than one service over the assembled router — is stated in that suite's OWN module doc,
+//! which is where it stays current; this file is the declaration list and nothing else.

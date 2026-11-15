@@ -564,6 +564,43 @@ pub const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
 /// See [`SETTLE_DEADLINE`].
 pub const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Poll `DescribeStacks` the way a client's waiter does and answer the RESPONSE the settled
+/// stack was reported by: the HTTP status and the body of the first read whose `StackStatus` is
+/// not an operation in flight, and the first read this service answers with something other
+/// than 200 — which is what a completed DELETION leaves behind.
+///
+/// The ONE waiter of this target, which the two readers below are built on: a stack's terminal
+/// status is due at an INSTANT this service records, so what a caller waits for is that status
+/// appearing, under [`SETTLE_DEADLINE`].
+async fn settled_stack_response(
+    case: &str,
+    router: &MultiServiceRouter,
+    region: &str,
+    stack: &str,
+) -> (u16, String) {
+    let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        let (code, body) =
+            call_in(router, region, "DescribeStacks", &[member("StackName", stack)]).await;
+        if code != 200 {
+            return (code, body);
+        }
+        let reported = xml_text(&body, "StackStatus").unwrap_or_default();
+        if !reported.is_empty() && !reported.ends_with("_IN_PROGRESS") {
+            return (code, body);
+        }
+        if seen.last().map(String::as_str) != Some(reported.as_str()) {
+            seen.push(reported);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected {stack} to settle, saw {seen:?}"
+        );
+        tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
+    }
+}
+
 /// Poll `DescribeStacks` the way a client's waiter does and answer the `StackStatus` the stack
 /// SETTLED on — the first status that is not an operation in flight.
 ///
@@ -576,27 +613,28 @@ pub async fn settled_stack_status(
     region: &str,
     stack: &str,
 ) -> String {
-    let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
-    let mut seen: Vec<String> = Vec::new();
-    loop {
-        let (code, body) =
-            call_in(router, region, "DescribeStacks", &[member("StackName", stack)]).await;
-        assert_eq!(
-            code, 200,
-            "case {case:?}: DescribeStacks must answer 200, got {code} {body}"
-        );
-        let reported = xml_text(&body, "StackStatus").unwrap_or_default();
-        if !reported.is_empty() && !reported.ends_with("_IN_PROGRESS") {
-            return reported;
-        }
-        if seen.last().map(String::as_str) != Some(reported.as_str()) {
-            seen.push(reported);
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "case {case:?}: expected {stack} to settle, saw {seen:?}"
-        );
-        tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
+    let (code, body) = settled_stack_response(case, router, region, stack).await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: DescribeStacks must answer 200, got {code} {body}"
+    );
+    xml_text(&body, "StackStatus").unwrap_or_default()
+}
+
+/// The same wait, answered with the settled stack's whole `DescribeStacks` BODY — for a suite
+/// that reads what the stack reported beside its status (its `StackStatusReason`, its outputs).
+///
+/// The empty string where this service no longer reports the stack at all, which is what a
+/// completed deletion can leave behind.
+pub async fn settled_stack(
+    case: &str,
+    router: &MultiServiceRouter,
+    region: &str,
+    stack: &str,
+) -> String {
+    match settled_stack_response(case, router, region, stack).await {
+        (200, body) => body,
+        _ => String::new(),
     }
 }
 

@@ -90,7 +90,10 @@ fn request_parameters(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 struct Held {
     name: &'static str,
     parameter_type: &'static str,
-    value: &'static str,
+    /// Owned, because a row whose inner type is an AWS-SPECIFIC one holds the identifier of a
+    /// resource the account really has: such a value is resolved against the service that owns
+    /// it, so the row reads the identifier off that service rather than stating one of its own.
+    value: String,
 }
 
 /// One row: a template, the parameters the request supplies, what each output must report
@@ -104,14 +107,30 @@ struct Case {
     /// `(OutputKey, OutputValue)`.
     outputs: Vec<(&'static str, String)>,
     /// `(ParameterKey, ParameterValue, ResolvedValue)`.
-    reported: Vec<(&'static str, &'static str, Option<&'static str>)>,
+    reported: Vec<(&'static str, &'static str, Option<String>)>,
 }
 
 fn sns_arn(name: &str) -> String {
     format!("arn:aws:sns:{REGION}:{ACCOUNT_ID}:{name}")
 }
 
-fn cases() -> Vec<Case> {
+/// The id of a public image the account can already see, read off Amazon EC2's own catalogue
+/// ("the images available to you include public images"), for the row whose inner type is an
+/// AWS-specific one: that type's value names an EXISTING image, so the row resolves against
+/// the image EC2 really holds rather than an identifier of its own.
+async fn published_image_id(router: &MultiServiceRouter) -> String {
+    let (status, body) = crate::stack_lifecycle::ec2(router, "DescribeImages", &[]).await;
+    assert_eq!(
+        status, 200,
+        "DescribeImages must answer 200, got {status} {body}"
+    );
+    xml_texts(&body, "imageId")
+        .into_iter()
+        .next()
+        .expect("a public image of the Region")
+}
+
+fn cases(image_id: &str) -> Vec<Case> {
     vec![
         Case {
             case: "a String parameter, named by the template's own Default",
@@ -119,7 +138,7 @@ fn cases() -> Vec<Case> {
             held: vec![Held {
                 name: "/probe/bootstrap-version",
                 parameter_type: "String",
-                value: "21",
+                value: "21".to_string(),
             }],
             // YAML, short-form intrinsics. The topic's NAME is built from the parameter, so
             // the resource the stack really creates in Amazon SNS is named from the value
@@ -151,7 +170,7 @@ Outputs:
             reported: vec![(
                 "BootstrapVersion",
                 "/probe/bootstrap-version",
-                Some("21"),
+                Some("21".to_string()),
             )],
         },
         Case {
@@ -161,12 +180,12 @@ Outputs:
                 Held {
                     name: "/probe/default-version",
                     parameter_type: "String",
-                    value: "7",
+                    value: "7".to_string(),
                 },
                 Held {
                     name: "/probe/requested-version",
                     parameter_type: "String",
-                    value: "42",
+                    value: "42".to_string(),
                 },
             ],
             template: r#"Parameters:
@@ -185,7 +204,11 @@ Outputs:
             // The request's own name wins over the declared Default, and the value is that
             // parameter's.
             outputs: vec![("Resolved", "42".to_string())],
-            reported: vec![("Version", "/probe/requested-version", Some("42"))],
+            reported: vec![(
+                "Version",
+                "/probe/requested-version",
+                Some("42".to_string()),
+            )],
         },
         Case {
             case: "a List<String> inner type is a list to every function that reads it",
@@ -193,7 +216,7 @@ Outputs:
             held: vec![Held {
                 name: "/probe/subnets",
                 parameter_type: "StringList",
-                value: "subnet-00000000000000001,subnet-00000000000000002",
+                value: "subnet-00000000000000001,subnet-00000000000000002".to_string(),
             }],
             // JSON, long-form intrinsics.
             template: r#"{"Parameters":{
@@ -217,7 +240,7 @@ Outputs:
             reported: vec![(
                 "Subnets",
                 "/probe/subnets",
-                Some("subnet-00000000000000001,subnet-00000000000000002"),
+                Some("subnet-00000000000000001,subnet-00000000000000002".to_string()),
             )],
         },
         Case {
@@ -228,7 +251,7 @@ Outputs:
                 parameter_type: "StringList",
                 // "An array of literal strings that are separated by commas": the spaces
                 // around an element are not part of it.
-                value: "dev, prod",
+                value: "dev, prod".to_string(),
             }],
             template: r#"{"Parameters":{
                    "Stages":{"Type":"AWS::SSM::Parameter::Value<CommaDelimitedList>",
@@ -243,7 +266,7 @@ Outputs:
                 ("Second", "prod".to_string()),
                 ("Joined", "dev+prod".to_string()),
             ],
-            reported: vec![("Stages", "/probe/stages", Some("dev, prod"))],
+            reported: vec![("Stages", "/probe/stages", Some("dev, prod".to_string()))],
         },
         Case {
             case: "an AWS-specific inner type resolves to one value",
@@ -251,7 +274,7 @@ Outputs:
             held: vec![Held {
                 name: "/probe/ami",
                 parameter_type: "String",
-                value: "ami-00000000000000001",
+                value: image_id.to_string(),
             }],
             template: r#"Parameters:
   ImageId:
@@ -266,8 +289,8 @@ Outputs:
 "#
             .to_string(),
             parameters: vec![],
-            outputs: vec![("Resolved", "ami-00000000000000001".to_string())],
-            reported: vec![("ImageId", "/probe/ami", Some("ami-00000000000000001"))],
+            outputs: vec![("Resolved", image_id.to_string())],
+            reported: vec![("ImageId", "/probe/ami", Some(image_id.to_string()))],
         },
         Case {
             // The complement: "AWS::SSM::Parameter::Name — the name of a Systems Manager
@@ -278,7 +301,7 @@ Outputs:
             held: vec![Held {
                 name: "/probe/named-key",
                 parameter_type: "String",
-                value: "never-substituted",
+                value: "never-substituted".to_string(),
             }],
             template: r#"Parameters:
   Key:
@@ -307,7 +330,7 @@ async fn hold(router: &MultiServiceRouter, case: &str, held: &[Held]) {
             case,
             parameter.name,
             parameter.parameter_type,
-            parameter.value,
+            &parameter.value,
         )
         .await;
     }
@@ -317,7 +340,7 @@ async fn hold(router: &MultiServiceRouter, case: &str, held: &[Held]) {
 async fn an_ssm_typed_parameter_is_deployed_as_the_value_parameter_store_holds() {
     let router = router();
 
-    for case in cases() {
+    for case in cases(&published_image_id(&router).await) {
         hold(&router, case.case, &case.held).await;
 
         let (status_code, body) = create_stack(
@@ -368,7 +391,7 @@ async fn an_ssm_typed_parameter_is_deployed_as_the_value_parameter_store_holds()
             });
             assert_eq!(
                 found.map(|parameter| (parameter.value.as_deref(), parameter.resolved_value.as_deref())),
-                Some((Some(*value), *resolved)),
+                Some((Some(*value), resolved.as_deref())),
                 "case {:?}: parameter {key:?} must report the name {value:?} and the \
                  resolved value {resolved:?}, got {found:?}",
                 case.case

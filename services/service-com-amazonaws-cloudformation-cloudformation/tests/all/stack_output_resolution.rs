@@ -195,8 +195,13 @@ Outputs:
         Case {
             case: "a list-typed parameter is a list to every function that reads it",
             stack_name: "typed-parameters",
+            // `List<String>` rather than a list of an AWS-SPECIFIC type: what this row is
+            // about is the list-ness a `List<…>` type gives a value, and a parameter of an
+            // AWS-specific type carries the identifier of a resource the account really has —
+            // which is resolved against the service that owns it, and is covered where that
+            // resolution lives (`ec2_typed_parameter_resolution.rs`).
             template: r#"{"Transform":"AWS::LanguageExtensions","Parameters":{
-                   "SubnetIds":{"Type":"List<AWS::EC2::Subnet::Id>"},
+                   "SubnetIds":{"Type":"List<String>"},
                    "Stages":{"Type":"CommaDelimitedList"},
                    "Single":{"Type":"String"}},
                  "Outputs":{

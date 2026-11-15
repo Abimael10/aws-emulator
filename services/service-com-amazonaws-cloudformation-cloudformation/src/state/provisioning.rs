@@ -236,7 +236,12 @@ pub(super) mod dynamodb_table;
 /// `AWS::EC2::Instance`: the instance a stack declares, launched in Amazon EC2 itself
 /// ([`ec2_instance`]).
 mod ec2_instance;
-mod ec2_vpc_network;
+/// The Amazon EC2 VPC-network types a stack declares, created in Amazon EC2 itself, beside
+/// the readers of that service's own answers that their arms are built from: visible to the
+/// rest of this service's state because the reading of a describe's RESULT SET
+/// ([`ec2_vpc_network::set_entry`]) is what resolves an AWS-specifically typed parameter's
+/// value too ([`super::parameter_constraints::aws_specific_types`]).
+pub(super) mod ec2_vpc_network;
 /// `AWS::ECS::TaskDefinition`: the revision a stack declares, registered in Amazon ECS
 /// itself ([`ecs_task_definition`]).
 mod ecs_task_definition;

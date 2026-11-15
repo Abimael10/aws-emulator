@@ -165,8 +165,14 @@ mod ec2_network_stack_drift;
 mod ec2_network_stack_resources;
 #[path = "all/ec2_refused_resource_sdk_diagnostic.rs"]
 mod ec2_refused_resource_sdk_diagnostic;
+#[path = "all/ec2_security_group_rule_resources.rs"]
+mod ec2_security_group_rule_resources;
 #[path = "all/ec2_security_group_stack_resources.rs"]
 mod ec2_security_group_stack_resources;
+#[path = "all/ec2_typed_parameter_resolution.rs"]
+mod ec2_typed_parameter_resolution;
+#[path = "all/ec2_typed_parameters.rs"]
+mod ec2_typed_parameters;
 #[path = "all/ec2_vpc_gateway_stack_resources.rs"]
 mod ec2_vpc_gateway_stack_resources;
 #[path = "all/ecs_elbv2_stack_identifiers.rs"]

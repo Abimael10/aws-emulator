@@ -65,6 +65,17 @@ pub(crate) async fn describe_stack(
     .await
 }
 
+/// Poll `stack` until it reports a status no operation is still in flight in, and answer the
+/// body that reported it — the shared waiter of this target
+/// ([`crate::harness::settled_stack`]), under the Region these suites deploy in.
+pub(crate) async fn settled_stack(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+) -> String {
+    crate::harness::settled_stack(case, router, REGION, stack).await
+}
+
 /// Percent-encode one form value, so a template body carrying `{`, `"`, `&` or a
 /// multi-byte character survives the body.
 ///

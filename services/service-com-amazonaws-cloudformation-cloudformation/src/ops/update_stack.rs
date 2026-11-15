@@ -779,6 +779,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &template_body,
             &parameter_values,
         );
+        // The same AWS-specific parameter-type resolution a create performs: a parameter
+        // whose declared `Type` is one of them carries the identifier of an EXISTING resource
+        // of this account and Region, so each such value is resolved against the service that
+        // owns the resource before anything is changed. A value that names none fails this
+        // update, which leaves the stack as it was
+        // (`crate::state::parameter_constraints::aws_specific_types`).
+        let parameter_failure =
+            crate::state::parameter_constraints::aws_specific_types::deployment_failure(
+                ctx,
+                &request_region,
+                &template_body,
+                &parameters,
+            )
+            .await;
         // "If you don't specify this parameter, CloudFormation doesn't modify the stack's
         // tags. If you specify an empty value, CloudFormation removes all associated
         // tags." The same shape holds for the other collection members the request may
@@ -858,7 +872,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::include::Processed::Failed(reason) => Some(reason.clone()),
             _ => None,
         }
-        .or(deployment_failure);
+        .or(deployment_failure)
+        .or(parameter_failure);
         // The transforms the template DECLARES are applied to the spliced document, so the
         // stage this update deploys and `GetTemplate` serves is the whole pipeline's — and
         // that expansion, like the splice, happens before the store lock below.
