@@ -1940,3 +1940,12 @@ mod cloudformation_cloudfront_published_edge_address;
 // `clippy::doc_lazy_continuation` asks for, so the lint is allowed for this whole test
 // target here. An inner ATTRIBUTE, like an inner doc comment, is legal only before the first
 // item, which is why it stands in this header rather than in the list below.
+// Single integration-test target for the router: the declaration list, and nothing else.
+// `tests/all/<name>.rs` and insert its pair in order; what a suite covers, and why it drives
+// the assembled router rather than one service crate, belongs in that suite's own module
+// header, where it is read beside the test it explains.
+// EVERY comment in this file is an ordinary `//` one, this header included, and that is
+// deliberate: an inner doc comment is legal only before the first item, so one that lands
+// past the declarations is `E0753` and compiles no suite of this target. With no inner doc
+// note here; `all/appended_notes.rs` records what the notes landings had appended to this file
+// said.

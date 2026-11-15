@@ -55,6 +55,8 @@ mod reported_output_members;
 mod resiliency_policy_deletion;
 #[path = "all/resiliency_policy_update.rs"]
 mod resiliency_policy_update;
+#[path = "all/resolution_handle_identity.rs"]
+mod resolution_handle_identity;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

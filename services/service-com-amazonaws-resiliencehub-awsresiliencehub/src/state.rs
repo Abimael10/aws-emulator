@@ -420,7 +420,8 @@ impl AppAssessmentRecord {
 #[derive(Debug, Clone)]
 pub struct ResourceResolution {
     /// The server-generated `resolutionId` this resolution is addressed by —
-    /// unique within this emulator, and never derived from the request.
+    /// unique within this emulator, and never derived from the request. Minted by
+    /// [`mint_resolution_id`], this record's own handle minter.
     pub resolution_id: String,
     /// When this resolution finishes: the instant the clock owes its move from
     /// the non-terminal status to the terminal one, whether or not anybody asks.
@@ -431,7 +432,7 @@ impl ResourceResolution {
     /// A resolution started at `now`, finishing one [`RESOLUTION_SPAN`] later.
     pub fn started_at(now: ::std::time::SystemTime) -> Self {
         Self {
-            resolution_id: mint_resource_id(),
+            resolution_id: mint_resolution_id(),
             completes_at: now + RESOLUTION_SPAN,
         }
     }
@@ -1246,8 +1247,12 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// The next server-generated resource id, as the canonical 8-4-4-4-12 form AWS gives
-/// a Resilience Hub application, resiliency policy or resource resolution.
+/// The next server-generated resource id — the id SEGMENT of an ARN this service
+/// mints — as the canonical 8-4-4-4-12 form AWS gives a Resilience Hub
+/// application, resiliency policy or application assessment.
+///
+/// A resource resolution has no ARN and takes its handle from
+/// [`mint_resolution_id`] instead.
 ///
 /// OPAQUE: a fresh version-4 UUID, drawn from the operating system's random source
 /// by the maintained `uuid` crate, so every nibble a client may inspect — the
@@ -1261,6 +1266,29 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// hands out do not collide, within a run or across a restart. Server-generated,
 /// never derived from the request.
 fn mint_resource_id() -> String {
+    ::uuid::Uuid::new_v4().hyphenated().to_string()
+}
+
+/// The handle one resource resolution is addressed by, minted when that
+/// resolution is STARTED.
+///
+/// A resolution is not a resource: it carries no ARN, it is reached only through
+/// the app version it belongs to, and the model constrains the members that carry
+/// it (`ResolveAppVersionResources`, `DescribeAppVersionResourcesResolutionStatus`
+/// and the resolution-scoped listings all target `String255`) by LENGTH alone,
+/// documenting it as the identifier for a specific resolution. So this is a
+/// HANDLE, and what it has to be is opaque: a fresh version-4 UUID from the
+/// operating system's random source, carrying nothing the request that started the
+/// resolution supplied, no minting instant and no ordering a client could read a
+/// neighbouring resolution's handle out of, and unique — 122 random bits — within
+/// a run and across a restart.
+///
+/// Its own minter rather than [`mint_resource_id`]: that one mints the id SEGMENT
+/// of an ARN this service hands out (an application's, a policy's, an
+/// assessment's), which is a resource identity a client can address directly,
+/// while this one mints a handle that only [`ResourceResolution::started_at`] ever
+/// calls — so no read can mint one, and the two namespaces are free to differ.
+fn mint_resolution_id() -> String {
     ::uuid::Uuid::new_v4().hyphenated().to_string()
 }
 
