@@ -91,6 +91,7 @@
 use std::collections::{HashMap, HashSet};
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::constraints::ViolationKind;
 use smithy_server_runtime::{
     BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refused,
@@ -456,7 +457,7 @@ pub fn quoting_refusal<Op: Operation>(
                 continue;
             }
             if let Some((member, clause)) =
-                map_value_clause::<Op>(&violation, &mut submitted, pattern)
+                map_value_clause::<Op>(&violation, &mut submitted, pattern, stated.entry_order)
             {
                 restated_a_clause = true;
                 violations.push(violation);
@@ -521,17 +522,77 @@ fn map_value_clause<Op: Operation>(
     violation: &Violation,
     submitted: &mut SubmittedMaps<'_>,
     pattern: PatternRendering,
+    order: MapEntryOrder,
 ) -> Option<(String, String)> {
+    stated_map_value_clause(
+        violation,
+        submitted,
+        &[Op::INPUT_SCHEMA],
+        pattern,
+        order,
+    )
+}
+
+/// The clause each of `violations` earns as a MAP VALUE's, keyed by the member path that
+/// earned it — for a service that words its constraint refusal in its own PRE-DISPATCH layer
+/// rather than through [`QuotingSubmittedCollections`], and whose recordings show a
+/// constraint broken by one of a map's values stated at the MAP MEMBER.
+///
+/// A violation that is not a map value's contributes no entry, which is what such a layer
+/// keeps the framework's own per-entry clause for
+/// ([`crate::validation_message::aws_validation_refusal_over_collections_quoting`], the
+/// renderer this is handed to). The rule, the sentence, the set read off `input_schemas` and
+/// every bound on what one clause may quote are [`stated_map_value_clause`]'s, so a
+/// pre-dispatch layer and the wrapper cannot word one map two ways; the request is read at
+/// most once per member path and for at most [`MAX_PARSED_PATHS`] paths, so the parses one
+/// refusal performs stay bounded by constants.
+///
+/// Two entries of one map earn the SAME clause — it names the member, the whole map and the
+/// whole set — so a renderer stating the clauses once per distinct text states one
+/// validation error for one offending map.
+#[must_use]
+pub fn stated_map_value_clauses(
+    violations: &[Violation],
+    req: &RtRequest,
+    input_schemas: &[&'static Schema],
+    pattern: PatternRendering,
+    order: MapEntryOrder,
+) -> HashMap<String, String> {
+    let mut submitted = SubmittedMaps::of(req);
+    violations
+        .iter()
+        .filter_map(|violation| {
+            let (_, clause) =
+                stated_map_value_clause(violation, &mut submitted, input_schemas, pattern, order)?;
+            Some((violation.path.clone(), clause))
+        })
+        .collect()
+}
+
+/// The MAP member `violation` belongs to and the clause stated at it, or `None` when
+/// `violation` is not a map VALUE's — the ONE place that clause is built, whichever layer
+/// states it.
+///
+/// A violation the walk marked `@sensitive` earns none: such a member is one the service
+/// never discloses, so the map it sat in is quoted nowhere — the clause that states no value
+/// at all is the framework's own, which this leaves in place.
+fn stated_map_value_clause(
+    violation: &Violation,
+    submitted: &mut SubmittedMaps<'_>,
+    input_schemas: &[&'static Schema],
+    pattern: PatternRendering,
+    order: MapEntryOrder,
+) -> Option<(String, String)> {
+    if violation.sensitive {
+        return None;
+    }
     let (member, key) = entry_of(&violation.path)?;
-    let declared = element_constraint_set(&[Op::INPUT_SCHEMA], member)?;
+    let declared = element_constraint_set(input_schemas, member)?;
     let entries = submitted.of_path(member)?;
     if !entries.iter().any(|(held, _)| held == key) {
         return None;
     }
-    let pairs: Vec<(&str, &str)> = entries
-        .iter()
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect();
+    let pairs = order(entries)?;
     let requirements: Vec<String> = declared
         .into_iter()
         .map(|kind| stated_requirement(kind, pattern))

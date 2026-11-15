@@ -45,6 +45,8 @@ mod developer_login_credential_exchange;
 mod developer_login_linking;
 #[path = "all/developer_provider_name_immutability.rs"]
 mod developer_provider_name_immutability;
+#[path = "all/disabled_identity_projection.rs"]
+mod disabled_identity_projection;
 #[path = "all/iam_oidc_federation.rs"]
 mod iam_oidc_federation;
 #[path = "all/identity_data_events.rs"]

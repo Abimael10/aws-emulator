@@ -2085,3 +2085,10 @@ mod s3_sourced_table_derived_key_schema;
 // suite covers, and why it drives the assembled router rather than one service crate, belongs
 // in that suite's own module header; `all/appended_notes.rs` keeps the notes this file had
 // collected.
+// is `E0753` and compiles no suite of this target — which is what had happened here, where
+// the tail had grown hundreds of re-typed copies of this header. With no inner doc comment in
+// the file at all, there is none to copy.
+// name is `E0428`, which fails every suite of this target too — and declare every suite file,
+// since one no `mod` names compiles nowhere and the build-time layout check refuses it.
+// `all/all_rs_is_a_canonical_declaration_list.rs` check the rules above rather than restating
+// them.

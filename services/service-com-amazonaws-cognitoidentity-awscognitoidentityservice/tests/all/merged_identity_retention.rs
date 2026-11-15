@@ -28,13 +28,11 @@ use serde_json::{json, Value};
 
 use crate::describe_identity::describe;
 use crate::developer_identity_tokens::pool_with_developer_provider;
+// The projection a read owes for an identity a MERGE merged away, read through the sibling
+// suite that pins that rule rather than kept here as a second copy of it.
+use crate::disabled_identity_projection::merged_away_projection;
 use crate::identity_pool_flow::{error_code, Emulator};
 use crate::merge_developer_identities::user;
-
-/// The one element the `Logins` list of a DISABLED identity carries — an identity every login
-/// has been taken off. Spelled out here so the wire-visible projection is pinned by the test
-/// rather than by the code under test.
-const DISABLED: &str = "DISABLED";
 
 /// How this service words the refusal of a request about a developer identity the caller may
 /// not reach — asserted against the literal, for the same reason.
@@ -275,10 +273,11 @@ async fn a_merge_leaves_the_merged_away_identity_stored_as_a_disabled_one() {
         );
 
         // It carries no login of its own any more — every one of them moved onto the survivor
-        // — which is what makes it a DISABLED identity, projected as the single sentinel.
+        // — which is what makes it a DISABLED identity, projected as the sentinel a merge
+        // leaves behind: the marker and the pool's own region.
         assert_eq!(
             logins_of(case, &after),
-            vec![DISABLED.to_string()],
+            merged_away_projection(&pool_id),
             "case {case:?}: expected {merged_away} to project the disabled sentinel, got {after}"
         );
 
@@ -464,7 +463,7 @@ async fn merging_many_users_into_one_retains_one_disabled_identity_per_merge() {
             let description = described(&emulator, &case, merged_away).await;
             assert_eq!(
                 logins_of(&case, &description),
-                vec![DISABLED.to_string()],
+                merged_away_projection(&pool_id),
                 "case {case:?}: expected {merged_away} to project the disabled sentinel, got \
                  {description}"
             );

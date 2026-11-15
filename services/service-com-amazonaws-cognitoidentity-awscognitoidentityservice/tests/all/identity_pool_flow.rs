@@ -124,10 +124,17 @@ impl Emulator {
 
     /// Call an operation that must succeed, returning its output object.
     pub(crate) async fn ok(&self, operation: &str, body: &Value) -> Value {
-        let (status, parsed) = self.call(operation, body).await;
+        self.ok_in(DEFAULT_REGION, operation, body).await
+    }
+
+    /// The same call, signed for `region` — for a suite whose rule is about the region the
+    /// call is served in (the one a pool's id is minted in).
+    pub(crate) async fn ok_in(&self, region: &str, operation: &str, body: &Value) -> Value {
+        let (status, parsed) = self.call_in(region, operation, body).await;
         assert_eq!(
             status, 200,
-            "operation {operation} on {body} expected HTTP 200, got {status} with {parsed}"
+            "operation {operation} in {region} on {body} expected HTTP 200, got {status} with \
+             {parsed}"
         );
         parsed
     }

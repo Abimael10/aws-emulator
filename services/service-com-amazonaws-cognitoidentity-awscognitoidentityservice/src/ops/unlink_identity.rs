@@ -405,6 +405,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkIdentity<En
             }
             if took_a_provider_off && identity.logins.is_empty() {
                 identity.disabled = true;
+                // The record states which call last took this identity's logins off it, and
+                // this is that call: a read of an identity an UNLINK left linked to nothing
+                // projects the disabled marker alone, where a merge's own end state projects
+                // the marker and the pool's region
+                // ([`crate::state::Identity::projected_logins`]).
+                identity.merged_away = false;
             }
         }
 

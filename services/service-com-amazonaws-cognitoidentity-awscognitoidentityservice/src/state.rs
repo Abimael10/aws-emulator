@@ -1829,6 +1829,12 @@ pub struct Identity {
     /// a different state from an identity that never carried a login — see
     /// [`Identity::is_disabled`].
     pub disabled: bool,
+    /// Whether the call that took this identity's logins off it was a MERGE — which is what
+    /// decides the `Logins` list a read of a DISABLED identity projects, since the two calls
+    /// that disable one are recorded leaving different sentinels behind (see
+    /// [`Identity::projected_logins`]). It is the LAST such call that counts: an unlink that
+    /// disables an identity a merge had merged away records itself here.
+    pub merged_away: bool,
     pub creation_date: SystemTime,
     pub last_modified_date: SystemTime,
 }
@@ -1842,11 +1848,18 @@ impl Identity {
 
     /// The `Logins` list every read of this identity reports — `DescribeIdentity` and the
     /// descriptions `ListIdentities` pages — which is the provider names it is linked to,
-    /// and for a DISABLED one the single [`DISABLED_LOGIN_PROJECTION`] sentinel standing in
-    /// place of the providers that were taken off it.
+    /// and for a DISABLED one the sentinel standing in place of the providers that were
+    /// taken off it: [`DISABLED_LOGIN_PROJECTION`] alone for an identity an unlink left
+    /// linked to nothing, and that marker followed by the REGION of the pool the identity
+    /// belongs to for one a merge merged away ([`Identity::merged_away`]). The region is
+    /// read off the pool's own id, so nothing of the request goes into it.
     pub fn projected_logins(&self) -> Vec<String> {
         if self.is_disabled() {
-            return vec![DISABLED_LOGIN_PROJECTION.to_string()];
+            let mut projected = vec![DISABLED_LOGIN_PROJECTION.to_string()];
+            if self.merged_away {
+                projected.push(region_of(&self.identity_pool_id).to_string());
+            }
+            return projected;
         }
         self.logins.clone()
     }
@@ -1863,10 +1876,12 @@ impl Identity {
     }
 }
 
-/// The one element the `Logins` list of a DISABLED identity carries: a fixed sentinel,
-/// not a provider name, which is how a read tells an identity an unlink orphaned from one
-/// that was never linked to anything (whose list is empty). It is the same value whatever
-/// providers were removed, so nothing of the request or of the stored record goes into it.
+/// The marker a DISABLED identity's `Logins` list OPENS with: a fixed sentinel, not a
+/// provider name, which is how a read tells an identity an unlink or a merge orphaned from
+/// one that was never linked to anything (whose list is empty). It is the same value whatever
+/// providers were removed, so nothing of the request or of the stored record goes into it;
+/// what follows it, for an identity a merge merged away, is the pool's own region
+/// ([`Identity::projected_logins`]).
 pub const DISABLED_LOGIN_PROJECTION: &str = "DISABLED";
 
 /// How AWS words the refusal of a call that has to be authorized by a LOGIN of the identity
@@ -2343,8 +2358,10 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     /// pair of this pool's identities to merge, so nothing was written).
     ///
     /// Every login `merged_away` was reached through — its developer user identifiers and
-    /// its federated logins alike — now resolves to `survivor`, which is left linked to the
-    /// union of the two provider sets and stamped with `now` as the instant it changed. The
+    /// its federated logins alike — now resolves to `survivor`, which is left carrying the
+    /// two provider lists APPENDED (a name it already carries is kept, so the merged record
+    /// holds one entry per user it now stands for) and stamped with `now` as the instant it
+    /// changed. The
     /// two users are one user afterwards, so nothing reaches `merged_away` any more: this
     /// service's record of the session outstanding for it and the OpenID Connect tokens
     /// issued for it spoke for a user that is now reached through `survivor` alone, so they
@@ -2354,10 +2371,11 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     ///
     /// The RECORD of `merged_away` nevertheless stays stored, in `identities` and in the
     /// pool's listing order, with its logins emptied and `disabled` set: a merge takes the
-    /// logins off an identity, it does not remove the identity, so what is left is exactly
-    /// the DISABLED identity an unlink of the last login leaves ([`Identity::is_disabled`])
-    /// — still described by a read of its id, still reported by a listing that hides no
-    /// disabled identity, and hidden from one that hides them. Removing the record is
+    /// logins off an identity, it does not remove the identity, so what is left is a
+    /// DISABLED identity ([`Identity::is_disabled`]) — still described by a read of its id,
+    /// still reported by a listing that hides no disabled identity, and hidden from one that
+    /// hides them, projecting the sentinel a merge leaves behind
+    /// ([`Identity::projected_logins`]). Removing the record is
     /// [`Self::delete_identity`]'s own effect, which no other transition borrows.
     ///
     /// Both identities have to be the named pool's own, which is what the caller resolved
@@ -2390,17 +2408,24 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
             Some(identity) => {
                 let absorbed = ::std::mem::take(&mut identity.logins);
                 identity.disabled = true;
+                // Which call disabled it is part of the record: a merge's own end state is
+                // recorded projecting the disabled marker followed by the pool's region,
+                // where an unlink's projects the marker alone
+                // ([`Identity::projected_logins`]).
+                identity.merged_away = true;
                 identity.last_modified_date = now;
                 absorbed
             }
             None => Vec::new(),
         };
         if let Some(identity) = self.identities.get_mut(survivor) {
-            for provider in absorbed {
-                if !identity.logins.contains(&provider) {
-                    identity.logins.push(provider);
-                }
-            }
+            // The provider names the merged-away user was reached through are APPENDED,
+            // keeping a name the survivor already carries: the merged record holds one entry
+            // per user it now stands for, so the survivor's list carries the pool's
+            // developer provider once for itself and once for each user merged into it —
+            // where LINKING another login to an identity adds a provider the identity is
+            // already linked to no second time.
+            identity.logins.extend(absorbed);
             identity.logins.sort();
             identity.last_modified_date = now;
         }
@@ -2434,18 +2459,23 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     }
 
     /// Whether linking `providers` to this identity would take it past
-    /// [`MAX_LOGIN_PROVIDERS_PER_IDENTITY`]. Only providers it is not linked to yet count.
+    /// [`MAX_LOGIN_PROVIDERS_PER_IDENTITY`]. Only providers it is not linked to yet count,
+    /// and a provider the record names more than once — which a merge leaves behind, the
+    /// record holding one entry per user the identity stands for
+    /// ([`Self::merge_identity_into`]) — counts ONCE: the ceiling is on the PROVIDERS an
+    /// identity is linked to, so merging users must not consume it.
     pub fn identity_providers_would_overflow(
         &self,
         identity_id: &str,
         providers: &[String],
     ) -> bool {
         self.identities.get(identity_id).is_some_and(|identity| {
+            let linked: ::std::collections::BTreeSet<&String> = identity.logins.iter().collect();
             let fresh = providers
                 .iter()
-                .filter(|provider| !identity.logins.contains(provider))
+                .filter(|provider| !linked.contains(provider))
                 .count();
-            identity.logins.len() + fresh > MAX_LOGIN_PROVIDERS_PER_IDENTITY
+            linked.len() + fresh > MAX_LOGIN_PROVIDERS_PER_IDENTITY
         })
     }
 
@@ -4053,6 +4083,7 @@ mod tests {
                     identity_pool_id: identity_pool_id.to_string(),
                     logins: Vec::new(),
                     disabled: false,
+                    merged_away: false,
                     creation_date: now,
                     last_modified_date: now,
                 },

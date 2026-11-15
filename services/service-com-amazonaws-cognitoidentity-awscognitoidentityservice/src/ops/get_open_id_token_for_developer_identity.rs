@@ -591,6 +591,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
                         // A freshly minted identity has had no unlink, so it is not a
                         // disabled one.
                         disabled: false,
+                        merged_away: false,
                         creation_date: now,
                         last_modified_date: now,
                     },

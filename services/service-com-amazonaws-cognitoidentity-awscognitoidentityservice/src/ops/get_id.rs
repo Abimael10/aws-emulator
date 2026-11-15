@@ -377,6 +377,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetId<Eng> {
                         // A freshly minted identity has had no unlink, so an unauthenticated
                         // one is linked to nothing WITHOUT being a disabled one.
                         disabled: false,
+                        merged_away: false,
                         creation_date: now,
                         last_modified_date: now,
                     },

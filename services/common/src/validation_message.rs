@@ -1553,6 +1553,7 @@ pub fn aws_validation_refusal_over_elements_stating(
         &quoted_collection,
         &|_| false,
         &element_set,
+        &|_| None,
     )
 }
 
@@ -1582,6 +1583,46 @@ pub fn aws_validation_refusal_over_elements_quoting(
         &quoted_collection,
         &|_| false,
         &|_| None,
+        &|_| None,
+    )
+}
+
+/// [`aws_validation_refusal_over_elements_quoting`], with a constraint broken by one of a
+/// MAP's VALUES stated at the MAP MEMBER too — the entry point for a service whose
+/// recordings show BOTH collection groupings.
+///
+/// The framework checks a map's value shape on each ENTRY and reports it at that entry
+/// (`<map member>.<key>`) with the one constraint that failed, where AWS reports it at the
+/// map member, quoting the value that member held and listing the value shape's whole
+/// declared set. `map_value_clause` is asked for that clause BY THE VIOLATION'S PATH, and
+/// `None` keeps the framework's per-entry clause — so a service states only the maps whose
+/// clause is its own. The clause itself is built by the one layer that can: the map a clause
+/// quotes is the value that member held, which no violation carries and only the request can
+/// answer ([`crate::submitted_collections::stated_map_value_clauses`], which owns the
+/// sentence, the set read off the same schemas and every bound on what one clause may
+/// quote).
+///
+/// Two entries of one map, and two constraints of one value, yield the SAME clause — it
+/// names the member, the whole map and the whole set — so the dedupe below states it once:
+/// one offending map is ONE validation error. Everything else is
+/// [`aws_validation_refusal_over_elements_quoting`]'s: the same grouping over a list's
+/// elements, the same value half, the same envelope and the same clauses for every other
+/// violation.
+pub fn aws_validation_refusal_over_collections_quoting(
+    refusal: &Refusal,
+    input_schemas: &[&'static Schema],
+    quote_pattern: impl Fn(&str) -> String,
+    quoted_collection: impl Fn(&str) -> Option<String>,
+    map_value_clause: impl Fn(&str) -> Option<String>,
+) -> Option<Refused> {
+    grouped_refusal(
+        refusal,
+        input_schemas,
+        &quote_pattern,
+        &quoted_collection,
+        &|_| false,
+        &|_| None,
+        &map_value_clause,
     )
 }
 
@@ -1609,6 +1650,7 @@ pub fn aws_validation_refusal_over_elements_withholding(
         &quote_pattern,
         &|_| None,
         &withholds_value,
+        &|_| None,
         &|_| None,
     )
 }
@@ -1641,6 +1683,7 @@ pub fn aws_validation_refusal_over_elements_quoting_withholding(
         &quoted_collection,
         &withholds_value,
         &|_| None,
+        &|_| None,
     )
 }
 
@@ -1671,6 +1714,7 @@ pub fn aws_validation_refusal_over_elements_stating_withholding(
         &|_| None,
         &withholds_value,
         &element_set,
+        &|_| None,
     )
 }
 
@@ -1760,6 +1804,7 @@ fn grouped_refusal(
     quoted_collection: &dyn Fn(&str) -> Option<String>,
     withholds_value: &dyn Fn(&str) -> bool,
     element_set: &dyn Fn(&str) -> Option<String>,
+    map_value_clause: &dyn Fn(&str) -> Option<String>,
 ) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
@@ -1790,6 +1835,11 @@ fn grouped_refusal(
                     ),
                 }
             })
+            // A constraint one of a MAP's VALUES broke is the other collection grouping:
+            // the clause the caller states at the map member, which needs the request the
+            // map was carried in (see
+            // [`aws_validation_refusal_over_collections_quoting`]).
+            .or_else(|| map_value_clause(&violation.path))
             .or_else(|| {
                 withholds_value(&violation.path)
                     .then(|| valueless_clause(violation))

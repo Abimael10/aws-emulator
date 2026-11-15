@@ -21,6 +21,15 @@
 //! this service states ONE clause at `<collection>`, quoting the whole list and listing
 //! every requirement the element shape declares.
 //!
+//! A constraint a MAP's VALUE SHAPE declares is the same rule on the other collection: the
+//! framework checks it per ENTRY and reports it at that entry (`<map>.<key>`) with the one
+//! constraint that value broke, while this service states ONE clause at `<map>`, quoting
+//! the whole map and listing every requirement the value shape declares
+//! (`Map value must satisfy constraint: [ … ]`). So one offending map is ONE validation
+//! error however many of its entries, or of one value's constraints, were broken \u2014 the
+//! sibling of the `Map keys must satisfy constraint: …` clause a handler of this service
+//! states for the one bound of such a map the walk ahead of it does not reach, its KEYS.
+//!
 //! [`Service::override_refusal`](smithy_server_runtime::Service::override_refusal) is handed
 //! the violations alone and never the request they were found in, so neither value can be
 //! recovered there. [`QuotingSubmittedValues`] is where they are: a per-operation wrapper,
@@ -57,10 +66,12 @@
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use service_common::query_error_envelope::with_request_id_header;
-use service_common::submitted_collections::{in_hashed_entry_order, quoting_submitted_maps};
+use service_common::submitted_collections::{
+    in_hashed_entry_order, quoting_submitted_maps, stated_map_value_clauses,
+};
 use service_common::validation::{refusing_violations_with_mapped_echoes, unanchored};
 use service_common::validation_message::{
-    aws_validation_refusal_over_elements_quoting, aws_validation_refusal_with,
+    aws_validation_refusal_over_collections_quoting, aws_validation_refusal_with,
     in_hashed_enum_order, quoting_the_submitted_collection,
 };
 use smithy_server_runtime::{
@@ -93,17 +104,24 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// `quoted_collection` answers, for a member path a clause is stated at, the collection that
 /// member held — the one value no violation carries. `None` from it states the clause
 /// without a value, which is the fail-safe direction.
+///
+/// `map_value_clause` answers, for the path a violation about one of a MAP's VALUES sits at,
+/// the clause stated at that map's member instead — the whole map as the value and the value
+/// shape's whole declared set as the requirement — and `None` keeps the framework's own
+/// per-entry clause.
 pub fn validation_error_message(
     violations: &[Violation],
     quoted_collection: impl Fn(&str) -> Option<String>,
+    map_value_clause: impl Fn(&str) -> Option<String>,
     input_schema: &'static ::aws_smithy_schema::Schema,
 ) -> Option<String> {
     let stated: Vec<Violation> = violations.iter().map(in_hashed_enum_order).collect();
-    aws_validation_refusal_over_elements_quoting(
+    aws_validation_refusal_over_collections_quoting(
         &Refusal::Invalid(stated),
         &[input_schema],
         unanchored,
         quoted_collection,
+        map_value_clause,
     )
     .map(|refused| refused.message)
 }
@@ -186,10 +204,20 @@ where
                 .collect();
             if !refused.is_empty() {
                 // A clause stated at a collection quotes the list that member held, which
-                // the collecting walk recorded under the same member path.
+                // the collecting walk recorded under the same member path; a clause about
+                // one of a MAP's VALUES is stated at the map member, quoting the map the
+                // request carried in the same order every other clause about one states.
+                let map_value_clauses = stated_map_value_clauses(
+                    &refused,
+                    req,
+                    &[Op::INPUT_SCHEMA],
+                    unanchored,
+                    in_hashed_entry_order,
+                );
                 let message = validation_error_message(
                     &refused,
                     |member| submitted_lists.get(member).cloned(),
+                    |path| map_value_clauses.get(path).cloned(),
                     Op::INPUT_SCHEMA,
                 );
                 if let Some(message) = message {

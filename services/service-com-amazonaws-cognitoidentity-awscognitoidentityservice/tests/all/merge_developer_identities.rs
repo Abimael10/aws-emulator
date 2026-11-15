@@ -32,7 +32,7 @@
 use serde_json::{json, Map, Value};
 
 use crate::developer_identity_tokens::{pool_with_developer_provider, token_request};
-use crate::identity_pool_flow::{error_code, Emulator, ABSENT_POOL_ID};
+use crate::identity_pool_flow::{error_code, Emulator, ABSENT_POOL_ID, DEFAULT_REGION};
 
 /// The operation under test, spelled once.
 const OPERATION: &str = "MergeDeveloperIdentities";
@@ -114,10 +114,32 @@ pub(crate) async fn user(
     identifiers: &[&str],
     federated: &[Login<'_>],
 ) -> String {
+    user_in(
+        emulator,
+        DEFAULT_REGION,
+        pool_id,
+        developer_provider,
+        identifiers,
+        federated,
+    )
+    .await
+}
+
+/// [`user`], registered through calls signed for `region` — for a suite whose rule is about
+/// the region the pool lives in. `pub(crate)` for the same reason.
+pub(crate) async fn user_in(
+    emulator: &Emulator,
+    region: &str,
+    pool_id: &str,
+    developer_provider: &str,
+    identifiers: &[&str],
+    federated: &[Login<'_>],
+) -> String {
     let mut logins: Vec<Login<'_>> = vec![(developer_provider, identifiers[0])];
     logins.extend(federated.iter().copied());
     let minted = emulator
-        .ok(
+        .ok_in(
+            region,
             "GetOpenIdTokenForDeveloperIdentity",
             &token_request(pool_id, &logins, None, None),
         )
@@ -128,7 +150,8 @@ pub(crate) async fn user(
         .to_string();
     for identifier in &identifiers[1..] {
         let linked = emulator
-            .ok(
+            .ok_in(
+                region,
                 "GetOpenIdTokenForDeveloperIdentity",
                 &token_request(
                     pool_id,
@@ -230,7 +253,7 @@ fn strings(values: &[Value]) -> Vec<String> {
 }
 
 /// `values` sorted and deduplicated, which is the order the store reports a pool's logins
-/// and an identity's providers in.
+/// and an identity's developer user identifiers in.
 fn sorted(values: &[&str]) -> Vec<String> {
     let mut sorted: Vec<String> = values.iter().map(|value| (*value).to_string()).collect();
     sorted.sort();
@@ -238,9 +261,18 @@ fn sorted(values: &[&str]) -> Vec<String> {
     sorted
 }
 
+/// `values` sorted, KEEPING every occurrence — the order an identity's `Logins` list is
+/// reported in, which carries one entry per user the identity stands for and so may name
+/// one provider twice.
+fn in_order(values: &[&str]) -> Vec<String> {
+    let mut ordered: Vec<String> = values.iter().map(|value| (*value).to_string()).collect();
+    ordered.sort();
+    ordered
+}
+
 /// RULE: merging two developer-authenticated users of a pool leaves every login of the
 /// destination user resolving to the source user's `IdentityId` — the id the call answers —
-/// with that identity linked to the union of the two users' providers, and the
+/// with that identity carrying the two users' provider lists appended, and the
 /// destination's own identity gone.
 #[tokio::test]
 async fn merging_two_developer_users_leaves_every_login_on_the_source_identity() {
@@ -434,8 +466,10 @@ async fn merging_two_developer_users_leaves_every_login_on_the_source_identity()
             );
         }
 
-        // The surviving identity is linked to the union of the two users' providers.
-        let mut providers: Vec<&str> = vec![case.developer_provider];
+        // The surviving identity carries the two users' provider lists APPENDED: the pool's
+        // developer provider once for itself and once for the user merged into it, plus
+        // every federated provider of either.
+        let mut providers: Vec<&str> = vec![case.developer_provider, case.developer_provider];
         providers.extend(
             case.source_federated
                 .iter()
@@ -444,7 +478,7 @@ async fn merging_two_developer_users_leaves_every_login_on_the_source_identity()
         );
         assert_eq!(
             providers_of(&emulator, survivor).await,
-            sorted(&providers),
+            in_order(&providers),
             "case {name:?}: expected the surviving identity linked to {providers:?}"
         );
 

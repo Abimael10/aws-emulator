@@ -14,6 +14,10 @@
 //! * a constraint the collection's ELEMENTS broke is stated once at the COLLECTION member,
 //!   quoting the collection and listing every requirement the element shape declares,
 //!   however many elements broke it;
+//! * a constraint one of a MAP's VALUES broke is stated the same way at the MAP member,
+//!   listing every requirement the VALUE shape declares, however many entries broke it. The
+//!   rows span the three value shapes this service's maps target, both `@length` bounds and
+//!   a `@pattern`;
 //! * a map KEY outside the constraints its key shape declares is the protocol's
 //!   `ValidationException` (HTTP 400) — not one of the service's own modelled errors — with
 //!   the map quoted and every requirement a key of that map has to satisfy listed. The rows
@@ -433,6 +437,241 @@ async fn a_map_key_outside_its_shape_is_refused_with_the_constraints_a_key_must_
         status, 200,
         "case \"a principal-tag key at its maximum\": expected HTTP 200, got {status} with {body}"
     );
+}
+
+/// The map `entries` as a clause quotes it: `{<key>=<value>, …}`, with the entries in the
+/// order the table holding them is walked — the shared rendering every clause of this
+/// service states a map through
+/// (`service_common::submitted_collections::hashed_entry_order`).
+fn quoted_map(entries: &[(&str, &str)]) -> String {
+    let rendered: Vec<String> = service_common::submitted_collections::hashed_entry_order(entries)
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    format!("{{{}}}", rendered.join(", "))
+}
+
+/// The requirements `TagValueType` declares, in the order a clause states them
+/// (`smithy_query(query="shape",shape="TagValueType")`: `length 0..256`) — the value shape of
+/// `IdentityPoolTagsType`, the map `TagResource$Tags`, `CreateIdentityPool$IdentityPoolTags`
+/// and `UpdateIdentityPool$IdentityPoolTags` all target.
+const TAG_VALUE_REQUIREMENTS: &str = "[Member must have length less than or equal to 256, \
+                                      Member must have length greater than or equal to 0]";
+
+/// The requirements `PrincipalTagValue` declares
+/// (`smithy_query(query="shape",shape="PrincipalTagValue")`: `length 1..256`) — the value
+/// shape of `SetPrincipalTagAttributeMap$PrincipalTags`.
+const PRINCIPAL_TAG_VALUE_REQUIREMENTS: &str = "[Member must have length less than or equal to \
+                                                256, Member must have length greater than or \
+                                                equal to 1]";
+
+/// The requirements `IdentityProviderId` declares
+/// (`smithy_query(query="shape",shape="IdentityProviders")`: value `length 1..128`,
+/// `pattern ^[\w.;_/-]+$`, quoted without the anchors that make the match total) — the value
+/// shape of `CreateIdentityPool$SupportedLoginProviders`.
+const PROVIDER_ID_REQUIREMENTS: &str = "[Member must have length less than or equal to 128, \
+                                        Member must have length greater than or equal to 1, \
+                                        Member must satisfy regular expression pattern: \
+                                        [\\w.;_/-]+]";
+
+/// One row of the map-value table: the operation carrying the map, the member path a clause
+/// names it at, the entries the request sends and the requirements the clause has to list.
+struct MapValueRow<'a> {
+    case: &'a str,
+    operation: &'a str,
+    member: &'a str,
+    entries: Vec<(&'a str, &'a str)>,
+    requirements: &'a str,
+}
+
+/// RULE: a constraint broken by one of a MAP's VALUES is stated once at the MAP member —
+/// quoting the whole map the request sent, and listing every requirement the value shape
+/// declares — rather than once per offending entry, so one offending map is ONE validation
+/// error.
+#[tokio::test]
+async fn a_constraint_a_map_value_broke_is_stated_at_the_map() {
+    let emulator = Emulator::new();
+    let pool_id = emulator
+        .pool_with_providers("constraint-refusal-map-values", true, &["graph.facebook.com"])
+        .await;
+    let arn = identity_pool_arn(&pool_id);
+
+    // The rows differ along what the rule generalises over: the map MEMBER and its value
+    // shape (three of them, spanning both `@length` bounds and a `@pattern`), the operation
+    // the map is carried on, HOW FAR outside the shape a value is, how many entries the map
+    // holds, and how many of them broke the shape — the clause names the member once either
+    // way.
+    let over_tag_value = "v".repeat(257);
+    let far_over_tag_value = "v".repeat(1024);
+    let over_principal_value = "c".repeat(257);
+    let rows: Vec<MapValueRow<'_>> = vec![
+        MapValueRow {
+            case: "a tag value one byte past its maximum, on TagResource",
+            operation: "TagResource",
+            member: "tags",
+            entries: vec![("Environment", over_tag_value.as_str())],
+            requirements: TAG_VALUE_REQUIREMENTS,
+        },
+        MapValueRow {
+            case: "a tag value far past its maximum, beside an admitted one",
+            operation: "TagResource",
+            member: "tags",
+            entries: vec![
+                ("Owner", "platform"),
+                ("Environment", far_over_tag_value.as_str()),
+            ],
+            requirements: TAG_VALUE_REQUIREMENTS,
+        },
+        MapValueRow {
+            case: "two tag values past the maximum, which is still one validation error",
+            operation: "TagResource",
+            member: "tags",
+            entries: vec![
+                ("Owner", over_tag_value.as_str()),
+                ("Environment", far_over_tag_value.as_str()),
+            ],
+            requirements: TAG_VALUE_REQUIREMENTS,
+        },
+        MapValueRow {
+            case: "a tag value past its maximum, on CreateIdentityPool",
+            operation: "CreateIdentityPool",
+            member: "identityPoolTags",
+            entries: vec![("Environment", over_tag_value.as_str())],
+            requirements: TAG_VALUE_REQUIREMENTS,
+        },
+        MapValueRow {
+            case: "a tag value past its maximum, on UpdateIdentityPool",
+            operation: "UpdateIdentityPool",
+            member: "identityPoolTags",
+            entries: vec![("Environment", over_tag_value.as_str())],
+            requirements: TAG_VALUE_REQUIREMENTS,
+        },
+        MapValueRow {
+            case: "a principal-tag value past its maximum",
+            operation: "SetPrincipalTagAttributeMap",
+            member: "principalTags",
+            entries: vec![("department", over_principal_value.as_str())],
+            requirements: PRINCIPAL_TAG_VALUE_REQUIREMENTS,
+        },
+        MapValueRow {
+            case: "an empty principal-tag value, under its minimum",
+            operation: "SetPrincipalTagAttributeMap",
+            member: "principalTags",
+            entries: vec![("sub", "custom:sub"), ("department", "")],
+            requirements: PRINCIPAL_TAG_VALUE_REQUIREMENTS,
+        },
+        MapValueRow {
+            case: "a supported-login-provider id the pattern does not admit",
+            operation: "CreateIdentityPool",
+            member: "supportedLoginProviders",
+            entries: vec![("graph.facebook.com", "an app id with spaces")],
+            requirements: PROVIDER_ID_REQUIREMENTS,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let MapValueRow {
+            case,
+            operation,
+            member,
+            entries,
+            requirements,
+        } = row;
+        let map = Value::Object(
+            entries
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), Value::String((*value).to_string())))
+                .collect(),
+        );
+        let request = match *operation {
+            "TagResource" => json!({ "ResourceArn": &arn, "Tags": map }),
+            "CreateIdentityPool" => {
+                let mut request = json!({
+                    "IdentityPoolName": format!("map-value-refusal-{index}"),
+                    "AllowUnauthenticatedIdentities": true,
+                });
+                request[if *member == "identityPoolTags" {
+                    "IdentityPoolTags"
+                } else {
+                    "SupportedLoginProviders"
+                }] = map;
+                request
+            }
+            "UpdateIdentityPool" => json!({
+                "IdentityPoolId": &pool_id,
+                "IdentityPoolName": "constraint-refusal-map-values",
+                "AllowUnauthenticatedIdentities": true,
+                "IdentityPoolTags": map,
+            }),
+            _ => json!({
+                "IdentityPoolId": &pool_id,
+                "IdentityProviderName": "graph.facebook.com",
+                "PrincipalTags": map,
+            }),
+        };
+        let (status, body) = emulator.call(operation, &request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            VALIDATION_EXCEPTION,
+            "case {case:?}: expected {VALIDATION_EXCEPTION}, got {body}"
+        );
+        assert_eq!(
+            message(&body, case),
+            format!(
+                "1 validation error detected: Value '{}' at '{member}' failed to satisfy \
+                 constraint: Map value must satisfy constraint: {requirements}",
+                quoted_map(entries)
+            ),
+            "case {case:?}: expected one clause at the map, got {body}"
+        );
+    }
+
+    // Values ON the published bounds are served, so the clauses above are about the bounds
+    // being broken and not about every map: a tag value at its maximum and at its minimum
+    // (`length 0..256`, so the empty string is admitted), a principal-tag value at its own
+    // minimum of one character, and a provider id the pattern admits.
+    let at_max_tag_value = "v".repeat(256);
+    let served: Vec<(&str, &str, Value)> = vec![
+        (
+            "a tag value at its maximum",
+            "TagResource",
+            json!({ "ResourceArn": &arn, "Tags": { "Environment": &at_max_tag_value } }),
+        ),
+        (
+            "a tag value at its minimum, the empty string",
+            "TagResource",
+            json!({ "ResourceArn": &arn, "Tags": { "Environment": "" } }),
+        ),
+        (
+            "a principal-tag value at its minimum",
+            "SetPrincipalTagAttributeMap",
+            json!({
+                "IdentityPoolId": &pool_id,
+                "IdentityProviderName": "graph.facebook.com",
+                "PrincipalTags": { "department": "d" },
+            }),
+        ),
+        (
+            "a provider id the pattern admits",
+            "CreateIdentityPool",
+            json!({
+                "IdentityPoolName": "map-value-refusal-admitted",
+                "AllowUnauthenticatedIdentities": true,
+                "SupportedLoginProviders": { "graph.facebook.com": "0123456789" },
+            }),
+        ),
+    ];
+    for (case, operation, request) in served {
+        let (status, body) = emulator.call(operation, &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?} on {operation}: expected HTTP 200, got {status} with {body}"
+        );
+    }
 }
 
 /// RULE: a refusal AWS words with a FIXED sentence carries that sentence alone — nothing of
