@@ -271,6 +271,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The service principals the document names are then RESOLVED: a service that assumes
+        // its roles under another service's principal has none to resolve, so the replacement
+        // would state a trust nothing could exercise. The rule is the shared one every writer
+        // of this member applies (`crate::state::unassumable_service_principal`), and a
+        // refused update leaves the document the role already held.
+        if let Some(principal) =
+            crate::state::unassumable_service_principal(&input.policy_document)
+        {
+            return Err(
+                UpdateAssumeRolePolicyErrorModeled::MalformedPolicyDocumentException(
+                    MalformedPolicyDocumentException {
+                        message: Some(crate::state::invalid_trust_policy_principal(&principal)),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // "Updates the policy that grants an IAM entity permission to assume a role":
         // the document REPLACES the one the role held, and is stored as the plain JSON
         // text the request carried — the one form this crate holds every policy

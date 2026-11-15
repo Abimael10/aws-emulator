@@ -484,6 +484,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The rendered document's service principals are resolved the same way every writer of
+        // this member resolves them (`crate::state::unassumable_service_principal`): a
+        // template whose principal comes from the request can name a service that assumes its
+        // roles under another service's principal, and a role carrying such a trust policy
+        // could never be assumed.
+        if let Some(principal) = assume_role_policy_document
+            .as_deref()
+            .and_then(crate::state::unassumable_service_principal)
+        {
+            return Err(AcquireRoleErrorModeled::MalformedPolicyDocumentException(
+                MalformedPolicyDocumentException {
+                    message: Some(crate::state::invalid_trust_policy_principal(&principal)),
+                },
+            )
+            .into());
+        }
 
         // "A list of inline policy templates that the service embeds in roles that you
         // create from this template": each one's name and document rendered, each document

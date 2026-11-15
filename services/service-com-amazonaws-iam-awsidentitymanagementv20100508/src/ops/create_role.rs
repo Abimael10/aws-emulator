@@ -229,6 +229,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A trust policy does not merely CARRY principals, it names the ones the role trusts,
+        // so IAM resolves each SERVICE it names: a service that assumes its roles under
+        // another service's principal has none to resolve here, and the document states a
+        // trust nothing could exercise. The rule is the shared one every writer of this
+        // member applies (`crate::state::unassumable_service_principal`) and the sentence is
+        // IAM's own, naming the rejected value as the request wrote it; nothing is stored.
+        if let Some(principal) =
+            crate::state::unassumable_service_principal(&input.assume_role_policy_document)
+        {
+            return Err(CreateRoleErrorModeled::MalformedPolicyDocumentException(
+                MalformedPolicyDocumentException {
+                    message: Some(crate::state::invalid_trust_policy_principal(&principal)),
+                },
+            )
+            .into());
+        }
+
         // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
         // "invalid … value … for an input parameter".
         let tags = input.tags.filter(|tags| !tags.is_empty());

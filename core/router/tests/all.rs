@@ -1637,3 +1637,13 @@ mod zz_probe_whole_emulator;
 // What a suite covers, and why it drives the assembled router rather than one service
 // crate, belongs in that suite's own module header, where it is read beside the test
 // it explains; the notes earlier landings had appended to this file live in
+// suite file, sorted by name, and no other line, so two branches landing at once insert two
+// lines in two places and have no prose to duplicate, re-word or mistype. EVERY comment here
+// is an ORDINARY `//` one, this header included: an inner doc comment (`//!`) and an inner
+// attribute are legal only before the first item, so one appended past the declarations is a
+// hard error and compiles no suite of this target — which is what had happened here, where
+// the tail had grown hundreds of re-typed copies of this header.
+// name is `E0428` and fails every suite in this target too — and declare every file the
+// directory holds, since a suite no `mod` names compiles nowhere and its tests never run.
+// explains; a note about this file itself belongs in `all/appended_notes.rs`. The suites
+// `all/all_rs_carries_no_inner_doc_comment.rs`,

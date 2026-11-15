@@ -403,6 +403,8 @@ mod simulated_statement_positions;
 mod simulated_wildcard_only_actions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/trust_policy_service_principals.rs"]
+mod trust_policy_service_principals;
 #[path = "all/unparseable_arn_refusal_wording.rs"]
 mod unparseable_arn_refusal_wording;
 #[path = "all/user_attached_policies.rs"]
