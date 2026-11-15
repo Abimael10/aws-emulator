@@ -3,8 +3,10 @@
 //! `ListStreams` is the DISCOVERY entry point of a streams consumer, so this suite
 //! pins the rule it answers by: every stream the control-plane seam has registered
 //! and not yet reclaimed is reported, with `StreamArn`, `TableName` and
-//! `StreamLabel` populated, and one page carries at most the documented upper limit
-//! of 100 entries whatever `Limit` asks for.
+//! `StreamLabel` populated, and a `Limit` up to the documented upper limit of 100
+//! is honoured exactly. (A `Limit` ABOVE that ceiling is refused, which is pinned
+//! with this service's other parameter bounds in
+//! `service_enforced_parameter_bounds.rs`.)
 //!
 //! The rows span the class rather than one table: every `StreamViewType` the model
 //! declares, table names at both ends of the documented `TableName` bound and over
@@ -339,10 +341,10 @@ async fn a_table_name_that_prefixes_another_owns_only_its_own_streams() {
     );
 }
 
-/// `Limit` is honoured up to the documented ceiling and never past it: "The maximum
-/// number of streams to return. The upper limit is 100"
-/// (`ListStreamsInput$Limit`), whose declared range is 1.. — so 0 is refused at the
-/// boundary, 100 is the largest page, and anything above it still yields 100.
+/// `Limit` is honoured exactly up to the documented ceiling: "The maximum number of
+/// streams to return. The upper limit is 100" (`ListStreamsInput$Limit`), whose
+/// declared range is 1.. — so 0 is refused at the boundary, an absent member asks for
+/// the widest page, and 100 is the largest page served.
 #[tokio::test]
 async fn one_page_never_exceeds_the_documented_hundred_streams() {
     let (engine, router) = build();
@@ -373,15 +375,14 @@ async fn one_page_never_exceeds_the_documented_hundred_streams() {
     );
 
     // Each row: the `Limit` sent (None for an absent member) and the page size the
-    // rule requires — the published bound, one past it, and far past it.
-    let cases: [(&str, Option<i64>, usize); 7] = [
+    // rule requires — the smallest the range allows, two values inside the ceiling,
+    // just inside it, and the published bound itself.
+    let cases: [(&str, Option<i64>, usize); 5] = [
         ("no Limit at all", None, 100),
         ("Limit 1, the smallest the range allows", Some(1), 1),
         ("Limit 17", Some(17), 17),
         ("Limit 99, just inside the ceiling", Some(99), 99),
         ("Limit 100, the published ceiling", Some(100), 100),
-        ("Limit 101, one past the ceiling", Some(101), 100),
-        ("Limit 10000, far past the ceiling", Some(10_000), 100),
     ];
 
     for (case, limit, expected_len) in cases {
@@ -412,12 +413,12 @@ async fn one_page_never_exceeds_the_documented_hundred_streams() {
         );
     }
 
-    // Paging with a `Limit` past the ceiling still visits every stream exactly once.
-    let case = "paging with Limit 10000";
+    // Paging at the ceiling still visits every stream exactly once.
+    let case = "paging with Limit 100";
     let mut seen: Vec<String> = Vec::new();
     let mut start: Option<String> = None;
     for _ in 0..all.len() + 2 {
-        let mut body = serde_json::json!({ "Limit": 10_000 });
+        let mut body = serde_json::json!({ "Limit": MAX_PAGE_LIMIT });
         if let (Some(target), Some(start)) = (body.as_object_mut(), start.as_ref()) {
             target.insert(
                 "ExclusiveStartStreamArn".to_string(),

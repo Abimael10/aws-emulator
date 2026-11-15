@@ -12,6 +12,8 @@
 //!   The upper limit is 100."
 //! * `GetRecordsInput$Limit` — "The maximum number of records to return from the
 //!   shard. The upper limit is 1000."
+//! * `ListStreamsInput$Limit` — "The maximum number of streams to return. The upper
+//!   limit is 100."
 //! * `GetShardIteratorInput$Timestamp` — "If the timestamp is in the future, the
 //!   request returns a ValidationException."
 //!
@@ -23,7 +25,7 @@
 //! the same member documents as NOT refusals, a timestamp older than the trim
 //! horizon and a future timestamp sent with an iterator type that does not read it.
 //!
-//! The two `Limit` sentences are deliberately different texts: each operation words
+//! The three `Limit` sentences are deliberately different texts: each operation words
 //! its own cap, so they are asserted separately and never through one template.
 
 use std::collections::HashMap;
@@ -56,6 +58,11 @@ const DESCRIBE_STREAM_LIMIT_REFUSAL: &str =
 /// sentence for the same kind of bound.
 const GET_RECORDS_LIMIT_REFUSAL: &str =
     "One or more parameter values were invalid: Limit should be less than or equal to 1000";
+
+/// The whole refusal `ListStreams` answers for a `Limit` above its cap — a third
+/// wording of the same kind of bound.
+const LIST_STREAMS_LIMIT_REFUSAL: &str = "One or more parameter values were invalid: \
+     Limit cannot be greater than the maximum allowed size: 100";
 
 /// The whole refusal `GetShardIterator` answers for an `AT_TIMESTAMP` start point
 /// that has not happened yet.
@@ -386,6 +393,77 @@ async fn get_records_refuses_a_limit_above_its_published_cap() {
                 );
             }
             None => assert_refused(case, status, &body, GET_RECORDS_LIMIT_REFUSAL),
+        }
+    }
+}
+
+/// `ListStreams` honours a `Limit` up to its published cap and REFUSES anything above
+/// it, rather than serving a page as if the request had asked for a width the service
+/// serves.
+#[tokio::test]
+async fn list_streams_refuses_a_limit_above_its_published_cap() {
+    let (engine, router) = build();
+    let base = seconds_ago(3_600);
+    // Three streams, one per table, so a page narrower than the registry is
+    // observably truncated without a fixture of a hundred streams.
+    let mut registered: Vec<String> = (0..3_u64)
+        .map(|index| {
+            register(
+                &engine,
+                &format!("ledger-{index}"),
+                base + Duration::from_secs(index),
+            )
+        })
+        .collect();
+    // One page is the next entries in stream-ARN order, which is how the registry
+    // keys them.
+    registered.sort();
+
+    let cap = i64::from(MAX_PAGE_LIMIT);
+    // Each row: the `Limit` sent, and the page size the rule requires — or None where
+    // the rule requires a refusal. The smallest the declared range allows, values
+    // inside the cap, the published bound itself, one past it, far past it, and the
+    // widest value the member carries.
+    let cases: [(&str, i64, Option<usize>); 7] = [
+        ("Limit 1, the smallest the declared range allows", 1, Some(1)),
+        ("Limit 2, inside both the cap and the registry", 2, Some(2)),
+        ("Limit 99, just inside the cap", cap - 1, Some(3)),
+        ("Limit 100, the published cap", cap, Some(3)),
+        ("Limit 101, one past the cap", cap + 1, None),
+        ("Limit 5000, far past the cap", 5_000, None),
+        (
+            "Limit 2147483647, the widest the member carries",
+            i64::from(i32::MAX),
+            None,
+        ),
+    ];
+
+    for (case, limit, expected) in cases {
+        let (status, body) = call(
+            &router,
+            "ListStreams",
+            serde_json::json!({ "Limit": limit }),
+        )
+        .await;
+        match expected {
+            Some(page_size) => {
+                assert_eq!(
+                    status, 200,
+                    "case {case}: a Limit inside the cap must be served, got {status} and {body}"
+                );
+                let page: Vec<String> = body["Streams"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("case {case}: no Streams in {body}"))
+                    .iter()
+                    .map(|stream| stream["StreamArn"].as_str().unwrap_or_default().to_string())
+                    .collect();
+                assert_eq!(
+                    page,
+                    registered[..page_size].to_vec(),
+                    "case {case}: expected the first {page_size} streams, got {page:?}"
+                );
+            }
+            None => assert_refused(case, status, &body, LIST_STREAMS_LIMIT_REFUSAL),
         }
     }
 }

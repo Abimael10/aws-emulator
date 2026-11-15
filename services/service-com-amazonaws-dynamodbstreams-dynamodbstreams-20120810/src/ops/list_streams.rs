@@ -10,6 +10,10 @@
 //! operations take, so a value that is not written as a stream's ARN is refused as
 //! invalid input (`ValidationException`) rather than used as a page boundary.
 //!
+//! `Limit`'s documented ceiling of 100 is not modelled, so it is enforced here: a page
+//! wider than the operation serves is refused as invalid input, the way the other
+//! paged operations of this service refuse their own ceilings, rather than narrowed.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -83,6 +87,20 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The refusal a `Limit` above this operation's own ceiling draws.
+///
+/// Fixed text whose only figure is the service's limit ([`crate::state::MAX_PAGE_LIMIT`],
+/// from "The maximum number of streams to return. The upper limit is 100."), never the
+/// value the caller sent. This sentence is this operation's own: the same bound on
+/// another operation's `Limit` is worded as that operation words it.
+fn limit_above_ceiling() -> ListStreamsError {
+    crate::scaffolded::Scaffolded::validation(format!(
+        "One or more parameter values were invalid: \
+         Limit cannot be greater than the maximum allowed size: {}",
+        crate::state::MAX_PAGE_LIMIT
+    ))
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -172,6 +190,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::INVALID_STREAM_ARN,
             ));
         }
+        // The bound the service enforces on this request's parameters, which the model
+        // does not express (`Limit` is declared 1.. with no maximum): a page wider than
+        // the operation serves is refused rather than silently narrowed, so a caller
+        // probing the ceiling can tell the valid boundary from an invalid request.
+        // Decided before anything is read — a request whose parameters cannot be served
+        // is refused whatever the store holds.
+        if input
+            .limit
+            .is_some_and(|limit| limit > crate::state::MAX_PAGE_LIMIT)
+        {
+            return Err(limit_above_ceiling());
+        }
         let now = std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListStreamsErrorModeled::InternalServerError(InternalServerError {
@@ -181,21 +211,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.materialize_due_expiries(now);
 
-        // `Limit`'s declared range (1..) is enforced at the boundary; the documented
-        // ceiling of 100 is not modelled, so it is applied here.
-        //
-        // Applied as a CAP rather than as the refusal `DescribeStream` and `GetRecords`
-        // answer for their own ceilings: each of those refusals carries that
-        // operation's own sentence, and no observed answer fixes the wording for this
-        // one, so a page of the widest size the operation serves is what an
-        // over-request gets here.
-        let limit = usize::try_from(
-            input
-                .limit
-                .unwrap_or(crate::state::MAX_PAGE_LIMIT)
-                .clamp(1, crate::state::MAX_PAGE_LIMIT),
-        )
-        .unwrap_or(1);
+        // `Limit`'s declared range (1..) is enforced at the boundary and its documented
+        // ceiling just above, so the width asked for is already one the operation
+        // serves; an absent member asks for the widest page.
+        let limit =
+            usize::try_from(input.limit.unwrap_or(crate::state::MAX_PAGE_LIMIT)).unwrap_or(1);
 
         // Streams are keyed by ARN in a `BTreeMap`, so the page boundary is a range
         // bound rather than a scan: `ExclusiveStartStreamArn` need not still exist.
