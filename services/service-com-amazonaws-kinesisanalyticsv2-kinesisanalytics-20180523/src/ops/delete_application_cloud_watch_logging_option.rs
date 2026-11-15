@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteApplicationCloudWatchLoggingOption
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteApplicationCloudWatchLoggingOption`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteApplicationCloudWatchLoggingOption::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: detaches the Amazon CloudWatch log stream a stored application holds under
+//! the `CloudWatchLoggingOptionId` the request names, moving the application on to a new
+//! version and answering the descriptions that REMAIN. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +167,185 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteApplicationCloudWatchLoggingOption` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteApplicationCloudWatchLoggingOptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteApplicationCloudWatchLoggingOption"))
+        let _ = ctx;
+        // Every modelled constraint on the input — `ApplicationName`'s and
+        // `CloudWatchLoggingOptionId`'s lengths and `^[a-zA-Z0-9_.-]+$` patterns,
+        // `CurrentApplicationVersionId`'s 1..999999999 range and `ConditionalToken`'s
+        // pattern — is refused at the boundary with HTTP 400 before this handler runs, so
+        // reaching here means the request satisfies them.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteApplicationCloudWatchLoggingOptionErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            "this service is not mounted on a stateful engine, so no \
+                             CloudWatch logging option can be removed"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let name = input.application_name.clone();
+        let now = crate::state::now_timestamp();
+
+        let mut store = state.lock();
+        store.settle_named(&name);
+
+        let Some(application) = store.applications.get(&name) else {
+            return Err(
+                DeleteApplicationCloudWatchLoggingOptionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_application_message(&name)),
+                    },
+                )
+                .into(),
+            );
+        };
+        let arn = application.arn.clone();
+        let status = application.status.clone();
+        let version_in_force = application.version_id;
+        let token_in_force = application.conditional_token.clone();
+        let monitored = !application.cloud_watch_logging_options.is_empty();
+
+        // The change is made against a NAMED version of the application, by whichever of
+        // the two members the caller supplied — the rule every operation of this service
+        // that changes a configuration shares
+        // (`crate::state::addressed_version_refusal`), mapped here onto THIS operation's
+        // modelled error shapes.
+        if let Some(refusal) = crate::state::addressed_version_refusal(
+            input.current_application_version_id,
+            input.conditional_token.as_deref(),
+            version_in_force,
+            token_in_force.as_deref(),
+        ) {
+            return Err(version_refusal(refusal));
+        }
+
+        // An application in the middle of another lifecycle action is not available for
+        // this one, worded through the sentence every operation of this service refuses an
+        // action on a status with.
+        if status != crate::state::STATUS_READY && status != crate::state::STATUS_RUNNING {
+            return Err(
+                DeleteApplicationCloudWatchLoggingOptionErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(crate::state::ineligible_status_message(
+                            crate::state::TRANSITION_UPDATED,
+                            &status,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An application monitored through no log stream at all holds nothing this
+        // operation could detach, whatever id the request names: the refusal states that
+        // fact about the application rather than quoting an id, so a caller that removed
+        // the last option and called again learns why no id would have worked.
+        if !monitored {
+            return Err(
+                DeleteApplicationCloudWatchLoggingOptionErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(NO_LOGGING_OPTIONS.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Accepted only for an id the application actually holds a log stream under: the
+        // request resolves one ELEMENT of the stored configuration, so an id naming none is
+        // not a valid argument — reported through the sentence every operation of this
+        // service resolving a configuration element by id reports a miss with, and with
+        // nothing written and no version consumed.
+        let Some((application_version_id, descriptions)) = store.remove_logging_option(
+            &name,
+            &input.cloud_watch_logging_option_id,
+            now,
+        ) else {
+            return Err(
+                DeleteApplicationCloudWatchLoggingOptionErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(crate::state::missing_update_target_message(
+                            LOGGING_OPTION_KIND,
+                            &input.cloud_watch_logging_option_id,
+                            &name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A RUNNING application has to restart its job before the change is in force, so it
+        // reports `UPDATING` until the clock makes that due and the operation record stays
+        // outstanding until then; one that is not running has no job to restart, so its
+        // change is complete when this call answers. The same settlement every change to a
+        // stored configuration in this crate makes.
+        let operation_id = if status == crate::state::STATUS_RUNNING {
+            let operation_id = store.record_operation(&name, Self::NAME, now);
+            store.begin_transition(
+                &name,
+                crate::state::STATUS_UPDATING,
+                &status,
+                operation_id.clone(),
+                now,
+            );
+            operation_id
+        } else {
+            store.record_completed_operation(&name, Self::NAME, now)
+        };
+
+        // Answered out of the store, so what the caller receives is exactly what a later
+        // DescribeApplication will report — including the ABSENCE of the member for an
+        // application whose last log stream this call took away, which is how every reader
+        // of this service reports an application that carries none.
+        Ok(DeleteApplicationCloudWatchLoggingOptionOutput {
+            application_arn: Some(arn),
+            application_version_id: Some(application_version_id),
+            cloud_watch_logging_option_descriptions: (!descriptions.is_empty())
+                .then_some(descriptions),
+            operation_id: Some(operation_id),
+        })
     }
+}
+
+/// The element of an application's configuration this operation resolves by id, as the API
+/// spells it in [`crate::state::missing_update_target_message`].
+const LOGGING_OPTION_KIND: &str = "CloudWatch logging option";
+
+/// What AWS answers a request to detach a log stream from an application that is monitored
+/// through none: the whole fixed sentence for that error class, naming the modelled member
+/// whose list is empty. It carries no id and no application name — the fact it states is
+/// about the application's configuration, which the request already names.
+const NO_LOGGING_OPTIONS: &str = "There are no CloudWatchLoggingOptions associated with the \
+                                  Application that you would like to Delete.";
+
+/// Lift the shared refusal of the version this change is addressed to onto this operation's
+/// modelled errors: a request that addresses no version carries a parameter value that is
+/// not valid (HTTP 400), while one addressing a consumed version lost a race with another
+/// change (HTTP 409).
+fn version_refusal(
+    refusal: crate::state::AddressedVersionRefusal,
+) -> DeleteApplicationCloudWatchLoggingOptionError {
+    match refusal {
+        crate::state::AddressedVersionRefusal::NotAddressed(message) => {
+            DeleteApplicationCloudWatchLoggingOptionErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(message),
+                },
+            )
+        }
+        crate::state::AddressedVersionRefusal::Stale(message) => {
+            DeleteApplicationCloudWatchLoggingOptionErrorModeled::ConcurrentModificationException(
+                ConcurrentModificationException {
+                    message: Some(message),
+                },
+            )
+        }
+    }
+    .into()
 }

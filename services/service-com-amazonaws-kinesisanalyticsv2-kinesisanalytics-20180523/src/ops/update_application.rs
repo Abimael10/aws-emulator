@@ -224,45 +224,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
-        // "You must provide the CurrentApplicationVersionId or the ConditionalToken"
-        // (both members' docs): the update is made against a NAMED version of the
-        // application, and whichever of the two the caller names has to be the version in
-        // force — otherwise something else has modified the application since the caller
-        // read it, which is what the modelled `ConcurrentModificationException` (HTTP 409)
-        // reports.
-        match (
+        // The update is made against a NAMED version of the application, and whichever of
+        // the two members the caller names has to be the version in force — the rule every
+        // operation of this service that changes a configuration shares
+        // (`crate::state::addressed_version_refusal`), mapped here onto THIS operation's
+        // modelled error shapes.
+        if let Some(refusal) = crate::state::addressed_version_refusal(
             input.current_application_version_id,
             input.conditional_token.as_deref(),
+            version_id,
+            stored_token.as_deref(),
         ) {
-            (None, None) => {
-                return Err(UpdateApplicationErrorModeled::InvalidArgumentException(
-                    InvalidArgumentException {
-                        message: Some(VERSION_OR_TOKEN_REQUIRED.to_string()),
-                    },
-                )
-                .into())
-            }
-            (Some(supplied), _) if supplied != version_id => {
-                return Err(
-                    UpdateApplicationErrorModeled::ConcurrentModificationException(
-                        ConcurrentModificationException {
-                            message: Some(stale_version_message(VERSION_ID_MEMBER)),
-                        },
-                    )
-                    .into(),
-                )
-            }
-            (_, Some(token)) if Some(token) != stored_token.as_deref() => {
-                return Err(
-                    UpdateApplicationErrorModeled::ConcurrentModificationException(
-                        ConcurrentModificationException {
-                            message: Some(stale_version_message(CONDITIONAL_TOKEN_MEMBER)),
-                        },
-                    )
-                    .into(),
-                )
-            }
-            _ => {}
+            return Err(version_refusal(refusal));
         }
 
         // An application in the middle of another lifecycle action is not available for
@@ -332,7 +305,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateApplicationErrorModeled::ConcurrentModificationException(
                     ConcurrentModificationException {
-                        message: Some(stale_version_message(VERSION_ID_MEMBER)),
+                        message: Some(crate::state::stale_version_message(
+                            crate::state::VERSION_ID_MEMBER,
+                        )),
                     },
                 )
                 .into(),
@@ -412,27 +387,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// What AWS answers a caller that names neither of the two members an update is made
-/// against, as both members' docs state the requirement ("You must provide the
-/// CurrentApplicationVersionId or the ConditionalToken").
-const VERSION_OR_TOKEN_REQUIRED: &str =
-    "You must provide the CurrentApplicationVersionId or the ConditionalToken.";
-
-/// The whole sentence an update that addresses a version other than the one in force is
-/// refused with.
-///
-/// The corpus records it for an update that named a consumed `CurrentApplicationVersionId`
-/// — "The provided application version ID does not match the most recent version for the
-/// application." — and the MEMBER the request addressed the version by is its only
-/// variable part, so an update that addressed it by `ConditionalToken` is refused in the
-/// same words about that member.
-fn stale_version_message(member: &str) -> String {
-    format!("The provided {member} does not match the most recent version for the application.")
+/// Lift the shared refusal of the version an update is addressed to onto this operation's
+/// modelled errors: a request that addresses no version carries a parameter value that is
+/// not valid (HTTP 400), while one addressing a consumed version lost a race with another
+/// change (HTTP 409).
+fn version_refusal(refusal: crate::state::AddressedVersionRefusal) -> UpdateApplicationError {
+    match refusal {
+        crate::state::AddressedVersionRefusal::NotAddressed(message) => {
+            UpdateApplicationErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(message),
+            })
+        }
+        crate::state::AddressedVersionRefusal::Stale(message) => {
+            UpdateApplicationErrorModeled::ConcurrentModificationException(
+                ConcurrentModificationException {
+                    message: Some(message),
+                },
+            )
+        }
+    }
+    .into()
 }
-
-/// The two members an update can address a version by, as that sentence names them.
-const VERSION_ID_MEMBER: &str = "application version ID";
-const CONDITIONAL_TOKEN_MEMBER: &str = "ConditionalToken";
 
 /// Lift a refusal sentence about an element of the configuration an update names into
 /// this operation's modelled `InvalidArgumentException` (HTTP 400).

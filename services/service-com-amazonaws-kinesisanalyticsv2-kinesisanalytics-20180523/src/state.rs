@@ -10,6 +10,11 @@
 //! names, `DescribeApplicationSnapshot` and `ListApplicationSnapshots` read it back from
 //! there and `DeleteApplicationSnapshot` removes it.
 //!
+//! `AddApplicationCloudWatchLoggingOption` and `DeleteApplicationCloudWatchLoggingOption`
+//! attach and detach the log streams an application is monitored through
+//! ([`ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State::add_logging_option`],
+//! [`ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State::remove_logging_option`]).
+//!
 //! Beside the records themselves this module owns the two projections every reader
 //! needs ([`Application::detail`], [`Application::summary`]), the per-version records a
 //! version reader reports ([`Application::version_detail`],
@@ -17,7 +22,8 @@
 //! ([`Application::tag_list`]), the resolution of a `ResourceARN` to the application it
 //! names ([`ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State::application_by_arn`]),
 //! the merge an update applies
-//! to a stored configuration ([`Application::apply_configuration_update`]), the mode an
+//! to a stored configuration ([`Application::apply_configuration_update`]), the version a
+//! change is addressed to ([`addressed_version_refusal`]), the mode an
 //! application runs in when its create named none ([`default_application_mode`]), the
 //! maintenance window every application carries
 //! ([`Application::maintenance_configuration`]), the resolution of a Studio notebook's
@@ -1466,6 +1472,56 @@ impl ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State {
             })
             .collect()
     }
+
+    /// Attach `option` as one of `application`'s CloudWatch log streams and move the
+    /// application on to a new version; answers that version and the logging option
+    /// descriptions it now carries.
+    ///
+    /// The whole accepted mutation of `AddApplicationCloudWatchLoggingOption`, in one place
+    /// beside the other writers of this store: the description (with the id the service
+    /// assigns it), the version advance, and the answer read back out of what was stored.
+    /// `None` when no application is stored under `application`.
+    pub fn add_logging_option(
+        &mut self,
+        application: &str,
+        option: &CloudWatchLoggingOption,
+        now: DateTime,
+    ) -> Option<(i64, Vec<CloudWatchLoggingOptionDescription>)> {
+        // Described exactly as a create describes the log streams it attaches, so one
+        // added after the fact carries the same id form and the same members.
+        let described = self.describe_logging_options(std::slice::from_ref(option));
+        // The detail of the version this add LEAVES: read before the option is stored, so
+        // the record kept for it describes the application as that version ran.
+        let superseded = self.applications.get(application)?.detail();
+        let version_id = self.advance_version(application, now, superseded)?;
+        let app = self.applications.get_mut(application)?;
+        app.cloud_watch_logging_options.extend(described);
+        Some((version_id, app.cloud_watch_logging_options.clone()))
+    }
+
+    /// Detach the CloudWatch log stream `application` holds under `option_id` and move the
+    /// application on to a new version; answers that version and the descriptions that
+    /// REMAIN.
+    ///
+    /// `None` when no application is stored under that name, or when the one stored holds
+    /// no logging option under that id — so nothing is written and no version is consumed
+    /// for a request naming an option that was never attached.
+    pub fn remove_logging_option(
+        &mut self,
+        application: &str,
+        option_id: &str,
+        now: DateTime,
+    ) -> Option<(i64, Vec<CloudWatchLoggingOptionDescription>)> {
+        let app = self.applications.get(application)?;
+        let position = app.cloud_watch_logging_options.iter().position(|described| {
+            described.cloud_watch_logging_option_id.as_deref() == Some(option_id)
+        })?;
+        let superseded = app.detail();
+        let version_id = self.advance_version(application, now, superseded)?;
+        let app = self.applications.get_mut(application)?;
+        app.cloud_watch_logging_options.remove(position);
+        Some((version_id, app.cloud_watch_logging_options.clone()))
+    }
 }
 
 /// The two `ConfigurationType` values, spelled as the model's enum spells them
@@ -1815,16 +1871,71 @@ pub fn maintenance_window_end(start: &str) -> String {
     }
 }
 
-/// How this service words a request whose `CurrentApplicationVersionId` is not the
-/// version the application is on now.
+/// How this service words a change addressed to a version other than the one in force.
 ///
-/// One wording for every operation that carries that optimistic-concurrency token, so
-/// two operations cannot report the same stale token differently. The sentence is entirely
-/// fixed text for this error class: naming the version the caller sent, or the one the
-/// application is on, would hand a client a way to guess its way past the check.
-pub const STALE_VERSION_MESSAGE: &str =
-    "The provided application version ID does not match the most recent version for the \
-     application.";
+/// One wording for every operation that carries that optimistic-concurrency token, so two
+/// operations cannot report the same stale address differently. The MEMBER the request
+/// addressed the version by is the sentence's only variable part: naming the version the
+/// caller sent, or the one the application is on, would hand a client a way to guess its
+/// way past the check.
+pub fn stale_version_message(member: &str) -> String {
+    format!("The provided {member} does not match the most recent version for the application.")
+}
+
+/// The two members a change can address a version by, as [`stale_version_message`] names
+/// them.
+pub const VERSION_ID_MEMBER: &str = "application version ID";
+/// See [`VERSION_ID_MEMBER`].
+pub const CONDITIONAL_TOKEN_MEMBER: &str = "ConditionalToken";
+
+/// What AWS answers a caller that names neither of the two members a change is made
+/// against, as both members' docs state the requirement ("You must provide the
+/// CurrentApplicationVersionId or the ConditionalToken").
+pub const VERSION_OR_TOKEN_REQUIRED: &str =
+    "You must provide the CurrentApplicationVersionId or the ConditionalToken.";
+
+/// Why the version a change is addressed to is refused.
+///
+/// The two cases are different error CLASSES, which is why they are distinguished here and
+/// not just worded differently: a request that addresses no version at all carries a
+/// parameter value that is not valid, while one that addresses a consumed version lost a
+/// race with another change.
+#[derive(Debug, Clone)]
+pub enum AddressedVersionRefusal {
+    /// The request named neither member, so it addresses no version at all.
+    NotAddressed(String),
+    /// The member it named no longer addresses the version in force, so something else has
+    /// modified the application since the caller read it.
+    Stale(String),
+}
+
+/// The refusal the version a change is addressed to earns, or `None` when it addresses the
+/// version in force.
+///
+/// "You must provide the CurrentApplicationVersionId or the ConditionalToken" (both
+/// members' docs): every operation that changes an application's configuration is made
+/// against a NAMED version, and whichever of the two the caller names has to be the version
+/// in force. One rule for all of them, so two such operations cannot decide the same
+/// address differently; each maps the refusal onto its OWN modelled error shapes.
+pub fn addressed_version_refusal(
+    supplied_version_id: Option<i64>,
+    supplied_token: Option<&str>,
+    version_in_force: i64,
+    token_in_force: Option<&str>,
+) -> Option<AddressedVersionRefusal> {
+    match (supplied_version_id, supplied_token) {
+        (None, None) => Some(AddressedVersionRefusal::NotAddressed(
+            VERSION_OR_TOKEN_REQUIRED.to_string(),
+        )),
+        (Some(supplied), _) if supplied != version_in_force => Some(
+            AddressedVersionRefusal::Stale(stale_version_message(VERSION_ID_MEMBER)),
+        ),
+        (_, Some(token)) if Some(token) != token_in_force => Some(
+            AddressedVersionRefusal::Stale(stale_version_message(CONDITIONAL_TOKEN_MEMBER)),
+        ),
+        _ => None,
+    }
+}
 
 /// The current wall-clock instant as a modelled timestamp, truncated to whole seconds.
 ///

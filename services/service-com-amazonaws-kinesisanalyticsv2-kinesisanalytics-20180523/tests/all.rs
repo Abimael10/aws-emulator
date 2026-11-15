@@ -21,6 +21,8 @@ mod application_version_advance;
 mod application_version_reads;
 #[path = "all/body_timestamp_class.rs"]
 mod body_timestamp_class;
+#[path = "all/cloud_watch_logging_options.rs"]
+mod cloud_watch_logging_options;
 #[path = "all/conditional_token_identity.rs"]
 mod conditional_token_identity;
 #[path = "all/error_envelope_wording.rs"]

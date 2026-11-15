@@ -227,7 +227,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 AddApplicationInputErrorModeled::ConcurrentModificationException(
                     ConcurrentModificationException {
-                        message: Some(crate::state::STALE_VERSION_MESSAGE.to_string()),
+                        message: Some(crate::state::stale_version_message(
+                            crate::state::VERSION_ID_MEMBER,
+                        )),
                     },
                 )
                 .into(),

@@ -203,7 +203,7 @@ impl Emulator {
 /// One VALID request per still-scaffolded operation — valid so the boundary validator
 /// passes it and it reaches that operation's own handler. Members and constraints from
 /// `OPERATIONS.md`.
-const SCAFFOLDED_DISPATCH_TABLE: [(&str, &str); 3] = [
+const SCAFFOLDED_DISPATCH_TABLE: [(&str, &str); 2] = [
     (
         "DeleteApplicationOutput",
         r#"{"ApplicationName":"collision-case","CurrentApplicationVersionId":1,"OutputId":"out-1"}"#,
@@ -211,10 +211,6 @@ const SCAFFOLDED_DISPATCH_TABLE: [(&str, &str); 3] = [
     (
         "AddApplicationOutput",
         r#"{"ApplicationName":"collision-case","CurrentApplicationVersionId":1,"Output":{"Name":"in_app_stream","DestinationSchema":{"RecordFormatType":"JSON"}}}"#,
-    ),
-    (
-        "DeleteApplicationCloudWatchLoggingOption",
-        r#"{"ApplicationName":"collision-case","CurrentApplicationVersionId":1,"CloudWatchLoggingOptionId":"cw-1"}"#,
     ),
 ];
 

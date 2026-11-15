@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddApplicationCloudWatchLoggingOption
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddApplicationCloudWatchLoggingOption`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddApplicationCloudWatchLoggingOption::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: attaches an Amazon CloudWatch log stream to a stored application — the
+//! stream is described with the `CloudWatchLoggingOptionId` the service assigns it, kept on
+//! the application in [`crate::state`], and the application moves on to a new version, so
+//! `DescribeApplication` reports exactly what this call answered. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +166,180 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddApplicationCloudWatchLoggingOption` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddApplicationCloudWatchLoggingOptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddApplicationCloudWatchLoggingOption"))
+        let _ = ctx;
+        // Every modelled constraint on the input — `ApplicationName`'s length and
+        // `^[a-zA-Z0-9_.-]+$` pattern, `CurrentApplicationVersionId`'s 1..999999999 range,
+        // `ConditionalToken`'s pattern and `CloudWatchLoggingOption$LogStreamARN`'s `^arn:`
+        // pattern — is refused at the boundary with HTTP 400 before this handler runs, so
+        // reaching here means the request satisfies them.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AddApplicationCloudWatchLoggingOptionErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            "this service is not mounted on a stateful engine, so no \
+                             CloudWatch logging option can be stored"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let name = input.application_name.clone();
+        let now = crate::state::now_timestamp();
+
+        let mut store = state.lock();
+        store.settle_named(&name);
+
+        let Some(application) = store.applications.get(&name) else {
+            return Err(
+                AddApplicationCloudWatchLoggingOptionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_application_message(&name)),
+                    },
+                )
+                .into(),
+            );
+        };
+        let arn = application.arn.clone();
+        let status = application.status.clone();
+        let version_in_force = application.version_id;
+        let token_in_force = application.conditional_token.clone();
+        let attached = application.cloud_watch_logging_options.len();
+
+        // The change is made against a NAMED version of the application, by whichever of
+        // the two members the caller supplied — the rule every operation of this service
+        // that changes a configuration shares
+        // (`crate::state::addressed_version_refusal`), mapped here onto THIS operation's
+        // modelled error shapes.
+        if let Some(refusal) = crate::state::addressed_version_refusal(
+            input.current_application_version_id,
+            input.conditional_token.as_deref(),
+            version_in_force,
+            token_in_force.as_deref(),
+        ) {
+            return Err(version_refusal(refusal));
+        }
+
+        // An application in the middle of another lifecycle action is not available for
+        // this one: the settled statuses this service drives an application through are
+        // READY and RUNNING, and a transient one (STARTING, STOPPING, an update still
+        // settling) means a change is already outstanding. Worded through the sentence
+        // every operation of this service refuses an action on a status with.
+        if status != crate::state::STATUS_READY && status != crate::state::STATUS_RUNNING {
+            return Err(
+                AddApplicationCloudWatchLoggingOptionErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(crate::state::ineligible_status_message(
+                            crate::state::TRANSITION_UPDATED,
+                            &status,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // What bounds the log streams a caller can grow one application's configuration
+        // by: each accepted call attaches another, and only the delete operation removes
+        // one, so the stored application accepts at most [`MAX_LOGGING_OPTIONS`] of them.
+        if attached >= MAX_LOGGING_OPTIONS {
+            return Err(
+                AddApplicationCloudWatchLoggingOptionErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(format!(
+                            "Application {name} already has {MAX_LOGGING_OPTIONS} CloudWatch \
+                             logging options, which is the maximum."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Accepted: the log stream is described with the id the service assigns it, stored
+        // on the application, and the application is moved on to a new version — "Kinesis
+        // Data Analytics updates the ApplicationVersionId each time you change the
+        // CloudWatch logging options" (the output member's own doc).
+        let Some((application_version_id, descriptions)) =
+            store.add_logging_option(&name, &input.cloud_watch_logging_option, now)
+        else {
+            return Err(
+                AddApplicationCloudWatchLoggingOptionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_application_message(&name)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A RUNNING application has to restart its job under the new configuration before
+        // the change is in force, so it reports `UPDATING` until the clock makes that due
+        // and the operation record stays outstanding until then — exactly as
+        // `UpdateApplication` settles its own change. An application that is not running
+        // has no job to restart: its change is complete when this call answers. Either way
+        // the `OperationId` the answer carries is the id of a record held in this store.
+        let operation_id = if status == crate::state::STATUS_RUNNING {
+            let operation_id = store.record_operation(&name, Self::NAME, now);
+            store.begin_transition(
+                &name,
+                crate::state::STATUS_UPDATING,
+                &status,
+                operation_id.clone(),
+                now,
+            );
+            operation_id
+        } else {
+            store.record_completed_operation(&name, Self::NAME, now)
+        };
+
+        // Answered out of the store, so what the caller receives is exactly what a later
+        // DescribeApplication will report.
+        Ok(AddApplicationCloudWatchLoggingOptionOutput {
+            application_arn: Some(arn),
+            application_version_id: Some(application_version_id),
+            cloud_watch_logging_option_descriptions: Some(descriptions),
+            operation_id: Some(operation_id),
+        })
     }
+}
+
+/// How many CloudWatch log streams one stored application carries.
+///
+/// The model publishes no bound on `CloudWatchLoggingOptions` and AWS publishes the quota
+/// as adjustable, so this ceiling is the emulator's OWN bound on growth a caller drives:
+/// every accepted call attaches another description that is held for the life of the
+/// process, and only `DeleteApplicationCloudWatchLoggingOption` takes one away. It is set
+/// high enough that no ordinary workflow meets it, and a caller that does is refused with
+/// the modelled `InvalidArgumentException` this operation declares rather than having its
+/// configuration silently trimmed.
+const MAX_LOGGING_OPTIONS: usize = 50;
+
+/// Lift the shared refusal of the version this change is addressed to onto this operation's
+/// modelled errors: a request that addresses no version carries a parameter value that is
+/// not valid (HTTP 400), while one addressing a consumed version lost a race with another
+/// change (HTTP 409).
+fn version_refusal(
+    refusal: crate::state::AddressedVersionRefusal,
+) -> AddApplicationCloudWatchLoggingOptionError {
+    match refusal {
+        crate::state::AddressedVersionRefusal::NotAddressed(message) => {
+            AddApplicationCloudWatchLoggingOptionErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(message),
+                },
+            )
+        }
+        crate::state::AddressedVersionRefusal::Stale(message) => {
+            AddApplicationCloudWatchLoggingOptionErrorModeled::ConcurrentModificationException(
+                ConcurrentModificationException {
+                    message: Some(message),
+                },
+            )
+        }
+    }
+    .into()
 }
