@@ -134,6 +134,9 @@ mod signing_platform_catalog;
 #[path = "all/signing_profile_lifecycle.rs"]
 mod signing_profile_lifecycle;
 
+#[path = "all/signing_region_label.rs"]
+mod signing_region_label;
+
 #[path = "all/start_signing_job_platform_workflow.rs"]
 mod start_signing_job_platform_workflow;
 

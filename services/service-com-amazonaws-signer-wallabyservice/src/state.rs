@@ -34,7 +34,7 @@ use crate::ops::types::{
 };
 
 /// The region an ARN is built for when the request carries no SigV4 credential
-/// scope to read one from.
+/// scope to read a region LABEL from (see [`request_region`]).
 pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// `SigningProfileStatus`'s values, spelled as the model spells them (see
@@ -2570,8 +2570,24 @@ fn cursor_digest(cursor: &str) -> String {
 /// The region this request was signed for — the region whose endpoint is being
 /// addressed, which is the region its resources live in and the one a profile ARN
 /// names.
+///
+/// The scope's region field is read as a region LABEL
+/// (`service_common::arn::region_label`, the one place that grammar is stated:
+/// non-empty, at most 20 characters and composed only of `[a-z0-9-]`, the form
+/// every model's `*Arn` pattern states for the field), and a value outside that
+/// grammar names no region an AWS endpoint has, so this falls back to
+/// [`DEFAULT_REGION`] exactly as it does for a request carrying no scope at all.
+/// A region is not just data here: it is spliced into the ARNs this service MINTS
+/// ([`profile_arn`], [`job_arn`]) and read back out of them by the one parse that
+/// resolves an ARN to a resource ([`signer_region_and_resource`]), whose fields
+/// are `:`-separated — so a region carrying a `:` would shift every later field
+/// and leave the service holding a resource whose own ARN its other operations
+/// could never resolve. The same narrowing keeps the value out of the endpoint
+/// authority the code-signing S3 client addresses
+/// ([`crate::state::code_signing`]).
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .filter(|scope| ::service_common::arn::region_label(&scope.region).is_some())
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
