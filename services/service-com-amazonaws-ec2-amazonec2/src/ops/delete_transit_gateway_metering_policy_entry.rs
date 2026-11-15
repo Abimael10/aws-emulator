@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTransitGatewayMeteringPolicyEntry
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTransitGatewayMeteringPolicyEntry`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the entry the request names — the one the metering policy it names
+//! holds at that rule number — from the store, and reports it in the one state its catalog
+//! gives an entry a delete has taken out of its policy.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTransitGatewayMeteringPolicyEntry::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +133,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTransitGatewayMeteringPolicyEntry` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTransitGatewayMeteringPolicyEntryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTransitGatewayMeteringPolicyEntry"))
+        // `ctx` carries request metadata only; this operation reads none of it — an entry is a
+        // resource OF the policy the request names and carries no Region of its own. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of the transit gateway metering policy containing the entry to delete"
+        // (`$TransitGatewayMeteringPolicyId`): the id's FORM first, before any other member is
+        // looked at and before the store is touched — the same order
+        // `CreateTransitGatewayMeteringPolicyEntry` and
+        // `GetTransitGatewayMeteringPolicyEntries` read it in, through the ONE place this
+        // resource's malformed refusal is worded, so the three cannot disagree about which
+        // refusal a request with two faults gets.
+        let metering_policy_id = input.transit_gateway_metering_policy_id.as_str();
+        state::require_well_formed_transit_gateway_metering_policy_id(metering_policy_id)?;
+
+        // "The rule number of the metering policy entry to delete" (`$PolicyRuleNumber`): a
+        // number below the lowest one a rule can take names an entry no policy could hold, so
+        // it is refused as a value outside the parameter rather than reported as an entry
+        // nobody holds — by the crate's ONE reading of the numbers a metering policy entry
+        // takes, the same the create holds its own member to.
+        let rule_number = input.policy_rule_number;
+        state::require_transit_gateway_metering_policy_rule_number(rule_number)?;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`$DryRun`): the flag asks about PERMISSION, not about the
+        // resources the request names, so it is answered once the request's own form has been
+        // checked and before anything is resolved or removed — the order the create of an entry
+        // and the delete of the policy itself answer it in; every caller of this emulator is
+        // permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock first: whether this entry can be deleted is asked of the state its policy
+        // is ACTUALLY in rather than the one its last writer left it in. That move was owed at
+        // this instant whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // An entry has nowhere to live without the policy that holds it, so an id this account
+        // holds no policy for is refused with the one refusal every reader of a
+        // `TransitGatewayMeteringPolicyId` answers for an id it cannot resolve, rather than
+        // read as "nothing to delete".
+        if !store
+            .transit_gateway_metering_policies
+            .contains_key(metering_policy_id)
+        {
+            return Err(state::invalid_transit_gateway_metering_policy_id_not_found(
+                metering_policy_id,
+            ));
+        }
+        // One rule number names one entry of one policy, and an entry has no id of its own, so
+        // a rule number the policy holds nothing at is refused as a value outside that
+        // parameter rather than answered as a deletion that removed nothing: a caller that
+        // deletes twice has to be able to tell the deletion it performed from one it did not.
+        if !store.transit_gateway_metering_policy_holds_entry(metering_policy_id, rule_number) {
+            return Err(state::transit_gateway_metering_policy_holds_no_entry());
+        }
+
+        let Some(deleted) =
+            store.remove_transit_gateway_metering_policy_entry(metering_policy_id, rule_number)
+        else {
+            // Unreachable: the policy and the entry were both resolved above, under the lock
+            // this still holds. Kept so a delete that removed nothing can never read as a 200
+            // over an entry the store still holds.
+            return Err(state::internal_error(format!(
+                "the entry at rule number {rule_number} of the transit gateway metering policy \
+                 '{metering_policy_id}' resolved a moment ago is not in the store any more"
+            )));
+        };
+
+        // "Information about the deleted transit gateway metering policy entry"
+        // (`$TransitGatewayMeteringPolicyEntry`): the entry as the store held it, in the
+        // terminal `deleted` state its catalog gives one a delete has taken out of its policy —
+        // a state nothing moves on from, so the entry is gone from the store rather than
+        // waiting on a move, and a read straight after this call corroborates that.
+        Ok(DeleteTransitGatewayMeteringPolicyEntryOutput {
+            transit_gateway_metering_policy_entry: Some(deleted),
+        })
     }
 }

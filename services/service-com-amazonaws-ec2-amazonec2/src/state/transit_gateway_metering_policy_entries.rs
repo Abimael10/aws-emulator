@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The entries of a transit gateway metering policy: what one is stored as, the state a
-//! created entry is in, what a create is refused with, the store's bounds and its one writer.
+//! The entries of a transit gateway metering policy: what one is stored as, the two states its
+//! catalog admits, the rule numbers one may take, what a create and a delete are refused with,
+//! the store's bounds, and the two writers that add an entry and take one out again.
 //!
 //! The policies themselves — their id form, their own states and the refusals for an id that
 //! names none — live in the "Transit gateway metering policies" section of [`crate::state`],
@@ -33,6 +34,14 @@ use crate::scaffolded::Scaffolded;
 /// terminal, state straight away and the clock owes it no move — unlike the policy it belongs
 /// to, whose own catalog does carry a `pending` member.
 pub const TRANSIT_GATEWAY_METERING_POLICY_ENTRY_STATE_AVAILABLE: &str = "available";
+
+/// An entry a delete has taken out of its policy: the other member of that same catalog, the
+/// state the delete reports the entry it removed in.
+///
+/// The catalog names no transient state between the two, so a delete settles at once: the
+/// entry is gone from the store when the call answers, rather than waiting on a move the clock
+/// owes it — unlike the policy that held it, whose own catalog carries a `deleting` member.
+pub const TRANSIT_GATEWAY_METERING_POLICY_ENTRY_STATE_DELETED: &str = "deleted";
 
 /// The code for an entry the policy already holds at that rule number.
 ///
@@ -100,6 +109,43 @@ pub fn transit_gateway_metering_policy_entry_already_exists<E>(
              holds an entry at rule number {rule_number}."
         ),
     )
+}
+
+/// Refuse a request whose `PolicyRuleNumber` names no entry of the metering policy it named:
+/// HTTP 400 [`super::INVALID_PARAMETER_VALUE`], through [`super::invalid_parameter_value`].
+///
+/// An entry of a metering policy has no id of its own: it is named by a PARAMETER of the policy
+/// that holds it, so a rule number the policy holds nothing at is a value outside that
+/// parameter rather than a resource id that resolved to nothing — which is why this answers the
+/// invalid-value code and not a `NotFound` of some entry kind.
+///
+/// The sentence is the one AWS words for this condition, which names no value of the request at
+/// all: every delete of an entry the policy does not hold reads the same, as the recorded
+/// refusal of a `DeleteTransitGatewayMeteringPolicyEntry` naming a rule number the policy no
+/// longer holds shows.
+pub fn transit_gateway_metering_policy_holds_no_entry<E>() -> Scaffolded<E> {
+    super::invalid_parameter_value("Metering Policy Entry RuleNumber provided does not exists")
+}
+
+/// Hold a `PolicyRuleNumber` to the numbers a metering policy entry can take before anything
+/// is resolved: [`super::invalid_parameter_value`] for one below
+/// [`MIN_TRANSIT_GATEWAY_METERING_POLICY_RULE_NUMBER`].
+///
+/// The model puts no `@range` on the member (`Integer` on both the create's and the delete's
+/// request), so the handlers are the only place that floor can be enforced — and it is worded
+/// HERE, once, so the operation that writes an entry and the one that removes one cannot
+/// disagree about which numbers name an entry at all.
+pub fn require_transit_gateway_metering_policy_rule_number<E>(
+    rule_number: i32,
+) -> Result<(), Scaffolded<E>> {
+    if rule_number >= MIN_TRANSIT_GATEWAY_METERING_POLICY_RULE_NUMBER {
+        return Ok(());
+    }
+    Err(super::invalid_parameter_value(format!(
+        "Value ({rule_number}) for parameter policyRuleNumber is invalid. A rule number is a \
+         positive integer, from {first}",
+        first = MIN_TRANSIT_GATEWAY_METERING_POLICY_RULE_NUMBER,
+    )))
 }
 
 /// The caller-chosen bytes ONE stored metering policy entry holds: the text of its rule's
@@ -227,5 +273,43 @@ impl ComAmazonawsEc2Amazonec2State {
             .get(transit_gateway_metering_policy_id)
             .and_then(|entries| entries.get(&rule_number))
             .cloned()
+    }
+
+    /// Take the entry at `rule_number` out of the metering policy
+    /// `transit_gateway_metering_policy_id`, and answer it as the delete reports it — or
+    /// `None`, with nothing removed, when that policy holds no entry at that rule number.
+    ///
+    /// The removed entry is reported in the terminal
+    /// [`TRANSIT_GATEWAY_METERING_POLICY_ENTRY_STATE_DELETED`] its catalog admits — that
+    /// catalog carries no state between `available` and `deleted`, so the entry leaves the
+    /// store as this call answers rather than waiting on a move the clock owes it, and the
+    /// read that lists a policy's entries stops reporting it straight away.
+    ///
+    /// The two instants the entry carries are left exactly as its last writer recorded them:
+    /// they say when the entry was last UPDATED and when that update takes effect, and this
+    /// call updates nothing — it removes the record.
+    ///
+    /// The bytes the entry held are given back, exactly the charge
+    /// [`Self::insert_transit_gateway_metering_policy_entry`] made, so a policy emptied and
+    /// refilled does not grow the store's budget.
+    pub fn remove_transit_gateway_metering_policy_entry(
+        &mut self,
+        transit_gateway_metering_policy_id: &str,
+        rule_number: i32,
+    ) -> Option<TransitGatewayMeteringPolicyEntry> {
+        let entries = self
+            .transit_gateway_metering_policy_entries
+            .get_mut(transit_gateway_metering_policy_id)?;
+        let mut removed = entries.remove(&rule_number)?;
+        if entries.is_empty() {
+            self.transit_gateway_metering_policy_entries
+                .remove(transit_gateway_metering_policy_id);
+        }
+        self.release_stored_bytes(
+            STORED_RECORD_OVERHEAD_BYTES
+                + transit_gateway_metering_policy_entry_payload_bytes(&removed),
+        );
+        removed.state = Some(TRANSIT_GATEWAY_METERING_POLICY_ENTRY_STATE_DELETED.to_string());
+        Some(removed)
     }
 }

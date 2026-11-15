@@ -2384,3 +2384,11 @@ mod parameter_refusal_codes;
 // ones with it, the second delete and the dry run it refuses without writing anything. Declared at
 #[path = "all/delete_ipam.rs"]
 mod delete_ipam;
+// What `DeleteTransitGatewayMeteringPolicyEntry` records: the entry the metering policy the
+// request names holds at the rule number it names taken OUT of the store and reported in the
+// state its catalog gives one a delete has removed, with every other member exactly as it was
+// stored, the read of that policy's entries stopping at once and the rule number free again —
+// and the ids, the rule numbers, the second delete and the dry run it refuses without removing
+// anything. Declared at the tail of this file, which is where every new ec2 suite lands.
+#[path = "all/delete_transit_gateway_metering_policy_entry.rs"]
+mod delete_transit_gateway_metering_policy_entry;

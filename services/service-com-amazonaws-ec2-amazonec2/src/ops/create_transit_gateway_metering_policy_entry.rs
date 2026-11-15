@@ -175,15 +175,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lowest to highest number" (`$PolicyRuleNumber`): the number is an ordinal position
         // in that order, counted from
         // [`crate::state::MIN_TRANSIT_GATEWAY_METERING_POLICY_RULE_NUMBER`]. The model puts no
-        // `@range` on the member, so the handler is the only place that floor can be enforced.
+        // `@range` on the member, so a handler is the only place that floor can be enforced —
+        // through the crate's ONE reading of the numbers a metering policy entry takes, which
+        // `DeleteTransitGatewayMeteringPolicyEntry` holds its own member to as well.
         let rule_number = input.policy_rule_number;
-        if rule_number < state::MIN_TRANSIT_GATEWAY_METERING_POLICY_RULE_NUMBER {
-            return Err(state::invalid_parameter_value(format!(
-                "Value ({rule_number}) for parameter policyRuleNumber is invalid. A rule \
-                 number is a positive integer, from {first}",
-                first = state::MIN_TRANSIT_GATEWAY_METERING_POLICY_RULE_NUMBER,
-            )));
-        }
+        state::require_transit_gateway_metering_policy_rule_number(rule_number)?;
 
         // The traffic-matching criteria the entry is to meter, every one of them optional:
         // "the ID of the source transit gateway attachment for traffic matching"
