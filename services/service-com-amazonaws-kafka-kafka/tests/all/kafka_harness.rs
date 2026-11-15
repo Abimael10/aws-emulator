@@ -978,6 +978,13 @@ pub struct ClusterRequest {
     pub client_broker: Option<&'static str>,
     pub sasl_scram: Option<bool>,
     pub sasl_iam: Option<bool>,
+    /// `ClientAuthentication$Tls$Enabled` — MUTUAL TLS, where the broker
+    /// authenticates the client by its certificate. A row that turns it on also
+    /// carries the certificate-authority list the member documents.
+    pub tls_auth: Option<bool>,
+    /// `ClientAuthentication$Unauthenticated$Enabled` — whether the cluster
+    /// accepts clients that present no credential at all.
+    pub unauthenticated: Option<bool>,
     pub storage_mode: Option<&'static str>,
     pub enhanced_monitoring: Option<&'static str>,
     pub public_access: Option<&'static str>,
@@ -1001,6 +1008,8 @@ impl ClusterRequest {
             client_broker: None,
             sasl_scram: None,
             sasl_iam: None,
+            tls_auth: None,
+            unauthenticated: None,
             storage_mode: None,
             enhanced_monitoring: None,
             public_access: None,
@@ -1084,8 +1093,36 @@ impl ClusterRequest {
         if let Some(enabled) = self.sasl_iam {
             sasl.insert("iam".to_string(), json!({ "enabled": enabled }));
         }
+        let mut authentication = Map::new();
         if !sasl.is_empty() {
-            body["clientAuthentication"] = json!({ "sasl": Value::Object(sasl) });
+            authentication.insert("sasl".to_string(), Value::Object(sasl));
+        }
+        if let Some(enabled) = self.tls_auth {
+            // `Tls$CertificateAuthorityArnList` is what a cluster authenticates a
+            // client certificate against, so a row that turns mutual TLS on names
+            // one.
+            authentication.insert(
+                "tls".to_string(),
+                match enabled {
+                    true => json!({
+                        "enabled": true,
+                        "certificateAuthorityArnList": [format!(
+                            "arn:aws:acm-pca:{REGION}:{ACCOUNT}:certificate-authority/\
+                             11112222-3333-4444-5555-666677778888"
+                        )],
+                    }),
+                    false => json!({ "enabled": false }),
+                },
+            );
+        }
+        if let Some(enabled) = self.unauthenticated {
+            authentication.insert(
+                "unauthenticated".to_string(),
+                json!({ "enabled": enabled }),
+            );
+        }
+        if !authentication.is_empty() {
+            body["clientAuthentication"] = Value::Object(authentication);
         }
         if let Some(mode) = self.storage_mode {
             body["storageMode"] = json!(mode);

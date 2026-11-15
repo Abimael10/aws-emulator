@@ -155,8 +155,11 @@ fn cases() -> Vec<Case> {
                 }
             })),
             zookeeper_access: None,
+            // The cluster authenticates with SASL/IAM, so the cluster-level TLS
+            // path (which carries no SASL exchange) is not offered; multi-VPC
+            // connectivity has its own client authentication, and the TLS one it
+            // turns on authenticates a client by certificate.
             expected_bootstrap: &[
-                "bootstrapBrokerStringTls",
                 "bootstrapBrokerStringSaslIam",
                 "bootstrapBrokerStringVpcConnectivityTls",
                 "bootstrapBrokerStringVpcConnectivitySaslScram",
@@ -179,12 +182,9 @@ fn cases() -> Vec<Case> {
             })),
             zookeeper_access: None,
             expected_bootstrap: &[
-                "bootstrapBrokerStringTls",
                 "bootstrapBrokerStringSaslScram",
-                "bootstrapBrokerStringPublicTls",
                 "bootstrapBrokerStringPublicSaslScram",
                 "bootstrapBrokerStringVpcConnectivityTls",
-                "bootstrapBrokerStringTlsIpv6",
                 "bootstrapBrokerStringSaslScramIpv6",
             ],
         },
@@ -208,13 +208,8 @@ fn cases() -> Vec<Case> {
             })),
             zookeeper_access: Some(true),
             expected_bootstrap: &[
-                "bootstrapBrokerString",
-                "bootstrapBrokerStringTls",
                 "bootstrapBrokerStringSaslIam",
-                "bootstrapBrokerStringPublicTls",
                 "bootstrapBrokerStringPublicSaslIam",
-                "bootstrapBrokerStringIpv6",
-                "bootstrapBrokerStringTlsIpv6",
                 "bootstrapBrokerStringSaslIamIpv6",
             ],
         },

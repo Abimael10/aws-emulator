@@ -4,8 +4,13 @@
 //! Renders the cluster's bootstrap-broker strings from its persisted access settings:
 //! one string per access path the cluster actually enables, each naming the address
 //! THIS emulator accepts an Apache Kafka connection on for that path. A path the
-//! cluster does not enable has no string at all. A cluster the service is still
-//! provisioning has no brokers yet ([`crate::state::cluster_has_broker_nodes`]), so it
+//! cluster does not enable has no string at all — a member is populated exactly when
+//! the cluster's encryption-in-transit setting AND its client authentication admit a
+//! client arriving on that path's connection scheme (and, for the public, multi-VPC
+//! and IPv6 siblings, its connectivity configuration too), so a cluster that requires
+//! a SASL credential offers neither the plaintext nor the unauthenticated-TLS string.
+//! A cluster the service is still provisioning has no brokers yet
+//! ([`crate::state::cluster_has_broker_nodes`]), so it
 //! is refused with `BadRequestException` rather than answered with endpoints nothing
 //! serves on.
 //!
@@ -221,7 +226,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Everything read off the cluster record is read under ONE guard, in a scope
         // of its own: the endpoints below are opened asynchronously, and a lock held
         // across an await would make this future non-`Send`.
-        let (serverless, plaintext, tls, scram, iam, public, dual_stack, vpc_tls, vpc_scram, vpc_iam) = {
+        // Each access path is a different CONNECTION SCHEME, and a scheme is
+        // offered only where the cluster's encryption-in-transit setting AND its
+        // client authentication both admit a client arriving on it: the plaintext
+        // and TLS paths carry no SASL exchange, so they belong to a cluster that
+        // accepts unauthenticated traffic (or, for TLS, authenticates clients by
+        // certificate), while each SASL path belongs to the mechanism it is named
+        // for ([`crate::state::Cluster::plaintext_access_offered`],
+        // [`crate::state::Cluster::tls_access_offered`]).
+        let (
+            serverless,
+            plaintext_offered,
+            tls_offered,
+            scram,
+            iam,
+            public,
+            dual_stack,
+            vpc_tls,
+            vpc_scram,
+            vpc_iam,
+        ) = {
             let mut state = state.lock();
             // An ARN this endpoint's region holds no cluster for — absent, or
             // belonging to another region — is refused the same way. Resolved
@@ -277,8 +301,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // and every other member is absent rather than empty.
             (
                 cluster.serverless_access_only(),
-                cluster.plaintext_enabled(),
-                cluster.tls_enabled(),
+                cluster.plaintext_access_offered(),
+                cluster.tls_access_offered(),
                 cluster.sasl_scram_enabled(),
                 cluster.sasl_iam_enabled(),
                 cluster.public_access_enabled(),
@@ -304,8 +328,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state::broker_plane::AccessPath::SaslIam,
         ] {
             let wanted = match path {
-                state::broker_plane::AccessPath::Plaintext => plaintext && !serverless,
-                state::broker_plane::AccessPath::Tls => (tls || vpc_tls) && !serverless,
+                state::broker_plane::AccessPath::Plaintext => plaintext_offered && !serverless,
+                state::broker_plane::AccessPath::Tls => (tls_offered || vpc_tls) && !serverless,
                 state::broker_plane::AccessPath::SaslScram => (scram || vpc_scram) && !serverless,
                 state::broker_plane::AccessPath::SaslIam => serverless || iam || vpc_iam,
             };
@@ -366,13 +390,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let iam_path = state::broker_plane::AccessPath::SaslIam;
 
         Ok(GetBootstrapBrokersOutput {
-            bootstrap_broker_string: when(plaintext, plaintext_path),
-            bootstrap_broker_string_tls: when(tls, tls_path),
+            bootstrap_broker_string: when(plaintext_offered, plaintext_path),
+            bootstrap_broker_string_tls: when(tls_offered, tls_path),
             bootstrap_broker_string_sasl_scram: when(scram, scram_path),
             bootstrap_broker_string_sasl_iam: when(iam, iam_path),
             // Public access carries no plaintext port: a public endpoint is
             // reachable only over TLS or SASL.
-            bootstrap_broker_string_public_tls: when(public && tls, tls_path),
+            bootstrap_broker_string_public_tls: when(public && tls_offered, tls_path),
             bootstrap_broker_string_public_sasl_scram: when(public && scram, scram_path),
             bootstrap_broker_string_public_sasl_iam: when(public && iam, iam_path),
             bootstrap_broker_string_vpc_connectivity_tls: when(vpc_tls, tls_path),
@@ -383,8 +407,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // record set gains AAAA entries on a `DUAL` cluster, so these members
             // repeat the IPv4 strings by design. An IPv4-only cluster (the model's
             // default `NetworkType`) has no IPv6 path at all.
-            bootstrap_broker_string_ipv6: when(dual_stack && plaintext, plaintext_path),
-            bootstrap_broker_string_tls_ipv6: when(dual_stack && tls, tls_path),
+            bootstrap_broker_string_ipv6: when(dual_stack && plaintext_offered, plaintext_path),
+            bootstrap_broker_string_tls_ipv6: when(dual_stack && tls_offered, tls_path),
             bootstrap_broker_string_sasl_scram_ipv6: when(dual_stack && scram, scram_path),
             bootstrap_broker_string_sasl_iam_ipv6: when(dual_stack && iam, iam_path),
         })

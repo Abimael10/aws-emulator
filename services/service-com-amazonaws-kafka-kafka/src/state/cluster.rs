@@ -1057,6 +1057,45 @@ impl Cluster {
         matches!(self.client_broker(), "TLS" | "TLS_PLAINTEXT")
     }
 
+    /// Whether a client may reach the brokers WITHOUT presenting a credential.
+    ///
+    /// `ClientAuthentication$Unauthenticated$Enabled` decides it where the cluster
+    /// carries that member; a cluster that names none accepts unauthenticated
+    /// traffic exactly when it requires no other client authentication, so turning
+    /// a SASL mechanism or certificate authentication on is what closes the
+    /// anonymous paths.
+    pub fn unauthenticated_access_enabled(&self) -> bool {
+        if let Some(enabled) = self
+            .client_authentication
+            .as_ref()
+            .and_then(|auth| auth.unauthenticated.as_ref())
+            .and_then(|unauthenticated| unauthenticated.enabled)
+        {
+            return enabled;
+        }
+        !(self.sasl_scram_enabled()
+            || self.sasl_iam_enabled()
+            || self.tls_client_authentication_enabled())
+    }
+
+    /// Whether the cluster OFFERS the plaintext access path: a client reaches it
+    /// with neither encryption nor a credential, so the path is open only where
+    /// the client-broker encryption setting admits plaintext AND the cluster
+    /// accepts unauthenticated traffic.
+    pub fn plaintext_access_offered(&self) -> bool {
+        self.plaintext_enabled() && self.unauthenticated_access_enabled()
+    }
+
+    /// Whether the cluster OFFERS the TLS access path: encrypted, with the client
+    /// presenting no SASL credential — so the path is open only where the
+    /// client-broker encryption setting admits TLS AND a client may arrive on it
+    /// either unauthenticated or authenticated by its own certificate (mutual
+    /// TLS).
+    pub fn tls_access_offered(&self) -> bool {
+        self.tls_enabled()
+            && (self.unauthenticated_access_enabled() || self.tls_client_authentication_enabled())
+    }
+
     /// Whether SASL/SCRAM client authentication is turned on.
     pub fn sasl_scram_enabled(&self) -> bool {
         self.client_authentication

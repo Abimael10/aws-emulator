@@ -322,10 +322,13 @@ fn assert_cluster_arn(arn: &str, name: &str, case: &ClusterRequest) {
 }
 
 /// RULE: `GetBootstrapBrokers` returns one endpoint string per access path the
-/// stored cluster actually enables — client-broker encryption decides the
-/// plaintext and TLS paths, client authentication the SASL ones, connectivity the
-/// public, multi-VPC and IPv6 ones — each listing every persisted broker on that
-/// path's documented port; a path the cluster does not enable has no string.
+/// stored cluster actually enables — a path is offered only where the client-broker
+/// encryption setting AND the client authentication both admit a client arriving on
+/// it (so the plaintext and TLS strings belong to a cluster that accepts
+/// unauthenticated traffic, or authenticates clients by certificate, and each SASL
+/// string to the mechanism it is named for), with connectivity deciding the public,
+/// multi-VPC and IPv6 ones — each listing every persisted broker on that path's
+/// documented port; a path the cluster does not enable has no string.
 #[tokio::test]
 async fn bootstrap_brokers_follow_the_cluster_access_paths() {
     // Ports per Amazon MSK's "Port information": 9092 plaintext, 9094 TLS,
@@ -360,15 +363,14 @@ async fn bootstrap_brokers_follow_the_cluster_access_paths() {
             vec![("bootstrapBrokerString", 9092)],
         ),
         (
+            // SASL/IAM required: a client must authenticate, so neither the
+            // plaintext nor the unauthenticated-TLS path is offered.
             ClusterRequest {
                 client_broker: Some("TLS"),
                 sasl_iam: Some(true),
                 ..ClusterRequest::named("tls-iam")
             },
-            vec![
-                ("bootstrapBrokerStringTls", 9094),
-                ("bootstrapBrokerStringSaslIam", 9098),
-            ],
+            vec![("bootstrapBrokerStringSaslIam", 9098)],
         ),
         (
             ClusterRequest {
@@ -378,7 +380,6 @@ async fn bootstrap_brokers_follow_the_cluster_access_paths() {
                 ..ClusterRequest::named("tls-scram-and-iam")
             },
             vec![
-                ("bootstrapBrokerStringTls", 9094),
                 ("bootstrapBrokerStringSaslScram", 9096),
                 ("bootstrapBrokerStringSaslIam", 9098),
             ],
@@ -401,9 +402,7 @@ async fn bootstrap_brokers_follow_the_cluster_access_paths() {
                 ..ClusterRequest::named("public-tls-iam")
             },
             vec![
-                ("bootstrapBrokerStringTls", 9094),
                 ("bootstrapBrokerStringSaslIam", 9098),
-                ("bootstrapBrokerStringPublicTls", 9194),
                 ("bootstrapBrokerStringPublicSaslIam", 9198),
             ],
         ),
@@ -414,10 +413,7 @@ async fn bootstrap_brokers_follow_the_cluster_access_paths() {
                 public_access: Some("DISABLED"),
                 ..ClusterRequest::named("public-disabled")
             },
-            vec![
-                ("bootstrapBrokerStringTls", 9094),
-                ("bootstrapBrokerStringSaslScram", 9096),
-            ],
+            vec![("bootstrapBrokerStringSaslScram", 9096)],
         ),
         (
             ClusterRequest {
@@ -443,9 +439,7 @@ async fn bootstrap_brokers_follow_the_cluster_access_paths() {
                 ..ClusterRequest::named("dual-stack")
             },
             vec![
-                ("bootstrapBrokerStringTls", 9094),
                 ("bootstrapBrokerStringSaslScram", 9096),
-                ("bootstrapBrokerStringTlsIpv6", 9094),
                 ("bootstrapBrokerStringSaslScramIpv6", 9096),
             ],
         ),

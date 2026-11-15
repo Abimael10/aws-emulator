@@ -182,11 +182,10 @@ fn cases() -> Vec<Case> {
             authentication: Some(json!({ "sasl": { "scram": { "enabled": true } } })),
             encryption: None,
             scram_after: true,
-            expected_bootstrap: &[
-                "bootstrapBrokerString",
-                "bootstrapBrokerStringTls",
-                "bootstrapBrokerStringSaslScram",
-            ],
+            // SASL/SCRAM is now required, so the paths that carry no SASL
+            // exchange — plaintext and unauthenticated TLS — are no longer
+            // offered.
+            expected_bootstrap: &["bootstrapBrokerStringSaslScram"],
         },
         // Both settings at once, on a cluster that authenticated SASL/SCRAM: the
         // submitted authentication REPLACES the cluster's, so SCRAM goes off and
@@ -199,7 +198,7 @@ fn cases() -> Vec<Case> {
             authentication: Some(json!({ "sasl": { "iam": { "enabled": true } } })),
             encryption: Some(json!({ "encryptionInTransit": { "clientBroker": "TLS" } })),
             scram_after: false,
-            expected_bootstrap: &["bootstrapBrokerStringTls", "bootstrapBrokerStringSaslIam"],
+            expected_bootstrap: &["bootstrapBrokerStringSaslIam"],
         },
         // Encryption ALONE, naming both of the in-transit members: the cluster's
         // authentication must come out untouched, so SASL/SCRAM stays on.
@@ -214,10 +213,7 @@ fn cases() -> Vec<Case> {
                 "encryptionInTransit": { "clientBroker": "PLAINTEXT", "inCluster": false }
             })),
             scram_after: true,
-            expected_bootstrap: &[
-                "bootstrapBrokerString",
-                "bootstrapBrokerStringSaslScram",
-            ],
+            expected_bootstrap: &["bootstrapBrokerStringSaslScram"],
         },
         // The other members of `ClientAuthentication`: mutual TLS with a
         // certificate authority list, and unauthenticated traffic turned off.
@@ -234,11 +230,14 @@ fn cases() -> Vec<Case> {
             })),
             encryption: None,
             scram_after: false,
-            expected_bootstrap: &["bootstrapBrokerString", "bootstrapBrokerStringTls"],
+            // Mutual TLS authenticates a client by its certificate on the TLS
+            // path, so that path stays offered where unauthenticated traffic is
+            // off; the plaintext one carries no certificate exchange and goes.
+            expected_bootstrap: &["bootstrapBrokerStringTls"],
         },
         // Turning SASL/SCRAM OFF: the opposite direction of the first row, and
         // the only member the submitted authentication names is unauthenticated
-        // traffic.
+        // traffic — which is what re-opens the plaintext and TLS paths.
         Case {
             created: ClusterRequest {
                 sasl_scram: Some(true),
@@ -266,7 +265,7 @@ fn cases() -> Vec<Case> {
                 }
             })),
             scram_after: false,
-            expected_bootstrap: &["bootstrapBrokerStringTls", "bootstrapBrokerStringSaslIam"],
+            expected_bootstrap: &["bootstrapBrokerStringSaslIam"],
         },
     ]
 }
