@@ -10,13 +10,14 @@
 //! elastic network interfaces ... includes the network interface ID, the MAC address, the
 //! subnet ID, and the private IPv4 address". That interface is allocated out of the
 //! networking the LAUNCH named, so the `subnetId` it reports is one of the subnets that
-//! launch configured and never a value of the service's own choosing, while the other
-//! three details are the INTERFACE's: a well-formed interface id, a unicast locally
-//! administered MAC address and a private IPv4 address, each belonging to exactly one
-//! interface of the account and unchanged by anything that moves the attachment's STATUS —
-//! the clock taking the interface to `ATTACHED`, or an agent acknowledging a status with
-//! `SubmitAttachmentStateChanges` ("Sent to acknowledge that an attachment changed
-//! states").
+//! launch configured and never a value of the service's own choosing — reported from the
+//! moment the attachment exists, because the launch supplied it — while the other three
+//! details are the INTERFACE's own and are reported once that interface is IN PLACE: a
+//! well-formed interface id, a unicast locally administered MAC address and a private IPv4
+//! address, each belonging to exactly one interface of the account and unchanged by
+//! anything that reads the task afterwards. Whichever took the attachment there — the clock
+//! or an agent acknowledging the attach with `SubmitAttachmentStateChanges` ("Sent to
+//! acknowledge that an attachment changed states") — reports the same identity.
 //!
 //! Member sources: `smithy_query(query="shape", shape="AwsVpcConfiguration")` — `subnets`
 //! is "The IDs of the subnets associated with the task or service", required, "with a
@@ -35,6 +36,7 @@
 
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -124,12 +126,12 @@ const ROWS: [Row; 5] = [
     },
 ];
 
-/// One task a row placed, beside the identity its interface reported the moment Amazon
-/// ECS created it — what every later read of that task is compared against.
+/// One task a row placed, beside the subnet its attachment reported the moment Amazon ECS
+/// created it — what every later read of that task is compared against.
 #[derive(Debug, Clone)]
 struct PlacedTask {
     task_arn: String,
-    created_identity: Vec<String>,
+    created_subnet: String,
 }
 
 /// What one row of the table placed: the row itself, the subnets its launch named, and the
@@ -189,6 +191,32 @@ async fn describe(router: &MultiServiceRouter, task_arn: &str, case: &str) -> Va
         .into_iter()
         .next()
         .unwrap_or_else(|| panic!("case {case:?}: expected one task back, got {body}"))
+}
+
+/// How often a poll re-reads a task it is waiting on.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long a poll keeps trying: every transition the start of an `awsvpc` task takes
+/// ([`AWSVPC_START`]) with generous margin for a loaded test machine.
+const POLL_BUDGET: Duration = AWSVPC_START.saturating_add(Duration::from_secs(30));
+
+/// Poll one task until it is RUNNING — the condition the clock owes it, rather than a fixed
+/// wait — and answer the record it reached.
+async fn running(router: &MultiServiceRouter, task_arn: &str, case: &str) -> Value {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let task = describe(router, task_arn, case).await;
+        if task["lastStatus"].as_str() == Some("RUNNING") {
+            return task;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the clock to attach the interface and run the task, it \
+             was still {:?}: {task}",
+            task["lastStatus"].as_str()
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// The one attachment an `awsvpc` task holds.
@@ -395,13 +423,20 @@ async fn an_awsvpc_interface_sits_in_a_configured_subnet_and_keeps_its_own_ident
         let subnets = subnet_ids(row.first_subnet, row.subnets);
         let arns = launch(&router, row, &family, &host, &subnets).await;
 
-        // Amazon ECS CREATES the interface with the task, so the identity is already
-        // reported and already well formed, before anything has attached it.
+        // Amazon ECS creates the interface while the task provisions, so the attachment
+        // starts with the subnet the launch supplied and NONE of the interface's own
+        // identity: there is no interface to report one for until it is in place.
         let mut created = Vec::new();
         for arn in &arns {
             let task = describe(&router, arn, case).await;
             let attachment = only_attachment(&task, case);
-            assert_well_formed(&attachment, case);
+            for name in IDENTITY_DETAILS {
+                assert!(
+                    detail(&attachment, name).is_none(),
+                    "case {case:?}: expected no {name} before the interface is in place, \
+                     got {attachment}"
+                );
+            }
             let subnet = detail(&attachment, SUBNET_DETAIL).unwrap_or_else(|| {
                 panic!("case {case:?}: the interface reports its subnet, got {attachment}")
             });
@@ -412,7 +447,7 @@ async fn an_awsvpc_interface_sits_in_a_configured_subnet_and_keeps_its_own_ident
             );
             created.push(PlacedTask {
                 task_arn: arn.clone(),
-                created_identity: identity(&attachment, case),
+                created_subnet: subnet,
             });
         }
         placed.push(Placed {
@@ -421,8 +456,6 @@ async fn an_awsvpc_interface_sits_in_a_configured_subnet_and_keeps_its_own_ident
             tasks: created,
         });
     }
-
-    tokio::time::sleep(AWSVPC_START).await;
 
     // Every address, MAC and interface id the store handed out, so no two interfaces of
     // the account share one.
@@ -434,10 +467,13 @@ async fn an_awsvpc_interface_sits_in_a_configured_subnet_and_keeps_its_own_ident
         let case = row.case;
         for PlacedTask {
             task_arn,
-            created_identity: before,
+            created_subnet,
         } in tasks
         {
-            let task = describe(&router, task_arn, case).await;
+            // Wait for the CONDITION the clock owes this task — its interface in place and
+            // the task running on it — re-reading the record until it holds or a generous
+            // deadline passes.
+            let task = running(&router, task_arn, case).await;
             let attachment = only_attachment(&task, case);
             assert_eq!(
                 (
@@ -450,9 +486,8 @@ async fn an_awsvpc_interface_sits_in_a_configured_subnet_and_keeps_its_own_ident
                  task, got {task}"
             );
 
-            // Attaching the interface moved its attachment's STATUS and nothing else: the
-            // subnet is still one the launch named and the identity is the one the created
-            // interface already reported.
+            // Attaching the interface left the subnet the launch named where it was, and
+            // the interface that is now in place reports an identity of its own.
             let subnet = detail(&attachment, SUBNET_DETAIL).unwrap_or_else(|| {
                 panic!("case {case:?}: the attached interface reports its subnet, got {attachment}")
             });
@@ -461,13 +496,22 @@ async fn an_awsvpc_interface_sits_in_a_configured_subnet_and_keeps_its_own_ident
                 "case {case:?}: expected the attached interface in one of the subnets the \
                  launch named ({subnets:?}), got {subnet:?}"
             );
-            let after = identity(&attachment, case);
             assert_eq!(
-                &after, before,
-                "case {case:?}: expected the interface to keep the identity it was created \
-                 with, got {after:?} against {before:?}"
+                &subnet, created_subnet,
+                "case {case:?}: expected the interface to stay in the subnet it was created \
+                 in, got {subnet:?} against {created_subnet:?}"
             );
+            let after = identity(&attachment, case);
             assert_well_formed(&attachment, case);
+            // And a second read reports the same identity: the values are stored, not
+            // minted per read.
+            let again = only_attachment(&describe(&router, task_arn, case).await, case);
+            assert_eq!(
+                identity(&again, case),
+                after,
+                "case {case:?}: expected two reads of one interface to report one identity, \
+                 got {again}"
+            );
 
             allocated += 1;
             for (seen, value) in handed_out.iter_mut().zip(after) {
@@ -492,9 +536,9 @@ async fn an_agent_report_moves_the_status_and_leaves_the_interface_identity_alon
     // The agent plane accepts one state in a report — `ATTACHED`, the attach the agent
     // completed — so the rows differ along the LAUNCH the reported-on interface came from
     // rather than along the state reported: each row runs its own family into its own pair
-    // of subnets, and whichever interface the agent reports on keeps the id, the MAC address
-    // and the address it was created with, because those belong to the interface and not to
-    // the state of its attachment.
+    // of subnets, and the interface whichever attach the agent reports puts in place gets an
+    // identity of its own, in the subnet the launch named, which later reads report
+    // unchanged.
     const REPORTED: &str = "ATTACHED";
     const LAUNCHES: usize = 4;
 
@@ -523,7 +567,6 @@ async fn an_agent_report_moves_the_status_and_leaves_the_interface_identity_alon
         let task_arn = string(&list(&body, "tasks", case)[0], "taskArn", case);
 
         let created = only_attachment(&describe(&router, &task_arn, case).await, case);
-        let before = identity(&created, case);
         let subnet_before = detail(&created, SUBNET_DETAIL);
         let attachment_id = string(&created, "id", case);
 
@@ -545,12 +588,7 @@ async fn an_agent_report_moves_the_status_and_leaves_the_interface_identity_alon
             "case {case:?}: the record holds the status the agent reported, got \
              {acknowledged}"
         );
-        assert_eq!(
-            identity(&acknowledged, case),
-            before,
-            "case {case:?}: expected the reported-on interface to keep its own identity, \
-             got {acknowledged}"
-        );
+        let reported_identity = identity(&acknowledged, case);
         assert_eq!(
             detail(&acknowledged, SUBNET_DETAIL),
             subnet_before,
@@ -558,5 +596,12 @@ async fn an_agent_report_moves_the_status_and_leaves_the_interface_identity_alon
              {acknowledged}"
         );
         assert_well_formed(&acknowledged, case);
+        let again = only_attachment(&describe(&router, &task_arn, case).await, case);
+        assert_eq!(
+            identity(&again, case),
+            reported_identity,
+            "case {case:?}: expected the reported-on interface to keep its own identity, \
+             got {again}"
+        );
     }
 }

@@ -173,6 +173,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     for container in &mut task.containers {
                         container.advance_to(STATUS_STOPPED);
                     }
+                    // The elastic network interface Amazon ECS created for the task is torn
+                    // down with the task, so what the attachment stands for is gone
+                    // ([`AttachmentRecord::delete_allocated_interface`]).
+                    for attachment in &mut task.attachments {
+                        attachment.delete_allocated_interface();
+                    }
                     task.version += 1;
                 }
             }
@@ -506,11 +512,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// `RegisterTaskDefinition$networkMode`: "If the network mode is `awsvpc`, the task is
     /// allocated an elastic network interface" — that interface is the attachment, and a
     /// task in any other network mode shares its host's networking and is allocated none.
-    /// The attachment starts [`ATTACHMENT_STATUS_PRECREATED`] — Amazon ECS has CREATED the
-    /// interface, so it already carries the id, the MAC address and the private IPv4 address
-    /// it was given beside the subnet the launch named — and the CLOCK takes it on from
-    /// there, one documented step at a time ([`INTERFACE_ATTACH_LIFECYCLE`]), the first of
-    /// them owed [`INTERFACE_STEP_SPAN`] from `now`.
+    /// The attachment starts [`ATTACHMENT_STATUS_PRECREATED`] carrying the ONE detail the
+    /// placement already knows — the subnet the launch named — and the CLOCK takes it on
+    /// from there, one documented step at a time ([`INTERFACE_ATTACH_LIFECYCLE`]), the first
+    /// of them owed [`INTERFACE_STEP_SPAN`] from `now`; the interface's own id, MAC address
+    /// and private IPv4 address are reported once it is in place
+    /// ([`AttachmentRecord::report_allocated_interface`]).
     pub fn mint_task_attachments(
         &mut self,
         network_mode: &str,
@@ -523,6 +530,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         let subnet = configuration
             .and_then(|configuration| configuration.awsvpc_configuration.as_ref())
             .and_then(|awsvpc| awsvpc.subnets.first().cloned());
+        // The range the interface takes its own address out of is the subnet's own
+        // ([`allocated_interface_private_ipv4_address`]), as Amazon VPC holds it; a subnet
+        // this store was never told the CIDR block of contributes none.
+        let subnet_cidr_block = subnet.as_deref().and_then(|subnet| {
+            self.subnet_placements
+                .get(subnet)
+                .and_then(|placement| placement.cidr_block.clone())
+        });
         let details = subnet
             .map(|subnet| {
                 vec![KeyValuePair {
@@ -531,16 +546,84 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 }]
             })
             .unwrap_or_default();
-        let mut attachment = AttachmentRecord {
+        vec![AttachmentRecord {
             id: self.next_attachment_id(),
             sequence: self.next_attachment_seq,
             attachment_type: ATTACHMENT_TYPE_ELASTIC_NETWORK_INTERFACE.to_string(),
             status: ATTACHMENT_STATUS_PRECREATED.to_string(),
             details,
+            subnet_cidr_block,
             next_status_due_at: Some(now + INTERFACE_STEP_SPAN),
-        };
-        attachment.report_allocated_interface();
-        vec![attachment]
+        }]
+    }
+
+    /// Record where each named subnet is, as Amazon VPC answered for it
+    /// ([`subnet_placements`]).
+    ///
+    /// Written by the call that PLACES a task into the subnet, which read those facts with
+    /// no guard of this store held; a later placement the clock makes reads them back here
+    /// ([`Self::task_availability_zone`], [`Self::mint_task_attachments`]) rather than
+    /// taking another store's lock under this one's.
+    pub fn record_subnet_placements(
+        &mut self,
+        placements: impl IntoIterator<Item = (String, SubnetPlacement)>,
+    ) {
+        for (subnet, placement) in placements {
+            self.subnet_placements.insert(subnet, placement);
+        }
+    }
+
+    /// The Availability Zone a task placed on `container_instance_arn`, into `subnets`,
+    /// runs in — and `None` when this emulator holds no zone for either.
+    ///
+    /// `Task$availabilityZone` is "the Availability Zone for the task", which is the zone of
+    /// the CAPACITY it was placed on: for a task that runs on a container instance, the zone
+    /// that instance's agent reported for itself ([`ATTRIBUTE_AVAILABILITY_ZONE`]); for a
+    /// task that was allocated its own elastic network interface, the zone of the subnet
+    /// that interface was created in, which is the first subnet the placement named
+    /// ([`Self::mint_task_attachments`]).
+    pub fn task_availability_zone(
+        &self,
+        container_instance_arn: Option<&str>,
+        subnets: &[String],
+    ) -> Option<String> {
+        if let Some(zone) =
+            self.instance_attribute(container_instance_arn, ATTRIBUTE_AVAILABILITY_ZONE)
+        {
+            return Some(zone);
+        }
+        subnets
+            .iter()
+            .find_map(|subnet| self.subnet_placements.get(subnet.as_str()))
+            .map(|placement| placement.availability_zone.clone())
+    }
+
+    /// The processor architecture the container instance `container_instance_arn` reports
+    /// for itself ([`ATTRIBUTE_CPU_ARCHITECTURE`]), and `None` for a task that runs on no
+    /// container instance or on one whose agent reported no architecture.
+    ///
+    /// The architecture a task's containers run on is the HOST's: a container instance is a
+    /// machine of a particular processor family, and the agent on it reports that family as
+    /// a built-in attribute of the instance ([`task_cpu_architecture`]).
+    pub fn host_cpu_architecture(&self, container_instance_arn: Option<&str>) -> Option<String> {
+        self.instance_attribute(container_instance_arn, ATTRIBUTE_CPU_ARCHITECTURE)
+    }
+
+    /// The value the container instance `container_instance_arn` reports for the attribute
+    /// `name`, and `None` when this store holds no such instance or the instance reports no
+    /// such attribute — the one reader of a host's own reported attributes.
+    fn instance_attribute(
+        &self,
+        container_instance_arn: Option<&str>,
+        name: &str,
+    ) -> Option<String> {
+        self.container_instances
+            .get(container_instance_arn?)?
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == name)?
+            .value
+            .clone()
     }
 
     /// The ARN of the task of `cluster_name` that holds the attachment `attachment_id`, or
@@ -597,15 +680,22 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             return;
         }
         attachment.status = status.to_string();
+        // A report that puts the interface in place is the instant its own identity is
+        // known, exactly as the clock's own last step is
+        // ([`AttachmentRecord::report_allocated_interface`]).
+        if attachment.is_attached() {
+            attachment.report_allocated_interface();
+        }
         task.report_connected(now);
         task.version += 1;
     }
 
-    /// Mint the next container id (32 lowercase hex digits, the shape of an ECS
-    /// container id).
+    /// Mint the next container id. Amazon ECS spells the id in a container's ARN as a UUID
+    /// ([`uuid_from_sequence`]) — unlike a task id, which is 32 hexadecimal digits — and the
+    /// counter is what makes every container of every task distinct.
     pub fn next_container_id(&mut self) -> String {
         self.next_container_seq += 1;
-        format!("{:032x}", self.next_container_seq)
+        uuid_from_sequence(self.next_container_seq)
     }
 
     /// Mint the next container-instance id (32 lowercase hex digits, the shape of an ECS
@@ -1700,10 +1790,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 let container_id = self.next_container_id();
                 ContainerRecord {
                     container_arn: container_arn(region, cluster_name, task_id, &container_id),
+                    sequence: self.next_container_seq,
                     task_arn: task_arn.to_string(),
                     name: container.name.clone(),
                     image: container.image.clone(),
-                    last_status: last_status.to_string(),
+                    last_status: initial_container_status(last_status).to_string(),
                     // `Container$cpu`: "The value is 0 if no value was specified in the
                     // container definition" — which is what the modelled non-optional
                     // `cpu` already holds.
@@ -3561,6 +3652,32 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             PROPAGATE_TAGS_TASK_DEFINITION => definition.tags.clone(),
             _ => Vec::new(),
         };
+        // The PLATFORM this placement runs on, resolved from the revision it places and the
+        // placement's own launch selection, exactly as a client's own placement resolves it
+        // ([`resolved_task_platform`]).
+        let platform = resolved_task_platform(
+            definition.runtime_platform.as_ref(),
+            definition.ephemeral_storage.as_ref(),
+            None,
+            places_on_fargate(
+                placement.launch_type.as_deref(),
+                &placed_through_strategy(placement.capacity_provider_name.as_deref()),
+            ),
+            placement.platform_version.as_deref(),
+        );
+        let container_instance_arn =
+            self.select_task_host(&service.cluster_name, placement.launch_type.as_deref());
+        let availability_zone = self.task_availability_zone(
+            container_instance_arn.as_deref(),
+            &configured_subnets(placement.network_configuration.as_ref()),
+        );
+        // The architecture the capacity this placement chose runs
+        // ([`task_cpu_architecture`]).
+        let cpu_architecture = task_cpu_architecture(
+            self.host_cpu_architecture(container_instance_arn.as_deref())
+                .as_deref(),
+            definition.runtime_platform.as_ref(),
+        );
         let record = TaskRecord {
             task_arn: task_arn.clone(),
             task_id,
@@ -3570,8 +3687,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // task" — the instance the scheduler chose for a launch type that runs on the
             // cluster's own registered capacity, and `None` for one that does not
             // ([`Self::select_task_host`]).
-            container_instance_arn: self
-                .select_task_host(&service.cluster_name, placement.launch_type.as_deref()),
+            container_instance_arn,
             task_definition_arn: definition.arn.clone(),
             family: definition.family.clone(),
             last_status: schedule.last_status.to_string(),
@@ -3579,10 +3695,20 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             containers,
             cpu: definition.cpu.clone(),
             memory: definition.memory.clone(),
-            overrides: None,
+            // A service's placement overrides nothing of the revision it runs, so the
+            // overrides its tasks run under name each of that revision's containers and
+            // override nothing of them ([`resolved_task_overrides`]).
+            overrides: Some(resolved_task_overrides(
+                None,
+                &definition.container_definitions,
+            )),
             launch_type: placement.launch_type.clone(),
             capacity_provider_name: placement.capacity_provider_name.clone(),
-            platform_version: placement.platform_version.clone(),
+            platform_version: platform.platform_version.clone(),
+            platform_family: platform.platform_family.clone(),
+            cpu_architecture,
+            availability_zone,
+            ephemeral_storage_gib: platform.ephemeral_storage_gib,
             // `Task$startedBy`: for a task the service scheduler placed, the id of the
             // deployment that placed it; for a task set's, the id of that task set.
             started_by: Some(placement.started_by.clone()),

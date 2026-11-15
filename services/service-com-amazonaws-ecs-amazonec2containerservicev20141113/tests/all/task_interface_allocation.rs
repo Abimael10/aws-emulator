@@ -140,9 +140,9 @@ async fn an_awsvpc_task_reports_the_interface_it_was_allocated_once_it_runs() {
         register(&router, &family, network_mode, case).await;
         let arns = run_tasks(&router, &family, network_mode, count, case).await;
 
-        // Amazon ECS CREATES the interface before the task runs, so the attachment already
-        // carries the interface's own details; what the task reaching RUNNING moves is the
-        // attachment's status.
+        // Amazon ECS creates the interface while the task PROVISIONS, so the attachment
+        // starts with the one detail the launch supplied — the subnet it will sit in — and
+        // the interface's own identity is reported once that interface is in place.
         for arn in &arns {
             let task = describe(&router, arn, case).await;
             for attachment in list(&task, "attachments", case) {
@@ -152,11 +152,20 @@ async fn an_awsvpc_task_reports_the_interface_it_was_allocated_once_it_runs() {
                     "case {case:?}: a task that is not running yet holds the attachment \
                      Amazon ECS created, got {attachment}"
                 );
-                for name in INTERFACE_DETAILS {
+                assert_eq!(
+                    detail(&attachment, "subnetId", case).as_deref(),
+                    Some(SUBNET),
+                    "case {case:?}: the attachment reports the subnet the launch \
+                     configured, got {attachment}"
+                );
+                for name in INTERFACE_DETAILS
+                    .iter()
+                    .filter(|name| **name != "subnetId")
+                {
                     assert!(
-                        detail(&attachment, name, case).is_some(),
-                        "case {case:?}: the created interface reports {name}, got \
-                         {attachment}"
+                        detail(&attachment, name, case).is_none(),
+                        "case {case:?}: expected no {name} before the interface is in \
+                         place, got {attachment}"
                     );
                 }
             }

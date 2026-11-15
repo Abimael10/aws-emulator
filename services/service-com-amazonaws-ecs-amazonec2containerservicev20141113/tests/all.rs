@@ -245,6 +245,8 @@ mod task_lifecycle;
 mod task_listing_filters;
 #[path = "all/task_override_and_size_validation.rs"]
 mod task_override_and_size_validation;
+#[path = "all/task_platform_and_sizing.rs"]
+mod task_platform_and_sizing;
 #[path = "all/task_protection_scale_in.rs"]
 mod task_protection_scale_in;
 #[path = "all/task_provisioning.rs"]

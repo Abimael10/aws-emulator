@@ -13308,6 +13308,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "ipnet",
  "percent-encoding",
  "serde_json",
  "service-com-amazonaws-autoscaling-autoscaling-2011-01-01",

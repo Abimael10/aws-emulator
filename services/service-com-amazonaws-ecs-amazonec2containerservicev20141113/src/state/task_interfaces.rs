@@ -6,9 +6,11 @@
 //! allocated an elastic network interface" — Amazon ECS creates that interface while the
 //! task provisions and attaches it before the task runs. `Attachment$details` "for elastic
 //! network interfaces ... includes the network interface ID, the MAC address, the subnet ID,
-//! and the private IPv4 address": the interface carries all four from the moment it is
-//! created, and the attachment's own status is what moves — `PRECREATED` the moment Amazon
-//! ECS creates it, `ATTACHING` while it is being attached, `ATTACHED` once it is in place.
+//! and the private IPv4 address": the SUBNET is known the instant the attachment exists,
+//! because the launch supplied it, and the other three are the interface's own and are
+//! reported once that interface is IN PLACE — the attachment's own status is what moves
+//! until then: `PRECREATED` the moment Amazon ECS creates the attachment, `ATTACHING` while
+//! the interface is being attached, `ATTACHED` once it is.
 //!
 //! The subnet comes from the launch (`AwsVpcConfiguration$subnets`); the other three are
 //! the interface's own and are derived from the counter its attachment id was minted out
@@ -32,6 +34,11 @@ pub const ATTACHMENT_STATUS_ATTACHED: &str = "ATTACHED";
 /// `Attachment$status` of an attachment Amazon ECS is in the middle of attaching to the
 /// task it created it for, from the same list of statuses.
 pub const ATTACHMENT_STATUS_ATTACHING: &str = "ATTACHING";
+
+/// `Attachment$status` of an attachment whose resource is GONE: the interface Amazon ECS
+/// created for a task is torn down with the task, so once the task has stopped the
+/// attachment that stood for it reports the last of the statuses the member lists.
+pub const ATTACHMENT_STATUS_DELETED: &str = "DELETED";
 
 /// The statuses Amazon ECS takes an interface it is attaching THROUGH, in the order it
 /// takes them: created for the task that is provisioning, being attached to it, and in
@@ -144,24 +151,61 @@ pub fn allocated_interface_mac_address(sequence: u64) -> String {
     )
 }
 
-/// The private IPv4 address the `sequence`-th interface carries.
+/// The private IPv4 address the `sequence`-th interface carries, out of the subnet it was
+/// created in.
 ///
-/// Drawn from `172.31.0.0/16`, the CIDR AWS gives a default VPC (Amazon VPC User Guide,
-/// "Default VPCs"), skipping the first four addresses of each `/24` — AWS reserves them —
-/// and the broadcast address, so every address handed out is one a network interface may
-/// actually take.
-pub fn allocated_interface_private_ipv4_address(sequence: u64) -> String {
-    format!("172.31.{}.{}", (sequence / 251) % 256, 4 + sequence % 251)
+/// An elastic network interface is created IN a subnet and is reachable at an address OF
+/// that subnet (`AwsVpcConfiguration$subnets`, and `Subnet$cidrBlock`: "the IPv4 CIDR block
+/// assigned to the subnet"), so the address comes out of that block — skipping the first
+/// four addresses, which AWS reserves in every subnet, and the broadcast address, so every
+/// address handed out is one a network interface may actually take (Amazon VPC User Guide,
+/// "Subnet CIDR blocks"). The counter is what makes one interface's address its own.
+///
+/// A subnet this emulator holds no CIDR block for falls back to `172.31.0.0/16`, the block
+/// AWS gives a default VPC (Amazon VPC User Guide, "Default VPCs"): the interface still has
+/// to report an address it could really hold.
+pub fn allocated_interface_private_ipv4_address(sequence: u64, cidr_block: Option<&str>) -> String {
+    /// The addresses AWS reserves at the start of every subnet's block.
+    const RESERVED_AT_START: u32 = 4;
+    /// The block a subnet with no CIDR block of its own is addressed out of, and its
+    /// prefix length.
+    const DEFAULT_VPC_NETWORK: ::std::net::Ipv4Addr = ::std::net::Ipv4Addr::new(172, 31, 0, 0);
+    const DEFAULT_VPC_PREFIX: u8 = 16;
+
+    let (network, prefix_len) = match cidr_block.and_then(|block| block.parse::<::ipnet::Ipv4Net>().ok())
+    {
+        Some(subnet) => (subnet.network(), subnet.prefix_len()),
+        None => (DEFAULT_VPC_NETWORK, DEFAULT_VPC_PREFIX),
+    };
+    // The addresses the block holds, less the four AWS reserves at its start and the
+    // broadcast address at its end: what is left is what an interface may be given. A block
+    // too small to hold one at all — which AWS allocates for no subnet — leaves the network
+    // address itself, so the address reported is always inside the block.
+    let held = 1u64 << (u32::BITS - u32::from(prefix_len));
+    let assignable = held.saturating_sub(u64::from(RESERVED_AT_START) + 1);
+    let offset = if assignable == 0 {
+        0
+    } else {
+        RESERVED_AT_START + (sequence % assignable) as u32
+    };
+    ::std::net::Ipv4Addr::from(u32::from(network).saturating_add(offset)).to_string()
 }
 
 impl AttachmentRecord {
-    /// Report, on this attachment, the three details that belong to the interface itself:
+    /// Report, on this attachment, the three details that belong to the interface ITSELF:
     /// its id, its MAC address and its private IPv4 address.
     ///
-    /// Amazon ECS creates the interface before the task runs, so they are reported from the
-    /// instant the attachment exists, beside the subnet the launch named. Each is written
-    /// once — a detail already reported is left as it is — and nothing but an elastic
-    /// network interface gets any of them.
+    /// They are reported once the interface is IN PLACE — the instant the attachment
+    /// reports [`ATTACHMENT_STATUS_ATTACHED`], whoever took it there ([`Self::advance_interface`],
+    /// an agent's own acknowledgement) — and not while Amazon ECS is still creating and
+    /// attaching it: a client that watches the attachment to learn when the task's
+    /// networking is usable would otherwise be given an interface id, a MAC address and an
+    /// address for an interface that is not attached to anything yet. The subnet the launch
+    /// supplied is reported from the start, because the launch supplied it
+    /// ([`ATTACHMENT_DETAIL_SUBNET_ID`]).
+    ///
+    /// Each is written once — a detail already reported is left as it is — and nothing but
+    /// an elastic network interface gets any of them.
     ///
     /// Answers whether anything changed.
     pub fn report_allocated_interface(&mut self) -> bool {
@@ -180,7 +224,10 @@ impl AttachmentRecord {
             ),
             (
                 ATTACHMENT_DETAIL_PRIVATE_IPV4_ADDRESS,
-                allocated_interface_private_ipv4_address(self.sequence),
+                allocated_interface_private_ipv4_address(
+                    self.sequence,
+                    self.subnet_cidr_block.as_deref(),
+                ),
             ),
         ] {
             if self
@@ -236,6 +283,30 @@ impl AttachmentRecord {
         self.attachment_type == ATTACHMENT_TYPE_ELASTIC_NETWORK_INTERFACE
     }
 
+    /// Report the interface Amazon ECS allocated for this attachment as GONE, which is what
+    /// the task it was created for reaching `STOPPED` means has happened.
+    ///
+    /// The interface an `awsvpc` task is allocated belongs to that task — Amazon ECS creates
+    /// it while the task provisions and tears it down when the task stops — so a stopped
+    /// task's attachment stands for a resource that no longer exists, and
+    /// [`ATTACHMENT_STATUS_DELETED`] is what the member's own list of statuses words that
+    /// with. An interface that WAS in place keeps the details it reported: they are what a
+    /// client reading a stopped task resolves the interface it HELD by. One the task stopped
+    /// before Amazon ECS had attached it reports none of them, for the reason it reported
+    /// none while it was being attached ([`Self::report_allocated_interface`]).
+    ///
+    /// Answers whether anything changed, which is what makes the task's `version` counter
+    /// move ("Every time a task experiences a change ... the version counter is
+    /// incremented").
+    pub fn delete_allocated_interface(&mut self) -> bool {
+        if !self.is_elastic_network_interface() || self.status == ATTACHMENT_STATUS_DELETED {
+            return false;
+        }
+        self.status = ATTACHMENT_STATUS_DELETED.to_string();
+        self.next_status_due_at = None;
+        true
+    }
+
     /// Whether the resource this attachment stands for is in place.
     pub fn is_attached(&self) -> bool {
         self.status == ATTACHMENT_STATUS_ATTACHED
@@ -283,6 +354,12 @@ impl AttachmentRecord {
                     self.next_status_due_at = self
                         .next_attach_status()
                         .map(|_| due + INTERFACE_STEP_SPAN);
+                    // The interface is in place from this step on, so its own identity is
+                    // what the attachment reports beside the subnet it sits in
+                    // ([`Self::report_allocated_interface`]).
+                    if self.status == ATTACHMENT_STATUS_ATTACHED {
+                        self.report_allocated_interface();
+                    }
                 }
                 // Nothing further is owed: the progression is over, whoever ended it.
                 None => self.next_status_due_at = None,
@@ -326,15 +403,21 @@ impl AttachmentRecord {
     }
 
     /// The `NetworkInterface` a container of the task holding this attachment reports for
-    /// it, or `None` when this attachment is not an interface — a container of an `awsvpc`
-    /// task reports the interface it is reached on.
+    /// it, or `None` when this attachment is not an interface, or when the interface it
+    /// stands for is not in place yet.
+    ///
+    /// `Container$networkInterfaces` is "the network interfaces associated with the
+    /// container": a container of an `awsvpc` task is reached on the one interface its task
+    /// was allocated, so it reports that interface once the interface EXISTS — which is what
+    /// its own identity being reported means ([`Self::report_allocated_interface`]) — and
+    /// reports none while Amazon ECS is still attaching it.
     pub fn container_network_interface(&self) -> Option<NetworkInterface> {
         if self.attachment_type != ATTACHMENT_TYPE_ELASTIC_NETWORK_INTERFACE {
             return None;
         }
         Some(NetworkInterface {
             attachment_id: Some(self.id.clone()),
-            private_ipv4_address: self.private_ipv4_address().map(str::to_string),
+            private_ipv4_address: Some(self.private_ipv4_address()?.to_string()),
             // No IPv6 address: nothing here allocates one, and reporting an address the
             // interface does not hold would be reporting a reachable address that is not.
             ipv6_address: None,

@@ -122,3 +122,65 @@ pub fn unresolved_subnet_refusal<Eng: Send + Sync + 'static>(
     };
     missing.map(|missing| subnet_lookup_message(&requested, &missing))
 }
+
+/// Where ONE subnet of the account is, as Amazon VPC holds it: what a placement into that
+/// subnet puts the task — and the interface it is allocated — in.
+#[derive(Debug, Clone)]
+pub struct SubnetPlacement {
+    /// `Subnet$availabilityZone`: the zone the subnet is in, which is the zone of every
+    /// task placed into it.
+    pub availability_zone: String,
+    /// `Subnet$cidrBlock`: "The IPv4 CIDR block assigned to the subnet", and `None` for a
+    /// subnet Amazon VPC holds none for — the range the interface created in it takes its
+    /// own address out of ([`allocated_interface_private_ipv4_address`]).
+    pub cidr_block: Option<String>,
+}
+
+/// Where each of `subnets` is, as Amazon VPC holds it ([`SubnetPlacement`]) — one pair per
+/// subnet that resolves, and nothing for an id Amazon VPC holds no subnet for.
+///
+/// `Task$availabilityZone` is "the Availability Zone for the task", and the zone of a task
+/// that was allocated its own elastic network interface is the zone of the subnet that
+/// interface was created in — a subnet is in exactly one zone, so the placement's first
+/// subnet decides it. The same subnet's CIDR block is what the interface's own address comes
+/// out of. Both are Amazon EC2's records, so they are read out of that service's own store
+/// through the one shared engine and kept on this store for the placements the clock makes
+/// later ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::record_subnet_placements`]).
+///
+/// LOCK ORDER: this takes the Amazon EC2 store's lock, holds no other while it does, and
+/// hands back owned values — so it is called with NO guard of this service's store held,
+/// exactly as [`unresolved_subnet_refusal`] is.
+pub fn subnet_placements<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    subnets: &[String],
+) -> Vec<(String, SubnetPlacement)> {
+    if subnets.is_empty() {
+        return Vec::new();
+    }
+    let Some(ec2) = ::service_com_amazonaws_ec2_amazonec2::state::service_state(engine) else {
+        return Vec::new();
+    };
+    let store = ec2.lock();
+    subnets
+        .iter()
+        .filter_map(|subnet| {
+            let held = store.subnets.get(subnet.as_str())?;
+            Some((
+                subnet.clone(),
+                SubnetPlacement {
+                    availability_zone: held.availability_zone.clone()?,
+                    cidr_block: held.cidr_block.clone(),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// The subnets an `awsvpc` placement names, in the order it named them, and an empty list
+/// for a placement that names none — the list [`subnet_placements`] is asked about.
+pub fn configured_subnets(configuration: Option<&NetworkConfiguration>) -> Vec<String> {
+    configuration
+        .and_then(|configuration| configuration.awsvpc_configuration.as_ref())
+        .map(|awsvpc| awsvpc.subnets.clone())
+        .unwrap_or_default()
+}

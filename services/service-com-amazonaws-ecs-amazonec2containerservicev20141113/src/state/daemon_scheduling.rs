@@ -1068,14 +1068,30 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             containers,
             cpu: definition.cpu.clone(),
             memory: definition.memory.clone(),
-            overrides: None,
+            // A daemon's placement overrides nothing of the revision it runs, and names
+            // each of that revision's containers ([`resolved_task_overrides`]).
+            overrides: Some(resolved_task_overrides(
+                None,
+                &Self::daemon_container_definitions(&definition),
+            )),
             // The capacity a daemon runs on is its capacity providers' ("ECS Managed
             // Daemons is only supported for Amazon ECS Managed Instances Capacity
             // Providers"), so a daemon task is placed through a provider rather than with a
             // launch type.
             launch_type: None,
             capacity_provider_name,
+            // A daemon task runs on the capacity its providers manage rather than on
+            // Fargate, so it reports none of the Fargate-only members; its containers run
+            // on the architecture the instance under them reports for itself
+            // ([`task_cpu_architecture`]).
             platform_version: None,
+            platform_family: None,
+            cpu_architecture: task_cpu_architecture(
+                self.host_cpu_architecture(Some(host_arn)).as_deref(),
+                None,
+            ),
+            availability_zone: self.task_availability_zone(Some(host_arn), &[]),
+            ephemeral_storage_gib: None,
             // `Task$startedBy`: for a task the daemon scheduler placed, the deployment that
             // placed it.
             started_by: Some(daemon.deployment_arn.clone()),

@@ -405,6 +405,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             input.network_configuration.as_ref(),
         );
+        // The Availability Zone of each subnet this placement names, and the CIDR block the
+        // interface created in it takes its address out of, read out of the same store under
+        // the same rule ([`crate::state::subnet_placements`]).
+        let placement_subnets =
+            crate::state::configured_subnets(input.network_configuration.as_ref());
+        let placements = crate::state::subnet_placements(&*self.engine, &placement_subnets);
 
         // The capacity the account's Amazon EC2 instances owe their clusters, in place
         // before this placement looks for it ([`crate::state::settle_ec2_capacity`]): "the
@@ -685,6 +691,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         let created_at = crate::state::now();
+        // Where the subnets this placement names are, kept on the store so a later
+        // placement the clock makes into the same subnet reports the same zone
+        // ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::record_subnet_placements`]).
+        guard.record_subnet_placements(placements);
+        // The PLATFORM this run resolved — the operating-system family and the platform
+        // version a Fargate placement runs on, the processor architecture its containers
+        // run on, and the ephemeral storage it was given
+        // ([`crate::state::resolved_task_platform`]).
+        let platform = crate::state::resolved_task_platform(
+            definition.runtime_platform.as_ref(),
+            definition.ephemeral_storage.as_ref(),
+            input.overrides.as_ref(),
+            crate::state::places_on_fargate(input.launch_type.as_deref(), &effective_strategy),
+            input.platform_version.as_deref(),
+        );
+        // "One or more container overrides": the task runs every container its revision
+        // declares, so each of them is named in the overrides it runs under, whether or not
+        // this request overrode anything of it
+        // ([`crate::state::resolved_task_overrides`]).
+        let overrides = crate::state::resolved_task_overrides(
+            input.overrides.as_ref(),
+            &definition.container_definitions,
+        );
         // Where the placement is routed through a capacity provider that still has to
         // ACQUIRE the capacity for it, the task has been accepted but not placed: Amazon
         // ECS has to add a container instance first, which is what `PROVISIONING` reports,
@@ -718,6 +747,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &definition.container_definitions,
                 schedule.last_status,
             );
+            let container_instance_arn =
+                guard.select_task_host(&cluster_name, launch_type.as_deref());
 
             let record = crate::state::TaskRecord {
                 task_arn: task_arn.clone(),
@@ -729,8 +760,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // the cluster's own registered capacity, and `None` for one that does not
                 // ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::select_task_host`]).
                 // `StartTask` is the placement whose caller NAMES one instead.
-                container_instance_arn: guard
-                    .select_task_host(&cluster_name, launch_type.as_deref()),
+                container_instance_arn: container_instance_arn.clone(),
                 task_definition_arn: definition.arn.clone(),
                 family: definition.family.clone(),
                 last_status: schedule.last_status.to_string(),
@@ -738,10 +768,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 containers,
                 cpu: definition.cpu.clone(),
                 memory: definition.memory.clone(),
-                overrides: input.overrides.clone(),
+                overrides: Some(overrides.clone()),
                 launch_type: launch_type.clone(),
                 capacity_provider_name: capacity_provider_name.clone(),
-                platform_version: input.platform_version.clone(),
+                platform_version: platform.platform_version.clone(),
+                platform_family: platform.platform_family.clone(),
+                // The architecture the capacity this run placed the task on runs
+                // ([`crate::state::task_cpu_architecture`]).
+                cpu_architecture: crate::state::task_cpu_architecture(
+                    guard
+                        .host_cpu_architecture(container_instance_arn.as_deref())
+                        .as_deref(),
+                    definition.runtime_platform.as_ref(),
+                ),
+                // The zone of the capacity this run placed the task on
+                // ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::task_availability_zone`]).
+                availability_zone: guard.task_availability_zone(
+                    container_instance_arn.as_deref(),
+                    &placement_subnets,
+                ),
+                ephemeral_storage_gib: platform.ephemeral_storage_gib,
                 started_by: input.started_by.clone(),
                 group: group.clone(),
                 // Nothing but the service scheduler places a task for a service, and

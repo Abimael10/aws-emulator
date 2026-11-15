@@ -231,8 +231,8 @@ async fn an_awsvpc_task_attaches_its_interface_before_it_runs_and_is_connected_f
         register(&router, &family, "awsvpc", case).await;
         let task_arn = launch(&router, path, &family, case).await;
 
-        // The interface is CREATED with the task, so the attachment is there, carries all
-        // four details the member documents, and is not attached yet.
+        // The attachment is CREATED with the task, carrying the one detail the launch
+        // supplied, and is not attached yet.
         let first = describe(&router, &task_arn, case).await;
         let attachment = only_attachment(&first, case);
         assert_eq!(
@@ -265,13 +265,21 @@ async fn an_awsvpc_task_attaches_its_interface_before_it_runs_and_is_connected_f
             observe(&mut attach_seen, &attach_status);
             observe(&mut task_seen, &task_status);
 
-            // Every detail of the interface is reported at every stage: they are the
-            // interface's own, and it exists from the moment Amazon ECS created it.
-            for name in ["subnetId", "networkInterfaceId", "macAddress", "privateIPv4Address"] {
-                assert!(
+            // The subnet the launch supplied is reported at every stage, and the
+            // interface's OWN identity from the stage its interface is in place: a client
+            // watching the attachment is not given an interface id, a MAC address and an
+            // address for an interface that is not attached to anything yet.
+            assert!(
+                detail(&attachment, "subnetId").is_some_and(|value| !value.is_empty()),
+                "case {case:?}: the attachment reports subnetId at every stage, got \
+                 {attachment}"
+            );
+            for name in ["networkInterfaceId", "macAddress", "privateIPv4Address"] {
+                assert_eq!(
                     detail(&attachment, name).is_some_and(|value| !value.is_empty()),
-                    "case {case:?}: the interface reports {name} at every stage, got \
-                     {attachment}"
+                    attach_status == "ATTACHED",
+                    "case {case:?}: expected {name} exactly once the interface is in \
+                     place, got {attachment}"
                 );
             }
 

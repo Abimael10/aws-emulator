@@ -331,11 +331,20 @@ async fn run_task_starts_a_task_in_provisioning_only_while_its_capacity_is_still
                 "case {case:?}: a task in {expected_status:?} has not started, got {task}"
             );
             for container in list(task, "containers", case) {
+                // `PROVISIONING` is a stage of the TASK's lifecycle, not of a container's:
+                // a container of a task that has not been launched yet is `PENDING`, the
+                // first stage of its own lifecycle.
+                let expected_container_status = if expected_status == "PROVISIONING" {
+                    "PENDING"
+                } else {
+                    expected_status
+                };
                 assert_eq!(
                     string(&container, "lastStatus", case),
-                    expected_status,
-                    "case {case:?}: expected the container to follow the task into \
-                     {expected_status:?}, got {container}"
+                    expected_container_status,
+                    "case {case:?}: expected the container at \
+                     {expected_container_status:?} for a task in {expected_status:?}, got \
+                     {container}"
                 );
             }
             match &expected_provider {

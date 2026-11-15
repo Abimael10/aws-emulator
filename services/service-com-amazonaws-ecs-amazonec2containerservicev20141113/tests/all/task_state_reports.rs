@@ -61,6 +61,11 @@ const ACK: &str = "ACK";
 /// the task can be launched, which is what `PROVISIONING` reports.
 const STARTING_STAGE: &str = "PROVISIONING";
 
+/// The `Container$lastStatus` the containers of that task are at: `PROVISIONING` is a
+/// stage of the TASK's lifecycle and not of a container's, so a container of a task that
+/// has not been launched yet is at the first stage of its own.
+const CONTAINER_STARTING_STAGE: &str = "PENDING";
+
 /// The sentence a report naming a cluster that resolves to nothing is refused with.
 const CLUSTER_NOT_FOUND: &str = "Cluster not found.";
 
@@ -347,7 +352,7 @@ async fn a_report_resolves_every_nested_reference_before_it_records_any_of_them(
         );
         assert_eq!(
             container_of(&read, FIRST_CONTAINER, row)["lastStatus"].as_str(),
-            Some(STARTING_STAGE),
+            Some(CONTAINER_STARTING_STAGE),
             "case {row:?}: a refused report must record none of its entries, got {read}"
         );
         assert_eq!(
@@ -736,16 +741,23 @@ async fn a_resolved_report_records_each_container_attachment_and_managed_agent_i
             "case {case:?}: expected the state the attachment entry named, got {read}"
         );
 
-        // The container the report never named holds nothing the report carried.
+        // The container the report never named holds nothing the report carried — it keeps
+        // the runtime id Amazon ECS gave it when it created the container, which is not the
+        // one the report named for its sibling.
         let sibling = container_of(&read, SECOND_CONTAINER, case);
+        assert_ne!(
+            sibling["runtimeId"].as_str(),
+            Some("0123456789abcdef0123456789abcdef"),
+            "case {case:?}: the reported runtime id belongs to the container it named, got \
+             {sibling}"
+        );
         assert_eq!(
             (
-                sibling["runtimeId"].as_str(),
                 sibling["exitCode"].as_i64(),
                 sibling["reason"].as_str(),
                 list(&sibling, "managedAgents", case).len(),
             ),
-            (None, None, None, 0),
+            (None, None, 0),
             "case {case:?}: the container nobody reported on holds no outcome, got \
              {sibling}"
         );

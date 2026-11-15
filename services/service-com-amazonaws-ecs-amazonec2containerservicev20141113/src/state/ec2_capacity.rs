@@ -83,14 +83,8 @@ const CPU_UNITS_PER_VCPU: i32 = 1024;
 /// The built-in attribute naming the instance type the agent runs on.
 const ATTRIBUTE_INSTANCE_TYPE: &str = "ecs.instance-type";
 
-/// The built-in attribute naming the Availability Zone the instance is in.
-const ATTRIBUTE_AVAILABILITY_ZONE: &str = "ecs.availability-zone";
-
 /// The built-in attribute naming the AMI the instance booted.
 const ATTRIBUTE_AMI_ID: &str = "ecs.ami-id";
-
-/// The built-in attribute naming the instance's processor architecture.
-const ATTRIBUTE_CPU_ARCHITECTURE: &str = "ecs.cpu-architecture";
 
 /// What ONE running instance's agent reports when it registers the instance.
 #[derive(Debug, Clone)]

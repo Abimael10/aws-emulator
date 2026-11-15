@@ -137,15 +137,10 @@ impl TaskRecord {
     /// other Fargate question of this service is ([`places_on_fargate`]), so a task cannot
     /// be Fargate for one reader and not for another.
     pub fn runs_on_fargate(&self) -> bool {
-        let placed_through: Vec<CapacityProviderStrategyItem> = self
-            .capacity_provider_name
-            .iter()
-            .map(|name| CapacityProviderStrategyItem {
-                capacity_provider: name.clone(),
-                ..CapacityProviderStrategyItem::default()
-            })
-            .collect();
-        places_on_fargate(self.launch_type.as_deref(), &placed_through)
+        places_on_fargate(
+            self.launch_type.as_deref(),
+            &placed_through_strategy(self.capacity_provider_name.as_deref()),
+        )
     }
 }
 

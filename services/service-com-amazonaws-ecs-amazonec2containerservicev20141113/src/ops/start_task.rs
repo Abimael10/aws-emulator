@@ -309,6 +309,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             input.network_configuration.as_ref(),
         );
+        // Where each subnet it names is, read out of the same store under the same rule
+        // ([`crate::state::subnet_placements`]).
+        let placement_subnets =
+            crate::state::configured_subnets(input.network_configuration.as_ref());
+        let placements = crate::state::subnet_placements(&*self.engine, &placement_subnets);
 
         // The capacity the account's Amazon EC2 instances owe their clusters, in place
         // before this placement resolves the instance it names
@@ -456,6 +461,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.tags.as_deref().unwrap_or_default(),
         );
         let created_at = crate::state::now();
+        // Where the subnets this placement names are, kept on the store beside the task
+        // that is placed into them ([`crate::state::subnet_placements`]).
+        guard.record_subnet_placements(placements);
+        // The PLATFORM this placement resolved. `StartTask` places onto a container
+        // instance, which is not Fargate capacity, so the Fargate-only members are left
+        // unreported and only the architecture its containers run on is resolved
+        // ([`crate::state::resolved_task_platform`]).
+        let platform = crate::state::resolved_task_platform(
+            definition.runtime_platform.as_ref(),
+            definition.ephemeral_storage.as_ref(),
+            input.overrides.as_ref(),
+            false,
+            None,
+        );
 
         let mut started = Vec::with_capacity(input.container_instances.len());
         let mut failures = Vec::new();
@@ -510,6 +529,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &definition.container_definitions,
                 schedule.last_status,
             );
+            // The zone of the capacity the caller named, read off the instance's own
+            // reported attributes — as is the architecture its containers run on.
+            let availability_zone =
+                guard.task_availability_zone(Some(&container_instance_arn), &placement_subnets);
+            let cpu_architecture = crate::state::task_cpu_architecture(
+                guard
+                    .host_cpu_architecture(Some(&container_instance_arn))
+                    .as_deref(),
+                definition.runtime_platform.as_ref(),
+            );
 
             let record = crate::state::TaskRecord {
                 task_arn: task_arn.clone(),
@@ -528,15 +557,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 containers,
                 cpu: definition.cpu.clone(),
                 memory: definition.memory.clone(),
-                overrides: input.overrides.clone(),
+                overrides: Some(crate::state::resolved_task_overrides(
+                    input.overrides.as_ref(),
+                    &definition.container_definitions,
+                )),
                 // A container instance is the registered capacity of this launch type,
                 // and `StartTask` carries neither a launch type nor a capacity provider
                 // to say otherwise.
                 launch_type: Some(crate::state::DEFAULT_LAUNCH_TYPE.to_string()),
                 capacity_provider_name: None,
                 // "A platform version is only specified for tasks hosted on Fargate",
-                // which a task on a container instance is not.
-                platform_version: None,
+                // which a task on a container instance is not — and the same holds for the
+                // platform family and the Fargate ephemeral storage
+                // ([`crate::state::resolved_task_platform`]).
+                platform_version: platform.platform_version.clone(),
+                platform_family: platform.platform_family.clone(),
+                // The architecture the instance this placement named reports for itself
+                // ([`crate::state::task_cpu_architecture`]).
+                cpu_architecture: cpu_architecture.clone(),
+                // The zone the instance this placement named is in
+                // ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::task_availability_zone`]).
+                availability_zone: availability_zone.clone(),
+                ephemeral_storage_gib: platform.ephemeral_storage_gib,
                 started_by: input.started_by.clone(),
                 group: group.clone(),
                 // Nothing but the service scheduler places a task for a service, and

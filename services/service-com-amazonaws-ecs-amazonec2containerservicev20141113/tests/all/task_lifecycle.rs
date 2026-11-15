@@ -844,7 +844,8 @@ async fn run_describe_stop_and_delete_is_one_consistent_story() {
             );
         }
 
-        // Without `include`, tags are absent.
+        // Without `include`, the tags themselves are not included: the member is the empty
+        // list every described task carries, never the tag set the task holds.
         let untagged = ok(
             &router,
             "DescribeTasks",
@@ -852,9 +853,11 @@ async fn run_describe_stop_and_delete_is_one_consistent_story() {
             &case,
         )
         .await;
-        assert!(
-            list(&untagged, "tasks", &case)[0]["tags"].is_null(),
-            "case {case:?}: tags must be absent without include TAGS, got {untagged}"
+        assert_eq!(
+            list(&untagged, "tasks", &case)[0]["tags"],
+            json!([]),
+            "case {case:?}: the tags a task holds must not be included without include \
+             TAGS, got {untagged}"
         );
 
         let running_view = ok(

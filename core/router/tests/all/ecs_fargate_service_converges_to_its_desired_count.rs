@@ -36,6 +36,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -70,6 +71,13 @@ const VPC: &str = "vpc-0123456789abcdef0";
 /// `Attachment$status`' own list: "PRECREATED, CREATED, ATTACHING, ATTACHED, DETACHING,
 /// DETACHED, DELETED, and FAILED").
 const ATTACHING_STATUSES: [&str; 3] = ["PRECREATED", "CREATED", "ATTACHING"];
+
+/// How often a poll re-reads the tasks it is waiting on, and how long it keeps trying:
+/// Amazon ECS creates and attaches the interface an `awsvpc` task is allocated one
+/// documented step at a time, so the wait is for that CONDITION with generous margin for a
+/// loaded test machine.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const ATTACH_BUDGET: Duration = Duration::from_secs(60);
 
 /// The `lastStatus` values a task that has been placed but has not started is in:
 /// `PROVISIONING` while Amazon ECS prepares what it needs (here, the interface it is
@@ -402,7 +410,7 @@ async fn a_load_balanced_fargate_service_places_its_task_set_with_nothing_runnin
 
         // The tasks it placed, as a client polling straight after the create reads them.
         let tasks = placed_tasks(&router, row).await;
-        let mut addresses = Vec::new();
+        let mut interfaces = Vec::new();
         for task in &tasks {
             let last_status = task["lastStatus"].as_str().unwrap_or_default();
             assert!(
@@ -416,8 +424,9 @@ async fn a_load_balanced_fargate_service_places_its_task_set_with_nothing_runnin
                 "case {case:?}: a task that has not started carries no startedAt, got {task}"
             );
             // "If the network mode is awsvpc, the task is allocated an elastic network
-            // interface": the interface exists from the moment the task is placed, carrying
-            // its own values, and the ATTACHMENT is what the clock still has to move.
+            // interface": the attachment exists from the moment the task is placed, and
+            // what the clock still has to move is its status — and with it the interface's
+            // own identity.
             let attachments: Vec<&Value> =
                 task["attachments"].as_array().into_iter().flatten().collect();
             assert_eq!(
@@ -448,11 +457,17 @@ async fn a_load_balanced_fargate_service_places_its_task_set_with_nothing_runnin
             };
             // `Attachment$details`: "For elastic network interfaces, this includes the
             // network interface ID, the MAC address, the subnet ID, and the private IPv4
-            // address."
+            // address." The SUBNET is known the instant the attachment exists, because the
+            // placement supplied it; the other three are the INTERFACE's own and are
+            // reported once that interface is in place, which for a task that has not
+            // started it is not — a client watching the attachment to learn when the task's
+            // networking is usable is not handed an interface id, a MAC address and an
+            // address for an interface attached to nothing yet.
             for name in ["networkInterfaceId", "macAddress", "privateIPv4Address"] {
                 assert!(
-                    detail(name).is_some_and(|value| !value.is_empty()),
-                    "case {case:?}: the interface reports its {name}, got {attachment}"
+                    detail(name).is_none(),
+                    "case {case:?}: the interface of a task that has not started reports no \
+                     {name} yet, got {attachment}"
                 );
             }
             let subnet = detail("subnetId").unwrap_or_default();
@@ -461,14 +476,19 @@ async fn a_load_balanced_fargate_service_places_its_task_set_with_nothing_runnin
                 "case {case:?}: the interface is created in a subnet the placement named, \
                  got {subnet:?}"
             );
-            addresses.push(detail("privateIPv4Address").unwrap_or_default());
+            interfaces.push(
+                attachment["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
         }
-        let distinct: BTreeSet<&String> = addresses.iter().collect();
+        let distinct: BTreeSet<&String> = interfaces.iter().collect();
         assert_eq!(
             distinct.len(),
-            addresses.len(),
+            interfaces.len(),
             "case {case:?}: each task is allocated its own interface, so no two share an \
-             address, got {addresses:?}"
+             attachment, got {interfaces:?}"
         );
 
         // And nothing is a target of the bound group yet: Amazon ECS registers a task once
@@ -478,6 +498,56 @@ async fn a_load_balanced_fargate_service_places_its_task_set_with_nothing_runnin
             held, 0,
             "case {case:?}: a task that is not running is a target of nothing, got {held} \
              target description(s)"
+        );
+
+        // Then the interface each task was allocated is attached, and reports an identity of
+        // its own: the ADDRESS is what makes one task's interface distinct from another's, so
+        // it is asserted where it exists — once the attachment is in place. The CONDITION is
+        // polled for, never waited out.
+        let deadline = Instant::now() + ATTACH_BUDGET;
+        let addresses = loop {
+            let detail_of = |task: &Value, name: &str| -> Option<String> {
+                task["attachments"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|attachment| {
+                        attachment["details"].as_array().into_iter().flatten()
+                    })
+                    .find(|entry| entry["name"].as_str() == Some(name))
+                    .and_then(|entry| entry["value"].as_str())
+                    .map(str::to_string)
+            };
+            let tasks = placed_tasks(&router, row).await;
+            let addresses: Vec<String> = tasks
+                .iter()
+                .filter_map(|task| detail_of(task, "privateIPv4Address"))
+                .collect();
+            if addresses.len() == tasks.len() {
+                for task in &tasks {
+                    let subnet = detail_of(task, "subnetId").unwrap_or_default();
+                    assert!(
+                        subnet == SUBNET || subnet == SECOND_SUBNET,
+                        "case {case:?}: the attached interface stays in the subnet the \
+                         placement named, got {subnet:?}"
+                    );
+                }
+                break addresses;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: expected every task's interface to be attached and to report \
+                 its own address, got {addresses:?} for {} task(s)",
+                tasks.len()
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        };
+        let distinct: BTreeSet<&String> = addresses.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            addresses.len(),
+            "case {case:?}: each task is allocated its own interface, so no two share an \
+             address, got {addresses:?}"
         );
     }
 }

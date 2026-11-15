@@ -588,6 +588,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 }
                 task.pull_started_at = Some(at);
                 task.pull_stopped_at = Some(at);
+                // The fetch is made for a container Amazon ECS has CREATED on the capacity
+                // the task was placed on, so each container reports the runtime id it was
+                // created with from here on, whichever way the fetch went
+                // ([`ContainerRecord::report_runtime_id`]).
+                let task_id = task.task_id.clone();
+                for container in &mut task.containers {
+                    container.report_runtime_id(&task_id);
+                }
                 if task.launch_failure.is_none() && task.is_pending() {
                     task.launch_failure = failure.clone();
                 }

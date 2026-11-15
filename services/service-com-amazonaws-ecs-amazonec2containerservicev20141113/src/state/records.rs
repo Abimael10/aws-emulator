@@ -16,6 +16,11 @@ use super::*;
 #[derive(Debug, Clone)]
 pub struct ContainerRecord {
     pub container_arn: String,
+    /// Which container of this store's whole history this is, from the counter the id in
+    /// its ARN was minted out of (`next_container_id`) — what makes the runtime id Amazon
+    /// ECS gives this container when it creates it its own
+    /// ([`ContainerRecord::report_runtime_id`]).
+    pub sequence: u64,
     pub task_arn: String,
     pub name: Option<String>,
     pub image: Option<String>,
@@ -159,5 +164,43 @@ impl ContainerRecord {
         if onward {
             self.last_status = status.to_string();
         }
+    }
+
+    /// Report the runtime id Amazon ECS gives this container when it CREATES it on the
+    /// capacity the task was placed on, if it does not carry one already.
+    ///
+    /// `Container$runtimeId` is "The ID of the Docker container": the container exists on
+    /// its host from the moment Amazon ECS creates it there — the step the image fetch is
+    /// made in, before any program of it runs — so the id is reported from then on, whether
+    /// or not that fetch succeeded, and an id the agent itself has reported
+    /// (`SubmitContainerStateChange$runtimeId`) is left as the agent gave it.
+    ///
+    /// `task_id` is the task the container belongs to: Amazon ECS derives the id from the
+    /// task it created the container for and the container's own place in this store's
+    /// allocations ([`Self::sequence`]), so one container's runtime id is its own and reads
+    /// the same every time.
+    ///
+    /// Answers whether anything changed.
+    pub fn report_runtime_id(&mut self, task_id: &str) -> bool {
+        if self.runtime_id.is_some() {
+            return false;
+        }
+        self.runtime_id = Some(format!("{task_id}-{}", self.sequence));
+        true
+    }
+}
+
+/// The `Container$lastStatus` a container of a task placed in `task_status` is reported at.
+///
+/// `Container$lastStatus` is "the last known status of the container", which moves through
+/// [`CONTAINER_LIFECYCLE`] — and `PROVISIONING` is not on it: the ECS task lifecycle's
+/// `PROVISIONING` is the TASK waiting for the resources Amazon ECS has to put in place
+/// before it can be launched, which is not a state a container of it is in. A container of
+/// a task that has not been launched yet is `PENDING`, the first stage of its own
+/// lifecycle; any other task status a container shares is its own stage.
+pub fn initial_container_status(task_status: &str) -> &str {
+    match container_stage_rank(task_status) {
+        Some(_) => task_status,
+        None => STATUS_PENDING,
     }
 }

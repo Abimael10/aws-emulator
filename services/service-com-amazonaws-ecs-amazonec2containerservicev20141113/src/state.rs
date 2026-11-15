@@ -124,7 +124,7 @@ use crate::ops::types::{
     Attachment, Attribute, AutoScalingGroupProvider, AwsVpcConfiguration, CapacityProvider,
     CapacityProviderStrategyItem, Cluster, ClusterConfiguration, ClusterServiceConnectDefaults,
     ClusterSetting, Container, ContainerDefinition, ContainerDependency, ContainerImage,
-    ContainerInstance,
+    ContainerInstance, ContainerOverride,
     DaemonCapacityProvider, DaemonCircuitBreaker, DaemonContainerDefinition, DaemonContainerImage,
     DaemonDeployment, DaemonDeploymentAlarms, DaemonDeploymentCapacityProvider,
     DaemonDeploymentConfiguration, DaemonDeploymentRevisionDetail, DaemonDeploymentSummary,
@@ -147,7 +147,7 @@ use crate::ops::types::{
     ServiceRevision, ServiceRevisionLoadBalancer, ServiceRevisionSummary,
     ServiceRevisionVpcLatticeConfiguration,
     ServiceVolumeConfiguration, Setting, Tag, Task, TaskDefinition,
-    TaskDefinitionPlacementConstraint, TaskOverride, TaskSet,
+    TaskDefinitionPlacementConstraint, TaskEphemeralStorage, TaskOverride, TaskSet,
     ThresholdConfiguration, UpdatedExpressGatewayService, VersionInfo, Volume,
     VpcLatticeConfiguration,
     CLUSTER_SETTING_NAME_VALUES,
@@ -252,6 +252,11 @@ pub use task_size::*;
 /// versions are published per operating system, so the pairing is read off the revision.
 mod platform_versions;
 pub use platform_versions::*;
+
+/// The platform a placed task runs on and the sizing it was given — the members a task
+/// reports off the placement that created it.
+mod task_platform;
+pub use task_platform::*;
 
 /// The bounds a service's deployment has to meet: the two percentages that bound the same
 /// count from opposite ends, and the grace period the scheduler waits out.
@@ -3730,10 +3735,32 @@ pub struct TaskRecord {
     pub containers: Vec<ContainerRecord>,
     pub cpu: Option<String>,
     pub memory: Option<String>,
+    /// `Task$overrides`: the overrides this task RUNS UNDER, as the placement resolved them
+    /// — one `containerOverrides` entry per container of the revision it runs, whether or
+    /// not the request overrode anything of that container ([`resolved_task_overrides`]).
+    /// `None` only for a task placed by a path that resolves no revision to read the
+    /// containers off.
     pub overrides: Option<TaskOverride>,
     pub launch_type: Option<String>,
     pub capacity_provider_name: Option<String>,
+    /// `Task$platformVersion`, as the placement RESOLVED it — the version a request that
+    /// asked for the `LATEST` alias was placed on ([`resolved_platform_version`]) — and
+    /// `None` for a task that runs on no managed platform ([`resolved_task_platform`]).
     pub platform_version: Option<String>,
+    /// `Task$platformFamily`: "The operating system that your tasks are running on",
+    /// resolved by the placement beside the version above and `None` for the same tasks.
+    pub platform_family: Option<String>,
+    /// The `CPUArchitecture` this task's containers run on, which is what
+    /// `Task$attributes` reports for the task ([`ATTRIBUTE_CPU_ARCHITECTURE`]).
+    pub cpu_architecture: String,
+    /// `Task$availabilityZone`: "The Availability Zone for the task" — the zone of the
+    /// capacity the placement put it on ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::task_availability_zone`]),
+    /// and `None` for a placement this emulator holds no zone for.
+    pub availability_zone: Option<String>,
+    /// The ephemeral storage, in GiB, the placement gave this task, reported as both
+    /// `Task$ephemeralStorage` and `Task$fargateEphemeralStorage`; `None` for a task whose
+    /// capacity reports none ([`resolved_ephemeral_storage_gib`]).
+    pub ephemeral_storage_gib: Option<i32>,
     pub started_by: Option<String>,
     pub group: String,
     /// The service whose scheduler placed this task, if any. `None` for a standalone
@@ -3852,6 +3879,15 @@ impl TaskRecord {
             // actually holds, so a task that was allocated none reports an empty list
             // rather than one invented.
             attachments: Some(self.attachments.iter().map(AttachmentRecord::view).collect()),
+            // `Task$attributes`: "The attributes of the task" — the processor architecture
+            // the placement resolved for it, which is the attribute Amazon ECS records for
+            // every task it places ([`ATTRIBUTE_CPU_ARCHITECTURE`]).
+            attributes: Some(vec![Attribute {
+                name: ATTRIBUTE_CPU_ARCHITECTURE.to_string(),
+                value: Some(cpu_architecture_display(&self.cpu_architecture)),
+                ..Attribute::default()
+            }]),
+            availability_zone: self.availability_zone.clone(),
             cluster_arn: Some(self.cluster_arn.clone()),
             connectivity: self.connectivity.clone(),
             connectivity_at: self.connectivity_at,
@@ -3873,6 +3909,22 @@ impl TaskRecord {
             launch_type: self.launch_type.clone(),
             capacity_provider_name: self.capacity_provider_name.clone(),
             platform_version: self.platform_version.clone(),
+            platform_family: self.platform_family.clone(),
+            // `Task$ephemeralStorage` is "the ephemeral storage settings for the task" and
+            // `Task$fargateEphemeralStorage` "the Fargate ephemeral storage settings for
+            // the task": one amount of scratch space, reported through both members the
+            // model carries for it.
+            ephemeral_storage: self
+                .ephemeral_storage_gib
+                .map(|size_in_gi_b| EphemeralStorage { size_in_gi_b }),
+            fargate_ephemeral_storage: self.ephemeral_storage_gib.map(|size_in_gi_b| {
+                TaskEphemeralStorage {
+                    size_in_gi_b,
+                    // No `kmsKeyId`: nothing here encrypts a task's ephemeral storage
+                    // with a customer key, so there is no key to report.
+                    kms_key_id: None,
+                }
+            }),
             memory: self.memory.clone(),
             overrides: self.overrides.clone(),
             pull_started_at: self.pull_started_at,
@@ -3883,11 +3935,17 @@ impl TaskRecord {
             stopped_at: self.stopped_at,
             stopped_reason: self.stopped_reason.clone(),
             stopping_at: self.stopping_at,
-            tags: if include_tags {
-                Some(self.tags.clone())
+            // `tags` is a LIST a described task always carries: `include` decides whether
+            // the tag set is MATERIALISED, not whether the member is there, so a task read
+            // without it reports an empty list — no tag of the task is included, which is
+            // what the member documents — and a client may index it unconditionally. The
+            // same shape a described cluster's own collection members take
+            // ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::cluster_view`]).
+            tags: Some(if include_tags {
+                self.tags.clone()
             } else {
-                None
-            },
+                Vec::new()
+            }),
             task_arn: Some(self.task_arn.clone()),
             task_definition_arn: Some(self.task_definition_arn.clone()),
             version: self.version,
@@ -4171,6 +4229,17 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// account setting has been specified") or a `PutAccountSetting` on the root user
     /// stored it. A name with no entry takes its [`ACCOUNT_SETTINGS`] default.
     pub account_setting_defaults: HashMap<String, String>,
+    /// `subnetId` -> where that subnet is, as Amazon VPC holds it ([`SubnetPlacement`]).
+    ///
+    /// Both facts are the SUBNET's, so they are read out of the Amazon EC2 service's own
+    /// store ([`subnet_placements`]) — by the call that places a task into the subnet, with
+    /// no guard of this store held — and kept here so a later placement the CLOCK makes,
+    /// which holds this store's lock and may take no other, can still report the zone of the
+    /// task it places ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::task_availability_zone`])
+    /// and give the interface it allocates an address of its subnet.
+    /// Bounded by the subnets Amazon VPC holds, since a subnet it has none of resolves to no
+    /// placement to record.
+    pub subnet_placements: HashMap<String, SubnetPlacement>,
     /// Monotonic source of task ids, so every task ARN is distinct.
     next_task_seq: u64,
     /// Monotonic source of container ids, so every container ARN is distinct.

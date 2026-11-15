@@ -916,6 +916,11 @@ pub struct AttachmentRecord {
     pub attachment_type: String,
     pub status: String,
     pub details: Vec<KeyValuePair>,
+    /// `Subnet$cidrBlock` of the subnet the interface was created in, as Amazon VPC held it
+    /// when the placement was made ([`SubnetPlacement`]) — the range the interface's own
+    /// address is taken out of ([`allocated_interface_private_ipv4_address`]) — and `None`
+    /// for an attachment whose subnet this emulator holds no CIDR block for.
+    pub subnet_cidr_block: Option<String>,
     /// When the next step of this attachment's own progression falls due
     /// ([`INTERFACE_ATTACH_LIFECYCLE`]), and `None` once the clock owes it nothing more:
     /// the resource is in place, or an agent has reported a status that progression does
