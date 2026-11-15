@@ -181,12 +181,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // Only reachable on an engine that is not the shared `InMemoryEngine`,
             // which this service has no store on — so nothing is implemented for it.
             crate::scaffolded::Scaffolded::not_implemented("ModifyCapacityReservation")
         })?;
+
+        // The FORM of the ARN is judged BEFORE the store is read: a value that is not an
+        // ARN this API could have minted for the Region the request addresses names no
+        // load balancer that could exist, so it is the request that has to be fixed rather
+        // than a load balancer that is missing ([`crate::state::identifier_syntax`]).
+        crate::state::check_resource_arn(
+            crate::state::ArnKind::LoadBalancer,
+            &input.load_balancer_arn,
+            &crate::state::request_region(ctx),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         let now = std::time::SystemTime::now();
 
         // "When modifying capacity reservation, you must include at least one

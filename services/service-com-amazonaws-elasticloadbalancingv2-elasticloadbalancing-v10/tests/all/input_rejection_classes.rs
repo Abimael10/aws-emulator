@@ -784,3 +784,172 @@ async fn a_placement_no_load_balancer_can_hold_stays_the_modelled_refusal() {
         reply.body
     );
 }
+
+// ---------------------------------------------------------------------------
+// The VPC a target group's targets live in.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// The VPC a target group's targets live in, and the port they receive traffic on.
+// ---------------------------------------------------------------------------
+
+/// The refusal a create that names no VPC for a target type whose targets live in one
+/// earns: wholly fixed text, naming neither the member nor the target type.
+const NO_VPC_SPECIFIED: &str = "A VPC ID must be specified";
+
+/// The refusal a create that states no port for a target type whose targets receive
+/// traffic on one earns, on the same footing.
+const NO_PORT_SPECIFIED: &str = "A port must be specified";
+
+/// `Port` is bracketed exactly as `VpcId` is — "the port on which the targets receive
+/// traffic", not used for a Lambda target — and is required wherever it applies: a target
+/// group whose targets receive traffic has to state on which port.
+///
+/// The rows cross every target type with a request that states a port and one that leaves
+/// the member out.
+#[tokio::test]
+async fn a_target_group_whose_targets_receive_traffic_needs_a_port() {
+    let (router, _engine) = emulator();
+
+    // (case, the target type the request names — empty for a request that names none, the
+    // protocol it needs, whether its targets receive traffic on a port)
+    let types: [(&str, &str, &str, bool); 5] = [
+        ("no target type, which defaults to instance", "", "HTTP", true),
+        ("an instance target group", "instance", "HTTP", true),
+        ("an ip target group", "ip", "HTTP", true),
+        ("an alb target group", "alb", "TCP", true),
+        ("a lambda target group", "lambda", "", false),
+    ];
+
+    for (index, (type_case, target_type, protocol, needs_port)) in types.iter().enumerate() {
+        for (port_case, port) in [("a port", Some("80")), ("no Port member", None)] {
+            let case = format!("{type_case} with {port_case}");
+            let name = format!("port-rule-{index}-{}", port_case.len());
+            let mut form = action("CreateTargetGroup");
+            form.push(p("Name", &name));
+            if !protocol.is_empty() {
+                form.push(p("Protocol", protocol));
+            }
+            if !target_type.is_empty() {
+                form.push(p("TargetType", target_type));
+            }
+            if *needs_port {
+                form.push(p("VpcId", "vpc-12345678"));
+            }
+            if let Some(port) = port {
+                form.push(p("Port", port));
+            }
+            let reply = call(&router, &form).await;
+
+            if !needs_port || port.is_some() {
+                assert_eq!(
+                    reply.status, 200,
+                    "case {case:?}: expected the create to be served, got {} body {}",
+                    reply.status, reply.body
+                );
+                continue;
+            }
+            assert_eq!(
+                refusal(&reply),
+                (
+                    400,
+                    VALIDATION_ERROR.to_string(),
+                    NO_PORT_SPECIFIED.to_string()
+                ),
+                "case {case:?}: expected 400 {VALIDATION_ERROR} {NO_PORT_SPECIFIED:?}, got {}",
+                reply.body
+            );
+            // A refused create stores nothing: the name is reported by nothing.
+            let mut form = action("DescribeTargetGroups");
+            form.push(p("Names.member.1", &name));
+            let described = call(&router, &form).await;
+            assert_eq!(
+                (described.status, described.error_code().as_str()),
+                (400, "TargetGroupNotFound"),
+                "case {case:?}: a refused create must store nothing, got {} body {}",
+                described.status,
+                described.body
+            );
+        }
+    }
+}
+
+/// `VpcId` is optional in the model and REQUIRED for every target type whose targets are
+/// addressed inside a VPC — `instance`, `ip` and `alb`, and the default the model
+/// documents for an absent `TargetType` is `instance`. Only a `lambda` target group is
+/// exempt ("if the target type is lambda, this parameter does not apply"), and a create
+/// refused for it stores nothing.
+///
+/// The rows cross every target type (including the one the request leaves out) with the
+/// three shapes the member arrives in: a VPC id, no member at all, and the member carrying
+/// nothing.
+#[tokio::test]
+async fn a_target_group_whose_targets_live_in_a_vpc_needs_one() {
+    let (router, _engine) = emulator();
+
+    // (case, the target type the request names — empty for a request that names none, the
+    // protocol it needs, whether the type's targets live in a VPC)
+    let types: [(&str, &str, &str, bool); 5] = [
+        ("no target type, which defaults to instance", "", "HTTP", true),
+        ("an instance target group", "instance", "HTTP", true),
+        ("an ip target group", "ip", "HTTP", true),
+        ("an alb target group", "alb", "TCP", true),
+        ("a lambda target group", "lambda", "", false),
+    ];
+    // (case, the VpcId fields, whether a VPC is named)
+    let vpcs: [(&str, Option<&str>, bool); 3] = [
+        ("a VPC id", Some("vpc-12345678"), true),
+        ("no VpcId member", None, false),
+        ("an empty VpcId", Some(""), false),
+    ];
+
+    for (index, (type_case, target_type, protocol, needs_vpc)) in types.iter().enumerate() {
+        for (vpc_case, vpc, named) in &vpcs {
+            let case = format!("{type_case} with {vpc_case}");
+            let name = format!("vpc-rule-{index}-{}", vpc_case.len());
+            let mut form = action("CreateTargetGroup");
+            form.push(p("Name", &name));
+            if !protocol.is_empty() {
+                form.push(p("Protocol", protocol));
+                form.push(p("Port", "80"));
+            }
+            if !target_type.is_empty() {
+                form.push(p("TargetType", target_type));
+            }
+            if let Some(vpc) = vpc {
+                form.push(p("VpcId", vpc));
+            }
+            let reply = call(&router, &form).await;
+
+            if !needs_vpc || *named {
+                assert_eq!(
+                    reply.status, 200,
+                    "case {case:?}: expected the create to be served, got {} body {}",
+                    reply.status, reply.body
+                );
+                continue;
+            }
+            assert_eq!(
+                refusal(&reply),
+                (
+                    400,
+                    VALIDATION_ERROR.to_string(),
+                    NO_VPC_SPECIFIED.to_string()
+                ),
+                "case {case:?}: expected 400 {VALIDATION_ERROR} {NO_VPC_SPECIFIED:?}, got {}",
+                reply.body
+            );
+            // A refused create stores nothing: the name is reported by nothing.
+            let mut form = action("DescribeTargetGroups");
+            form.push(p("Names.member.1", &name));
+            let described = call(&router, &form).await;
+            assert_eq!(
+                (described.status, described.error_code().as_str()),
+                (400, "TargetGroupNotFound"),
+                "case {case:?}: a refused create must store nothing, got {} body {}",
+                described.status,
+                described.body
+            );
+        }
+    }
+}

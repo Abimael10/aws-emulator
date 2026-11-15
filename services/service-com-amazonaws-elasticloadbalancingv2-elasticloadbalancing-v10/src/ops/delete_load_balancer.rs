@@ -151,14 +151,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::scaffolded::Scaffolded::not_implemented("DeleteLoadBalancer")
         })?;
 
+        // The FORM of the ARN is judged BEFORE the store is read: a value that is not an
+        // ARN this API could have minted for the Region the request addresses names no
+        // load balancer that could exist, so it is the request that has to be fixed rather
+        // than a delete that found nothing ([`crate::state::identifier_syntax`]).
+        crate::state::check_resource_arn(
+            crate::state::ArnKind::LoadBalancer,
+            &input.load_balancer_arn,
+            &crate::state::request_region(ctx),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
         // "You can't delete a load balancer if deletion protection is enabled": the
         // refusal is answered before anything is removed, so a protected load balancer
         // and its listeners are left exactly as they were.
         //
-        // The store's lock lives in this block and is released with it, because what
-        // follows reads another service (the EC2-owned Availability Zone IDs) and nothing
-        // holds this store while it does.
-        let registration = {
+        // The store's lock lives in this block and is released with it, and the ONE store
+        // of another service it is held across is the shared certificate directory, whose
+        // module fixes the single order every service takes the two in — this store first,
+        // the directory under it
+        // ([`crate::state::certificate_consumers`]) — so no peer can invert it. Everything
+        // that reaches ANOTHER service's own store — the account's EC2 inventory below,
+        // and the Amazon Application Recovery Controller registry past the block — is
+        // called with this lock released, so nothing holds this store while a peer's is
+        // taken.
+        let (registration, network_interface_ids) = {
             let mut guard = state.lock();
             if guard
                 .load_balancers
@@ -197,7 +214,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|load_balancer| load_balancer.network_interface_ids.clone())
                 .unwrap_or_default();
             guard.remove_load_balancer(&input.load_balancer_arn);
-            crate::state::release_load_balancer_interfaces(&*self.engine, &network_interface_ids);
             // A load balancer that is gone presents no certificate, so every reference its
             // listeners held is given up — the service holding those certificates reads
             // that from the shared directory, and until the teardown falls due it still
@@ -210,8 +226,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             // And a load balancer that is gone is no managed resource of ARC, whatever its
             // zonal-shift integration was set to.
-            registration
+            (registration, network_interface_ids)
         };
+        // The interfaces the record held, handed back with this store's lock released: the
+        // inventory they live in is EC2's own store.
+        crate::state::release_load_balancer_interfaces(&*self.engine, &network_interface_ids);
         // A load balancer that is gone checks no target group, so the host-count series of
         // every pair it was routing closes here ([`crate::state::host_counts`]).
         crate::state::drive_host_count_metrics(&self.engine);

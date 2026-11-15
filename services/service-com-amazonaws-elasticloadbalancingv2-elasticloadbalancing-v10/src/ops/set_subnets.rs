@@ -209,6 +209,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx);
 
+        // The FORM of the ARN is judged BEFORE the store is read: a value that is not an
+        // ARN this API could have minted for the Region the request addresses names no
+        // load balancer that could exist, so it is the request that has to be fixed rather
+        // than a load balancer that is missing ([`crate::state::identifier_syntax`]).
+        crate::state::check_resource_arn(
+            crate::state::ArnKind::LoadBalancer,
+            &input.load_balancer_arn,
+            &region,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
         // The model: "You must specify either subnets or subnet mappings" — and the
         // create's own documentation adds "but not both". Read from the request alone, so
         // it is checked before anything is looked up.

@@ -144,12 +144,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // Only reachable on an engine that is not the shared `InMemoryEngine`,
             // which this service has no store on — so nothing is implemented for it.
             crate::scaffolded::Scaffolded::not_implemented("DescribeListeners")
         })?;
+        let region = crate::state::request_region(ctx);
 
         let guard = state.lock();
 
@@ -177,6 +177,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 selected
             } else if let Some(load_balancer_arn) = input.load_balancer_arn.as_ref() {
+                // The FORM of the ARN is judged before the store is read, exactly as the
+                // listener ARNs above are: a value that is not an ARN this API could have
+                // minted for the Region the request addresses names no load balancer that
+                // could exist ([`crate::state::identifier_syntax`]).
+                crate::state::check_resource_arn(
+                    crate::state::ArnKind::LoadBalancer,
+                    load_balancer_arn,
+                    &region,
+                )
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
                 let Some(load_balancer) = guard.load_balancers.get(load_balancer_arn) else {
                     return Err(DescribeListenersErrorModeled::LoadBalancerNotFoundException(
                         LoadBalancerNotFoundException {
@@ -206,9 +216,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::PagedCollection::Listeners,
         )
         .map_err(|_| {
-            crate::scaffolded::Scaffolded::validation(
-                "The marker is not valid: it must be a NextMarker from a previous page of this collection",
-            )
+            crate::scaffolded::Scaffolded::validation_error(crate::state::invalid_marker_message(
+                input.marker.as_deref(),
+            ))
         })?;
 
         Ok(DescribeListenersOutput {

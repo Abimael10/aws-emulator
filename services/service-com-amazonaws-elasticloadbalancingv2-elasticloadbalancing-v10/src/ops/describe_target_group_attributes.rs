@@ -134,12 +134,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // Only reachable on an engine that is not the shared `InMemoryEngine`,
             // which this service has no store on — so nothing is implemented for it.
             crate::scaffolded::Scaffolded::not_implemented("DescribeTargetGroupAttributes")
         })?;
+
+        // The FORM of the identifier is judged BEFORE the store is read: a value that is
+        // not an ARN this API could have minted for the Region the request addresses names
+        // no target group that could exist — a bare target group NAME where an ARN belongs
+        // is the common case — so it is the request that has to be fixed rather than a
+        // target group that is missing ([`crate::state::identifier_syntax`]).
+        let region = crate::state::request_region(ctx);
+        crate::state::check_arn_format(
+            crate::state::ArnKind::TargetGroup,
+            &input.target_group_arn,
+            &region,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
         let guard = state.lock();
         let Some(group) = guard.target_groups.get(&input.target_group_arn) else {

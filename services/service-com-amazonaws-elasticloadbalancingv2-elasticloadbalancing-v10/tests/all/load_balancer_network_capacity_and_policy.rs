@@ -222,9 +222,9 @@ fn load_balancer_operations() -> Vec<OperationRow> {
 /// envelope.
 ///
 /// Two dimensions: every such operation, against every shape of ARN that names no load
-/// balancer of this store — a well-formed one of each type code, one of another Region,
-/// one whose name and id nothing carries, and the ARN of a load balancer that WAS here
-/// and was deleted, which must read exactly like one that never existed.
+/// balancer of this store — a well-formed one of each type code, one whose name and id
+/// nothing carries, and the ARN of a load balancer that WAS here and was deleted, which
+/// must read exactly like one that never existed.
 #[tokio::test]
 async fn every_operation_naming_an_absent_load_balancer_answers_the_modelled_refusal() {
     let (router, _engine) = emulator();
@@ -254,11 +254,11 @@ async fn every_operation_naming_an_absent_load_balancer_answers_the_modelled_ref
             "a gateway load balancer ARN nothing carries",
             absent_load_balancer_arn(REGION, "gwy", "absent-gwy", "1111111111111111"),
         ),
-        (
-            "a well-formed ARN of another Region",
-            absent_load_balancer_arn("eu-west-1", "app", "elsewhere", "2222222222222222"),
-        ),
         ("the ARN of a deleted load balancer", deleted),
+        // Every row is an ARN of the form this API mints, in the Region the request
+        // addresses: the lookup is what it reaches. An ARN of another Region, or of
+        // another shape, is refused on the request's own identifier before any lookup —
+        // `all/identifier_arn_forms.rs` pins that across the operations that take one.
     ];
 
     for (arn_case, arn) in &absent {

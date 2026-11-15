@@ -889,8 +889,8 @@ async fn the_associations_of_a_trust_store_are_the_listeners_that_authenticate_a
         let refused = describe_associations(&emulator, &arn, &[p("Marker", marker)]).await;
         assert_eq!(
             (refused.status, refused.error_code().as_str()),
-            (400, "ValidationException"),
-            "case {case:?}: expected 400 ValidationException, got {} body {}",
+            (400, "ValidationError"),
+            "case {case:?}: expected 400 ValidationError, got {} body {}",
             refused.status,
             refused.body
         );

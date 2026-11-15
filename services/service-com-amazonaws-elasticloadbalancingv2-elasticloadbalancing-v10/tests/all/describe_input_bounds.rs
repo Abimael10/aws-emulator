@@ -5,13 +5,15 @@
 //!
 //! The rules these tables pin:
 //!
-//! * `DescribeLoadBalancers` describes at most 20 load balancers per call, counting the
-//!   ones the request asks about through `LoadBalancerArns` and `Names` together
+//! * `DescribeLoadBalancers` describes at most 20 load balancers per call
 //!   (`LoadBalancerArns`' own documentation: "You can specify up to 20 load balancers in
 //!   a single call" — `smithy_query(query="doc",shape="DescribeLoadBalancersInput",
 //!   member="LoadBalancerArns")`; the model declares no length constraint for either
 //!   list, so the bound is the service's own). Past it the answer is HTTP 400
-//!   `ValidationError` naming the limit and the count the request carried.
+//!   `ValidationError` naming the limit and the count the request carried. Its two
+//!   selectors — `LoadBalancerArns` and `Names` — state two different selections, so a
+//!   call carries at most one of them, and a call carrying both is HTTP 400
+//!   `ValidationError` on the pair.
 //! * `DescribeTargetGroups` describes at most 20 target groups per call, and its three
 //!   filters — `Names`, `TargetGroupArns` and `LoadBalancerArn` — select in three
 //!   different ways, so a call carries at most one of them. Either way the answer is
@@ -21,6 +23,16 @@
 //!   missing resource, and never with a report. An identifier nothing holds INSIDE the
 //!   bound still answers the modelled not-found, which is what the rows carrying one
 //!   absent identifier pin.
+//! * A `Marker` is an identifier this service MINTS, so a value it did not mint names no
+//!   position in any collection and is refused on the request: HTTP 400 `ValidationError`
+//!   quoting the marker. A marker is bound to the collection it was issued for.
+//! * Pagination walks a whole collection rather than a selection out of it, so
+//!   `DescribeLoadBalancers` refuses a call that both names the load balancers to report
+//!   and asks for a page of them.
+//! * A read that selects by NAME judges the name on its own form first: a value outside
+//!   the clauses the create enforces names no resource this API could have minted, so it
+//!   is HTTP 400 `ValidationError` stating the clause, while a well-formed name nothing
+//!   holds stays the modelled not-found.
 //!
 //! Every row differs along what those rules generalise over: which member carries the
 //! identifiers, how many it carries on each side of the bound, whether the identifiers
@@ -57,9 +69,21 @@ enum Expect {
     /// The request is outside the per-call bound; the refusal carries this count when the
     /// service's wording quotes one.
     PastBound(usize),
+    /// The request carries two selectors at once, which state two selections: refused on
+    /// the pair with this message, whatever the identifiers in them are.
+    Conflicting(&'static str),
     /// The request is well shaped, and one identifier in it resolves to nothing.
     NotFound,
 }
+
+/// The refusal `DescribeLoadBalancers` answers a call that selects by both of its members
+/// with.
+const LOAD_BALANCER_SELECTOR_CONFLICT: &str =
+    "Load balancer names and load balancer ARNs cannot be specified at the same time";
+
+/// The refusal `DescribeLoadBalancers` answers a call that both names the load balancers
+/// to report and asks for a page of them.
+const PAGINATION_CONFLICT: &str = "Pagination is not supported when specifying load balancers";
 
 /// One row: the case, the indices the request names by ARN, the indices it names by name,
 /// and what must come back.
@@ -124,6 +148,24 @@ fn ix(count: usize) -> Vec<usize> {
     (0..count).collect()
 }
 
+/// Assert a row that carries two selectors at once was refused on the PAIR: the
+/// `ValidationError` code and the service's wording for that rule.
+fn assert_conflict(case: &str, reply: &crate::provisioning_loop::Reply, conflict: &str) {
+    assert_eq!(
+        (reply.status, reply.error_code().as_str()),
+        (400, VALIDATION_ERROR),
+        "case {case:?}: expected 400 {VALIDATION_ERROR}, got {} body {}",
+        reply.status,
+        reply.body
+    );
+    let message = reply.text("Message").map(|text| unescaped(&text));
+    assert_eq!(
+        message.as_deref(),
+        Some(conflict),
+        "case {case:?}: expected the message {conflict:?}, got {message:?}"
+    );
+}
+
 /// The indices `from..to`, for a row that names a slice of the pool.
 fn span(from: usize, to: usize) -> Vec<usize> {
     (from..to).collect()
@@ -164,10 +206,16 @@ async fn describe_load_balancers_bounds_the_load_balancers_one_call_asks_about()
             Expect::Reports(PER_CALL),
         ),
         (
-            "ten ARNs and ten names, together at the bound",
+            "ten ARNs and ten names together, inside the bound",
             ix(10),
             span(10, PER_CALL),
-            Expect::Reports(PER_CALL),
+            Expect::Conflicting(LOAD_BALANCER_SELECTOR_CONFLICT),
+        ),
+        (
+            "eleven ARNs and ten names together, one past the bound",
+            ix(11),
+            span(11, POOL),
+            Expect::Conflicting(LOAD_BALANCER_SELECTOR_CONFLICT),
         ),
         (
             "twenty-one names that all exist, one past the bound",
@@ -179,12 +227,6 @@ async fn describe_load_balancers_bounds_the_load_balancers_one_call_asks_about()
             "twenty-one ARNs that all exist, one past the bound",
             ix(POOL),
             vec![],
-            Expect::PastBound(POOL),
-        ),
-        (
-            "eleven ARNs and ten names, together one past the bound",
-            ix(11),
-            span(11, POOL),
             Expect::PastBound(POOL),
         ),
         (
@@ -222,9 +264,14 @@ async fn describe_load_balancers_bounds_the_load_balancers_one_call_asks_about()
                 &name_at(&names, *index, "absent-lb"),
             ));
         }
-        // Every row asks for every load balancer it can report in one page, so the
-        // reported count is the whole selection rather than a page of it.
-        form.push(p("PageSize", "400"));
+        // Pagination walks the whole collection rather than a selection out of it, so a
+        // row that NAMES the load balancers it asks about must not also ask for a page of
+        // them (the pagination table below). `PageSize` therefore goes only on the row
+        // that selects nothing, where it is what makes the whole collection one page; a
+        // row that selects reports its whole selection anyway.
+        if arn_indices.is_empty() && name_indices.is_empty() {
+            form.push(p("PageSize", "400"));
+        }
         let reply = call(&router, &form).await;
 
         match expected {
@@ -268,6 +315,7 @@ async fn describe_load_balancers_bounds_the_load_balancers_one_call_asks_about()
                     reply.body
                 );
             }
+            Expect::Conflicting(conflict) => assert_conflict(case, &reply, conflict),
         }
     }
 }
@@ -397,6 +445,298 @@ async fn describe_target_groups_bounds_the_target_groups_one_call_asks_about() {
                     reply.body
                 );
             }
+            Expect::Conflicting(conflict) => assert_conflict(case, &reply, conflict),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_marker_no_read_issued_is_refused_as_an_invalid_marker_id() {
+    let (router, _engine) = emulator();
+
+    // Something to page through, so a read that is served has a position to resume from.
+    for index in 0..3 {
+        create_load_balancer(&router, &format!("marker-lb-{index}")).await;
+        crate::provisioning_loop::create_http_target_group(&router, &format!("marker-tg-{index}"))
+            .await;
+    }
+
+    // A `Marker` is an identifier this service MINTS: a value it did not mint names no
+    // position in any collection, so it is refused on the request — HTTP 400
+    // `ValidationError` quoting the marker — rather than answered with a page or an empty
+    // report. The rows differ along the FORM of the value: words, the ordinals a caller
+    // might compute for itself, a negative and a fractional one, and one far past the end.
+    let markers: [(&str, String); 7] = [
+        ("a word", "not-a-marker".to_string()),
+        ("an ordinal", "1".to_string()),
+        ("the first ordinal", "0".to_string()),
+        ("a negative ordinal", "-1".to_string()),
+        ("a fractional ordinal", "1.5".to_string()),
+        ("an ordinal past the end", "9999".to_string()),
+        ("an empty marker", String::new()),
+    ];
+    // (the read, the fields it needs beside the marker)
+    let reads: [(&str, Vec<(String, String)>); 5] = [
+        ("DescribeLoadBalancers", vec![]),
+        ("DescribeTargetGroups", vec![]),
+        ("DescribeSSLPolicies", vec![]),
+        ("DescribeAccountLimits", vec![]),
+        ("DescribeTrustStores", vec![]),
+    ];
+
+    for (read, fields) in &reads {
+        for (form_case, marker) in &markers {
+            let case = format!("{read} given {form_case}");
+            let mut form = action(read);
+            form.push(p("Marker", marker));
+            for field in fields {
+                form.push(field.clone());
+            }
+            let reply = call(&router, &form).await;
+            let expected = format!("Invalid Marker Id: {marker}");
+            let stated = reply.text("Message").map(|text| unescaped(&text));
+            assert_eq!(
+                (reply.status, reply.error_code(), stated.clone()),
+                (400, VALIDATION_ERROR.to_string(), Some(expected.clone())),
+                "case {case:?}: expected 400 {VALIDATION_ERROR} {expected:?}, got {} body {}",
+                reply.status,
+                reply.body
+            );
+        }
+    }
+
+    // A marker is bound to the COLLECTION it was issued for: the one the load balancers
+    // page left names no position among the target groups, and is refused in the same
+    // words — while the read that issued it resumes from it.
+    let mut form = action("DescribeLoadBalancers");
+    form.push(p("PageSize", "1"));
+    let first = call(&router, &form).await;
+    let issued = first
+        .text("NextMarker")
+        .unwrap_or_else(|| panic!("case paging the load balancers: no NextMarker in {}", first.body));
+
+    let mut form = action("DescribeTargetGroups");
+    form.push(p("Marker", &issued));
+    let elsewhere = call(&router, &form).await;
+    let expected = format!("Invalid Marker Id: {issued}");
+    let stated = elsewhere.text("Message").map(|text| unescaped(&text));
+    assert_eq!(
+        (elsewhere.status, elsewhere.error_code(), stated.clone()),
+        (400, VALIDATION_ERROR.to_string(), Some(expected.clone())),
+        "case another collection's marker: expected 400 {VALIDATION_ERROR} {expected:?}, got {} \
+         body {}",
+        elsewhere.status,
+        elsewhere.body
+    );
+
+    let mut form = action("DescribeLoadBalancers");
+    form.push(p("Marker", &issued));
+    form.push(p("PageSize", "1"));
+    let resumed = call(&router, &form).await;
+    assert_eq!(
+        (resumed.status, members(&resumed.body, "LoadBalancers").len()),
+        (200, 1),
+        "case the marker this read issued: expected the next page, got {} body {}",
+        resumed.status,
+        resumed.body
+    );
+}
+
+#[tokio::test]
+async fn describe_load_balancers_refuses_pagination_together_with_a_selection() {
+    let (router, _engine) = emulator();
+
+    let mut arns = Vec::new();
+    let mut names = Vec::new();
+    for index in 0..3 {
+        let name = format!("paging-lb-{index}");
+        arns.push(create_load_balancer(&router, &name).await);
+        names.push(name);
+    }
+
+    // (case, the fields beside the pagination members, whether the row carries a
+    // selection)
+    //
+    // The rows cross the two selectors — by ARN and by name, with identifiers that exist
+    // and identifiers that do not — with each pagination member on its own and the two
+    // together: what decides the refusal is that the request both names load balancers and
+    // asks for a page, not which member it named them in or whether they are there.
+    let selections: Vec<(&str, Vec<(String, String)>)> = vec![
+        (
+            "no selection",
+            vec![],
+        ),
+        (
+            "one ARN that exists",
+            vec![p("LoadBalancerArns.member.1", &arns[0])],
+        ),
+        (
+            "two ARNs that exist",
+            vec![
+                p("LoadBalancerArns.member.1", &arns[0]),
+                p("LoadBalancerArns.member.2", &arns[1]),
+            ],
+        ),
+        (
+            "one ARN nothing holds",
+            vec![p("LoadBalancerArns.member.1", &absent_load_balancer_arn(9))],
+        ),
+        (
+            "one name that exists",
+            vec![p("Names.member.1", &names[0])],
+        ),
+        ("one name nothing holds", vec![p("Names.member.1", "absent-lb-9")]),
+    ];
+    let pagination: Vec<(&str, Vec<(String, String)>)> = vec![
+        ("no pagination", vec![]),
+        ("a page size", vec![p("PageSize", "1")]),
+        ("a marker", vec![p("Marker", "any-marker")]),
+        (
+            "a page size and a marker",
+            vec![p("PageSize", "1"), p("Marker", "any-marker")],
+        ),
+    ];
+
+    for (selection_case, selection) in &selections {
+        for (pagination_case, paging) in &pagination {
+            let case = format!("{selection_case} with {pagination_case}");
+            let mut form = action("DescribeLoadBalancers");
+            for field in selection.iter().chain(paging.iter()) {
+                form.push(field.clone());
+            }
+            let reply = call(&router, &form).await;
+            if selection.is_empty() || paging.is_empty() {
+                // One of the two alone is a request this API accepts — which is what makes
+                // the refusal above about the COMBINATION. A marker nothing issued is its
+                // own refusal, so the rows that carry one are not asserted to be served
+                // here (`a_marker_no_read_issued_is_refused_as_an_invalid_marker_id`).
+                assert_ne!(
+                    reply.text("Message").map(|text| unescaped(&text)).as_deref(),
+                    Some(PAGINATION_CONFLICT),
+                    "case {case:?}: one of the two alone must not earn the combination's \
+                     refusal, got {}",
+                    reply.body
+                );
+                continue;
+            }
+            assert_eq!(
+                (
+                    reply.status,
+                    reply.error_code(),
+                    reply.text("Message").map(|text| unescaped(&text))
+                ),
+                (
+                    400,
+                    VALIDATION_ERROR.to_string(),
+                    Some(PAGINATION_CONFLICT.to_string())
+                ),
+                "case {case:?}: expected 400 {VALIDATION_ERROR} {PAGINATION_CONFLICT:?}, got {} \
+                 body {}",
+                reply.status,
+                reply.body
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_name_no_resource_could_carry_is_refused_on_the_request() {
+    let (router, _engine) = emulator();
+
+    // A name outside the documented form names no resource this API could ever have
+    // minted, so a read that SELECTS by name refuses it on the request — HTTP 400
+    // `ValidationError` stating the clause the value broke — rather than reporting it as a
+    // name nothing holds. The clauses are the ones the creates enforce, and the rows walk
+    // them: the length, the character set, a leading and a trailing hyphen, the prefix a
+    // load balancer name may not begin with, and the DNS name a caller reaches for when it
+    // has no ARN.
+    //
+    // (case, the name, the clause the refusal must state — `None` for a name that is well
+    // formed and simply absent)
+    let thirty_three = "a".repeat(33);
+    let names: Vec<(&str, String, Option<&str>)> = vec![
+        ("a well-formed name nothing holds", "absent-name".to_string(), None),
+        (
+            "a name at the published maximum nothing holds",
+            "a".repeat(32),
+            None,
+        ),
+        (
+            "a name one past the published maximum",
+            thirty_three.clone(),
+            Some("cannot be longer than '32' characters"),
+        ),
+        (
+            "the published DNS name rather than the name",
+            format!("probe-lb-0123456789abcdef.{REGION}.elb.amazonaws.com"),
+            Some("cannot be longer than '32' characters"),
+        ),
+        (
+            "a name carrying an underscore",
+            "probe_lb".to_string(),
+            Some("can only contain characters that are alphanumeric characters or hyphens"),
+        ),
+        (
+            "a name carrying a dot",
+            "probe.lb".to_string(),
+            Some("can only contain characters that are alphanumeric characters or hyphens"),
+        ),
+        (
+            "a name beginning with a hyphen",
+            "-probe-lb".to_string(),
+            Some("cannot begin or end with a hyphen"),
+        ),
+        (
+            "a name ending with a hyphen",
+            "probe-lb-".to_string(),
+            Some("cannot begin or end with a hyphen"),
+        ),
+    ];
+
+    // (the read, the member its names travel in, the subject its clauses name, the
+    // modelled code a well-formed absent name earns)
+    let reads: [(&str, &str, &str, &str); 2] = [
+        (
+            "DescribeLoadBalancers",
+            "Names.member.1",
+            "The load balancer name",
+            LOAD_BALANCER_NOT_FOUND,
+        ),
+        (
+            "DescribeTargetGroups",
+            "Names.member.1",
+            "The target group name",
+            TARGET_GROUP_NOT_FOUND,
+        ),
+    ];
+
+    for (read, member, subject, not_found) in &reads {
+        for (name_case, name, clause) in &names {
+            let case = format!("{read} given {name_case}");
+            let mut form = action(read);
+            form.push(p(member, name));
+            let reply = call(&router, &form).await;
+            let Some(clause) = clause else {
+                // A name this API could have minted, that nothing holds: the modelled
+                // not-found, which is what makes the refusals above about the REQUEST.
+                assert_eq!(
+                    (reply.status, reply.error_code().as_str()),
+                    (400, *not_found),
+                    "case {case:?}: expected 400 {not_found}, got {} body {}",
+                    reply.status,
+                    reply.body
+                );
+                continue;
+            };
+            let expected = format!("{subject} '{name}' {clause}");
+            let stated = reply.text("Message").map(|text| unescaped(&text));
+            assert_eq!(
+                (reply.status, reply.error_code(), stated.clone()),
+                (400, VALIDATION_ERROR.to_string(), Some(expected.clone())),
+                "case {case:?}: expected 400 {VALIDATION_ERROR} {expected:?}, got {} body {}",
+                reply.status,
+                reply.body
+            );
         }
     }
 }

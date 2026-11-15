@@ -251,6 +251,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .unwrap_or_else(|| "instance".to_string());
         let lambda = target_type == "lambda";
+        // `VpcId` is optional in the model and REQUIRED for every target type whose
+        // targets live in a VPC — an `instance`, `ip` or `alb` target is addressed inside
+        // one, while "if the target type is lambda, this parameter does not apply". The
+        // model cannot express the dependency, so the handler refuses the request before
+        // anything is written, with the fixed sentence the service states (recorded
+        // behaviour: it names neither the member nor the target type).
+        if !lambda && input.vpc_id.as_deref().unwrap_or_default().is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                NO_VPC_SPECIFIED,
+            ));
+        }
+        // `Port` is bracketed the same way — "the port on which the targets receive
+        // traffic … not used if the target is a Lambda function" — and is required
+        // wherever it applies, because a target group whose targets receive traffic has to
+        // state on which port. Recorded behaviour again, and fixed text again.
+        if !lambda && input.port.is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                NO_PORT_SPECIFIED,
+            ));
+        }
         // The model: "If the target type is instance, ip, or alb, health checks are
         // always enabled and can't be disabled." The model cannot express that, so
         // the handler refuses the combination rather than discarding the input.
@@ -399,33 +419,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Refuse a `Name` the service does not accept, with the awsQuery `ValidationError`
 /// code and a message built from the request: the value, and the rule it broke.
 ///
-/// Every rule is a clause of the model's own `Name` documentation (see this file's
-/// header): at most [`crate::state::TARGET_GROUP_NAME_MAX_LENGTH`] characters, only
-/// alphanumeric characters or hyphens, and neither end a hyphen.
+/// The clauses are the model's own `Name` documentation, read in
+/// [`crate::state::check_target_group_name`] — the one place the rule lives, so the
+/// create that takes a name, the read that selects by one and the ARN form that carries
+/// one agree on what a target group name is.
 fn validate_name(name: &str) -> Result<(), CreateTargetGroupError> {
-    let refuse = |detail: String| Err(crate::scaffolded::Scaffolded::validation_error(detail));
-    if name.is_empty() {
-        return refuse("Target group name cannot be empty".to_string());
-    }
-    if name.chars().count() > crate::state::TARGET_GROUP_NAME_MAX_LENGTH {
-        return refuse(format!(
-            "Target group name '{name}' cannot be longer than '{}' characters",
-            crate::state::TARGET_GROUP_NAME_MAX_LENGTH
-        ));
-    }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return refuse(format!(
-            "Target group name '{name}' can only contain characters that are alphanumeric \
-             characters or hyphens"
-        ));
-    }
-    if name.starts_with('-') || name.ends_with('-') {
-        return refuse(format!(
-            "Target group name '{name}' cannot begin or end with a hyphen"
-        ));
-    }
-    Ok(())
+    crate::state::check_target_group_name(name)
+        .map_err(crate::scaffolded::Scaffolded::validation_error)
 }
+
+/// The refusal a create that names no VPC for a target type whose targets live in one
+/// earns.
+///
+/// Recorded behaviour, and WHOLLY fixed text: it names neither the member nor the target
+/// type, so nothing of the request appears in it.
+const NO_VPC_SPECIFIED: &str = "A VPC ID must be specified";
+
+/// The refusal a create that states no port for a target type whose targets receive
+/// traffic on one earns, on the same footing as [`NO_VPC_SPECIFIED`]: recorded behaviour,
+/// wholly fixed text.
+const NO_PORT_SPECIFIED: &str = "A port must be specified";
 
 /// Refuse a `HealthCheckPort` whose VALUE is no health-check port, as
 /// [`crate::state::check_health_check_port`] states the rule: the member is a bare

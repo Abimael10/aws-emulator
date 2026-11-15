@@ -281,8 +281,8 @@ async fn every_trust_store_is_reported_and_paged_in_one_stable_order() {
         let refused = describe(&router, &[p("Marker", marker)]).await;
         assert_eq!(
             (refused.status, refused.error_code().as_str()),
-            (400, "ValidationException"),
-            "case {case:?}: expected 400 ValidationException, got {} {}",
+            (400, "ValidationError"),
+            "case {case:?}: expected 400 ValidationError, got {} {}",
             refused.status,
             refused.body
         );

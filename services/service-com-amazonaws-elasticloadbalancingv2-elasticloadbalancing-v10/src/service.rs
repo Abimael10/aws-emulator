@@ -105,6 +105,9 @@ pub mod listener_socket;
 
 pub mod management_events;
 
+/// The ORDER this service states an enum's value set in when it refuses a value outside
+/// it, which is the service's own rather than the model's declaration order.
+mod enum_value_sets;
 use service_common::audited_operation::AuditedDefinition;
 use service_common::query_error_envelope::{
     RequestIdEnvelopeDefinition, RequestIdEnvelopeOperation,
@@ -282,13 +285,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // closes that.
         //
         // The MESSAGE is the framework's own envelope over the same violations, so the
-        // sentence a caller reads is unchanged and the two layers cannot drift: only the
-        // code is restated. `None` when there is nothing to state, and for an
-        // authentication refusal, which keeps the framework's 403 and its wording.
+        // sentence a caller reads is unchanged and the two layers cannot drift — with one
+        // exception, which is a property of this service rather than of the model: the
+        // ORDER an enum's value set is listed in ([`enum_value_sets`]). That order is
+        // restated on the VIOLATION, so the clause and the envelope stay with the
+        // framework. `None` when there is nothing to state, and for an authentication
+        // refusal, which keeps the framework's 403 and its wording.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: crate::scaffolded::VALIDATION_ERROR.to_string(),
-                message: aws_smithy_schema_server::envelope(violations)?,
+                message: aws_smithy_schema_server::envelope(&enum_value_sets::in_stated_order(
+                    violations,
+                ))?,
             }),
             _ => None,
         }

@@ -291,8 +291,8 @@ async fn the_account_limits_catalogue_pages_in_one_stable_order() {
         .await;
         assert_eq!(
             (refused.status, refused.error_code().as_str()),
-            (400, "ValidationException"),
-            "case {case:?}: expected a 400 ValidationException, got {} body {}",
+            (400, "ValidationError"),
+            "case {case:?}: expected a 400 ValidationError, got {} body {}",
             refused.status,
             refused.body
         );

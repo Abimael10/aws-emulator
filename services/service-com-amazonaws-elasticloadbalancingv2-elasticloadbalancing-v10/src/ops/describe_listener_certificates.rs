@@ -180,9 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::PagedCollection::Certificates,
         )
         .map_err(|_| {
-            crate::scaffolded::Scaffolded::validation(
-                "The marker is not valid: it must be a NextMarker from a previous page of this collection",
-            )
+            crate::scaffolded::Scaffolded::validation_error(crate::state::invalid_marker_message(
+                input.marker.as_deref(),
+            ))
         })?;
 
         Ok(DescribeListenerCertificatesOutput {

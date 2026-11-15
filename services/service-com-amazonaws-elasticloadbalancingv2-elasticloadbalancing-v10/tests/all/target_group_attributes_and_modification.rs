@@ -1158,15 +1158,20 @@ async fn a_target_group_name_follows_the_documented_rule() {
             message.contains(&name),
             "case {case:?}: the refusal must name the value it rejected, got {message:?}"
         );
-        // A refused create stores nothing.
+        // A refused create stores nothing: a read by that name reports no target group —
+        // either because nothing holds the name (`TargetGroupNotFound`) or because the
+        // read refuses the name on its own form, exactly as the create just did.
         let mut form = action("DescribeTargetGroups");
         form.push(p("Names.member.1", &name));
         let described = call(&router, &form).await;
         assert_eq!(
-            (described.status, described.error_code().as_str()),
-            (400, "TargetGroupNotFound"),
+            described.status, 400,
             "case {case:?}: a refused create must store nothing, got {} body {}",
-            described.status,
+            described.status, described.body
+        );
+        assert!(
+            !described.body.contains("<TargetGroups"),
+            "case {case:?}: a refused create must store nothing, got {}",
             described.body
         );
     }

@@ -41,10 +41,14 @@ mod certificate_resolution_and_redirect_protocol;
 mod declared_action_set;
 #[path = "all/describe_input_bounds.rs"]
 mod describe_input_bounds;
+#[path = "all/enum_value_set_order.rs"]
+mod enum_value_set_order;
 #[path = "all/forward_action_config_and_mutual_authentication.rs"]
 mod forward_action_config_and_mutual_authentication;
 #[path = "all/host_count_health_checks.rs"]
 mod host_count_health_checks;
+#[path = "all/identifier_arn_forms.rs"]
+mod identifier_arn_forms;
 #[path = "all/input_rejection_classes.rs"]
 mod input_rejection_classes;
 #[path = "all/ip_targets.rs"]

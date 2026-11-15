@@ -169,6 +169,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = std::time::SystemTime::now();
 
+        // The FORM of the ARN is judged BEFORE the store is read: a value that is not an
+        // ARN this API could have minted for the Region the request addresses names no
+        // target group that could exist, so it is the request that has to be fixed rather
+        // than a target group that is missing ([`crate::state::identifier_syntax`]) — the
+        // same reading the target IDS below are judged under.
+        crate::state::check_resource_arn(
+            crate::state::ArnKind::TargetGroup,
+            &input.target_group_arn,
+            &region,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
         // What the group is, read and released before anything is resolved against
         // another service: the store's guard is never held across a call out of this
         // handler.

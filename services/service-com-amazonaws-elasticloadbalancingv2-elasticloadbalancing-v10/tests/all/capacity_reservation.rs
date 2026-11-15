@@ -403,10 +403,11 @@ async fn the_entitlement_is_settled_before_the_load_balancer_is_looked_up() {
             "a network load balancer ARN nothing carries",
             absent_load_balancer_arn(REGION, "net", "absent-capacity-net", "1111111111111111"),
         ),
-        (
-            "a well-formed ARN of another Region",
-            absent_load_balancer_arn("eu-west-1", "app", "elsewhere", "2222222222222222"),
-        ),
+        // Every row here is an ARN of the form this API mints, in the Region the request
+        // addresses, so what it reaches is the LOOKUP. An ARN of another Region, or of
+        // another shape, never gets that far — it is refused on the request's own
+        // identifier, which `all/identifier_arn_forms.rs` pins across the operations that
+        // take one.
     ] {
         targets.push((case.to_string(), arn, false));
     }

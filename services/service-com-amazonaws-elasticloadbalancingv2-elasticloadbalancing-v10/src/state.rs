@@ -52,7 +52,7 @@ mod vpc_topology;
 /// it hands back.
 pub mod pagination;
 
-pub use pagination::{paginate, PageError, PageTokenKey, PagedCollection};
+pub use pagination::{invalid_marker_message, paginate, PageError, PageTokenKey, PagedCollection};
 
 /// What a redirect action's target URI is read as, and what makes one an action this
 /// service refuses.
@@ -131,6 +131,17 @@ pub mod load_balancer_endpoint;
 
 pub use load_balancer_endpoint::{
     certificate_key_material_directory, open_load_balancer_endpoint, LoadBalancerEndpoint,
+};
+
+/// The FORM a caller-supplied identifier carries — a target id, and the ARN of a resource
+/// this API addresses — read before anything is looked up.
+pub mod identifier_syntax;
+
+pub use identifier_syntax::{
+    arn_format_message, check_arn_format, check_resource_arn, check_target_group_name,
+    check_target_group_name_as, check_target_id, invalid_arn_message,
+    invalid_instance_id_message, invalid_instance_targets_message, is_resource_arn, ArnKind,
+    SELECTED_TARGET_GROUP_NAME_SUBJECT, TARGET_GROUP_NAME_SUBJECT,
 };
 
 use crate::ops::types::{
@@ -269,83 +280,6 @@ pub fn targets_per_target_group(group: &TargetGroupRecord) -> usize {
         LoadBalancerFamily::Network => TARGETS_PER_NETWORK_TARGET_GROUP,
         LoadBalancerFamily::Gateway => TARGETS_PER_GATEWAY_TARGET_GROUP,
     }
-}
-
-/// The prefix every EC2 instance id carries, which is what a target of an `instance`
-/// target group is written as.
-const INSTANCE_ID_PREFIX: &str = "i-";
-
-/// The lengths an EC2 instance id's hexadecimal part has: AWS writes an instance id as
-/// `i-` and either 8 or 17 hexadecimal characters, and a value of any other length is no
-/// instance id at all.
-const INSTANCE_ID_DIGITS: [usize; 2] = [8, 17];
-
-/// A Lambda function's ARN, which is what a target of a `lambda` target group is written
-/// as (`TargetDescription$Id`: "if the target type is lambda, specify the ARN of the
-/// Lambda function").
-const LAMBDA_FUNCTION: ::service_common::arn::Requirement = ::service_common::arn::Requirement {
-    vendor: "lambda",
-    resource_type: Some("function"),
-    label: "a Lambda function ARN",
-};
-
-/// An Application Load Balancer's ARN, which is what a target of an `alb` target group is
-/// written as (`TargetDescription$Id`: "if the target type is alb, specify the ARN of the
-/// Application Load Balancer target").
-const LOAD_BALANCER_TARGET: ::service_common::arn::Requirement =
-    ::service_common::arn::Requirement {
-        vendor: SERVICE_NAMESPACE,
-        resource_type: Some("loadbalancer"),
-        label: "an Application Load Balancer ARN",
-    };
-
-/// Whether `id` is written the way a target of a `target_type` target group is written,
-/// and — when it is not — the rule it broke.
-///
-/// What a target id NAMES depends on the group's target type, and `TargetDescription$Id`
-/// states the form for each: "if the target type of the target group is instance, specify
-/// an instance ID. If the target type is ip, specify an IP address. If the target type is
-/// lambda, specify the ARN of the Lambda function. If the target type is alb, specify the
-/// ARN of the Application Load Balancer target." A value of none of those forms names no
-/// target of ANY account — it is the request that has to be fixed rather than a target the
-/// service could not find — so the operation that carries it refuses with this service's
-/// `ValidationError`, before anything is resolved against the service that owns the
-/// target.
-///
-/// An `ip` target's form is read by [`network::parse_ip_target`], which answers the
-/// address itself, so it is not restated here; the model puts no form on an id this
-/// service does not resolve at all.
-pub fn check_target_id(target_type: &str, id: &str) -> Result<(), String> {
-    let refuse = |form: &str| Err(format!("'{id}' in Targets is not {form}"));
-    match target_type {
-        "instance" => {
-            let digits = id.strip_prefix(INSTANCE_ID_PREFIX).unwrap_or_default();
-            if !INSTANCE_ID_DIGITS.contains(&digits.len())
-                || !digits
-                    .chars()
-                    .all(|digit| digit.is_ascii_digit() || ('a'..='f').contains(&digit))
-            {
-                return refuse("an instance ID");
-            }
-            Ok(())
-        }
-        "lambda" if !LAMBDA_FUNCTION.admits(id) => refuse(LAMBDA_FUNCTION.label),
-        "alb" if !LOAD_BALANCER_TARGET.admits(id) => refuse(LOAD_BALANCER_TARGET.label),
-        _ => Ok(()),
-    }
-}
-
-/// The message a registration naming instance ids EC2 holds no instance for is refused
-/// with: the ids it could not resolve, each quoted, in the order the request named them.
-///
-/// Elastic Load Balancing words this refusal about the TARGETS of the request — the ids are
-/// what the caller corrects — and states nothing about the target group or the account.
-pub fn invalid_instance_targets_message<'a>(ids: impl IntoIterator<Item = &'a str>) -> String {
-    let quoted: Vec<String> = ids.into_iter().map(|id| format!("'{id}'")).collect();
-    format!(
-        "The following targets are not valid instances: {}",
-        quoted.join(", ")
-    )
 }
 
 /// How many tags one Elastic Load Balancing resource carries before a tag write refuses
@@ -910,6 +844,26 @@ pub fn is_load_balancer_name(name: &str) -> bool {
     check_load_balancer_name(name).is_ok()
 }
 
+/// How a refusal names the subject of a load balancer NAME clause.
+///
+/// Elastic Load Balancing states the same clauses with two subjects, and which one it uses
+/// belongs to the operation: the create that takes a `Name` states `Load balancer name
+/// '<value>' …`, while a read that SELECTS by name states `The load balancer name
+/// '<value>' …`. Both are recorded behaviour, so the clause bodies live in one place
+/// ([`check_load_balancer_name_as`]) and only the subject differs.
+pub const LOAD_BALANCER_NAME_SUBJECT: &str = "Load balancer name";
+
+/// The subject a read that selects by NAME states the same clauses with — see
+/// [`LOAD_BALANCER_NAME_SUBJECT`].
+pub const SELECTED_LOAD_BALANCER_NAME_SUBJECT: &str = "The load balancer name";
+
+/// Whether `name` is a load balancer name this service accepts and — when it is not — the
+/// clause it broke, stated with the subject the create uses
+/// ([`LOAD_BALANCER_NAME_SUBJECT`]).
+pub fn check_load_balancer_name(name: &str) -> Result<(), String> {
+    check_load_balancer_name_as(LOAD_BALANCER_NAME_SUBJECT, name)
+}
+
 /// Whether `name` is a load balancer name this service accepts and — when it is not — the
 /// clause it broke, so a refusal can name the value and the rule the caller has to satisfy.
 ///
@@ -919,32 +873,36 @@ pub fn is_load_balancer_name(name: &str) -> bool {
 /// begin with \"internal-\"." Uniqueness is the only one that needs the store, so it is
 /// the create's own (a name already taken is `DuplicateLoadBalancerName`); the rest are
 /// read off the value alone, which is why they are stated here once for every operation
-/// that takes or parses a load balancer name.
-pub fn check_load_balancer_name(name: &str) -> Result<(), String> {
+/// that takes, selects by or parses a load balancer name. The clauses are read in the order
+/// AWS reports them: the LENGTH before the character set, which is what a value that breaks
+/// both is refused for.
+///
+/// `subject` is how the operation names the subject of the clause
+/// ([`LOAD_BALANCER_NAME_SUBJECT`]).
+pub fn check_load_balancer_name_as(subject: &str, name: &str) -> Result<(), String> {
     if name.is_empty() {
-        return Err("Load balancer name cannot be empty".to_string());
+        return Err(format!("{subject} cannot be empty"));
     }
     if name.chars().count() > LOAD_BALANCER_NAME_MAX_LENGTH {
         return Err(format!(
-            "Load balancer name '{name}' cannot be longer than '{LOAD_BALANCER_NAME_MAX_LENGTH}' \
+            "{subject} '{name}' cannot be longer than '{LOAD_BALANCER_NAME_MAX_LENGTH}' \
              characters"
         ));
     }
     if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(format!(
-            "Load balancer name '{name}' can only contain characters that are alphanumeric \
+            "{subject} '{name}' can only contain characters that are alphanumeric \
              characters or hyphens"
         ));
     }
     if name.starts_with('-') || name.ends_with('-') {
         return Err(format!(
-            "Load balancer name '{name}' cannot begin or end with a hyphen"
+            "{subject} '{name}' cannot begin or end with a hyphen"
         ));
     }
     if name.starts_with(RESERVED_LOAD_BALANCER_NAME_PREFIX) {
         return Err(format!(
-            "Load balancer name '{name}' cannot begin with \
-             '{RESERVED_LOAD_BALANCER_NAME_PREFIX}'"
+            "{subject} '{name}' cannot begin with '{RESERVED_LOAD_BALANCER_NAME_PREFIX}'"
         ));
     }
     Ok(())

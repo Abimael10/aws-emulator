@@ -8,9 +8,13 @@
 //! operation's `@paginated(inputToken: Marker, outputToken: NextMarker, items:
 //! LoadBalancers)` trait declares.
 //!
-//! A selector naming more load balancers than one call may describe
-//! ([`LOAD_BALANCERS_PER_CALL`]) is refused on the request's own shape, before any
-//! lookup: a bad request is never reported as a missing resource.
+//! The request's own shape is judged BEFORE any lookup, so a bad request is never
+//! reported as a missing resource: a call that selects by both members at once, one that
+//! both selects and paginates, one naming more load balancers than one call may describe
+//! ([`LOAD_BALANCERS_PER_CALL`]), and one whose selector carries a value that is no
+//! identifier of a load balancer this API could have minted — an ARN of another Region,
+//! vendor or resource type, or a name outside the documented form
+//! ([`crate::state::identifier_syntax`]) — are all refused on the request.
 //!
 //! It reports; the only state it writes is the move out of `provisioning` the clock
 //! already made due (see [`crate::state::ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State::settle`]).
@@ -86,6 +90,26 @@ use super::types::*;
 /// the store happens to hold.
 const LOAD_BALANCERS_PER_CALL: usize = 20;
 
+/// The refusal a call that selects by BOTH members earns.
+///
+/// `LoadBalancerArns` and `Names` each state which load balancers to report, so a request
+/// carrying both states two selections and the service accepts neither: recorded
+/// behaviour, worded as a verdict on the pair with nothing of the request in it — what the
+/// caller has to fix is which of the two members to keep. `DescribeTargetGroups` states
+/// the same rule over its own three selectors.
+const CONFLICTING_SELECTORS: &str =
+    "Load balancer names and load balancer ARNs cannot be specified at the same time";
+
+/// The refusal a call that both selects load balancers and paginates earns.
+///
+/// `Marker` and `PageSize` walk the collection this read reports; a call that states WHICH
+/// load balancers to report has already bounded what comes back
+/// ([`LOAD_BALANCERS_PER_CALL`]), so the two cannot be combined. Recorded behaviour,
+/// worded as a verdict on the combination with nothing of the request in it — the caller
+/// drops one of the two.
+const PAGINATION_WITH_A_SELECTION: &str =
+    "Pagination is not supported when specifying load balancers";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -154,21 +178,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // Only reachable on an engine that is not the shared `InMemoryEngine`,
             // which this service has no store on — so nothing is implemented for it.
             crate::scaffolded::Scaffolded::not_implemented("DescribeLoadBalancers")
         })?;
 
-        // The request's own shape is judged BEFORE anything is looked up: a selector past
-        // the per-call bound is a request this API never accepts, whatever the store
-        // holds, so it must not be answered as a missing resource. What the bound counts
-        // is the load balancers the call asks about — an ARN and a name each name one.
+        // The request's own shape is judged BEFORE anything is looked up, so a request
+        // this API never accepts cannot be answered as a missing resource.
+        //
+        // The two selectors select different sets, so a request may carry at most one of
+        // them: naming a load balancer by ARN and another by name states no one set of
+        // load balancers to report.
+        let selects_by_arn = input.load_balancer_arns.iter().flatten().next().is_some();
+        let selects_by_name = input.names.iter().flatten().next().is_some();
+        if selects_by_arn && selects_by_name {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                CONFLICTING_SELECTORS,
+            ));
+        }
+
+        // And pagination walks the whole collection rather than a selection out of it, so
+        // a request that both NAMES the load balancers to report and asks for a page of
+        // them is refused on the pair: what it asks for is a page of a set the caller
+        // already enumerated.
+        let paginating = input.marker.is_some() || input.page_size.is_some();
+        if (selects_by_arn || selects_by_name) && paginating {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                PAGINATION_WITH_A_SELECTION,
+            ));
+        }
+
+        // A selector past the per-call bound is a request this API never accepts, whatever
+        // the store holds, so it must not be answered as a missing resource either. What
+        // the bound counts is the load balancers the call asks about — an ARN and a name
+        // each name one.
         let asked_about = input.load_balancer_arns.iter().flatten().count()
             + input.names.iter().flatten().count();
         if asked_about > LOAD_BALANCERS_PER_CALL {
             return Err(too_many_load_balancers(asked_about));
+        }
+
+        // And so is the FORM of every ARN the selector carries, for the same reason: a
+        // value that is not an ARN this API could have minted for the Region the request
+        // addresses names no load balancer that could exist, which is a bad request rather
+        // than a load balancer that is missing
+        // ([`crate::state::identifier_syntax`]). Only a well-formed ARN reaches the store
+        // below, where an absent one is this operation's modelled `LoadBalancerNotFound`.
+        let region = crate::state::request_region(ctx);
+        for arn in input.load_balancer_arns.iter().flatten() {
+            crate::state::check_resource_arn(
+                crate::state::ArnKind::LoadBalancer,
+                arn,
+                &region,
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        }
+        // The same reading of the other selector: a value outside the documented form of a
+        // load balancer NAME names no load balancer this API could have minted either, so
+        // it is refused on the request rather than reported as a name nothing holds. The
+        // clauses are the ones the create states ([`crate::state::check_load_balancer_name_as`]),
+        // under the subject a read that selects by name states them with.
+        for name in input.names.iter().flatten() {
+            crate::state::check_load_balancer_name_as(
+                crate::state::SELECTED_LOAD_BALANCER_NAME_SUBJECT,
+                name,
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         }
 
         let now = std::time::SystemTime::now();
@@ -218,9 +294,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::PagedCollection::LoadBalancers,
         )
         .map_err(|_| {
-            crate::scaffolded::Scaffolded::validation(
-                "The marker is not valid: it must be a NextMarker from a previous page of this collection",
-            )
+            crate::scaffolded::Scaffolded::validation_error(crate::state::invalid_marker_message(
+                input.marker.as_deref(),
+            ))
         })?;
 
         Ok(DescribeLoadBalancersOutput {

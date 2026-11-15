@@ -195,8 +195,8 @@ async fn a_marker_that_is_not_a_position_in_the_catalogue_is_refused() {
         let refused = describe(&router, "DescribeSSLPolicies", &[p("Marker", &marker)]).await;
         assert_eq!(
             (refused.status, refused.error_code().as_str()),
-            (400, "ValidationException"),
-            "case {case:?}: expected 400 ValidationException, got {} body {}",
+            (400, "ValidationError"),
+            "case {case:?}: expected 400 ValidationError, got {} body {}",
             refused.status,
             refused.body
         );
@@ -237,8 +237,8 @@ async fn a_marker_that_is_not_a_position_in_the_catalogue_is_refused() {
     let refused = describe(&router, "DescribeSSLPolicies", &[p("Marker", &foreign)]).await;
     assert_eq!(
         (refused.status, refused.error_code().as_str()),
-        (400, "ValidationException"),
-        "case another store's marker: expected 400 ValidationException, got {} body {}",
+        (400, "ValidationError"),
+        "case another store's marker: expected 400 ValidationError, got {} body {}",
         refused.status,
         refused.body
     );

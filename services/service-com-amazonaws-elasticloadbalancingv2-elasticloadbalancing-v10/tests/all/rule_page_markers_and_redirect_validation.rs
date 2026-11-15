@@ -36,8 +36,9 @@ const VALIDATION_ERROR: &str = "ValidationError";
 /// `InvalidLoadBalancerActionException`, `awsQueryError` code `InvalidLoadBalancerAction`).
 const INVALID_ACTION: &str = "InvalidLoadBalancerAction";
 
-/// The code the framework answers a `Marker` this store did not issue with.
-const MARKER_REFUSAL_CODE: &str = "ValidationException";
+/// The code this service answers a `Marker` this store did not issue with: the one code
+/// it answers every value it cannot accept under.
+const MARKER_REFUSAL_CODE: &str = "ValidationError";
 
 /// The `<Message>` of a refusal, with the XML escapes the serializer writes read back —
 /// an error message quoting a member name or a reserved keyword carries apostrophes and

@@ -82,6 +82,18 @@ fn assert_refused(case: &str, reply: &Reply, code: &str, message: &str) {
     );
 }
 
+/// The sentence a target id outside the form its target type requires is refused with.
+///
+/// Elastic Load Balancing words the INSTANCE class as a verdict on the instance id it was
+/// handed (recorded behaviour), while the ARN-valued target types name the member and the
+/// form expected; `form` is the form a row names.
+fn wrong_form_message(target_type: &str, id: &str, form: &str) -> String {
+    match target_type {
+        "instance" => format!("Instance ID '{id}' is not valid"),
+        _ => format!("'{id}' in Targets is not {form}"),
+    }
+}
+
 /// Assert a refusal's status and code alone, for a class whose sentence another table
 /// pins.
 fn assert_refused_under(case: &str, reply: &Reply, code: &str) {
@@ -1001,7 +1013,7 @@ async fn a_target_id_not_written_for_its_target_type_is_refused() {
                 &case,
                 &reply,
                 VALIDATION_ERROR,
-                &format!("'{id}' in Targets is not {form}"),
+                &wrong_form_message(target_type, id, form),
             ),
             None => assert_eq!(
                 reply.status, 200,

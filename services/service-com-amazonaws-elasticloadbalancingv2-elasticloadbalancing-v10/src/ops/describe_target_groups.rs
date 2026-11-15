@@ -157,7 +157,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // Only reachable on an engine that is not the shared `InMemoryEngine`,
             // which this service has no store on — so nothing is implemented for it.
@@ -192,6 +191,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                 "You cannot describe more than '{TARGET_GROUPS_PER_CALL}' target groups at a time"
             )));
+        }
+        // And so is the FORM of every ARN a selector carries: a value that is not an ARN
+        // this API could have minted for the Region the request addresses names no
+        // resource that could exist, so it is a bad request rather than a resource that is
+        // missing ([`crate::state::identifier_syntax`]). Only a well-formed ARN reaches
+        // the store below, where an absent one is the modelled `LoadBalancerNotFound` /
+        // `TargetGroupNotFound`.
+        let region = crate::state::request_region(ctx);
+        if let Some(load_balancer_arn) = input.load_balancer_arn.as_ref() {
+            crate::state::check_resource_arn(
+                crate::state::ArnKind::LoadBalancer,
+                load_balancer_arn,
+                &region,
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        }
+        for arn in input.target_group_arns.iter().flatten() {
+            crate::state::check_resource_arn(
+                crate::state::ArnKind::TargetGroup,
+                arn,
+                &region,
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        }
+        // The same reading of the name selector: a value outside the documented form of a
+        // target group NAME names no target group this API could have minted either
+        // ([`crate::state::check_target_group_name_as`]).
+        for name in input.names.iter().flatten() {
+            crate::state::check_target_group_name_as(
+                crate::state::SELECTED_TARGET_GROUP_NAME_SUBJECT,
+                name,
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         }
 
         let guard = state.lock();
@@ -256,9 +288,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::PagedCollection::TargetGroups,
         )
         .map_err(|_| {
-            crate::scaffolded::Scaffolded::validation(
-                "The marker is not valid: it must be a NextMarker from a previous page of this collection",
-            )
+            crate::scaffolded::Scaffolded::validation_error(crate::state::invalid_marker_message(
+                input.marker.as_deref(),
+            ))
         })?;
 
         Ok(DescribeTargetGroupsOutput {

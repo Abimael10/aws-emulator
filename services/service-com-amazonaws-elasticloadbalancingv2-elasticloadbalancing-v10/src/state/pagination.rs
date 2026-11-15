@@ -73,6 +73,21 @@ impl PagedCollection {
 /// cannot run together.
 const CURSOR_SEPARATOR: char = '\u{1f}';
 
+/// The refusal every paginated read answers a `Marker` this store did not issue with.
+///
+/// Recorded behaviour, and the same refusal class as a malformed resource ARN: a marker is
+/// an identifier the service minted, so a value that is none of them is a bad REQUEST
+/// rather than an empty page or a missing resource. The code is this service's own
+/// `ValidationError` and the fixed text is `Invalid Marker Id: `, with the one variable
+/// part the marker the request carried — stated once here so no two paginated reads word
+/// it differently.
+///
+/// A request that carries no marker cannot earn this refusal (an absent marker starts at
+/// the first page), so `None` renders the empty value rather than inventing a word for it.
+pub fn invalid_marker_message(marker: Option<&str>) -> String {
+    format!("Invalid Marker Id: {}", marker.unwrap_or_default())
+}
+
 /// One page of `items`, plus the `NextMarker` that resumes after it.
 ///
 /// A read is handed everything the request selected and answers at most `page_size` of

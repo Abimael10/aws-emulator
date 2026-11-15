@@ -727,7 +727,12 @@ async fn a_not_found_refusal_names_the_identifiers_the_lookup_carried() {
                 p("Version", crate::provisioning_loop::VERSION),
                 p(
                     "LoadBalancerArns.member.1",
-                    "arn:aws:elasticloadbalancing:us-west-2:000000000000:loadbalancer/app/ghost/1",
+                    // Well formed — this service's vendor, the Region the request is
+                    // signed for, and the resource form it mints — so the read gets as
+                    // far as the store and answers for the load balancer it did not find
+                    // rather than for the shape of the ARN.
+                    "arn:aws:elasticloadbalancing:us-west-2:000000000000:loadbalancer/app/ghost\
+                     /0123456789abcdef",
                 ),
             ],
             "One or more load balancers not found".to_string(),
