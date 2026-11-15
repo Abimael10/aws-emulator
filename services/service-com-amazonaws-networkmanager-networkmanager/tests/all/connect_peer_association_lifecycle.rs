@@ -658,8 +658,8 @@ async fn a_request_the_store_cannot_serve_is_refused_and_changes_nothing() {
     let rows: Vec<(&str, String, Value, u16, &str)> = vec![
         (
             // The association is a new record stored under the global network the path
-            // addresses, so that parent reference is a field failure rather than the
-            // missing-resource answer the resources inside it get.
+            // addresses, so that parent reference is a field failure, judged before the
+            // resources inside it.
             "an unknown global network",
             unknown_network.to_string(),
             json!({ "ConnectPeerId": peer, "DeviceId": fixture.sited_device }),
@@ -674,11 +674,15 @@ async fn a_request_the_store_cannot_serve_is_refused_and_changes_nothing() {
             "ResourceNotFoundException",
         ),
         (
+            // A device or link the request names is a REFERENCE of the new record, judged
+            // as input: a member that names no object of this global network is a field
+            // failure on that member (`crate::unknown_object_reference_on_a_tie` owns that
+            // rule over the associates that share it).
             "an unknown device",
             fixture.global_network.clone(),
             json!({ "ConnectPeerId": peer, "DeviceId": unknown_device }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "an unknown link",
@@ -688,8 +692,8 @@ async fn a_request_the_store_cannot_serve_is_refused_and_changes_nothing() {
                 "DeviceId": fixture.sited_device,
                 "LinkId": unknown_link,
             }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "a link the device is not associated with",

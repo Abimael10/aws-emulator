@@ -602,8 +602,7 @@ async fn a_request_naming_nothing_stored_or_no_customer_gateway_is_refused_and_s
         );
     }
 
-    // A resource INSIDE the global network that names nothing stored is the missing-resource
-    // answer (404); the global network in the path is judged before them, and — the
+    // The global network in the path is judged before the resources inside it, and — the
     // association being a new record stored under it — as a field failure.
     let arn = plain_cgw_arn("0123456789abcdef1");
     let (status, refused) = associate(
@@ -626,11 +625,18 @@ async fn a_request_naming_nothing_stored_or_no_customer_gateway_is_refused_and_s
         json!([{ "Name": "globalNetworkId", "Message": "Global network not found." }]),
         "case associate under an unknown global network: expected one Fields entry naming globalNetworkId, got {refused}"
     );
-    let not_found = [
+    // A device or link the request names is a REFERENCE of the new record, judged as input
+    // exactly as the global network in the path is: a member naming no object of that
+    // global network is a field failure on that member
+    // (`crate::unknown_object_reference_on_a_tie` owns that rule over the associates that
+    // share it).
+    let refused_references = [
         (
             "unknown device",
             network.clone(),
             json!({ "CustomerGatewayArn": arn, "DeviceId": unknown_device }),
+            "deviceId",
+            "Device not found.",
         ),
         (
             "unknown link",
@@ -640,18 +646,25 @@ async fn a_request_naming_nothing_stored_or_no_customer_gateway_is_refused_and_s
                 "DeviceId": subject.device,
                 "LinkId": unknown_link,
             }),
+            "linkId",
+            "Link not found.",
         ),
     ];
-    for (case, target, body) in &not_found {
+    for (case, target, body, field, message) in &refused_references {
         let (status, refused) = associate(&emulator, target, body.clone()).await;
         assert_eq!(
-            status, 404,
-            "case associate {case}: expected 404, got {status} with {refused}"
+            status, 400,
+            "case associate {case}: expected 400, got {status} with {refused}"
         );
         assert_eq!(
             error_code(&refused),
-            "ResourceNotFoundException",
-            "case associate {case}: expected ResourceNotFoundException, got {refused}"
+            "ValidationException",
+            "case associate {case}: expected ValidationException, got {refused}"
+        );
+        assert_eq!(
+            refused["Fields"],
+            json!([{ "Name": field, "Message": message }]),
+            "case associate {case}: expected one Fields entry naming {field}, got {refused}"
         );
     }
     let (status, refused) = disassociate(&emulator, unknown_network, &arn).await;

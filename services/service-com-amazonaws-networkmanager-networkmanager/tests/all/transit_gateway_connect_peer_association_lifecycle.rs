@@ -812,20 +812,22 @@ async fn an_associate_that_cannot_hold_is_refused_and_stores_nothing() {
     let case = &rows[0];
     let absent_id = "device-0000000000000dead";
 
-    // A reference that names nothing, and one stored under another global network, are both
-    // the missing-resource answer; a link not associated with the named device, and a peer
-    // no registered gateway of this global network can carry, are both refused as 400.
+    // A device or link reference that names nothing, and one stored under another global
+    // network, are an input-validation failure on the member that carried it
+    // (`crate::unknown_object_reference_on_a_tie` owns that rule over the associates that
+    // share it); a link not associated with the named device, and a peer no registered
+    // gateway of this global network can carry, are both refused as 400 too.
     let refusals: Vec<(&str, u16, &str, Value)> = vec![
         (
             "an unknown device",
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
             json!({ "TransitGatewayConnectPeerArn": case.arn, "DeviceId": absent_id }),
         ),
         (
             "an unknown link",
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
             json!({
                 "TransitGatewayConnectPeerArn": case.arn,
                 "DeviceId": fixture.sited_device,

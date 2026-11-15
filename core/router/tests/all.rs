@@ -1821,3 +1821,18 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 //! and why it belongs to this cross-service target rather than to one service crate's
 //! own, is stated in that suite's own module doc, where it is read beside the test it
 //! explains; the notes earlier landings appended here live in `all/appended_notes.rs`.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted in its sorted position.
+//! Three rules this crate root lives by, each checked by a suite of its own
+//! * declare each suite exactly ONCE — this is one crate root, so a second `mod` for one
+//!   name is `E0428` and compiles neither copy;
+//!   only place one may stand: past the first item `//!` is `E0753` and compiles no suite of
+//!   this target;
+//! * the list below holds nothing but the pairs, sorted by name — so two branches landing at
+//!   once insert two lines in two places and have no prose to duplicate, re-word or mistype.
+//! A suite no `mod` here names compiles nowhere and its tests never run, and a suite left at
+//! the top level of `tests/` is a test target of its own, which the layout check refuses:
+//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of
+//! this file, and the `#[path]` is what points each declaration into `tests/all/`.
+//! service crate's own, belongs in that suite's own module doc, where it is read beside the
+//! test it explains; `all/appended_notes.rs` holds the notes successive landings had left
+//! here.

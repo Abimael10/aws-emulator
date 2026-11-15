@@ -408,25 +408,29 @@ async fn associate_link_refuses_a_pair_that_is_not_two_resources_of_one_site() {
             "ValidationException",
         ),
         (
+            // A device or link the request names is a REFERENCE of the new record, judged
+            // as input: a member naming no object of this global network is a field failure
+            // on that member (`crate::unknown_object_reference_on_a_tie` owns that rule over
+            // the operations that share it).
             "a device id that names nothing stored",
             network.as_str(),
             "device-0000000000000beef",
             link.as_str(),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "a link id that names nothing stored",
             network.as_str(),
             device.as_str(),
             "link-0000000000000beef",
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             // The association is a new record stored under the global network the path
-            // addresses, so that parent reference is a field failure rather than the
-            // missing-resource answer the resources inside it get.
+            // addresses, so that parent reference is a field failure too, and it is judged
+            // before the resources inside it.
             "an unknown global network",
             "global-network-0000000000000beef",
             device.as_str(),
@@ -439,16 +443,16 @@ async fn associate_link_refuses_a_pair_that_is_not_two_resources_of_one_site() {
             network.as_str(),
             foreign_device.as_str(),
             link.as_str(),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "a link stored under another global network",
             network.as_str(),
             device.as_str(),
             foreign_link.as_str(),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
     ];
 

@@ -4,10 +4,12 @@
 //! Associates a stored link with a stored device of the same global network and site, and
 //! reports the association as `PENDING` until the settle span the clock owes has passed:
 //! a global network the path addresses and the store does not hold is a field failure on
-//! `globalNetworkId` (`ValidationException`, 400), an unknown device or link inside it is
-//! a 404, a device and link that do not sit at the same site are refused with
-//! `ValidationException` (400), and re-associating a pair already associated reports the
-//! stored association unchanged. This is the ONLY file to touch for this operation.
+//! `globalNetworkId` (`ValidationException`, 400), a device or link inside it that names
+//! nothing stored is the same field failure on the member that carried it
+//! (`deviceId` / `linkId`, "Device not found." / "Link not found."), a device and link
+//! that do not sit at the same site are refused with `ValidationException` (400), and
+//! re-associating a pair already associated reports the stored association unchanged.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Reaching this service's state
 //!
@@ -163,9 +165,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // A device or link stored under a DIFFERENT global network is not addressable
-        // here either: "The device and link must be in the same global network"
-        // (`smithy_query query="doc" shape="AssociateLink"`).
+        // The device and the link are REFERENCES this new record carries, so each is judged
+        // as input exactly as the parent above is: a member naming no object of the global
+        // network that resolved is a field failure on that member
+        // ([`crate::state::unknown_reference`]), not the missing-resource answer an
+        // operation addressed AT an existing resource gives. A device or link stored under a
+        // DIFFERENT global network is not addressable here either: "The device and link must
+        // be in the same global network" (`smithy_query query="doc" shape="AssociateLink"`).
         let device_site = match store
             .devices
             .get(&input.device_id)
@@ -173,10 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             Some(device) => device.site_id.clone(),
             None => {
-                return Err(AssociateLinkErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(
+                return Err(AssociateLinkErrorModeled::ValidationException(
+                    crate::state::unknown_reference(
+                        crate::state::FIELD_DEVICE_ID,
                         crate::state::DEVICE_KIND,
-                        &input.device_id,
                     ),
                 )
                 .into())
@@ -189,8 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             Some(link) => link.site_id.clone(),
             None => {
-                return Err(AssociateLinkErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(crate::state::LINK_KIND, &input.link_id),
+                return Err(AssociateLinkErrorModeled::ValidationException(
+                    crate::state::unknown_reference(
+                        crate::state::FIELD_LINK_ID,
+                        crate::state::LINK_KIND,
+                    ),
                 )
                 .into())
             }

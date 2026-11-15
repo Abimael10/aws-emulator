@@ -4,8 +4,10 @@
 //! Ties one stored core network Connect peer to one device of the global network the path
 //! addresses, optionally over one of that device's links, and registers the peering with
 //! that global network's telemetry. A global network the path addresses and the store does
-//! not hold is a field failure on `globalNetworkId` (`ValidationException`, 400), a peer,
-//! device or link inside it that names nothing is `ResourceNotFoundException` (404), a link
+//! not hold is a field failure on `globalNetworkId` (`ValidationException`, 400), a device
+//! or link inside it that names nothing stored is the same field failure on the member that
+//! carried it (`deviceId` / `linkId`), a peer inside it that names nothing is
+//! `ResourceNotFoundException` (404), a link
 //! not associated with the named device is
 //! `ValidationException` (400), and a peer already tied to another device is
 //! `ConflictException` (409). This is the ONLY file to touch for this operation.
@@ -201,13 +203,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // The device and the link are REFERENCES this new record carries, so each is judged
+        // as input exactly as the parent above is: a member naming no object of the global
+        // network that resolved is a field failure on that member
+        // ([`crate::state::unknown_reference`]), as `AssociateLink` answers the same two
+        // members.
         if store
             .devices
             .get(&input.device_id)
             .is_none_or(|device| device.global_network_id != input.global_network_id)
         {
-            return Err(AssociateConnectPeerErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(crate::state::DEVICE_KIND, &input.device_id),
+            return Err(AssociateConnectPeerErrorModeled::ValidationException(
+                crate::state::unknown_reference(
+                    crate::state::FIELD_DEVICE_ID,
+                    crate::state::DEVICE_KIND,
+                ),
             )
             .into());
         }
@@ -221,8 +231,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .get(link)
                 .is_none_or(|record| record.global_network_id != input.global_network_id)
             {
-                return Err(AssociateConnectPeerErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(crate::state::LINK_KIND, link),
+                return Err(AssociateConnectPeerErrorModeled::ValidationException(
+                    crate::state::unknown_reference(
+                        crate::state::FIELD_LINK_ID,
+                        crate::state::LINK_KIND,
+                    ),
                 )
                 .into());
             }

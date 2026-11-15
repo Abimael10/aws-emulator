@@ -422,25 +422,28 @@ async fn every_associate_refuses_a_link_that_resolves_nothing_alike_and_stores_n
     // the addressed global network that the named device is associated with. The rows span
     // the ways such a value fails — never stored, stored under another global network, blank
     // (which is a value and not the absence of one), and a link of this global network the
-    // device is not associated with — and the three operations must fail each one alike.
+    // device is not associated with — and the three operations must fail each one alike. A
+    // reference that names no link at all is a field failure on the member that carried it
+    // (`crate::unknown_object_reference_on_a_tie`); one that names a link of this global
+    // network the device is not tied to fails the documented precondition instead.
     let rows: Vec<(&str, String, u16, &str)> = vec![
         (
             "a link id nothing was stored under",
             UNSTORED_LINK.to_string(),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "a link of another global network",
             fixture.foreign_link.clone(),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "a blank link id, which is a value and not the absence of one",
             " ".to_string(),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "a link of this global network the device is not associated with",

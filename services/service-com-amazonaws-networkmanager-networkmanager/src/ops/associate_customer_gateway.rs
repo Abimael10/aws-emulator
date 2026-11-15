@@ -222,9 +222,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .devices
             .get(&input.device_id)
             .is_some_and(|device| device.global_network_id == input.global_network_id);
+        // The device and the link are REFERENCES this new record carries, so each is judged
+        // as input exactly as the parent above is: a member naming no object of the global
+        // network that resolved is a field failure on that member
+        // ([`crate::state::unknown_reference`]), as `AssociateLink` answers the same two
+        // members.
         if !device_resolves {
-            return Err(AssociateCustomerGatewayErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(crate::state::DEVICE_KIND, &input.device_id),
+            return Err(AssociateCustomerGatewayErrorModeled::ValidationException(
+                crate::state::unknown_reference(
+                    crate::state::FIELD_DEVICE_ID,
+                    crate::state::DEVICE_KIND,
+                ),
             )
             .into());
         }
@@ -239,8 +247,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .get(link_id)
                 .is_some_and(|link| link.global_network_id == input.global_network_id);
             if !link_resolves {
-                return Err(AssociateCustomerGatewayErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(crate::state::LINK_KIND, link_id),
+                return Err(AssociateCustomerGatewayErrorModeled::ValidationException(
+                    crate::state::unknown_reference(
+                        crate::state::FIELD_LINK_ID,
+                        crate::state::LINK_KIND,
+                    ),
                 )
                 .into());
             }

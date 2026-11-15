@@ -245,6 +245,8 @@ mod transit_gateway_route_table_attachment;
 mod transit_gateway_route_table_attachment_lifecycle;
 #[path = "all/unknown_global_network_on_a_new_record.rs"]
 mod unknown_global_network_on_a_new_record;
+#[path = "all/unknown_object_reference_on_a_tie.rs"]
+mod unknown_object_reference_on_a_tie;
 #[path = "all/unknown_parent_reference.rs"]
 mod unknown_parent_reference;
 #[path = "all/unminted_page_token_refusal.rs"]

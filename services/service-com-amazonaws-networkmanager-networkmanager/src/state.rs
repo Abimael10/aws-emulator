@@ -577,6 +577,12 @@ pub fn requested_reference(supplied: Option<&str>) -> Option<Option<&str>> {
 /// show — "<Kind> not found." for the kind the member references, from [`kind_label`] —
 /// and is repeated as the field's own message, exactly as recorded.
 ///
+/// It is EVERY reference the input carries that is judged this way, not only the parent the
+/// record hangs off: the device and link a record is tied to are references of the request
+/// too, and a recorded `AssociateLink` naming a link that was deleted answers this same 400
+/// with "Link not found.", exactly as the recorded `CreateConnection` refusals of an
+/// unresolvable `deviceId` / `linkId` do.
+///
 /// This is the crate's SINGLE construction for an unresolvable reference refused as a
 /// validation failure, so one service reports one field name and one message for the same
 /// member whichever operation refused it. Which errors the operation MODELS does not decide
@@ -584,7 +590,8 @@ pub fn requested_reference(supplied: Option<&str>) -> Option<Option<&str>> {
 /// the store does not hold are both this 400 on operations that model the 404 as well. An
 /// operation addressed AT a resource that already exists — a read, an update, a delete, a
 /// disassociation — answers the absent resource with that 404 instead (see
-/// [`resource_not_found`]).
+/// [`resource_not_found`]), and so does the resource the request is addressed at even where
+/// its id travels in the body.
 ///
 /// `member` is the field name the refusal reports; `kind` is the resource kind the
 /// member references ([`GLOBAL_NETWORK_KIND`], [`SITE_KIND`], [`CORE_NETWORK_KIND`]).

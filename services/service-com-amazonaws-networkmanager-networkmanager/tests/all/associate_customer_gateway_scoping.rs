@@ -5,8 +5,9 @@
 //!
 //! The rule under test: a customer gateway association is addressed THROUGH the global
 //! network in the request's URI, so every resource the request names must belong to THAT
-//! global network — one stored under another is not addressable and is the missing-resource
-//! answer — and the association's identity is the global network plus the gateway's ARN, so
+//! global network — one stored under another names nothing here, so the member that carried
+//! it is refused as a field-validation failure — and the association's identity is the
+//! global network plus the gateway's ARN, so
 //! the same gateway may be tied in two global networks independently and each network
 //! reports only its own ties. The number of ties one global network holds is bounded, and an
 //! associate past that bound answers the operation's modelled quota error and stores
@@ -37,11 +38,15 @@ async fn resources_of_another_global_network_are_not_addressable() {
     let arn = plain_cgw_arn("0123456789abcdef1");
 
     // The rows span which of the two references crosses the boundary: the device alone, the
-    // link alone, and both at once.
+    // link alone, and both at once. A reference naming nothing of this global network is a
+    // field failure on the member that carried it, resolved outside-in, so the device is the
+    // member reported when both cross (`crate::unknown_object_reference_on_a_tie`).
     let rows = [
         (
             "a device of another global network",
             json!({ "CustomerGatewayArn": arn, "DeviceId": theirs.device }),
+            "deviceId",
+            "Device not found.",
         ),
         (
             "a link of another global network",
@@ -50,6 +55,8 @@ async fn resources_of_another_global_network_are_not_addressable() {
                 "DeviceId": mine.device,
                 "LinkId": theirs.link,
             }),
+            "linkId",
+            "Link not found.",
         ),
         (
             "a device and a link of another global network",
@@ -58,18 +65,25 @@ async fn resources_of_another_global_network_are_not_addressable() {
                 "DeviceId": theirs.device,
                 "LinkId": theirs.link,
             }),
+            "deviceId",
+            "Device not found.",
         ),
     ];
-    for (case, body) in &rows {
+    for (case, body, field, message) in &rows {
         let (status, refused) = associate(&emulator, &here, body.clone()).await;
         assert_eq!(
-            status, 404,
-            "case {case}: expected 404, got {status} with {refused}"
+            status, 400,
+            "case {case}: expected 400, got {status} with {refused}"
         );
         assert_eq!(
             error_code(&refused),
-            "ResourceNotFoundException",
-            "case {case}: expected ResourceNotFoundException, got {refused}"
+            "ValidationException",
+            "case {case}: expected ValidationException, got {refused}"
+        );
+        assert_eq!(
+            refused["Fields"],
+            json!([{ "Name": field, "Message": message }]),
+            "case {case}: expected one Fields entry naming {field}, got {refused}"
         );
     }
 

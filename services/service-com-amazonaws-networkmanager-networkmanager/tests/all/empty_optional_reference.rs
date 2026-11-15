@@ -464,13 +464,18 @@ async fn associate_customer_gateway_reads_an_empty_link_id_as_no_link() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "case a LinkId nothing was stored under: expected 404, got {status} with {answer}"
+        status, 400,
+        "case a LinkId nothing was stored under: expected 400, got {status} with {answer}"
     );
     assert_eq!(
         error_code(&answer),
-        "ResourceNotFoundException",
-        "case a LinkId nothing was stored under: expected ResourceNotFoundException, got {answer}"
+        "ValidationException",
+        "case a LinkId nothing was stored under: expected ValidationException, got {answer}"
+    );
+    assert_eq!(
+        answer["Fields"],
+        json!([{ "Name": "linkId", "Message": "Link not found." }]),
+        "case a LinkId nothing was stored under: expected one Fields entry naming linkId, got {answer}"
     );
 
     // A link of this global network that is NOT associated with the device is a value the
