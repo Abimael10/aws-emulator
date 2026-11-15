@@ -262,8 +262,9 @@ impl ComAmazonawsSsoSwbportalserviceState {
     /// `federated` is what [`federated_sign_in`] resolved for the same token and instant.
     /// The two sources are combined here and nowhere else:
     ///
-    /// 1. a record THIS store holds decides whether the sign-in is still usable, because
-    ///    ending a sign-in is what `Logout` writes here and nothing else records it;
+    /// 1. a record THIS store still holds — one the clock has not made spent — decides
+    ///    whether the sign-in is still usable, because ending a sign-in is what `Logout`
+    ///    writes here and nothing else records it;
     /// 2. the sign-in the emulator's own mint made is then reported as it stands NOW, so
     ///    an assignment made or withdrawn since the token was first presented is in force;
     /// 3. a sign-in this store was GIVEN (one seeded through
@@ -277,13 +278,22 @@ impl ComAmazonawsSsoSwbportalserviceState {
     /// names a sign-in, so a token the mint no longer holds — one a refresh superseded, or
     /// one past its own lifetime — is refused at that instant rather than served from a
     /// frozen copy.
+    ///
+    /// A record the CLOCK has made spent is read as absent
+    /// ([`Self::live_sign_in_record`]): it is a record whose reclaim this store owes at
+    /// that instant, so it answers nothing in step 1 either. That is what makes this
+    /// question independent of when the reclaim is materialised
+    /// ([`super::end_expired_credentials`]) — the same token resolves to the same sign-in
+    /// whether that sweep has already run or is still outstanding, so a caller asking
+    /// before a handler has swept (the service's authentication gate) and the handler
+    /// behind it cannot reach different verdicts.
     pub fn signed_in(
         &self,
         access_token: &str,
         federated: Option<&SignedIn>,
         now: SystemTime,
     ) -> Option<SignedIn> {
-        let recorded = self.sessions.get(access_token);
+        let recorded = self.live_sign_in_record(access_token, now);
         let resolved = match recorded {
             Some(session) if !session.is_usable_at(now) => None,
             _ => match federated.filter(|sign_in| sign_in.is_usable_at(now)) {

@@ -6991,3 +6991,10 @@ mod all_rs_is_a_canonical_declaration_list;
 // a SIBLING of it: every declaration carries its own `#[path = "all/<name>.rs"]`.
 // the first item one is `E0753` and compiles no suite of this target, so add a declaration
 // here rather than a note about one. `all/all_rs_declares_each_suite_once.rs` and
+//! these header lines are the only place one may stand: past them `//!` is `E0753`, which
+//! compiles no suite of this target either. `all/all_rs_declares_each_suite_once.rs` and
+//! this file and for every service crate's `tests/all.rs`, so add a DECLARATION here and
+//! leave every rule and every note to those two suites and to each suite's own module doc,
+//! never to a line below the list.
+//! (`tests/boot_serve.rs`), which the layout check refuses. The `#[path]` attribute is what
+//! points each declaration into `tests/all/`.

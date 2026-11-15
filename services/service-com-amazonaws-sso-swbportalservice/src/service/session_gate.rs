@@ -95,7 +95,12 @@ impl<Eng: Send + Sync + 'static> SessionGate<Eng> {
     /// [`PresentedSession::StoreUnreachable`] rather than either verdict.
     ///
     /// A pure READ: it writes nothing, so asking it cannot change what a later caller
-    /// sees, and two identical requests get the identical answer.
+    /// sees, and two identical requests get the identical answer. Nor does it need a write
+    /// to be correct: resolution reads a sign-in record the clock has made spent as absent,
+    /// so the verdict is the same whether or not the reclaim that record is owed has been
+    /// materialised yet (the sweep a handler runs before it serves,
+    /// [`crate::state::end_expired_credentials`]) — which is why the gate cannot refuse a
+    /// token the handler behind it would have served.
     pub(super) fn presented_session(
         &self,
         req: &aws_smithy_runtime_api::http::Request,

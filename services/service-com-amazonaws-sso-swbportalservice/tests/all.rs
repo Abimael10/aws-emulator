@@ -35,6 +35,8 @@ mod route_path_agreement;
 mod state_roundtrip;
 #[path = "all/store_unreachable_refusal.rs"]
 mod store_unreachable_refusal;
+#[path = "all/sweep_independent_sign_in.rs"]
+mod sweep_independent_sign_in;
 #[path = "all/unauthorized_rejection.rs"]
 mod unauthorized_rejection;
 #[path = "all/user_role_assignment.rs"]

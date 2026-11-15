@@ -50,15 +50,15 @@ const PORTAL_HOST: &str = "portal.sso.us-east-1.amazonaws.com";
 const REGION: &str = "us-east-1";
 
 /// One account an administrator assigns permission sets on.
-struct Granted {
-    label: &'static str,
+pub(crate) struct Granted {
+    pub(crate) label: &'static str,
     /// `TargetId`, modelled `^\d{12}$`. The rows span the published bounds of that
     /// pattern (all zeros, all nines) and one id in between.
-    account_id: String,
+    pub(crate) account_id: String,
     /// The permission sets granted on the account, in the order the test creates them —
     /// NOT the order the portal must report their names in. `Name` is modelled
     /// `^[\w+=,.@-]+$`, length 1..32.
-    permission_sets: &'static [&'static str],
+    pub(crate) permission_sets: &'static [&'static str],
     /// `PrincipalType`: the model's enum is `USER | GROUP`.
     principal_type: &'static str,
     /// `PrincipalId`: both forms the modelled pattern admits appear below (a bare GUID and
@@ -70,7 +70,7 @@ struct Granted {
 /// sets per account, both `PrincipalType` values, an account the organization HOLDS a
 /// record of and one it does not, and role names that sort differently from the order they
 /// are created in.
-fn granted() -> Vec<Granted> {
+pub(crate) fn granted() -> Vec<Granted> {
     vec![
         Granted {
             label: "the organization's management account, two permission sets, a USER principal",
@@ -99,7 +99,7 @@ fn granted() -> Vec<Granted> {
 }
 
 /// The four services the production router mounts, on one shared engine.
-struct Emulator {
+pub(crate) struct Emulator {
     engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
@@ -172,11 +172,15 @@ impl Emulator {
         (status, body)
     }
 
-    async fn list_accounts(&self, token: &str) -> (StatusCode, Value) {
+    pub(crate) async fn list_accounts(&self, token: &str) -> (StatusCode, Value) {
         self.portal(Method::GET, "/assignment/accounts", token).await
     }
 
-    async fn list_account_roles(&self, token: &str, account_id: &str) -> (StatusCode, Value) {
+    pub(crate) async fn list_account_roles(
+        &self,
+        token: &str,
+        account_id: &str,
+    ) -> (StatusCode, Value) {
         self.portal(
             Method::GET,
             &format!("/assignment/roles?account_id={account_id}"),
@@ -185,7 +189,7 @@ impl Emulator {
         .await
     }
 
-    async fn role_credentials(
+    pub(crate) async fn role_credentials(
         &self,
         token: &str,
         account_id: &str,
@@ -199,7 +203,7 @@ impl Emulator {
         .await
     }
 
-    async fn logout(&self, token: &str) -> (StatusCode, Value) {
+    pub(crate) async fn logout(&self, token: &str) -> (StatusCode, Value) {
         self.portal(Method::POST, "/logout", token).await
     }
 
@@ -300,7 +304,7 @@ impl Emulator {
     /// An access token the emulator's OWN OIDC service issued, through the whole device
     /// flow a client (`aws sso login`) walks: register, start the authorization, have it
     /// approved at the access portal, then exchange the device code.
-    async fn minted_token(&self, identity_store_id: &str) -> String {
+    pub(crate) async fn minted_token(&self, identity_store_id: &str) -> String {
         self.minted_sign_in(identity_store_id).await.access_token
     }
 
@@ -490,7 +494,7 @@ impl Emulator {
     }
 
     /// This service's own store, for the cases whose subject is a record only it keeps.
-    fn portal_store(
+    pub(crate) fn portal_store(
         &self,
     ) -> engine::ServiceState<
         service_com_amazonaws_sso_swbportalservice::state::ComAmazonawsSsoSwbportalserviceState,
@@ -501,7 +505,7 @@ impl Emulator {
 
     /// Whether the portal keeps a record of the sign-in `access_token` names — which it
     /// does only once a `Logout` or a credential mint made it record one.
-    fn records_sign_in(&self, access_token: &str) -> bool {
+    pub(crate) fn records_sign_in(&self, access_token: &str) -> bool {
         self.portal_store().lock().sessions.contains_key(access_token)
     }
 
@@ -553,7 +557,7 @@ fn parsed(response: Response<Bytes>) -> (u16, Value) {
 }
 
 /// One required string member of a response.
-fn text(body: &Value, member: &str) -> String {
+pub(crate) fn text(body: &Value, member: &str) -> String {
     body[member]
         .as_str()
         .unwrap_or_else(|| panic!("{member} is missing from {body}"))
@@ -561,7 +565,7 @@ fn text(body: &Value, member: &str) -> String {
 }
 
 /// The wire error code (`__type`) of a failure response, without its namespace.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body["__type"]
         .as_str()
         .unwrap_or_default()
@@ -572,7 +576,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// The `accountId` of every account a `ListAccounts` response reports, in order.
-fn reported_accounts(body: &Value) -> Vec<String> {
+pub(crate) fn reported_accounts(body: &Value) -> Vec<String> {
     body["accountList"]
         .as_array()
         .cloned()
@@ -583,7 +587,7 @@ fn reported_accounts(body: &Value) -> Vec<String> {
 }
 
 /// The `roleName` of every role a `ListAccountRoles` response reports, in order.
-fn reported_roles(body: &Value) -> Vec<String> {
+pub(crate) fn reported_roles(body: &Value) -> Vec<String> {
     body["roleList"]
         .as_array()
         .cloned()
@@ -594,10 +598,10 @@ fn reported_roles(body: &Value) -> Vec<String> {
 }
 
 /// An emulator with every row of [`granted`] assigned and every grant complete.
-struct Assigned {
-    emulator: Emulator,
+pub(crate) struct Assigned {
+    pub(crate) emulator: Emulator,
     instance_arn: String,
-    identity_store_id: String,
+    pub(crate) identity_store_id: String,
     /// The permission-set ARNs of each row, in the row's own order.
     permission_sets: Vec<Vec<String>>,
     /// An access token the emulator's own mint issued.
@@ -605,7 +609,7 @@ struct Assigned {
 }
 
 /// Set an emulator up with every row of `rows` assigned and its grant complete.
-async fn assigned_emulator(rows: &[Granted]) -> Assigned {
+pub(crate) async fn assigned_emulator(rows: &[Granted]) -> Assigned {
     let emulator = Emulator::new();
     let (instance_arn, identity_store_id) = emulator.instance().await;
     let mut permission_sets: Vec<Vec<String>> = Vec::new();
@@ -636,7 +640,7 @@ async fn assigned_emulator(rows: &[Granted]) -> Assigned {
 
 /// The role name the portal must report for the permission set `name` of `account_id`: the
 /// set's own name, which [`assigned_emulator`] makes unique per account.
-fn role_name(name: &str, account_id: &str) -> String {
+pub(crate) fn role_name(name: &str, account_id: &str) -> String {
     format!("{name}-{account_id}")
 }
 

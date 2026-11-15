@@ -455,32 +455,84 @@ impl ComAmazonawsSsoSwbportalserviceState {
         ended
     }
 
+    /// Whether a role credential this store still holds was issued to `access_token` and is
+    /// itself still inside its own duration at `now`.
+    ///
+    /// That is the one thing that keeps a sign-in record alive past the record's own expiry:
+    /// such a credential goes on working for the rest of its duration and this record is the
+    /// identity it speaks for (see [`Self::signed_in_subject`]).
+    fn speaks_for_a_live_credential(&self, access_token: &str, now: SystemTime) -> bool {
+        self.issued_credentials
+            .iter()
+            .any(|((issued_to, _, _), record)| {
+                issued_to == access_token && record.is_valid_at(now)
+            })
+    }
+
+    /// Whether the record held under `access_token` is one the CLOCK has made spent at
+    /// `now`, by [`sign_in_record_is_spent`] — the question asked of a record this store is
+    /// still holding, so the credential that may be keeping it alive is looked up here.
+    fn recorded_sign_in_is_spent(
+        &self,
+        access_token: &str,
+        session: &Session,
+        now: SystemTime,
+    ) -> bool {
+        sign_in_record_is_spent(
+            session.expires_at,
+            self.speaks_for_a_live_credential(access_token, now),
+            now,
+        )
+    }
+
+    /// The record `access_token` names that the clock has NOT made spent at `now` — the one
+    /// [`Self::expire_sessions`] leaves behind. A spent record reads as absent, because it
+    /// is a record this store owes nothing but its reclaim.
+    pub(crate) fn live_sign_in_record(
+        &self,
+        access_token: &str,
+        now: SystemTime,
+    ) -> Option<&Session> {
+        self.sessions
+            .get(access_token)
+            .filter(|session| !self.recorded_sign_in_is_spent(access_token, session, now))
+    }
+
     /// Forget every sign-in record the clock has made spent at `now`: one whose own expiry
     /// has passed and that no role credential this store still holds was issued to.
     ///
     /// A sign-in's expiry is the instant the CLOCK makes the record spent — past it the
-    /// record answers nothing, because an expired sign-in is refused whether it is held
-    /// here or resolved from the mint — so dropping it is owed then and no response changes
+    /// record answers nothing, because resolving a token reads a spent record as absent
+    /// ([`Self::live_sign_in_record`]) — so dropping it is owed then and no response changes
     /// because this ran. A record a still-valid credential was issued to is KEPT whatever
     /// its expiry, because that credential goes on working for the rest of its own duration
     /// and this record is the identity it speaks for (see [`Self::signed_in_subject`]); the
     /// sweep is therefore run AFTER [`Self::expire_credentials`], when every credential left
-    /// is one still inside its duration.
+    /// is one still inside its duration — and it drops exactly the records that resolution
+    /// already disregards, whichever order the two run in.
     ///
     /// This is what bounds the record count: a request presenting a token the emulator's
     /// own mint issued has one recorded for it ([`Self::remember_sign_in`]), and the records
     /// of tokens whose lifetimes have run out are reclaimed here rather than held for the
     /// life of the process.
     pub fn expire_sessions(&mut self, now: SystemTime) {
-        // The tokens a credential still speaks through, read once: the sweep is run on
-        // every request, so it walks the credentials once rather than once per record.
+        // The tokens a still-usable credential speaks through, read once: the sweep is run
+        // on every request, so it walks the credentials once rather than once per record.
+        // A credential whose own duration has run out holds nothing back — it is itself a
+        // record `expire_credentials` is owed to end — so this set says the same thing
+        // `speaks_for_a_live_credential` does, whether or not that sweep has run yet.
         let issued_to: HashSet<&str> = self
             .issued_credentials
-            .keys()
-            .map(|(access_token, _, _)| access_token.as_str())
+            .iter()
+            .filter(|(_, record)| record.is_valid_at(now))
+            .map(|((access_token, _, _), _)| access_token.as_str())
             .collect();
         self.sessions.retain(|access_token, session| {
-            session.expires_at > now || issued_to.contains(access_token.as_str())
+            !sign_in_record_is_spent(
+                session.expires_at,
+                issued_to.contains(access_token.as_str()),
+                now,
+            )
         });
     }
 
@@ -541,6 +593,26 @@ pub fn end_expired_credentials(
     // After the credentials, so a record still speaking for a usable credential is kept
     // and every other expired record is reclaimed.
     state.expire_sessions(now);
+}
+
+/// Whether the CLOCK has made a sign-in record spent at `now`: its own expiry has passed
+/// and no role credential still inside its own duration was issued to it
+/// (`kept_by_a_credential`).
+///
+/// The ONE expression of "spent", evaluated by both readings of that question — the
+/// reclaim's own ([`ComAmazonawsSsoSwbportalserviceState::expire_sessions`], which drops
+/// every record it holds of) and resolution's
+/// ([`ComAmazonawsSsoSwbportalserviceState::live_sign_in_record`], which reads such a record
+/// as absent). Written once because the two must agree: were they stated separately,
+/// resolving a token would answer one thing while the reclaim was still outstanding and
+/// another once it had run, and the reclaim is owed at its instant rather than at whichever
+/// request happens to materialise it.
+fn sign_in_record_is_spent(
+    expires_at: SystemTime,
+    kept_by_a_credential: bool,
+    now: SystemTime,
+) -> bool {
+    expires_at <= now && !kept_by_a_credential
 }
 
 /// `at` as epoch milliseconds, the unit `RoleCredentials$expiration` is modeled in.
