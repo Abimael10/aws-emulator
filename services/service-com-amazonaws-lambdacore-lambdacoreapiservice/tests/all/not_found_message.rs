@@ -45,8 +45,8 @@ use service_com_amazonaws_lambdacore_lambdacoreapiservice::state::names_a_connec
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::network_connector_lifecycle::{
-    create, delete, emulator, expected_arn, get, list_versions, minimal_configuration,
-    minimal_create, text, update, wait_for_the_clock, Answer,
+    create, delete, emulator, expected_arn, expected_arn_in, get, list_versions,
+    minimal_configuration, minimal_create, text, update, wait_for_the_clock, Answer, REGION,
 };
 
 /// The error code every one of these refusals carries
@@ -103,7 +103,7 @@ impl Addressed {
 
 /// Whether `identifier` qualifies a version: its last colon-separated segment is a positive
 /// integer (`<name-or-arn>:<version>`).
-fn names_a_version(identifier: &str) -> bool {
+pub(crate) fn names_a_version(identifier: &str) -> bool {
     identifier
         .rsplit_once(':')
         .is_some_and(|(head, suffix)| !head.is_empty() && suffix.parse::<u32>().is_ok_and(|version| version >= 1))
@@ -136,6 +136,14 @@ async fn send(
 /// `identifier`: the resource that identifier determines — the ARN for an id, an ARN as
 /// supplied, a name as supplied, each keeping any version suffix.
 pub(crate) fn expected_message(identifier: &str) -> String {
+    expected_message_in(REGION, identifier)
+}
+
+/// [`expected_message`] for a request signed for `region`: an `Id` carries no Region of its
+/// own, so the ARN it determines is the one of the Region the request was signed for. The two
+/// forms that carry their own Region — an ARN, and a name that determines none — are stated as
+/// supplied whichever Region asks.
+pub(crate) fn expected_message_in(region: &str, identifier: &str) -> String {
     let (addressed, version) = match identifier.rsplit_once(':') {
         Some((head, suffix)) if names_a_version(identifier) => (head, Some(suffix)),
         _ => (identifier, None),
@@ -145,7 +153,7 @@ pub(crate) fn expected_message(identifier: &str) -> String {
     if !determines_the_resource {
         return format!("Network connector not found: {identifier}");
     }
-    let arn = expected_arn(addressed);
+    let arn = expected_arn_in(region, addressed);
     match version {
         Some(version) => format!("Network connector not found: {arn}:{version}"),
         None => format!("Network connector not found: {arn}"),

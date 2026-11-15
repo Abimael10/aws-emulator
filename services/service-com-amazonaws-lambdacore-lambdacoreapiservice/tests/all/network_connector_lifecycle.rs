@@ -27,24 +27,32 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The URI prefix every operation of this service is bound under.
 pub(crate) const PREFIX: &str = "/2026-04-04/network-connectors";
 
-/// A SigV4 credential scope naming this service's signing name (`lambda`). It is what
-/// routes a request here, and its region is what a connector ARN is built for.
-const SIGNED_FOR_EU_WEST_1: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDEXAMPLE/20260101/eu-west-1/lambda/aws4_request, \
-     SignedHeaders=host, Signature=abc";
+/// A SigV4 credential scope naming this service's signing name (`lambda`), for `region`. It
+/// is what routes a request here, and its region is what a connector ARN is built for.
+pub(crate) fn signed_for(region: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/lambda/aws4_request, \
+         SignedHeaders=host, Signature=abc"
+    )
+}
 
-/// The region [`SIGNED_FOR_EU_WEST_1`] signs for.
-const REGION: &str = "eu-west-1";
+/// The region the helpers below sign for unless a case names another.
+pub(crate) const REGION: &str = "eu-west-1";
 
 /// The account id every emulated ARN carries (`engine::EMULATOR_ACCOUNT_ID`), spelled out
 /// here so a wrong account in the implementation fails.
 const ACCOUNT: &str = "000000000000";
 
-/// The unqualified ARN the service must build for the connector whose `Id` is `id`: the
-/// resource segment of a connector's ARN is the Id the service assigned it, so `Arn` and
-/// `Id` of one answer always name the same resource.
+/// The unqualified ARN the service must build for the connector whose `Id` is `id`, in
+/// `region`: the resource segment of a connector's ARN is the Id the service assigned it, so
+/// `Arn` and `Id` of one answer always name the same resource.
+pub(crate) fn expected_arn_in(region: &str, id: &str) -> String {
+    format!("arn:aws:lambda:{region}:{ACCOUNT}:network-connector:{id}")
+}
+
+/// [`expected_arn_in`] for the region the helpers sign for by default.
 pub(crate) fn expected_arn(id: &str) -> String {
-    format!("arn:aws:lambda:{REGION}:{ACCOUNT}:network-connector:{id}")
+    expected_arn_in(REGION, id)
 }
 
 /// One emulator: a router carrying only this service, over one shared engine.
@@ -86,12 +94,24 @@ pub(crate) async fn call(
     uri: &str,
     body: Option<Value>,
 ) -> Answer {
+    call_signed_for(router, REGION, method, uri, body).await
+}
+
+/// [`call`] with the request signed for `region`, so a case can vary the region the
+/// credential scope names — the region a connector ARN the service builds belongs to.
+pub(crate) async fn call_signed_for(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> Answer {
     let payload = body.map(|value| value.to_string()).unwrap_or_default();
     let mut builder = ::http::Request::builder()
         .method(method)
         .uri(uri)
-        .header("host", "lambda.eu-west-1.amazonaws.com")
-        .header("authorization", SIGNED_FOR_EU_WEST_1);
+        .header("host", format!("lambda.{region}.amazonaws.com"))
+        .header("authorization", signed_for(region));
     if !payload.is_empty() {
         builder = builder.header("content-type", "application/json");
     }

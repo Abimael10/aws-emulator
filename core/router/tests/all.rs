@@ -1336,3 +1336,24 @@ mod zz_probe_whole_emulator;
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of
 // this file, which the layout check refuses: the `#[path]` above each declaration is what
 // points it into `tests/all/`.
+// Single integration-test target for the router: the canonical declaration list of every
+// cross-service suite under `tests/all/`, and nothing else.
+// This file holds this header, then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
+// suite file under `tests/all/`, sorted strictly by name, and no other line. Put a new suite
+// at `tests/all/<name>.rs` and insert its pair into the sorted list below; what that suite
+// covers, and why it drives the assembled router rather than one service crate, belongs in
+// that suite's own module doc, where it is read beside the test it explains.
+// EVERY comment here is an ordinary `//` one, this header included, and no inner attribute
+// stands anywhere. An inner doc comment (`//!`) and an inner attribute (`#![...]`) are legal
+// only before the first item, so one appended past the declarations is `E0753` and compiles
+// no suite of this target; with none anywhere in the file, no appended, re-typed or merged
+// copy of a line of it can be one.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod <name>;` would resolve to a
+// SIBLING of this file, which the layout check refuses: the `#[path]` is what points each
+// declaration into `tests/all/`. Declare each suite exactly once — a second `mod` for one
+// name is `E0428`, which fails every suite of this target too.
+// Guard suites pin all of that rather than restating it here:
+// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs`, for this file and
+// for every service crate's `tests/all.rs`. `all/appended_notes.rs`,
+// `all/appended_notes_tail.rs`, `all/appended_header_notes.rs` and `all/appended_prose.rs`
+// keep the notes earlier landings appended here.

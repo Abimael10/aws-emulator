@@ -35,6 +35,9 @@ mod not_found_message;
 #[path = "all/referenced_resources.rs"]
 mod referenced_resources;
 
+#[path = "all/refusal_region_and_account.rs"]
+mod refusal_region_and_account;
+
 #[path = "all/removed_connector_refusal.rs"]
 mod removed_connector_refusal;
 
