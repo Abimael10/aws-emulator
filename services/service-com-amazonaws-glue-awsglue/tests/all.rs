@@ -369,6 +369,8 @@ mod security_configurations;
 mod service_filled_read_members;
 #[path = "all/session_deletion.rs"]
 mod session_deletion;
+#[path = "all/session_idle_expiry.rs"]
+mod session_idle_expiry;
 #[path = "all/session_tags.rs"]
 mod session_tags;
 #[path = "all/sessions.rs"]

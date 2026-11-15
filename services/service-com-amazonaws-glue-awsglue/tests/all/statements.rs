@@ -51,7 +51,7 @@ const STATUS_TIMEOUT: &str = "TIMEOUT";
 const ROLE: &str = "arn:aws:iam::000000000000:role/GlueSessionRole";
 
 /// Seconds in one minute: both documented session timeouts are stated in minutes.
-const SECONDS_PER_MINUTE: u64 = 60;
+pub(crate) const SECONDS_PER_MINUTE: u64 = 60;
 
 /// Create the session `id`, with the create body `extra` merged over the required members.
 pub(crate) async fn create_session(router: &MultiServiceRouter, id: &str, extra: Value) {

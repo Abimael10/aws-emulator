@@ -17,14 +17,17 @@
 //! (every value of the modelled enum), whether a resource of that name exists, the form of
 //! the `ResourceId`, and whether the call carries a `RequestOrigin`.
 
+use std::sync::Arc;
+
 use serde_json::json;
 use service_com_amazonaws_glue_awsglue::state::messages::{
     dashboard_url_not_supported, DASHBOARD_URL_RESOURCE_NOT_FOUND,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::job_runs::job_body;
-use crate::wire::{call, emulator, error_code, error_message, ok};
+use crate::job_runs::{already_past, job_body};
+use crate::statements::{create_session, set_session_due};
+use crate::wire::{call, emulator, emulator_on, error_code, error_message, ok};
 
 /// Every value of the modelled `GlueResourceType` enum, which `ResourceType` is one of.
 /// Source: `smithy_query shape=GlueResourceType`.
@@ -153,6 +156,86 @@ async fn an_unknown_session_is_refused_as_not_found() {
         assert!(
             body["Url"].is_null(),
             "case {case}: a refused call hands out no URL, got {body}"
+        );
+    }
+}
+
+/// A session this endpoint no longer holds — one a delete removed — is the same miss as an
+/// id that never existed: this operation's own fixed sentence, which is NOT the session
+/// read's templated one for the same id. The two refusals carry the same code for the same
+/// missing session and must still differ in wording, so they cannot share one message.
+///
+/// The rows differ along the form of the id the deleted session was addressed by.
+#[tokio::test]
+async fn a_deleted_session_is_refused_with_this_operations_own_miss_text() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(engine.clone());
+
+    let ids = [
+        "deleted-session",
+        "team.session.7",
+        "11111111-2222-3333-4444-555555555555",
+    ];
+
+    for id in ids {
+        // A session only reaches a status a delete is allowed in once its provisioning has
+        // settled, so the record is brought there before it is removed.
+        create_session(&router, id, json!({})).await;
+        set_session_due(&engine, id, already_past());
+        let (status, body) = dashboard_url(&router, id, SESSION, None).await;
+        assert_eq!(
+            status, 200,
+            "case {id}: a session this endpoint holds must be answered with its dashboard URL, \
+             got {status} with {body}"
+        );
+        ok(&router, "DeleteSession", &json!({ "Id": id })).await;
+
+        let (status, body) = dashboard_url(&router, id, SESSION, None).await;
+        assert_eq!(
+            status, 400,
+            "case {id}: a deleted session must be refused, got {status} with {body}"
+        );
+        assert!(
+            error_code(&body).ends_with("EntityNotFoundException"),
+            "case {id}: expected EntityNotFoundException, got {} in {body}",
+            error_code(&body)
+        );
+        let dashboard_miss = error_message(&body);
+        assert_eq!(
+            dashboard_miss, "Entity not found",
+            "case {id}: the miss must be this operation's fixed sentence, got {body}"
+        );
+        assert!(
+            !dashboard_miss.contains(id),
+            "case {id}: the refusal must not echo the id the request addressed, got {body}"
+        );
+        assert!(
+            body["Url"].is_null(),
+            "case {id}: a refused call hands out no URL, got {body}"
+        );
+
+        // The session READ's own miss for the SAME id: the same error class, worded as that
+        // operation words it — which is what the two messages must not share.
+        let (status, read) = call(&router, "GetSession", &json!({ "Id": id })).await;
+        assert_eq!(
+            status, 400,
+            "case {id}: the deleted session must be a miss for the session read too, got \
+             {status} with {read}"
+        );
+        assert!(
+            error_code(&read).ends_with("EntityNotFoundException"),
+            "case {id}: expected EntityNotFoundException, got {} in {read}",
+            error_code(&read)
+        );
+        let session_miss = error_message(&read);
+        assert_eq!(
+            session_miss,
+            format!("Session {id} not found."),
+            "case {id}: the session read's miss names the id it could not resolve, got {read}"
+        );
+        assert_ne!(
+            dashboard_miss, session_miss,
+            "case {id}: the dashboard miss and the session read's miss must differ"
         );
     }
 }
