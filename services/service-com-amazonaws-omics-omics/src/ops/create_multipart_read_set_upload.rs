@@ -318,6 +318,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time_ms: now_ms,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             client_token: input.client_token,
+            // An upload is initiated empty: the parts are what `UploadReadSetPart`
+            // writes into it afterwards.
+            parts: Default::default(),
         };
         let response = reported(&upload);
         let created = upload.upload_id.clone();

@@ -11,7 +11,8 @@
 //! `GetRunCache`) and the **sequence store** that holds read sets
 //! (`CreateSequenceStore` / `GetSequenceStore` / `DeleteSequenceStore`), together with the **multipart read set
 //! upload** a caller initiates against that store
-//! (`CreateMultipartReadSetUpload`). Each resource is stored exactly once, keyed by the numeric id
+//! (`CreateMultipartReadSetUpload`) and the **parts** uploaded into it
+//! (`UploadReadSetPart` / `ListReadSetUploadParts`). Each resource is stored exactly once, keyed by the numeric id
 //! the model's `^[0-9]+$` patterns describe (a version by its name, inside its
 //! workflow's record), so every operation reads and writes the one record.
 //!
@@ -240,6 +241,14 @@ pub const SHARE_NOT_FOUND_MESSAGE: &str = "Requested share not found";
 /// its path).
 pub const SEQUENCE_STORE_NOT_FOUND_MESSAGE: &str = "The specified sequence store does not exist.";
 
+/// How this service states that no multipart read set upload the request could reach
+/// carries the `uploadId` it named: the same wording class as
+/// [`SEQUENCE_STORE_NOT_FOUND_MESSAGE`], for the other resource the upload operations
+/// resolve. An upload belongs to the store it was initiated against, so an upload id
+/// presented under another store is "does not exist" too.
+pub const MULTIPART_READ_SET_UPLOAD_NOT_FOUND_MESSAGE: &str =
+    "The specified upload does not exist.";
+
 /// What `CreateShare` answers when the resource the request offers is not one this
 /// emulator holds.
 ///
@@ -387,6 +396,16 @@ pub const MAX_SHARES: usize = 500;
 /// carries a cap like every other growth site here. A create past it is refused with the
 /// modelled `ServiceQuotaExceededException`.
 pub const MAX_MULTIPART_READ_SET_UPLOADS: usize = 100;
+
+/// The most part bytes this emulator will hold for ONE multipart read set upload.
+///
+/// Emulator resource guard, not an AWS quota: a part's bytes are kept so the upload is
+/// backed by the content the caller sent, and that content lives in this process's
+/// memory, so the per-upload collection carries a cap like every other growth site
+/// here. It is far below the 5 GiB one part may be under the modelled `partSize` range,
+/// so a part past it is refused with the modelled `ServiceQuotaExceededException`
+/// instead of being held.
+pub const MAX_READ_SET_UPLOAD_PART_BYTES: usize = 64 * 1024 * 1024;
 
 /// The most tags one workflow or run may carry.
 ///
@@ -666,12 +685,65 @@ pub struct MultipartReadSetUpload {
     /// upload collection, which [`MAX_MULTIPART_READ_SET_UPLOADS`] already bounds, so no
     /// separate token map grows here.
     pub client_token: Option<String>,
+    /// The parts uploaded into this upload, keyed by the pair that identifies a part
+    /// within it: its source file and its part number. A second upload of a pair already
+    /// held REPLACES the part, which is what `UploadReadSetPart` documents ("When you a
+    /// upload a read set part with a part number that already exists, the new part
+    /// replaces the existing one"), and the key order is source then ascending part
+    /// number, so one source's parts are listed in part-number order and a page token can
+    /// name the part number the next page resumes at.
+    pub parts: BTreeMap<(String, i32), ReadSetUploadPart>,
 }
 
 impl MultipartReadSetUpload {
     /// `tags` as the wire shapes want it: omitted when none were ever set.
     pub fn tags_output(&self) -> Option<HashMap<String, String>> {
         tags_output(&self.tags)
+    }
+
+    /// Every part uploaded from `part_source`, in ascending part-number order.
+    pub fn parts_from<'a>(
+        &'a self,
+        part_source: &'a str,
+    ) -> impl Iterator<Item = &'a ReadSetUploadPart> + 'a {
+        self.parts
+            .iter()
+            .filter(move |((source, _), _)| source == part_source)
+            .map(|(_, part)| part)
+    }
+
+    /// The bytes every part of this upload holds together.
+    pub fn held_bytes(&self) -> usize {
+        self.parts.values().map(|part| part.payload.len()).sum()
+    }
+}
+
+/// One part uploaded into a multipart read set upload: every member
+/// `ListReadSetUploadParts` reports for it, plus the bytes the caller sent.
+///
+/// The content is kept, not just measured: the part's size and checksum are read off
+/// these bytes, and the read set a completed upload forms is the content of its parts.
+#[derive(Debug, Clone, Default)]
+pub struct ReadSetUploadPart {
+    pub part_number: i32,
+    pub part_source: String,
+    /// The part's content, exactly as the request carried it.
+    pub payload: Vec<u8>,
+    /// The digest of [`ReadSetUploadPart::payload`], from [`read_set_part_checksum`].
+    pub checksum: String,
+    /// When this part number was FIRST uploaded, in epoch millis: a part that replaces
+    /// an earlier one keeps the instant the first upload of that number created.
+    pub creation_time_ms: i64,
+    /// When this part was last uploaded, in epoch millis — the same instant as
+    /// `creation_time_ms` until a later upload replaces it.
+    pub last_updated_time_ms: i64,
+}
+
+impl ReadSetUploadPart {
+    /// The part's size, as the modelled `partSize` (a `Long`) reports it: the length of
+    /// the content this part holds.
+    pub fn part_size(&self) -> i64 {
+        self.payload.len() as i64
     }
 }
 
@@ -1093,6 +1165,19 @@ impl ComAmazonawsOmicsOmicsState {
             .filter(move |(_, upload)| upload.sequence_store_id == sequence_store_id)
     }
 
+    /// The same record, for an operation that CHANGES the upload — above all the parts
+    /// it holds. One lookup rule for both, so a part write and a part read cannot
+    /// disagree about which upload a pair of ids names.
+    pub fn multipart_read_set_upload_mut(
+        &mut self,
+        sequence_store_id: &str,
+        upload_id: &str,
+    ) -> Option<&mut MultipartReadSetUpload> {
+        self.multipart_read_set_uploads
+            .get_mut(&numeric_id(upload_id)?)
+            .filter(|upload| upload.sequence_store_id == sequence_store_id)
+    }
+
     /// The run cache the modelled `RunCacheId` `id` names, or `None`.
     pub fn run_cache(&self, id: &str) -> Option<&RunCache> {
         self.run_caches.get(&numeric_id(id)?)
@@ -1268,6 +1353,12 @@ pub const WORKFLOW_PAGE_TOKEN_TAG: &str = "wf_";
 
 /// The same, for `ListRunGroups`.
 pub const RUN_GROUP_PAGE_TOKEN_TAG: &str = "rg_";
+
+/// The same, for `ListReadSetUploadParts`. A part is keyed by its part NUMBER inside
+/// the one upload and source the request names, so that listing's token names the part
+/// number the next page resumes at; the tag is still distinct from every other, so no
+/// token can resume another listing's walk.
+pub const READ_SET_UPLOAD_PART_PAGE_TOKEN_TAG: &str = "rsup_";
 
 /// The same, for `ListWorkflowVersions`. A version is keyed by its NAME inside its
 /// workflow, so that listing's token names a name rather than a numeric id; the tag is
@@ -1454,6 +1545,20 @@ pub fn definition_digest(definition_zip: Option<&[u8]>) -> Option<String> {
     Some(hex::encode(sha2::Sha256::digest(zip)))
 }
 
+/// The checksum of one uploaded read set part: the content digest
+/// `UploadReadSetPart` answers with and `ListReadSetUploadParts` reports for that part.
+///
+/// SHA-256 over the part's bytes (the `sha2` crate — no hashing is written here),
+/// rendered as lowercase hex, exactly as [`definition_digest`] digests a workflow
+/// definition. It is computed from the content alone, so a caller that digests the bytes
+/// it sent gets the same value back and can confirm the part the service holds is the
+/// part it uploaded; re-uploading a part number with the same content yields the same
+/// checksum, and different content a different one.
+pub fn read_set_part_checksum(payload: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(payload))
+}
+
 /// Whether `account_id` names the one account this emulator serves
 /// (`engine::emulator_account_id()`).
 ///
@@ -1625,6 +1730,9 @@ pub enum AuditOutcome {
     SequenceStoreDeleted,
     /// A multipart read set upload was initiated and stored against a sequence store.
     MultipartReadSetUploadCreated,
+    /// A part was stored against a multipart read set upload, replacing whatever that
+    /// source and part number held before.
+    ReadSetUploadPartStored,
     /// A run cache was minted and stored.
     RunCacheCreated,
     /// A run group was minted and stored.
@@ -1666,6 +1774,7 @@ impl AuditOutcome {
             Self::SequenceStoreCreated => "sequence-store-created",
             Self::SequenceStoreDeleted => "sequence-store-deleted",
             Self::MultipartReadSetUploadCreated => "multipart-read-set-upload-created",
+            Self::ReadSetUploadPartStored => "read-set-upload-part-stored",
             Self::RunCacheCreated => "run-cache-created",
             Self::RunGroupCreated => "run-group-created",
             Self::ShareCreated => "share-created",

@@ -15,6 +15,8 @@
 mod multipart_read_set_uploads;
 #[path = "all/private_workflow_runs.rs"]
 mod private_workflow_runs;
+#[path = "all/read_set_upload_parts.rs"]
+mod read_set_upload_parts;
 #[path = "all/response_member_wire_form.rs"]
 mod response_member_wire_form;
 #[path = "all/resource_shares.rs"]

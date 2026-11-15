@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UploadReadSetPart
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UploadReadSetPart`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UploadReadSetPart::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Uploads one part of a read set into a multipart read set upload, replacing whatever
+//! that source and part number held before.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +159,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UploadReadSetPart` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UploadReadSetPartErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UploadReadSetPart"))
+        // `partNumber` (1..10000) and the `partSource` enum are modelled constraints the
+        // centralized walk has already refused anything outside of, so what is checked
+        // below is only what the model does not express: the part's own length, and that
+        // the upload it is written into is one this emulator holds.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            UploadReadSetPartErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics sequence store registry is unavailable".to_string(),
+            })
+        })?;
+
+        // A part carries content: the modelled `partSize` this part is listed with is a
+        // `Long` in 1..5368709120, so a zero-byte part has no size the model admits and
+        // is refused rather than stored as a part of size 0.
+        if input.payload.is_empty() {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::ValidationRefused,
+                None,
+            );
+            return Err(UploadReadSetPartErrorModeled::ValidationException(
+                ValidationException {
+                    message: "payload carries no bytes; an upload part must carry content"
+                        .to_string(),
+                },
+            )
+            .into());
+        }
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut registry = state.lock();
+        registry.settle(now_ms);
+
+        // A part is written INTO the sequence store the upload was initiated against, so
+        // there is nothing to write to until that store is one this emulator holds.
+        if registry.sequence_store(&input.sequence_store_id).is_none() {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.sequence_store_id),
+            );
+            return Err(UploadReadSetPartErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::SEQUENCE_STORE_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let part_bytes = input.payload.len();
+        let Some(upload) =
+            registry.multipart_read_set_upload_mut(&input.sequence_store_id, &input.upload_id)
+        else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.upload_id),
+            );
+            return Err(UploadReadSetPartErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::MULTIPART_READ_SET_UPLOAD_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A part is identified inside its upload by the source file it came from and its
+        // part number: uploading that pair again replaces the part the upload holds for
+        // it, so the bytes that part held are released rather than counted twice.
+        let key = (input.part_source.clone(), input.part_number);
+        let replaced = upload.parts.get(&key);
+        let held_after =
+            upload.held_bytes() - replaced.map_or(0, |part| part.payload.len()) + part_bytes;
+        if held_after > crate::state::MAX_READ_SET_UPLOAD_PART_BYTES {
+            let upload_id = upload.upload_id.clone();
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::QuotaExceeded,
+                Some(&upload_id),
+            );
+            return Err(
+                UploadReadSetPartErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "upload {upload_id} would hold {held_after} part bytes, more than \
+                             the {} this service accepts for one upload",
+                            crate::state::MAX_READ_SET_UPLOAD_PART_BYTES
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The checksum is read off the bytes this request carried, and the record keeps
+        // both the content and that checksum, so what a later read reports for this part
+        // is the part that was uploaded.
+        let checksum = crate::state::read_set_part_checksum(&input.payload);
+        // Replacing a part is not creating one: the part number keeps the instant it was
+        // first uploaded, and only its last-updated instant moves.
+        let creation_time_ms = replaced.map_or(now_ms, |part| part.creation_time_ms);
+        upload.parts.insert(
+            key,
+            crate::state::ReadSetUploadPart {
+                part_number: input.part_number,
+                part_source: input.part_source,
+                payload: input.payload,
+                checksum: checksum.clone(),
+                creation_time_ms,
+                last_updated_time_ms: now_ms,
+            },
+        );
+        let upload_id = upload.upload_id.clone();
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::ReadSetUploadPartStored,
+            Some(&upload_id),
+        );
+
+        Ok(UploadReadSetPartOutput { checksum })
     }
 }

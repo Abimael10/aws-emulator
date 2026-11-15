@@ -1801,3 +1801,16 @@ mod cloudtrail_iam_credential_write_audit;
 // this file: the `#[path]` is what points each declaration into `tests/all/`.
 // the test it explains; `all/appended_notes.rs` keeps the notes landings had appended here.
 // Three suites of this target pin the shape above rather than restating it:
+// lands past the declarations is `E0753` and compiles no suite of this target. With none in
+// the file, no merge of two landings can leave one there — which is how this file last
+// broke, after landings appended hundreds of re-typed copies of its header.
+// suite, sorted by name, and NO other line, so two branches landing at once insert two
+// lines in two places and have no prose to duplicate, re-word or mistype. The `#[path]` is
+// what points each declaration into `tests/all/`: this file is a test-target crate root,
+// where a bare `mod` would resolve to a sibling of it, which the layout check refuses.
+// What a suite covers, and why it drives the assembled router rather than one service
+// crate, belongs in that suite's own module header; a note about THIS file belongs in
+// `all/appended_notes.rs`. Four suites pin the rules rather than restating them here:
+// `all/all_rs_declares_each_suite_once.rs` (a second `mod` for one name is `E0428`),
+// `all/all_rs_is_a_canonical_declaration_list.rs` (one sorted pair per suite, nothing else)
+// and `all/every_suite_file_is_declared.rs`.

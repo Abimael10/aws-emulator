@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListReadSetUploadParts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListReadSetUploadParts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the parts uploaded into one multipart read set upload, for one source file.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListReadSetUploadParts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -132,6 +125,54 @@ impl From<ListReadSetUploadPartsErrorModeled> for ListReadSetUploadPartsError {
     }
 }
 
+/// A page token naming the part number the NEXT page starts at. The codec and the page
+/// bound are [`crate::state::encode_page_token`] / [`crate::state::decode_page_token`]
+/// and [`crate::state::MAX_LIST_PAGE_SIZE`], shared with this crate's other listings;
+/// this wrapper only renders an unreadable token as THIS operation's 400 refusal.
+fn decode_page_token(token: &str) -> Result<u64, ListReadSetUploadPartsError> {
+    crate::state::decode_page_token(crate::state::READ_SET_UPLOAD_PART_PAGE_TOKEN_TAG, token)
+        .ok_or_else(|| {
+            ListReadSetUploadPartsErrorModeled::ValidationException(ValidationException {
+                message: "nextToken is not a pagination token issued by ListReadSetUploadParts"
+                    .to_string(),
+            })
+            .into()
+        })
+}
+
+/// One stored part as this listing's item: every member `ReadSetUploadPartListItem`
+/// models, read from that record alone, so the size and checksum reported here are the
+/// ones taken from the bytes `UploadReadSetPart` stored.
+fn reported(part: &crate::state::ReadSetUploadPart) -> ReadSetUploadPartListItem {
+    ReadSetUploadPartListItem {
+        part_number: part.part_number,
+        part_size: part.part_size(),
+        part_source: part.part_source.clone(),
+        checksum: part.checksum.clone(),
+        creation_time: Some(crate::state::timestamp(part.creation_time_ms)),
+        last_updated_time: Some(crate::state::timestamp(part.last_updated_time_ms)),
+    }
+}
+
+/// Whether `created_at_ms` falls inside the window `filter` names.
+///
+/// Each bound is inclusive and either may be absent, which bounds that side not at all:
+/// a filter that names neither selects every part.
+fn within(filter: Option<&ReadSetUploadPartListFilter>, created_at_ms: i64) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let after = filter
+        .created_after
+        .as_ref()
+        .is_none_or(|after| after.to_millis().is_ok_and(|ms| ms <= created_at_ms));
+    let before = filter
+        .created_before
+        .as_ref()
+        .is_none_or(|before| before.to_millis().is_ok_and(|ms| ms >= created_at_ms));
+    after && before
+}
+
 /// The `ListReadSetUploadParts` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -168,18 +209,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListReadSetUploadParts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListReadSetUploadPartsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListReadSetUploadParts"))
+        // Every branch below records the call through `crate::state::audit`. A listing
+        // resolves no single resource, so its records carry
+        // `crate::state::AUDIT_NO_RESOURCE` once the upload it reads has resolved.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            ListReadSetUploadPartsErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics sequence store registry is unavailable".to_string(),
+            })
+        })?;
+
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_LIST_PAGE_SIZE, |requested| {
+                requested.clamp(1, crate::state::MAX_LIST_PAGE_SIZE as i32) as usize
+            });
+        let start = match input.next_token.as_deref().map(decode_page_token) {
+            Some(Err(refusal)) => {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::ValidationRefused,
+                    None,
+                );
+                return Err(refusal);
+            }
+            Some(Ok(start)) => start,
+            None => 0,
+        };
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut registry = state.lock();
+        registry.settle(now_ms);
+
+        // The parts of an upload are read through the store the upload was initiated
+        // against, so neither id resolving is "not found" rather than an empty listing.
+        if registry.sequence_store(&input.sequence_store_id).is_none() {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.sequence_store_id),
+            );
+            return Err(
+                ListReadSetUploadPartsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::SEQUENCE_STORE_NOT_FOUND_MESSAGE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+        let Some(upload) =
+            registry.multipart_read_set_upload(&input.sequence_store_id, &input.upload_id)
+        else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.upload_id),
+            );
+            return Err(
+                ListReadSetUploadPartsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::MULTIPART_READ_SET_UPLOAD_NOT_FOUND_MESSAGE
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut parts = Vec::with_capacity(page_size.min(upload.parts.len()));
+        let mut next_token = None;
+        // A token names a part NUMBER, which the model bounds at 10000, so one naming a
+        // number no part can carry resumes past every part rather than wrapping.
+        let start_number = i32::try_from(start).unwrap_or(i32::MAX);
+        // One source file's parts, in ascending part-number order, so the walk is stable
+        // across calls and a token simply names the part number the next page resumes at.
+        for part in upload.parts_from(&input.part_source) {
+            if part.part_number < start_number {
+                continue;
+            }
+            if !within(input.filter.as_ref(), part.creation_time_ms) {
+                continue;
+            }
+            // The first part that does not fit becomes the next page's start, and only
+            // then is a `nextToken` emitted — the last page carries none.
+            if parts.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(
+                    crate::state::READ_SET_UPLOAD_PART_PAGE_TOKEN_TAG,
+                    u64::from(part.part_number.unsigned_abs()),
+                ));
+                break;
+            }
+            parts.push(reported(part));
+        }
+
+        crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::Reported, None);
+
+        Ok(ListReadSetUploadPartsOutput {
+            parts: Some(parts),
+            next_token,
+        })
     }
 }
