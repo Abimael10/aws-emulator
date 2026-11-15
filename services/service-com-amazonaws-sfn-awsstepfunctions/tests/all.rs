@@ -203,6 +203,8 @@ mod refused_invocation_series;
 mod resource_tags;
 #[path = "all/response_request_id.rs"]
 mod response_request_id;
+#[path = "all/retry_delay_jitter.rs"]
+mod retry_delay_jitter;
 #[path = "all/role_log_and_key_authorization.rs"]
 mod role_log_and_key_authorization;
 #[path = "all/run_a_job_pattern_calls.rs"]

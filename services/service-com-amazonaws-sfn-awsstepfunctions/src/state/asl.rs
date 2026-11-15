@@ -162,6 +162,7 @@
 //! rather than the sum.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Map, Value};
@@ -886,6 +887,13 @@ const CONTINUING_STATE_TYPES: &[&str] = &["Map", "Parallel", "Pass", "Task", "Wa
 const DEFAULT_RETRY_INTERVAL_SECONDS: f64 = 1.0;
 const DEFAULT_RETRY_MAX_ATTEMPTS: u64 = 3;
 const DEFAULT_RETRY_BACKOFF_RATE: f64 = 2.0;
+
+/// The `JitterStrategy` value that SPREADS a retrier's waits out: "If you choose FULL,
+/// the wait time between retries will be a random number between 0 and the computed
+/// wait time" — the computed wait being the one `MaxDelaySeconds` has already capped.
+/// The member's other value is its own documented default, `NONE`, which waits the
+/// computed time itself.
+const JITTER_STRATEGY_FULL: &str = "FULL";
 
 /// The members each executed state type may carry. A state that carries any other
 /// member is not executed: the member changes what the state does, and running the
@@ -3700,7 +3708,9 @@ fn finite_seconds(retrier: &Map<String, Value>, member: &str) -> Option<f64> {
 
 /// How long a retrier waits before the attempt after `taken` ones:
 /// "IntervalSeconds" scaled by "BackoffRate" once per attempt already taken, capped
-/// by `MaxDelaySeconds` where the retrier declares one.
+/// by `MaxDelaySeconds` where the retrier declares one, and — where it asks for full
+/// jitter — drawn uniformly from zero up to that capped figure
+/// ([`jittered_seconds`]).
 ///
 /// The product is of two numbers the definition chose, so it can overflow to infinity
 /// (or to NaN, when a zero interval meets an infinite backoff). A wait no longer than
@@ -3717,11 +3727,58 @@ fn retry_delay_seconds(retrier: &Map<String, Value>, taken: u64) -> f64 {
     if let Some(cap) = finite_seconds(retrier, "MaxDelaySeconds") {
         delay = delay.min(cap);
     }
-    if delay.is_finite() {
+    let computed = if delay.is_finite() {
         delay.clamp(0.0, MAX_WAIT_SECONDS as f64)
     } else {
         MAX_WAIT_SECONDS as f64
+    };
+    if jitters_fully(retrier) {
+        jittered_seconds(computed)
+    } else {
+        computed
     }
+}
+
+/// Whether `retrier` asks for full jitter on the waits between its attempts, which is
+/// what its `JitterStrategy` names ([`JITTER_STRATEGY_FULL`]).
+///
+/// A retrier that declares no strategy — or any other one — keeps the computed wait,
+/// because `NONE` is the member's documented default.
+fn jitters_fully(retrier: &Map<String, Value>) -> bool {
+    retrier
+        .get("JitterStrategy")
+        .and_then(Value::as_str)
+        .is_some_and(|strategy| strategy == JITTER_STRATEGY_FULL)
+}
+
+/// One wait drawn uniformly from `[0, computed]` seconds, which is what a retrier
+/// asking for full jitter waits instead of `computed` itself.
+///
+/// Jitter only ever SHORTENS a wait: the draw is bounded above by the figure the
+/// retrier's own arithmetic reached, so a capped delay stays capped. A `computed` of
+/// zero — or one that is somehow no usable number — draws nothing, since there is no
+/// span to spread the wait over.
+fn jittered_seconds(computed: f64) -> f64 {
+    if !computed.is_finite() || computed <= 0.0 {
+        return 0.0;
+    }
+    // The 53 bits a double carries exactly, as a fraction in [0, 1).
+    let fraction = (jitter_draw() >> 11) as f64 / (1_u64 << 53) as f64;
+    (computed * fraction).clamp(0.0, computed)
+}
+
+/// The counter behind [`jittered_seconds`]' draws: what makes two draws in the same
+/// nanosecond differ, exactly as it does for every id the store mints.
+static JITTER_DRAWS: AtomicU64 = AtomicU64::new(0);
+
+/// One draw from the generator every value this service samples comes from
+/// ([`super::splitmix64`]), seeded from the process clock mixed with the count of
+/// draws already made. The draw spreads waits apart rather than keeping anything
+/// secret, so the mixer's own non-cryptographic quality is what it needs.
+fn jitter_draw() -> u64 {
+    let drawn = JITTER_DRAWS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    let mut seed = super::now_nanos() ^ drawn.rotate_left(29);
+    super::splitmix64(&mut seed)
 }
 
 /// Which retrier of the `Task` state `state_name` of `definition` retries an activity

@@ -3495,8 +3495,9 @@ impl Interpreter<'_> {
                 }
                 // The delay is already clamped finite and inside
                 // [`MAX_WAIT_SECONDS`] by [`retry_delay_seconds`], whatever a
-                // definition writes in `IntervalSeconds`, `BackoffRate` and
-                // `MaxDelaySeconds`. The conversion and the accumulation are
+                // definition writes in `IntervalSeconds`, `BackoffRate`,
+                // `MaxDelaySeconds` and `JitterStrategy`. The conversion and the
+                // accumulation are
                 // nevertheless written so NEITHER can panic: a caller-sized figure
                 // must not be able to take the process down, so a delay that somehow
                 // left that range waits no time at all and the offset saturates

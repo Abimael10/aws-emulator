@@ -691,7 +691,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// "Retry […] an array of objects, called retriers": the first retrier whose
     /// `ErrorEquals` names the error decides, it makes at most its own `MaxAttempts`
     /// attempts, and the next one is due `IntervalSeconds` scaled by `BackoffRate`
-    /// once per attempt already taken and capped by `MaxDelaySeconds` after the
+    /// once per attempt already taken, capped by `MaxDelaySeconds` and — under a
+    /// `JitterStrategy` of `FULL` — drawn uniformly from zero up to that capped
+    /// figure, after the
     /// failure ([`asl::activity_retry`]).
     ///
     /// The attempt that failed is CLOSED: its token answers nothing afterwards, so the
