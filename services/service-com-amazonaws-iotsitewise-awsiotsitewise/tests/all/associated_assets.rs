@@ -468,12 +468,16 @@ async fn unresolvable_labels_and_tokens_are_modelled_refusals() {
             // error (400), never a silently-defaulted direction. The shared validation
             // layer refuses it before this handler runs, so the handler's own
             // `InvalidRequestException` branch is the belt-and-braces path.
+            //
+            // The refusal names the MEMBER and the value set it had to satisfy: this
+            // service's request-validation report states no rejected value, so the
+            // identifier a row of this table looks for is the member path.
             case: "traversalDirection outside the modelled enum",
             asset: fixture.parent.clone(),
             query: "traversalDirection=SIBLING".to_string(),
             status: 400,
             code: None,
-            names: Some("SIBLING".to_string()),
+            names: Some("traversalDirection".to_string()),
         },
     ];
 

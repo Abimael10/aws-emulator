@@ -241,6 +241,13 @@ impl ServerProtocol for UnsetStringMembersRestJson {
         // The REQUEST side is the framework's own: the rule is about what a read
         // reports, and a request carrying a value outside a member's `@length` is
         // refused by the validating walk rather than quietly dropped here.
+        //
+        // This is also the one place a request's INPUT SHAPE is in hand, so what that
+        // shape declares is recorded here for the refusal the walk may produce: the
+        // walk cannot apply an expression written with look-around, and a clause
+        // stated at a collection member lists the element shape's whole constraint
+        // set, which no violation carries (`super::input_shape`).
+        super::input_shape::reading_input(input_schema);
         self.inner.deserialize_input(request, input_schema)
     }
 

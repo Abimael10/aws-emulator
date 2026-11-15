@@ -340,20 +340,35 @@ fn hex_run(length: usize) -> String {
     "a".repeat(length)
 }
 
-/// How the boundary validator words one broken length bound, as AWS words it.
-fn length_refusal(value: &str, member: &str, relation: &str, bound: usize) -> String {
+/// One clause of the report a broken length bound is stated with, as AWS words it:
+/// the member and the requirement, and no value.
+fn length_clause(member: &str, relation: &str, bound: usize) -> String {
     format!(
-        "1 validation error detected: Value '{value}' at '{member}' failed to satisfy \
-         constraint: Member must have length {relation} {bound}"
+        "Value at '{member}' failed to satisfy constraint: Member must have length \
+         {relation} {bound}"
     )
 }
 
-/// The same for one broken pattern.
-fn pattern_refusal(value: &str, member: &str, pattern: &str) -> String {
+/// The same for one broken pattern, quoting the expression the member's shape
+/// publishes.
+fn pattern_clause(member: &str, pattern: &str) -> String {
     format!(
-        "1 validation error detected: Value '{value}' at '{member}' failed to satisfy \
-         constraint: Member must satisfy regular expression pattern: {pattern}"
+        "Value at '{member}' failed to satisfy constraint: Member must satisfy regular \
+         expression pattern: {pattern}"
     )
+}
+
+/// The whole report over the clauses one request incurred: the envelope counts them,
+/// and a member that broke several of its requirements states the expression first.
+fn report(clauses: &[String]) -> String {
+    match clauses {
+        [one] => format!("1 validation error detected: {one}"),
+        many => format!(
+            "{} validation errors detected: {}",
+            many.len(),
+            many.join("; ")
+        ),
+    }
 }
 
 /// How this service states an absence, written out by hand.
@@ -367,14 +382,25 @@ fn absent(kind: &str, identifier: &str) -> String {
 /// `^(0|([1-9]{1}\d*))$`.
 const VERSION_PATTERN: &str = r"^(0|([1-9]{1}\d*))$";
 
+/// The pattern `ID` publishes — what `datasetId` targets.
+///
+/// Source: `smithy_query(query="shape", shape="ID")` — len 36..36, a non-nil
+/// lowercase-hexadecimal UUID. Written out BY HAND here as the oracle; the boundary
+/// applies it with a look-around-capable engine, because the expression opens with
+/// the negative lookahead that excludes the nil UUID.
+const ID_PATTERN: &str = r"^(?!00000000-0000-0000-0000-000000000000)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
+
 /// The refusal rows, over the request members `DescribeDataset` carries.
 ///
 /// The bounds come from `smithy_query(query="operation",
-/// operation="DescribeDataset")`: `datasetId` (`ID`, len 36..36),
+/// operation="DescribeDataset")`: `datasetId` (`ID`, len 36..36, a non-nil UUID),
 /// `datasetVersion` (`Version`, len 1..10, pattern `^(0|([1-9]{1}\d*))$`) and
-/// `workspaceName` (`WorkspaceName`, len 1..64). Each length bound is walked one
-/// character PAST each published end, and the pattern both one value it refuses
-/// and one carrying a character outside its alphabet.
+/// `workspaceName` (`WorkspaceName`, len 1..64, pattern `^[a-zA-Z0-9_-]+$`). Each
+/// length bound is walked one character PAST each published end, and the pattern
+/// both one value it refuses and one carrying a character outside its alphabet. A
+/// value that breaks its member's EXPRESSION as well as its length is reported with
+/// both clauses, which is what a `datasetId` of the wrong length is: a run of
+/// hexadecimal digits is no UUID.
 fn refusals(held: &str) -> Vec<Refusal> {
     let short_id = hex_run(35);
     let long_id = hex_run(37);
@@ -386,47 +412,52 @@ fn refusals(held: &str) -> Vec<Refusal> {
             uri: describe_uri(&short_id, None, None),
             status: 400,
             code: "InvalidRequestException",
-            message: length_refusal(&short_id, "datasetId", "greater than or equal to", 36),
+            message: report(&[
+                pattern_clause("datasetId", ID_PATTERN),
+                length_clause("datasetId", "greater than or equal to", 36),
+            ]),
         },
         Refusal {
             label: "a datasetId one character over its published length",
             uri: describe_uri(&long_id, None, None),
             status: 400,
             code: "InvalidRequestException",
-            message: length_refusal(&long_id, "datasetId", "less than or equal to", 36),
+            message: report(&[
+                pattern_clause("datasetId", ID_PATTERN),
+                length_clause("datasetId", "less than or equal to", 36),
+            ]),
         },
         Refusal {
             label: "a datasetVersion one character over its published length",
             uri: describe_uri(held, None, Some(&long_version)),
             status: 400,
             code: "InvalidRequestException",
-            message: length_refusal(&long_version, "datasetVersion", "less than or equal to", 10),
+            message: report(&[length_clause(
+                "datasetVersion",
+                "less than or equal to",
+                10,
+            )]),
         },
         Refusal {
             label: "a datasetVersion carrying a leading zero, which its pattern refuses",
             uri: describe_uri(held, None, Some("01")),
             status: 400,
             code: "InvalidRequestException",
-            message: pattern_refusal("01", "datasetVersion", VERSION_PATTERN),
+            message: report(&[pattern_clause("datasetVersion", VERSION_PATTERN)]),
         },
         Refusal {
             label: "a datasetVersion outside the digits its pattern admits",
             uri: describe_uri(held, None, Some("x")),
             status: 400,
             code: "InvalidRequestException",
-            message: pattern_refusal("x", "datasetVersion", VERSION_PATTERN),
+            message: report(&[pattern_clause("datasetVersion", VERSION_PATTERN)]),
         },
         Refusal {
             label: "a workspaceName one character over its published length",
             uri: describe_uri(held, Some(&long_workspace), None),
             status: 400,
             code: "InvalidRequestException",
-            message: length_refusal(
-                &long_workspace,
-                "workspaceName",
-                "less than or equal to",
-                64,
-            ),
+            message: report(&[length_clause("workspaceName", "less than or equal to", 64)]),
         },
         Refusal {
             label: "a well-formed datasetId no create minted",

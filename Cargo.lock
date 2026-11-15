@@ -15055,6 +15055,7 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "evalexpr",
+ "fancy-regex 0.16.2",
  "hex",
  "http",
  "mp4",

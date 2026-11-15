@@ -46,9 +46,18 @@
 //! A sixth seam, `override_protocol`, is one this service DOES take: the codec every
 //! modelled response is rendered through omits a string member whose stored value is
 //! unset instead of reporting it as the empty string — see [`unset_string_members`]
-//! for that rule and why it cannot live in a generated shape.
+//! for that rule and why it cannot live in a generated shape. That same seam records
+//! what the input shape each request is read against declares, which is what lets the
+//! refusal below state a requirement the framework's own walk cannot apply and the
+//! constraint set a clause at a collection member lists ([`input_shape`]).
+//!
+//! The WORDS of a constraint refusal are [`validation`]'s, this service's one home
+//! for them.
 
+mod input_shape;
+mod unapplied_patterns;
 mod unset_string_members;
+pub mod validation;
 
 use crate::ops::invoke_assistant::InvokeAssistant;
 use service_common::event_stream::EventStreamRoute;
@@ -151,33 +160,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        match refusal {
-            // A value outside a declared `@length`/`@range`/`@pattern`, or an
-            // absent required member: IoT SiteWise states all of these as
-            // [`INVALID_REQUEST`], which is both a modelled shape of this service
-            // and a 400, the same status the framework renders a refusal with.
-            //
-            // EVERY `Invalid` refusal is restated, with no fall-through: a refusal
-            // this service declines to word would be rendered with the framework's
-            // default code, `ValidationException`, which names no shape of this
-            // model — exactly the answer this seam exists to remove.
-            //
-            // Only the CODE is restated. The message keeps the framework's
-            // wording, which is the AWS request-validation envelope naming the
-            // member and the constraint it failed (`1 validation error detected:
-            // Value ... at 'tags' failed to satisfy constraint: Member must have
-            // length less than or equal to 50`) — the rule the caller has to fix.
-            // `envelope` answers `None` only for an empty violation list, which
-            // carries no member to name, so that one case states the class alone.
-            Refusal::Invalid(violations) => Some(Refused {
-                code: INVALID_REQUEST.to_string(),
-                message: ::aws_smithy_schema_server::envelope(violations)
-                    .unwrap_or_else(|| "The request isn't valid.".to_string()),
-            }),
-            // An authentication refusal is the emulator's, not this service's:
-            // keep the framework's 403 wording.
-            _ => None,
-        }
+        // A value outside a declared `@length`/`@range`/`@pattern`, a value outside
+        // an enumerated type, or an absent required member: IoT SiteWise states all
+        // of these as [`INVALID_REQUEST`], which is both a modelled shape of this
+        // service and a 400, the same status the framework renders a refusal with.
+        //
+        // Both halves of the answer — the code and the AWS request-validation
+        // report naming every member and the requirement it broke — are
+        // [`validation`]'s, the one home for this service's refusal words, so no
+        // operation and no seam can word the same refusal another way. An
+        // authentication refusal keeps the framework's 403 wording.
+        validation::refused(refusal)
     }
 
     fn override_routing_error(

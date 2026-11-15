@@ -48,6 +48,10 @@ sqlparser = "0.59"
 # Pinned below 12 deliberately: 11.3.1 is MIT, and 12 relicensed to AGPL-3.0-only.
 # No advisory is published against this crate at this version.
 evalexpr = { version = "11.3", default-features = false }
+# Applies the modelled `@pattern` of a `CustomID` reference, which is written with
+# the negative look-ahead the `regex` crate behind `@pattern` cannot compile, so the
+# boundary would otherwise never apply it (`src/service/unapplied_patterns.rs`).
+fancy-regex = "0.16"
 # `iso8601_span`: the ISO 8601 duration a tumbling window's interval and offset
 # may be spelled as, read through the workspace's one maintained reading of that
 # grammar rather than a second one here.

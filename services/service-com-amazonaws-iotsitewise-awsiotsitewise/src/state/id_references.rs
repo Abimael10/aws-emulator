@@ -16,25 +16,27 @@
 //! The framework's constraint walk cannot state that half of the rule. Its
 //! `@pattern` check compiles the expression with the `regex` crate, whose syntax
 //! has no negative lookahead — the one `CustomID` opens with, to exclude the nil
-//! UUID — and an expression it cannot compile is treated as matching. So the
-//! length bound is enforced at the boundary and the reference form is not,
-//! which is why the operations that resolve such a label ask [`custom_id_clause`]
-//! for themselves before they look anything up.
+//! UUID — and an expression it cannot compile is treated as matching. The BOUNDARY
+//! applies it anyway, over the members the input shape declares directly
+//! (`crate::service::unapplied_patterns`), so a request it refuses for another
+//! reason states this requirement beside that one; what the boundary cannot reach
+//! is a member nested inside a structure or a collection element, whose constraints
+//! codegen does not put on the input shape's schema. So the operations that resolve
+//! such a label ask [`custom_id_clause`] for themselves, which is also what states
+//! the requirement for a request whose ONLY fault is the reference form.
 //!
 //! The refusal is the framework's own request-validation report, assembled
 //! through `service_common::validation_message` so this service's clauses and
 //! envelope are the ones every other member's refusal carries: the clause names
 //! the member and the expression it had to satisfy, and states no value (the
-//! dialect IoT SiteWise refuses in).
+//! dialect IoT SiteWise refuses in, `crate::service::validation`).
 //!
 //! The STRUCTURAL fix is at the boundary rather than here: the walk fails OPEN
-//! for every member whose `@pattern` it cannot compile, so a rule applied from
-//! the model would cover every `CustomID` member of this service at once instead
-//! of being asked for per operation. That belongs to the open issue
-//! `20261103T025010Z-iotsitewise-validation-messages-quote-the-rejected-value-aws-omits.md`,
-//! whose own recorded refusals require the boundary to state this very clause
-//! beside the length clause of one member; the operations below ask for it
-//! themselves until that lands.
+//! for every member whose `@pattern` it cannot compile, and
+//! `crate::service::unapplied_patterns` applies the model's own expression there
+//! instead, for every member of an input shape at once. What is left here is the
+//! reference form of a member the boundary cannot see and of a request carrying no
+//! other fault, which the operations below ask for themselves.
 
 use ::aws_smithy_schema_server::{Violation, ViolationKind};
 use ::service_common::validation_message::{envelope_over, valueless_clause};
@@ -138,15 +140,14 @@ pub fn custom_id_clause(member_path: &str, label: &str) -> Option<String> {
     }
     let violation = Violation {
         path: member_path.to_string(),
-        // A `@pattern` is a FIND rather than a whole-value match, and this
-        // service's refusals quote the expression with the anchor that CLOSES
-        // the match dropped while every anchor the expression writes around its
-        // own branches stays as declared. That rendering is one of the dialects
-        // `service_common::validation` owns, the shared home of this family, so
-        // the rule is not spelled a second time here.
-        kind: ViolationKind::Pattern(
-            ::service_common::validation::unanchored_at_the_close(CUSTOM_ID_PATTERN),
-        ),
+        // A `@pattern` is a FIND rather than a whole-value match, and the
+        // expression a refusal quotes is the one this service PUBLISHES for the
+        // member's shape — `crate::service::validation::published_expression`, the
+        // one home for that rendering, so a clause this states and one the boundary
+        // states quote the same expression.
+        kind: ViolationKind::Pattern(crate::service::validation::published_expression(
+            CUSTOM_ID_PATTERN,
+        )),
         // The clause states no value; the echo is what `valueless_clause` strips.
         value: Some(label.to_string()),
         sensitive: false,
