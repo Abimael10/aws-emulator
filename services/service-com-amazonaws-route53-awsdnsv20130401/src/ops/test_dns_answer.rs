@@ -103,13 +103,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::state::client_location::{self, ClientLocation};
 use crate::state::{
-    canonical_dns_name, name_is_in_zone, no_such_hosted_zone, normalize_zone_id,
+    canonical_dns_name, dns_name_address, name_is_in_zone, no_such_hosted_zone, normalize_zone_id,
     ComAmazonawsRoute53Awsdnsv20130401State, StoredZone,
 };
 
@@ -163,6 +163,17 @@ const DEFAULT_CIDR_LOCATION: &str = "*";
 /// primary resource record set regardless of the health of the secondary
 /// resource record set."
 const FAILOVER_PRIMARY: &str = "PRIMARY";
+
+/// The `RRType` whose record data is an IPv4 address.
+///
+/// `RRType`'s own value set names the types a record set may carry; `A` is the
+/// one whose data is an IPv4 address, which is what an alias to an address is
+/// answered with ([`address_record_data`]).
+const RR_TYPE_A: &str = "A";
+
+/// The `RRType` whose record data is an IPv6 address (same value set as
+/// [`RR_TYPE_A`]).
+const RR_TYPE_AAAA: &str = "AAAA";
 
 /// The most record sets a multivalue answer query is answered from.
 ///
@@ -533,6 +544,11 @@ fn answering_members<'a>(
 /// it lands in. The work of one answer is therefore the chain's length, bounded
 /// by [`MAX_ALIAS_HOPS`], and a hop that returns to a (zone, name, type) this
 /// walk already resolved ends it, so a cycle costs one pass rather than looping.
+///
+/// An alias target that names an ADDRESS rather than a name ends the walk at that
+/// address ([`address_record_data`]): there is no further name to resolve, and
+/// "an IP address … for the … resource" is the very answer `RecordDataEntry`
+/// documents for an alias to an Amazon Web Services resource.
 fn record_data<'a>(
     store: &'a ComAmazonawsRoute53Awsdnsv20130401State,
     record: &'a ResourceRecordSet,
@@ -552,6 +568,12 @@ fn record_data<'a>(
                 .map(|resource_record| resource_record.value.clone())
                 .collect();
         };
+        // An address is where the walk ENDS, whichever hosted zone the target
+        // names: an address resolves to itself, so there is no record set behind
+        // it to read a value from.
+        if let Some(address) = dns_name_address(&alias.dns_name) {
+            return address_record_data(address, current.r#type.as_str());
+        }
         let target_name = canonical_dns_name(&alias.dns_name);
         let target_zone_id = normalize_zone_id(&alias.hosted_zone_id);
         let Some(target_zone) = store.zones.get(target_zone_id) else {
@@ -570,6 +592,29 @@ fn record_data<'a>(
     }
     // A chain longer than the bound answers with nothing rather than with a
     // value from halfway down it.
+    Vec::new()
+}
+
+/// The record data a query of type `rr_type` is answered with by an alias whose
+/// target names `address`: the address itself when the query asks for the type
+/// that address is record data OF, and nothing at all otherwise.
+///
+/// `RRType`'s own documentation pairs each type with the data it carries, and an
+/// address is the record data of exactly one of them — `A` for an IPv4 address,
+/// `AAAA` for an IPv6 one (which is also how `ChangeResourceRecordSets` judges a
+/// submitted value of either type). So a query of the OTHER address family, and a
+/// query for a type whose record data is not an address at all, is answered with
+/// no record data rather than with a value that is not of the type asked for: the
+/// name exists, the type does not, which is the "no answer" the enclosing
+/// response code already states.
+fn address_record_data(address: IpAddr, rr_type: &str) -> Vec<String> {
+    let answered = matches!(
+        (rr_type, address),
+        (RR_TYPE_A, IpAddr::V4(_)) | (RR_TYPE_AAAA, IpAddr::V6(_))
+    );
+    if answered {
+        return vec![address.to_string()];
+    }
     Vec::new()
 }
 

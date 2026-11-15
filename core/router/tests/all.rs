@@ -1436,3 +1436,5 @@ mod zz_probe_whole_emulator;
 // one this target needs stands in the header above rather than in the list below.
 #[path = "all/eks_nodegroup_nodes_join_the_cluster_api.rs"]
 mod eks_nodegroup_nodes_join_the_cluster_api;
+#[path = "all/apigateway_custom_domain_dns_alias.rs"]
+mod apigateway_custom_domain_dns_alias;

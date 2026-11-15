@@ -13,6 +13,10 @@
 // points it into `tests/all/`.
 #[path = "all/account_limits.rs"]
 mod account_limits;
+// Declared beside the answering suites: this one is what an alias whose target
+// names an ADDRESS rather than a host is answered with.
+#[path = "all/alias_address_answers.rs"]
+mod alias_address_answers;
 #[path = "all/checker_ip_ranges.rs"]
 mod checker_ip_ranges;
 #[path = "all/cidr_collections.rs"]

@@ -7,6 +7,38 @@ Issue-Commit: b99723d2552fb1e14ee46a597822867680795a41
 
 # acm__apigateway: a REGIONAL custom domain's data plane never becomes observable — the ISSUED-certificate presentation leg reaches no verdict and the check is killed at the 60 s cap
 
+## Resolution
+
+The BLOCKING loop this report identifies — candidate (a), "a Route 53 ALIAS whose DNSName target
+is a host:port authority rather than a DNS host resolves no IPv4 A record, so the TestDNSAnswer
+poll never returns an address" — is FIXED, and the custom domain's data plane is reachable at the
+address Route 53 now answers with:
+
+* `TestDNSAnswer` resolves an alias whose target names an ADDRESS to that address
+  (`services/service-com-amazonaws-route53-awsdnsv20130401/src/ops/test_dns_answer.rs`,
+  `src/state.rs::dns_name_address`): an `A` query is answered with an IPv4 address, an `AAAA`
+  query with an IPv6 one, and the port a data plane is dialled on is no part of the answer.
+  Pinned by `tests/all/alias_address_answers.rs` in that crate.
+* The address really is the custom domain's front door: `core/router/tests/all/apigateway_custom_domain_dns_alias.rs`
+  creates a REGIONAL custom domain, aliases it from a hosted zone exactly as a client does,
+  resolves the alias through `TestDNSAnswer` and dials what came back — the front door there
+  answers `403` for a Host no base path mapping covers.
+* The TLS half of that front door — the leaf `regionalCertificateArn` names, selected by
+  `ClientHello` SNI, the `securityPolicy` floor and the mutual-TLS contract — was already served
+  by `services/service-com-amazonaws-apigateway-backplanecontrolservice/src/service/custom_domain_socket.rs`
+  and is pinned by that crate's `tests/all/regional_custom_domain_front_door.rs`.
+
+What REMAINS for this check, and it is not these service crates' to serve: the check dials the
+resolved address on the port `https` implies (443), while an `A` record carries an address and no
+port. `Listeners::tcp_plaintext` (`vendor/server/src/listeners.rs`, binding through
+`bind_tokio`/`bind_std`) takes no requested port — it binds an OS-assigned port inside
+`EMULATOR_LISTENER_PORT_RANGE` — and the core's TLS presents the one process certificate with no
+per-connection certificate resolver (`vendor/server/src/tls_certificate_authority.rs`), so neither
+can the custom domain's front door answer on 443 nor can the emulator's data port present that
+domain's ACM leaf. It needs the core listener API to accept a port (the same core gap recorded for
+the RDS engine endpoints in
+`issues/things-that-now-work/20261104T154127Z-rds-the-aurora-cluster-endpoint-admits-no-sql-session.md`).
+
 > _Note: this issue was identified against the code base at commit `b99723d2552fb1e14ee46a597822867680795a41`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

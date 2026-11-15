@@ -2783,6 +2783,48 @@ pub fn canonical_dns_name(name: &str) -> String {
     canonical
 }
 
+/// The ADDRESS a `DNSName` names, when it names one rather than a domain name —
+/// and `None` for every name that names a host.
+///
+/// An alias target is "the DNS domain name for another resource with which you
+/// want to route traffic to", and the resource a target names may be addressed
+/// by an ADDRESS rather than by a name: a data plane this emulator serves is
+/// reached at the `host:port` the service that opened it published, so that is
+/// what a record set aliasing it carries. An address is not a name, so what a
+/// query for it is answered with is the address itself, and the port is no part
+/// of a DNS answer.
+///
+/// The name is read in PRESENTATION form through the same label parse every other
+/// name in this store is identified by ([`canonical_dns_name`]), so the stored
+/// canonical spelling of an address — where every octet outside the plain set,
+/// the `:` of a port and the `[`/`]` of an IPv6 literal included, is an octal
+/// escape code — names the same address the caller submitted. The host is taken
+/// off the authority by the one shared reading of how a client addresses a data
+/// plane (`service_common::data_plane_addressing::host_only`), so an address with
+/// a port and the same address without one are read alike.
+pub fn dns_name_address(name: &str) -> Option<::std::net::IpAddr> {
+    let labels = dns_labels(name);
+    if labels.is_empty() {
+        return None;
+    }
+    let text: String = labels
+        .iter()
+        .map(|label| String::from_utf8_lossy(label).into_owned())
+        .collect::<Vec<String>>()
+        .join(".");
+    // An address written with no port at all, an IPv6 literal above all: its own
+    // colons are not a port separator, so it is parsed before the authority is
+    // split on one.
+    if let Ok(address) = text.parse::<::std::net::IpAddr>() {
+        return Some(address);
+    }
+    let host = ::service_common::data_plane_addressing::host_only(&text);
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()
+}
+
 /// A DNS name in the canonical WIRE form a DNSSEC digest is computed over: each
 /// label's octet count followed by the label's own octets, lower-cased, ended by
 /// the zero-length root label.
