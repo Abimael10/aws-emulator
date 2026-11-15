@@ -23,7 +23,7 @@ const AUTHORIZATION: &str = concat!(
 );
 
 /// One emulator: a single shared engine behind the production router.
-fn new_router() -> MultiServiceRouter {
+pub(crate) fn new_router() -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
@@ -36,7 +36,7 @@ fn new_router() -> MultiServiceRouter {
 
 /// Send one request and return its status and parsed body (`Value::Null` for an
 /// empty body).
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -93,7 +93,7 @@ fn error_message(body: &Value) -> String {
 }
 
 /// Create an agent space and return its id.
-async fn create_space(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn create_space(router: &MultiServiceRouter, name: &str) -> String {
     let (status, body) = call(router, "POST", "/v1/agentspaces", Some(json!({"name": name}))).await;
     assert_eq!(
         status, 201,
@@ -139,7 +139,7 @@ async fn create_asset_of_type(
 }
 
 /// Create an `artifact` asset whose content is `content`, and return its id.
-async fn create_asset(
+pub(crate) async fn create_asset(
     router: &MultiServiceRouter,
     space: &str,
     case: &str,
@@ -174,18 +174,18 @@ fn zip_bundle(entries: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 /// The `ListAssetFiles` URI for one asset.
-fn files_uri(space: &str, asset: &str) -> String {
+pub(crate) fn files_uri(space: &str, asset: &str) -> String {
     format!("/asset/agent-space/{space}/assets/{asset}/files")
 }
 
 /// The file-plane URI for one file of one asset, with `wire_path` already in the
 /// form the greedy `{path+}` label carries it in.
-fn asset_file_uri(space: &str, asset: &str, wire_path: &str) -> String {
+pub(crate) fn asset_file_uri(space: &str, asset: &str, wire_path: &str) -> String {
     format!("{}/{wire_path}", files_uri(space, asset))
 }
 
 /// List one asset's files, asserting a 200, and return the response body.
-async fn list_files(
+pub(crate) async fn list_files(
     router: &MultiServiceRouter,
     space: &str,
     asset: &str,
@@ -202,7 +202,7 @@ async fn list_files(
 }
 
 /// The `items` of a listing, as a vector.
-fn items(case: &str, body: &Value) -> Vec<Value> {
+pub(crate) fn items(case: &str, body: &Value) -> Vec<Value> {
     body["items"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: no items list in {body}"))
@@ -210,7 +210,7 @@ fn items(case: &str, body: &Value) -> Vec<Value> {
 }
 
 /// The `path` of each reported summary, in the order the listing served them.
-fn paths(case: &str, body: &Value) -> Vec<String> {
+pub(crate) fn paths(case: &str, body: &Value) -> Vec<String> {
     items(case, body)
         .iter()
         .map(|item| {
@@ -223,7 +223,7 @@ fn paths(case: &str, body: &Value) -> Vec<String> {
 }
 
 /// Create one file of an asset through the wire, asserting it was accepted.
-async fn add_file(
+pub(crate) async fn add_file(
     router: &MultiServiceRouter,
     space: &str,
     asset: &str,
@@ -245,15 +245,15 @@ async fn add_file(
 
 /// One asset a listing case is read from: how its content arrived, which files are
 /// created in it afterwards, and the files it then holds.
-struct Row {
-    case: &'static str,
-    content: Value,
+pub(crate) struct Row {
+    pub(crate) case: &'static str,
+    pub(crate) content: Value,
     /// Paths to create afterwards, in the WIRE form the URI carries (a space and
     /// parens are percent-encoded; the modelled `AssetFilePath` pattern
     /// `^[a-zA-Z0-9_./ ()-]+$` admits them raw, the URI does not).
-    added: Vec<(&'static str, &'static str)>,
+    pub(crate) added: Vec<(&'static str, &'static str)>,
     /// Every path the asset holds once the row is set up, in no particular order.
-    holds: Vec<&'static str>,
+    pub(crate) holds: Vec<&'static str>,
 }
 
 /// The rows every listing case runs over: assets whose content arrived through
@@ -261,7 +261,7 @@ struct Row {
 /// shape="AssetContent")`) — a single `file`, a `zip` bundle of one and of several
 /// entries, and a `sourceUrl` import that materialises no file — each with and
 /// without files created in it afterwards.
-fn rows() -> Vec<Row> {
+pub(crate) fn rows() -> Vec<Row> {
     vec![
         Row {
             case: "a single-file asset",
@@ -332,7 +332,11 @@ fn rows() -> Vec<Row> {
 
 /// Set one row up in `space` and return the asset's id with the paths it holds, in
 /// the order a listing reports them (by path).
-async fn seed(router: &MultiServiceRouter, space: &str, row: &Row) -> (String, Vec<String>) {
+pub(crate) async fn seed(
+    router: &MultiServiceRouter,
+    space: &str,
+    row: &Row,
+) -> (String, Vec<String>) {
     let asset = create_asset(router, space, row.case, row.content.clone()).await;
     for (wire_path, _) in &row.added {
         add_file(router, space, &asset, row.case, wire_path).await;

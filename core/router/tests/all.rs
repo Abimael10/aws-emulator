@@ -7063,3 +7063,11 @@ mod all_rs_is_a_canonical_declaration_list;
 //! resolves to a SIBLING of this file, which the layout check refuses: the `#[path]` is
 //! declaration — never a note about one, and never a copy of this header.
 //! leaving a note here; `all/appended_notes.rs` holds the notes landings had appended.
+//! name is `E0428` and fails every suite in this target. An inner doc comment (`//!`) is
+//! legal only BEFORE the first item, so this header is the only place one may stand — past
+//! it, `//!` is `E0753` and compiles nothing. `all/all_rs_declares_each_suite_once.rs` and
+//! This file is a declaration list and nothing else: one `#[path]`/`mod` pair per suite, in
+//! sorted order, so a landing has exactly one place to insert and nothing to keep
+//! consistent. A note that is worth keeping goes in `all/appended_notes.rs`, which holds
+//! comments alone, not between the declarations below.
+// (`tests/boot_serve.rs`) — which the layout check refuses. The `#[path]` is what points it

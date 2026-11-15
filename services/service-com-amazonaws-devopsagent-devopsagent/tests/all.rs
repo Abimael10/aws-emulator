@@ -21,6 +21,8 @@ mod agent_space_not_found_refusal;
 mod asset_content_export;
 #[path = "all/asset_file_listing.rs"]
 mod asset_file_listing;
+#[path = "all/asset_file_listing_invariants.rs"]
+mod asset_file_listing_invariants;
 #[path = "all/asset_file_updates.rs"]
 mod asset_file_updates;
 #[path = "all/asset_files.rs"]
