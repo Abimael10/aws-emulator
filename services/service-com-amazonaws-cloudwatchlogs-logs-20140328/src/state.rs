@@ -2227,6 +2227,39 @@ fn is_log_group_name_pattern_char(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '/' | '#')
 }
 
+/// The longest `logGroupNamePattern` the SUBSTRING search takes, from the member's own
+/// `LogGroupNamePattern` `@length(min: 0, max: 512)`
+/// (`smithy_query(query="shape",shape="LogGroupNamePattern")`).
+pub const LOG_GROUP_NAME_SUBSTRING_PATTERN_MAX_LEN: usize = 512;
+
+/// Judge a `logGroupNamePattern` of the SUBSTRING search — the member `DescribeLogGroups`
+/// carries, "if you specify a string for this parameter, the operation returns only log groups
+/// that have names that match the string based on a case-sensitive substring search" —
+/// answering the message to refuse it with.
+///
+/// That value is LITERAL TEXT matched against the names the account holds rather than an
+/// expression, so the character class its shape declares is no bound on what the service
+/// takes: a value carrying a character a log group name can never hold matches no log group,
+/// which the service reports as an empty page rather than refusing. The member's own
+/// `@length(min: 0)` says the same thing from the other end — a zero-length value is legal,
+/// and a search for the empty string matches every name.
+///
+/// What the service cannot take is a value LONGER than the member admits, which is enforced
+/// here because the member carries `skip_validation` and the boundary walk no longer sees it
+/// ([`crate::ops::types::DescribeLogGroupsInput`]).
+pub fn check_log_group_name_substring_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.chars().count() > LOG_GROUP_NAME_SUBSTRING_PATTERN_MAX_LEN {
+        return Err(validation_message(
+            "logGroupNamePattern",
+            &format!(
+                "Member must have length less than or equal to \
+                 {LOG_GROUP_NAME_SUBSTRING_PATTERN_MAX_LEN}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The `LogGroupNameRegexPattern` expression as the SERVICE states it in a refusal, which
 /// is not the trait string the model carries: it is stated UNANCHORED, the form the
 /// pattern-rendering rule of `requirement` in `crate::service` states for every shape AWS

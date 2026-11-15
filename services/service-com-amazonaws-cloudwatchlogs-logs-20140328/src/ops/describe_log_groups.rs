@@ -268,6 +268,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         };
 
+        // The one modelled bound on `logGroupNamePattern` this operation judges itself, the
+        // member carrying `skip_validation`: its LENGTH. Its character class is not a bound on
+        // what the service takes — the value is literal text for a substring search, so one
+        // carrying a character no log group name can hold matches nothing and is answered with
+        // an empty page ([`crate::state::check_log_group_name_substring_pattern`]). Judged
+        // before the cross-member rules below, which is the order the boundary walk judged it
+        // in.
+        if let Some(pattern) = input.log_group_name_pattern.as_deref() {
+            if let Err(message) = crate::state::check_log_group_name_substring_pattern(pattern) {
+                return Err(invalid(&message));
+            }
+        }
+
         // "logGroupNamePattern and logGroupNamePrefix are mutually exclusive. Only one
         // of these parameters can be passed." The refusal is the service's one
         // exclusive-pair sentence, naming the two filters the way the service names them —
@@ -384,7 +397,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let last = first.saturating_add(limit).min(matching.len());
         let page = &matching[first..last];
 
-        let next_token = page.last().filter(|_| last < matching.len()).map(|group| {
+        // "The token for the next set of items to return": CloudWatch Logs hands one back on
+        // every page it reported a log group on, whether or not groups follow it — a
+        // continuation is how a client learns the enumeration is finished, and the
+        // continuation of the last page is the empty page that carries no token at all. So
+        // the token is minted from the position of the last group reported, and a page that
+        // reported nothing ends the walk.
+        let next_token = page.last().map(|group| {
             Cursor {
                 log_group_name_prefix: input.log_group_name_prefix.clone(),
                 log_group_name_pattern: input.log_group_name_pattern.clone(),

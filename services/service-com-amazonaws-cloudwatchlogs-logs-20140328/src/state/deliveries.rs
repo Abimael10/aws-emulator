@@ -642,3 +642,51 @@ pub const COLUMNAR_OUTPUT_FORMAT: &str = "parquet";
 /// as the model's `OutputFormat` enum spells it
 /// ([`crate::ops::types::OUTPUT_FORMAT_VALUES`]).
 pub const DELIMITED_OUTPUT_FORMATS: [&str; 3] = ["plain", "raw", "w3c"];
+
+/// The log stream CloudWatch Logs itself creates in the destination log group of a delivery
+/// it has wired to one: a delivery to a log group is validated by writing to that group, and
+/// that write goes to a stream of this fixed name — so a client polling `DescribeLogStreams`
+/// on the destination group observes the delivery subscription being validated, which is how
+/// a workflow confirms a vended delivery is live.
+///
+/// The name is fixed text; the stream's own `arn` and `creationTime` come from the group it is
+/// created in and the instant it is created ([`LogStreamRecord::new`]).
+pub const DELIVERY_VALIDATION_LOG_STREAM: &str =
+    "log_stream_created_by_aws_to_validate_log_delivery_subscriptions";
+
+impl super::ComAmazonawsCloudwatchlogsLogs20140328State {
+    /// Hold the delivery-validation log stream ([`DELIVERY_VALIDATION_LOG_STREAM`]) in the log
+    /// group a delivery's `destination_resource_arn` names, where that resource is a log group
+    /// this account holds.
+    ///
+    /// Idempotent: a group that already carries the stream keeps the one it has, with the
+    /// creation time it got, so wiring a second delivery to the same destination neither
+    /// re-creates it nor moves its clock. A destination resource another service owns (a
+    /// bucket, a delivery stream, X-Ray) holds no log stream at all, and a log group this
+    /// account does not hold has none to create one in — both leave the store untouched.
+    pub fn ensure_delivery_validation_stream(&mut self, region: &str, destination_arn: &str) {
+        if !is_log_group_arn(destination_arn) {
+            return;
+        }
+        let group_name = log_group_name_from_identifier(destination_arn).to_string();
+        let Some(group) = self.log_groups.get_mut(&group_name) else {
+            return;
+        };
+        if group.streams.contains_key(DELIVERY_VALIDATION_LOG_STREAM) {
+            return;
+        }
+        // The emulator's own per-group ceiling, the one `CreateLogStream` holds a request to.
+        if group.streams.len() >= MAX_STREAMS_PER_GROUP {
+            return;
+        }
+        group.streams.insert(
+            DELIVERY_VALIDATION_LOG_STREAM.to_string(),
+            LogStreamRecord::new(
+                region,
+                &group_name,
+                DELIVERY_VALIDATION_LOG_STREAM,
+                now_ms(),
+            ),
+        );
+    }
+}

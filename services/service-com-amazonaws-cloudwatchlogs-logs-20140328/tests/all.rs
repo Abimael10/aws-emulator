@@ -89,6 +89,8 @@ mod delivery_source_resource_resolution;
 mod delivery_source_resource_pairings;
 #[path = "all/delivery_sources.rs"]
 mod delivery_sources;
+#[path = "all/delivery_validation_stream.rs"]
+mod delivery_validation_stream;
 #[path = "all/destination_access_authorization.rs"]
 mod destination_access_authorization;
 #[path = "all/destination_policies.rs"]
@@ -181,6 +183,8 @@ mod log_anomaly_detector_updates;
 mod log_anomaly_detectors;
 #[path = "all/log_core_loop.rs"]
 mod log_core_loop;
+#[path = "all/log_event_ids_and_cursor_tokens.rs"]
+mod log_event_ids_and_cursor_tokens;
 #[path = "all/log_fields.rs"]
 mod log_fields;
 #[path = "all/log_group_auth_and_encryption.rs"]
@@ -189,6 +193,8 @@ mod log_group_auth_and_encryption;
 mod log_group_class_features;
 #[path = "all/log_group_fields.rs"]
 mod log_group_fields;
+#[path = "all/log_group_listing_continuation.rs"]
+mod log_group_listing_continuation;
 #[path = "all/log_group_name_pattern_lists.rs"]
 mod log_group_name_pattern_lists;
 #[path = "all/log_group_pattern_projection.rs"]

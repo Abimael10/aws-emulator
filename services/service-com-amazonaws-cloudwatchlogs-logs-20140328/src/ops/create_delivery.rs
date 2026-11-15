@@ -7,7 +7,9 @@
 //! decides `logs:PutResourcePolicy` on a destination RESOURCE of this service's own, the
 //! write that grants the log-delivery service access to it; then pairs one stored delivery
 //! source with one stored delivery destination,
-//! minting the delivery `DescribeDeliveries` and `GetDelivery` then report. The pair
+//! minting the delivery `DescribeDeliveries` and `GetDelivery` then report, and creating
+//! the delivery-validation log stream in a destination log group this account holds. The
+//! pair
 //! identifies the delivery, so a create naming a pair the account already holds is
 //! idempotent: it answers the stored delivery, with its existing id and configuration,
 //! rather than minting a second delivery of the pair or refusing the call. This is the
@@ -328,6 +330,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::DELIVERY_SOURCE_NOT_FOUND_MESSAGE,
             ));
         }
+
+        // Where the delivery-validation log stream belongs, once this call has decided it
+        // serves the create: the destination RESOURCE being wired, read here because the
+        // write below needs the store exclusively ([`crate::state::DELIVERY_VALIDATION_LOG_STREAM`]).
+        let destination_resource = store
+            .delivery_destination_by_arn(&region, &input.delivery_destination_arn)
+            .and_then(|destination| destination.destination_resource_arn.clone());
         // "Displays whether the delivery destination associated with this delivery is
         // CloudWatch Logs, Amazon S3, Firehose, or X-Ray": that is a fact about the
         // DESTINATION, which carries it, rather than about the logical destination's own ARN
@@ -384,12 +393,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // changed by `UpdateDeliveryConfiguration`, which is why this call leaves the stored
         // record alone. `ConflictException` stays for the creates whose identity is a
         // caller-chosen name already held by a DIFFERENT resource.
-        if let Some(existing) = store.deliveries_in(&region).find(|delivery| {
-            delivery.delivery_source_name == input.delivery_source_name
-                && delivery.delivery_destination_arn == input.delivery_destination_arn
-        }) {
+        let existing = store
+            .deliveries_in(&region)
+            .find(|delivery| {
+                delivery.delivery_source_name == input.delivery_source_name
+                    && delivery.delivery_destination_arn == input.delivery_destination_arn
+            })
+            .map(crate::state::DeliveryRecord::reported);
+        if let Some(delivery) = existing {
+            // The stream belongs to the destination this delivery is wired to rather than to
+            // one request, so a create the account already holds the delivery for reports the
+            // same wiring — and a stream the group already carries is kept as it is.
+            if let Some(resource) = &destination_resource {
+                store.ensure_delivery_validation_stream(&region, resource);
+            }
             return Ok(CreateDeliveryOutput {
-                delivery: Some(existing.reported()),
+                delivery: Some(delivery),
             });
         }
         if store.deliveries.len() >= crate::state::MAX_DELIVERIES {
@@ -438,6 +457,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store
             .deliveries
             .insert(crate::state::RegionalKey::new(&region, &id), record);
+
+        // A delivery wired to a CloudWatch Logs destination is VALIDATED by writing to the
+        // destination log group, and the stream that write goes to is created with the
+        // delivery itself ([`crate::state::DELIVERY_VALIDATION_LOG_STREAM`]) — so a client
+        // polling `DescribeLogStreams` on the destination group sees the wiring settle. It is
+        // written only once the delivery is STORED, so a create this call refuses leaves the
+        // destination group exactly as it found it.
+        if let Some(resource) = &destination_resource {
+            store.ensure_delivery_validation_stream(&region, resource);
+        }
 
         Ok(CreateDeliveryOutput {
             // "A structure that contains information about the delivery that you just

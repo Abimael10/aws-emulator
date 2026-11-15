@@ -33,11 +33,150 @@ pub struct GetLogEventsOutput {
     pub next_backward_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.cloudwatchlogs#OutputLogEvent")]
+/// One log event a read of a stream reports.
+///
+/// Hand-written schema and codec below instead of
+/// `#[smithy_macros::smithy(shape = "com.amazonaws.cloudwatchlogs#OutputLogEvent")]`: the wire
+/// carries one member — `eventId`, the id of the event — that the on-disk model's
+/// `OutputLogEvent` does not declare, and that derive admits EXACTLY the model's member list
+/// (a Rust field with no member behind it is a compile error). The same member IS modelled on
+/// the neighbouring `FilteredLogEvent` (`FilteredLogEvent$eventId`, "The ID of the event"), so
+/// this is a gap in the shape rather than a member of this service's own invention.
 #[derive(Debug, Clone, Default)]
 pub struct OutputLogEvent {
     pub timestamp: Option<i64>,
     pub message: Option<String>,
     pub ingestion_time: Option<i64>,
+    /// The id of the event, as the neighbouring `FilteredLogEvent` models it. Reported only:
+    /// the service mints it from the event the store holds, so nothing a request carries can
+    /// set it.
+    pub event_id: Option<String>,
+}
+
+/// The namespace the recorded `eventId` member's own shape id sits in: NOT this service's, so
+/// nothing declared here can claim to be modelled, or collide with a member the model may
+/// declare later — a later model refresh only has to put the derive back.
+const RECORDED_NAMESPACE: &str = "com.amazonaws.cloudwatchlogs.recorded";
+
+/// The shape id prefix of the members the model DOES declare.
+const OUTPUT_LOG_EVENT_SHAPE: &str = "com.amazonaws.cloudwatchlogs#OutputLogEvent";
+
+#[allow(non_upper_case_globals)]
+impl OutputLogEvent {
+    pub const M_TIMESTAMP: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.cloudwatchlogs#OutputLogEvent$timestamp",
+            "com.amazonaws.cloudwatchlogs",
+            "timestamp",
+        ),
+        ::aws_smithy_schema::ShapeType::Long,
+        "timestamp",
+        0,
+    );
+
+    pub const M_MESSAGE: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.cloudwatchlogs#OutputLogEvent$message",
+            "com.amazonaws.cloudwatchlogs",
+            "message",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "message",
+        1,
+    );
+
+    pub const M_INGESTION_TIME: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.cloudwatchlogs#OutputLogEvent$ingestionTime",
+                "com.amazonaws.cloudwatchlogs",
+                "ingestionTime",
+            ),
+            ::aws_smithy_schema::ShapeType::Long,
+            "ingestionTime",
+            2,
+        );
+
+    /// The member the model does not declare, appended LAST so every modelled member keeps
+    /// the index the model gives it, with its shape id in [`RECORDED_NAMESPACE`].
+    pub const M_EVENT_ID: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.cloudwatchlogs.recorded#OutputLogEvent$eventId",
+            RECORDED_NAMESPACE,
+            "eventId",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "eventId",
+        3,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            OUTPUT_LOG_EVENT_SHAPE,
+            "com.amazonaws.cloudwatchlogs",
+            "OutputLogEvent",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_TIMESTAMP,
+            &Self::M_MESSAGE,
+            &Self::M_INGESTION_TIME,
+            &Self::M_EVENT_ID,
+        ],
+    );
+}
+
+pub static OUTPUT_LOG_EVENT_SCHEMA: &::aws_smithy_schema::Schema = &OutputLogEvent::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for OutputLogEvent {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(timestamp) = self.timestamp.as_ref() {
+            serializer.write_long(&Self::M_TIMESTAMP, *timestamp)?;
+        }
+        if let Some(message) = self.message.as_ref() {
+            serializer.write_string(&Self::M_MESSAGE, message.as_str())?;
+        }
+        if let Some(ingestion_time) = self.ingestion_time.as_ref() {
+            serializer.write_long(&Self::M_INGESTION_TIME, *ingestion_time)?;
+        }
+        if let Some(event_id) = self.event_id.as_ref() {
+            serializer.write_string(&Self::M_EVENT_ID, event_id.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for OutputLogEvent {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut timestamp = None;
+        let mut message = None;
+        let mut ingestion_time = None;
+        deserializer.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => timestamp = Some(d.read_long(&Self::M_TIMESTAMP)?),
+                Some(1) => message = Some(d.read_string(&Self::M_MESSAGE)?),
+                Some(2) => ingestion_time = Some(d.read_long(&Self::M_INGESTION_TIME)?),
+                // The service MINTS the event id from the event it holds, so a value on the
+                // wire sets nothing — it is read, to keep the codec in step with the
+                // document, and discarded.
+                Some(3) => {
+                    let _ = d.read_string(&Self::M_EVENT_ID)?;
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            timestamp,
+            message,
+            ingestion_time,
+            event_id: None,
+        })
+    }
 }
 

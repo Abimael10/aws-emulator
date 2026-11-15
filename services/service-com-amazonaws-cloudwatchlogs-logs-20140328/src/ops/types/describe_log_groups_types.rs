@@ -11,7 +11,20 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatchlogs-logs-20140328.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.cloudwatchlogs#DescribeLogGroupsRequest")]
+// `logGroupNamePattern` is the member whose one modelled constraint this OPERATION judges
+// itself. The value is literal text for a case-sensitive SUBSTRING search over the names the
+// account holds, not an expression, so the character class `LogGroupNamePattern` declares is
+// no bound on what the service takes: a value carrying a character a log group name can never
+// hold matches no log group, which is a success with an empty page.
+// `skip_validation` drops only this member's constraint traits, so
+// `crate::state::check_log_group_name_substring_pattern` can apply the one that IS a bound —
+// the `@length(max: 512)` on the whole value — and refuse with this operation's own modelled
+// `InvalidParameterException`; every other member of this shape is still validated at the
+// boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.cloudwatchlogs#DescribeLogGroupsRequest",
+    skip_validation = ["logGroupNamePattern"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct DescribeLogGroupsInput {
     pub account_identifiers: Option<Vec<String>>,

@@ -3,7 +3,9 @@
 //! @op GetLogEvents
 //! Implemented: reads the events persisted for the named stream, filters them to the
 //! requested time window, pages through them in either direction and hands back the
-//! tokens that resume the scan. An event CloudWatch Logs can no longer decrypt — one
+//! tokens that resume the scan. Each event is reported with the id the store holds it
+//! under, and each token is a direction-prefixed envelope around a FIXED-WIDTH opaque
+//! body. An event CloudWatch Logs can no longer decrypt — one
 //! ingested under a customer managed key KMS no longer lets it use
 //! ([`crate::state::event_key_access`]) — is withheld from the page rather than refusing
 //! the read. This is the ONLY file to touch for this operation.
@@ -177,10 +179,6 @@ impl From<GetLogEventsErrorModeled> for GetLogEventsError {
     }
 }
 
-/// The kind tag this operation's pagination cursors carry, so a token minted by
-/// another paginated operation is refused rather than misread.
-const CURSOR_KIND: &str = "GetLogEvents";
-
 /// The envelope prefix of a cursor that scans towards newer events.
 const FORWARD_DIRECTION: &str = "f";
 /// The envelope prefix of a cursor that scans towards older events.
@@ -191,6 +189,81 @@ const END_OF_STREAM_SENTINEL: &str = "/s";
 /// The cursor body the service answers with when a page has no position to resume
 /// from: the zero of a cursor body's width.
 const NO_POSITION_BODY: &str = "00000000000000000000000000000000000000000000000000000000";
+
+/// How many characters a cursor BODY carries. CloudWatch Logs renders a continuation token
+/// as a direction prefix and a FIXED-WIDTH decimal body, the width every token-shaped value
+/// of this service is minted at ([`crate::state::mint_sequence_token`]) — so a client can
+/// size-bound and persist a token, and no name this store holds rides in one.
+const CURSOR_BODY_DIGITS: usize = 56;
+
+/// The body of no position is one body's width of zeros.
+const _: () = assert!(NO_POSITION_BODY.len() == CURSOR_BODY_DIGITS);
+
+/// The digits each field of a body occupies, in the order the body renders them: which KIND
+/// of position it names, which of the scan's two time bounds are set, the two bounds
+/// themselves, the position's own instant, the position's ingestion sequence within that
+/// instant, and the fingerprint of the scan the cursor belongs to.
+const POSITION_KIND_DIGITS: usize = 1;
+const WINDOW_FLAGS_DIGITS: usize = 1;
+const INSTANT_DIGITS: usize = 13;
+const SEQ_DIGITS: usize = 8;
+const SCAN_DIGITS: usize = 7;
+
+/// The fields fill the body exactly: the two bounds and the position's instant are one
+/// [`INSTANT_DIGITS`] field each.
+const _: () = assert!(
+    POSITION_KIND_DIGITS + WINDOW_FLAGS_DIGITS + 3 * INSTANT_DIGITS + SEQ_DIGITS + SCAN_DIGITS
+        == CURSOR_BODY_DIGITS
+);
+
+/// What a body's position field names: the head of the scan (before every event), one stored
+/// event, or its tail (after every event). `0` is no kind at all, which is what keeps
+/// [`NO_POSITION_BODY`] — and any other all-zero body — unplaceable.
+const POSITION_AT_HEAD: u64 = 1;
+const POSITION_AT_EVENT: u64 = 2;
+const POSITION_AT_TAIL: u64 = 3;
+
+/// The widest epoch-milliseconds instant an [`INSTANT_DIGITS`] field holds. Every timestamp
+/// this store keeps is far inside it — `PutLogEvents` admits an event only within a
+/// clock-relative ingestion window — so a time bound a request states beyond this ceiling
+/// selects exactly the events the ceiling selects.
+const MAX_INSTANT_MS: i64 = 9_999_999_999_999;
+
+/// The widest ingestion sequence a [`SEQ_DIGITS`] field holds. One stream holds at most
+/// [`crate::state::MAX_STREAM_EVENTS`] events, and the sequence counts what one store has
+/// ingested, so this ceiling is far above what a cursor ever has to carry.
+const MAX_SEQ: u64 = 99_999_999;
+
+/// How many fingerprints a [`SCAN_DIGITS`] field distinguishes, counted from one: the zero
+/// fingerprint is reserved, so no all-zero body is a cursor of any scan. The field is wide
+/// enough that two different streams sharing a fingerprint — which would let one stream's
+/// cursor be placed in the other instead of being refused — is negligible.
+const SCAN_FINGERPRINTS: u64 = 9_999_999;
+
+/// An instant as a body's [`INSTANT_DIGITS`] field holds it ([`MAX_INSTANT_MS`]).
+fn instant(value: i64) -> i64 {
+    value.clamp(0, MAX_INSTANT_MS)
+}
+
+/// One field of a body: `value` rendered right-aligned in `width` decimal digits.
+fn field(value: u64, width: usize) -> String {
+    format!("{value:0>width$}")
+}
+
+/// The fingerprint of the scan a cursor belongs to: the log group and the log stream it
+/// walks, in [`SCAN_FINGERPRINTS`] buckets counted from one. It is what lets the service tell
+/// a cursor of THIS scan from one minted for another stream without carrying either name in
+/// the token, which is the caller's business in neither direction.
+///
+/// The hasher's output is this process's own — it is not a value any client is handed in
+/// another form, and a token outlives neither this store nor the events it names.
+fn scan_fingerprint(log_group_name: &str, log_stream_name: &str) -> u64 {
+    use ::std::hash::{Hash, Hasher};
+    let mut hasher = ::std::hash::DefaultHasher::new();
+    log_group_name.hash(&mut hasher);
+    log_stream_name.hash(&mut hasher);
+    1 + hasher.finish() % SCAN_FINGERPRINTS
+}
 
 /// One `nextForwardToken` / `nextBackwardToken`: the direction the cursor scans in, the
 /// opaque body carrying its position, and whether that scan has reached the end of the
@@ -265,49 +338,85 @@ impl Token {
     }
 }
 
-/// Where a page resumes from: a position in the stream's event order, plus the scan the
-/// cursor belongs to (the stream, and the time window the scan was started with). The
-/// direction travels in the token's envelope rather than in this body, so the forward
-/// and the backward cursor of one page differ in both their envelope and their position.
-#[derive(Debug, Clone)]
+/// Where a page resumes from: a position in the stream's event order, plus the time window
+/// the scan it belongs to was started with. The direction travels in the token's envelope
+/// rather than in this body, so the forward and the backward cursor of one page differ in
+/// both their envelope and their position; which STREAM the scan walks travels as a
+/// fingerprint ([`scan_fingerprint`]) rather than by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Cursor {
-    log_group_name: String,
-    log_stream_name: String,
     at: crate::state::EventKey,
     start_time: Option<i64>,
     end_time: Option<i64>,
 }
 
 impl Cursor {
-    /// Render this cursor as the opaque body of a token.
-    fn encode(&self) -> String {
-        crate::state::encode_token(&::serde_json::json!({
-            "kind": CURSOR_KIND,
-            "logGroupName": self.log_group_name,
-            "logStreamName": self.log_stream_name,
-            "timestamp": self.at.timestamp,
-            "seq": self.at.seq,
-            "startTime": self.start_time,
-            "endTime": self.end_time,
-        }))
+    /// Render this cursor as the opaque body of a token of the scan `scan` fingerprints:
+    /// [`CURSOR_BODY_DIGITS`] decimal digits, whatever the cursor carries.
+    fn encode(&self, scan: u64) -> String {
+        let (kind, at, seq) = match self.at {
+            crate::state::EventKey::BEFORE_ALL => (POSITION_AT_HEAD, 0, 0),
+            crate::state::EventKey::AFTER_ALL => (POSITION_AT_TAIL, 0, 0),
+            position => (
+                POSITION_AT_EVENT,
+                instant(position.timestamp),
+                position.seq.min(MAX_SEQ),
+            ),
+        };
+        let flags = u64::from(self.start_time.is_some()) + 2 * u64::from(self.end_time.is_some());
+        let bound = |value: Option<i64>| {
+            u64::try_from(instant(value.unwrap_or(0))).unwrap_or(0)
+        };
+        let mut body = String::with_capacity(CURSOR_BODY_DIGITS);
+        body.push_str(&field(kind, POSITION_KIND_DIGITS));
+        body.push_str(&field(flags, WINDOW_FLAGS_DIGITS));
+        body.push_str(&field(bound(self.start_time), INSTANT_DIGITS));
+        body.push_str(&field(bound(self.end_time), INSTANT_DIGITS));
+        body.push_str(&field(u64::try_from(at).unwrap_or(0), INSTANT_DIGITS));
+        body.push_str(&field(seq, SEQ_DIGITS));
+        body.push_str(&field(scan, SCAN_DIGITS));
+        body
     }
 
-    /// Read back a cursor body this operation minted. `None` for anything else.
-    fn decode(body: &str) -> Option<Self> {
-        let value = crate::state::decode_token(body)?;
-        if value.get("kind")?.as_str()? != CURSOR_KIND {
+    /// Read back a cursor body this operation minted, with the fingerprint of the scan it
+    /// was minted for. `None` for a body in no form this operation renders — another
+    /// width, a character that is not a digit, or a position kind it never writes — which
+    /// is a body this store cannot place.
+    fn decode(body: &str) -> Option<(Self, u64)> {
+        if body.len() != CURSOR_BODY_DIGITS || !body.bytes().all(|byte| byte.is_ascii_digit()) {
             return None;
         }
-        Some(Self {
-            log_group_name: value.get("logGroupName")?.as_str()?.to_string(),
-            log_stream_name: value.get("logStreamName")?.as_str()?.to_string(),
-            at: crate::state::EventKey {
-                timestamp: value.get("timestamp")?.as_i64()?,
-                seq: value.get("seq")?.as_u64()?,
+        let mut read_at = 0usize;
+        let mut take = |width: usize| -> Option<u64> {
+            let slice = body.get(read_at..read_at.saturating_add(width))?;
+            read_at = read_at.saturating_add(width);
+            slice.parse::<u64>().ok()
+        };
+        let kind = take(POSITION_KIND_DIGITS)?;
+        let flags = take(WINDOW_FLAGS_DIGITS)?;
+        let start = take(INSTANT_DIGITS)?;
+        let end = take(INSTANT_DIGITS)?;
+        let at = take(INSTANT_DIGITS)?;
+        let seq = take(SEQ_DIGITS)?;
+        let scan = take(SCAN_DIGITS)?;
+        let bound = |set: bool, value: u64| set.then(|| instant(i64::try_from(value).unwrap_or(0)));
+        let position = match kind {
+            POSITION_AT_HEAD => crate::state::EventKey::BEFORE_ALL,
+            POSITION_AT_TAIL => crate::state::EventKey::AFTER_ALL,
+            POSITION_AT_EVENT => crate::state::EventKey {
+                timestamp: instant(i64::try_from(at).unwrap_or(0)),
+                seq,
             },
-            start_time: value.get("startTime").and_then(::serde_json::Value::as_i64),
-            end_time: value.get("endTime").and_then(::serde_json::Value::as_i64),
-        })
+            _ => return None,
+        };
+        Some((
+            Self {
+                at: position,
+                start_time: bound(flags & 1 == 1, start),
+                end_time: bound(flags & 2 == 2, end),
+            },
+            scan,
+        ))
     }
 }
 
@@ -478,9 +587,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             None => None,
         };
+        // The scan this read walks, as a cursor of it fingerprints the stream
+        // ([`scan_fingerprint`]): a cursor whose fingerprint is another scan's is refused
+        // rather than answered over a different set of events.
+        let scan = scan_fingerprint(&log_group_name, &input.log_stream_name);
         let cursor = match &inbound {
             Some(token) => {
-                let Some(cursor) = Cursor::decode(&token.body) else {
+                let Some((cursor, cursor_scan)) = Cursor::decode(&token.body) else {
                     // A cursor in the service's envelope whose body this store cannot
                     // place carries no position to resume from, so the scan it names has
                     // nothing left to walk: an exhausted cursor is a successful empty
@@ -495,9 +608,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         next_backward_token: Some(next_backward_token),
                     });
                 };
-                if cursor.log_group_name != log_group_name
-                    || cursor.log_stream_name != input.log_stream_name
-                {
+                if cursor_scan != scan {
                     return Err(GetLogEventsErrorModeled::InvalidParameterException(
                         InvalidParameterException {
                             message: Some(
@@ -511,8 +622,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // present must agree with it.
                 if input
                     .start_time
-                    .is_some_and(|start| Some(start) != cursor.start_time)
-                    || input.end_time.is_some_and(|end| Some(end) != cursor.end_time)
+                    .is_some_and(|start| Some(instant(start)) != cursor.start_time)
+                    || input
+                        .end_time
+                        .is_some_and(|end| Some(instant(end)) != cursor.end_time)
                 {
                     return Err(GetLogEventsErrorModeled::InvalidParameterException(
                         InvalidParameterException {
@@ -529,7 +642,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let (start_time, end_time) = match &cursor {
             Some(cursor) => (cursor.start_time, cursor.end_time),
-            None => (input.start_time, input.end_time),
+            // Held to what a cursor body carries ([`instant`]), so the first page of a scan
+            // and every continuation of it select over exactly the same window.
+            None => (
+                input.start_time.map(instant),
+                input.end_time.map(instant),
+            ),
         };
 
         // The events this read can serve: the stream's, less the ones whose ingest key
@@ -607,13 +725,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let body_at = |at: crate::state::EventKey| {
             Cursor {
-                log_group_name: log_group_name.clone(),
-                log_stream_name: input.log_stream_name.clone(),
                 at,
                 start_time,
                 end_time,
             }
-            .encode()
+            .encode(scan)
         };
         let forward_exhausted =
             matching.partition_point(|event| event.key() <= forward_at) == total;
@@ -639,6 +755,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // asked to unmask them.
                         message: Some(event.message_as_read(input.unmask).to_string()),
                         ingestion_time: Some(event.ingestion_time),
+                        // "The ID of the event" (`FilteredLogEvent$eventId`, the member the
+                        // model declares for the same value on the neighbouring shape):
+                        // minted from the store's own ingestion ordering, so one event keeps
+                        // one id however it is read and no two events share one.
+                        event_id: Some(crate::state::subscription_delivery::event_id(event)),
                     })
                     .collect(),
             ),
