@@ -29,6 +29,8 @@ mod client_refusal_wording;
 mod cross_account_requests;
 #[path = "all/cross_account_resource_arns.rs"]
 mod cross_account_resource_arns;
+#[path = "all/ebs_volume_inventory_analysis.rs"]
+mod ebs_volume_inventory_analysis;
 #[path = "all/ebs_volume_recommendations.rs"]
 mod ebs_volume_recommendations;
 #[path = "all/ebs_volume_recommendations_export.rs"]

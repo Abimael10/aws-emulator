@@ -264,7 +264,8 @@ impl FromIterator<IdleResourceAnalysis> for IdleRecommendationStore {
 /// The set holds the resource kinds Compute Optimizer reports ONLY as idle resources — a NAT
 /// gateway, a DynamoDB table, an ElastiCache cluster, a MemoryDB cluster, a DocumentDB
 /// cluster, a WorkSpace and a SageMaker endpoint — plus an UNATTACHED Amazon EBS volume,
-/// which is not part of the volume inventory [`observed_volumes`] holds either, because a
+/// which the rightsizing analysis of the account's volumes ([`analysed_volumes`]) reports no
+/// recommendation for either, because a
 /// volume attached to nothing carries no workload to rightsize. Every `IdleFinding` value
 /// occurs, the costs all differ so an ordering is observable, the observed periods differ so a
 /// look-back preference is observable, and each row's metrics are the ones its own resource

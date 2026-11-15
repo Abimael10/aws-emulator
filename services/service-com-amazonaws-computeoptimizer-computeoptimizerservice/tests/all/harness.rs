@@ -14,10 +14,15 @@
 //! exactly what `core/router` assembles. An Amazon Aurora or RDS database recommendation is
 //! computed the same way over the DB instances the Amazon RDS emulator holds and the
 //! `AWS/RDS` utilization published for them, which is what
-//! [`emulator_with_analysed_databases`] mounts. Amazon S3 is mounted by every emulator here
-//! for the same reason: a recommendations export is written into a bucket of the one object
-//! store this emulator holds, so an export suite CREATES its destination bucket over S3's own
-//! wire ([`create_bucket`]) and reads the exported objects back over it ([`get_object`]).
+//! [`emulator_with_analysed_databases`] mounts. An Amazon EBS volume recommendation is
+//! computed over the volumes the Amazon EC2 emulator holds and the `AWS/EBS` utilization
+//! published for them, so every emulator here starts with the account's own volumes in that
+//! store ([`register_analysed_volumes`]) — and [`emulator_with_volume_inventory`] starts with
+//! none, for a suite that creates one over Amazon EC2's own wire. Amazon S3 is mounted by
+//! every emulator here for the same reason: a recommendations export is written into a bucket
+//! of the one object store this emulator holds, so an export suite CREATES its destination
+//! bucket over S3's own wire ([`create_bucket`]) and reads the exported objects back over it
+//! ([`get_object`]).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -27,8 +32,8 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::RESOURCE_TYPE_VALUES;
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    service_state, METRIC_STATISTIC_MAXIMUM, RESOURCE_TYPE_AUTO_SCALING_GROUP, SCOPE_ACCOUNT_ID,
-    SCOPE_RESOURCE_ARN, ANALYSIS_DELAY,
+    service_state, EBS_METRIC_NAMESPACE, EBS_VOLUME_DIMENSION, METRIC_STATISTIC_MAXIMUM,
+    RESOURCE_TYPE_AUTO_SCALING_GROUP, SCOPE_ACCOUNT_ID, SCOPE_RESOURCE_ARN, ANALYSIS_DELAY,
 };
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -69,6 +74,7 @@ pub(crate) fn emulator() -> MultiServiceRouter {
 /// creates, and then read it back over the wire like any client.
 pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    register_analysed_volumes(&engine);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
@@ -76,6 +82,95 @@ pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemor
         Arc::clone(&engine),
     ));
     (router, engine)
+}
+
+/// Compute Optimizer, Amazon EC2 and CloudWatch over ONE engine, with NO volume of the
+/// account's own: the emulator a suite needs to CREATE an Amazon EBS volume over Amazon EC2's
+/// own wire and publish the `AWS/EBS` utilization its recommendation is computed from.
+///
+/// Every other emulator here starts with the account's analysed volumes already in the Amazon
+/// EC2 store ([`register_analysed_volumes`]); this one starts with none, so a suite can drive
+/// the whole path from "the account owns no volume" to "it owns this one".
+pub(crate) fn emulator_with_volume_inventory() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
+{
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(
+        service_com_amazonaws_ec2_amazonec2::EmulatedService::new(Arc::clone(&engine)),
+    );
+    router.register_service(
+        service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
+    (router, engine)
+}
+
+/// One Amazon EC2 call at the endpoint of `region`: an `ec2Query` `POST /` whose body carries
+/// the `Action`, the API `Version` and the request's parameters, as an SDK sends one. EC2
+/// answers XML, so the body comes back as the document text.
+pub(crate) async fn call_ec2_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    action: &str,
+    params: &[(&str, String)],
+) -> (u16, String) {
+    let mut body = format!("Action={action}&Version={EC2_API_VERSION}");
+    for (name, value) in params {
+        body.push('&');
+        body.push_str(name);
+        body.push('=');
+        body.push_str(&form_encode(value));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://ec2.{region}.amazonaws.com/"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        // The SigV4 credential scope is what routes a request to its service, and the region
+        // it names is the regional endpoint the request addressed.
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIDEXAMPLE/20260101/{region}/ec2/aws4_request, \
+                 SignedHeaders=host, Signature=not-verified"
+            ),
+        )
+        .body(Bytes::from(body))
+        .expect("build the request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    (
+        status,
+        String::from_utf8_lossy(response.body()).into_owned(),
+    )
+}
+
+/// The Amazon EC2 API version a client sends in an `ec2Query` body.
+const EC2_API_VERSION: &str = "2016-11-15";
+
+/// The text of the first `<tag>` element of an `awsQuery` or `ec2Query` response document,
+/// and the empty string where the document carries none.
+///
+/// The ONE reader the suites that drive another emulated service over a query protocol share:
+/// those services answer XML, and what a suite needs out of the answer is one element — the id
+/// a create minted, the identifier a describe reports back.
+pub(crate) fn element(document: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let Some(start) = document.find(&open).map(|at| at + open.len()) else {
+        return String::new();
+    };
+    let rest = &document[start..];
+    let Some(end) = rest.find(&close) else {
+        return String::new();
+    };
+    rest[..end].to_string()
 }
 
 /// Compute Optimizer, Amazon ECS and CloudWatch over ONE engine: the emulator a suite needs
@@ -126,6 +221,252 @@ pub(crate) const ANALYSED_SUBNET: &str = "subnet-0123456789abcdef0";
 /// The VPC [`ANALYSED_SUBNET`] is in.
 const ANALYSED_VPC: &str = "vpc-0123456789abcdef0";
 
+/// The Availability Zone the analysed Amazon EBS volumes are in, and so the Region they are
+/// reported at: a volume belongs to ONE Region, the one its zone is in.
+const ANALYSED_VOLUME_ZONE: &str = "us-east-1a";
+
+/// The period one seeded `AWS/EBS` datapoint covers, in seconds — the default
+/// `StorageResolution` [`seed_cloudwatch_series`] publishes under. Amazon EBS publishes its
+/// ops and bytes metrics as COUNTS over the datapoint's period, so a per-second rate is
+/// published as that rate times this span.
+const EBS_METRIC_PERIOD_SECS: f64 = 60.0;
+
+/// Bytes in a MiB: the `VolumeRead/WriteBytes` series are bytes and a volume's throughput is
+/// MiB per second. The crate's own figure, so a suite and the analysis cannot differ on it.
+pub(crate) use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::BYTES_PER_MIB;
+
+/// One interval of demand observed on a seeded volume: how long before now it was observed,
+/// and the per-second read and write rates observed in it.
+struct VolumeDemand {
+    days_ago: f64,
+    read_ops: f64,
+    write_ops: f64,
+    read_mib: f64,
+    write_mib: f64,
+}
+
+/// One Amazon EBS volume of the account's own Amazon EC2 inventory, with the demand observed
+/// on it.
+struct AnalysedVolume {
+    volume_id: &'static str,
+    volume_type: &'static str,
+    size: i32,
+    /// The `Iops` and `Throughput` provisioned on it, for the types that provision them.
+    iops: Option<i32>,
+    /// See [`AnalysedVolume::iops`].
+    throughput: Option<i32>,
+    tags: &'static [(&'static str, &'static str)],
+    /// The device an instance holds this volume at, when one does — a root device name makes
+    /// it that instance's root volume.
+    attached_at: Option<&'static str>,
+    demand: Vec<VolumeDemand>,
+}
+
+/// The Amazon EBS volumes the account owns while these suites run, and the `AWS/EBS`
+/// utilization published for each.
+///
+/// A volume recommendation is computed over the volumes AMAZON EC2 holds for the account and
+/// the utilization published for them, so a suite that reads one holds both: the volumes go
+/// into Amazon EC2's own volume store and the series into the CloudWatch metric store, exactly
+/// as the analysed ECS services and DB instances of this crate's other suites are held by the
+/// services that own them.
+///
+/// The set spans the cases a volume recommendation distinguishes: a previous-generation volume
+/// whose demand fits its capacity (cheaper on gp3), a gp3 volume whose demand outruns its
+/// provisioned IOPS (needs more performance), a heavily over-provisioned Provisioned IOPS
+/// volume whose peak demand arrived outside the default look-back period, and a gp3 volume
+/// already provisioned for its workload.
+fn analysed_volumes() -> Vec<AnalysedVolume> {
+    vec![
+        // gp2, 500 GiB: 3 IOPS per GiB of baseline (1,500) with a 3,000 IOPS burst and 250
+        // MiB/s of throughput. Its peak fits that comfortably, so the gp3 option carries the
+        // same workload for less money. An instance boots from it.
+        AnalysedVolume {
+            volume_id: "vol-0a1b2c3d4e5f60001",
+            volume_type: "gp2",
+            size: 500,
+            iops: None,
+            throughput: None,
+            tags: &[("Owner", "TeamA")],
+            attached_at: Some("/dev/xvda"),
+            demand: vec![
+                VolumeDemand {
+                    days_ago: 0.0,
+                    read_ops: 300.0,
+                    write_ops: 400.0,
+                    read_mib: 20.0,
+                    write_mib: 25.0,
+                },
+                VolumeDemand {
+                    days_ago: 3.0,
+                    read_ops: 450.0,
+                    write_ops: 450.0,
+                    read_mib: 30.0,
+                    write_mib: 30.0,
+                },
+                VolumeDemand {
+                    days_ago: 40.0,
+                    read_ops: 200.0,
+                    write_ops: 150.0,
+                    read_mib: 10.0,
+                    write_mib: 8.0,
+                },
+            ],
+        },
+        // gp3, 100 GiB at its included performance, driven past it: the option has to
+        // provision more IOPS and more throughput, which costs MORE than the volume costs
+        // today — a recommendation is not always a saving.
+        AnalysedVolume {
+            volume_id: "vol-0a1b2c3d4e5f60002",
+            volume_type: "gp3",
+            size: 100,
+            iops: Some(3_000),
+            throughput: Some(125),
+            tags: &[("Owner", "TeamB")],
+            attached_at: None,
+            demand: vec![
+                VolumeDemand {
+                    days_ago: 0.0,
+                    read_ops: 2_400.0,
+                    write_ops: 2_400.0,
+                    read_mib: 60.0,
+                    write_mib: 60.0,
+                },
+                VolumeDemand {
+                    days_ago: 10.0,
+                    read_ops: 1_000.0,
+                    write_ops: 900.0,
+                    read_mib: 40.0,
+                    write_mib: 30.0,
+                },
+            ],
+        },
+        // io1, 200 GiB with 8,000 provisioned IOPS: far more than the workload asks for, and
+        // its heaviest day falls OUTSIDE the default look-back period, so a longer look-back
+        // preference changes the option this volume gets.
+        AnalysedVolume {
+            volume_id: "vol-0a1b2c3d4e5f60003",
+            volume_type: "io1",
+            size: 200,
+            iops: Some(8_000),
+            throughput: None,
+            tags: &[("Owner", "TeamB"), ("Environment", "production")],
+            attached_at: None,
+            demand: vec![
+                VolumeDemand {
+                    days_ago: 1.0,
+                    read_ops: 600.0,
+                    write_ops: 600.0,
+                    read_mib: 30.0,
+                    write_mib: 20.0,
+                },
+                VolumeDemand {
+                    days_ago: 50.0,
+                    read_ops: 1_500.0,
+                    write_ops: 1_500.0,
+                    read_mib: 100.0,
+                    write_mib: 60.0,
+                },
+            ],
+        },
+        // gp3, 50 GiB, already provisioned for its workload, and carrying no tag at all.
+        AnalysedVolume {
+            volume_id: "vol-0a1b2c3d4e5f60004",
+            volume_type: "gp3",
+            size: 50,
+            iops: Some(3_000),
+            throughput: Some(125),
+            tags: &[],
+            attached_at: None,
+            demand: vec![VolumeDemand {
+                days_ago: 0.0,
+                read_ops: 700.0,
+                write_ops: 800.0,
+                read_mib: 20.0,
+                write_mib: 20.0,
+            }],
+        },
+    ]
+}
+
+/// Put [`analysed_volumes`] into the stores that OWN them: each volume into Amazon EC2's
+/// volume store, and the demand observed on it into the CloudWatch metric store as the
+/// `AWS/EBS` series Amazon EBS publishes for a volume.
+fn register_analysed_volumes(engine: &Arc<engine::InMemoryEngine>) {
+    use service_com_amazonaws_ec2_amazonec2 as ec2;
+
+    let now = ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::now_secs();
+    let available_at = std::time::Instant::now();
+    for volume in analysed_volumes() {
+        {
+            let ec2_state = ec2::state::service_state(&**engine)
+                .expect("the in-memory engine carries the account's Amazon EC2 store");
+            let mut store = ec2_state.lock();
+            let view = ec2::state::VolumeView {
+                volume_id: Some(volume.volume_id.to_string()),
+                owner_id: Some(ACCOUNT.to_string()),
+                availability_zone: Some(ANALYSED_VOLUME_ZONE.to_string()),
+                volume_type: Some(volume.volume_type.to_string()),
+                size: Some(volume.size),
+                iops: volume.iops,
+                throughput: volume.throughput,
+                create_time: Some(DateTime::from_secs_f64(now)),
+                tags: Some(
+                    volume
+                        .tags
+                        .iter()
+                        .map(|(key, value)| ec2::ops::types::Tag {
+                            key: Some((*key).to_string()),
+                            value: Some((*value).to_string()),
+                        })
+                        .collect(),
+                ),
+                attachments: volume.attached_at.map(|device| {
+                    vec![ec2::ops::types::AttachVolumeOutput {
+                        volume_id: Some(volume.volume_id.to_string()),
+                        instance_id: Some(ANALYSED_VOLUME_INSTANCE.to_string()),
+                        device: Some(device.to_string()),
+                        state: Some(ec2::state::VOLUME_ATTACHMENT_STATE_ATTACHED.to_string()),
+                        ..Default::default()
+                    }]
+                }),
+                ..Default::default()
+            };
+            store.volumes.insert(
+                volume.volume_id.to_string(),
+                ec2::state::VolumeRecord::created(view, available_at),
+            );
+        }
+        for observed in &volume.demand {
+            let at = now - observed.days_ago * 86_400.0;
+            for (metric_name, unit, rate) in [
+                ("VolumeReadOps", "Count", observed.read_ops),
+                ("VolumeWriteOps", "Count", observed.write_ops),
+                ("VolumeReadBytes", "Bytes", observed.read_mib * BYTES_PER_MIB),
+                (
+                    "VolumeWriteBytes",
+                    "Bytes",
+                    observed.write_mib * BYTES_PER_MIB,
+                ),
+            ] {
+                seed_cloudwatch_series(
+                    engine,
+                    EBS_METRIC_NAMESPACE,
+                    metric_name,
+                    &[(EBS_VOLUME_DIMENSION, volume.volume_id)],
+                    Some(unit),
+                    at,
+                    // A count over the datapoint's period, which is the rate over it.
+                    &[rate * EBS_METRIC_PERIOD_SECS],
+                );
+            }
+        }
+    }
+}
+
+/// The instance the root volume of [`analysed_volumes`] is attached to.
+const ANALYSED_VOLUME_INSTANCE: &str = "i-0123456789abcdef0";
+
 /// The same emulator, with the engine it was built on — for a suite that has to seed a
 /// CloudWatch series of the AWS-reserved namespace space ([`seed_cloudwatch_series`]), which
 /// no client call can write.
@@ -133,6 +474,7 @@ pub(crate) fn emulator_with_analysed_services_and_engine(
 ) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     register_analysed_network(&engine);
+    register_analysed_volumes(&engine);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
@@ -158,6 +500,7 @@ pub(crate) fn emulator_with_analysed_services_and_engine(
 pub(crate) fn emulator_with_analysed_databases() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
 {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    register_analysed_volumes(&engine);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));

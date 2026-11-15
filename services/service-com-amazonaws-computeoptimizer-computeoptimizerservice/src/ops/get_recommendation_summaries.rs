@@ -287,6 +287,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &account_id,
             crate::state::now_secs(),
         );
+        // The Amazon EBS volumes the account holds an analysis for, by the crate's one rule for
+        // it ([`crate::state::analysed_volumes`]): a summary of the account's volumes counts
+        // exactly the volumes `GetEBSVolumeRecommendations` reports at this endpoint, at the
+        // findings it reports for them, so the two cannot disagree about how many there are or
+        // about any one's finding, risk or cost. The look-back period in force is the one that
+        // reader analyses them under, so the two agree on each volume's figures as well.
+        let volume_look_back_period = guard
+            .effective_look_back_period(crate::state::RESOURCE_TYPE_EBS_VOLUME, &account_id);
+        let volumes: Vec<crate::state::AnalysedResource> = crate::state::analysed_volumes(
+            &*self.engine,
+            &guard,
+            &crate::state::request_region(ctx),
+            &account_id,
+            crate::state::now_secs(),
+        )
+        .iter()
+        .map(|volume| volume.to_analysed_resource(&volume_look_back_period))
+        .collect();
         // The records a caller can read, grouped by resource type: the rightsizing catalog
         // and the idle analysis. A caller sees either only once the analysis its enrollment
         // started is due
@@ -299,6 +317,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         analysed.insert(
             crate::state::SOURCE_TYPE_RDS_DB_INSTANCE,
             databases.iter().collect(),
+        );
+        // The Amazon EBS volume rows are the analysed volumes above, for the same reason: a
+        // volume is one the account's Amazon EC2 inventory holds, so the catalog records none.
+        analysed.insert(
+            crate::state::SOURCE_TYPE_EBS_VOLUME,
+            volumes.iter().collect(),
         );
         let idle = guard.idle_analyses_by_source_type(&account_id);
         // One summary per resource type this service TRACKS — every value of the

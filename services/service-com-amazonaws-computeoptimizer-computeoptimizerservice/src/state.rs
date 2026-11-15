@@ -62,12 +62,16 @@ mod auto_scaling_groups;
 // The Amazon Aurora and RDS databases the account OWNS, analysed from the Amazon RDS
 // inventory that holds them and the utilization published for them.
 mod rds_inventory;
+// The Amazon EBS volumes the account OWNS, analysed from the Amazon EC2 inventory that holds
+// them and the utilization published for them.
+mod ebs_inventory;
 // How a preferred-resource preference's include and exclude lists resolve into the effective
 // set of recommendation candidates, and the instance-type catalog they resolve against.
 mod preferred_resources;
 pub use preferred_resources::*;
 pub use auto_scaling_groups::*;
 pub use rds_inventory::*;
+pub use ebs_inventory::*;
 pub use idle::*;
 pub use functions::*;
 pub use licenses::*;
@@ -3483,13 +3487,6 @@ pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// Every stored recommendation preference, ordered by key so a page boundary is
     /// stable across calls.
     pub preferences: BTreeMap<PreferenceKey, PreferenceRecord>,
-    /// The Amazon EBS volumes Compute Optimizer observes, by volume id, so a page
-    /// boundary is stable across calls. Part of the store's initial value rather than
-    /// something a reader writes on first use: `GetEBSVolumeRecommendations` REPORTS this
-    /// observation and must not mutate the store (see [`observed_volumes`]). It is the
-    /// SINGLE source for a volume: the EBS volume rows of [`Self::analysed_resources`]
-    /// are projected from it.
-    pub volumes: BTreeMap<String, ObservedVolume>,
     /// The Amazon EC2 instances Compute Optimizer observes, by instance id, so the
     /// iteration order is stable across calls. Part of the store's initial value rather than
     /// something a reader writes on first use: a reader REPORTS this analysis and must not
@@ -3517,8 +3514,7 @@ pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// store's initial value rather than something a reader writes on first use, so every
     /// findings reader serves the same rows and none of them mutates the store. The Auto
     /// Scaling group rows are PROJECTED from [`Self::auto_scaling_group_analyses`], the
-    /// EBS volume rows from [`Self::volumes`], the Amazon EC2 instance rows from
-    /// [`Self::instances`] and the Lambda function rows from
+    /// Amazon EC2 instance rows from [`Self::instances`] and the Lambda function rows from
     /// [`Self::functions`] ([`seed_analysed_resources`]), so the two readers of one resource
     /// cannot disagree about its finding, its risk or what it costs.
     pub analysed_resources: Vec<AnalysedResource>,
@@ -3554,10 +3550,6 @@ impl Default for ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             enrollment: Enrollment::default(),
             organization_members: OrganizationMemberStore::default(),
             preferences: BTreeMap::new(),
-            volumes: observed_volumes()
-                .into_iter()
-                .map(|volume| (volume.volume_id.clone(), volume))
-                .collect(),
             instances: observed_instances()
                 .into_iter()
                 .map(|instance| (instance.instance_id.clone(), instance))
@@ -3670,16 +3662,9 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
             .iter()
             .map(AnalyzedAutoScalingGroup::to_analysed_resource),
     )
-    // The Amazon EBS volume rows are the SAME observation
-    // `GetEBSVolumeRecommendations` reports, projected the same way
-    // ([`ObservedVolume::to_analysed_resource`]) under the look-back period in force when
-    // no preference sets one, so a summary of the account's volumes counts exactly the
-    // volumes that reader reports and agrees with it on each one's finding, risk and cost.
-    .chain(
-        observed_volumes()
-            .iter()
-            .map(|volume| volume.to_analysed_resource(DEFAULT_LOOK_BACK_PERIOD)),
-    )
+    // The Amazon EBS volume rows are not here either: a volume is one the account OWNS, so
+    // those rows are projected from the Amazon EC2 inventory that holds it and the utilization
+    // published for it when a read asks for them ([`ebs_inventory::analysed_volumes`]).
     // The Lambda function rows are the SAME observation
     // `GetLambdaFunctionRecommendations` reports, projected the same way
     // ([`ObservedFunction::to_analysed_resource`]) under the look-back period in force when
@@ -3819,29 +3804,15 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             .unwrap_or_else(|| DEFAULT_LOOK_BACK_PERIOD.to_string())
     }
 
-    /// The Amazon EBS volumes whose observation a caller can read, by volume id.
-    ///
-    /// The same gate [`visible_auto_scaling_group_analyses`] applies: Compute Optimizer
-    /// reports recommendations for an ENROLLED account only, and only once the analysis
-    /// that enrollment starts is due ([`ANALYSIS_DELAY`]), so an account that never opted
-    /// in, one that opted out, and one that has just opted in all read the empty set
-    /// rather than an analysis nothing has produced yet.
-    ///
-    /// [`visible_auto_scaling_group_analyses`]: Self::visible_auto_scaling_group_analyses
-    pub fn visible_volumes(&self) -> impl Iterator<Item = &ObservedVolume> {
-        let visible = self.enrollment.analysis_visible();
-        self.volumes.values().filter(move |_| visible)
-    }
-
     /// The Lambda functions whose observation a caller can read, in ARN order.
     ///
-    /// The same gate [`visible_volumes`] applies: Compute Optimizer reports recommendations
+    /// The same gate [`visible_auto_scaling_group_analyses`] applies: Compute Optimizer reports recommendations
     /// for an ENROLLED account only, and only once the analysis that enrollment starts is
     /// due ([`ANALYSIS_DELAY`]), so an account that never opted in, one that opted out, and
     /// one that has just opted in all read the empty set rather than an analysis nothing has
     /// produced yet.
     ///
-    /// [`visible_volumes`]: Self::visible_volumes
+    /// [`visible_auto_scaling_group_analyses`]: Self::visible_auto_scaling_group_analyses
     pub fn visible_functions(&self) -> impl Iterator<Item = &ObservedFunction> {
         let visible = self.enrollment.analysis_visible();
         self.functions.values().filter(move |_| visible)
@@ -3850,13 +3821,13 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// The licensed Amazon EC2 instances whose observation a caller can read, in instance-id
     /// order.
     ///
-    /// The same gate [`visible_volumes`] applies: Compute Optimizer reports recommendations
+    /// The same gate [`visible_auto_scaling_group_analyses`] applies: Compute Optimizer reports recommendations
     /// for an ENROLLED account only, and only once the analysis that enrollment starts is
     /// due ([`ANALYSIS_DELAY`]), so an account that never opted in, one that opted out, and
     /// one that has just opted in all read the empty set rather than an analysis nothing has
     /// produced yet.
     ///
-    /// [`visible_volumes`]: Self::visible_volumes
+    /// [`visible_auto_scaling_group_analyses`]: Self::visible_auto_scaling_group_analyses
     pub fn visible_licenses(&self) -> impl Iterator<Item = &ObservedLicensedInstance> {
         let visible = self.enrollment.analysis_visible();
         self.licenses.values().filter(move |_| visible)
@@ -3864,13 +3835,13 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
 
     /// The Amazon EC2 instances whose analysis a caller can read, in instance-id order.
     ///
-    /// The same gate [`visible_volumes`] applies: Compute Optimizer reports recommendations
+    /// The same gate [`visible_auto_scaling_group_analyses`] applies: Compute Optimizer reports recommendations
     /// for an ENROLLED account only, and only once the analysis that enrollment starts is
     /// due ([`ANALYSIS_DELAY`]), so an account that never opted in, one that opted out, and
     /// one that has just opted in all read the empty set rather than an analysis nothing has
     /// produced yet.
     ///
-    /// [`visible_volumes`]: Self::visible_volumes
+    /// [`visible_auto_scaling_group_analyses`]: Self::visible_auto_scaling_group_analyses
     pub fn visible_instances(&self) -> impl Iterator<Item = &ObservedInstance> {
         let visible = self.enrollment.analysis_visible();
         self.instances.values().filter(move |_| visible)
@@ -3878,13 +3849,13 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
 
     /// The idle resource analysis a caller can read, in record order.
     ///
-    /// The same gate [`visible_volumes`] applies: Compute Optimizer reports recommendations
+    /// The same gate [`visible_auto_scaling_group_analyses`] applies: Compute Optimizer reports recommendations
     /// for an ENROLLED account only, and only once the analysis that enrollment starts is
     /// due ([`ANALYSIS_DELAY`]), so an account that never opted in, one that opted out, and
     /// one that has just opted in all read the empty set rather than an analysis nothing has
     /// produced yet.
     ///
-    /// [`visible_volumes`]: Self::visible_volumes
+    /// [`visible_auto_scaling_group_analyses`]: Self::visible_auto_scaling_group_analyses
     pub fn visible_idle_recommendations(&self) -> impl Iterator<Item = &IdleResourceAnalysis> {
         let visible = self.enrollment.analysis_visible();
         self.idle_recommendations
@@ -3894,7 +3865,7 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
 
     /// The findings catalog rows a caller can read, in catalog order.
     ///
-    /// The same gate [`visible_volumes`] applies: Compute Optimizer reports recommendations
+    /// The same gate [`visible_auto_scaling_group_analyses`] applies: Compute Optimizer reports recommendations
     /// for an ENROLLED account only, and only once the analysis that enrollment starts is
     /// due ([`ANALYSIS_DELAY`]), so an account that never opted in, one that opted out, and
     /// one that has just opted in all read the empty set rather than an analysis nothing has
@@ -3904,7 +3875,7 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// the catalog with — so no two readers of one analysis can disagree about whether it
     /// exists yet.
     ///
-    /// [`visible_volumes`]: Self::visible_volumes
+    /// [`visible_auto_scaling_group_analyses`]: Self::visible_auto_scaling_group_analyses
     /// [`analysed_resources_by_type`]: Self::analysed_resources_by_type
     pub fn visible_analysed_resources(&self) -> impl Iterator<Item = &AnalysedResource> {
         let visible = self.enrollment.analysis_visible();

@@ -191,6 +191,12 @@ pub struct ExportPlan {
     /// `GetRDSDatabaseRecommendations` reported at that moment. Empty for every other resource
     /// type's export, which no database row belongs to.
     pub analysed_databases: Vec<AnalysedResource>,
+    /// The Amazon EBS volumes the account held an analysis for when the export was created
+    /// ([`super::analysed_volumes`]): the volumes of its own Amazon EC2 inventory. They are
+    /// resolved with the plan, for the same reason the databases are, so an exported file holds
+    /// exactly the volumes `GetEBSVolumeRecommendations` reported at that moment. Empty for
+    /// every other resource type's export, which no volume row belongs to.
+    pub analysed_volumes: Vec<AnalysedResource>,
 }
 
 /// The two objects an export job has computed but not yet written: the export file and its
@@ -561,6 +567,28 @@ pub fn create_export_job<Eng: Send + Sync + 'static, F: ExportFilter>(
                 ::engine::emulator_account_id(),
                 now,
             )
+        } else {
+            Vec::new()
+        },
+        // The volumes the account holds an analysis for, resolved through the ONE rule every
+        // EBS volume surface of this service reads them by, under the look-back period in
+        // force for them — so an export and a read of the same moment cannot differ on which
+        // volumes the account has or on what each one's analysis found.
+        analysed_volumes: if request.resource_type == RESOURCE_TYPE_EBS_VOLUME {
+            let look_back_period = guard.effective_look_back_period(
+                RESOURCE_TYPE_EBS_VOLUME,
+                ::engine::emulator_account_id(),
+            );
+            super::analysed_volumes(
+                &**engine,
+                &guard,
+                &region,
+                ::engine::emulator_account_id(),
+                now,
+            )
+            .iter()
+            .map(|volume| volume.to_analysed_resource(&look_back_period))
+            .collect()
         } else {
             Vec::new()
         },
@@ -941,6 +969,15 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
                 &plan.cpu_vendor_architectures,
                 last_refresh,
             ),
+            // The account's analysed volumes, which the plan resolved: a volume row carries the
+            // columns the findings-catalog row records, exactly as a row of a resource type the
+            // catalog does hold rows for does.
+            RESOURCE_TYPE_EBS_VOLUME => self.rows_of_analysed_resources(
+                &plan.analysed_volumes.iter().collect::<Vec<_>>(),
+                RESOURCE_TYPE_EBS_VOLUME,
+                &plan.region,
+                last_refresh,
+            ),
             resource_type => {
                 self.analysed_resource_export_rows(resource_type, &plan.region, last_refresh)
             }
@@ -1097,23 +1134,34 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
         by_type
             .get(resource_type)
             .map(|resources| {
-                resources
-                    .iter()
-                    .map(|resource| {
-                        let arn = resource.arn_in(region);
-                        let preferences =
-                            self.effective_preferences_for(&arn, resource_type, account_id);
-                        analysed_resource_row(
-                            resource,
-                            resource_type,
-                            &arn,
-                            &preferences,
-                            last_refresh,
-                        )
-                    })
-                    .collect()
+                self.rows_of_analysed_resources(resources, resource_type, region, last_refresh)
             })
             .unwrap_or_default()
+    }
+
+    /// The export rows of a given set of analysed resources of one resource type: one row per
+    /// resource, carrying the columns its catalog row records ([`analysed_resource_row`]).
+    ///
+    /// The rows a surface hands in are its own selection — the findings catalog's
+    /// ([`Self::analysed_resource_export_rows`]) or the account's own inventory, for a resource
+    /// type whose analysis is computed over another service's store — so one projection serves
+    /// both and no two of them can state a resource's columns differently.
+    fn rows_of_analysed_resources(
+        &self,
+        resources: &[&AnalysedResource],
+        resource_type: &str,
+        region: &str,
+        last_refresh: Option<f64>,
+    ) -> Vec<ExportRow> {
+        let account_id = ::engine::emulator_account_id();
+        resources
+            .iter()
+            .map(|resource| {
+                let arn = resource.arn_in(region);
+                let preferences = self.effective_preferences_for(&arn, resource_type, account_id);
+                analysed_resource_row(resource, resource_type, &arn, &preferences, last_refresh)
+            })
+            .collect()
     }
 
     /// The export rows of the Amazon Aurora and RDS database analysis: one per analysed

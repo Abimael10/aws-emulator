@@ -36,7 +36,7 @@ use service_com_amazonaws_rds_amazonrdsv19::state::STATUS_TRANSITION_DELAY;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, call_in_region, call_rds, call_rds_in, cell, create_bucket, csv_rows,
+    call, call_in_region, call_rds, call_rds_in, cell, create_bucket, csv_rows, element,
     emulator_with_analysed_databases, export_destination, get_object, metrics, opt_in,
     seed_cloudwatch_series, strings, ACCOUNT, REGION,
 };
@@ -116,20 +116,6 @@ async fn describe_db_instance(
         "describing {identifier}: expected 200, got {status}: {body}"
     );
     body
-}
-
-/// The text of the first `<tag>` element of an `awsQuery` response document.
-fn element(document: &str, tag: &str) -> String {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let Some(start) = document.find(&open).map(|at| at + open.len()) else {
-        return String::new();
-    };
-    let rest = &document[start..];
-    let Some(end) = rest.find(&close) else {
-        return String::new();
-    };
-    rest[..end].to_string()
 }
 
 /// Publish `values` of one `AWS/RDS` series of one DB instance, one hour ago — inside the

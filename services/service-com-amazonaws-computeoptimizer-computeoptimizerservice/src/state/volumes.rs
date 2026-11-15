@@ -1,170 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The Amazon EBS volumes Compute Optimizer observes, and the recommendation every reader
-//! of one derives from that observation.
+//! One Amazon EBS volume as Compute Optimizer observes it, and the recommendation every
+//! reader of one derives from that observation.
+//!
+//! WHICH volumes the service observes is not here: a volume belongs to the account's Amazon
+//! EC2 inventory and its utilization to the `AWS/EBS` series published for it, so the
+//! observation of each one is read from those two stores at the moment of a read
+//! ([`analysed_volumes`]). This file holds what is derived FROM one observation, so every
+//! surface that reports a volume derives it the same way.
 //!
 //! Part of [`super`]'s one state module, in its own file so one concern lives in one place.
 
 use super::*;
-
-/// The Amazon EBS volume inventory this emulator observes, generated once when the store
-/// is created.
-///
-/// The emulator watches no real workload, so the volumes and their metric samples are a
-/// fixed observation rather than something derived from traffic. Everything a
-/// recommendation reports is nevertheless computed from what is stored here — the
-/// analysed peaks come from these samples, the recommended configuration from those
-/// peaks, and every cost from [`volume_monthly_cost`] — so a reader cannot report a
-/// figure the observation does not support.
-///
-/// The set spans the cases a volume recommendation distinguishes: a previous-generation
-/// volume whose demand fits its capacity (cheaper on gp3), a gp3 volume whose demand
-/// outruns its provisioned IOPS (needs more performance), a heavily over-provisioned
-/// Provisioned IOPS volume whose peak demand arrived outside the default look-back
-/// period, and a gp3 volume already provisioned for its workload.
-pub(super) fn observed_volumes() -> Vec<ObservedVolume> {
-    let account_id = ::engine::emulator_account_id().to_string();
-
-    vec![
-        // gp2, 500 GiB: 3 IOPS per GiB of baseline (1,500) with a 3,000 IOPS burst and
-        // 250 MiB/s of throughput. Its peak fits that comfortably, so the gp3 option
-        // carries the same workload for less money.
-        ObservedVolume {
-            volume_id: "vol-0a1b2c3d4e5f60001".to_string(),
-            account_id: account_id.clone(),
-            configuration: VolumeConfiguration {
-                volume_type: Some("gp2".to_string()),
-                volume_size: 500,
-                volume_baseline_iops: 1_500,
-                volume_burst_iops: 3_000,
-                volume_baseline_throughput: 250,
-                volume_burst_throughput: 250,
-                root_volume: Some(true),
-            },
-            tags: vec![("Owner".to_string(), "TeamA".to_string())],
-            days_observed: 93.0,
-            samples: vec![
-                VolumeSample {
-                    days_ago: 0.0,
-                    read_ops_per_second: 300.0,
-                    write_ops_per_second: 400.0,
-                    read_bytes_per_second: 20.0 * BYTES_PER_MIB,
-                    write_bytes_per_second: 25.0 * BYTES_PER_MIB,
-                },
-                VolumeSample {
-                    days_ago: 3.0,
-                    read_ops_per_second: 450.0,
-                    write_ops_per_second: 450.0,
-                    read_bytes_per_second: 30.0 * BYTES_PER_MIB,
-                    write_bytes_per_second: 30.0 * BYTES_PER_MIB,
-                },
-                VolumeSample {
-                    days_ago: 40.0,
-                    read_ops_per_second: 200.0,
-                    write_ops_per_second: 150.0,
-                    read_bytes_per_second: 10.0 * BYTES_PER_MIB,
-                    write_bytes_per_second: 8.0 * BYTES_PER_MIB,
-                },
-            ],
-        },
-        // gp3, 100 GiB at its included performance, driven past it: the option has to
-        // provision more IOPS and more throughput, which costs MORE than the volume
-        // costs today — a recommendation is not always a saving.
-        ObservedVolume {
-            volume_id: "vol-0a1b2c3d4e5f60002".to_string(),
-            account_id: account_id.clone(),
-            configuration: VolumeConfiguration {
-                volume_type: Some(VOLUME_TYPE_GP3.to_string()),
-                volume_size: 100,
-                volume_baseline_iops: GP3_INCLUDED_IOPS,
-                volume_burst_iops: 0,
-                volume_baseline_throughput: GP3_INCLUDED_THROUGHPUT_MIB,
-                volume_burst_throughput: 0,
-                root_volume: Some(false),
-            },
-            tags: vec![("Owner".to_string(), "TeamB".to_string())],
-            days_observed: 93.0,
-            samples: vec![
-                VolumeSample {
-                    days_ago: 0.0,
-                    read_ops_per_second: 2_400.0,
-                    write_ops_per_second: 2_400.0,
-                    read_bytes_per_second: 60.0 * BYTES_PER_MIB,
-                    write_bytes_per_second: 60.0 * BYTES_PER_MIB,
-                },
-                VolumeSample {
-                    days_ago: 10.0,
-                    read_ops_per_second: 1_000.0,
-                    write_ops_per_second: 900.0,
-                    read_bytes_per_second: 40.0 * BYTES_PER_MIB,
-                    write_bytes_per_second: 30.0 * BYTES_PER_MIB,
-                },
-            ],
-        },
-        // io1, 200 GiB with 8,000 provisioned IOPS: far more than the workload asks for,
-        // and its heaviest day falls OUTSIDE the default look-back period, so a longer
-        // look-back preference changes the option this volume gets.
-        ObservedVolume {
-            volume_id: "vol-0a1b2c3d4e5f60003".to_string(),
-            account_id: account_id.clone(),
-            configuration: VolumeConfiguration {
-                volume_type: Some("io1".to_string()),
-                volume_size: 200,
-                volume_baseline_iops: 8_000,
-                volume_burst_iops: 0,
-                volume_baseline_throughput: 500,
-                volume_burst_throughput: 0,
-                root_volume: Some(false),
-            },
-            tags: vec![
-                ("Owner".to_string(), "TeamB".to_string()),
-                ("Environment".to_string(), "production".to_string()),
-            ],
-            days_observed: 93.0,
-            samples: vec![
-                VolumeSample {
-                    days_ago: 1.0,
-                    read_ops_per_second: 600.0,
-                    write_ops_per_second: 600.0,
-                    read_bytes_per_second: 30.0 * BYTES_PER_MIB,
-                    write_bytes_per_second: 20.0 * BYTES_PER_MIB,
-                },
-                VolumeSample {
-                    days_ago: 50.0,
-                    read_ops_per_second: 1_500.0,
-                    write_ops_per_second: 1_500.0,
-                    read_bytes_per_second: 100.0 * BYTES_PER_MIB,
-                    write_bytes_per_second: 60.0 * BYTES_PER_MIB,
-                },
-            ],
-        },
-        // gp3, 50 GiB, already provisioned for its workload — and observed for only a
-        // week, so the period analysed is that week however long a look-back period the
-        // account prefers.
-        ObservedVolume {
-            volume_id: "vol-0a1b2c3d4e5f60004".to_string(),
-            account_id,
-            configuration: VolumeConfiguration {
-                volume_type: Some(VOLUME_TYPE_GP3.to_string()),
-                volume_size: 50,
-                volume_baseline_iops: GP3_INCLUDED_IOPS,
-                volume_burst_iops: 0,
-                volume_baseline_throughput: GP3_INCLUDED_THROUGHPUT_MIB,
-                volume_burst_throughput: 0,
-                root_volume: Some(false),
-            },
-            tags: Vec::new(),
-            days_observed: 7.0,
-            samples: vec![VolumeSample {
-                days_ago: 0.0,
-                read_ops_per_second: 700.0,
-                write_ops_per_second: 800.0,
-                read_bytes_per_second: 20.0 * BYTES_PER_MIB,
-                write_bytes_per_second: 20.0 * BYTES_PER_MIB,
-            }],
-        },
-    ]
-}
 
 /// One Amazon EBS volume Compute Optimizer observes: its configuration, its tags, and
 /// the metric samples a recommendation for it is computed from. This is the OBSERVATION;
@@ -184,11 +31,8 @@ pub struct ObservedVolume {
     pub configuration: VolumeConfiguration,
     /// The volume's tags, as key/value pairs, in the order EC2 reports them.
     pub tags: Vec<(String, String)>,
-    /// How many days Compute Optimizer has been observing this volume. A look-back
-    /// preference longer than this cannot be honoured, so the analysed period is the
-    /// shorter of the two.
-    pub days_observed: f64,
-    /// The metric samples observed, most recent first.
+    /// The metric samples observed for the volume, each one interval of the `AWS/EBS` series
+    /// published for it ([`analysed_volumes`]).
     pub samples: Vec<VolumeSample>,
 }
 
@@ -214,29 +58,33 @@ impl ObservedVolume {
             .fold(0.0_f64, f64::max)
     }
 
-    /// How many analysed samples `exceeded` answers true for.
-    pub(super) fn samples_exceeding(
+    /// Whether any analysed sample `exceeded` answers true for, as the `1`/`0` indicator the
+    /// two "exceeded" metrics report: "a value of 1 means the provisioned IOPS were exceeded;
+    /// a value of 0 means they were not" (`EBSUtilizationMetric$name`), reported under the
+    /// `Maximum` statistic — so a period in which the volume's provisioned performance was
+    /// exceeded at all reports 1.
+    pub(super) fn exceeded_indicator(
         &self,
         look_back_days: f64,
         exceeded: impl Fn(&VolumeSample) -> bool,
     ) -> f64 {
-        self.analysed_samples(look_back_days)
-            .filter(|sample| exceeded(sample))
-            .count() as f64
+        f64::from(u8::from(
+            self.analysed_samples(look_back_days).any(exceeded),
+        ))
     }
 
     /// "The number of days for which utilization metrics were analyzed for the volume"
-    /// (`VolumeRecommendation$lookBackPeriodInDays`): the preferred look-back period
-    /// ([`look_back_period_in_days`]), or however long this volume has been observed when
-    /// that is shorter.
+    /// (`VolumeRecommendation$lookBackPeriodInDays`): the length of the look-back period in
+    /// force ([`look_back_period_in_days`]), which is the window the samples analysed were
+    /// taken in ([`Self::analysed_samples`]).
     pub fn analysed_days(&self, look_back_period: &str) -> f64 {
-        look_back_period_in_days(look_back_period).min(self.days_observed)
+        look_back_period_in_days(look_back_period)
     }
 
     /// The metrics `VolumeRecommendation$utilizationMetrics` reports: every
     /// `EBSMetricName` the model declares, each the peak of the analysed samples — and,
-    /// for the two "exceeded" metrics, the number of analysed samples whose demand went
-    /// past the capacity the volume's configuration delivers.
+    /// for the two "exceeded" metrics, whether any analysed sample's demand went past the
+    /// capacity the volume's configuration delivers ([`Self::exceeded_indicator`]).
     pub fn utilization_metrics(&self, look_back_days: f64) -> Vec<EBSUtilizationMetric> {
         let iops_capacity = configured_iops_capacity(&self.configuration);
         let throughput_capacity = configured_throughput_capacity(&self.configuration);
@@ -264,11 +112,11 @@ impl ObservedVolume {
             ),
             metric(
                 EBS_METRIC_IOPS_EXCEEDED,
-                self.samples_exceeding(look_back_days, |sample| sample.iops() > iops_capacity),
+                self.exceeded_indicator(look_back_days, |sample| sample.iops() > iops_capacity),
             ),
             metric(
                 EBS_METRIC_THROUGHPUT_EXCEEDED,
-                self.samples_exceeding(look_back_days, |sample| {
+                self.exceeded_indicator(look_back_days, |sample| {
                     sample.throughput_mib_per_second() > throughput_capacity
                 }),
             ),

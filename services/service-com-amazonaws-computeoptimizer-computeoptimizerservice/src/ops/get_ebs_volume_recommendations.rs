@@ -3,11 +3,12 @@
 //! @op GetEBSVolumeRecommendations
 //!
 //! IMPLEMENTED: reports the Amazon EBS volume recommendations Compute Optimizer holds for
-//! an account — for every observed volume the request selects, the recommendation
-//! [`crate::state::ObservedVolume::to_recommendation`] derives from that volume's stored
-//! configuration and metric samples under the look-back period in force, one page at a
-//! time. REPORTING only: Compute Optimizer has no API that creates a recommendation, so
-//! this call writes nothing.
+//! an account — for every volume of the account's own Amazon EC2 inventory the request
+//! selects, the recommendation [`crate::state::ObservedVolume::to_recommendation`] derives
+//! from that volume's configuration and from the `AWS/EBS` utilization published for it under
+//! the look-back period in force ([`crate::state::analysed_volumes`]), one page at a time.
+//! REPORTING only: Compute Optimizer has no API that creates a recommendation, so this call
+//! writes nothing.
 //!
 //! A request narrows the answer three ways, each applied before the page is cut:
 //! `accountIds` (one account id, as the model documents — naming any account other than
@@ -253,19 +254,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::state::Enrollment::last_analysis_refresh`]).
         let last_refresh_timestamp = guard.enrollment.last_analysis_refresh();
 
-        // The volumes this request asks about: the account's whole observed inventory in
-        // this Region — which a caller sees only once the analysis its enrollment started
-        // is due ([`crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::visible_volumes`]) —
-        // or exactly the ones the named ARNs pick out of it. A well-formed volume ARN of
-        // the requested account that this service holds no recommendation for is simply
-        // ABSENT from the answer: the recorded behaviour of the real service is that such
-        // an ARN is not reported in `errors`, which carries the volumes an analysis
-        // rejected ("an error is returned if you request recommendations for an
-        // unsupported volume", `GetEBSVolumeRecommendationsResponse$errors`) and not the
-        // ones it has never seen. This emulator observes the inventory in `crate::state`
-        // and classifies no volume as unsupported, so it reports no error.
-        let selected: Vec<&crate::state::ObservedVolume> = guard
-            .visible_volumes()
+        // The volumes this request asks about: the account's analysed inventory in this
+        // Region — the Amazon EBS volumes Amazon EC2 holds for it, each with the utilization
+        // published for it, resolved through the ONE rule every EBS volume surface of this
+        // service reads them by ([`crate::state::analysed_volumes`]) — or exactly the ones the
+        // named ARNs pick out of it. A caller sees them only once the analysis its enrollment
+        // started is due, the same gate that rule applies for every reader.
+        //
+        // A well-formed volume ARN of the requested account that this service holds no
+        // recommendation for is simply ABSENT from the answer: the recorded behaviour of the
+        // real service is that such an ARN is not reported in `errors`, which carries the
+        // volumes an analysis rejected ("an error is returned if you request recommendations
+        // for an unsupported volume", `GetEBSVolumeRecommendationsResponse$errors`) and not
+        // the ones it has never seen. This analysis classifies no volume of the inventory as
+        // unsupported — a volume it has no utilization for is one it has not analysed, not one
+        // it rejected — so it reports no error.
+        let analysed = crate::state::analysed_volumes(
+            &*self.engine,
+            &guard,
+            &region,
+            &account_id,
+            crate::state::now_secs(),
+        );
+        let selected: Vec<&crate::state::ObservedVolume> = analysed
+            .iter()
             .filter(|volume| volume.account_id == account_id)
             .filter(|volume| {
                 requested_volumes

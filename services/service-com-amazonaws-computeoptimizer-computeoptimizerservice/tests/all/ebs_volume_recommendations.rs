@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! `GetEBSVolumeRecommendations` over the wire: the recommendation this service derives
-//! from each observed Amazon EBS volume, and how a request narrows, pages and refuses.
+//! from each Amazon EBS volume of the account's own inventory, and how a request narrows,
+//! pages and refuses.
 //!
 //! Every assertion here is on the RULE, checked over a set of volumes that differ in
-//! volume type, size, demand shape and how long they have been observed — the response
-//! itself carries the analysed peaks, so an option can be checked against the demand it
-//! has to carry without this suite restating the handler's arithmetic.
+//! volume type, size and demand shape — the response itself carries the analysed peaks, so
+//! an option can be checked against the demand it has to carry without this suite restating
+//! the handler's arithmetic. WHICH volumes the account owns is the harness's, which holds
+//! them in Amazon EC2's own volume store with the `AWS/EBS` utilization published for each.
 
 use std::time::Duration;
 
@@ -294,12 +296,13 @@ async fn every_observed_volume_gets_the_recommendation_its_samples_ask_for() {
     // volume whose demand fits its capacity, a current-generation one whose demand
     // outruns its provisioned IOPS, a heavily over-provisioned Provisioned IOPS volume,
     // and one already provisioned for its workload. `look_back_days` is the period
-    // analysed: the preferred 14 days, or the volume's shorter observation window.
+    // analysed: the preferred 14 days, which is the window the analysed samples were
+    // observed in.
     let cases: [(&str, &str, bool, f64); 4] = [
         (GP2_WITH_HEADROOM, "NotOptimized", true, 14.0),
         (GP3_OUTRUNNING_ITS_IOPS, "NotOptimized", false, 14.0),
         (IO1_OVER_PROVISIONED, "NotOptimized", true, 14.0),
-        (GP3_ALREADY_RIGHT_SIZED, "Optimized", false, 7.0),
+        (GP3_ALREADY_RIGHT_SIZED, "Optimized", false, 14.0),
     ];
     assert_eq!(
         reported_arns(&body).len(),
@@ -314,6 +317,14 @@ async fn every_observed_volume_gets_the_recommendation_its_samples_ask_for() {
             recommendation["finding"],
             json!(finding),
             "case {suffix}: expected finding {finding}, got {recommendation}"
+        );
+        // Only the first volume is attached to an instance, at a root device name, so it is
+        // the only one reported as a root volume.
+        assert_eq!(
+            recommendation["currentConfiguration"]["rootVolume"],
+            json!(suffix == GP2_WITH_HEADROOM),
+            "case {suffix}: a volume an instance boots from is the one reported as a root \
+             volume: {recommendation}"
         );
         assert_eq!(
             number(&recommendation, "lookBackPeriodInDays"),
@@ -358,6 +369,34 @@ async fn every_observed_volume_gets_the_recommendation_its_samples_ask_for() {
         "a volume with six times the IOPS its workload asks for is at very low risk: \
          {over_provisioned}"
     );
+
+    // The two "exceeded" metrics are the documented indicator, not a count of samples: "a
+    // value of 1 means the provisioned IOPS were exceeded; a value of 0 means they were not".
+    // The under-provisioned volume's peak demand (4,800 IOPS) outran the 3,000 IOPS it
+    // provisions while its 120 MiB/s stayed inside its 125 MiB/s, so the one reads 1 and the
+    // other 0 for the SAME volume; the over-provisioned volume exceeded neither.
+    for (case, recommendation, iops_exceeded, throughput_exceeded) in [
+        (
+            GP3_OUTRUNNING_ITS_IOPS,
+            &under_provisioned,
+            1.0_f64,
+            0.0_f64,
+        ),
+        (IO1_OVER_PROVISIONED, &over_provisioned, 0.0, 0.0),
+    ] {
+        for (name, expected) in [
+            ("VolumeIOPSExceeded", iops_exceeded),
+            ("VolumeThroughputExceeded", throughput_exceeded),
+        ] {
+            let actual = metric(recommendation, name);
+            assert_eq!(
+                actual, expected,
+                "case {case}/{name}: the indicator is 1 when the analysed period exceeded the \
+                 volume's provisioned performance and 0 when it did not, expected {expected}, \
+                 got {actual}: {recommendation}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -395,13 +434,15 @@ async fn a_longer_look_back_preference_analyses_more_of_the_observed_period() {
         "the option has to carry the higher peak the longer period reveals: {after}"
     );
 
-    // A volume observed for less than the preferred period is analysed over what was
-    // observed: the preference cannot conjure samples that were never taken.
+    // A volume whose demand was all observed inside the shorter period is analysed to the
+    // same peaks under the longer one: a preference cannot conjure samples that were never
+    // taken.
     let short_history = recommendation_for(&longer_period, GP3_ALREADY_RIGHT_SIZED);
     assert_eq!(
-        number(&short_history, "lookBackPeriodInDays"),
-        7.0,
-        "a volume observed for a week is analysed over that week: {short_history}"
+        peak_iops(&short_history),
+        peak_iops(&recommendation_for(&default_period, GP3_ALREADY_RIGHT_SIZED)),
+        "a volume observed only in the last day has the same peak over 93 days as over 14: \
+         {short_history}"
     );
 }
 
@@ -727,43 +768,45 @@ async fn a_page_walks_the_inventory_once_and_a_forged_token_is_refused() {
 }
 
 #[tokio::test]
-async fn a_recommendation_names_its_volume_in_the_region_the_request_was_signed_for() {
+async fn a_recommendation_names_its_volume_in_the_region_the_volume_is_in() {
     let router = emulator();
     analysed(&router).await;
 
-    // Compute Optimizer is a regional service: each row is a Region a caller addresses,
-    // and every ARN the answer carries is in that Region, over the same volume ids.
-    let mut ids_per_region: Vec<Vec<String>> = Vec::new();
-    for region in ["us-east-1", "us-west-2", "eu-central-1"] {
+    // Compute Optimizer is a regional service and an Amazon EBS volume belongs to ONE
+    // Region — the one its Availability Zone is in — so each row is a Region a caller
+    // addresses and what that endpoint analyses: the account's volumes at their own
+    // Region's endpoint, and nothing at any other.
+    for (region, holds_the_volumes) in [
+        ("us-east-1", true),
+        ("us-west-2", false),
+        ("eu-central-1", false),
+    ] {
         let (status, body) =
             call_in_region(&router, region, "GetEBSVolumeRecommendations", json!({})).await;
         assert_eq!(
             status, 200,
             "case {region}: expected 200, got {status}: {body}"
         );
-        let prefix = format!("arn:aws:ec2:{region}:{}:volume/", ::engine::emulator_account_id());
-        let mut ids = Vec::new();
-        for arn in reported_arns(&body) {
-            let id = arn.strip_prefix(&prefix).map(str::to_string);
-            let id = id.unwrap_or_else(|| {
-                panic!("case {region}: expected an ARN under {prefix}, got {arn}")
-            });
-            ids.push(id);
-        }
-        assert!(
-            !ids.is_empty(),
-            "case {region}: the Region's inventory is reported: {body}"
-        );
-        ids_per_region.push(ids);
-    }
-    for ids in &ids_per_region {
+        let reported = reported_arns(&body);
         assert_eq!(
-            ids, &ids_per_region[0],
-            "the same volumes are reported in every Region, each under its own ARN"
+            !reported.is_empty(),
+            holds_the_volumes,
+            "case {region}: a volume is analysed at the endpoint of its own Region only, \
+             got {reported:?}"
         );
+        let prefix = format!(
+            "arn:aws:ec2:{region}:{}:volume/",
+            ::engine::emulator_account_id()
+        );
+        for arn in &reported {
+            assert!(
+                arn.starts_with(&prefix),
+                "case {region}: expected an ARN under {prefix}, got {arn}"
+            );
+        }
     }
 
-    // A volume ARN of another Region names nothing this endpoint observes, so it selects
+    // A volume ARN of another Region names nothing this endpoint analyses, so it selects
     // nothing — and is no error, exactly like an unknown volume of this Region.
     let (status, body) = call_in_region(
         &router,
