@@ -120,6 +120,19 @@ const SENDER: &str = "Sender";
 /// (`com.amazonaws.cloudfront#InvalidArgument`, HTTP 400).
 const INVALID_ARGUMENT: &str = "InvalidArgument";
 
+/// The wire code CloudFront's front door names a request that matches no action of this API
+/// ([`unknown_action`]).
+///
+/// The model declares no shape for it — it is the FRONT DOOR's refusal rather than any
+/// operation's modelled error, raised before an action is named at all — and the recorded
+/// responses in this project's corpus carry `<Code>InvalidAction</Code>` under
+/// [`UNKNOWN_ACTION`] for a request whose path matches no route of this API.
+const INVALID_ACTION: &str = "InvalidAction";
+
+/// The status that refusal answers with: the action was not FOUND, which is a 404 and a client
+/// error, never a server fault.
+const UNKNOWN_ACTION: u16 = 404;
+
 /// The wire code CloudFront answers a request whose XML body it cannot read — including
 /// a required payload that is not there at all.
 ///
@@ -294,12 +307,25 @@ fn element_text<'a>(document: &'a str, name: &str) -> Option<&'a str> {
 /// raised is rendered by the protocol and reaches the same envelope through
 /// [`with_request_id`].
 fn error_response(status: u16, code: &str, message: &str) -> RtResponse {
+    envelope_response(status, code, Some(message))
+}
+
+/// The error envelope this service answers `status` / `code` with, stating `message` when
+/// the refusal has something to say beyond its code.
+///
+/// A refusal with NO message is not one whose message is empty: the `Message` element is
+/// absent altogether, which is how the front door answers a request it could not read as any
+/// action of this API — there is no member, no value and no resource for it to name.
+fn envelope_response(status: u16, code: &str, message: Option<&str>) -> RtResponse {
+    let stated = match message {
+        Some(message) => format!("<Message>{}</Message>", xml_escape(message)),
+        None => String::new(),
+    };
     let body = format!(
         "<?xml version=\"1.0\"?><ErrorResponse xmlns=\"{namespace}\"><Error>\
-         <Type>{SENDER}</Type><Code>{code}</Code><Message>{message}</Message></Error>\
+         <Type>{SENDER}</Type><Code>{code}</Code>{stated}</Error>\
          <{REQUEST_ID_ELEMENT}>{request_id}</{REQUEST_ID_ELEMENT}></ErrorResponse>",
         namespace = xml_escape(XML_NAMESPACE),
-        message = xml_escape(message),
         request_id = new_request_id(),
     );
     let mut resp = RtResponse::new(
@@ -310,6 +336,21 @@ fn error_response(status: u16, code: &str, message: &str) -> RtResponse {
     );
     resp.headers_mut().insert("content-type", "application/xml");
     resp
+}
+
+/// The refusal this service's front door answers a request whose method and path name none of
+/// the actions it serves.
+///
+/// What failed is the ACTION lookup — nothing read the request as an operation of this API, so
+/// no operation, member or resource is named — and CloudFront answers it as the unknown action
+/// it is: [`UNKNOWN_ACTION`] with [`INVALID_ACTION`] and no `Message`. Deliberately NOT the
+/// framework's generic `501 NotImplemented`: that is a server-fault class telling a client
+/// this emulator lacks the operation, which is false for a path it merely could not match (an
+/// identifier carrying a `/` — an ARN where an id belongs — spills into the next path segment
+/// and matches no route, while the operation itself is served), and its sentence would echo
+/// the request's own path back, which this API never does.
+pub fn unknown_action() -> RtResponse {
+    envelope_response(UNKNOWN_ACTION, INVALID_ACTION, None)
 }
 
 /// The body `resp` should carry so its error envelope names the request, or `None` when
@@ -791,9 +832,12 @@ fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
 
 /// The generated definition, with the error envelope finished on the three failures the
 /// router renders OUTSIDE the dispatch path: a request that names no modelled operation,
-/// a transport-level failure, and a refusal made before any operation runs. Each is the
-/// generated renderer's own document with the envelope's request id added, so a caller
-/// correlating a failure never has to care which layer refused it.
+/// a transport-level failure, and a refusal made before any operation runs. The last two are
+/// the generated renderer's own document with the envelope's request id added, so a caller
+/// correlating a failure never has to care which layer refused it; the FIRST is this
+/// service's own front-door refusal ([`unknown_action`]), because the action a request names
+/// is what this layer resolves and `501 NotImplemented` would report an operation this
+/// emulator serves as one it lacks.
 ///
 /// Identity, the protocol and the routing table come from the generated
 /// [`crate::ServiceDefinition`] untouched — nothing model-derived is restated here. The
@@ -842,8 +886,13 @@ impl<Eng: Send + Sync + 'static> ErasedServiceDefinition for CloudFrontDefinitio
         self.entry.routing_table()
     }
 
-    fn routing_error_response(&self, req: &RtRequest) -> RtResponse {
-        with_request_id(self.entry.routing_error_response(req))
+    fn routing_error_response(&self, _req: &RtRequest) -> RtResponse {
+        // NOT the generated renderer's `501 NotImplemented`: a request this API could not
+        // match to a route is one whose ACTION the front door could not find
+        // ([`unknown_action`]), which is a client error this service names itself. The
+        // generated renderer is left unread for this one failure; the other two below still
+        // go through it.
+        unknown_action()
     }
 
     fn framework_error_response(

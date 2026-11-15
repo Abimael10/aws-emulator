@@ -3972,3 +3972,11 @@ pub use announced_url::*;
 /// [`functions`] is one; `pub use` keeps every name reachable as `crate::state::<name>`.
 mod resource_policies;
 pub use resource_policies::*;
+
+/// What an identifier bound to the request PATH has to be before the operation it addresses
+/// resolves it: the form CloudFront issues that resource kind's identifiers in, and — for the
+/// kinds CloudFront draws identifiers for from one form — which kind this account holds the
+/// identifier as. A SUBMODULE for the same reason [`functions`] is one; `pub use` keeps every
+/// name reachable as `crate::state::<name>`.
+mod path_identifiers;
+pub use path_identifiers::*;

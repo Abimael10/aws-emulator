@@ -143,7 +143,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = store.origin_access_control(&input.id) else {
             return Err(
                 GetOriginAccessControlErrorModeled::NoSuchOriginAccessControl(
-                    crate::state::no_such_origin_access_control(),
+                    // The identifier is read as an origin access control identifier BEFORE the
+                    // absent control is reported: a value that is no such identifier at all —
+                    // outside the form CloudFront issues one in, or held by this account as a
+                    // resource of another kind of the same identifier family (a distribution
+                    // id, say) — is reported as the unreadable argument it is, and the
+                    // absent-control sentence is kept for an identifier that could address one.
+                    store.unresolved_origin_access_control(&input.id),
                 )
                 .into(),
             );

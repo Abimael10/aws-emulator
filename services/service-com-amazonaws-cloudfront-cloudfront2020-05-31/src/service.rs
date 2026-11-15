@@ -30,7 +30,10 @@
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
-//!   404, …). Return `Some(resp)` to answer in your own envelope if desired.
+//!   404, …). This service keeps `None` here and words that refusal in
+//!   [`envelope::CloudFrontDefinition`] instead, where every renderer of it reads one
+//!   answer: CloudFront's front-door refusal of an unknown action, `404 InvalidAction`
+//!   ([`envelope::unknown_action`]).
 //! - `override_framework_error` — how this service words a transport-level
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
@@ -252,10 +255,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
+        // routing table resolved it. `None` here, because this service words that
+        // refusal ONE level down instead, in [`envelope::CloudFrontDefinition`]'s own
+        // `routing_error_response`: the same refusal is reachable from the dispatch path too
+        // (see [`envelope::ErrorEnvelope`]), so wording it where every renderer reads it
+        // keeps the two from disagreeing. What it answers is CloudFront's front-door
+        // refusal of an unknown action ([`envelope::unknown_action`]) rather than the
+        // framework's generic `501 NotImplemented`.
         let _ = req;
         None
     }

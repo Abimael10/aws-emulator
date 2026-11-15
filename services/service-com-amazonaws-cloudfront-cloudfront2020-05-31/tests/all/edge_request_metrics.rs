@@ -15,12 +15,13 @@
 //! client sees is what `ListMetrics` and `GetMetricStatistics` answer. The sibling
 //! `edge_data_plane` suite pins what the edge SERVES; this one pins what it REPORTS about it.
 //!
-//! The rows span what the rule generalises over: the status class of the answer (a 2xx and a
-//! 4xx and a 5xx the origin produced, a 4xx CloudFront produced itself for a method the
-//! behaviour does not allow, and a 5xx CloudFront produced for an origin it could not reach),
-//! the method (one a byte counter counts and one it does not), and the distribution the
-//! traffic was addressed to — two of them, so a series is shown to carry one distribution's
-//! requests and not another's.
+//! The rows span what the rule generalises over: the status class of the answer (a 2xx and two
+//! 4xx the origin produced — one its own not-found, one its front door's refusal of a request
+//! naming no action of it — a 4xx CloudFront produced itself for a method the behaviour does
+//! not allow, and a 5xx CloudFront produced for an origin it could not reach, which is where
+//! this suite's 5xx coverage lives), the method (one a byte counter counts and one it does
+//! not), and the distribution the traffic was addressed to — two of them, so a series is shown
+//! to carry one distribution's requests and not another's.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -300,10 +301,10 @@ fn served_requests() -> Vec<Driven> {
             status: 200,
         },
         Driven {
-            case: "a HEAD the origin answers with a status of its own",
+            case: "a HEAD naming no action of the origin's API",
             method: "HEAD",
             path: "/2020-05-31/distribution",
-            status: 501,
+            status: 404,
         },
         Driven {
             case: "a GET for a distribution the origin does not hold",

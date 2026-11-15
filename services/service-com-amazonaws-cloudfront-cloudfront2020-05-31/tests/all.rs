@@ -402,6 +402,8 @@ mod tenant_web_acl_association_scope;
 mod tenant_web_acl_disassociation_scope;
 #[path = "all/trust_store_lifecycle.rs"]
 mod trust_store_lifecycle;
+#[path = "all/unreadable_path_identifiers.rs"]
+mod unreadable_path_identifiers;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;
 #[path = "all/verify_dns_configuration.rs"]

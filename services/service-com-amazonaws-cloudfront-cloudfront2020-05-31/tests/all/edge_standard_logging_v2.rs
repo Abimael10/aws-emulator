@@ -363,11 +363,11 @@ async fn each_served_viewer_request_appears_as_one_record_in_the_deliverys_log_g
             status: 200,
         },
         Probe {
-            case: "a head the origin answers no implementation for",
+            case: "a head naming no action of the origin's API",
             method: "HEAD",
             path: "/2020-05-31/distribution",
             query: "",
-            status: 501,
+            status: 404,
         },
         Probe {
             case: "a path the origin answers no object for",
