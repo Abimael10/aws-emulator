@@ -459,6 +459,8 @@ mod layer_listing;
 mod layer_listing_entry_members;
 #[path = "all/layer_region_scope.rs"]
 mod layer_region_scope;
+#[path = "all/layer_request_value_rules.rs"]
+mod layer_request_value_rules;
 #[path = "all/layer_version_by_arn.rs"]
 mod layer_version_by_arn;
 #[path = "all/layer_version_listing.rs"]

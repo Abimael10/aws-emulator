@@ -151,6 +151,11 @@ mod request_quota;
 /// an SDK reads its response metadata's `RequestId` from; see the module's own header.
 pub mod request_id_header;
 
+/// How a value bound into the request URI that the protocol cannot CONVERT to its member's
+/// modelled type is refused, which is not the class of failure a broken constraint is; see
+/// the module's own header.
+mod uri_value_coercion;
+
 /// WHERE a constraint broken by a COLLECTION's elements is stated, and what that clause says
 /// an element has to satisfy; see the module's own header.
 mod validation;
@@ -640,6 +645,16 @@ where
             // the request would have stored (see [`request_quota`]).
             if let Some(refusal) = request_quota::refusing_body(O::NAME, req) {
                 return fault_class::with_fault_class(O::NAME, refusal);
+            }
+            // A value bound into the request URI that cannot be CONVERTED to the modelled
+            // type of its member never becomes a value at all, so it fails in the protocol's
+            // deserializer rather than against a constraint this model declares: it is
+            // answered in the framework's own error envelope, ahead of the constraint walk
+            // below, because a request that never became an input has no constraint
+            // violations for that walk to state (see [`uri_value_coercion`]).
+            if let Some(unconvertible) = uri_value_coercion::refusal_for(O::INPUT_SCHEMA, req.uri())
+            {
+                return uri_value_coercion::serialization_exception(&unconvertible);
             }
             // The definition is read, used and dropped inside this statement:
             // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await

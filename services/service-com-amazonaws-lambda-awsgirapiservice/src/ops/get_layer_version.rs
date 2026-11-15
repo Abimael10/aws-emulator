@@ -180,6 +180,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = crate::state::layer_name_in(&input.layer_name, &region)
             .map_err(invalid_parameter)?;
 
+        // "The version number" addresses one of the versions a publish assigned, and those
+        // are numbered from the first one upwards, so a number below it names no version
+        // that could exist anywhere: the value is refused as the input error it is, ahead
+        // of the lookup, rather than looked up and reported as a version this account does
+        // not hold (see [`crate::state::layer_version_at_or_above_first`]).
+        crate::state::layer_version_at_or_above_first(input.version_number)
+            .map_err(invalid_parameter)?;
+
         // Whose layer the request named is decided before anything is looked up: a layer
         // of another account is reachable only through ITS OWN permissions policy, which
         // this endpoint does not hold (see `crate::state::layer_authorization`).

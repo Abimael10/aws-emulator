@@ -106,6 +106,21 @@ pub const FUNCTION_ONLY_OPERATION_MESSAGE: &str =
 /// `400 InvalidParameterValueException` with `message` exactly this.
 pub const INVALID_MARKER_MESSAGE: &str = "Invalid marker value from user.";
 
+/// What `ListLayers` refuses a `Marker` it did not issue with.
+///
+/// The same CLASS of refusal as [`INVALID_MARKER_MESSAGE`] — a value this listing never
+/// handed back names no place to continue from — worded as this listing words it, and
+/// carrying nothing of the request for the same reason: the value is the caller's own, and
+/// what is wrong with it is only that this service did not issue it.
+///
+/// Which sentence a listing words it with is RECORDED per operation rather than derived,
+/// exactly as the fault class a refusal names is
+/// (`crate::service::fault_class::NAMES_NO_CLASS`). Recorded behaviour: fixture
+/// `lambda-lls-list-filter-and-paging-parameter-mistakes`, step `task#4`, where `ListLayers`
+/// with a `Marker` this service never issued is answered
+/// `400 InvalidParameterValueException` with `message` exactly this.
+pub const INVALID_PAGINATION_KEY_MESSAGE: &str = "Invalid pagination key.";
+
 #[cfg(test)]
 mod tests {
     use super::*;

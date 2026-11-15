@@ -61,6 +61,53 @@ pub fn layer_key(region: &str, name: &str) -> LayerKey {
     (region.to_string(), name.to_string())
 }
 
+/// The lowest version number a layer can ever hold.
+///
+/// "Each time you call `PublishLayerVersion` with the same layer name, a new version is
+/// created" and the numbering starts here (`crate::ops::publish_layer_version`), so this is
+/// the first number a publish can assign and therefore the first one that can name a
+/// version at all.
+pub const FIRST_LAYER_VERSION: i64 = 1;
+
+/// What an operation addressing a layer version BY NUMBER refuses a number below
+/// [`FIRST_LAYER_VERSION`] with.
+///
+/// Fixed text, with nothing of the request in it: what is wrong is not which version was
+/// asked for but that the number is below the first one that exists, and the caller sent
+/// the number.
+///
+/// Recorded behaviour: corpus `simparity-wire-aws-v1`, fixture
+/// `lambda-lls-version-number-mistakes-then-list-first`, step `task#4`, where a
+/// `GetLayerVersion` for a version number below the first is answered
+/// `400 InvalidParameterValueException` with `message` exactly this.
+pub const LAYER_VERSION_BELOW_FIRST_MESSAGE: &str = "Layer Version Cannot be less than 1";
+
+/// `Err(`[`LAYER_VERSION_BELOW_FIRST_MESSAGE`]`)` for a `VersionNumber` below the first
+/// version a publish can assign, `Ok(())` for every number that could name one.
+///
+/// The member is a plain long — "The version number", with no `@range` for the request walk
+/// to judge (`smithy_query(query="operation", operation="GetLayerVersion")`) — so the rule
+/// is the OPERATION's: a number below the first one names no version that could exist in
+/// any account or any Region, so it is a value the caller has to change rather than a
+/// resource that might appear later. That is why it is refused as the modelled parameter
+/// error ahead of the lookup, and not reported as a version this account does not hold: a
+/// caller distinguishing "fix your input" from "not published yet" branches on exactly that
+/// difference.
+///
+/// ONE reading of the member, shared by every operation that addresses a layer version by
+/// its number: the version READ (`GetLayerVersion`) and the three policy operations through
+/// [`crate::state::resolve_layer_version`] /
+/// [`crate::state::resolve_layer_version_ref`]. `DeleteLayerVersion` is `@idempotent` and
+/// answers its modelled 204 for every version it does not hold, so it has nothing to refuse;
+/// `GetLayerVersionByArn` takes no number at all — it reads one out of an ARN whose own
+/// pattern admits only digits.
+pub fn layer_version_at_or_above_first(version_number: i64) -> Result<(), String> {
+    if version_number < FIRST_LAYER_VERSION {
+        return Err(LAYER_VERSION_BELOW_FIRST_MESSAGE.to_string());
+    }
+    Ok(())
+}
+
 impl ComAmazonawsLambdaAwsgirapiserviceState {
     /// The layer `name` published in `region`, or `None` when this Region holds no layer
     /// under that name — including when ANOTHER Region holds one.

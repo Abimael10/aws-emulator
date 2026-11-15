@@ -8,6 +8,11 @@
 //! version the store still has under the name, and the metadata that version was
 //! published with. A pure report — this operation writes nothing.
 //!
+//! One page continues after the `Marker` the page before it handed back, and only after
+//! one this listing ISSUED: the position travels inside a token the store authenticated
+//! (`crate::state::page_marker`), so a value this listing never minted names no place in
+//! the order and is refused rather than paged from.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -192,6 +197,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let architecture = input.compatible_architecture.as_deref();
 
         let store = state.lock();
+        // Taken off the store before the records it reports are borrowed: `PageTokenKey` is
+        // `Copy`, so this page's own marker is minted under this store's secret while the
+        // entries are being read.
+        let page_token_key = store.page_token_key;
+
+        // "A pagination token returned by a previous call", so the only values this listing
+        // continues from are the ones it handed back: the position travels inside a token
+        // THIS store minted (see [`crate::state::page_marker`]), and a value it did not
+        // issue names no place in the order at all. It is refused rather than paged from,
+        // because a listing that silently ignored the token would restart from the
+        // beginning and report layers the caller has already seen.
+        //
+        // The refusal is the MODELLED parameter error, not the boundary walk's: `Marker`
+        // carries no modelled constraint for that walk to decide, so what refuses it is
+        // this service's own reading of the value, with the one sentence this listing words
+        // for a marker it did not issue
+        // (`crate::state::INVALID_PAGINATION_KEY_MESSAGE`).
+        let start_after = match input.marker.as_deref() {
+            Some(marker) => Some(
+                crate::state::marker_cursor(&page_token_key, marker).ok_or_else(|| {
+                    invalid_parameter(crate::state::INVALID_PAGINATION_KEY_MESSAGE.to_string())
+                })?,
+            ),
+            None => None,
+        };
+
         // The store keys layers by Region and name, so one Region's layers come out in
         // name order, which is the order the entries are reported and paginated in.
         let entries: Vec<LayersListItem> = store
@@ -213,10 +244,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // The marker is the name of the last layer the previous page reported, so the
-        // next page starts at the first layer ordered after it and no layer is ever
-        // reported twice.
-        let start = match input.marker.as_deref() {
+        // The marker names the last layer the previous page reported, so the next page
+        // starts at the first layer ordered after it and no layer is ever reported twice.
+        let start = match start_after.as_deref() {
             Some(marker) => entries
                 .iter()
                 .position(|entry| entry.layer_name.as_deref().is_some_and(|name| name > marker))
@@ -232,12 +262,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(ListLayersOutput {
             layers: Some(page.to_vec()),
             // "A pagination token returned when the response doesn't contain all
-            // layers" — so it is absent on the last page, and it is the key of the last
-            // entry THIS page reported, which is what the next page continues after.
+            // layers" — so it is absent on the last page, and it carries the key of the
+            // last entry THIS page reported, which is what the next page continues after.
             next_marker: page
                 .last()
                 .filter(|_| truncated)
-                .and_then(|entry| entry.layer_name.clone()),
+                .and_then(|entry| entry.layer_name.as_deref())
+                .map(|name| crate::state::minted_marker(&page_token_key, name)),
         })
     }
 }

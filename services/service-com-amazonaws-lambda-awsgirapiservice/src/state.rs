@@ -450,11 +450,15 @@ pub mod function_url_endpoint;
 pub use function_url_endpoint::{open_function_url_endpoint, FunctionUrlEndpoint};
 
 /// The workspace's one reading of an authenticated pagination token, which this store's
-/// paginated reads mint their `NextMarker` with
-/// ([`function_url::function_url_marker`]): the secret lives on the store
-/// ([`ComAmazonawsLambdaAwsgirapiserviceState::page_token_key`]), so a token one store
-/// issued is the only one it reads back.
+/// paginated reads mint their `NextMarker` with ([`page_marker`]): the secret lives on the
+/// store ([`ComAmazonawsLambdaAwsgirapiserviceState::page_token_key`]), so a token one
+/// store issued is the only one it reads back.
 pub use ::service_common::page_tokens::PageTokenKey;
+
+/// The SPELLING a `Marker` this store issued has on the wire, shared by every paginated
+/// listing that hands one out; see the module's own header.
+pub mod page_marker;
+pub use page_marker::{marker_cursor, minted_marker};
 
 /// The region an ARN carries when the request is unsigned and therefore names no
 /// SigV4 credential scope to read a region from.
@@ -4861,6 +4865,11 @@ pub fn resolve_layer_version<'a>(
     version_number: i64,
     region: &str,
 ) -> Result<ResolvedLayerVersion<'a>, ResolveFailure> {
+    // The pair is read as a REQUEST first and as a resource second: a version number below
+    // the first one a publish assigns names no version that could exist, so it is refused
+    // ahead of the lookup rather than reported absent (see
+    // [`layer_version_at_or_above_first`]).
+    layer_version_at_or_above_first(version_number).map_err(ResolveFailure::Malformed)?;
     // A layer is a REGIONAL resource, so the record is the one published in the Region
     // this request addressed; a layer of any other Region is not held here at all, and a
     // `LayerName` that NAMES another Region is refused rather than read as this one's.
@@ -4884,6 +4893,8 @@ pub fn resolve_layer_version_ref<'a>(
     version_number: i64,
     region: &str,
 ) -> Result<ResolvedLayerVersionRef<'a>, ResolveFailure> {
+    // Judged as a REQUEST first, for the same reason as [`resolve_layer_version`].
+    layer_version_at_or_above_first(version_number).map_err(ResolveFailure::Malformed)?;
     // Region-scoped for the same reason as [`resolve_layer_version`].
     let name = layer_name_of(layer_name, region)?;
     let record = store

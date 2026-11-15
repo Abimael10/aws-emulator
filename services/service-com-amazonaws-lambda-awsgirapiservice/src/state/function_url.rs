@@ -523,12 +523,11 @@ fn first_segment(path: &str) -> Option<&str> {
 ///
 /// The position travels inside the token behind an authenticator over it
 /// ([`PageTokenKey`]), so the only values this listing continues from are the ones it
-/// issued; the bytes are rendered hexadecimal, which is the spelling a token on the wire
-/// has here — one fixed alphabet, so a token this listing minted reads the same whatever
-/// position it carries.
+/// issued, and the token is spelled the way every paginated listing of this service spells
+/// one (`super::page_marker`).
 #[must_use]
 pub fn function_url_marker(key: &PageTokenKey, qualifier: &str) -> String {
-    ::hex::encode(key.mint(qualifier))
+    super::minted_marker(key, qualifier)
 }
 
 /// The position `marker` names, or `None` for any value this store did not mint — a value
@@ -539,8 +538,7 @@ pub fn function_url_marker(key: &PageTokenKey, qualifier: &str) -> String {
 /// words for a marker it did not issue (`super::INVALID_MARKER_MESSAGE`).
 #[must_use]
 pub fn function_url_marker_cursor(key: &PageTokenKey, marker: &str) -> Option<String> {
-    let token = ::hex::decode(marker).ok()?;
-    key.cursor_of(&token)
+    super::marker_cursor(key, marker)
 }
 
 #[cfg(test)]

@@ -1176,12 +1176,18 @@ async fn delete_layer_version_is_idempotent_on_a_version_the_store_does_not_hold
             "CodeSha256",
             Some(json!(expected_code_sha256(&archive))),
         );
-        // And nothing was created: the version the row named is still absent.
+        // And nothing was created: the version the row named is still not readable. A
+        // number below the first version a publish assigns names no version that could
+        // exist, so the READ of such a number is refused as the input error it is (400)
+        // rather than looked up and reported absent (404); either way the row's version is
+        // not one this layer holds.
         let absent = get_layer_version(&router, reference, *version).await;
+        let unreadable = if *version < 1 { 400 } else { 404 };
         assert_eq!(
             absent.status,
-            404,
-            "case {case:?}: expected the deleted version to stay absent, got {} {}",
+            unreadable,
+            "case {case:?}: expected the deleted version to stay unreadable ({unreadable}), \
+             got {} {}",
             absent.status,
             absent.text()
         );
