@@ -1221,6 +1221,10 @@ fn route53_entity_arn(entity: &str, id: &str) -> String {
     format!("arn:{PARTITION}:{ROUTE53_ARN_NAMESPACE}:::{entity}/{id}")
 }
 
+/// The entity segment of a CIDR collection's ARN, as Route 53 writes it
+/// (`arn:aws:route53:::cidrcollection/<id>`).
+pub(crate) const ROUTE53_CIDR_COLLECTION_ENTITY: &str = "cidrcollection";
+
 /// The reusable delegation set id an ARN of that form names: its resource path's last
 /// segment, which is the bare `ResourceId` every operation on the set takes.
 ///

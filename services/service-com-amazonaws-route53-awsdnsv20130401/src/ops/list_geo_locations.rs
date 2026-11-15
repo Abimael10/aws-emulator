@@ -105,6 +105,7 @@
 use super::types::*;
 
 use crate::state::geo_location::{self, Location};
+use crate::state::served_page_size;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -137,10 +138,6 @@ impl From<ListGeoLocationsErrorModeled> for ListGeoLocationsError {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
 }
-
-/// The fewest locations a page can carry: a listing answers with locations, so a
-/// `maxitems` of zero or less names no page at all and is read as one location.
-const MIN_PAGE_SIZE: i32 = 1;
 
 /// A value a request carried, or `None` when it carried none: an absent query
 /// parameter and an empty one both name nothing.
@@ -274,7 +271,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // catalog gets the whole catalog, and a request that names no `maxitems` is
         // bounded by nothing but the catalog itself.
         let catalog_size = i32::try_from(catalog.len()).unwrap_or(i32::MAX);
-        let page_size = input.max_items.unwrap_or(catalog_size).max(MIN_PAGE_SIZE);
+        // A `maxitems` below one asks for no page at all, so it is refused rather than
+        // served.
+        let page_size = served_page_size(input.max_items, catalog_size, i32::MAX)
+            .map_err(ListGeoLocationsErrorModeled::InvalidInput)?;
         // Route 53 echoes the `maxitems` the caller asked for ("The value that you
         // specified for MaxItems in the request"); a request that specified none
         // reads back the bound that did apply, which is the catalog's own size.

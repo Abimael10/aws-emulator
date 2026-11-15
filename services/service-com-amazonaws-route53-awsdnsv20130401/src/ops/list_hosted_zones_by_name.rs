@@ -126,8 +126,8 @@
 use super::types::*;
 
 use crate::state::{
-    dns_sort_key, invalid_domain_name_message, normalize_zone_id, DnsNameKey, StoredZone,
-    DEFAULT_PAGE_SIZE,
+    dns_sort_key, invalid_domain_name_message, normalize_zone_id, served_page_size, DnsNameKey,
+    StoredZone, DEFAULT_PAGE_SIZE,
 };
 
 /// The most hosted zones one response carries.
@@ -256,10 +256,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let page_size = input
-            .max_items
-            .unwrap_or(DEFAULT_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE);
+        // A `maxitems` below one asks for no page at all, so it is refused rather than
+        // served.
+        let page_size = served_page_size(input.max_items, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE)
+            .map_err(ListHostedZonesByNameErrorModeled::InvalidInput)?;
         // Route 53 echoes the `maxitems` the caller asked for; the clamped
         // `page_size` above only bounds the work and the response size.
         let reported_max_items = input.max_items.unwrap_or(DEFAULT_PAGE_SIZE);

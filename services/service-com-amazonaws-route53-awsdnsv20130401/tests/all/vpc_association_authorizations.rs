@@ -464,8 +464,9 @@ async fn authorization_paging_covers_every_authorization_exactly_once() {
     }
 
     // The rows differ along the asked-for page size: one, a size that does not
-    // divide the total, the documented maximum, one past it, no value at all
-    // (the documented default), and sizes below the bottom of the range.
+    // divide the total, the documented maximum, one past it, and no value at all
+    // (the documented default). A page size that is not a POSITIVE integer names
+    // no page at all and is refused rather than walked, which is its own suite.
     let rows = [
         PageRow {
             case: "one VPC per page",
@@ -491,16 +492,6 @@ async fn authorization_paging_covers_every_authorization_exactly_once() {
             case: "no MaxResults at all, which is the documented default",
             max_results: None,
             full_page: Some(PAGE_MAXIMUM),
-        },
-        PageRow {
-            case: "a page size of zero",
-            max_results: Some(0),
-            full_page: None,
-        },
-        PageRow {
-            case: "a negative page size",
-            max_results: Some(-7),
-            full_page: None,
         },
     ];
 

@@ -126,7 +126,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{dns_sort_key, no_such_hosted_zone, normalize_zone_id, RecordKey};
+use crate::state::{
+    dns_sort_key, no_such_hosted_zone, normalize_zone_id, served_page_size, RecordKey,
+};
 
 /// The most record sets one response carries, and the page size a request that
 /// names no `maxitems` is served and answered with.
@@ -232,10 +234,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let page_size = input
-            .max_items
-            .unwrap_or(MAX_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE);
+        // A `maxitems` below one asks for no page at all, so it is refused rather than
+        // served.
+        let page_size = served_page_size(input.max_items, MAX_PAGE_SIZE, MAX_PAGE_SIZE)
+            .map_err(ListResourceRecordSetsErrorModeled::InvalidInput)?;
         // Route 53 echoes the `maxitems` the caller asked for; the clamped
         // `page_size` above only bounds the work and the response size.
         let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE);

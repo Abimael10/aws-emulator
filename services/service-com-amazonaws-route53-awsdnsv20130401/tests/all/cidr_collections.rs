@@ -118,14 +118,12 @@ fn is_uuid(id: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f' | b'-'))
 }
 
-/// The ARN a collection with id `id` carries: Route 53 names no region in a
-/// resource ARN, and the account is the one every ARN this emulator mints
-/// carries.
+/// The ARN a collection with id `id` carries: Route 53 is a global service, so
+/// neither the region nor the account field of one of its resource ARNs is
+/// populated (the model's own `arn:aws:route53:::hostedzone/hosted zone ID`,
+/// smithy_query(query="doc",shape="com.amazonaws.route53#CreateQueryLoggingConfig")).
 fn expected_arn(id: &str) -> String {
-    format!(
-        "arn:aws:route53::{}:cidrcollection/{id}",
-        engine::emulator_account_id()
-    )
+    format!("arn:aws:route53:::cidrcollection/{id}")
 }
 
 // ---------------------------------------------------------------------------

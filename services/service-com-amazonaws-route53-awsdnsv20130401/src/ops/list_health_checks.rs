@@ -89,7 +89,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{monitored_alarm, DEFAULT_PAGE_SIZE};
+use crate::state::{monitored_alarm, served_page_size, DEFAULT_PAGE_SIZE};
 
 /// The most health checks one response carries.
 ///
@@ -177,10 +177,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let page_size = input
-            .max_items
-            .unwrap_or(DEFAULT_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE);
+        // A `maxitems` below one asks for no page at all, so it is refused rather than
+        // served.
+        let page_size = served_page_size(input.max_items, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE)
+            .map_err(ListHealthChecksErrorModeled::InvalidInput)?;
         // Route 53 echoes the `maxitems` the caller asked for, and the default
         // page size it applied when the caller asked for none; the clamped
         // `page_size` above only bounds the work and the response size.

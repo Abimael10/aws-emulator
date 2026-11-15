@@ -94,7 +94,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{FIRST_TRAFFIC_POLICY_VERSION, MAX_TRAFFIC_POLICY_VERSION};
+use crate::state::{served_page_size, FIRST_TRAFFIC_POLICY_VERSION, MAX_TRAFFIC_POLICY_VERSION};
 
 /// The most traffic policy versions one response carries.
 ///
@@ -195,10 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let page_size = input
-            .max_items
-            .unwrap_or(DEFAULT_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE);
+        // A `maxitems` below one asks for no page at all, so it is refused rather than
+        // served.
+        let page_size = served_page_size(input.max_items, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE)
+            .map_err(ListTrafficPolicyVersionsErrorModeled::InvalidInput)?;
         // Route 53 echoes "the value that you specified for the maxitems
         // parameter"; the clamped `page_size` above only bounds the work and the
         // response size, and a request that specified no value reads back the

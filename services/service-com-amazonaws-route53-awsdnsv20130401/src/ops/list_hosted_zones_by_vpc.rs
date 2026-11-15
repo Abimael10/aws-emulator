@@ -100,7 +100,7 @@
 use super::types::*;
 
 use crate::state::account_vpcs::{account_holds_vpc, vpc_not_owned_message};
-use crate::state::{invalid_pagination_token, DEFAULT_PAGE_SIZE};
+use crate::state::{invalid_pagination_token, served_page_size, DEFAULT_PAGE_SIZE};
 
 /// The most hosted zones one page carries.
 ///
@@ -241,10 +241,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let page_size = input
-            .max_items
-            .unwrap_or(DEFAULT_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE);
+        // A `maxitems` below one asks for no page at all, so it is refused rather than
+        // served.
+        let page_size = served_page_size(input.max_items, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE)
+            .map_err(ListHostedZonesByVPCErrorModeled::InvalidInput)?;
         // "The value that you specified for MaxItems in the most recent
         // ListHostedZonesByVPC request" — echoed as sent, while `page_size`
         // above bounds the work and the response size.

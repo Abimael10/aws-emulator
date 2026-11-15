@@ -70,7 +70,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{no_such_cidr_collection, DEFAULT_PAGE_SIZE};
+use crate::state::{no_such_cidr_collection, served_page_size, DEFAULT_PAGE_SIZE};
 
 /// The largest page this listing serves: the default page size every Route 53 listing is
 /// served in, which is past the locations one collection can hold under any faithful
@@ -181,10 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         };
-        let page_size = input
-            .max_results
-            .unwrap_or(DEFAULT_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE) as usize;
+        // A page size below one asks for no page at all, so it is refused rather than
+        // served.
+        let page_size = served_page_size(input.max_results, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE)
+            .map_err(ListCidrLocationsErrorModeled::InvalidInput)? as usize;
 
         // A pure read: nothing below writes to the store.
         let store = state.lock();

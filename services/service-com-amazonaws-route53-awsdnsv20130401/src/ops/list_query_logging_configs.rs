@@ -91,7 +91,7 @@ use super::types::*;
 
 use crate::state::{
     invalid_pagination_token, minted_uuid_is_well_formed, no_such_hosted_zone, normalize_zone_id,
-    DEFAULT_PAGE_SIZE,
+    served_page_size, DEFAULT_PAGE_SIZE,
 };
 
 /// The largest page this listing serves, which is also the page it serves when the
@@ -196,10 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
         };
-        let page_size = input
-            .max_results
-            .unwrap_or(DEFAULT_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE) as usize;
+        // A page size below one asks for no page at all, so it is refused rather than
+        // served.
+        let page_size = served_page_size(input.max_results, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE)
+            .map_err(ListQueryLoggingConfigsErrorModeled::InvalidInput)? as usize;
         // "If you want to list the query logging configuration that is associated
         // with a hosted zone, specify the ID in HostedZoneId"
         // (`ListQueryLoggingConfigsRequest$HostedZoneId`); either spelling of a

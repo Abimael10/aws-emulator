@@ -19,10 +19,11 @@
 //!    already holds elsewhere is the modelled `CidrBlockInUseException` (HTTP 400) — while
 //!    MOVING it, by taking it out and putting it back in one request, is served.
 //! 4. The reads report what the store holds: `ListCidrBlocks` reports every block beside its
-//!    location (narrowed to one location where the request names one, and refusing a location
-//!    the collection associates nothing with), `ListCidrLocations` reports the locations it
-//!    associates blocks with, and `ListCidrCollections` reports the collection's metadata —
-//!    all bounded by the page size the request asks for.
+//!    location (narrowed to one location where the request names one, and enumerating an
+//!    empty result set for a location the collection holds no block for),
+//!    `ListCidrLocations` reports the locations it associates blocks with, and
+//!    `ListCidrCollections` reports the collection's metadata — all bounded by the page size
+//!    the request asks for.
 //! 5. A collection holds at most [`MAX_CIDR_BLOCKS_PER_COLLECTION`] blocks: a change
 //!    carrying more than that is the modelled `LimitsExceeded` (HTTP 400) and leaves the
 //!    collection exactly as it was, so the quota bounds the work a request can ask for
@@ -54,7 +55,6 @@ const VERSION_MISMATCH: &str = "CidrCollectionVersionMismatchException";
 const BLOCK_IN_USE: &str = "CidrBlockInUseException";
 const COLLECTION_IN_USE: &str = "CidrCollectionInUseException";
 const NO_SUCH_COLLECTION: &str = "NoSuchCidrCollectionException";
-const NO_SUCH_LOCATION: &str = "NoSuchCidrLocationException";
 const INVALID_INPUT: &str = "InvalidInput";
 const LIMITS_EXCEEDED: &str = "LimitsExceeded";
 
@@ -543,9 +543,10 @@ async fn the_reads_report_what_the_collection_holds() {
         locations.body
     );
 
-    // A location the collection associates no block with matches no location of the account —
-    // one it never named, and one a change has emptied, which `ListCidrLocations` stops
-    // reporting at the same moment.
+    // A location the collection associates no block with is reported by `ListCidrLocations`
+    // no longer, while the block enumeration narrowed to it is still a SUCCESS carrying no
+    // row: the 404s `ListCidrBlocks` models are for the collection id itself.
+
     let emptied = change_collection(
         &router,
         &id,
@@ -576,19 +577,20 @@ async fn the_reads_report_what_the_collection_holds() {
         ("an unknown location", "north"),
         ("a location a change emptied", "west"),
     ] {
-        let refused = call(
+        let (reply, held) = listed_blocks(
             &router,
-            "GET",
             &format!("/2013-04-01/cidrcollection/{id}/cidrblocks?location={location}"),
-            "",
         )
         .await;
         assert_eq!(
-            refused.error_code(),
-            NO_SUCH_LOCATION,
-            "case {case:?}: expected {NO_SUCH_LOCATION}, got {:?}; body {}",
-            refused.error_code(),
-            refused.body
+            reply.status, 200,
+            "case {case:?}: expected 200 from ListCidrBlocks, got {} with body {}",
+            reply.status, reply.body
+        );
+        assert!(
+            held.is_empty(),
+            "case {case:?}: expected no block reported, got {held:?}; body {}",
+            reply.body
         );
     }
     // A collection the account does not hold is its own refusal.

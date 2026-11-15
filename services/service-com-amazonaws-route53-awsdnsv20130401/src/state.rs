@@ -83,6 +83,7 @@ use crate::ops::types::shared_types::{
     ChangeInfo, CloudWatchAlarmConfiguration, ConflictingDomainExists, DelegationSet, HealthCheck,
     HealthCheckConfig,
     HealthCheckObservation, HostedZone, HostedZoneConfig, HostedZoneFeatures,
+    InvalidInput,
     InvalidPaginationToken, InvalidTrafficPolicyDocument, KeySigningKey, NoSuchCidrCollectionException,
     NoSuchDelegationSet,
     NoSuchHealthCheck, NoSuchHostedZone, NoSuchTrafficPolicy, NoSuchTrafficPolicyInstance,
@@ -3481,17 +3482,39 @@ pub fn resource_location(
     format!("https://{host}/2013-04-01/{path}")
 }
 
-/// The ARN of the CIDR collection `id`, as `CidrCollection$Arn` reports it.
+/// The ARN of the CIDR collection `id`, as `CidrCollection$Arn` and
+/// `CollectionSummary$Arn` report it.
 ///
-/// Route 53 is a global service, so its resource ARNs name no region; the
-/// account is the one every ARN this emulator mints carries
-/// ([`::engine::emulator_arn`]). The resource half is the collection's own
-/// `cidrcollection/<id>`, which is what makes the ARN usable "to reference the
-/// collection in IAM policy or in another Amazon Web Services account"
-/// (`CidrCollection$Arn`).
+/// The resource half is the collection's own `cidrcollection/<id>`, which is
+/// what makes the ARN usable "to reference the collection in IAM policy or in
+/// another Amazon Web Services account" (`CidrCollection$Arn`) — so it is
+/// rendered in the layout of a Route 53 resource ARN
+/// ([`global_resource_arn`]), the one a client compares for equality against
+/// the ARN it holds.
 pub fn cidr_collection_arn(id: &str) -> String {
-    ::engine::emulator_arn(ARN_SERVICE, "", &format!("cidrcollection/{id}"))
+    global_resource_arn(&format!("cidrcollection/{id}"))
 }
+
+/// The ARN of the Route 53 resource whose path below the service is `resource`
+/// (`cidrcollection/<id>`, `hostedzone/<id>`).
+///
+/// Route 53 is a GLOBAL service, so neither the region field nor the ACCOUNT
+/// field of one of its resource ARNs is populated: the model spells that layout
+/// out itself where it tells a caller which ARN identifies a hosted zone —
+/// "`aws:SourceArn: arn:aws:route53:::hostedzone/hosted zone ID`"
+/// (smithy_query(query="doc",shape="com.amazonaws.route53#CreateQueryLoggingConfig"))
+/// — four colons between the service and the resource. That is why this is not
+/// [`::engine::emulator_arn`], which populates the account field for the
+/// regional services whose ARNs carry one; the account a Route 53 resource
+/// belongs to is not part of its name, and an ARN that stamps one in matches no
+/// ARN a client holds.
+fn global_resource_arn(resource: &str) -> String {
+    format!("arn:{ARN_PARTITION}:{ARN_SERVICE}:::{resource}")
+}
+
+/// The partition every ARN this service renders belongs to, which is the one
+/// every ARN this emulator mints belongs to.
+const ARN_PARTITION: &str = "aws";
 
 /// The service segment of every ARN this service mints, which is this service's
 /// own name in an ARN.
@@ -3554,6 +3577,44 @@ pub fn conflicting_domain_exists(
 pub fn invalid_pagination_token(token: &str) -> InvalidPaginationToken {
     InvalidPaginationToken {
         message: Some(format!("Invalid pagination token: {token}")),
+    }
+}
+
+/// The modelled `InvalidInput` (HTTP 400) for a page size that is not a
+/// positive integer.
+///
+/// The ONE place this service words that refusal, so every listing answers a
+/// page size it cannot serve identically. The sentence is FIXED TEXT for the
+/// class — it names no value, no member and no bound — which is how Route 53
+/// words it for the `maxitems`/`maxresults` member of any of its listings.
+pub const NON_POSITIVE_PAGE_SIZE_MESSAGE: &str = "Max items must be a positive integer.";
+
+/// The page size a listing serves a request that asked for `requested`, or the
+/// refusal a page size it cannot serve is answered with.
+///
+/// A listing's page-size member (`MaxItems`, `MaxResults` — the `@paginated`
+/// `pageSize` of the operation) says how many items the response may carry, so
+/// a value below one asks for no page at all: it is REFUSED under the one input
+/// error every listing in this service models (`InvalidInput`, HTTP 400,
+/// [`NON_POSITIVE_PAGE_SIZE_MESSAGE`]) rather than quietly turned into a size
+/// the caller never asked for. A positive value is served up to `bound`, the
+/// ceiling the operation publishes for itself, and a request that names no page
+/// size is served `default`.
+///
+/// Shared by every listing, so one of them cannot accept a page size another
+/// refuses. The REPORTED `MaxItems` is still the value the request carried: this
+/// bounds the page that is served, it does not rewrite what the response echoes.
+pub fn served_page_size(
+    requested: Option<i32>,
+    default: i32,
+    bound: i32,
+) -> Result<i32, InvalidInput> {
+    match requested {
+        Some(asked) if asked < 1 => Err(InvalidInput {
+            message: Some(NON_POSITIVE_PAGE_SIZE_MESSAGE.to_string()),
+        }),
+        Some(asked) => Ok(asked.min(bound.max(1))),
+        None => Ok(default.clamp(1, bound.max(1))),
     }
 }
 

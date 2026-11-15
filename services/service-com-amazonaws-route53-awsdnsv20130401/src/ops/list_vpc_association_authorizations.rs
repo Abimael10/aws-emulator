@@ -81,7 +81,7 @@
 use super::types::*;
 
 use crate::state::{
-    invalid_pagination_token, no_such_hosted_zone, normalize_zone_id,
+    invalid_pagination_token, no_such_hosted_zone, normalize_zone_id, served_page_size,
     MAX_VPC_AUTHORIZATIONS_PER_PAGE,
 };
 
@@ -163,10 +163,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let page_size = input
-            .max_results
-            .unwrap_or(MAX_VPC_AUTHORIZATIONS_PER_PAGE)
-            .clamp(1, MAX_VPC_AUTHORIZATIONS_PER_PAGE) as usize;
+        // A page size below one asks for no page at all, so it is refused rather than
+        // served.
+        let page_size = served_page_size(
+            input.max_results,
+            MAX_VPC_AUTHORIZATIONS_PER_PAGE,
+            MAX_VPC_AUTHORIZATIONS_PER_PAGE,
+        )
+        .map_err(ListVPCAssociationAuthorizationsErrorModeled::InvalidInput)? as usize;
         // The caller may pass the bare id or the `/hostedzone/`-prefixed `Id` a
         // HostedZone handed it back; both name the same zone.
         let zone_id = normalize_zone_id(&input.hosted_zone_id).to_string();

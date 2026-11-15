@@ -23,6 +23,11 @@ mod checker_ip_ranges;
 mod cidr_collections;
 #[path = "all/cidr_collection_blocks.rs"]
 mod cidr_collection_blocks;
+// Declared beside the block suite: this one is the two READ paths over a collection —
+// the ARN layout every reported collection is keyed by, and the empty enumeration of a
+// collection that holds no matching block.
+#[path = "all/cidr_collection_read_paths.rs"]
+mod cidr_collection_read_paths;
 // Declared beside the block suite: this one is the BODY shape the two CIDR-collection
 // refusals the service reports by their error class alone answer with.
 #[path = "all/cidr_collection_refusal_bodies.rs"]
@@ -150,6 +155,10 @@ mod key_signing_keys;
 // `maxitems`-paged listing reports, across all of them at once.
 #[path = "all/listing_page_size_echo.rs"]
 mod listing_page_size_echo;
+// Declared beside the page-size echo suite: this one is the page size a listing REFUSES,
+// across every listing that takes one.
+#[path = "all/listing_page_size_refusal.rs"]
+mod listing_page_size_refusal;
 #[path = "all/reference_catalogs.rs"]
 mod reference_catalogs;
 // Declared beside the other refusal-wording suites: this one is the three

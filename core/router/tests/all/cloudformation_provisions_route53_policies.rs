@@ -405,7 +405,10 @@ async fn a_stack_provisions_the_three_route53_policy_resources() {
                 outputs.get(key)
             );
         }
-        let expected_arn = format!("arn:aws:route53::000000000000:cidrcollection/{collection_id}");
+        // Route 53 is a global service, so neither the Region nor the account field of one
+        // of its resource ARNs is populated — the ARN the stack reports is the one Route 53
+        // itself reports for the collection it created.
+        let expected_arn = format!("arn:aws:route53:::cidrcollection/{collection_id}");
         assert_eq!(
             outputs.get("CollectionArn"),
             Some(&expected_arn),

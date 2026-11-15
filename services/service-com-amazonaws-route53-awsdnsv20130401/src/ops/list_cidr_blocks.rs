@@ -66,12 +66,17 @@
 //! * `NoSuchCidrCollectionException` (HTTP 404) — The CIDR collection you specified, doesn't
 //!   exist.
 //! * `NoSuchCidrLocationException` (HTTP 404) — The CIDR collection location doesn't match
-//!   any locations in your account.
+//!   any locations in your account. Not answered by this handler: that sentence is about the
+//!   locations the ACCOUNT holds, and a collection of the account enumerates its blocks —
+//!   narrowed to a location it holds no block for, the result is an empty page rather than a
+//!   refusal.
 
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{no_such_cidr_collection, DEFAULT_PAGE_SIZE, MAX_CIDR_BLOCKS_PER_COLLECTION};
+use crate::state::{
+    no_such_cidr_collection, served_page_size, DEFAULT_PAGE_SIZE, MAX_CIDR_BLOCKS_PER_COLLECTION,
+};
 
 /// The largest page this listing serves: one collection's whole block quota
 /// ([`MAX_CIDR_BLOCKS_PER_COLLECTION`]), so a caller asking for everything the
@@ -82,11 +87,6 @@ const MAX_PAGE_SIZE: i32 = MAX_CIDR_BLOCKS_PER_COLLECTION as i32;
 /// The refusal text this operation answers a `NextToken` it never minted with
 /// (`InvalidInput`, HTTP 400), as the model words that class.
 const INVALID_TOKEN_MESSAGE: &str = "The input is not valid.";
-
-/// The refusal text this operation answers a `LocationName` the collection holds no
-/// blocks for with (`NoSuchCidrLocationException`, HTTP 404), as the model words it.
-const NO_SUCH_LOCATION_MESSAGE: &str =
-    "The CIDR collection location doesn't match any locations in your account.";
 
 /// What separates the two halves of a page token: a location name admits only
 /// `[0-9A-Za-z_\-]` (`CidrLocationNameDefaultNotAllowed`'s own pattern) and a CIDR block
@@ -192,10 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             },
         };
-        let page_size = input
-            .max_results
-            .unwrap_or(DEFAULT_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE) as usize;
+        // "Maximum number of results you want returned": a page size below one asks for
+        // no page at all, so it is refused rather than served.
+        let page_size = served_page_size(input.max_results, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE)
+            .map_err(ListCidrBlocksErrorModeled::InvalidInput)? as usize;
 
         // A pure read: nothing below writes to the store.
         let store = state.lock();
@@ -203,23 +203,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ListCidrBlocksErrorModeled::NoSuchCidrCollectionException(no_such_cidr_collection())
         })?;
         // "The name of the CIDR collection location": a request naming one reports that
-        // location's blocks alone, and one the collection associates NO BLOCK with is no
-        // location of it — the same reading `ListCidrLocations` reports locations under, so
-        // a location emptied by a change is absent from both.
-        if let Some(location) = input.location_name.as_deref() {
-            let held = collection
-                .locations
-                .get(location)
-                .is_some_and(|blocks| !blocks.is_empty());
-            if !held {
-                return Err(ListCidrBlocksErrorModeled::NoSuchCidrLocationException(
-                    NoSuchCidrLocationException {
-                        message: Some(NO_SUCH_LOCATION_MESSAGE.to_string()),
-                    },
-                )
-                .into());
-            }
-        }
+        // location's blocks ALONE — the name selects which of the collection's rows are
+        // reported, so one the collection holds no block for selects none of them and the
+        // enumeration is an empty page. A collection that exists enumerates; the 404s this
+        // operation models are for the collection id itself naming no collection.
         // The blocks are held per location in `BTreeMap`s of `BTreeSet`s, so this walk is
         // a stable total order and a token always resumes at the same place.
         let matching = collection

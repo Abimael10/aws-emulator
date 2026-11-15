@@ -1809,19 +1809,15 @@ pub(crate) fn return_values(
         // minted, which is what every call on the collection takes — so a declaration
         // reports an identifier of that service's own shape (the 8-4-4-4-12 lowercase hex
         // the model's `UUID` fixes) rather than the name, and the collection's ARN is built
-        // from it the way Route 53 builds one (`cidrcollection/<id>`, with no region, since
-        // Route 53 is a global service). This is also the type `super::provisioning`
-        // creates in Route 53 itself, which reports the id IT minted and the ARN it built
-        // back over these attributes.
+        // from it the way Route 53 builds one ([`route53_entity_arn`]: no Region and no
+        // account, since Route 53 is a global service). This is also the type
+        // `super::provisioning` creates in Route 53 itself, which reports the id IT minted
+        // and the ARN it built back over these attributes.
         ROUTE53_CIDR_COLLECTION => {
             let id = generated_uuid(resource_type, name);
             attributes.insert(
                 "Arn".to_string(),
-                ::emulator_server::emulator_arn(
-                    ROUTE53_ARN_NAMESPACE,
-                    "",
-                    &format!("cidrcollection/{id}"),
-                ),
+                route53_entity_arn(ROUTE53_CIDR_COLLECTION_ENTITY, &id),
             );
             attributes.insert("Id".to_string(), id.clone());
             (id, attributes)
