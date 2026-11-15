@@ -340,7 +340,7 @@ pub fn str_field(body: &Value, member: &str) -> String {
 }
 
 /// The `__type` an error body carries, with any `namespace#` prefix stripped.
-fn error_code(body: &Value) -> String {
+pub fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()

@@ -263,6 +263,8 @@ mod studio_app_lifecycle;
 mod studio_domain_network_placement;
 #[path = "all/studio_domain_registry.rs"]
 mod studio_domain_registry;
+#[path = "all/trained_model_endpoint_lifecycle.rs"]
+mod trained_model_endpoint_lifecycle;
 #[path = "all/training_job_admission.rs"]
 mod training_job_admission;
 #[path = "all/training_job_algorithm_reference.rs"]
