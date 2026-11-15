@@ -4139,6 +4139,11 @@ pub struct BuiltInApplicationProvider {
     /// provider — empty for a provider that exposes no resource server, which is then
     /// reported with no `ResourceServerConfig` at all rather than an empty one.
     pub scopes: &'static [BuiltInAccessScope],
+    /// The asset id in the provider's published portal icon URL
+    /// (`DisplayData$IconUrl`), or `None` for a provider the catalog publishes no icon
+    /// asset for — `IconUrl` is an optional member and no rule derives the asset id from
+    /// the provider id, so it is carried per entry ([`BuiltInApplicationProvider::icon_url`]).
+    pub icon_asset_id: Option<&'static str>,
 }
 
 /// One IAM Identity Center access scope of a provider's resource server, as
@@ -4169,11 +4174,18 @@ impl BuiltInAccessScope {
 
 /// The host every provider icon of the IAM Identity Center portal is served from.
 ///
-/// SOURCE: recorded behavior — a catalog provider's `DisplayData$IconUrl` is an `https`
-/// URL under this static asset host (`https://<host>/app-<digest>/icons/default.png`).
-/// The digest in a recorded URL is environment detail, so it is DERIVED from the provider
-/// id here (see [`BuiltInApplicationProvider::icon_url`]) rather than copied.
+/// SOURCE: recorded behavior — a provider's `DisplayData$IconUrl` is an `https` URL under
+/// this static asset host, of the form `https://<host>/app-<asset id>/icons/default.png`.
+/// The asset id is the provider's OWN published data: no rule derives it from the provider
+/// id, so an entry carries the published URL it has and no URL at all otherwise
+/// ([`BuiltInApplicationProvider::icon_url`]).
 const PROVIDER_ICON_HOST: &str = "static.global.sso.amazonaws.com";
+
+/// The published portal icon URL of the provider whose published asset id is `asset_id`:
+/// `https://<icon host>/app-<asset id>/icons/default.png`.
+fn provider_icon_url(asset_id: &str) -> String {
+    format!("https://{PROVIDER_ICON_HOST}/app-{asset_id}/icons/default.png")
+}
 
 /// The portal description of an application provider: its display name followed by this
 /// word.
@@ -4196,14 +4208,27 @@ const FEDERATION_SAML: &str = "SAML";
 const FEDERATION_OAUTH: &str = "OAUTH";
 
 impl BuiltInApplicationProvider {
-    /// This provider's `DisplayData`, complete: every member the shape declares is
-    /// reported, because every provider of the catalog HAS all three — the display name
-    /// from the record, the description composed from it, the icon URL derived from the
-    /// provider id.
+    /// This provider with `icon_asset_id` as the published asset id of its portal icon.
+    pub const fn with_icon_asset_id(mut self, icon_asset_id: &'static str) -> Self {
+        self.icon_asset_id = Some(icon_asset_id);
+        self
+    }
+
+    /// This provider's `DisplayData$IconUrl` — the published icon URL of its portal asset
+    /// ([`provider_icon_url`]) — or `None` for a provider the catalog publishes no icon
+    /// asset for.
+    pub fn icon_url(&self) -> Option<String> {
+        self.icon_asset_id.map(provider_icon_url)
+    }
+
+    /// This provider's `DisplayData`: the display name from the record, the description
+    /// composed from it, and the published icon URL only when the record carries one —
+    /// `IconUrl` is optional in the model, and an entry the catalog publishes no icon for
+    /// is reported without it rather than with an invented one.
     pub fn display_data(&self) -> DisplayData {
         DisplayData {
             display_name: Some(self.display_name.to_string()),
-            icon_url: Some(self.icon_url()),
+            icon_url: self.icon_url(),
             description: Some(self.description()),
         }
     }
@@ -4216,22 +4241,6 @@ impl BuiltInApplicationProvider {
     pub fn description(&self) -> String {
         let description = format!("{} {PROVIDER_DESCRIPTION_SUFFIX}", self.display_name);
         truncate_chars(&description, 128)
-    }
-
-    /// This provider's `DisplayData$IconUrl`:
-    /// `https://<icon host>/app-<digest>/icons/default.png`.
-    ///
-    /// The digest is the first 16 hex digits of the SHA-256 of the provider ID — derived
-    /// from the provider, so it is stable across reads and distinct per provider, and
-    /// carries nothing from the request. The URL satisfies the modelled `IconUrl`
-    /// (`^(http|https)://.*$`, 1..768).
-    pub fn icon_url(&self) -> String {
-        use ::sha2::Digest as _;
-        let digest = ::hex::encode(::sha2::Sha256::digest(self.id.as_bytes()));
-        format!(
-            "https://{PROVIDER_ICON_HOST}/app-{}/icons/default.png",
-            &digest[..16]
-        )
     }
 
     /// This provider's `ResourceServerConfig`, or `None` when it exposes no resource
@@ -4324,6 +4333,7 @@ const fn aws_managed_provider(
         customer_managed: false,
         display_name,
         scopes,
+        icon_asset_id: None,
     }
 }
 
@@ -4341,6 +4351,7 @@ const fn customer_managed_provider(
         customer_managed: true,
         display_name,
         scopes,
+        icon_asset_id: None,
     }
 }
 
@@ -4359,6 +4370,7 @@ const fn catalog_application(
         customer_managed: false,
         display_name,
         scopes: &[],
+        icon_asset_id: None,
     }
 }
 
@@ -4381,20 +4393,34 @@ const fn catalog_application(
 ///   `catalog/Statuspage`, `catalog/DuoNetworkGateway` and `catalog/DruvaInSync`
 ///   alongside service providers such as `glue`).
 ///
-/// The MEMBERSHIP is behavior, not model: AWS adds applications to its catalog over time,
-/// so this is the catalog the emulator publishes rather than a list any rule derives, and
-/// the ORDER is the order written here — a service-published catalog's order is its own
-/// data, which is why no read of it sorts.
-/// What IS a rule — every entry carries a complete `DisplayData` whose `Description` is
-/// its display name as an application ([`BuiltInApplicationProvider::description`]), an id
-/// of one of the two forms above, and a `ResourceServerConfig` exactly when it publishes
-/// access scopes — holds for every entry here, and for any entry added to it.
+/// The MEMBERSHIP and the ORDER are behavior, not model: AWS adds applications to its
+/// catalog over time, so this is the catalog the emulator publishes rather than a list any
+/// rule derives, and it is published in the order written here — a service-published
+/// catalog's order is its own data, which is why no read of it sorts. The order written
+/// here leads with the entries the recorded catalog publishes first
+/// (`catalog/Statuspage`, `catalog/DuoNetworkGateway`, `catalog/DruvaInSync`), so the
+/// first page a client sees is the published one; the entries after them are the ones this
+/// emulator publishes, in the order written here, which is not the published order of any
+/// larger catalog.
+/// What IS a rule — every entry carries a `DisplayData` whose `Description` is its display
+/// name as an application ([`BuiltInApplicationProvider::description`]) and whose
+/// `IconUrl` is the published portal icon URL of the asset id the entry carries, reported
+/// only when it carries one ([`BuiltInApplicationProvider::icon_url`]); an id of one of the
+/// two forms above; and a `ResourceServerConfig` exactly when it publishes access scopes —
+/// holds for every entry here, and for any entry added to it.
 ///
 /// A provider exists in every partition the ARN pattern admits, so the lookup
 /// ([`built_in_application_provider`]) matches on the id and not on the whole ARN.
 pub const BUILT_IN_APPLICATION_PROVIDERS: &[BuiltInApplicationProvider] = &[
+    // ---- The head of the published catalog --------------------------------------------
+    // The entries the recorded catalog publishes first, in the order it publishes them.
+    catalog_application("catalog/Statuspage", "Statuspage")
+        .with_icon_asset_id("d77638588eff9057"),
+    catalog_application("catalog/DuoNetworkGateway", "Duo Network Gateway"),
+    catalog_application("catalog/DruvaInSync", "DruvaInSync"),
     // ---- The custom (customer managed) provider ---------------------------------------
-    customer_managed_provider("custom", "SSO Custom Application Provider", &[]),
+    customer_managed_provider("custom", "SSO Custom Application Provider", &[])
+        .with_icon_asset_id("efbe0dd582ec4f87"),
     // ---- AWS managed providers -------------------------------------------------------
     aws_managed_provider("athena", "Amazon Athena", &[]),
     aws_managed_provider("emr", "Amazon EMR", &[]),
@@ -4466,8 +4492,6 @@ pub const BUILT_IN_APPLICATION_PROVIDERS: &[BuiltInApplicationProvider] = &[
     catalog_application("catalog/DocuSign", "DocuSign"),
     catalog_application("catalog/Domo", "Domo"),
     catalog_application("catalog/DropboxBusiness", "Dropbox Business"),
-    catalog_application("catalog/DruvaInSync", "Druva inSync"),
-    catalog_application("catalog/DuoNetworkGateway", "Duo Network Gateway"),
     catalog_application("catalog/DynamicSignal", "Dynamic Signal"),
     catalog_application("catalog/Egnyte", "Egnyte"),
     catalog_application("catalog/Envoy", "Envoy"),
@@ -4525,7 +4549,6 @@ pub const BUILT_IN_APPLICATION_PROVIDERS: &[BuiltInApplicationProvider] = &[
     catalog_application("catalog/Smartsheet", "Smartsheet"),
     catalog_application("catalog/Snowflake", "Snowflake"),
     catalog_application("catalog/Splunk", "Splunk"),
-    catalog_application("catalog/Statuspage", "Statuspage"),
     catalog_application("catalog/SugarCRM", "SugarCRM"),
     catalog_application("catalog/SumoLogic", "Sumo Logic"),
     catalog_application("catalog/Tableau", "Tableau"),

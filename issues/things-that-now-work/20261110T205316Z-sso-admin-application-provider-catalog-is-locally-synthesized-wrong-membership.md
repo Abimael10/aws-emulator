@@ -22,6 +22,30 @@ Issue-Commit: 7753983c6e495ec3612695b1336bf4936fc7b7fd
 
 # Application-provider catalog is locally synthesized: wrong membership, wrong order and derived IconUrl
 
+## Resolution
+
+Causes 2, 3 and 4 are closed: the catalog record now carries each entry's published
+portal-icon asset id instead of a digest computed from the provider id, the shared
+`DisplayData` projection reports `IconUrl` only for an entry the catalog publishes an icon
+for, and the catalog is published with the recorded head of the catalog first, so the
+list-then-describe flow resolves the pre-integrated application it should (every
+`DescribeApplicationProvider` key above now replays as fixed).
+
+Cause 1 is closed as far as any rule reaches, and its residue is DECLINED as data this
+checkout does not hold: the published catalog holds 394 entries and this emulator holds the
+entries it publishes. Which applications AWS has pre-integrated, and the order after the
+recorded head entries, is published service data no rule derives — the Smithy model carries
+only the per-entry shape and the `ApplicationProviderArn` pattern, nothing in the checkout
+enumerates the catalog, and inventing the remaining provider names and positions would be
+fabricated data rather than a fix. The two keys
+`sso-admin|ListApplicationProviders|2xx->2xx|$.ApplicationProviders[*]` and
+`…[*].DisplayData.IconUrl` therefore still diverge on the recorded catalog page: the first
+on the entries this emulator does not publish, the second because the recorded enumeration
+of the round-trip fixture carries no icon where the catalog fixture publishes one for the
+same provider, and the fix follows the recording that publishes it so the two reads of one
+record agree. `services/service-com-amazonaws-ssoadmin-swbexternalservice/src/state.rs`
+states the same limits beside the catalog itself.
+
 > _Note: this issue was identified against the code base at commit `7753983c6e495ec3612695b1336bf4936fc7b7fd`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

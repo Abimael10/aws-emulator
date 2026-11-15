@@ -7,8 +7,9 @@
 //! (`^arn:aws(-[a-z]{1,5}){0,3}:sso::aws:applicationProvider/[a-zA-Z0-9-/]+$`) and no
 //! operation of this service creates one — so `DescribeApplicationProvider` REPORTS the
 //! catalogue entry THE REQUESTED ARN names, echoing the ARN asked for with that entry's
-//! `FederationProtocol`, its COMPLETE `DisplayData` (`DisplayName`, `Description` and an
-//! `https` `IconUrl`) and a `ResourceServerConfig` exactly when the entry publishes
+//! `FederationProtocol`, its `DisplayData` (`DisplayName`, `Description` and the published
+//! `https` `IconUrl` of an entry the catalogue publishes an icon for) and a
+//! `ResourceServerConfig` exactly when the entry publishes
 //! access scopes, and refuses every other ARN the pattern admits with the modelled
 //! `ResourceNotFoundException`, at the HTTP 400 this awsJson1_1 service answers every
 //! refusal of a request with. It writes nothing.

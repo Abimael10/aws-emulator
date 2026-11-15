@@ -79,6 +79,8 @@ mod application_list;
 mod application_provider_describe;
 #[path = "all/application_provider_display_data.rs"]
 mod application_provider_display_data;
+#[path = "all/application_provider_published_icons.rs"]
+mod application_provider_published_icons;
 #[path = "all/application_provider_resolution.rs"]
 mod application_provider_resolution;
 #[path = "all/application_refusal_wording.rs"]

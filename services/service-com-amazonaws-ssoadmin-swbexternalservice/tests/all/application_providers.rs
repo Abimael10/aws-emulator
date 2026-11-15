@@ -10,8 +10,9 @@
 //! ([`state::BUILT_IN_APPLICATION_PROVIDERS`], the same records
 //! `DescribeApplicationProvider` answers from): every entry exactly once, in the
 //! CATALOGUE'S OWN order (the order of a service-published catalogue is the service's
-//! data, not something this read imposes), every entry carrying the COMPLETE `DisplayData`
-//! the shape declares (`DisplayName`, `Description` and an `https` `IconUrl`) and a
+//! data, not something this read imposes), every entry carrying the `DisplayData` the
+//! record holds (`DisplayName`, `Description`, and the published `https` `IconUrl` of the
+//! entries the catalogue publishes an icon for) and a
 //! `ResourceServerConfig` exactly when the entry publishes access scopes. The enumeration
 //! is PAGED: a response carries at most the effective page size — the caller's
 //! `MaxResults` when it named one, this service's default page size
@@ -352,10 +353,11 @@ async fn every_listed_entry_matches_the_catalogue_and_its_describe() {
     );
 }
 
-/// RULE — `DisplayData` is reported COMPLETE for every provider: the record's display
-/// name, its display name as an application as the description, and the provider's static
-/// portal icon URL, each inside the member's modelled length (`DisplayName` 1..100,
-/// `Description` 1..128, `IconUrl` 1..768 matching `^(http|https)://.*$`).
+/// RULE — `DisplayData` carries the record's display name, its display name as an
+/// application as the description, and the provider's PUBLISHED portal icon URL only when
+/// the catalogue publishes one for the entry, each inside the member's modelled length
+/// (`DisplayName` 1..100, `Description` 1..128, `IconUrl` 1..768 matching
+/// `^(http|https)://.*$`).
 ///
 /// The description rule holds for EVERY entry, whichever of the two id forms it carries:
 /// `application_provider_display_data.rs` owns the suite that states it and the
@@ -397,9 +399,24 @@ pub(crate) fn assert_display_data(
          {description:?}"
     );
 
+    // `IconUrl` is reported exactly when the catalogue PUBLISHES an icon for the entry:
+    // the published URL verbatim, and no member at all otherwise.
+    // `application_provider_published_icons.rs` owns the suite that states this rule.
+    let Some(published) = provider.icon_url() else {
+        assert!(
+            display_data["IconUrl"].is_null(),
+            "case {id:?}: the catalogue publishes no icon for this entry, so none may be \
+             reported, got {display_data}"
+        );
+        return;
+    };
     let icon_url = display_data["IconUrl"].as_str().unwrap_or_else(|| {
-        panic!("case {id:?}: a provider must carry an IconUrl, got {display_data}")
+        panic!("case {id:?}: expected the published IconUrl {published:?}, got {display_data}")
     });
+    assert_eq!(
+        icon_url, published,
+        "case {id:?}: expected the record's published IconUrl {published:?}, got {icon_url:?}"
+    );
     assert!(
         icon_url.starts_with("https://"),
         "case {id:?}: IconUrl must match ^(http|https)://.*$, got {icon_url:?}"
@@ -407,30 +424,6 @@ pub(crate) fn assert_display_data(
     assert!(
         (1..=768).contains(&icon_url.chars().count()),
         "case {id:?}: IconUrl is 1..768 characters, got {icon_url:?}"
-    );
-    assert_eq!(
-        icon_url,
-        provider.icon_url(),
-        "case {id:?}: expected the record's IconUrl, got {icon_url:?}"
-    );
-    // The provider's static portal icon path: its own `app-<id>` under the portal's
-    // default icon file.
-    let path = icon_url
-        .strip_prefix("https://")
-        .and_then(|rest| rest.split_once('/'))
-        .map(|(_host, path)| path)
-        .unwrap_or_else(|| panic!("case {id:?}: expected a path in the IconUrl, got {icon_url:?}"));
-    let segment = path
-        .split('/')
-        .next()
-        .unwrap_or_else(|| panic!("case {id:?}: expected an app segment, got {icon_url:?}"));
-    assert!(
-        segment.starts_with("app-") && segment.len() > "app-".len(),
-        "case {id:?}: expected the provider's app-<id> segment, got {icon_url:?}"
-    );
-    assert!(
-        path.ends_with("/icons/default.png"),
-        "case {id:?}: expected the portal's default icon file, got {icon_url:?}"
     );
 }
 
@@ -468,10 +461,11 @@ pub(crate) fn assert_resource_server_config(
     }
 }
 
-/// RULE — a provider's icon URL is derived from the provider, so it is STABLE across
-/// reads and DISTINCT per provider: no two entries of the catalogue share one.
+/// RULE — a provider's published icon URL is the catalogue record's own data, so it is
+/// STABLE across reads and DISTINCT per provider: no two entries that publish an icon
+/// share one.
 #[tokio::test]
-async fn every_provider_has_its_own_stable_icon_url() {
+async fn every_published_icon_url_is_stable_and_its_own() {
     let router = router();
     let (first, _) = enumerate(&router, None, "first read").await;
     let (second, _) = enumerate(&router, None, "second read").await;
@@ -482,19 +476,29 @@ async fn every_provider_has_its_own_stable_icon_url() {
 
     let mut urls: Vec<&str> = first
         .iter()
-        .map(|entry| {
-            entry["DisplayData"]["IconUrl"]
-                .as_str()
-                .unwrap_or_else(|| panic!("an entry without an IconUrl: {entry}"))
-        })
+        .filter_map(|entry| entry["DisplayData"]["IconUrl"].as_str())
         .collect();
     let total = urls.len();
+    assert_eq!(
+        total,
+        state::BUILT_IN_APPLICATION_PROVIDERS
+            .iter()
+            .filter(|provider| provider.icon_url().is_some())
+            .count(),
+        "an IconUrl is reported for exactly the entries the catalogue publishes one for, \
+         got {total}"
+    );
+    assert!(
+        total > 0,
+        "the catalogue must publish at least one provider icon for this rule to be \
+         observable"
+    );
     urls.sort_unstable();
     urls.dedup();
     assert_eq!(
         urls.len(),
         total,
-        "each provider must have its own IconUrl, got {} distinct for {total} providers",
+        "each provider must have its own IconUrl, got {} distinct for {total} entries",
         urls.len()
     );
 }

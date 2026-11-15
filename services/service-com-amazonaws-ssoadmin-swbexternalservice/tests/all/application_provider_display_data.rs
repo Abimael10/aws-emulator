@@ -10,8 +10,9 @@
 //!    the display name followed by ` Application` — for EVERY entry of the catalog,
 //!    whichever of the two id forms it carries (`catalog/<Name>` for a pre-integrated
 //!    application, a service slug for an Amazon Web Services managed one), and its
-//!    `DisplayData$IconUrl` is that provider's static portal icon path
-//!    (`https://<host>/app-<id>/icons/default.png`). `DescribeApplicationProvider` and
+//!    `DisplayData$IconUrl` is the published portal icon URL the entry carries
+//!    (`https://<host>/app-<asset id>/icons/default.png`), reported only for the entries
+//!    the catalog publishes an icon for. `DescribeApplicationProvider` and
 //!    `ListApplicationProviders` compose both through the same builder, so they agree
 //!    member for member.
 //! 2. `DescribeApplicationProvider` reports the entry it resolved as a whole
@@ -112,8 +113,8 @@ async fn list_all(router: &MultiServiceRouter) -> Vec<Value> {
 }
 
 /// RULE 1 — a provider's `Description` is its `DisplayName` as an application, and its
-/// `IconUrl` is that provider's static portal icon path. The table is every entry of the
-/// catalog, asserted on BOTH reads of it.
+/// `IconUrl` is the published portal icon URL the entry carries, when it carries one. The
+/// table is every entry of the catalog, asserted on BOTH reads of it.
 #[tokio::test]
 async fn every_provider_is_described_as_its_display_name_as_an_application() {
     let router = router();
@@ -139,8 +140,8 @@ async fn every_provider_is_described_as_its_display_name_as_an_application() {
             "case {case:?}: expected Description {expected:?}, got {:?}",
             body["DisplayData"]["Description"]
         );
-        // The rest of the complete `DisplayData` — the display name, the modelled
-        // lengths and the static portal icon path — through the one assertion
+        // The rest of the `DisplayData` — the display name, the modelled lengths and the
+        // published portal icon URL — through the one assertion
         // `application_providers.rs` owns for it.
         assert_display_data(&body["DisplayData"], provider);
 

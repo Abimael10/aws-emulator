@@ -2052,3 +2052,17 @@ mod zz_probe_whole_emulator;
 // `all/declaration_roots_are_canonical_and_complete.rs` suites pin the rules above, for this
 // file and for every service crate's `tests/all.rs`, so check there rather than leaving a
 // note here.
+// Past this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
+// suite file under `tests/all/`, sorted by name, and no other line — so two branches landing
+// at once insert two lines in two places and have no prose to duplicate, re-word or mistype.
+// Put a new suite at `tests/all/<name>.rs` and insert its pair where its name sorts to.
+// the declarations compiles no suite of this target at all. With none anywhere in the file, no
+// merge of two landings can leave one past the first item.
+// Declare each suite exactly ONCE: this is one crate root, so a second declaration of one name
+// fails every suite of this target too. A suite file no declaration names is compiled nowhere
+// and its tests never run (this crate's build-time layout check refuses it), and a suite left
+// at the top level of `tests/` fails the build. `tests/all.rs` is a test-target CRATE ROOT, so
+// a bare `mod` would resolve to a sibling of this file, which the layout check refuses: the
+// note about THIS file belongs in `all/appended_notes.rs`, declared below like any other suite.
+// The suites `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/every_suite_file_is_declared.rs` check the rules above, for this file and for every

@@ -18,8 +18,10 @@
 //! lookup is by provider ID — the whole
 //! id, so a `catalog/<Name>` application resolves as readily as a service slug — which is
 //! why the same provider resolves in every partition the pattern admits, and the ARN
-//! reported back is the one asked for. Every member of the record is reported: the
-//! complete `DisplayData` and, where the provider publishes access scopes, its
+//! reported back is the one asked for. Every member of the record is reported: its
+//! `DisplayData` — the display name, the description, and the published portal icon URL of
+//! an entry the catalog publishes an icon for — and, where the provider publishes access
+//! scopes, its
 //! `ResourceServerConfig` — and, beside those flat members, the whole entry once more as
 //! an `ApplicationProvider` structure, which is RECORDED BEHAVIOUR the on-disk model does
 //! not declare (see [`DescribeApplicationProviderOutput`]).
