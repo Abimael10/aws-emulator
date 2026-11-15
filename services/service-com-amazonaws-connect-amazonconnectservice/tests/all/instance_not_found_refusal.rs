@@ -1,25 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The refusal Connect gives for an `InstanceId` that names no instance, driven over
-//! HTTP through the same `MultiServiceRouter` the emulator serves with.
+//! The refusal Connect gives for a request that names a resource this account does not
+//! hold, driven over HTTP through the same `MultiServiceRouter` the emulator serves
+//! with.
 //!
-//! RULE: when a request carries an `InstanceId` that resolves to no instance — one that
-//! never existed, or one `DeleteInstance` retired — the service answers
-//! `ResourceNotFoundException` (HTTP 404, from the model's error binding) and its
-//! `Message` is the sentence `Instance <InstanceId> not found`, whose only variable part
-//! is the identifier, taken verbatim from the request.
+//! RULE: when a request names a resource that resolves to nothing — an `InstanceId`
+//! that never existed or that `DeleteInstance` retired, or a resource inside an instance
+//! that is not there — the service answers `ResourceNotFoundException` (HTTP 404, from
+//! the model's error binding) and its `Message` is the FIXED sentence `Resource not
+//! found`: it names no resource kind, and it quotes none of the identifiers the request
+//! carried.
 //!
 //! The suites below assert that rule over a TABLE: every operation of this service that
 //! has to resolve an `InstanceId` crossed with identifiers of several forms and lengths,
 //! including both ends of the modelled `InstanceId` length bound and an identifier whose
 //! instance really existed until it was deleted. The last suite pins the other side of
 //! the rule: when the instance IS there and the resource inside it is not, the refusal
-//! names that resource instead.
+//! is that same sentence, so no identifier of the request reaches the reply.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_connect_amazonconnectservice::state::INSTANCE_ACTIVATION_DELAY;
 
 use super::harness::{connect_managed, Connect};
 
@@ -32,6 +33,12 @@ const FLOW_CONTENT: &str =
 /// A row that sends one only ever reaches the instance lookup, which is what the rule is
 /// about; the suite that needs the child lookup itself sends it against a live instance.
 const ABSENT_CHILD: &str = "11111111-2222-3333-4444-555555555555";
+
+/// How long the suite below will keep looking for a new instance to report `ACTIVE`
+/// before it calls the wait a failure: a deadline, not a wait — the poll leaves as soon
+/// as the status holds. Deliberately far longer than the activation span the store
+/// records, so a loaded host cannot fail the run.
+const ACTIVATION_DEADLINE: Duration = Duration::from_secs(60);
 
 /// One request that has to resolve an `InstanceId`: the operation's name, and the HTTP
 /// method, URI and body it is sent as. The method/URI pairs are the `http` bindings of
@@ -175,15 +182,38 @@ fn message_of(body: &Value) -> String {
     body["Message"].as_str().unwrap_or_default().to_string()
 }
 
+/// The one sentence every `ResourceNotFoundException` of this service carries, written
+/// out here rather than read off the implementation so the suite pins the text itself.
+const RESOURCE_NOT_FOUND: &str = "Resource not found";
+
+/// Whether an operation checks the FORM of its `InstanceId` label before it resolves
+/// anything: the queue plane does, so a label that is not an identifier this service
+/// could have minted is a 400 there and never reaches the lookup this suite is about
+/// (`queue_crud_refusals` pins that half). Every other operation below resolves the
+/// label as sent.
+fn checks_the_labels_form(operation: &str) -> bool {
+    matches!(
+        operation,
+        "CreateQueue" | "DescribeQueue" | "DeleteQueue" | "ListQueues"
+    )
+}
+
 /// Drive every instance-resolving call against `instance_id` and assert the rule on each
-/// answer: 404, `ResourceNotFoundException`, and AWS's sentence carrying that identifier.
+/// answer: 404, `ResourceNotFoundException`, and AWS's fixed sentence.
+///
+/// `of_the_identifier_form` says whether `instance_id` has the form this service mints;
+/// when it does not, the operations that check that form first are left out, since their
+/// answer is the parameter refusal rather than the not-found one.
 async fn assert_every_call_reports_the_instance_missing(
     connect: &Connect,
     case: &str,
     instance_id: &str,
+    of_the_identifier_form: bool,
 ) {
-    let expected = format!("Instance {instance_id} not found");
     for call in calls_resolving_an_instance(instance_id) {
+        if !of_the_identifier_form && checks_the_labels_form(call.operation) {
+            continue;
+        }
         let answer = connect
             .send_answer(call.method, &call.uri, call.body.clone())
             .await;
@@ -199,21 +229,24 @@ async fn assert_every_call_reports_the_instance_missing(
             call.operation, answer.error_code
         );
         assert_eq!(
-            actual, expected,
-            "case {case:?}/{}: expected message {expected:?}, got {actual:?}",
+            actual, RESOURCE_NOT_FOUND,
+            "case {case:?}/{}: expected message {RESOURCE_NOT_FOUND:?}, got {actual:?}",
             call.operation
         );
     }
 }
 
 /// RULE: an `InstanceId` that names no instance is refused with
-/// `ResourceNotFoundException` (404) whose message is `Instance <InstanceId> not found`,
+/// `ResourceNotFoundException` (404) whose message is the fixed `Resource not found`,
 /// for every operation that resolves an `InstanceId`.
 ///
 /// The table spans the identifier's form and length: the UUID shape Connect mints, both
 /// ends of the modelled `InstanceId` length bound (1..100), a mixed-case identifier, one
 /// that is a prefix of a UUID, and one carrying the characters an identifier may hold —
-/// crossed with every instance-resolving operation.
+/// crossed with every instance-resolving operation. The last element of each row says
+/// whether the identifier has the minted form, which decides whether the operations that
+/// check that form first are part of the row (see
+/// [`assert_every_call_reports_the_instance_missing`]).
 #[tokio::test]
 async fn an_unknown_instance_id_is_refused_in_awss_sentence() {
     let connect = Connect::new();
@@ -222,55 +255,80 @@ async fn an_unknown_instance_id_is_refused_in_awss_sentence() {
     let (live_id, _) = connect.create_instance(connect_managed("neighbour")).await;
 
     let longest = "i".repeat(99) + "z"; // InstanceId length bound: 1..100.
-    let cases: Vec<(&str, String)> = vec![
+    let cases: Vec<(&str, String, bool)> = vec![
         (
             "the UUID shape Connect mints",
             "7f3c9b21-0d4e-4a86-9c15-2b6f8e5d1a30".to_string(),
+            true,
         ),
-        ("one character, the length lower bound", "a".to_string()),
-        ("100 characters, the length upper bound", longest),
-        ("mixed case", "AbCdEf-0123".to_string()),
+        (
+            "the same shape in upper case",
+            "7F3C9B21-0D4E-4A86-9C15-2B6F8E5D1A30".to_string(),
+            true,
+        ),
+        (
+            "one character, the length lower bound",
+            "a".to_string(),
+            false,
+        ),
+        ("100 characters, the length upper bound", longest, false),
+        ("mixed case", "AbCdEf-0123".to_string(), false),
         (
             "a prefix of a UUID-shaped identifier",
             "7f3c9b21".to_string(),
+            false,
         ),
         (
             "a prefix of the live instance's identifier",
             live_id[..live_id.len() - 1].to_string(),
+            false,
         ),
-        ("digits only", "9876543210".to_string()),
+        ("digits only", "9876543210".to_string(), false),
     ];
 
-    for (case, instance_id) in cases {
+    for (case, instance_id, of_the_identifier_form) in cases {
         assert_ne!(
             instance_id, live_id,
             "case {case:?}: the row has to name an instance the store does not hold"
         );
-        assert_every_call_reports_the_instance_missing(&connect, case, &instance_id).await;
+        assert_every_call_reports_the_instance_missing(
+            &connect,
+            case,
+            &instance_id,
+            of_the_identifier_form,
+        )
+        .await;
     }
 }
 
 /// RULE (the same one, on an identifier that really named an instance): deleting an
-/// instance retires its identifier, so every later call carrying it is refused with
-/// `Instance <InstanceId> not found` — the identifier minted for that instance, not one
-/// the test wrote.
+/// instance retires its identifier, so every later call carrying it is refused with the
+/// same fixed sentence.
 #[tokio::test]
 async fn a_deleted_instances_id_is_refused_in_awss_sentence() {
     let connect = Connect::new();
     let (instance_id, _) = connect.create_instance(connect_managed("retired")).await;
 
     // The instance really exists first: it reaches ACTIVE once the activation span the
-    // store records has elapsed.
-    tokio::time::sleep(INSTANCE_ACTIVATION_DELAY + Duration::from_millis(100)).await;
-    let described = connect
-        .send_answer("GET", &format!("/instance/{instance_id}"), None)
-        .await;
-    assert_eq!(
-        described.body["Instance"]["InstanceStatus"],
-        json!("ACTIVE"),
-        "the instance has to be ACTIVE before it is deleted, got {}",
-        described.body
-    );
+    // store records falls due. The suite waits for that CONDITION — it polls the read
+    // until the status holds, under a deadline far longer than any span the store uses —
+    // rather than for a stretch of the clock, so the wait does not depend on how fast the
+    // host runs.
+    let deadline = Instant::now() + ACTIVATION_DEADLINE;
+    loop {
+        let read = connect
+            .send_answer("GET", &format!("/instance/{instance_id}"), None)
+            .await;
+        if read.body["Instance"]["InstanceStatus"] == json!("ACTIVE") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the instance has to reach ACTIVE before it is deleted, last read {}",
+            read.body
+        );
+        tokio::task::yield_now().await;
+    }
 
     let deleted = connect
         .send_answer("DELETE", &format!("/instance/{instance_id}"), None)
@@ -285,6 +343,7 @@ async fn a_deleted_instances_id_is_refused_in_awss_sentence() {
         &connect,
         "a deleted instance's identifier",
         &instance_id,
+        true,
     )
     .await;
 
@@ -293,18 +352,19 @@ async fn a_deleted_instances_id_is_refused_in_awss_sentence() {
         &connect,
         "a deleted instance's identifier, read twice",
         &instance_id,
+        true,
     )
     .await;
 }
 
-/// RULE (the boundary of the one above): the instance-missing sentence is reserved for a
-/// missing INSTANCE. When the instance is there and the resource inside it is not, the
-/// refusal is still `ResourceNotFoundException` (404) but names that resource.
+/// RULE (the other half of the one above): the sentence does not depend on WHICH
+/// resource was missing. When the instance is there and the resource inside it is not,
+/// the refusal is still `ResourceNotFoundException` (404) with that same fixed text, and
+/// it quotes neither the instance nor the resource the request named.
 #[tokio::test]
-async fn a_present_instance_with_an_absent_child_names_the_child() {
+async fn a_present_instance_with_an_absent_child_reports_the_same_sentence() {
     let connect = Connect::new();
     let (instance_id, _) = connect.create_instance(connect_managed("children")).await;
-    let instance_sentence = format!("Instance {instance_id} not found");
 
     let cases: Vec<(&str, &str, String)> = vec![
         (
@@ -349,14 +409,16 @@ async fn a_present_instance_with_an_absent_child_names_the_child() {
             "case {case:?}: expected error code ResourceNotFoundException, got {:?}",
             answer.error_code
         );
-        assert_ne!(
-            actual, instance_sentence,
-            "case {case:?}: the instance is present, so its message must name the \
-             resource inside it, got {actual:?}"
+        assert_eq!(
+            actual, RESOURCE_NOT_FOUND,
+            "case {case:?}: expected message {RESOURCE_NOT_FOUND:?}, got {actual:?}"
         );
         assert!(
-            actual.contains(ABSENT_CHILD),
-            "case {case:?}: expected the message to name {ABSENT_CHILD}, got {actual:?}"
+            !answer.body.to_string().contains(ABSENT_CHILD)
+                && !answer.body.to_string().contains(&instance_id),
+            "case {case:?}: the refusal must quote neither identifier the request \
+             carried, got {}",
+            answer.body
         );
     }
 }

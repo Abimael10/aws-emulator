@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let instance = store.instances.get(&input.instance_id).ok_or_else(|| {
             DescribeInstanceStorageConfigErrorModeled::ResourceNotFoundException(
-                crate::state::instance_not_found(&input.instance_id),
+                crate::state::resource_not_found(),
             )
         })?;
 
@@ -167,13 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .storage_config(&input.association_id, &input.resource_type)
             .ok_or_else(|| {
                 DescribeInstanceStorageConfigErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "No storage config with association {} for resource type {} exists \
-                             for instance {}",
-                            input.association_id, input.resource_type, input.instance_id
-                        )),
-                    },
+                    crate::state::resource_not_found(),
                 )
             })?;
 

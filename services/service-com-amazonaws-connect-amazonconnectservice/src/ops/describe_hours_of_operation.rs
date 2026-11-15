@@ -159,19 +159,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it the request asks for.
         let instance = store.instances.get(&input.instance_id).ok_or_else(|| {
             DescribeHoursOfOperationErrorModeled::ResourceNotFoundException(
-                crate::state::instance_not_found(&input.instance_id),
+                crate::state::resource_not_found(),
             )
         })?;
         let hours = instance
             .hours_of_operation_detail(&input.hours_of_operation_id)
             .ok_or_else(|| {
                 DescribeHoursOfOperationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Hours of operation not found: {} in instance {}",
-                            input.hours_of_operation_id, input.instance_id
-                        )),
-                    },
+                    crate::state::resource_not_found(),
                 )
             })?;
 

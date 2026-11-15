@@ -153,6 +153,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The path label is checked BEFORE any state is resolved: a label the service
+        // cannot accept is a client-input fault answered as one
+        // (`InvalidParameterException`, HTTP 400), not as a resource that is missing. The
+        // bound comes off the request boundary for this (`skip_validation` in
+        // `super::types::list_queues_types`) so the refusal is this service's own
+        // modelled error rather than the framework's.
+        if !crate::state::is_resource_id(&input.instance_id) {
+            return Err(ListQueuesErrorModeled::InvalidParameterException(
+                crate::state::invalid_parameter("InstanceId"),
+            )
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListQueuesErrorModeled::InternalServiceException(InternalServiceException {
                 message: Some("the Amazon Connect store is unavailable".to_string()),
@@ -171,9 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let instance = store.instances.get(&input.instance_id).ok_or_else(|| {
-            ListQueuesErrorModeled::ResourceNotFoundException(crate::state::instance_not_found(
-                &input.instance_id,
-            ))
+            ListQueuesErrorModeled::ResourceNotFoundException(crate::state::resource_not_found())
         })?;
 
         let wanted = input.queue_types.unwrap_or_default();

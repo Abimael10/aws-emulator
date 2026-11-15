@@ -1623,3 +1623,23 @@ mod zz_probe_whole_emulator;
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING under
 // `tests/` — which the layout check refuses. The `#[path]` above each `mod` is what points
 // the declaration into `tests/all/`.
+// `mod <name>;` pair below, in the sorted list. One pair per suite and NO other line —
+// not a blank one, not a note — so two branches landing at once insert two lines in two
+// deliberate: an inner doc comment (`//!`) is legal only before the first item, so one
+// that lands past the declarations — which is what concurrent landings appending to this
+// file kept producing — is `E0753` and compiles no suite of this target. With no inner
+// doc comment anywhere, no merge of two landings can put one past the first item.
+// `all/all_rs_is_a_canonical_declaration_list.rs`, for this file and for every service
+// crate's `tests/all.rs`):
+// * Declare each suite EXACTLY ONCE. This is one crate root, so a second `mod` for the
+//   same name is `E0428` and takes every suite in the target down with it.
+// * Keep no inner doc comment and no inner attribute past the first declaration: either
+//   is `E0753`.
+// * `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a
+//   SIBLING of this file (`tests/<name>.rs`), which the layout check refuses: the
+//   `#[path]` is what points each declaration into `tests/all/`.
+// What a suite covers, and why it has to live in THIS target rather than in one service
+// crate's own, belongs in that suite's own module header, where it is read beside the
+// test it explains. A note repeated here drifts from it, and notes appended here are
+// what grew this file past the project's file-length ceiling once already
+// (`all/appended_notes.rs` keeps the ones it had collected).

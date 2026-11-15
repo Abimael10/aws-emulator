@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.instance_id)
             .ok_or_else(|| {
                 AssociateInstanceStorageConfigErrorModeled::ResourceNotFoundException(
-                    crate::state::instance_not_found(&input.instance_id),
+                    crate::state::resource_not_found(),
                 )
             })?;
 

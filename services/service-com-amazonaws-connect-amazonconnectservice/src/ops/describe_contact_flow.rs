@@ -161,21 +161,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // The instance is resolved on its own first: an `InstanceId` that names no
-        // instance is refused as the instance not being found, whichever resource inside
-        // it the request asks for.
+        // instance is refused as a resource that was not found, whichever resource
+        // inside it the request asks for.
         let instance = store.instances.get(&input.instance_id).ok_or_else(|| {
             DescribeContactFlowErrorModeled::ResourceNotFoundException(
-                crate::state::instance_not_found(&input.instance_id),
+                crate::state::resource_not_found(),
             )
         })?;
         let flow = instance
             .contact_flow_for_label(&input.contact_flow_id)
             .ok_or_else(|| {
                 DescribeContactFlowErrorModeled::ResourceNotFoundException(
-                    crate::state::contact_flow_not_found(
-                        &input.contact_flow_id,
-                        &input.instance_id,
-                    ),
+                    crate::state::resource_not_found(),
                 )
             })?;
 

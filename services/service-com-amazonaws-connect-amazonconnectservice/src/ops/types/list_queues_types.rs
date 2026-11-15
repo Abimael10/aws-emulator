@@ -11,7 +11,13 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-connect-amazonconnectservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connect#ListQueuesRequest")]
+// `skip_validation = ["InstanceId"]`: the same label, checked by the handler for the
+// same reason as `describe_queue_types` gives. `MaxResults` and the other members keep
+// their boundary checks.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.connect#ListQueuesRequest",
+    skip_validation = ["InstanceId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListQueuesInput {
     pub instance_id: String,

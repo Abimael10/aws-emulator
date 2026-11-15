@@ -2,7 +2,8 @@
 
 //! @op CreateQueue
 //!
-//! Mints a queue inside an existing instance: unknown `InstanceId` is a 404, a queue
+//! Mints a queue inside an existing instance: a parameter the service cannot accept is
+//! a 400 refused before anything is resolved, an unknown `InstanceId` is a 404, a queue
 //! `Name` already taken within that instance is a 409, and the stored queue's ARN is the
 //! instance's own ARN plus `/queue/<QueueId>`.
 //!
@@ -179,6 +180,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The whole request is checked BEFORE any state is resolved: a parameter the
+        // service cannot accept is a client-input fault, so it is answered as one
+        // (`InvalidParameterException`, HTTP 400) whatever the store happens to hold.
+        // Resolving first would report a missing resource for a request that was never
+        // valid, and would mask which parameter was wrong.
+        if !crate::state::is_resource_id(&input.instance_id) {
+            return Err(invalid_parameter("InstanceId"));
+        }
+        // `Name`'s own `@length` bound, enforced here rather than at the request
+        // boundary (`skip_validation` in `super::types::create_queue_types`) so the
+        // refusal is this service's modelled `InvalidParameterException` naming the
+        // parameter and the bound it broke.
+        let name_length = input.name.chars().count();
+        if name_length > crate::state::QUEUE_NAME_MAX_LENGTH {
+            return Err(CreateQueueErrorModeled::InvalidParameterException(
+                crate::state::value_above_maximum_length(
+                    crate::state::QUEUE_NAME_PARAMETER,
+                    crate::state::QUEUE_NAME_MAX_LENGTH,
+                ),
+            )
+            .into());
+        }
+        if name_length < crate::state::QUEUE_NAME_MIN_LENGTH {
+            return Err(CreateQueueErrorModeled::InvalidParameterException(
+                crate::state::value_below_minimum_length(
+                    crate::state::QUEUE_NAME_PARAMETER,
+                    crate::state::QUEUE_NAME_MIN_LENGTH,
+                ),
+            )
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateQueueErrorModeled::InternalServiceException(InternalServiceException {
                 message: Some("the Amazon Connect store is unavailable".to_string()),
@@ -192,14 +225,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Identifiers need not be contiguous: a refused create simply leaves its id
         // unused.
         let id = store.mint_resource_id();
-        let instance = store
-            .instances
-            .get_mut(&input.instance_id)
-            .ok_or_else(|| {
-                CreateQueueErrorModeled::ResourceNotFoundException(
-                    crate::state::instance_not_found(&input.instance_id),
-                )
-            })?;
+        let instance = store.instances.get_mut(&input.instance_id).ok_or_else(|| {
+            CreateQueueErrorModeled::ResourceNotFoundException(crate::state::resource_not_found())
+        })?;
 
         // A queue name is unique within its instance.
         if instance.queue_id_named(&input.name).is_some() {
@@ -250,4 +278,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             queue_arn: Some(arn),
         })
     }
+}
+
+/// The modelled `InvalidParameterException` (HTTP 400) a parameter this operation
+/// cannot accept is refused with, naming the member
+/// ([`crate::state::invalid_parameter`]).
+fn invalid_parameter(member: &str) -> CreateQueueError {
+    CreateQueueErrorModeled::InvalidParameterException(crate::state::invalid_parameter(member))
+        .into()
 }

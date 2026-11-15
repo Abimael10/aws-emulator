@@ -11,7 +11,12 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-connect-amazonconnectservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connect#DeleteQueueRequest")]
+// `skip_validation = ["InstanceId", "QueueId"]`: the same two labels, checked by the
+// handler for the same reason as `describe_queue_types` gives.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.connect#DeleteQueueRequest",
+    skip_validation = ["InstanceId", "QueueId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct DeleteQueueInput {
     pub instance_id: String,

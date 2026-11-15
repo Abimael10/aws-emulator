@@ -2,8 +2,9 @@
 
 //! @op DescribeQueue
 //!
-//! Returns the stored queue, projected onto the modelled `Queue` shape. An unknown
-//! instance or queue id is a 404.
+//! Returns the stored queue, projected onto the modelled `Queue` shape. A path label
+//! that is not an identifier this service accepts is a 400 refused before anything is
+//! resolved; an unknown instance or queue is a 404.
 //!
 //! ## Shape of an operation
 //!
@@ -142,6 +143,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // Both path labels are checked BEFORE any state is resolved: a label the service
+        // cannot accept is a client-input fault, so it is answered as one
+        // (`InvalidParameterException`, HTTP 400) whatever the store happens to hold.
+        // Resolving first would report a missing resource for a request that was never
+        // valid, and would mask which parameter was wrong. The constraints come off the
+        // request boundary for this (`skip_validation` in
+        // `super::types::describe_queue_types`) so the refusal is this service's own
+        // modelled error rather than the framework's.
+        if !crate::state::is_resource_id(&input.instance_id) {
+            return Err(invalid_parameter("InstanceId"));
+        }
+        if !crate::state::is_resource_id(&input.queue_id) {
+            return Err(invalid_parameter("QueueId"));
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeQueueErrorModeled::InternalServiceException(InternalServiceException {
                 message: Some("the Amazon Connect store is unavailable".to_string()),
@@ -150,24 +166,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // The instance is resolved on its own first: an `InstanceId` that names no
-        // instance is refused as the instance not being found, whichever resource inside
-        // it the request asks for.
+        // instance is refused as a resource that was not found, whichever resource
+        // inside it the request asks for.
         let instance = store.instances.get(&input.instance_id).ok_or_else(|| {
-            DescribeQueueErrorModeled::ResourceNotFoundException(crate::state::instance_not_found(
-                &input.instance_id,
-            ))
+            DescribeQueueErrorModeled::ResourceNotFoundException(crate::state::resource_not_found())
         })?;
         let queue = instance.queues.get(&input.queue_id).ok_or_else(|| {
-            DescribeQueueErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "Queue not found: {} in instance {}",
-                    input.queue_id, input.instance_id
-                )),
-            })
+            DescribeQueueErrorModeled::ResourceNotFoundException(crate::state::resource_not_found())
         })?;
 
         Ok(DescribeQueueOutput {
             queue: Some(queue.to_queue()),
         })
     }
+}
+
+/// The modelled `InvalidParameterException` (HTTP 400) a label this operation cannot
+/// accept is refused with, naming the member ([`crate::state::invalid_parameter`]).
+fn invalid_parameter(member: &str) -> DescribeQueueError {
+    DescribeQueueErrorModeled::InvalidParameterException(crate::state::invalid_parameter(member))
+        .into()
 }

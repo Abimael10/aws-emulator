@@ -160,16 +160,11 @@ pub(crate) fn connect_managed(alias: &str) -> Value {
     })
 }
 
-/// `8-4-4-4-12` lowercase hex: the shape of the v4 UUIDs Connect mints.
+/// `8-4-4-4-12` hex: the shape of the identifiers Connect mints. The service itself owns
+/// that predicate — its handlers refuse a path label of any other form — so this asks it
+/// rather than keeping a second copy of the shape.
 pub(crate) fn looks_like_a_uuid(value: &str) -> bool {
-    let groups: Vec<&str> = value.split('-').collect();
-    groups.len() == 5
-        && [8usize, 4, 4, 4, 12]
-            .iter()
-            .zip(&groups)
-            .all(|(len, group)| {
-                group.len() == *len && group.chars().all(|c| c.is_ascii_hexdigit())
-            })
+    service_com_amazonaws_connect_amazonconnectservice::state::is_resource_id(value)
 }
 
 /// Pull one member out of every entry of a summary list.

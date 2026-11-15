@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime};
 use ::service_com_amazonaws_connectparticipant_amazonconnectparticipantservicelambda as participant;
 
 use super::{ComAmazonawsConnectAmazonconnectserviceState, InstanceRecord};
-use crate::ops::types::{ResourceNotFoundException, SegmentAttributeValue};
+use crate::ops::types::SegmentAttributeValue;
 
 /// How long a chat lasts when the request names no `ChatDurationInMinutes`.
 ///
@@ -295,15 +295,6 @@ pub fn chat_session_for(record: &ChatContactRecord) -> participant::state::ChatS
 /// than that ends first, and a token cannot outlive the chat it reaches.
 pub fn connection_token_expiry(record: &ChatContactRecord, now: SystemTime) -> SystemTime {
     (now + participant::state::CONNECTION_TOKEN_TTL).min(record.ends_at)
-}
-
-/// Connect's refusal for a `ContactId` that names no chat contact of `instance_id`.
-pub fn chat_contact_not_found(contact_id: &str, instance_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!(
-            "Contact {contact_id} not found in instance {instance_id}"
-        )),
-    }
 }
 
 /// The chat-session store of the Connect Participant Service, in the shared engine:

@@ -161,12 +161,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let store = state.lock();
         let record = store.phone_numbers.get(&input.phone_number_id).ok_or_else(|| {
-            DescribePhoneNumberErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "Phone number not found: {}",
-                    input.phone_number_id
-                )),
-            })
+            DescribePhoneNumberErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
         })?;
 
         Ok(DescribePhoneNumberOutput {

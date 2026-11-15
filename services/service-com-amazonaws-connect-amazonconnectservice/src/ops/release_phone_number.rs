@@ -198,12 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         if store.phone_numbers.remove(&input.phone_number_id).is_none() {
             return Err(ReleasePhoneNumberErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Phone number not found: {}",
-                        input.phone_number_id
-                    )),
-                },
+                crate::state::resource_not_found(),
             )
             .into());
         }

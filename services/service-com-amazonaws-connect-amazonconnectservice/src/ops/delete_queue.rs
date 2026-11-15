@@ -3,7 +3,9 @@
 //! @op DeleteQueue
 //!
 //! Removes the queue from its instance, so the matching `DescribeQueue` is a 404 and
-//! `ListQueues` no longer reports it. Deleting a queue that is not there is itself a 404.
+//! `ListQueues` no longer reports it. A path label that is not an identifier this
+//! service accepts is a 400 refused before anything is resolved, and deleting a queue
+//! that is not there is itself a 404.
 //!
 //! ## Shape of an operation
 //!
@@ -168,6 +170,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // Both path labels are checked BEFORE any state is resolved, and so before
+        // anything is removed: a label the service cannot accept is a client-input fault
+        // answered as one (`InvalidParameterException`, HTTP 400) whatever the store
+        // holds. The constraints come off the request boundary for this
+        // (`skip_validation` in `super::types::delete_queue_types`) so the refusal is
+        // this service's own modelled error rather than the framework's.
+        if !crate::state::is_resource_id(&input.instance_id) {
+            return Err(invalid_parameter("InstanceId"));
+        }
+        if !crate::state::is_resource_id(&input.queue_id) {
+            return Err(invalid_parameter("QueueId"));
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteQueueErrorModeled::InternalServiceException(InternalServiceException {
                 message: Some("the Amazon Connect store is unavailable".to_string()),
@@ -176,26 +191,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The instance is resolved on its own first: an `InstanceId` that names no
-        // instance is refused as the instance not being found, whichever resource inside
-        // it the request asks for.
+        // instance is refused as a resource that was not found, whichever resource
+        // inside it the request asks for.
         let instance = store.instances.get_mut(&input.instance_id).ok_or_else(|| {
-            DeleteQueueErrorModeled::ResourceNotFoundException(crate::state::instance_not_found(
-                &input.instance_id,
-            ))
+            DeleteQueueErrorModeled::ResourceNotFoundException(crate::state::resource_not_found())
         })?;
 
         if instance.queues.remove(&input.queue_id).is_none() {
             return Err(DeleteQueueErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Queue not found: {} in instance {}",
-                        input.queue_id, input.instance_id
-                    )),
-                },
+                crate::state::resource_not_found(),
             )
             .into());
         }
 
         Ok(DeleteQueueOutput)
     }
+}
+
+/// The modelled `InvalidParameterException` (HTTP 400) a label this operation cannot
+/// accept is refused with, naming the member ([`crate::state::invalid_parameter`]).
+fn invalid_parameter(member: &str) -> DeleteQueueError {
+    DeleteQueueErrorModeled::InvalidParameterException(crate::state::invalid_parameter(member))
+        .into()
 }

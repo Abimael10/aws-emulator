@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = store.mint_resource_id();
         let instance = store.instances.get_mut(&input.instance_id).ok_or_else(|| {
             CreateHoursOfOperationErrorModeled::ResourceNotFoundException(
-                crate::state::instance_not_found(&input.instance_id),
+                crate::state::resource_not_found(),
             )
         })?;
 
@@ -243,12 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for parent_id in &parent_ids {
             if !instance.hours_of_operations.contains_key(parent_id) {
                 return Err(CreateHoursOfOperationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Hours of operation not found: {parent_id} in instance {}",
-                            instance.id
-                        )),
-                    },
+                    crate::state::resource_not_found(),
                 )
                 .into());
             }

@@ -332,7 +332,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let instance = store.instances.get_mut(&input.instance_id).ok_or_else(|| {
             StartChatContactErrorModeled::ResourceNotFoundException(
-                crate::state::instance_not_found(&input.instance_id),
+                crate::state::resource_not_found(),
             )
         })?;
         // The chat is started by a flow of the instance, so an identifier that names no
@@ -342,7 +342,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_none()
         {
             return Err(StartChatContactErrorModeled::ResourceNotFoundException(
-                crate::state::contact_flow_not_found(&input.contact_flow_id, &input.instance_id),
+                crate::state::resource_not_found(),
             )
             .into());
         }
@@ -368,7 +368,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some((kind, source)) => {
                 let source = instance.chat_contacts.get(source).ok_or_else(|| {
                     StartChatContactErrorModeled::ResourceNotFoundException(
-                        crate::state::chat_contact_not_found(source, &input.instance_id),
+                        crate::state::resource_not_found(),
                     )
                 })?;
                 let continued = if kind == REHYDRATION_FROM_SEGMENT {

@@ -203,9 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // resource.
                 crate::state::TargetProblem::Unresolved => {
                     ClaimPhoneNumberErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(problem.refusal().to_string()),
-                        },
+                        crate::state::resource_not_found(),
                     )
                 }
                 _ => ClaimPhoneNumberErrorModeled::InvalidParameterException(

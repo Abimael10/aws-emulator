@@ -11,7 +11,15 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-connect-amazonconnectservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connect#DescribeQueueRequest")]
+// `skip_validation = ["InstanceId", "QueueId"]`: this operation checks both path labels
+// itself, before it resolves anything, and refuses one it cannot accept with its OWN
+// modelled `InvalidParameterException` naming that member — so the boundary validator
+// must not refuse the label's `@length` with a framework `ValidationException` first.
+// `skip_validation` drops only those members' constraint traits.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.connect#DescribeQueueRequest",
+    skip_validation = ["InstanceId", "QueueId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct DescribeQueueInput {
     pub instance_id: String,

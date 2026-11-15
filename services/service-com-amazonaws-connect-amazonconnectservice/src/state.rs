@@ -37,10 +37,20 @@ pub use attached_files::{
 /// everything else here.
 mod chat_contacts;
 pub use chat_contacts::{
-    attributes_problem, chat_contact_not_found, chat_duration, chat_session_for,
-    chat_session_state, connection_token_expiry, ChatContactRecord, ChatStreaming,
+    attributes_problem, chat_duration, chat_session_for, chat_session_state,
+    connection_token_expiry, ChatContactRecord, ChatStreaming,
     CHAT_CONTACTS_PER_INSTANCE_QUOTA, CHAT_DURATION_DEFAULT_MINUTES, CHAT_MESSAGE_CONTENT_TYPES,
     MAX_ATTRIBUTES_BYTES, REQUIRED_MESSAGING_CONTENT_TYPE, SUPPORTED_MESSAGING_CONTENT_TYPES,
+};
+
+/// How this service words a refusal, and the identifier forms a path label may take:
+/// one concern of its own, so its own file, re-exported so a handler reaches it through
+/// `crate::state` like everything else here.
+mod refusals;
+pub use refusals::{
+    invalid_parameter, resource_not_found, value_above_maximum_length,
+    value_below_minimum_length, QUEUE_NAME_MAX_LENGTH, QUEUE_NAME_MIN_LENGTH,
+    QUEUE_NAME_PARAMETER, RESOURCE_NOT_FOUND_MESSAGE,
 };
 
 use crate::ops::types::{
@@ -48,7 +58,7 @@ use crate::ops::types::{
     HoursOfOperation, HoursOfOperationConfig, HoursOfOperationSummary, HoursOfOperationTimeSlice,
     HoursOfOperationsIdentifier, Instance, InstanceStorageConfig, InstanceSummary,
     OutboundCallerConfig, OutboundEmailConfig, PhoneNumberStatus, Queue, QueueSummary,
-    ResourceNotFoundException, PHONE_NUMBER_TYPE_VALUES,
+    PHONE_NUMBER_TYPE_VALUES,
 };
 
 /// The region an unsigned request is served in. The emulator's own shared AWS config
@@ -1549,34 +1559,29 @@ pub fn instance_access_url(alias: Option<&str>, instance_id: &str) -> String {
     format!("https://{label}.my.connect.aws")
 }
 
-/// Connect's refusal for an `InstanceId` that names no instance — including an
-/// identifier that named one until `DeleteInstance` retired it.
+/// Whether `value` has the identifier form
+/// [`ComAmazonawsConnectAmazonconnectserviceState::mint_resource_id`] hands out: five
+/// `-`-separated groups of 8, 4, 4, 4 and 12 hex digits.
 ///
-/// The message is the identifier embedded in the service's sentence, `Instance <id>
-/// not found`, with the identifier taken verbatim from the request and no other member
-/// of the error populated. Every handler that resolves an `InstanceId` builds the
-/// refusal here, so the service has exactly one spelling of it.
-pub fn instance_not_found(instance_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!("Instance {instance_id} not found")),
-    }
-}
-
-/// Connect's refusal for a `ContactFlowId` that names no flow of `instance_id` —
-/// including one of the forms `DescribeContactFlow` documents for the label (the bare
-/// id, the flow's ARN, either with the `$SAVED` alias) that resolves to no stored flow.
-///
-/// One spelling for every handler that resolves a `ContactFlowId`, for the reason
-/// [`instance_not_found`] gives.
-pub fn contact_flow_not_found(
-    contact_flow_id: &str,
-    instance_id: &str,
-) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!(
-            "Flow not found: {contact_flow_id} in instance {instance_id}"
-        )),
-    }
+/// The companion of the minter, and the reason a label the service could never have
+/// minted is refused as a bad parameter rather than looked up: no stored resource can
+/// carry an identifier of any other form, so such a label names no resource that could
+/// exist, whatever the store holds. A handler asks this BEFORE it resolves anything,
+/// which is what makes the refusal the bad parameter it is rather than a resource that
+/// happens to be missing. The form is narrower than the `@length` bound the model puts
+/// on `InstanceId` (1..100 characters,
+/// `smithy_query(query="shape",shape="InstanceId")`), so a label outside that bound is
+/// refused here too, and `QueueId`, which the model leaves unconstrained, is checked by
+/// the same form.
+pub fn is_resource_id(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == 5
+        && [8usize, 4, 4, 4, 12]
+            .iter()
+            .zip(&groups)
+            .all(|(length, group)| {
+                group.len() == *length && group.chars().all(|c| c.is_ascii_hexdigit())
+            })
 }
 
 /// Convert a stored instant into the modelled timestamp type.
