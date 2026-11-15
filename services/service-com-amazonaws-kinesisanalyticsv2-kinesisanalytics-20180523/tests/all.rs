@@ -35,6 +35,8 @@ mod list_tags_for_resource_reads;
 mod modeled_client_errors;
 #[path = "all/ops_name_bindings.rs"]
 mod ops_name_bindings;
+#[path = "all/presigned_extension_url.rs"]
+mod presigned_extension_url;
 #[path = "all/runtime_configuration_defaults.rs"]
 mod runtime_configuration_defaults;
 #[path = "all/scratch.rs"]

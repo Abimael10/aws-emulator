@@ -1585,3 +1585,17 @@ mod cloudtrail_iam_credential_write_audit;
 // of this target at all, so the list holds pairs only — and with no `//!` anywhere in this
 // file, no merge of two landings can leave a doc comment past the first item.
 // here so a re-appended note is a note rather than a build failure.
+// Put a new suite at `tests/all/<name>.rs` and insert its `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair into the sorted list below. The list holds one pair per suite and no
+// other line, so two branches landing at once insert two lines in two places and have no
+// prose to duplicate, re-word or mistype.
+// EVERY comment in this file is an ordinary `//` one, this header included: an inner doc
+// comment is legal only before the first item, so with none anywhere in the file no merge of
+// two landings can leave one past the first item. `tests/all.rs` is a test-target CRATE ROOT,
+// so a bare `mod` would resolve to a sibling of this file, which the layout check refuses:
+// the `#[path]` above each `mod` is what points it into `tests/all/`. Declare each suite
+// exactly once: a second `mod` for one name is `E0428` and fails every suite in this target.
+// What a suite covers, and why it drives the assembled router rather than one service crate,
+// belongs in that suite's own module header; `all/appended_notes.rs` keeps the notes landings
+// had appended here. `all/all_rs_declares_each_suite_once.rs`,
+// `all/every_suite_file_is_declared.rs` check these rules rather than restating them.

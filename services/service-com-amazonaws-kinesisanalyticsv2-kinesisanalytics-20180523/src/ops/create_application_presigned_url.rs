@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplicationPresignedUrl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplicationPresignedUrl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: issues a URL, signed against this emulator, for the extension of an
+//! application that is RUNNING, and refuses the request from any other status. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplicationPresignedUrl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A caller connects to an application's extension through the URL this operation returns:
+//! it is signed by the emulator's own signer, so it leads back here rather than to the real
+//! service, and it stays valid for as long as the session the caller asked for. The
+//! extension itself runs inside the running application, so a URL for it is issued only
+//! while the application is RUNNING.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +85,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::std::time::Duration;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -155,18 +157,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplicationPresignedUrl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationPresignedUrlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplicationPresignedUrl"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // With no store mounted there is no application to issue a URL for, which is
+            // the lookup miss below, worded the one way this service words it.
+            return Err(
+                CreateApplicationPresignedUrlErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_application_message(
+                            &input.application_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let name = input.application_name.clone();
+
+        let mut store = state.lock();
+        // The status this call is judged on is the status in force NOW, so the change the
+        // clock already owed this application is materialised first: that write was due at
+        // the same instant whether or not anybody called.
+        store.settle_named(&name);
+
+        let Some(application) = store.applications.get(&name) else {
+            return Err(
+                CreateApplicationPresignedUrlErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_application_message(&name)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // An extension is served by the application itself — the Flink dashboard and the
+        // Zeppelin notebook UI both run inside the running job — so there is an extension
+        // to connect to only while the application is RUNNING. From any other status,
+        // settled or transient, the application is not available for this operation: the
+        // modelled `ResourceInUseException` (HTTP 400), stating the operation and the
+        // status read off the stored application, so one sentence answers every status a
+        // caller can catch an application in.
+        if application.status != crate::state::STATUS_RUNNING {
+            return Err(
+                CreateApplicationPresignedUrlErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(not_performable_message(Self::NAME, &application.status)),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Nothing below reads or writes the store, and the URL is the caller's answer
+        // rather than a change to this application, so the guard is released here.
+        drop(store);
+
+        // "You control the amount of time that the URL will be valid using the
+        // SessionExpirationDurationInSeconds parameter. If you do not provide this
+        // parameter, the returned URL is valid for twelve hours." The modelled `@range` of
+        // 1800..43200 is refused at the boundary, so a supplied value is already in range;
+        // it is read as an unsigned count of seconds regardless, so no request-supplied
+        // integer can reach the signer as a nonsensical validity.
+        let valid_for = input
+            .session_expiration_duration_in_seconds
+            .map_or(DEFAULT_SESSION_VALIDITY, |seconds| {
+                Duration::from_secs(seconds.unsigned_abs())
+            });
+
+        // The URL the caller opens later has to lead back to THIS emulator, so it is
+        // query-signed by the emulator's own signer for exactly as long as the session it
+        // opens stays valid. The path names the application and the extension asked for,
+        // so each extension of each application has its own address.
+        let path = extension_path(&name, &input.url_type);
+        let signed = ::smithy_server_runtime::SignedUrlRequest::new(
+            ::http::Method::GET,
+            crate::state::SIGNING_NAME,
+            &path,
+        );
+        let url = ctx.url_signer().sign(signed, valid_for).map_err(|error| {
+            crate::scaffolded::Scaffolded::validation(format!(
+                "no presigned URL can be issued for this request: {error}"
+            ))
+        })?;
+
+        Ok(CreateApplicationPresignedUrlOutput {
+            authorized_url: Some(url.as_str().to_string()),
+        })
     }
+}
+
+/// How long an extension URL this operation issues stays valid when the request names no
+/// `SessionExpirationDurationInSeconds`: twelve hours, which the operation documents ("If
+/// you do not provide this parameter, the returned URL is valid for twelve hours").
+const DEFAULT_SESSION_VALIDITY: Duration = Duration::from_secs(12 * 60 * 60);
+
+/// How this service words a request refused because the application is not in a status the
+/// operation can be served from: the operation the caller named and the status the
+/// application is in, quoted.
+///
+/// `operation` and `status` are the sentence's only variable parts — the first is this
+/// operation's name, the second is read off the STORED application — so the refusal reads
+/// the same for every status an extension URL can be asked for from. The application's
+/// name is not in it: the request already carries that.
+fn not_performable_message(operation: &str, status: &str) -> String {
+    format!("{operation} operation cannot be performed for Application in '{status}' state")
+}
+
+/// The path, on this emulator, the URL for one application's extension addresses: the
+/// application the extension belongs to and the `UrlType` naming which extension it is
+/// (`smithy_query(query="shape",shape="UrlType")`), so the two extensions of one
+/// application, and the same extension of two applications, each have their own address.
+///
+/// Decoded, as a signed path is laid out; `ApplicationName`'s pattern
+/// (`^[a-zA-Z0-9_.-]+$`) carries no separator of its own, so the path has one segment per
+/// part.
+fn extension_path(application: &str, url_type: &str) -> String {
+    format!("/applications/{application}/extensions/{url_type}")
 }

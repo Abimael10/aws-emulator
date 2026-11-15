@@ -2134,6 +2134,11 @@ pub fn application_arn(region: &str, name: &str) -> String {
 /// of every ARN it mints, and the one a `ResourceARN` it is handed has to carry.
 const ARN_NAMESPACE: &str = "kinesisanalytics";
 
+/// This service's SigV4 signing name (`sigv4Name` in `smithy_query(query="service_info")`):
+/// the service a URL this emulator signs for a caller to fetch later is signed as, so the
+/// emulator verifies that URL as a request to THIS service.
+pub const SIGNING_NAME: &str = "kinesisanalytics";
+
 /// A digest-derived id in the 8-4-4-4-12 hex form.
 fn hex_id(seed: &str) -> String {
     let hex = digest_hex(seed);
