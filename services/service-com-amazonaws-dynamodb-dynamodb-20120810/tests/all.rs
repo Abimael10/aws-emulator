@@ -143,6 +143,8 @@ mod kms_key_state_refusals;
 mod legacy_conditional_operator_refusals;
 #[path = "all/limit_reached_page_stop_keys.rs"]
 mod limit_reached_page_stop_keys;
+#[path = "all/management_event_recording.rs"]
+mod management_event_recording;
 #[path = "all/list_exports.rs"]
 mod list_exports;
 #[path = "all/list_imports.rs"]

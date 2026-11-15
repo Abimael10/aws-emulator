@@ -62,6 +62,21 @@ pub fn with_request_id_header(resp: RtResponse) -> RtResponse {
     with_stated_request_id_header(resp, &new_request_id())
 }
 
+/// One response of this service and the ONE id it names its request by, reported where no
+/// layer named it yet.
+///
+/// The same report as [`with_request_id_header`], for the one reader that needs the id
+/// BACK: the audit record of the call carries it as the event's `requestID`, so a client
+/// holding a response can find the record of that very call
+/// (`super::management_events`). The shared module owns the rule
+/// ([`service_common::query_error_envelope::named_request_as`]) and this names the FORM, so
+/// the id a record carries is read in the same spelling this service's responses state it
+/// in — the hyphenated-UUID reader beside it would find none and report an id no caller was
+/// ever answered under.
+pub fn named_request(resp: RtResponse) -> (RtResponse, String) {
+    service_common::query_error_envelope::named_request_as(resp, new_request_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

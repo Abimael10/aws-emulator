@@ -714,9 +714,12 @@ fn within_record_limit(document: serde_json::Value) -> serde_json::Value {
 /// Read off the operation's own error channel, so the code a record carries is the FAULT
 /// SHAPE's own name — which is what CloudTrail records, and not always the code the
 /// caller saw: a query-protocol error renders its `awsQueryError` code on the wire
-/// (`DBInstanceNotFound`) while the record names the shape (`DBInstanceNotFoundFault`).
-/// The modelled error's `Display` prefixes that same shape name, which the record already
-/// carries as its `errorCode`, so the message is recorded alone.
+/// (`DBInstanceNotFound`) while the record names the shape (`DBInstanceNotFoundFault`),
+/// and a service whose wire code is the API-version-qualified shape id
+/// (`com.amazonaws.<service>.v<version>#ResourceNotFoundException`, which an `awsJson`
+/// body's `__type` may carry whole) is recorded by the SHAPE that id names. The modelled
+/// error's `Display` prefixes that same name, which the record already carries as its
+/// `errorCode`, so the message is recorded alone.
 pub fn recorded_failure<T, E>(outcome: &Result<T, E>) -> (Option<String>, Option<String>)
 where
     E: ::smithy_server_runtime::OperationError + std::fmt::Display,
@@ -724,12 +727,17 @@ where
     match outcome {
         Ok(_) => (None, None),
         Err(error) => {
+            let stated = error.shape_name();
+            // The shape's own name is the last segment of a shape id, and the whole value
+            // for a channel that names the shape bare.
+            let code = stated.rsplit('#').next().unwrap_or(stated);
             let rendered = error.to_string();
             let message = rendered
-                .strip_prefix(&format!("{}: ", error.shape_name()))
+                .strip_prefix(&format!("{code}: "))
+                .or_else(|| rendered.strip_prefix(&format!("{stated}: ")))
                 .unwrap_or(&rendered)
                 .to_string();
-            (Some(error.shape_name().to_string()), Some(message))
+            (Some(code.to_string()), Some(message))
         }
     }
 }

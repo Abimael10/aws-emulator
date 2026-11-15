@@ -294,6 +294,19 @@ pub trait AuditedService: Send + Sync + 'static {
     fn omitted_members(&self) -> &'static [&'static str] {
         &[]
     }
+
+    /// The response as it is sent, and the ONE id it names its request by — the record's
+    /// `requestID`.
+    ///
+    /// The default is the shared rule ([`crate::query_error_envelope::named_request`]),
+    /// which reads and reports the id in the form almost every AWS service spells its ids
+    /// in. A service whose ids have a FORM of its own answers this with that form's reader
+    /// ([`crate::query_error_envelope::named_request_as`]), because the id a record carries
+    /// must be the one the CALLER was answered under: a reader that does not recognise this
+    /// service's spelling would report a record naming a request nobody ever saw.
+    fn names_the_request(&self, resp: RtResponse) -> (RtResponse, String) {
+        named_request(resp)
+    }
 }
 
 /// Whether a call only REPORTED state, as CloudTrail stamps an event's `readOnly` — the
@@ -558,11 +571,12 @@ impl<W: ErasedOperation, S: AuditedService> ErasedOperation for RecordedCall<W, 
             let resp = self.inner.run(svc, req, ctx).await;
             let pending = taken_record();
             // The record is written only now, because its `requestID` is the id the CALLER
-            // is answered under, and that id is the rendered response's. A response the
-            // renderer named no request in is named one here, which every layer outside
-            // this one then reports unchanged, so the record and the caller can never hold
-            // two ids for one call.
-            let (resp, answered_as) = named_request(resp);
+            // is answered under, and that id is the rendered response's — read in the form
+            // the serving service spells its ids in
+            // ([`AuditedService::names_the_request`]). A response the renderer named no
+            // request in is named one here, which every layer outside this one then reports
+            // unchanged, so the record and the caller can never hold two ids for one call.
+            let (resp, answered_as) = self.service.names_the_request(resp);
             if let Some(call) = pending {
                 // The record, and — while the account's CloudTrail is logging calls of its
                 // kind — the event that same record is fanned out onto the default event bus

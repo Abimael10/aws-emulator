@@ -263,6 +263,18 @@ pub trait DataEventDelivery: Send + Sync + 'static {
         served_at: SystemTime,
         answered_as: &str,
     ) -> Vec<DeliveredLogFile>;
+
+    /// The response as it is sent, and the ONE id it names its request by — the delivered
+    /// record's `requestID`.
+    ///
+    /// The default is the shared rule ([`crate::query_error_envelope::named_request`]), and
+    /// a service whose request ids have a FORM of its own answers this with that form's
+    /// reader ([`crate::query_error_envelope::named_request_as`]) — the same reason the
+    /// management recorder takes it per service
+    /// ([`crate::audited_operation::AuditedService::names_the_request`]).
+    fn names_the_request(&self, resp: RtResponse) -> (RtResponse, String) {
+        named_request(resp)
+    }
 }
 
 /// One operation served so that the data event its handler held is DELIVERED.
@@ -298,7 +310,7 @@ impl<W: ErasedOperation, S: DataEventDelivery> ErasedOperation for DeliveringDat
             forget_any_undelivered();
             let resp = self.inner.run(svc, req, ctx).await;
             let pending = taken_data_event();
-            let (resp, answered_as) = named_request(resp);
+            let (resp, answered_as) = self.service.names_the_request(resp);
             if let Some((call, served_at)) = pending {
                 // Every write is made OUTSIDE the log's lock, after the response the caller
                 // gets has been rendered, so it changes nothing about what this call answers.

@@ -101,6 +101,17 @@
 //! It is the definition rather than [`Service::override_refusal`] because the seam that is
 //! handed WHICH failure it was is the definition's `refusal_response`; the refusal hook sees
 //! the structural refusal alone, which is why this service uses it for input constraints.
+//!
+//! ## The audit leg: what every served call is recorded as
+//!
+//! The definition this file hands back is also where this front door's AUDIT leg hangs: the
+//! generated entry is reached through the shared management-event recorder
+//! ([`management_events`]), so every CONTROL-PLANE call this service serves — accepted and
+//! refused alike — is recorded in the account's event history where CloudTrail's
+//! `LookupEvents` reports it, through one code path for every operation rather than a
+//! recording written into each handler. The calls on the ITEMS a table holds are the other
+//! CloudTrail class: they are DATA events, recorded in no event history and delivered only
+//! into the bucket of a trail whose selectors admit them ([`data_events`]).
 
 use service_common::authentication_refusal::{
     AuthenticationRefusalDefinition, StatedAuthenticationRefusal,
@@ -130,6 +141,14 @@ mod front_door;
 /// table request it serves, under the `{TableName, Operation}` dimension pair that family is
 /// reported on.
 mod request_latency_metrics;
+
+/// This front door's AUDIT leg: every control-plane call it serves is a management event of
+/// this service, recorded in the account's event history where CloudTrail reads it.
+pub mod management_events;
+
+/// The other CloudTrail class: the calls on the ITEMS a table holds, which are data events
+/// of that table rather than management events of the account.
+pub mod data_events;
 
 /// Everything every response of this service reports about ITSELF, whichever layer
 /// produced it: the request it answered ([`request_id`]) and the checksum of its own body
@@ -922,11 +941,14 @@ const AUTHENTICATION_REFUSAL: StatedAuthenticationRefusal = StatedAuthentication
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The generated entry, with its three framework-level error renderers wrapped so a
-    /// response no operation produced still names the request it answers, and inside that
-    /// the layer that states an authentication refusal in this service's own codes
-    /// ([`AUTHENTICATION_REFUSAL`]).
+    /// response no operation produced still names the request it answers, inside that the
+    /// layer that states an authentication refusal in this service's own codes
+    /// ([`AUTHENTICATION_REFUSAL`]), and INSIDE both the AUDITED routing table every
+    /// request this service serves is resolved through ([`management_events`]).
     entry: RequestIdEnvelopeDefinition<
-        AuthenticationRefusalDefinition<crate::ServiceDefinition<Eng>>,
+        AuthenticationRefusalDefinition<
+            management_events::AuditedDefinition<crate::ServiceDefinition<Eng>>,
+        >,
     >,
     /// The dispatch `override_operation` hands back, which carries the served
     /// operation's clause form into [`Service::override_refusal`] and names the request
@@ -944,10 +966,22 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        // The AUDITED table, built before the entry it is nested inside: every modelled
+        // operation, each constructed from this same shared engine and wrapped in the
+        // management-event recorder (see [`management_events`]).
+        let audited = management_events::audited_table(&engine);
         Self {
             entry: RequestIdEnvelopeDefinition::reporting(
                 AuthenticationRefusalDefinition::new(
-                    crate::ServiceDefinition::new(Arc::clone(&engine)),
+                    // The audited table is the INNERMOST wrapper, so every layer that
+                    // resolves an operation for a request — the router, this service's own
+                    // dispatch, the envelope wrappers around it — reaches the audited
+                    // operation, and no request can be served by a path that records
+                    // nothing.
+                    management_events::AuditedDefinition::new(
+                        crate::ServiceDefinition::new(Arc::clone(&engine)),
+                        audited,
+                    ),
                     AUTHENTICATION_REFUSAL,
                 ),
                 reported,

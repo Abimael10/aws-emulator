@@ -441,6 +441,35 @@ pub fn named_request(resp: RtResponse) -> (RtResponse, String) {
     (resp, stated)
 }
 
+/// One response and the ONE id it names its request by, where that id is spelled in a FORM
+/// of the serving service's own and stated in the header alone.
+///
+/// [`named_request`] is the same thing for the form almost every AWS service reports: it
+/// reads a stated id through [`reported_request_id`], which only reports a value having
+/// THAT form, so a service whose ids are spelled another way (a fixed-width run of
+/// uppercase alphanumeric characters, say) would be told its own response names no
+/// request. This reads the header the id is stated in without holding the value to a form,
+/// and mints one with `mint` only where no layer stated any — so a layer that needs to know
+/// which request a response names (an audit record of the call, which carries that id so a
+/// client holding the response can find the record of that very call) reads the id the
+/// CALLER was answered under whichever form the service spells its ids in.
+///
+/// Idempotent exactly as [`named_request`] is, and the whole report for a protocol with no
+/// envelope element for the id: the body, the status and every other header are left as the
+/// renderer wrote them.
+pub fn named_request_as(resp: RtResponse, mint: fn() -> String) -> (RtResponse, String) {
+    let stated = resp
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .filter(|stated| !stated.is_empty())
+        .map(ToString::to_string);
+    if let Some(stated) = stated {
+        return (resp, stated);
+    }
+    let minted = mint();
+    (with_stated_request_id_header(resp, &minted), minted)
+}
+
 /// The modelled operation the service's routing table names for this request, or `None`
 /// when the request names none.
 fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dyn ErasedOperation> {
