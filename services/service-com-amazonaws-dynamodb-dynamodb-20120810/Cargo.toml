@@ -102,6 +102,11 @@ rand = "0.9"
 # `sts:GetCallerIdentity` answers from, and reads the identity-based policies the IAM store
 # holds for that principal through STS's own view of it.
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The Account API owns which Regions this account has turned on (`EnableRegion` /
+# `GetRegionOptStatus`): the Region gate ahead of every operation reads that service's own
+# store, so a Region the account has not opted into serves no request here
+# (`state::region_opt_in`).
+service-com-amazonaws-account-account = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

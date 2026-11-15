@@ -223,6 +223,8 @@ mod request_shape_validation_classes;
 mod request_validation_refusals;
 #[path = "all/region_from_the_request_endpoint.rs"]
 mod region_from_the_request_endpoint;
+#[path = "all/region_opt_in_gate.rs"]
+mod region_opt_in_gate;
 #[path = "all/regions_indexes_and_capacity.rs"]
 mod regions_indexes_and_capacity;
 #[path = "all/replica_auto_scaling.rs"]

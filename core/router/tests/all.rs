@@ -1,5 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: the CANONICAL DECLARATION LIST of its
+// cross-service suites, and nothing else.
+//
+// Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
+// suite file under `tests/all/`, sorted by name, and no other line. Put a new suite at
+// `tests/all/<name>.rs` and insert its pair into the sorted list — nothing beside it, so two
+// branches landing at once insert two lines in two places and have no prose to duplicate,
+// re-word or mistype.
+// EVERY comment in this file is an ORDINARY `//` one, this header included, and that is
+// deliberate: an inner doc comment (`//!`) is legal only before the first item, so one that
+// lands past the declarations — which is what concurrent landings appending notes to this
+// file kept producing — is `E0753` and compiles no suite of this target. With no `//!`
+// anywhere, no merge of two landings can put one past the first item.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of
+// this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each
+// `mod` is what points the declaration into `tests/all/`. A suite no `mod` names compiles
+// nowhere and its tests never run (this crate's `build.rs` refuses it), and a suite declared
+// twice is `E0428` — each fails every suite in this target, which is why four suites pin the
+// shape above rather than restating it here: `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`.
+// WHAT a suite covers, and WHY it belongs to this cross-service target rather than to one
+// service crate's own, is stated in that suite's own module doc, where it is read beside the
+// test it explains; `all/appended_notes.rs` keeps the notes earlier landings had appended
+// here.
 // Single integration-test target for the router: the DECLARATION LIST, and nothing else.
 //! Single integration-test target for the router.
 //!

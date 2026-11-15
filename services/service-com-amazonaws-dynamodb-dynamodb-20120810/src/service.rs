@@ -53,6 +53,16 @@
 //! (the surface itself) and [`Service::override_routing_error`] (a target naming no bound
 //! operation).
 //!
+//! ## The Region gate
+//!
+//! A DynamoDB endpoint is REGIONAL, and a Region the account has not turned on serves it
+//! nothing: every request addressed to such an endpoint is refused ahead of every operation,
+//! rather than answered with an empty result, so a client can tell a Region it cannot use
+//! from one that merely holds nothing of its own. Which Regions are on for the account is
+//! the Account API's own state, read through [`crate::state::region_is_enabled_for_account`],
+//! and the refusal is worded by [`region_refusal`] at the one layer every request this
+//! service serves passes through ([`OperationScopedClauseForm`]).
+//!
 //! ## What every response reports about itself
 //!
 //! Two things every response of this service carries, whichever layer produced it, are
@@ -612,6 +622,17 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
         Box::pin(async move {
+            // The REGION gate, ahead of every operation: DynamoDB is reached through a
+            // REGIONAL endpoint, and a Region the account has not turned on serves it
+            // nothing at all — every request to that endpoint is refused rather than
+            // answered with an empty result, which is what lets a client tell "this Region
+            // is not available to me" from "this Region holds nothing of mine". It belongs
+            // here rather than in any one handler because it is a fact of the ENDPOINT the
+            // request reached, not of the operation it named
+            // ([`crate::state::region_is_enabled_for_account`]).
+            if let Some(refusal) = region_refusal(&*self.engine, ctx) {
+                return front_door::announced(req, reported(refusal));
+            }
             // `override_operation` returns this type only for a request the routing
             // table can serve, so the lookup below resolves; a request that cannot be
             // routed keeps the framework's routing-error answer either way.
@@ -684,6 +705,43 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
         // this wrapper cannot weaken them.
         None
     }
+}
+
+/// The refusal a request addressed to a Region this account has not turned on is answered
+/// with, or `None` when the Region it addresses serves the account
+/// ([`crate::state::region_is_enabled_for_account`]).
+///
+/// The code and the sentence are the ones this service answers a credential that does not
+/// resolve with ([`AUTHENTICATION_REFUSAL`] and the sentence
+/// `service_common::authentication_refusal` owns): a Region the account has not turned on
+/// has no principal to speak for a request addressed to it, so what a caller is answered is
+/// that its credential is not valid there rather than an empty result or a denial of the
+/// action. The status and the envelope are the protocol's, taken from the framework's own
+/// `awsJson` renderer ([`management_events::JSON_ENVELOPE`]) so this refusal is rendered
+/// exactly like every other pre-dispatch one rather than by a second hand-written envelope.
+///
+/// The refusal names no member of the request, because it is about the ENDPOINT the request
+/// reached: nothing of the request, and nothing of this account's state, is echoed in it.
+fn region_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &OperationContext<'_>,
+) -> Option<aws_smithy_runtime_api::http::Response> {
+    let region = crate::state::request_region(ctx.parts());
+    if crate::state::region_is_enabled_for_account(
+        engine,
+        &region,
+        ::std::time::SystemTime::now(),
+    ) {
+        return None;
+    }
+    Some(smithy_server_runtime::protocol_error_response_with(
+        management_events::JSON_ENVELOPE,
+        ::aws_smithy_schema_server::ProtocolError::Unauthenticated {
+            code: AUTHENTICATION_REFUSAL.unresolved_credential,
+            message: ::service_common::authentication_refusal::UNRESOLVED_CREDENTIAL_MESSAGE,
+        },
+        None,
+    ))
 }
 
 /// One clause for one violated member, in the `form` the served operation states

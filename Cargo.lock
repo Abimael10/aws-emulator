@@ -13077,6 +13077,7 @@ dependencies = [
  "rand 0.9.5",
  "ruzstd",
  "serde_json",
+ "service-com-amazonaws-account-account",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810",

@@ -4520,6 +4520,13 @@ pub mod authorization;
 mod regions;
 pub use regions::*;
 
+/// Whether the regional endpoint a request reached serves this account at all — the Region
+/// OPT-IN gate, in its own file: it is about the ACCOUNT's Regions, held in the Account
+/// API's store, while the module beside it only reads which Region a request addresses.
+/// Re-exported below, so every caller still names it `crate::state::…`.
+mod region_opt_in;
+pub use region_opt_in::*;
+
 /// The backup, import and export catalogues: the records a table's COPIES live in,
 /// their ARNs and their status vocabularies. Re-exported below, so every caller still
 /// names them `crate::state::…`.
