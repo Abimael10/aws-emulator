@@ -497,6 +497,8 @@ mod node_runtime_environment;
 mod node_unhandled_error_log;
 #[path = "all/nodejs_invoke_run.rs"]
 mod nodejs_invoke_run;
+#[path = "all/package_type_parameter_support.rs"]
+mod package_type_parameter_support;
 #[path = "all/package_unzipped_ceiling.rs"]
 mod package_unzipped_ceiling;
 #[path = "all/permission_and_policy_refusals.rs"]
