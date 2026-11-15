@@ -99,6 +99,9 @@ impl Reply {
 /// The emulator under test: this one service mounted on the real router.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The SINGLE engine the mounted service reads and writes its state
+    /// through, kept so a suite can seed a resource no operation writes yet.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -107,9 +110,15 @@ impl Emulator {
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_mediatailor_mediatailor::EmulatedService::new(engine),
+            service_com_amazonaws_mediatailor_mediatailor::EmulatedService::new(engine.clone()),
         );
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// The engine this emulator's service was constructed from — the same store
+    /// every request of it reads.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     pub(crate) async fn request(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {

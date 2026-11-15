@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetChannelSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetChannelSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetChannelSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the schedule of the channel named by `ChannelName` from
+//! [`crate::state`] — one entry per program persisted on that channel, in ascending
+//! scheduled-start order, restricted to the audience and the schedule window the
+//! request asks for and served in pages bounded by `MaxResults`. A pure read: it
+//! changes nothing. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +72,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{ProgramRecord, CHANNEL_NOT_FOUND_MESSAGE};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -83,14 +80,22 @@ use super::types::*;
 // `GetChannelScheduleError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-mediatailor-mediatailor.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `GetChannelScheduleError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mediatailor#GetChannelSchedule")]
+// The operation's MODELED errors, widened with the one client error this SERVICE
+// declares: the model lists no error on `GetChannelSchedule` itself, and
+// `extra_errors` is how an operation refuses a request value the model cannot
+// constrain — here a `NextToken` this service never issued, and a
+// `DurationMinutes` that is not a number of minutes (the member travels as
+// `__string`). A `ChannelName` that addresses no channel is NOT unexpected data
+// — the request is well formed and the channel is simply absent — so that miss
+// is answered through `crate::scaffolded::Scaffolded::not_found` (HTTP 404), as
+// every other channel route answers it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mediatailor#GetChannelSchedule",
+    extra_errors = ["BadRequestException"]
+)]
 #[derive(Debug)]
 pub enum GetChannelScheduleErrorModeled {
+    BadRequestException(BadRequestException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -105,6 +110,153 @@ pub type GetChannelScheduleError = crate::scaffolded::Scaffolded<GetChannelSched
 impl From<GetChannelScheduleErrorModeled> for GetChannelScheduleError {
     fn from(modeled: GetChannelScheduleErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// The milliseconds in one minute: `DurationMinutes` states a window in minutes
+/// and a program's position in the schedule is held in epoch milliseconds.
+const MILLIS_PER_MINUTE: i64 = 60_000;
+
+/// The milliseconds in one second: `ScheduleEntry$ApproximateDurationSeconds`
+/// reports in seconds what a program stores in milliseconds.
+const MILLIS_PER_SECOND: i64 = 1_000;
+
+/// The entry type of a program playing its own default media, and of one playing
+/// the alternate media an audience sees instead: two of the values
+/// `ScheduleEntryType` models (`SCHEDULE_ENTRY_TYPE_VALUES` in
+/// `crate::ops::types`).
+const PROGRAM_SCHEDULE_ENTRY: &str = "PROGRAM";
+/// See [`PROGRAM_SCHEDULE_ENTRY`].
+const ALTERNATE_MEDIA_SCHEDULE_ENTRY: &str = "ALTERNATE_MEDIA";
+
+/// A page boundary travels as an opaque token. It encodes the ORDER KEY of the
+/// last entry of the page just served — the scheduled start instant and the
+/// program name, the same pair the schedule is ordered by — so the next page
+/// resumes at the first program after it however many programs share one start
+/// instant. Hex keeps the token opaque to a caller and total over every program
+/// name.
+fn encode_token(start_millis: i64, program_name: &str) -> String {
+    hex::encode(format!("{start_millis} {program_name}"))
+}
+
+/// The order key a continuation token resumes after, or `None` when the token is
+/// not one this service issued.
+fn decode_token(token: &str) -> Option<(i64, String)> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    let (start_millis, program_name) = decoded.split_once(' ')?;
+    Some((start_millis.parse().ok()?, program_name.to_string()))
+}
+
+/// The ad breaks programmed into one program, as the schedule reports them.
+///
+/// `AdBreak$OffsetMillis` is the break's offset from the START of the program it
+/// is programmed into and `ScheduleAdBreak$ApproximateStartTime` is the instant
+/// the break plays at, so the reported instant is the program's start plus that
+/// offset. The slate the break plays is where its source names come from, and a
+/// break with no slate reports none.
+fn schedule_ad_breaks(ad_breaks: &[AdBreak], start_millis: i64) -> Vec<ScheduleAdBreak> {
+    ad_breaks
+        .iter()
+        .map(|ad_break| ScheduleAdBreak {
+            // Nothing a programmed break carries states how long it runs, so
+            // the schedule reports no duration for it.
+            approximate_duration_seconds: None,
+            approximate_start_time: Some(::aws_smithy_types::DateTime::from_millis(
+                start_millis.saturating_add(ad_break.offset_millis),
+            )),
+            source_location_name: ad_break
+                .slate
+                .as_ref()
+                .and_then(|slate| slate.source_location_name.clone()),
+            vod_source_name: ad_break
+                .slate
+                .as_ref()
+                .and_then(|slate| slate.vod_source_name.clone()),
+        })
+        .collect()
+}
+
+/// The entry one stored program is reported as, for the audience the request
+/// named (`None` when it named none).
+///
+/// A program occupies ONE slot in the schedule — the instant it is scheduled to
+/// start — and which media plays in that slot depends on the audience: a program
+/// that defines alternate media for the requested audience plays that media for
+/// it, which is the `ALTERNATE_MEDIA` entry type ("media to be played instead of
+/// the default media on a particular program"), and one that defines none plays
+/// its default media, which is the `PROGRAM` type. The slot is the program's
+/// either way, so only the media — its sources, its duration and its ad breaks —
+/// is the alternate one's.
+fn schedule_entry(record: &ProgramRecord, audience: Option<&str>) -> ScheduleEntry {
+    let alternate = audience.and_then(|wanted| {
+        record
+            .audience_media
+            .iter()
+            .find(|media| media.audience.as_deref() == Some(wanted))
+            .and_then(|media| media.alternate_media.as_ref())
+            .and_then(|alternate| alternate.first())
+    });
+
+    // The audiences the entry is reported for: the one the request asked about
+    // when it asked about one, and otherwise every audience the program defines
+    // media for.
+    let audiences: Vec<String> = match audience {
+        Some(wanted) => vec![wanted.to_string()],
+        None => record
+            .audience_media
+            .iter()
+            .filter_map(|media| media.audience.clone())
+            .collect(),
+    };
+
+    let (source_location_name, live_source_name, vod_source_name, duration_millis, ad_breaks) =
+        match alternate {
+            Some(media) => (
+                media
+                    .source_location_name
+                    .clone()
+                    .unwrap_or_else(|| record.source_location_name.clone()),
+                media.live_source_name.clone(),
+                media.vod_source_name.clone(),
+                media.duration_millis.or(record.duration_millis),
+                media.ad_breaks.clone().unwrap_or_default(),
+            ),
+            None => (
+                record.source_location_name.clone(),
+                record.live_source_name.clone(),
+                record.vod_source_name.clone(),
+                record.duration_millis,
+                record.ad_breaks.clone(),
+            ),
+        };
+
+    ScheduleEntry {
+        // A program's duration is stored in milliseconds and reported in whole
+        // seconds, and one whose duration is not known is reported without the
+        // member rather than as zero seconds.
+        approximate_duration_seconds: duration_millis.map(|millis| millis / MILLIS_PER_SECOND),
+        approximate_start_time: Some(::aws_smithy_types::DateTime::from_millis(
+            record.scheduled_start_time_millis,
+        )),
+        arn: record.arn.clone(),
+        channel_name: record.channel_name.clone(),
+        live_source_name,
+        program_name: record.name.clone(),
+        schedule_ad_breaks: Some(schedule_ad_breaks(
+            &ad_breaks,
+            record.scheduled_start_time_millis,
+        )),
+        schedule_entry_type: Some(
+            if alternate.is_some() {
+                ALTERNATE_MEDIA_SCHEDULE_ENTRY
+            } else {
+                PROGRAM_SCHEDULE_ENTRY
+            }
+            .to_string(),
+        ),
+        source_location_name,
+        vod_source_name,
+        audiences: Some(audiences),
     }
 }
 
@@ -142,20 +294,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetChannelSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetChannelScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetChannelSchedule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the router builds one
+            // `InMemoryEngine` and hands it to every operation. Without the
+            // store there is no schedule to report, so answer the scaffold's 501
+            // rather than a response nothing backs.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetChannelSchedule",
+            ));
+        };
+
+        // `DurationMinutes` travels as a string, so the boundary validator
+        // cannot constrain it: a value that is not a whole number of minutes, or
+        // a negative window, is unexpected data.
+        let window_minutes = match input.duration_minutes.as_deref() {
+            Some(text) => match text.parse::<i64>() {
+                Ok(minutes) if minutes >= 0 => Some(minutes),
+                _ => {
+                    return Err(GetChannelScheduleErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(format!(
+                                "DurationMinutes must be a whole number of minutes, and was \
+                                 {text}"
+                            )),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => match decode_token(token) {
+                Some(boundary) => Some(boundary),
+                None => {
+                    return Err(GetChannelScheduleErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(
+                                "NextToken is not a pagination token this service issued."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        // The page size is clamped HERE, not left to the boundary validator
+        // alone: `MaxResults`' modelled range is 1..100, and the handler bounds
+        // the work and the response size it will produce itself.
+        let page_size = input.max_results.map_or(crate::state::MAX_PAGE_SIZE, |max| {
+            max.clamp(1, crate::state::MAX_PAGE_SIZE as i32) as usize
+        });
+
+        let store = state.lock();
+        // A schedule belongs to a channel, so a name the account holds no
+        // channel under has NO schedule to report rather than an empty one.
+        if !store.channels.contains_key(&input.channel_name) {
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                CHANNEL_NOT_FOUND_MESSAGE,
+            ));
+        }
+
+        // The far end of the window the request asked for: `DurationMinutes` is
+        // how far ahead of the request the schedule is wanted, so a program
+        // scheduled to start beyond it is outside the window. The window bounds
+        // only that far end, so a program already playing is in every window,
+        // and a request that names no window asks for the whole schedule.
+        let window_end_millis = window_minutes.map(|minutes| {
+            let now_millis = ::std::time::SystemTime::now()
+                .duration_since(::std::time::UNIX_EPOCH)
+                .map_or(0, |since_epoch| since_epoch.as_millis() as i64);
+            now_millis.saturating_add(minutes.saturating_mul(MILLIS_PER_MINUTE))
+        });
+
+        // The schedule is ordered by the instant each program is scheduled to
+        // start — that is what a channel's schedule IS — and two programs
+        // scheduled for the same instant are ordered by name, so the order is
+        // total and one page boundary names one program.
+        let mut scheduled: Vec<&ProgramRecord> = store
+            .programs
+            .get(&input.channel_name)
+            .map(|programs| programs.values().collect())
+            .unwrap_or_default();
+        scheduled.sort_by(|left, right| {
+            (left.scheduled_start_time_millis, left.name.as_str())
+                .cmp(&(right.scheduled_start_time_millis, right.name.as_str()))
+        });
+
+        let mut remaining = scheduled
+            .into_iter()
+            .filter(|record| {
+                window_end_millis.is_none_or(|end| record.scheduled_start_time_millis <= end)
+            })
+            .filter(|record| {
+                resume_after.as_ref().is_none_or(|(start_millis, name)| {
+                    (record.scheduled_start_time_millis, record.name.as_str())
+                        > (*start_millis, name.as_str())
+                })
+            })
+            .peekable();
+
+        let mut items: Vec<ScheduleEntry> = Vec::new();
+        let mut boundary: Option<String> = None;
+        while items.len() < page_size {
+            let Some(record) = remaining.next() else { break };
+            boundary = Some(encode_token(
+                record.scheduled_start_time_millis,
+                &record.name,
+            ));
+            items.push(schedule_entry(record, input.audience.as_deref()));
+        }
+
+        // A token is issued only when a program is left to report, so the last
+        // page carries none and a caller knows it has the whole schedule.
+        let next_token = if remaining.peek().is_some() {
+            boundary
+        } else {
+            None
+        };
+
+        Ok(GetChannelScheduleOutput {
+            // A channel with no program scheduled on it has an EMPTY schedule
+            // rather than no schedule, so the member is always reported and a
+            // caller walks a list either way.
+            items: Some(items),
+            next_token,
+        })
     }
 }

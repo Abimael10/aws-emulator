@@ -189,6 +189,24 @@ pub struct ComAmazonawsMediatailorMediatailorState {
     /// channels in one stable order and a continuation token can name the page
     /// boundary.
     pub channels: BTreeMap<String, ChannelRecord>,
+    /// Every program this emulator holds, keyed by the `ChannelName` of the
+    /// channel it is scheduled on and then by its own `ProgramName` — the two
+    /// identifiers `POST /channel/{ChannelName}/program/{ProgramName}` mints it
+    /// under and every other program route addresses it by.
+    ///
+    /// A program belongs to ONE channel, so the outer key is that channel and
+    /// `DeleteChannel` drops the whole entry with the channel: a program cannot
+    /// outlive the schedule it is on. The inner `BTreeMap` walks one channel's
+    /// programs in one stable order, which is what lets the schedule read break
+    /// a tie between two programs scheduled for the same instant and name a page
+    /// boundary.
+    ///
+    /// This is the SINGLE source of truth for a channel's schedule:
+    /// `GetChannelSchedule` reports it, and the program writes own it. No
+    /// request grows it yet — the program writes are still scaffolds — and the
+    /// write that fills it bounds how many programs one channel holds, the way
+    /// [`MAX_CHANNELS`] bounds the channel store.
+    pub programs: BTreeMap<String, BTreeMap<String, ProgramRecord>>,
     /// The tags of every taggable resource, keyed by resource ARN. This is the
     /// SINGLE source of truth for tags: `TagResource`/`UntagResource`/
     /// `ListTagsForResource` read and write it, `PutPlaybackConfiguration` seeds
@@ -586,6 +604,43 @@ impl ChannelRecord {
             audiences,
         }
     }
+}
+
+/// One program scheduled on a channel: the resource a program write mints, and
+/// what a read of that channel's schedule reports an entry from.
+///
+/// A program's position in the schedule is the instant it is scheduled to start,
+/// held here in epoch milliseconds the way `Transition$ScheduledStartTimeMillis`
+/// carries it ("The date and time that the program is scheduled to start, in
+/// epoch milliseconds"), so the stored value both orders the schedule and
+/// derives the instant the wire reports.
+///
+/// `Tags` is deliberately NOT here: tags live once, in
+/// [`ComAmazonawsMediatailorMediatailorState::tags_by_arn`], keyed by this
+/// record's `arn`.
+#[derive(Debug, Clone)]
+pub struct ProgramRecord {
+    pub name: String,
+    pub channel_name: String,
+    pub arn: String,
+    /// The source location the program's media plays from, and the live or VOD
+    /// source within it: `SourceLocationName` is required of every program, and
+    /// a program plays one of the two source kinds.
+    pub source_location_name: String,
+    pub live_source_name: Option<String>,
+    pub vod_source_name: Option<String>,
+    /// Where the program sits in the schedule, in epoch milliseconds.
+    pub scheduled_start_time_millis: i64,
+    /// How long the program runs, in milliseconds; none when its duration is
+    /// not known (a live program whose transition named none).
+    pub duration_millis: Option<i64>,
+    /// The ad breaks programmed into it, each at its own offset from the
+    /// program's start.
+    pub ad_breaks: Vec<AdBreak>,
+    /// The media an audience sees INSTEAD of the program's default media, one
+    /// entry per audience the program defines media for; empty when every
+    /// audience sees the default media.
+    pub audience_media: Vec<AudienceMedia>,
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

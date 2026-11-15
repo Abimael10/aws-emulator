@@ -140,6 +140,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // holding an ARN that addresses nothing.
         if let Some(record) = store.channels.remove(&input.channel_name) {
             store.tags_by_arn.remove(&record.arn);
+            // A program is scheduled ON this channel, so the schedule goes with
+            // it too: leaving the programs behind would hand the next channel
+            // created under the same name the deleted channel's schedule.
+            store.programs.remove(&input.channel_name);
         }
 
         Ok(DeleteChannelOutput {})
