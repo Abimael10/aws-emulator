@@ -522,7 +522,6 @@ fn read_source<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                         destination.bucket_prefix.as_deref(),
                         &plan.flow_name,
                         execution_id,
-                        output_file_type(destination),
                     ),
                     file_type: output_file_type(destination).to_string(),
                 },
@@ -834,8 +833,9 @@ fn missing_actions(
 ///
 /// Everything a stored object carries that a WRITE does not choose is left as a
 /// `PutObject` of the same bytes would leave it: the entity tag is computed from the bytes
-/// by the object store's own function, and the encryption is the destination bucket's
-/// default, because that is what any other write to that bucket is stored under.
+/// by the object store's own function, the checksum is the one Amazon S3 itself adds to a
+/// whole-object write that names no algorithm, and the encryption is the destination
+/// bucket's default, because that is what any other write to that bucket is stored under.
 fn stored_object(
     store: &::service_com_amazonaws_s3_amazons3::state::ComAmazonawsS3Amazons3State,
     bucket: &str,
@@ -843,6 +843,11 @@ fn stored_object(
 ) -> ::service_com_amazonaws_s3_amazons3::state::Object {
     ::service_com_amazonaws_s3_amazons3::state::Object {
         etag: ::service_com_amazonaws_s3_amazons3::state::object_etag(&body),
+        // A run writes the file whole and names no checksum algorithm, so the object store
+        // settles the checksum such a write carries — its default algorithm over all of
+        // the bytes — through its own function for it, and a read or a listing of the
+        // transferred object reports what the same bytes put through `PutObject` report.
+        checksum: ::service_com_amazonaws_s3_amazons3::state::stored_object_checksum(None, &body),
         body,
         version_id: None,
         last_modified: SystemTime::now(),
@@ -862,34 +867,28 @@ fn stored_object(
             .map(::service_com_amazonaws_s3_amazons3::state::Bucket::default_object_encryption)
             .unwrap_or_default(),
         // A transferred object carries no Object Lock retention, legal hold, restore,
-        // annotation, ACL or checksum of its own, and is written whole: each of those is
-        // placed on a stored object afterwards by Amazon S3's own operation for it.
+        // annotation or ACL of its own, and is written whole: each of those is placed on a
+        // stored object afterwards by Amazon S3's own operation for it.
         retention: None,
         legal_hold: None,
         restore: None,
         annotations: ::std::collections::BTreeMap::new(),
         acl: None,
-        checksum: None,
         parts: Vec::new(),
         replication: None,
     }
 }
 
-/// The key a run writes its file at: the destination prefix, then the flow and the run
-/// that produced the file, then the file itself.
+/// The key a run writes its file at: the destination prefix, then the flow, then the run
+/// that produced the file — three segments, with no further path element and no file-name
+/// extension.
 ///
-/// The run's own identifier is in the path, so two runs of one flow never overwrite each
-/// other's output and a reader can tell which run wrote what; the flow name is above it,
-/// so two flows writing under one prefix stay apart. A destination naming no prefix writes
-/// at the top of the bucket.
-fn destination_key(
-    prefix: Option<&str>,
-    flow_name: &str,
-    execution_id: &str,
-    file_type: &str,
-) -> String {
-    let file = format!("{execution_id}.{}", file_type.to_ascii_lowercase());
-    let within_flow = format!("{flow_name}/{execution_id}/{file}");
+/// The run's own identifier is the LAST segment, so two runs of one flow never overwrite
+/// each other's output and a reader can tell which run wrote what; the flow name is above
+/// it, so two flows writing under one prefix stay apart. A destination naming no prefix
+/// writes at the top of the bucket.
+fn destination_key(prefix: Option<&str>, flow_name: &str, execution_id: &str) -> String {
+    let within_flow = format!("{flow_name}/{execution_id}");
     match prefix
         .map(|prefix| prefix.trim_end_matches('/'))
         .filter(|prefix| !prefix.is_empty())

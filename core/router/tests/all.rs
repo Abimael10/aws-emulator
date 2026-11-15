@@ -1499,3 +1499,21 @@ mod zz_probe_whole_emulator;
 // what points each declaration into `tests/all/`. Some of the files below are shared harnesses
 // rather than suites (`query_wire`, `eks_wire`, `cloudformation_stack_clock`) and some are
 // probes; every one of them is declared.
+// One `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`, sorted by
+// name, and no other line — so two branches landing at once insert two lines in two places and
+// have no prose to duplicate, re-word or mistype. A file no pair names is compiled nowhere and
+// its tests never run; a suite left at the top level of `tests/` fails the build; a second pair
+// for one name is `E0428`; and an inner doc comment past the first item is `E0753`. Each of the
+// last two fails EVERY suite of this target rather than one, which is why every comment here is
+// an ordinary `//` one, this header included: with no inner doc comment anywhere in the file,
+// no merge of two landings can leave one past the first item.
+// This file is a test-target CRATE ROOT, where a bare `mod` would resolve to a SIBLING of it
+// under `tests/`, which the layout check refuses: the `#[path]` above each declaration is what
+// points it into `tests/all/`. What a suite covers, and why it drives the assembled router
+// rather than one service crate, belongs in that suite's own module header, where it is read
+// beside the test it explains; the notes earlier landings appended to the tail of this file
+// live in `all/appended_notes.rs`, `all/appended_notes_tail.rs`, `all/appended_header_notes.rs`
+// and `all/appended_prose.rs`, each declared below like any other suite.
+// The lint allowed here is for the suite files this root compiles: a wrapped paragraph in one of
+// their module headers is a note rather than a build failure. An inner attribute, like an inner
+// doc comment, is legal only before the first item, so it stands here rather than in the list.

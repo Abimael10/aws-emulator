@@ -507,8 +507,7 @@ async fn an_s3_to_s3_run_transfers_the_source_records_to_the_destination() {
 
         // What the run WROTE, read back through Amazon S3's own data plane at the key the
         // destination prefix, the flow and the run name.
-        let extension = row.output_file_type.unwrap_or("JSON").to_ascii_lowercase();
-        let key = format!("outbound/{flow_name}/{execution_id}/{execution_id}.{extension}");
+        let key = format!("outbound/{flow_name}/{execution_id}");
         let written = emulator.object(destination_bucket, &key).await;
         assert_eq!(
             written.status, 200,
@@ -651,11 +650,8 @@ async fn a_run_writes_every_destination_the_definition_names() {
         // Every destination holds the file the run wrote for it, and the reported bytes
         // are those files together.
         let mut written_bytes = 0u64;
-        for (bucket, file_type) in buckets.iter().zip(&file_types) {
-            let key = format!(
-                "outbound/{flow_name}/{execution_id}/{execution_id}.{}",
-                file_type.to_ascii_lowercase()
-            );
+        for bucket in &buckets {
+            let key = format!("outbound/{flow_name}/{execution_id}");
             let written = emulator.object(bucket, &key).await;
             assert_eq!(
                 written.status, 200,
@@ -777,7 +773,7 @@ async fn a_run_with_an_endpoint_this_emulator_does_not_reach_performs_nothing() 
         }
         // And nothing was written at the Amazon S3 destination of the second row either:
         // a run that cannot serve every destination serves none.
-        let key = format!("outbound/{flow_name}/{execution_id}/{execution_id}.json");
+        let key = format!("outbound/{flow_name}/{execution_id}");
         let written = emulator.object("unreached-out", &key).await;
         assert_eq!(
             written.status, 404,
@@ -955,7 +951,7 @@ async fn a_run_the_locations_do_not_allow_moves_nothing() {
             );
         }
         if destination_still_there {
-            let key = format!("outbound/{flow_name}/{execution_id}/{execution_id}.json");
+            let key = format!("outbound/{flow_name}/{execution_id}");
             let written = emulator.object(destination_bucket, &key).await;
             assert_eq!(
                 written.status, 404,

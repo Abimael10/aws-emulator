@@ -422,6 +422,15 @@ pub fn write_objects<Eng: Send + Sync + 'static>(
             // The entity tag is computed over the bytes stored, exactly as it is for an
             // object written through `PutObject`.
             etag: ::service_com_amazonaws_s3_amazons3::state::object_etag(&object.body),
+            // An export names no checksum algorithm and writes each object whole, so the
+            // object store settles the checksum such a write carries — its default
+            // algorithm over all of the bytes — through its own function for it, and a
+            // read or a listing of the exported object reports what the same bytes put
+            // through `PutObject` report.
+            checksum: ::service_com_amazonaws_s3_amazons3::state::stored_object_checksum(
+                None,
+                &object.body,
+            ),
             body: object.body.clone(),
             version_id: None,
             last_modified: SystemTime::now(),
@@ -447,9 +456,6 @@ pub fn write_objects<Eng: Send + Sync + 'static>(
             // And no ACL of its own: it carries the one every object starts with, the
             // owner's `FULL_CONTROL`, which a reader derives.
             acl: None,
-            // And no checksum: the export names no checksum algorithm, so a read of the
-            // object reports none.
-            checksum: None,
             // It is written whole rather than assembled from parts.
             parts: Vec::new(),
             // And nothing replicated it: S3's own store settles a replication record when

@@ -27,6 +27,8 @@ mod flow_lifecycle;
 mod flow_principal_identity;
 #[path = "all/flow_run_completion_metadata.rs"]
 mod flow_run_completion_metadata;
+#[path = "all/flow_run_output_object.rs"]
+mod flow_run_output_object;
 #[path = "all/flow_run_transfer.rs"]
 mod flow_run_transfer;
 #[path = "all/flow_state_fidelity.rs"]

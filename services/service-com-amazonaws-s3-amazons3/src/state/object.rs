@@ -962,6 +962,11 @@ impl Object {
     /// own `PutObject` and `CopyObject` build the object they store themselves, because they
     /// carry the cache-control, metadata, tag set and encryption configuration of the request.
     pub fn stored(body: Vec<u8>, content_type: Option<String>) -> Self {
+        // A writer that carries only bytes names no checksum algorithm, so the object it
+        // stores carries the checksum S3 itself adds to such a write — the default
+        // algorithm over all of the bytes, whole ([`stored_object_checksum`]) — and a read
+        // or a listing of it reports that, exactly as for a `PutObject` of the same bytes.
+        let checksum = stored_object_checksum(None, &body);
         Self {
             etag: object_etag(&body),
             body,
@@ -983,9 +988,7 @@ impl Object {
             restore: None,
             annotations: BTreeMap::new(),
             acl: None,
-            // A writer that carries only bytes names no checksum algorithm, so the object
-            // it stores carries no checksum either.
-            checksum: None,
+            checksum,
             // Nor is it assembled from parts: one write stored it whole.
             parts: Vec::new(),
             // Replication is settled by the store once the version is recorded (see
