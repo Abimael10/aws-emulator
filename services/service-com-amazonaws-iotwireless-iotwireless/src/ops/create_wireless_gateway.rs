@@ -263,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             id: id.clone(),
             name: input.name.clone(),
             description: input.description.clone(),
-            lorawan: input.lo_ra_wan.clone(),
+            lorawan: crate::state::gateway_lorawan_settings(&input.lo_ra_wan),
             thing_name: None,
             thing_arn: None,
             // No event topic is enabled until `UpdateResourceEventConfiguration` says

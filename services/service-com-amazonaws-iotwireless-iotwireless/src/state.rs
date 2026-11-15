@@ -978,6 +978,22 @@ pub struct WirelessGateway {
     pub tags: Vec<Tag>,
 }
 
+/// The LoRaWAN configuration a stored gateway carries: the members the request named,
+/// kept exactly as submitted, and an empty `Beaconing` container when the request named
+/// none at all.
+///
+/// `Beaconing` is the block of beacon parameters a LoRaWAN gateway transmits with, and
+/// the service reports the container for every LoRaWAN gateway — its own members unset
+/// while nothing has configured them — so a client can tell "no beacon parameters" from
+/// "this field is not reported". One function, so the stored record, and therefore every
+/// reader of it, carries the container whether or not the request spelled one out.
+pub fn gateway_lorawan_settings(requested: &LoRaWANGateway) -> LoRaWANGateway {
+    LoRaWANGateway {
+        beaconing: Some(requested.beaconing.clone().unwrap_or_default()),
+        ..requested.clone()
+    }
+}
+
 /// A wireless gateway task definition: the firmware update one gateway task applies.
 ///
 /// `update` is the settings the create carried, reported back unchanged by the
@@ -1860,10 +1876,10 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
 /// last resort rather than a behaviour change: at most one token is recorded per stored
 /// resource, a resource's tokens are dropped with it where its delete is implemented
 /// (`forget_*_tokens_for`, which the destination, wireless-device, device-profile,
-/// service-profile, multicast-group, FUOTA-task and wireless-gateway-task-definition
-/// deletes call — the wireless-gateway and network-analyzer-configuration deletes are
-/// still scaffolded, so those two maps release a token only when the whole store is
-/// dropped), and each
+/// service-profile, multicast-group, FUOTA-task, wireless-gateway and
+/// wireless-gateway-task-definition deletes call — the network-analyzer-configuration
+/// delete is still scaffolded, so that one map releases a token only when the whole
+/// store is dropped), and each
 /// token cap equals its resource ceiling — so the map can only reach `cap` when every
 /// entry in it names a resource the store accepted and the resource store is itself
 /// full, which the create already refuses before it gets here. Eviction exists so the
@@ -2027,6 +2043,41 @@ impl ComAmazonawsIotwirelessIotwirelessState {
             token,
             record,
         );
+    }
+
+    /// Drop every `CreateWirelessGateway` token that minted gateway `id`, so a token
+    /// never outlives the resource it names.
+    pub fn forget_wireless_gateway_tokens_for(&mut self, id: &str) {
+        forget_tokens_for(
+            &mut self.wireless_gateway_tokens,
+            &mut self.wireless_gateway_token_order,
+            id,
+        );
+    }
+
+    /// Remove wireless gateway `id` and everything the store held only because the
+    /// gateway did: the `GatewayEui` that addressed it, the firmware task it was running,
+    /// the network analyzer configurations that tracked it, and the idempotency tokens
+    /// that minted it.
+    ///
+    /// `None` for a gateway the store does not hold, which is what lets the delete refuse
+    /// an unknown `Id` from the same call that removes a known one. The `GatewayEui` goes
+    /// because the identifier is free for another gateway to claim once this one is gone;
+    /// the task and the tracked ids go because neither may name a gateway the account no
+    /// longer holds.
+    pub fn remove_wireless_gateway(&mut self, id: &str) -> Option<WirelessGateway> {
+        let removed = self.wireless_gateways.remove(id)?;
+        if let Some(gateway_eui) = removed.lorawan.gateway_eui.as_deref() {
+            if self.gateway_eui_index.get(gateway_eui).map(String::as_str) == Some(id) {
+                self.gateway_eui_index.remove(gateway_eui);
+            }
+        }
+        self.wireless_gateway_tasks.remove(id);
+        for configuration in self.network_analyzer_configurations.values_mut() {
+            configuration.wireless_gateways.retain(|tracked| tracked != id);
+        }
+        self.forget_wireless_gateway_tokens_for(id);
+        Some(removed)
     }
 
     /// Mint a fresh, unused `WirelessGatewayTaskDefinitionId`.

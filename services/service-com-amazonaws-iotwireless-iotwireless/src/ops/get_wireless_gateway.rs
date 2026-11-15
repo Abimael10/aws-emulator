@@ -172,16 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let gateway = store
             .find_gateway(&input.identifier_type, &input.identifier)
             .ok_or_else(|| {
+                // The one body every operation that addresses a gateway refuses a missing
+                // one with, so a gateway this account does not hold — one a delete has
+                // since removed among them — is refused identically wherever it is read.
                 GetWirelessGatewayError::from(
                     GetWirelessGatewayErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(format!(
-                                "No wireless gateway with {} {}",
-                                input.identifier_type, input.identifier
-                            )),
-                            resource_id: Some(input.identifier.clone()),
-                            resource_type: Some("WirelessGateway".to_string()),
-                        },
+                        crate::state::wireless_gateway_not_found(),
                     ),
                 )
             })?;

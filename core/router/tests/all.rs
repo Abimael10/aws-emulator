@@ -1870,3 +1870,15 @@ mod default_vpc_internet_path_runs_ecs_tasks;
 // (`all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs`).
 #[path = "all/cognito_user_pool_replica_over_a_multi_region_key.rs"]
 mod cognito_user_pool_replica_over_a_multi_region_key;
+// that suite's own module header, where it is read beside the test it explains, and a note
+// about THIS file belongs in `all/appended_notes.rs`.
+// EVERY comment in this file is an ordinary `//` one, this header included, and no inner
+// attribute stands anywhere in it: an inner doc comment (`//!`) and an inner attribute are
+// legal only before the first item, so one appended past the declarations is a hard error
+// that compiles no suite of this target, and with neither anywhere in the file no merge of
+// two landings can leave one there. A suite declared twice is `E0428`, and a suite file no
+// declaration names compiles nowhere. The guard suites
+// crate's `tests/all.rs`, so a note about any of them belongs there rather than here.
+// This file is a test-target CRATE ROOT, where a bare `mod` would resolve to a sibling of it
+// under `tests/` — which the layout check refuses: the `#[path]` above each `mod` is what
+// points the declaration into `tests/all/`.
