@@ -202,10 +202,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let log_group_name = crate::state::log_group_name_from_identifier(identifier);
 
+        // A log group the account does not hold is refused the way this surface words a
+        // missing group ([`crate::state::INDEX_POLICY_LOG_GROUP_NOT_FOUND_MESSAGE`]).
         let Some(group) = store.log_groups.get(log_group_name) else {
             return Err(DescribeIndexPoliciesErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::resource_not_found_message("log group")),
+                    message: Some(
+                        crate::state::INDEX_POLICY_LOG_GROUP_NOT_FOUND_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());

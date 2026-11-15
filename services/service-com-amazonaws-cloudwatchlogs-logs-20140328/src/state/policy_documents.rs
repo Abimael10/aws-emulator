@@ -259,10 +259,7 @@ pub fn check_field_index_policy_document(document: &str) -> Result<Vec<IndexedFi
         });
     }
     if fields.is_empty() && fields_v2.is_empty() {
-        return Err(
-            "policyDocument for a field index policy must contain at least one field index"
-                .to_string(),
-        );
+        return Err(EMPTY_INDEX_POLICY_DOCUMENT_MESSAGE.to_string());
     }
     if let Some(name) = fields.iter().find(|field| fields_v2.contains_key(*field)) {
         return Err(format!(
@@ -1038,7 +1035,13 @@ pub fn check_data_protection_policy_document(
         .ok()
         .filter(serde_json::Value::is_object)
         .ok_or_else(|| {
-            "policyDocument must be a data protection policy in JSON (a JSON object)".to_string()
+            // A document that is not JSON at all never reaches the rules below: the service
+            // answers its own JSON parser's failure, naming the token it could not read and
+            // where that token is ([`unreadable_policy_json_message`]).
+            unreadable_policy_json_message(document).unwrap_or_else(|| {
+                "policyDocument must be a data protection policy in JSON (a JSON object)"
+                    .to_string()
+            })
         })?;
     let statements = parsed
         .get("Statement")

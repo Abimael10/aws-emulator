@@ -185,13 +185,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .log_groups
             .get_mut(&log_group_name)
             .ok_or_else(|| not_found(&crate::state::resource_not_found_message("log group")))?;
-        // The resource this operation deletes is the policy, so a group holding none has
-        // nothing to delete. The request identifies that policy by nothing of its own —
-        // only by the group it is attached to — so the refusal states nothing about it
-        // beyond that the resource is not there.
+        // The resource this operation deletes is the policy, which the account owns per log
+        // group: so a group holding none has nothing to delete, and the refusal reports the
+        // key nothing was found under — the account that would own the policy and the group
+        // the request named ([`crate::state::data_protection_policy_not_found_message`]).
         if group.data_protection_policy.take().is_none() {
             return Err(not_found(
-                crate::state::UNIDENTIFIED_RESOURCE_NOT_FOUND_MESSAGE,
+                &crate::state::data_protection_policy_not_found_message(
+                    ::engine::emulator_account_id(),
+                    &log_group_name,
+                ),
             ));
         }
 

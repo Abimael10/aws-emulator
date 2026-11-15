@@ -209,14 +209,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .policy_name
             .as_deref()
             .filter(|name| !name.trim().is_empty());
-        // "This is formatted as a JSON string": a document that is not a JSON object is
-        // not a policy document.
+        // "This is formatted as a JSON string": a document that is not a JSON object is not a
+        // policy document, and what refuses it is the service's IAM policy parser — the same
+        // parser, and the same fixed sentence, that refuses an access policy it will not take
+        // ([`crate::state::ACCESS_POLICY_PARSE_FAILED`]).
         if !::serde_json::from_str::<::serde_json::Value>(policy_document)
             .is_ok_and(|document| document.is_object())
         {
-            return Err(invalid(
-                "policyDocument must be a JSON policy document (a JSON object)",
-            ));
+            return Err(invalid(crate::state::ACCESS_POLICY_PARSE_FAILED));
         }
         let now = crate::state::now_ms();
 

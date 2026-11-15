@@ -88,6 +88,16 @@ async fn data_protection_status(logs: &Logs, group: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// How many members a `GetDataProtectionPolicy` answer carries: a group holding no policy is
+/// reported by an answer carrying none of them.
+fn reported_members(answer: &Value) -> usize {
+    match answer {
+        Value::Null => 0,
+        Value::Object(members) => members.len(),
+        other => panic!("the read answers a JSON object, got {other}"),
+    }
+}
+
 /// A policy is held by the one group it was put on: each group reports its own document,
 /// and a group nobody put on holds none and reports no status.
 #[tokio::test]
@@ -132,15 +142,16 @@ async fn a_policy_is_held_by_the_one_group_it_was_put_on() {
                 );
             }
             None => {
-                let code = logs
-                    .err(
+                let got = logs
+                    .ok(
                         "GetDataProtectionPolicy",
                         &json!({"logGroupIdentifier": group}),
                     )
                     .await;
                 assert_eq!(
-                    code, "ResourceNotFoundException",
-                    "case {group}: a group nobody put on holds no policy, got {code}"
+                    reported_members(&got),
+                    0,
+                    "case {group}: a group nobody put on holds no policy, so the read reports none, got {got}"
                 );
                 assert_eq!(
                     data_protection_status(&logs, group).await,
@@ -192,15 +203,16 @@ async fn deleting_the_log_group_takes_its_policy_with_it() {
 
         logs.ok("CreateLogGroup", &json!({"logGroupName": group}))
             .await;
-        let code = logs
-            .err(
+        let got = logs
+            .ok(
                 "GetDataProtectionPolicy",
                 &json!({"logGroupIdentifier": identifier}),
             )
             .await;
         assert_eq!(
-            code, "ResourceNotFoundException",
-            "case {selector}: a new group under an old name holds no policy, got {code}"
+            reported_members(&got),
+            0,
+            "case {selector}: a new group under an old name holds no policy, got {got}"
         );
         assert_eq!(
             data_protection_status(&logs, &group).await,

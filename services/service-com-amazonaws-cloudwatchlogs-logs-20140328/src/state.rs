@@ -261,6 +261,11 @@ pub use integration_records::*;
 mod policy_documents;
 pub use policy_documents::*;
 
+/// The refusal a data protection policy document that is not JSON at all is answered with,
+/// which reports the service's own JSON parser rather than any rule about the policy.
+mod policy_json;
+pub use policy_json::*;
+
 /// Masking the sensitive data a log group's data protection policy names, as an event is
 /// ingested.
 pub mod data_protection;
@@ -3637,6 +3642,25 @@ pub fn transformer_not_found_message(log_group_name: &str) -> String {
 /// account identity; the sentence is otherwise fixed.
 pub fn log_group_not_found_for_owner_message(log_group_name: &str, owner_account_id: &str) -> String {
     format!("Log group '{log_group_name}' for owner '{owner_account_id}' cannot be found")
+}
+
+/// The refusal the data protection policy DELETE answers when the log group it resolves holds
+/// no such policy.
+///
+/// A data protection policy is keyed by the account that owns it and the log group it is
+/// attached to, and the delete reports the key it found nothing under: the sentence is fixed
+/// around that one variable part, built from the caller's account identity and the group the
+/// request named. That key is the whole diagnostic the refusal carries — a caller deleting
+/// policies across groups learns which group held none instead of guessing which of its
+/// requests failed.
+pub fn data_protection_policy_not_found_message(
+    owner_account_id: &str,
+    log_group_name: &str,
+) -> String {
+    format!(
+        "In DeleteDataProtectionPolicyInternalImpl request, there is no related \
+         DataProtectionPolicy with policyKey {owner_account_id}:{log_group_name}."
+    )
 }
 
 /// The refusal CloudWatch Logs builds from the request when the identifier a

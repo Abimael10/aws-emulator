@@ -304,7 +304,7 @@ async fn a_policy_document_in_the_wrong_json_form_states_the_malformed_text() {
         (
             "no field index at all",
             json!({"Fields": []}).to_string(),
-            "at least one field index",
+            "at least 1 field",
         ),
         (
             "a type outside the index types",
@@ -753,7 +753,7 @@ async fn a_transformer_delete_names_the_group_it_found_none_on() {
 
 /// A data protection policy read of a log group the account does not hold names the group that
 /// was looked for AND the account that would own it — whichever identifier form named it —
-/// while a group that exists and holds no policy is still the fixed missing-resource text.
+/// while a group that exists and holds no policy is reported rather than refused.
 #[tokio::test]
 async fn a_data_protection_read_names_the_missing_group_and_its_owner() {
     const PRESENT: &str = "/wording/holds-no-policy";
@@ -785,20 +785,21 @@ async fn a_data_protection_read_names_the_missing_group_and_its_owner() {
         }
     }
 
-    // The boundary: the group is there and the POLICY is not, which the request identifies
-    // nothing of — so the refusal is the fixed text, naming neither the group nor its owner.
-    let (code, message) = logs
-        .refusal(
+    // The boundary: the group is there and the POLICY is not, which is not a missing resource
+    // at all — the read reports the absence by carrying none of its members.
+    let got = logs
+        .ok(
             "GetDataProtectionPolicy",
             &json!({"logGroupIdentifier": PRESENT}),
         )
         .await;
+    let reported = match &got {
+        Value::Null => 0,
+        Value::Object(members) => members.len(),
+        other => panic!("case \"a group holding no policy\": the read answers an object, got {other}"),
+    };
     assert_eq!(
-        code, NOT_FOUND,
-        "case \"a group holding no policy\": expected {NOT_FOUND}, got {code} {message:?}"
-    );
-    assert_eq!(
-        message, UNIDENTIFIED_NOT_FOUND,
-        "case \"a group holding no policy\": expected {UNIDENTIFIED_NOT_FOUND:?}, got {message:?}"
+        reported, 0,
+        "case \"a group holding no policy\": expected an answer carrying no member, got {got}"
     );
 }

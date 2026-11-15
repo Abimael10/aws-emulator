@@ -187,10 +187,14 @@ pub fn access_policy_grants_organization(document: &str) -> bool {
     false
 }
 
-/// The refusal CloudWatch Logs answers an `accessPolicy` its IAM policy parser will not
-/// take: a document that is not an IAM policy document at all, and one whose statements do
-/// not identify the principals they grant to. The text is FIXED — it carries nothing from
+/// The refusal CloudWatch Logs answers a resource policy document its IAM policy parser will
+/// not take: a document that is not an IAM policy document at all, and one whose statements
+/// do not identify the principals they grant to. The text is FIXED — it carries nothing from
 /// the request — so every such refusal reads identically.
+///
+/// It is the parser's own sentence rather than one operation's, so it names the `accessPolicy`
+/// the parser is invoked for whichever member of whichever request carried the document
+/// (`PutDestinationPolicy$accessPolicy`, `PutResourcePolicy$policyDocument`).
 pub const ACCESS_POLICY_PARSE_FAILED: &str =
     "Error occurred while parsing accessPolicy. Please check if the accessPolicy has been \
      constructed correctly using IAM grammar.";

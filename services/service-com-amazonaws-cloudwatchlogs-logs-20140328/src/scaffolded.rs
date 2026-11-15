@@ -178,14 +178,19 @@ impl SerializableStruct for ValidationException {
 }
 
 /// The `message` member of the synthetic `AccessDeniedException` error shape.
+///
+/// The wire name is `Message`: this service's model declares no `AccessDeniedException`, so
+/// the shape is not one the model's own member-naming applies to — it is the AWS COMMON
+/// error, whose payload names its one member that way, and a client reading an authorization
+/// refusal of this service reads it under that name.
 static ACCESS_DENIED_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
-        "smithy.framework#AccessDeniedException$message",
+        "smithy.framework#AccessDeniedException$Message",
         "smithy.framework",
-        "message",
+        "Message",
     ),
     ShapeType::String,
-    "message",
+    "Message",
     0,
 )
 .with_xml_name("Message");

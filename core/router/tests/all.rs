@@ -1759,3 +1759,13 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 //! `all/all_rs_is_a_canonical_declaration_list.rs`, so they are stated there rather than
 //! restated here. What a suite covers, and why it belongs in this target, is in that
 //! suite's own module doc, where it is read beside the test it explains.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted into the sorted list — so two
+//! branches landing at once insert two lines in two places and have no prose to duplicate,
+//! re-word or mistype.
+//! * declare each suite EXACTLY ONCE — this is one crate root, so a second `mod` of the same
+//!   name is `E0428` and takes every suite in the target down with it;
+//! * an inner doc comment (`//!`) is legal only BEFORE the first item, so THIS header is the
+//!   only place one may stand: past the first item it is `E0753` and compiles nothing;
+//! * the list holds declaration pairs and no other line — what a suite covers, and why it
+//!   belongs to this cross-service target rather than to one service crate's own, is stated
+//!   in that suite's own module header, where it is read beside the test it explains.

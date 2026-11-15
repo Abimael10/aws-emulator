@@ -179,14 +179,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ::engine::emulator_account_id(),
             ))
         })?;
-        // A group that holds no policy has no policy to report: the resource this
-        // operation reads is the policy, not the group. The request identifies that policy
-        // by nothing of its own — only by the group it is attached to — so the refusal
-        // states nothing about it beyond that the resource is not there.
-        let policy = group
-            .data_protection_policy
-            .as_ref()
-            .ok_or_else(|| not_found(crate::state::UNIDENTIFIED_RESOURCE_NOT_FOUND_MESSAGE))?;
+        // A group that holds no policy has no policy to REPORT, and nothing about the read
+        // failed: the operation "returns information about a log group data protection
+        // policy", so a group that has none is reported by an answer carrying none of the
+        // output's members. The resource a refusal would be about is the LOG GROUP, which
+        // is the one thing this request names and the one thing that can be missing.
+        let Some(policy) = group.data_protection_policy.as_ref() else {
+            return Ok(GetDataProtectionPolicyOutput {
+                log_group_identifier: None,
+                policy_document: None,
+                last_updated_time: None,
+            });
+        };
 
         Ok(GetDataProtectionPolicyOutput {
             // "The log group name or ARN that you specified in your request" — the

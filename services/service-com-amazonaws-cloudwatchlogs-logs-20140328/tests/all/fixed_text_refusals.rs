@@ -7,8 +7,9 @@
 //! * a missing resource the request identifies NOTHING of — a log-group level policy
 //!   document addressed by the identifier of the log group it is attached to and by nothing
 //!   else — is refused with the service's own missing-resource text, naming neither the log
-//!   group, nor a policy name, nor a word for the kind of resource (`DeleteIndexPolicy`,
-//!   `GetDataProtectionPolicy` / `DeleteDataProtectionPolicy`);
+//!   group, nor a policy name, nor a word for the kind of resource (`DeleteIndexPolicy`);
+//!   the data protection delete is the counterpart of that, naming the KEY its policy would
+//!   have been stored under (the owning account and the log group);
 //! * an `expectedRevisionId` that IS a revision the service issued and a later write
 //!   superseded is refused as a conflict against the resource the caller is to re-read and
 //!   retry, naming neither the revision presented, nor the stored one, nor the policy's name
@@ -64,6 +65,11 @@ const INVALID_REVISION: &str = "Invalid ExpectedRevisionId";
 /// the counterpart of.
 const LOG_GROUP_NOT_FOUND: &str = "The specified log group does not exist.";
 
+/// The whole message the FIELD INDEX POLICY operations refuse a log group the account does
+/// not hold with: that surface states the kind of resource that could not be found and
+/// nothing else.
+const INDEX_POLICY_LOG_GROUP_NOT_FOUND: &str = "Log group cannot be found.";
+
 /// One log-group level resource: the put that stores one, the operations that refuse a
 /// group holding none, and the word the kind of resource would be named by if the refusal
 /// interpolated one.
@@ -99,6 +105,16 @@ fn transformer_refusal(log_group_name: &str) -> String {
     format!("Transformer does not exist on log group '{log_group_name}'")
 }
 
+/// The sentence the data protection delete refuses a group holding no policy with: the key
+/// such a policy is stored under — the account that owns it and the group it is attached to.
+fn data_protection_key_refusal(log_group_name: &str) -> String {
+    format!(
+        "In DeleteDataProtectionPolicyInternalImpl request, there is no related \
+         DataProtectionPolicy with policyKey {}:{log_group_name}.",
+        engine::emulator_account_id()
+    )
+}
+
 /// The log-group level resources a request addresses by its log group's identifier alone.
 fn rows() -> Vec<Row> {
     vec![
@@ -118,9 +134,12 @@ fn rows() -> Vec<Row> {
             resource: "data protection policy",
             put: "PutDataProtectionPolicy",
             document: json!({"policyDocument": data_protection_document("EmailAddress")}),
-            readers: &["GetDataProtectionPolicy"],
+            // `GetDataProtectionPolicy` is NOT a refusing reader of this resource: a group
+            // that holds no policy is reported by an answer carrying no policy, which
+            // `tests/all/policy_surface_refusals.rs` is about.
+            readers: &[],
             delete: "DeleteDataProtectionPolicy",
-            refusal: unidentified_refusal,
+            refusal: data_protection_key_refusal,
         },
         Row {
             slug: "transformer",
@@ -315,9 +334,10 @@ async fn an_unidentified_missing_resource_is_refused_with_the_services_fixed_tex
     }
 }
 
-/// The boundary of that fixed text: where the request DOES identify the missing resource —
-/// a log group the account does not hold — the refusal names it, on every one of the same
-/// operations and under either identifier form.
+/// The boundary of that fixed text: a log group the account does not hold is a DIFFERENT
+/// missing resource from the policy document it would have carried, so every one of the same
+/// operations refuses it with its own surface's missing-group sentence instead, under either
+/// identifier form.
 #[tokio::test]
 async fn a_missing_log_group_is_still_named_in_the_refusal() {
     let logs = Logs::new();
@@ -352,13 +372,17 @@ async fn a_missing_log_group_is_still_named_in_the_refusal() {
 /// The message an operation refuses a log group the account does not hold with: the
 /// service's sentence naming the resource kind, except the data protection policy READ,
 /// which \u2014 because such a policy is readable across accounts \u2014 names the group that was
-/// looked for and the account that would own it.
+/// looked for and the account that would own it, and the field index policy operations,
+/// which word a missing group as their own surface does.
 fn missing_group_message(operation: &str, log_group_name: &str) -> String {
     if operation == "GetDataProtectionPolicy" {
         return format!(
             "Log group '{log_group_name}' for owner '{}' cannot be found",
             engine::emulator_account_id()
         );
+    }
+    if operation == "PutIndexPolicy" || operation == "DeleteIndexPolicy" || operation == "DescribeIndexPolicies" {
+        return INDEX_POLICY_LOG_GROUP_NOT_FOUND.to_string();
     }
     LOG_GROUP_NOT_FOUND.to_string()
 }

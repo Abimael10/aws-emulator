@@ -221,10 +221,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolves to the name the store is keyed by.
         let log_group_name =
             crate::state::log_group_name_from_identifier(&input.log_group_identifier).to_string();
+        // A log group the account does not hold is refused the way this surface words a
+        // missing group ([`crate::state::INDEX_POLICY_LOG_GROUP_NOT_FOUND_MESSAGE`]).
         let Some(group) = store.log_groups.get_mut(&log_group_name) else {
             return Err(PutIndexPolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::resource_not_found_message("log group")),
+                    message: Some(
+                        crate::state::INDEX_POLICY_LOG_GROUP_NOT_FOUND_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());

@@ -145,6 +145,26 @@ fn last_updated_time(body: &Value) -> i64 {
         .unwrap_or_else(|| panic!("the response must carry lastUpdatedTime, got {body}"))
 }
 
+/// Assert the read of `identifier` reports NO policy: a group that holds none is answered
+/// with none of the output's members rather than refused.
+async fn assert_reports_no_policy(logs: &Logs, case: &str, identifier: &str) {
+    let got = logs
+        .ok(
+            "GetDataProtectionPolicy",
+            &json!({"logGroupIdentifier": identifier}),
+        )
+        .await;
+    let reported = match &got {
+        Value::Null => 0,
+        Value::Object(members) => members.len(),
+        other => panic!("case {case:?}: the read answers a JSON object, got {other}"),
+    };
+    assert_eq!(
+        reported, 0,
+        "case {case:?}: a group holding no policy is reported by an empty answer, got {got}"
+    );
+}
+
 /// The `dataProtectionStatus` `DescribeLogGroups` reports for one group, or `None` when
 /// the group reports none.
 async fn data_protection_status(logs: &Logs, group: &str) -> Option<String> {
@@ -262,15 +282,7 @@ async fn policy_round_trips_through_put_get_and_delete() {
                         &json!({"logGroupIdentifier": identifier}),
                     )
                     .await;
-                    assert_eq!(
-                        logs.err(
-                            "GetDataProtectionPolicy",
-                            &json!({"logGroupIdentifier": identifier})
-                        )
-                        .await,
-                        "ResourceNotFoundException",
-                        "case {case:?}: the deleted policy is gone"
-                    );
+                    assert_reports_no_policy(&logs, &format!("{case}: deleted"), &identifier).await;
                     assert_eq!(
                         data_protection_status(&logs, &group).await.as_deref(),
                         Some("DELETED"),
@@ -509,15 +521,8 @@ async fn a_malformed_document_is_refused() {
             code, "InvalidParameterException",
             "case {case:?}: a document breaking a documented rule is refused InvalidParameterException, got {code}"
         );
-        assert_eq!(
-            logs.err(
-                "GetDataProtectionPolicy",
-                &json!({"logGroupIdentifier": "malformed"})
-            )
-            .await,
-            "ResourceNotFoundException",
-            "case {case:?}: a refused put stores nothing"
-        );
+        assert_reports_no_policy(&logs, &format!("{case}: a refused put stores nothing"), "malformed")
+            .await;
         assert_eq!(
             data_protection_status(&logs, "malformed").await,
             None,
@@ -545,7 +550,8 @@ async fn a_malformed_document_is_refused() {
 }
 
 /// Every one of the three operations answers `ResourceNotFoundException` for a log group
-/// that does not exist, and the two readers for a group that holds no policy.
+/// that does not exist, and the delete for a group that holds no policy; the READ of a group
+/// that holds none reports that instead.
 #[tokio::test]
 async fn a_missing_group_or_policy_is_not_found() {
     let logs = Logs::new();
@@ -580,11 +586,6 @@ async fn a_missing_group_or_policy_is_not_found() {
             json!({"logGroupIdentifier": "never-created"}),
         ),
         (
-            "get/no-policy",
-            "GetDataProtectionPolicy",
-            json!({"logGroupIdentifier": "no-policy"}),
-        ),
-        (
             "delete/never-created",
             "DeleteDataProtectionPolicy",
             json!({"logGroupIdentifier": "never-created"}),
@@ -603,4 +604,8 @@ async fn a_missing_group_or_policy_is_not_found() {
             "case {case:?}: a missing resource is refused ResourceNotFoundException, got {code}"
         );
     }
+
+    // The boundary: the GROUP is there and the policy is not, which the read reports rather
+    // than refuses.
+    assert_reports_no_policy(&logs, "get/no-policy", "no-policy").await;
 }

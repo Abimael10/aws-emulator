@@ -354,6 +354,24 @@ pub const INVALID_JSON_POLICY_DOCUMENT_MESSAGE: &str = "Invalid json policy docu
 /// its members) is refused with that rule's own sentence instead.
 pub const MALFORMED_POLICY_DOCUMENT_MESSAGE: &str = "Policy document contains invalid JSON format.";
 
+/// The refusal CloudWatch Logs answers a field index `policyDocument` it CAN read that names
+/// no field index at all: "It must contain at least one field index"
+/// (`PutIndexPolicy$policyDocument`). Like [`MALFORMED_POLICY_DOCUMENT_MESSAGE`] the sentence
+/// is fixed for the class — it states the rule and interpolates nothing of the document — and
+/// it is the same rule however the document names its fields (`Fields`, `FieldsV2`), so one
+/// sentence answers every form of naming none.
+pub const EMPTY_INDEX_POLICY_DOCUMENT_MESSAGE: &str = "Policy document should contain at least 1 field.";
+
+/// The refusal the FIELD INDEX POLICY operations answer when the `logGroupIdentifier` they
+/// resolve names a log group the account does not hold.
+///
+/// This surface words a missing log group its own way: it states the kind of resource that
+/// could not be found and nothing else — neither the identifier the request carried nor the
+/// account that would own the group — unlike the service-wide sentence
+/// ([`super::resource_not_found_message`]) and unlike the data protection READ, which names
+/// the group and its owner because such a policy is readable across accounts.
+pub const INDEX_POLICY_LOG_GROUP_NOT_FOUND_MESSAGE: &str = "Log group cannot be found.";
+
 /// How many account-level policies of one type the account may hold when the policy being
 /// put is "scoped to a subset of log groups with the selectionCriteria parameter": for a
 /// transformer policy, "you can create as many as 20 account-level transformer policies",

@@ -4,14 +4,26 @@
 //! before any association with it is recorded.
 //!
 //! The rule under test: **a `kmsKeyId` names a KMS key only as that KEY's own ARN, and the key
-//! it names is usable only when KMS itself reports a key in its enabled state — an identifier
-//! KMS can find no key for is refused with `InvalidParameterException` and `The specified KMS
-//! Key Id could not be found.`, a key KMS reports as not enabled with the same code and `The
-//! specified KMS key is marked as disabled.`, and nothing is recorded either way.**
-//! `AssociateKmsKey` states the class: "If you attempt to associate a KMS key with a log group
-//! but the KMS key does not exist or the KMS key is disabled, you receive an
-//! InvalidParameterException error", and the member is documented as "The Amazon Resource Name
-//! (ARN) of the KMS key to use when encrypting log data".
+//! it names is usable only when KMS itself reports a key in its enabled state — and nothing is
+//! recorded when it does not.** How the refusal is worded follows WHICH of those failed:
+//!
+//! * an identifier that is not a key's own ARN names no key the member takes, which is the
+//!   identifier being wrong: `InvalidParameterException` and `The specified KMS Key Id could
+//!   not be found.`;
+//! * a key KMS reports in a state it cannot encrypt in is the VALUE being wrong, under the
+//!   class `AssociateKmsKey` states for it — "If you attempt to associate a KMS key with a log
+//!   group but the KMS key does not exist or the KMS key is disabled, you receive an
+//!   InvalidParameterException error" — with `The specified KMS key is marked as disabled.`;
+//! * a well-formed key ARN KMS holds NO key under is a key the service cannot use for the
+//!   resource the request names, which the ASSOCIATION reports as an authorization refusal
+//!   naming that resource (`AccessDeniedException`, `The specified KMS key does not exist or is
+//!   not allowed to be used with Arn '<resource>'`) — the same answer as a key whose own policy
+//!   does not cover the resource (`tests/all/cmk_key_policy_scope.rs`), because from the
+//!   caller's side the two are one condition. `CreateLogGroup` keeps the class its own
+//!   documentation states for a key that does not exist.
+//!
+//! The member is documented as "The Amazon Resource Name (ARN) of the KMS key to use when
+//! encrypting log data".
 //!
 //! CloudWatch Logs and KMS are mounted on ONE shared engine — the same assembly `core/router`
 //! performs — so every key a row names is a key KMS itself holds, in the state KMS itself
@@ -34,8 +46,13 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The Region every request here is signed for, which is the Region the ARNs carry.
 const REGION: &str = "eu-west-2";
 
-/// The error code every refusal of this rule carries, as `AssociateKmsKey` documents it.
+/// The error code a refusal about the identifier or the key's state carries, as
+/// `AssociateKmsKey` documents it.
 const INVALID_PARAMETER: &str = "InvalidParameterException";
+
+/// The error code the association answers when the key cannot be used for the resource the
+/// request names, which is what KMS holding no key under a well-formed key ARN amounts to.
+const ACCESS_DENIED: &str = "AccessDeniedException";
 
 /// CloudWatch Logs and KMS on one shared engine, reached over the wire.
 struct Emulator {
@@ -211,26 +228,68 @@ fn log_group_arn(name: &str) -> String {
     )
 }
 
+/// The message a refusal body carries, read under the member name the error class names it
+/// by: a modelled error of this service names it `message`, and the AWS COMMON
+/// `AccessDeniedException` — which this service's model declares no shape for — names it
+/// `Message`.
+fn refusal_message<'a>(body: &'a Value, code: &str) -> Option<&'a str> {
+    let member = if code == ACCESS_DENIED {
+        "Message"
+    } else {
+        "message"
+    };
+    body.get(member).and_then(Value::as_str)
+}
+
 /// What the service must answer for one `kmsKeyId`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Expected {
     /// The key is resolved and the association is recorded.
     Accepted,
-    /// Refused: KMS can find no key under the identifier — which includes every identifier
-    /// form that is not a key's own ARN.
-    NotFound,
+    /// Refused: the identifier is not a key's own ARN, so it names no key this member takes.
+    NotAKeyReference,
+    /// Refused: the identifier IS a key's ARN and KMS holds no key under it.
+    NoSuchKey,
     /// Refused: KMS reports the key, in a state it cannot be used in.
     Disabled,
 }
 
+/// The whole message a refusal that the key cannot be used for `resource_arn` carries: the
+/// fixed text, and the ARN of the resource the key was asked to encrypt.
+fn key_not_usable(resource_arn: &str) -> String {
+    format!(
+        "The specified KMS key does not exist or is not allowed to be used with Arn \
+         '{resource_arn}'"
+    )
+}
+
+/// The whole message an identifier that names no key the member takes is refused with. Fixed
+/// text for its class, naming nothing of the request.
+const KEY_NOT_FOUND: &str = "The specified KMS Key Id could not be found.";
+
+/// The whole message a key KMS reports in an unusable state is refused with. Fixed text too.
+const KEY_DISABLED: &str = "The specified KMS key is marked as disabled.";
+
 impl Expected {
-    /// The message this outcome's refusal carries. Both are fixed text for their class, naming
-    /// nothing of the request.
-    fn message(self) -> Option<&'static str> {
+    /// The code and message `CreateLogGroup` refuses this outcome with, or `None` when it
+    /// creates the group: the create states ONE class for a key that is not there and a key
+    /// that cannot be used, which is what its own documentation says.
+    fn create_refusal(self) -> Option<(&'static str, String)> {
         match self {
             Self::Accepted => None,
-            Self::NotFound => Some("The specified KMS Key Id could not be found."),
-            Self::Disabled => Some("The specified KMS key is marked as disabled."),
+            Self::NotAKeyReference | Self::NoSuchKey => {
+                Some((INVALID_PARAMETER, KEY_NOT_FOUND.to_string()))
+            }
+            Self::Disabled => Some((INVALID_PARAMETER, KEY_DISABLED.to_string())),
+        }
+    }
+
+    /// The code and message `AssociateKmsKey` refuses this outcome with for the resource
+    /// `resource_arn` names, or `None` when it records the association.
+    fn associate_refusal(self, resource_arn: &str) -> Option<(&'static str, String)> {
+        match self {
+            Self::NoSuchKey => Some((ACCESS_DENIED, key_not_usable(resource_arn))),
+            other => other.create_refusal(),
         }
     }
 }
@@ -293,32 +352,32 @@ async fn rows(emulator: &Emulator) -> Vec<Row> {
         Row {
             case: "an alias ARN of that same key".to_string(),
             kms_key_id: alias_arn,
-            expected: Expected::NotFound,
+            expected: Expected::NotAKeyReference,
         },
         Row {
             case: "an alias NAME of that same key".to_string(),
             kms_key_id: ALIAS_NAME.to_string(),
-            expected: Expected::NotFound,
+            expected: Expected::NotAKeyReference,
         },
         Row {
             case: "the bare key id of that same key".to_string(),
             kms_key_id: bare_key_id,
-            expected: Expected::NotFound,
+            expected: Expected::NotAKeyReference,
         },
         Row {
             case: "a value that is no ARN at all".to_string(),
             kms_key_id: "not-an-arn".to_string(),
-            expected: Expected::NotFound,
+            expected: Expected::NotAKeyReference,
         },
         Row {
             case: "an ARN of another vendor".to_string(),
             kms_key_id: log_group_arn("some-group"),
-            expected: Expected::NotFound,
+            expected: Expected::NotAKeyReference,
         },
         Row {
             case: "a well-formed key ARN KMS holds no key for".to_string(),
             kms_key_id: absent,
-            expected: Expected::NotFound,
+            expected: Expected::NoSuchKey,
         },
         Row {
             case: "the ARN of a disabled key".to_string(),
@@ -348,7 +407,7 @@ async fn create_log_group_resolves_the_key_before_it_creates_anything() {
             )
             .await;
 
-        match row.expected.message() {
+        match row.expected.create_refusal() {
             None => {
                 assert_eq!(
                     status, 200,
@@ -361,19 +420,19 @@ async fn create_log_group_resolves_the_key_before_it_creates_anything() {
                     "case {case:?}: the group reports the key it was created with"
                 );
             }
-            Some(expected) => {
+            Some((expected_code, expected)) => {
                 assert_eq!(
                     status, 400,
                     "case {case:?}: expected the create to be refused, got {status} {parsed}"
                 );
                 assert_eq!(
                     crate::harness::error_code(&parsed),
-                    INVALID_PARAMETER,
-                    "case {case:?}: expected {INVALID_PARAMETER}, got {parsed}"
+                    expected_code,
+                    "case {case:?}: expected {expected_code}, got {parsed}"
                 );
                 assert_eq!(
-                    parsed.get("message").and_then(Value::as_str),
-                    Some(expected),
+                    refusal_message(&parsed, expected_code),
+                    Some(expected.as_str()),
                     "case {case:?}: expected {expected:?}, got {parsed}"
                 );
                 assert!(
@@ -404,7 +463,7 @@ async fn associate_kms_key_resolves_the_key_before_it_records_anything() {
             )
             .await;
 
-        match row.expected.message() {
+        match row.expected.associate_refusal(&log_group_arn(&group)) {
             None => {
                 assert_eq!(
                     status, 200,
@@ -417,19 +476,19 @@ async fn associate_kms_key_resolves_the_key_before_it_records_anything() {
                     "case {case:?}: the group reports the associated key"
                 );
             }
-            Some(expected) => {
+            Some((expected_code, expected)) => {
                 assert_eq!(
                     status, 400,
                     "case {case:?}: expected the association to be refused, got {status} {parsed}"
                 );
                 assert_eq!(
                     crate::harness::error_code(&parsed),
-                    INVALID_PARAMETER,
-                    "case {case:?}: expected {INVALID_PARAMETER}, got {parsed}"
+                    expected_code,
+                    "case {case:?}: expected {expected_code}, got {parsed}"
                 );
                 assert_eq!(
-                    parsed.get("message").and_then(Value::as_str),
-                    Some(expected),
+                    refusal_message(&parsed, expected_code),
+                    Some(expected.as_str()),
                     "case {case:?}: expected {expected:?}, got {parsed}"
                 );
                 assert_eq!(

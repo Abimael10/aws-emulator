@@ -224,14 +224,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         };
 
-        // "The Amazon Resource Name (ARN) of the KMS key to use when encrypting log
-        // data": an identifier that names no key KMS can find, and a key KMS reports in a
-        // state it cannot be used in, are each refused before anything is recorded
-        // ([`crate::state::kms_key_reference`]). Asked of KMS with no lock held.
-        if let Some(message) =
-            crate::state::kms_key_reference::refusal_for(ctx, &region, &input.kms_key_id).await
-        {
-            return Err(invalid(message));
+        // "The Amazon Resource Name (ARN) of the KMS key to use when encrypting log data":
+        // a value that is not a key's ARN names no key this member takes, which is the
+        // identifier itself being wrong — judged first, because it needs neither the store
+        // nor KMS ([`crate::state::kms_key_reference::is_key_arn`]).
+        if !crate::state::kms_key_reference::is_key_arn(&input.kms_key_id) {
+            return Err(invalid(
+                crate::state::kms_key_reference::KEY_NOT_FOUND_MESSAGE.to_string(),
+            ));
         }
 
         // "you specify either the logGroupName parameter or the resourceIdentifier
@@ -270,6 +270,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::query_results_arn(&region)
             }
         };
+
+        // What KMS answers about the key the request names, asked with no lock held. A key KMS
+        // holds none of is one this service cannot encrypt the named resource with, which is
+        // how it reports a key whose own policy does not cover that resource too: from the
+        // caller's side the two are one condition — the key cannot be used here — so one
+        // sentence states both possibilities, around the ARN of the resource the key was asked
+        // to encrypt ([`crate::state::kms_key_grant::key_not_usable_message`]). A key KMS DOES
+        // report, in a state it cannot encrypt in, is the VALUE of `kmsKeyId` being wrong
+        // instead: "if you attempt to associate a KMS key with a log group but [...] the KMS
+        // key is disabled, you receive an InvalidParameterException error".
+        match crate::state::kms_key_reference::usability(ctx, &region, &input.kms_key_id).await {
+            crate::state::kms_key_reference::KeyUsability::NoSuchKey => {
+                return Err(AssociateKmsKeyError::access_denied(
+                    crate::state::kms_key_grant::key_not_usable_message(&encrypted_resource_arn),
+                ));
+            }
+            crate::state::kms_key_reference::KeyUsability::Disabled => {
+                return Err(invalid(
+                    crate::state::kms_key_reference::KEY_DISABLED_MESSAGE.to_string(),
+                ));
+            }
+            crate::state::kms_key_reference::KeyUsability::NotAKeyReference
+            | crate::state::kms_key_reference::KeyUsability::NotRefused => {}
+        }
 
         // "After a KMS key is associated with a log group, all newly ingested data for the
         // log group is encrypted using the KMS key": whether this key MAY encrypt that data

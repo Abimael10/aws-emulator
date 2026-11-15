@@ -326,7 +326,9 @@ async fn create_log_group_is_accepted_only_when_the_key_policy_covers_the_group(
             log_group_arn(OTHER_GROUP)
         );
         assert_eq!(
-            parsed.get("message").and_then(Value::as_str),
+            // The AWS COMMON `AccessDeniedException`, which this service's model declares no
+            // shape for, names its one member `Message`.
+            parsed.get("Message").and_then(Value::as_str),
             Some(expected.as_str()),
             "case {:?}: expected {expected:?}, got {parsed}",
             row.case

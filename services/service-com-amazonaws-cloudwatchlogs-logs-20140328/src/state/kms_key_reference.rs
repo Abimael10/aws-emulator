@@ -71,32 +71,57 @@ pub const KEY_NOT_FOUND_MESSAGE: &str = "The specified KMS Key Id could not be f
 /// value is true, otherwise it is false" (`KeyMetadata$Enabled`).
 pub const KEY_DISABLED_MESSAGE: &str = "The specified KMS key is marked as disabled.";
 
-/// `Some(message)` when the `kmsKeyId` a request names is not a key this service could encrypt
-/// with — it names no key KMS can find ([`KEY_NOT_FOUND_MESSAGE`]), or KMS reports the key in a
-/// state it cannot be used in ([`KEY_DISABLED_MESSAGE`]) — and `None` when it is usable, or when
-/// KMS did not report on it at all, which establishes nothing (see the module docs).
-pub async fn refusal_for(
+/// What KMS answers about the key a `kmsKeyId` names, as the two conditions
+/// `AssociateKmsKey` states are told apart from each other and from the FORM of the
+/// identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyUsability {
+    /// The value is not a key's ARN, so it names no key this member takes: nothing was asked
+    /// of KMS, because there is nothing to ask about.
+    NotAKeyReference,
+    /// KMS reports no key under the ARN: it holds none, or it cannot read the ARN as a key's.
+    NoSuchKey,
+    /// KMS reports the key in a state it cannot encrypt in.
+    Disabled,
+    /// KMS reports the key as usable — or did not report on it at all, which establishes
+    /// nothing (see the module docs).
+    NotRefused,
+}
+
+/// What KMS answers about the key `kms_key_id` names.
+///
+/// The caller decides how each answer is refused, because the operations differ: a key
+/// CloudWatch Logs cannot use for the resource it was asked to encrypt is an authorization
+/// refusal naming that resource on the association path, while the identifier's own form is a
+/// bad parameter wherever it is named.
+pub async fn usability(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     kms_key_id: &str,
-) -> Option<String> {
+) -> KeyUsability {
     // Only the key's own ARN names a key here, so no other identifier form is even taken to
     // KMS: it names no key this member accepts.
     if !is_key_arn(kms_key_id) {
-        return Some(KEY_NOT_FOUND_MESSAGE.to_string());
+        return KeyUsability::NotAKeyReference;
     }
     let narrowed = ::service_common::arn::region_label(region).unwrap_or(super::DEFAULT_REGION);
     let client = callback_client!(aws_sdk_kms, ctx.callback(), "kms", narrowed);
     match client.describe_key().key_id(kms_key_id).send().await {
         Ok(answer) => {
             // An answer carrying no metadata states nothing about the key.
-            let metadata = answer.key_metadata()?;
-            (!is_enabled(metadata)).then(|| KEY_DISABLED_MESSAGE.to_string())
+            let Some(metadata) = answer.key_metadata() else {
+                return KeyUsability::NotRefused;
+            };
+            if is_enabled(metadata) {
+                KeyUsability::NotRefused
+            } else {
+                KeyUsability::Disabled
+            }
         }
         Err(error) => {
             let code = ::aws_smithy_types::error::metadata::ProvideErrorMetadata::code(&error);
             if code.is_some_and(|code| NO_SUCH_KEY_CODES.contains(&code)) {
-                return Some(KEY_NOT_FOUND_MESSAGE.to_string());
+                return KeyUsability::NoSuchKey;
             }
             // Not KMS reporting on the key, so nothing is established about it and nothing is
             // refused. Worth a debug line, because a deployment with no KMS to ask is one
@@ -107,8 +132,30 @@ pub async fn refusal_for(
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                 "KMS did not report on the key this request names, so the key is not judged"
             );
-            None
+            KeyUsability::NotRefused
         }
+    }
+}
+
+/// `Some(message)` when the `kmsKeyId` a request names is not a key this service could encrypt
+/// with — it names no key KMS can find ([`KEY_NOT_FOUND_MESSAGE`]), or KMS reports the key in a
+/// state it cannot be used in ([`KEY_DISABLED_MESSAGE`]) — and `None` when it is usable, or when
+/// KMS did not report on it at all, which establishes nothing (see the module docs).
+///
+/// This is the answer for an operation that states ONE error class for both conditions: "If you
+/// attempt to associate a KMS key with the log group but the KMS key does not exist or the KMS
+/// key is disabled, you receive an InvalidParameterException error" (`CreateLogGroup`).
+pub async fn refusal_for(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    kms_key_id: &str,
+) -> Option<String> {
+    match usability(ctx, region, kms_key_id).await {
+        KeyUsability::NotAKeyReference | KeyUsability::NoSuchKey => {
+            Some(KEY_NOT_FOUND_MESSAGE.to_string())
+        }
+        KeyUsability::Disabled => Some(KEY_DISABLED_MESSAGE.to_string()),
+        KeyUsability::NotRefused => None,
     }
 }
 

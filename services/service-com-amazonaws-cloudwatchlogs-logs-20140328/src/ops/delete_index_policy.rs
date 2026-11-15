@@ -159,10 +159,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolves to the name the store is keyed by.
         let log_group_name =
             crate::state::log_group_name_from_identifier(&input.log_group_identifier).to_string();
+        // A log group the account does not hold is refused the way this surface words a
+        // missing group ([`crate::state::INDEX_POLICY_LOG_GROUP_NOT_FOUND_MESSAGE`]).
         let group = store
             .log_groups
             .get_mut(&log_group_name)
-            .ok_or_else(|| not_found(&crate::state::resource_not_found_message("log group")))?;
+            .ok_or_else(|| not_found(crate::state::INDEX_POLICY_LOG_GROUP_NOT_FOUND_MESSAGE))?;
 
         // "Deletes a log-group level field index policy that was applied to a single log
         // group": the policy is the resource this operation deletes, so a group holding none

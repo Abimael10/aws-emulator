@@ -223,6 +223,8 @@ mod metric_transformation_exclusion_wording;
 mod missing_destination_refusal;
 #[path = "all/parameter_pair_refusals.rs"]
 mod parameter_pair_refusals;
+#[path = "all/policy_surface_refusals.rs"]
+mod policy_surface_refusals;
 #[path = "all/put_log_events_batch_constraints.rs"]
 mod put_log_events_batch_constraints;
 #[path = "all/probe_scratch.rs"]
