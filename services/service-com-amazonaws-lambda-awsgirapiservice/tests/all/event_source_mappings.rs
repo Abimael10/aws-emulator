@@ -920,7 +920,7 @@ pub(crate) fn unsupported_source_refusal(event_source: &str) -> String {
 /// Assert `answered` carries every member `expected` states, where a `Null` expectation
 /// means the member must be ABSENT (the default its own documentation gives the member
 /// for this event source is "no value at all").
-fn assert_members(case: &str, label: &str, answered: &Value, expected: &Value) {
+pub(crate) fn assert_members(case: &str, label: &str, answered: &Value, expected: &Value) {
     for (member, want) in expected.as_object().expect("expectations are an object") {
         let got = answered.get(member).cloned().unwrap_or(Value::Null);
         assert_eq!(
@@ -928,6 +928,28 @@ fn assert_members(case: &str, label: &str, answered: &Value, expected: &Value) {
             "case {case:?}: {label} must report {member} as {want}, got {got} in {answered}"
         );
     }
+}
+
+/// Assert no member of `answered` is reported as a null: a mapping has no value for a member
+/// its event source's documentation scopes to other sources, and AWS omits such a member
+/// rather than reporting it as null, which is what a strict deserializer breaks on.
+///
+/// The companion of [`assert_members`], which states what a member MUST report, in the module
+/// that owns every assertion over a reported mapping.
+pub(crate) fn assert_no_null_member(case: &str, label: &str, answered: &Value) {
+    let document = answered.as_object().unwrap_or_else(|| {
+        panic!("case {case:?}: {label} must answer a JSON object, got {answered}")
+    });
+    let nulls: Vec<&String> = document
+        .iter()
+        .filter(|(_, value)| value.is_null())
+        .map(|(member, _)| member)
+        .collect();
+    assert!(
+        nulls.is_empty(),
+        "case {case:?}: {label} must omit a member it has no value for, got null for \
+         {nulls:?} in {answered}"
+    );
 }
 
 /// Whether `uuid` is a hyphenated, 36-character UUID, as `UUIDString` and the

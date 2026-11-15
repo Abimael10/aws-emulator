@@ -2016,3 +2016,6 @@ mod ses_configuration_set_cursor_shared_across_v1_and_v2;
 // module header; `all/appended_notes.rs` records why notes do not live here, and the
 // `all_rs_*`, `all/every_suite_file_is_declared.rs` and
 // `all/declaration_roots_are_canonical_and_complete.rs` suites pin this shape.
+// suite, sorted by name, and no other line — not a note, not a blank one — so two branches
+// landing at once insert two lines in two places and have no prose to duplicate, re-word or
+// file at all, no landing can put one past the first item.

@@ -169,6 +169,8 @@ mod event_source_mapping_queue_visibility;
 mod event_source_mapping_role_access;
 #[path = "all/event_source_mapping_scaling_concurrency.rs"]
 mod event_source_mapping_scaling_concurrency;
+#[path = "all/event_source_mapping_setting_round_trip.rs"]
+mod event_source_mapping_setting_round_trip;
 #[path = "all/event_source_mapping_shard_refusal_wording.rs"]
 mod event_source_mapping_shard_refusal_wording;
 #[path = "all/event_source_mapping_source_selection.rs"]
