@@ -2584,3 +2584,16 @@ mod cloudformation_stackset_failed_instance_events;
 //! in one service crate's own, belongs in that suite's own module doc, where it is read
 //! check these rules, for this file and for every service crate's `tests/all.rs`, so a note
 //! about any of them belongs there.
+// Single integration-test target for the router: the DECLARATION LIST of every
+// cross-service suite, and nothing else.
+// name. One pair per suite and no other line, so two branches landing at once insert two
+// producing — is `E0753` and compiles no suite of this target at all.
+// A suite that no `mod` here names is compiled nowhere and its tests never run (this
+// crate's build script refuses it); a suite left at the top level of `tests/` fails the
+// build; and a suite declared twice is `E0428`. `tests/all.rs` is a test-target CRATE
+// ROOT, so a bare `mod` would resolve to a SIBLING of this file, which the layout check
+// refuses: the `#[path]` is what points each declaration into `tests/all/`.
+// Three suites check those rules rather than restating them here:
+// the test it explains and cannot collide with a concurrent landing.
+#[path = "all/autoscaling_plans_delete_withdraws_its_registration.rs"]
+mod autoscaling_plans_delete_withdraws_its_registration;

@@ -16,6 +16,17 @@
 //! configuration under the name the plan derives for it
 //! ([`crate::state::derived_policy_name`]).
 //!
+//! Withdrawing a plan is the same statement read backwards: the registration and the
+//! policies a resource carries are the plan's, so a resource the plan stops covering has
+//! both taken away there — the policies deleted and the scalable target deregistered —
+//! and that service then reports the resource as one nothing scales. A plan is treated as
+//! the OWNER of the registration of every resource it covers, which is what deleting a
+//! plan is documented to do ("Deleting a scaling plan deletes the underlying
+//! ScalingInstruction for all of the scalable resources that are covered by the plan"):
+//! the withdrawal does not ask how the registration came to be there, so a resource a
+//! caller had registered itself and then brought under a plan loses that registration
+//! with the plan.
+//!
 //! The writes are made by CALLING Application Auto Scaling, in process over the callback
 //! transport (`::smithy_server_runtime::EmbeddedEmulator`), signed the way every
 //! in-process caller signs (`::service_common::in_process_sigv4`) — so the policies are
@@ -90,8 +101,8 @@ type InstalledPolicy = (ResourceTriple, String);
 /// so it outlives the instruction it was read from.
 type ResourceTriple = (String, String, String);
 
-/// Make Application Auto Scaling hold exactly the policies `current` asks for, for the
-/// plan named `plan_name`, having held the ones `previous` asked for.
+/// Make Application Auto Scaling hold exactly the registrations and policies `current`
+/// asks for, for the plan named `plan_name`, having held the ones `previous` asked for.
 ///
 /// This is the one entry every write path of this service uses: a create has nothing
 /// `previous`, an update has the instruction set it replaces, and a delete has nothing
@@ -100,6 +111,13 @@ type ResourceTriple = (String, String, String);
 /// configuration; a policy `previous` installed that `current` no longer asks for is
 /// deleted, which is what makes a dropped configuration, a re-pointed metric and a dropped
 /// resource stop reporting a policy that nothing is tracking any more.
+///
+/// The REGISTRATION is withdrawn the same way: a resource `previous` registered a scalable
+/// target for that `current` no longer covers is DEREGISTERED, after its policies are
+/// deleted — the plan is what registered it, so when the plan stops covering the resource
+/// (an instruction dropped by an update, every instruction by a delete) nothing is left
+/// managing its capacity, and Application Auto Scaling reports neither a target nor a
+/// policy for it.
 ///
 /// Answers nothing: a plan is created, updated and deleted on its own terms, and what
 /// another service says about the resources it names is not this operation's answer to
@@ -119,6 +137,16 @@ pub async fn install(
     for policy in installed_policies(plan_name, previous) {
         if !wanted.contains(&policy) {
             delete_scaling_policy(callback, region, &policy).await;
+        }
+    }
+    // The registrations are diffed the same way, and withdrawn AFTER the policies of the
+    // resources they are on: a target the plan no longer covers takes its whole
+    // registration with it, so the resource stops being one Application Auto Scaling
+    // manages rather than keeping the dead plan's capacity window.
+    let kept: BTreeSet<ResourceTriple> = registered_targets(current);
+    for target in registered_targets(previous) {
+        if !kept.contains(&target) {
+            deregister_scalable_target(callback, region, &target).await;
         }
     }
     for instruction in current.iter().filter(|instruction| owned(instruction)) {
@@ -173,6 +201,26 @@ fn installed_policies(
                     )
                 })
                 .collect::<Vec<InstalledPolicy>>()
+        })
+        .collect()
+}
+
+/// Every scalable target a plan registers for `instructions`, as the resource it is on.
+///
+/// One per resource an instruction of an owned namespace covers, whether or not that
+/// instruction configures dynamic scaling — which is exactly what [`install`] registers,
+/// so the diff withdraws precisely what a previous instruction set put there.
+fn registered_targets(instructions: &[ScalingInstruction]) -> BTreeSet<ResourceTriple> {
+    instructions
+        .iter()
+        .filter(|instruction| owned(instruction))
+        .map(|instruction| {
+            let (namespace, resource_id, dimension) = resource_identity(instruction);
+            (
+                namespace.to_string(),
+                resource_id.to_string(),
+                dimension.to_string(),
+            )
         })
         .collect()
 }
@@ -268,6 +316,25 @@ fn tracking_configuration(configuration: &TargetTrackingConfiguration) -> Value 
         document["DisableScaleIn"] = json!(disabled);
     }
     document
+}
+
+/// Deregister the scalable target a plan registered for one resource.
+///
+/// Addressed by the identity it was registered under — the only members this operation
+/// takes — so the resource stops carrying a registration, and with it the scaling policies
+/// that hang off one.
+async fn deregister_scalable_target(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    target: &ResourceTriple,
+) {
+    let (namespace, resource_id, dimension) = target;
+    let request = json!({
+        "ServiceNamespace": namespace,
+        "ResourceId": resource_id,
+        "ScalableDimension": dimension,
+    });
+    call(callback, region, "DeregisterScalableTarget", &request).await;
 }
 
 /// Delete one policy a plan installed, on the resource it is on.
@@ -374,6 +441,116 @@ mod tests {
             "case EstimatedInstanceWarmup: the member is not one Application Auto Scaling \
              words, got {document:?}"
         );
+    }
+
+    /// One instruction over a resource of `namespace`, with dynamic scaling as `dynamic`
+    /// says.
+    fn instruction(namespace: &str, resource_id: &str, dynamic: bool) -> ScalingInstruction {
+        ScalingInstruction {
+            service_namespace: namespace.to_string(),
+            resource_id: resource_id.to_string(),
+            scalable_dimension: format!("{namespace}:resource:Capacity"),
+            min_capacity: 1,
+            max_capacity: 4,
+            target_tracking_configurations: vec![configuration()],
+            disable_dynamic_scaling: Some(!dynamic),
+            ..ScalingInstruction::default()
+        }
+    }
+
+    /// RULE: a plan registers a scalable target for every resource an instruction of a
+    /// namespace Application Auto Scaling owns covers, whatever else that instruction
+    /// states — so the set a previous instruction set is diffed against covers exactly
+    /// those resources.
+    #[test]
+    fn the_registered_targets_are_the_resources_of_the_owned_namespaces() {
+        // (case, instruction set, the resources a target is registered for)
+        let rows: &[(&str, Vec<ScalingInstruction>, &[&str])] = &[
+            ("nothing covered", vec![], &[]),
+            (
+                "one dynamically scaled resource",
+                vec![instruction("dynamodb", "table/one", true)],
+                &["table/one"],
+            ),
+            (
+                "an instruction that configures no dynamic scaling still registers",
+                vec![instruction("ecs", "service/cluster/one", false)],
+                &["service/cluster/one"],
+            ),
+            (
+                "two resources of two owned namespaces",
+                vec![
+                    instruction("rds", "cluster:one", true),
+                    instruction("ec2", "spot-fleet-request/sfr-one", true),
+                ],
+                &["cluster:one", "spot-fleet-request/sfr-one"],
+            ),
+            (
+                "a namespace whose policies this service does not own",
+                vec![instruction("autoscaling", "group/one", true)],
+                &[],
+            ),
+        ];
+        for (case, instructions, expected) in rows {
+            let registered = registered_targets(instructions);
+            let mut resources: Vec<&str> = registered
+                .iter()
+                .map(|(_, resource_id, _)| resource_id.as_str())
+                .collect();
+            resources.sort_unstable();
+            let mut wanted: Vec<&str> = expected.to_vec();
+            wanted.sort_unstable();
+            assert_eq!(
+                resources, wanted,
+                "case {case:?}: expected targets for {wanted:?}, got {registered:?}"
+            );
+        }
+    }
+
+    /// RULE: a resource the previous instruction set registered that the current one no
+    /// longer covers is the one whose registration is withdrawn — every one of them when
+    /// the current set is empty, as a delete makes it.
+    #[test]
+    fn a_resource_the_current_set_drops_is_the_one_withdrawn() {
+        let previous = vec![
+            instruction("dynamodb", "table/kept", true),
+            instruction("dynamodb", "table/dropped", true),
+        ];
+        // (case, the set now in force, the resources whose registration is withdrawn)
+        let rows: &[(&str, Vec<ScalingInstruction>, &[&str])] = &[
+            (
+                "every resource, as a delete leaves nothing in force",
+                vec![],
+                &["table/dropped", "table/kept"],
+            ),
+            (
+                "only the resource the update dropped",
+                vec![instruction("dynamodb", "table/kept", true)],
+                &["table/dropped"],
+            ),
+            (
+                "nothing, when the set in force still covers both",
+                previous.clone(),
+                &[],
+            ),
+        ];
+        for (case, current, expected) in rows {
+            let kept = registered_targets(current);
+            let left = registered_targets(&previous);
+            let mut withdrawn: Vec<&str> = left
+                .iter()
+                .filter(|target| !kept.contains(*target))
+                .map(|(_, resource_id, _)| resource_id.as_str())
+                .collect();
+            withdrawn.sort_unstable();
+            let mut wanted: Vec<&str> = expected.to_vec();
+            wanted.sort_unstable();
+            assert_eq!(
+                withdrawn, wanted,
+                "case {case:?}: expected the registrations of {wanted:?} to be withdrawn, \
+                 got {withdrawn:?}"
+            );
+        }
     }
 
     /// RULE: a member the configuration does not carry is not sent as a value of its own.

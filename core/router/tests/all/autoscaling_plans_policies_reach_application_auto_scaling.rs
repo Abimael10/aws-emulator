@@ -50,8 +50,8 @@ const REGION: &str = "us-east-1";
 
 /// The `X-Amz-Target` prefixes of the three services this suite drives, and the signing
 /// name each is addressed by.
-const PLANS_TARGET_PREFIX: &str = "AnyScaleScalingPlannerFrontendService";
-const PLANS_SIGNING_NAME: &str = "autoscaling-plans";
+pub(crate) const PLANS_TARGET_PREFIX: &str = "AnyScaleScalingPlannerFrontendService";
+pub(crate) const PLANS_SIGNING_NAME: &str = "autoscaling-plans";
 const APP_SCALING_TARGET_PREFIX: &str = "AnyScaleFrontendService";
 const APP_SCALING_SIGNING_NAME: &str = "application-autoscaling";
 const DYNAMODB_TARGET_PREFIX: &str = "DynamoDB_20120810";
@@ -67,26 +67,27 @@ const TARGET_TRACKING_SCALING: &str = "TargetTrackingScaling";
 
 /// The narratives a plan reports once its create, and once an update of it, has been
 /// applied.
-const CREATED_MESSAGE: &str = "Scaling plan has been created and applied to all resources.";
-const UPDATED_MESSAGE: &str = "Scaling plan has been updated successfully.";
+pub(crate) const CREATED_MESSAGE: &str =
+    "Scaling plan has been created and applied to all resources.";
+pub(crate) const UPDATED_MESSAGE: &str = "Scaling plan has been updated successfully.";
 
 /// The capacity window every instruction here states, and the wider one its update moves
 /// to — a change the plan APPLIES to the resource, which is what makes the update
 /// observable both on the plan's narrative and on the scalable target.
-const MIN_CAPACITY: i64 = 1;
-const MAX_CAPACITY: i64 = 10;
+pub(crate) const MIN_CAPACITY: i64 = 1;
+pub(crate) const MAX_CAPACITY: i64 = 10;
 const UPDATED_MIN_CAPACITY: i64 = 2;
 const UPDATED_MAX_CAPACITY: i64 = 20;
 
 /// How long a lifecycle step is given to come due, polled rather than waited out: the
 /// deadline is generous only so a failure is a failure rather than a hang.
-const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+pub(crate) const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// How often a wait looks again.
-const LOOK_AGAIN: Duration = Duration::from_millis(50);
+pub(crate) const LOOK_AGAIN: Duration = Duration::from_millis(50);
 
 /// One `X-Amz-Target` RPC call, answering the status and the parsed body.
-async fn rpc(
+pub(crate) async fn rpc(
     router: &MultiServiceRouter,
     signing_name: &str,
     target_prefix: &str,
@@ -114,7 +115,12 @@ async fn rpc(
 }
 
 /// One AWS Auto Scaling (`autoscaling-plans`) call that must answer 200.
-async fn plans(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn plans(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let (status, parsed) = rpc(
         router,
         PLANS_SIGNING_NAME,
@@ -133,7 +139,7 @@ async fn plans(router: &MultiServiceRouter, case: &str, operation: &str, body: &
 }
 
 /// One Application Auto Scaling call that must answer 200.
-async fn application_auto_scaling(
+pub(crate) async fn application_auto_scaling(
     router: &MultiServiceRouter,
     case: &str,
     operation: &str,
@@ -177,7 +183,11 @@ async fn dynamodb(router: &MultiServiceRouter, case: &str, operation: &str, body
 
 /// A table whose throughput is PROVISIONED — the only mode with a provisioned value for a
 /// scalable target to scale — polled until it reports `ACTIVE`.
-async fn given_provisioned_table(router: &MultiServiceRouter, case: &str, name: &str) {
+pub(crate) async fn given_provisioned_table(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) {
     dynamodb(
         router,
         case,
@@ -205,7 +215,7 @@ async fn given_provisioned_table(router: &MultiServiceRouter, case: &str, name: 
 
 /// One scaling instruction over `table`'s `dimension`, tracking `metric` to `target`,
 /// with the capacity window `min`..`max`.
-fn instruction(
+pub(crate) fn instruction(
     table: &str,
     dimension: &str,
     metric: &str,
@@ -243,7 +253,12 @@ async fn described(router: &MultiServiceRouter, case: &str, name: &str) -> Value
 
 /// Poll the plan `name` until it reports `Active` with `message`, answering what it
 /// reported then.
-async fn applied(router: &MultiServiceRouter, case: &str, name: &str, message: &str) -> Value {
+pub(crate) async fn applied(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    message: &str,
+) -> Value {
     let started = Instant::now();
     let mut last = Value::Null;
     while started.elapsed() < SETTLE_DEADLINE {
@@ -281,7 +296,7 @@ async fn reported_policies(router: &MultiServiceRouter, case: &str, name: &str) 
 }
 
 /// The policies Application Auto Scaling itself holds for one scalable resource.
-async fn held_policies(
+pub(crate) async fn held_policies(
     router: &MultiServiceRouter,
     case: &str,
     table: &str,
