@@ -17,11 +17,15 @@
 //!    (`Cluster$LakehouseRegistrationStatus` and `$CatalogArn` are members of the
 //!    cluster itself).
 //! 2. Each dependency the request names is resolved against the state that holds
-//!    it, and each answers its OWN fault: a cluster this account does not hold is
+//!    it, and each answers its OWN fault, worded with the precondition THIS
+//!    operation enforces: a cluster this account does not hold is
 //!    `ClusterNotFound` (404) with this operation's own sentence, a cluster the
 //!    service is still working on is `InvalidClusterState` (400), and an IAM
-//!    Identity Center application this account did not register is
-//!    `RedshiftIdcApplicationNotExists` (404).
+//!    Identity Center application this account did not register — or one whose
+//!    onboarding has not finished, so it can propagate no identity yet — is
+//!    `RedshiftIdcApplicationNotExists` (404) with a sentence naming both of
+//!    those failure modes, which is not the sentence the operations that only
+//!    dereference an application answer.
 
 use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
 
@@ -368,6 +372,164 @@ async fn an_identity_center_application_this_account_did_not_register_is_refused
          body {}",
         disassociated.body
     );
+}
+
+#[tokio::test]
+async fn the_application_refusal_states_the_precondition_this_operation_enforces() {
+    let emulator = Emulator::new();
+    available_cluster(&emulator, "idc-wording-cluster").await;
+
+    let registered = emulator
+        .call(
+            "CreateRedshiftIdcApplication",
+            &[
+                (
+                    "IdcInstanceArn",
+                    "arn:aws:sso:::instance/ssoins-2222222222222222",
+                ),
+                ("RedshiftIdcApplicationName", "wording-app"),
+                ("IdcDisplayName", "Wording"),
+                (
+                    "IamRoleArn",
+                    "arn:aws:iam::000000000000:role/RedshiftIdcRole",
+                ),
+            ],
+        )
+        .await;
+    assert_eq!(
+        registered.status, 200,
+        "case seed the application: expected 200, got {} with body {}",
+        registered.status, registered.body
+    );
+    let application_arn = registered
+        .text("RedshiftIdcApplicationArn")
+        .expect("the create reports the Redshift application's ARN");
+    let managed_arn = registered
+        .text("IdcManagedApplicationArn")
+        .expect("the create reports the Identity Center application's ARN");
+
+    // The class: ARNs that name no associable application of this account,
+    // differing in which part of the ARN is wrong and in whether the value is an
+    // ARN at all.
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "another account",
+            application_arn.replace("000000000000", "111111111111"),
+        ),
+        ("another region", application_arn.replace(REGION, "eu-west-1")),
+        (
+            "another resource type",
+            application_arn.replace("redshiftidcapplication:", "qev2idcapplication:"),
+        ),
+        (
+            "an unknown id of this type",
+            format!("{application_arn}-nope"),
+        ),
+        (
+            "an Identity Center ARN naming no application",
+            format!("{managed_arn}-nope"),
+        ),
+        ("no ARN at all", "wording-app".to_string()),
+    ];
+
+    for (case, arn) in rows {
+        let refused = modify(
+            &emulator,
+            &[
+                ("ClusterIdentifier", "idc-wording-cluster"),
+                ("LakehouseIdcRegistration", "Associate"),
+                ("LakehouseIdcApplicationArn", arn.as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            (refused.status, refused.error_code().as_deref()),
+            (404, Some("RedshiftIdcApplicationNotExists")),
+            "case {case:?}: expected 404 RedshiftIdcApplicationNotExists, got {} / {:?} with \
+             body {}",
+            refused.status,
+            refused.error_code(),
+            refused.body
+        );
+        // This operation's own sentence: its precondition is not existence
+        // alone, so the refusal names BOTH failure modes — written out here so a
+        // wording change is caught …
+        assert_eq!(
+            refused.text("Message"),
+            Some(format!(
+                "The RedshiftIdcApplication with the ARN {arn} wasn't found, or the status \
+                 isn't {}.",
+                state::REDSHIFT_IDC_ONBOARD_STATUS
+            )),
+            "case {case:?}: expected the association's own sentence, got {:?}",
+            refused.text("Message")
+        );
+        // … and compared with the catalog entry the handler names, so the two
+        // cannot drift apart.
+        assert_eq!(
+            refused.text("Message"),
+            Some(state::redshift_idc_application_not_exists_message(
+                state::RedshiftIdcApplicationNotExistsWording::ArnWasNotFoundOrStatusNotCompleted,
+                &arn,
+            )),
+            "case {case:?}: expected the catalog's wording, got {:?}",
+            refused.text("Message")
+        );
+
+        // The operations that only DEREFERENCE an application word the same
+        // fault differently for the same ARN: the sentence is an attribute of
+        // the operation, not of the service.
+        let dereferenced = emulator
+            .call(
+                "DescribeRedshiftIdcApplications",
+                &[("RedshiftIdcApplicationArn", arn.as_str())],
+            )
+            .await;
+        assert_eq!(
+            dereferenced.text("Message"),
+            Some(state::redshift_idc_application_not_exists_message(
+                state::RedshiftIdcApplicationNotExistsWording::ArnWasNotFound,
+                &arn,
+            )),
+            "case {case:?}: expected the dereference wording from the read, got {:?}",
+            dereferenced.text("Message")
+        );
+        assert_ne!(
+            refused.text("Message"),
+            dereferenced.text("Message"),
+            "case {case:?}: expected the two paths to word the fault differently, got {:?} from \
+             both",
+            refused.text("Message")
+        );
+    }
+
+    // Either ARN of the SAME registered application resolves, and an
+    // application whose onboarding has finished is associable: the refusals
+    // above are the precondition, not an "everything is refused" artefact.
+    for (case, arn) in [
+        ("the Redshift application's own ARN", &application_arn),
+        ("the Identity Center application's ARN", &managed_arn),
+    ] {
+        let associated = modify(
+            &emulator,
+            &[
+                ("ClusterIdentifier", "idc-wording-cluster"),
+                ("LakehouseIdcRegistration", "Associate"),
+                ("LakehouseIdcApplicationArn", arn.as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            (
+                associated.status,
+                associated.text("LakehouseIdcApplicationArn")
+            ),
+            (200, Some(arn.clone())),
+            "case {case:?}: expected the association served, got {} with body {}",
+            associated.status,
+            associated.body
+        );
+    }
 }
 
 #[tokio::test]

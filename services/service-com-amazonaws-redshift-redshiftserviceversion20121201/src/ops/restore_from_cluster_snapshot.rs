@@ -638,7 +638,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
             return Err(
                 RestoreFromClusterSnapshotErrorModeled::RedshiftIdcApplicationNotExistsFault(
                     RedshiftIdcApplicationNotExistsFault {
-                        message: Some(st::redshift_idc_application_not_exists(application_arn)),
+                        // Existence is the whole of the precondition this path
+                        // enforces — see the per-operation catalog
+                        // [`st::RedshiftIdcApplicationNotExistsWording`].
+                        message: Some(st::redshift_idc_application_not_exists_message(
+                            st::RedshiftIdcApplicationNotExistsWording::ArnWasNotFound,
+                            application_arn,
+                        )),
                     },
                 )
                 .into(),

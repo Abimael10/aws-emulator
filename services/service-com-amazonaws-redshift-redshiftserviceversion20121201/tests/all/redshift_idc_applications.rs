@@ -647,7 +647,8 @@ async fn an_arn_naming_no_application_is_refused_by_every_operation_that_takes_o
             // precondition uses, so none of them can word it differently.
             assert_eq!(
                 answer.text("Message"),
-                Some(state::redshift_idc_application_not_exists(
+                Some(state::redshift_idc_application_not_exists_message(
+                    state::RedshiftIdcApplicationNotExistsWording::ArnWasNotFound,
                     &application_arn
                 )),
                 "case {operation} on {case}: expected every operation to word it alike, got {:?}",

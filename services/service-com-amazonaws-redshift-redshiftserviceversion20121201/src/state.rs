@@ -2097,15 +2097,56 @@ pub const REDSHIFT_IDC_APPLICATION_QUOTA: usize = 10_000;
 /// `CreateRedshiftIdcApplication` returns and the status it reports is terminal.
 pub const REDSHIFT_IDC_ONBOARD_STATUS: &str = "Completed";
 
-/// What every operation taking a `RedshiftIdcApplicationArn` answers when the
-/// ARN names no registered application: ONE sentence, naming the ARN the
-/// request supplied.
+/// Which sentence a `RedshiftIdcApplicationNotExistsFault` is worded with.
 ///
-/// One helper rather than a sentence per handler, so the create, the read, the
-/// modify, the delete and the cluster operations that take the member cannot
-/// report different wording for the same precondition.
-pub fn redshift_idc_application_not_exists(application_arn: &str) -> String {
-    format!("The RedshiftIdcApplication with the ARN {application_arn} wasn't found.")
+/// The same split as [`ClusterNotFoundWording`]: the fault's status (404) and
+/// awsQuery code (`RedshiftIdcApplicationNotExists`) are what the model fixes,
+/// while the fixed text around the ARN states the precondition the OPERATION
+/// actually enforces. Both sentences name the ARN the request supplied; they
+/// differ in how much of the precondition they report, so naming each wording
+/// here keeps the choice at the handler that makes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedshiftIdcApplicationNotExistsWording {
+    /// `The RedshiftIdcApplication with the ARN <arn> wasn't found.` — what
+    /// every operation that only DEREFERENCES the application the ARN names
+    /// answers, because existence is the whole of its precondition: the read,
+    /// the modify and the delete of the application itself, and
+    /// `RestoreFromClusterSnapshot`, which carries the application's ARN onto
+    /// the cluster it restores.
+    ArnWasNotFound,
+    /// `The RedshiftIdcApplication with the ARN <arn> wasn't found, or the
+    /// status isn't Completed.` — what a path that ASSOCIATES a cluster with
+    /// the application answers, because its precondition is not existence
+    /// alone: trusted identity propagation can only be enabled from an
+    /// application whose onboarding has finished, so the refusal states both
+    /// failure modes and the caller can tell "no such application" from "not
+    /// usable yet". This is the wording
+    /// `ModifyLakehouseConfiguration` answers for its
+    /// `LakehouseIdcApplicationArn`.
+    ArnWasNotFoundOrStatusNotCompleted,
+}
+
+/// The `RedshiftIdcApplicationNotExistsFault` message `wording` words, naming
+/// the application ARN the request supplied.
+///
+/// One helper rather than a sentence per handler, so the read, the modify, the
+/// delete, the restore and the lakehouse configuration cannot drift apart
+/// within the wording each of them answers.
+pub fn redshift_idc_application_not_exists_message(
+    wording: RedshiftIdcApplicationNotExistsWording,
+    application_arn: &str,
+) -> String {
+    match wording {
+        RedshiftIdcApplicationNotExistsWording::ArnWasNotFound => {
+            format!("The RedshiftIdcApplication with the ARN {application_arn} wasn't found.")
+        }
+        RedshiftIdcApplicationNotExistsWording::ArnWasNotFoundOrStatusNotCompleted => {
+            format!(
+                "The RedshiftIdcApplication with the ARN {application_arn} wasn't found, \
+                 or the status isn't {REDSHIFT_IDC_ONBOARD_STATUS}."
+            )
+        }
+    }
 }
 
 /// What `CreateRedshiftIdcApplication` answers when the NAME the request

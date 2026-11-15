@@ -177,7 +177,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteRedshiftIdcApplicationErrorModeled::RedshiftIdcApplicationNotExistsFault(
                     RedshiftIdcApplicationNotExistsFault {
-                        message: Some(st::redshift_idc_application_not_exists(
+                        // Existence is the whole of this operation's
+                        // precondition, so it answers the wording that reports
+                        // just that — see the per-operation catalog
+                        // [`st::RedshiftIdcApplicationNotExistsWording`].
+                        message: Some(st::redshift_idc_application_not_exists_message(
+                            st::RedshiftIdcApplicationNotExistsWording::ArnWasNotFound,
                             &input.redshift_idc_application_arn,
                         )),
                     },

@@ -15,9 +15,11 @@
 //!   a lakehouse configuration is a configuration OF a cluster, and one the
 //!   service is still working on takes no configuration change;
 //! * an `LakehouseIdcApplicationArn` has to name an IAM Identity Center
-//!   application this account registered, resolved against the applications this
-//!   service holds — "the application you attempted to find doesn't exist" is
-//!   the fault for one it does not.
+//!   application this account registered whose onboarding has finished,
+//!   resolved against the applications this service holds — "the application you
+//!   attempted to find doesn't exist" is the fault for one it does not, worded
+//!   with the precondition this operation enforces (see
+//!   [`crate::state::RedshiftIdcApplicationNotExistsWording`]).
 //!
 //! A `DryRun` request "validates the request without actually modifying the
 //! lakehouse configuration", so it takes every check above and then reports the
@@ -259,15 +261,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The Identity Center application the request names has to be one this
-        // account registered: the trusted identity propagation a lakehouse
-        // registration carries is propagation FROM that application, so an ARN
-        // naming none configures nothing.
+        // account registered AND one whose onboarding has finished: the trusted
+        // identity propagation a lakehouse registration carries is propagation
+        // FROM that application, so an ARN naming none — or naming one that
+        // cannot propagate yet — configures nothing, and the refusal states
+        // both failure modes so the caller can tell them apart.
         if let Some(application_arn) = input.lakehouse_idc_application_arn.as_deref() {
-            if !store.holds_identity_center_application(application_arn) {
+            if !store.identity_center_application_associable(application_arn) {
                 return Err(
                     ModifyLakehouseConfigurationErrorModeled::RedshiftIdcApplicationNotExistsFault(
                         RedshiftIdcApplicationNotExistsFault {
-                            message: Some(st::redshift_idc_application_not_exists(
+                            message: Some(st::redshift_idc_application_not_exists_message(
+                                st::RedshiftIdcApplicationNotExistsWording::ArnWasNotFoundOrStatusNotCompleted,
                                 application_arn,
                             )),
                         },

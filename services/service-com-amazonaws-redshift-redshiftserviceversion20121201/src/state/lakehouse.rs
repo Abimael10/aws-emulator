@@ -81,7 +81,8 @@ pub fn catalog_arn(catalog_name: &str, region: &str) -> String {
 
 impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// Whether `application_arn` names an IAM Identity Center application this
-    /// account registered with Amazon Redshift.
+    /// account registered with Amazon Redshift whose trusted identity
+    /// propagation a cluster can be associated with.
     ///
     /// `LakehouseIdcApplicationArn` is "the ARN of the IAM Identity Center
     /// application used for enabling Amazon Web Services IAM Identity Center
@@ -89,14 +90,24 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// application, which a Redshift IdC application record carries as its
     /// `IdcManagedApplicationArn`, beside the ARN of the Redshift application
     /// that manages it (`RedshiftIdcApplicationArn`). Either ARN names the same
-    /// registered application, so either resolves, and an ARN naming neither
-    /// names an application that "doesn't exist".
+    /// registered application, so either resolves.
+    ///
+    /// Resolving is not existence alone: an application still onboarding
+    /// propagates no identity yet, so the record also has to report the
+    /// onboarding finished ([`REDSHIFT_IDC_ONBOARD_STATUS`]) — which is what the
+    /// refusal this answers states
+    /// ([`RedshiftIdcApplicationNotExistsWording::ArnWasNotFoundOrStatusNotCompleted`]).
     #[must_use]
-    pub fn holds_identity_center_application(&self, application_arn: &str) -> bool {
-        self.redshift_idc_applications.iter().any(|application| {
-            application.idc_managed_application_arn.as_deref() == Some(application_arn)
-                || application.redshift_idc_application_arn.as_deref() == Some(application_arn)
-        })
+    pub fn identity_center_application_associable(&self, application_arn: &str) -> bool {
+        self.redshift_idc_applications
+            .iter()
+            .filter(|application| {
+                application.idc_managed_application_arn.as_deref() == Some(application_arn)
+                    || application.redshift_idc_application_arn.as_deref() == Some(application_arn)
+            })
+            .any(|application| {
+                application.idc_onboard_status.as_deref() == Some(REDSHIFT_IDC_ONBOARD_STATUS)
+            })
     }
 
     /// The lakehouse configuration the cluster at `position` carries, as a

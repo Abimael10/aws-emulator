@@ -2401,3 +2401,17 @@ mod cloudformation_provisions_glue_table_optimizers;
 // for this file and for every service crate's `tests/all.rs`.
 // all, no merge of two landings can leave one past the first item.
 // declaration into `tests/all/`. Declare each suite exactly once — a second `mod` for one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair into the sorted list below, in the one
+// place its name sorts to. The list holds those pairs and no other line, so two branches
+// landing at once insert two lines in two places and have nothing to duplicate, re-word or
+// deliberate: an inner doc comment is legal only before the first item, so one left past the
+// declarations compiles no suite of this target at all. With none anywhere in the file, no
+// merge of two landings can produce one.
+// the top level of `tests/` fails the build; and a second `mod` for one name fails every
+// suite of this target. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would
+// resolve to a SIBLING of this file, which the layout check refuses: the `#[path]` above
+// each declaration is what points it into `tests/all/`.
+// crate, belongs in that suite's own module doc, where it is read beside the test it
+// any other suite. `all/all_rs_is_a_canonical_declaration_list.rs`,
+// `all/declaration_roots_are_canonical_and_complete.rs` check all of it, for this file and
+// for every service crate's `tests/all.rs`, so check there rather than leaving a note here.
