@@ -27,10 +27,11 @@
 //! 4. while the creation the clock owes is in progress, a second creation and a
 //!    `CreateType` are both refused 409 `ConcurrentModificationException`, and the
 //!    creation those refusals left alone still comes due;
-//! 5. an API no creation has ever run for is in `NOT_APPLICABLE`, an `apiId` that cannot
-//!    name an API is a 400 `BadRequestException` and one that names no API this account
-//!    holds a 404 `NotFoundException` — for the creating call and the reporting one
-//!    alike.
+//! 5. an API no creation has ever run for is in `NOT_APPLICABLE`, and the REPORTING call
+//!    refuses an `apiId` that cannot name an API with a 400 `BadRequestException` and one
+//!    that names no API this account holds with a 404 `NotFoundException` (what the
+//!    SUBMITTING call owes such an id is pinned by
+//!    `schema_creation_plane_refusals`).
 //!
 //! The harness (`router`, `call`, `create_api`) is the one the association suites
 //! already carry, so every assertion goes through the router the production emulator
@@ -416,7 +417,7 @@ async fn a_created_schema_is_the_types_its_document_declares() {
             ),
             (
                 Some(state::SCHEMA_SUCCESS),
-                Some(state::SCHEMA_SUCCESS_DETAIL)
+                Some(state::schema_success_detail(row.declared.len()).as_str())
             ),
             "case {:?}: expected the creation to have been performed past the due instant, got \
              {:?}",
@@ -871,93 +872,85 @@ async fn a_document_at_the_type_quota_is_created_and_one_past_it_fails() {
 }
 
 /// One row of the reference table: an `apiId` that names no API of this account, and the
-/// answer both schema operations owe it.
+/// answer the READING call of the schema plane owes it.
+///
+/// The SUBMITTING call's answer is one for every row — the bad request its own suite
+/// pins (`schema_creation_plane_refusals`) — so it is not carried per row here.
 #[derive(Debug)]
 struct Reference {
     label: &'static str,
     api_id: &'static str,
-    status: u16,
-    error_type: &'static str,
-    /// The text the refusal must carry, written out here rather than read off the
-    /// service's own constant. `None` where the row only pins the status and the error
-    /// shape.
-    message: Option<&'static str>,
+    read_status: u16,
+    read_error_type: &'static str,
+    /// The text the reading call's refusal must carry, written out here rather than read
+    /// off the service's own constant. `None` where the row only pins the status and the
+    /// error shape.
+    read_message: Option<&'static str>,
 }
 
 /// The ways an `apiId` can name no API: a value no AppSync API id can be — one character
 /// past the 26 one has (`state::API_ID_LEN`) — and a well-formed id this account does
 /// not hold, in the alphabet the service mints ids over and outside it (the alphabet is
-/// no part of what makes an id nameable, so either is a not-found).
+/// no part of what makes an id nameable, so either names no API).
 fn references() -> Vec<Reference> {
     vec![
         Reference {
             label: "an id too long to be one",
             api_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            status: 400,
-            error_type: "BadRequestException",
-            message: None,
+            read_status: 400,
+            read_error_type: "BadRequestException",
+            read_message: None,
         },
         Reference {
             label: "an id outside the id alphabet",
             api_id: "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-            status: 404,
-            error_type: "NotFoundException",
-            message: Some("API not found."),
+            read_status: 404,
+            read_error_type: "NotFoundException",
+            read_message: Some("API not found."),
         },
         Reference {
             label: "an api this account does not hold",
             api_id: "abcdefghijklmnopqrstuvwxyz",
-            status: 404,
-            error_type: "NotFoundException",
-            message: Some("API not found."),
+            read_status: 404,
+            read_error_type: "NotFoundException",
+            read_message: Some("API not found."),
         },
     ]
 }
 
 #[tokio::test]
-async fn an_api_id_naming_no_api_is_refused_by_both_calls() {
+async fn an_api_id_naming_no_api_is_refused_by_the_reporting_call() {
     let router = router();
 
     for reference in references() {
-        let started = start_creation(
-            &router,
-            reference.api_id,
-            b"type Query {\n  hello: String\n}\n",
-        )
-        .await;
-        let read = creation_status(&router, reference.api_id).await;
-        for (call_name, answer) in [
-            ("StartSchemaCreation", started),
-            ("GetSchemaCreationStatus", read),
-        ] {
-            assert_eq!(
-                (answer.status, answer.error_type.as_str()),
-                (reference.status, reference.error_type),
-                "case {:?} {call_name}: expected {} {}, got {} {} {:?}",
+        let answer = creation_status(&router, reference.api_id).await;
+        assert_eq!(
+            (answer.status, answer.error_type.as_str()),
+            (reference.read_status, reference.read_error_type),
+            "case {:?} GetSchemaCreationStatus: expected {} {}, got {} {} {:?}",
+            reference.label,
+            reference.read_status,
+            reference.read_error_type,
+            answer.status,
+            answer.error_type,
+            answer.body
+        );
+        match reference.read_message {
+            Some(message) => assert_eq!(
+                answer.body["message"].as_str(),
+                Some(message),
+                "case {:?} GetSchemaCreationStatus: expected the message {message:?}, got {:?}",
                 reference.label,
-                reference.status,
-                reference.error_type,
-                answer.status,
-                answer.error_type,
-                answer.body
-            );
-            match reference.message {
-                Some(message) => assert_eq!(
-                    answer.body["message"].as_str(),
-                    Some(message),
-                    "case {:?} {call_name}: expected the message {message:?}, got {:?}",
-                    reference.label,
-                    answer.body["message"]
-                ),
-                None => assert!(
-                    answer.body["message"]
-                        .as_str()
-                        .is_some_and(|text| !text.is_empty()),
-                    "case {:?} {call_name}: expected a message stating why, got {:?}",
-                    reference.label,
-                    answer.body["message"]
-                ),
-            }
+                answer.body["message"]
+            ),
+            None => assert!(
+                answer.body["message"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty()),
+                "case {:?} GetSchemaCreationStatus: expected a message stating why, got {:?}",
+                reference.label,
+                answer.body["message"]
+            ),
         }
     }
 }

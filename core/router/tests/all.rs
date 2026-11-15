@@ -4814,3 +4814,8 @@ mod appended_notes;
 //! The `#[path]` attribute is what points a module into `tests/all/`: this file is a
 //! test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of it, which the
 //! layout check refuses.
+//! pair, keeping the list sorted. A suite that is not declared here compiles nowhere and
+//! its tests never run, and a suite left at the top level of `tests/` fails the build.
+// it into `tests/all/`.
+// The list below is sorted and holds nothing but one `#[path]`/`mod` pair per suite, so a
+// landing has one place to insert and nothing else to keep consistent.

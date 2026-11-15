@@ -149,6 +149,8 @@ mod response_member_projections;
 mod sandbox_evaluation_authorization;
 #[path = "all/schema_creation.rs"]
 mod schema_creation;
+#[path = "all/schema_creation_plane_refusals.rs"]
+mod schema_creation_plane_refusals;
 #[path = "all/schema_creation_status_polling.rs"]
 mod schema_creation_status_polling;
 #[path = "all/source_api_association.rs"]

@@ -151,18 +151,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // An `apiId` that is not an API id at all is a malformed request, not a
-        // missing resource (see `crate::state::is_api_id`).
-        if !crate::state::is_api_id(&input.api_id) {
-            return Err(StartSchemaCreationErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(crate::state::invalid_api_id_message(&input.api_id)),
-                    ..Default::default()
-                },
-            )
-            .into());
-        }
-
         // The schema arrives as "The schema definition, in GraphQL schema language
         // format", i.e. as text: a payload that is not UTF-8 text is no GraphQL document
         // either, so it is carried into the creation as a document that cannot be read
@@ -181,12 +169,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // left behind.
         guard.settle_schema_creations(now);
 
-        // A schema is a property OF a GraphQL API, so an API this account does not hold
-        // has none to add one to.
+        // Submitting a document is addressed at an API by its id, and this operation
+        // VALIDATES that id rather than resolving a resource through it: an `apiId` that
+        // names no API of this account is a malformed request — the id is the thing that
+        // is wrong — so the refusal is the modelled bad request, carrying the rejected id
+        // so the caller can see which value was refused. Every ground an `apiId` fails on
+        // is that one refusal: a value no API id can be at all and a well-formed id this
+        // account does not hold both name no API to add a schema to.
         let Some(api) = guard.graphql_apis.get(&input.api_id) else {
-            return Err(StartSchemaCreationErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            return Err(StartSchemaCreationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                    ..Default::default()
                 },
             )
             .into());

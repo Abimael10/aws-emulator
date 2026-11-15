@@ -40,8 +40,21 @@ pub const SCHEMA_NOT_APPLICABLE: &str = "NOT_APPLICABLE";
 pub const SCHEMA_PROCESSING_DETAIL: &str =
     "The schema creation is scheduled and has not been performed yet.";
 
-/// The `details` that goes with [`SCHEMA_SUCCESS`].
-pub const SCHEMA_SUCCESS_DETAIL: &str = "The schema was created and is ready for use.";
+/// The `details` that goes with [`SCHEMA_SUCCESS`], for a creation that installed
+/// `type_count` types.
+///
+/// The member is "Detailed information about the status of the schema creation
+/// operation", and what a creation that succeeded has to detail is the type system it
+/// installed: the sentence states HOW MANY types the document the creation carried
+/// defines, so a caller that reports or gates on how much of its document was accepted
+/// reads that number off the schema it submitted rather than off a constant sentence.
+///
+/// The count is the only variable part: the noun is not inflected for it, because the
+/// sentence recorded behaviour supplies carries the plural form and the service states no
+/// rule that would change it with the number.
+pub fn schema_success_detail(type_count: usize) -> String {
+    format!("Successfully created schema with {type_count} types.")
+}
 
 /// How long after a `StartSchemaCreation` the creation it scheduled comes due.
 ///
@@ -157,12 +170,16 @@ impl GraphqlApiRecord {
         });
         let (status, details) = match outcome {
             Some(SchemaCreationOutcome::Created(types)) => {
+                // Counted off the type system this creation installs — the types its
+                // document defines — so the detail reports the schema that was created
+                // rather than a sentence that holds for every one.
+                let detail = schema_success_detail(types.len());
                 self.types = types;
                 // The document itself is kept too: it declares what the type map cannot
                 // hold — the root operation types a `schema` definition binds and the
                 // directives the schema defines — which the introspection schema reports.
                 self.schema_document = self.schema.as_ref().map(|schema| schema.definition.clone());
-                (SCHEMA_SUCCESS, SCHEMA_SUCCESS_DETAIL.to_string())
+                (SCHEMA_SUCCESS, detail)
             }
             Some(SchemaCreationOutcome::Failed(detail)) => (SCHEMA_FAILED, detail),
             // Unreachable: a record that is due carries the outcome the call that
