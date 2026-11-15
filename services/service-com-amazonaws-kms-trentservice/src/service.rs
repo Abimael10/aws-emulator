@@ -45,6 +45,8 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The response members this service renders that its model does not declare.
+pub mod recorded_response_members;
 /// Which members of this service a refusal states no value for, read from the model.
 pub mod sensitive_members;
 
@@ -55,6 +57,9 @@ pub mod sensitive_members;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// This service's wire protocol, built once: `override_protocol` borrows it from
+    /// `&self` and must never build one per request.
+    protocol: recorded_response_members::RecordedResponseJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -64,6 +69,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: recorded_response_members::RecordedResponseJson::new(),
         }
     }
 }
@@ -140,6 +146,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // word that routing failure in your own envelope instead.
         let _ = req;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model-derived protocol is `awsJson1_1`, and so is this one: it delegates
+        // routing, request deserialization and every error to the framework's own
+        // `awsJson1_1`, and differs only in the response members this service's wire
+        // reports beside the modelled ones. See [`recorded_response_members`] for the rule.
+        Some(&self.protocol)
     }
 
     fn override_framework_error(

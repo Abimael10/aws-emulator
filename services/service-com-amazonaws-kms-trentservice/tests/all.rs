@@ -15,6 +15,8 @@
 mod account_level_authorization;
 #[path = "all/alias_lifecycle.rs"]
 mod alias_lifecycle;
+#[path = "all/alias_listing_count.rs"]
+mod alias_listing_count;
 #[path = "all/aliases.rs"]
 mod aliases;
 #[path = "all/asymmetric_decrypt.rs"]
