@@ -726,9 +726,10 @@ async fn a_stack_provisions_the_glue_job_its_template_declares() {
 /// A declaration AWS Glue REFUSES does not report a resource nothing created: the stack fails
 /// with that service's own refusal, and no job is left behind.
 ///
-/// The rows differ along WHAT that service refuses: a command kind no job can run, a timeout
-/// past the documented bound, a capacity stated two ways at once, and a name a client already
-/// holds a job under in that Region.
+/// The rows differ along WHAT that service refuses: a timeout past the documented bound, a
+/// capacity stated two ways at once, and a name a client already holds a job under in that
+/// Region. A command KIND is not among them: `JobCommand$Name` is an unconstrained string
+/// Glue stores as declared, so no value of it fails a stack.
 #[tokio::test]
 async fn a_glue_job_declaration_the_owning_service_refuses_fails_the_stack() {
     let (router, engine) = build_router_and_engine();
@@ -756,14 +757,6 @@ async fn a_glue_job_declaration_the_owning_service_refuses_fails_the_stack() {
     // for — which must hold no job once the stack has failed, except where a client created
     // it).
     let rows: Vec<(&str, Value, &str)> = vec![
-        (
-            "a command kind no job can run",
-            json!({
-                "Name": "gjwr-bad-command",
-                "Command": { "Name": "notacommand", "ScriptLocation": "s3://sim2real-etl/x.py" },
-            }),
-            "gjwr-bad-command",
-        ),
         (
             "a timeout past the documented bound",
             json!({

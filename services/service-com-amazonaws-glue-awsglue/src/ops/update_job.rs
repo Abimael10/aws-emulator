@@ -180,21 +180,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // "The `JobCommand` that runs this job (required)", and "for an Apache Spark ETL
-        // job, this must be `glueetl`. For a Python shell job, it must be `pythonshell`.
-        // For an Apache Spark streaming ETL job, this must be `gluestreaming`. For a Ray
-        // job, this must be `glueray`." A command naming anything else names no job this
-        // service can run.
+        // "The `JobCommand` that runs this job (required)": the submitted definition
+        // replaces the stored one whole, so a definition naming no command at all names
+        // nothing to run. The command's NAME is another matter — `JobCommand$Name` is an
+        // optional `GenericString` with no enum, length or pattern, and the names it
+        // documents per job kind do not close the set an update admits — so the submitted
+        // command is stored as sent, exactly as a create stores it.
         let Some(command) = update.command.as_ref() else {
             return Err(invalid_input("JobUpdate.Command is required".to_string()));
         };
         let command_name = command.name.as_deref().unwrap_or_default();
-        if !crate::state::JOB_COMMAND_NAMES.contains(&command_name) {
-            return Err(invalid_input(format!(
-                "Command Name should be one of {:?}, got {command_name:?}",
-                crate::state::JOB_COMMAND_NAMES
-            )));
-        }
 
         // "Jobs must have timeout values less than 7 days or 10080 minutes. Otherwise,
         // the jobs will throw an exception."

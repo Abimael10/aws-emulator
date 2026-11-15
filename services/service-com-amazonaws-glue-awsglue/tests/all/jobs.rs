@@ -562,7 +562,9 @@ async fn the_timeout_bounds_are_enforced() {
 
 /// A request `CreateJob` cannot serve is refused with the error the model names for it,
 /// and nothing is stored. The rows differ along which part of the request is at fault:
-/// the name's uniqueness, the command, the role, and the two ways of naming capacity.
+/// the name's uniqueness, the role, and the two ways of naming capacity. The job's
+/// COMMAND is not among them: `JobCommand$Name` is an unconstrained string the create
+/// stores as submitted (see [`crate::job_command_references`]).
 #[tokio::test]
 async fn an_unservable_create_is_refused_with_the_modeled_error() {
     let router = emulator();
@@ -574,26 +576,6 @@ async fn an_unservable_create_is_refused_with_the_modeled_error() {
             "a name already taken",
             job_body("taken"),
             "AlreadyExistsException",
-        ),
-        (
-            // "For an Apache Spark ETL job, this must be glueetl. For a Python shell
-            // job, it must be pythonshell. … gluestreaming … glueray."
-            "a command the service does not run",
-            json!({
-                "Name": "bad-command",
-                "Role": ROLE_ARN,
-                "Command": { "Name": "sparkmagic", "ScriptLocation": "s3://etl/x.py" },
-            }),
-            "InvalidInputException",
-        ),
-        (
-            "a command naming no job kind at all",
-            json!({
-                "Name": "no-command-name",
-                "Role": ROLE_ARN,
-                "Command": { "ScriptLocation": "s3://etl/x.py" },
-            }),
-            "InvalidInputException",
         ),
         (
             "a blank role",

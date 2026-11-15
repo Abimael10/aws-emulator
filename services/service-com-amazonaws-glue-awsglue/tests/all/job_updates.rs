@@ -533,7 +533,9 @@ async fn an_update_keeps_what_a_job_update_cannot_carry() {
 /// A request `UpdateJob` cannot serve is refused with the error the model names for it,
 /// and the stored definition is left exactly as it was. The rows differ along what is at
 /// fault: the job addressed, the two members `JobUpdate` documents as required, the
-/// command kind, the timeout, the capacity named twice, and the execution class.
+/// timeout, the capacity named twice, and the execution class. The command's NAME is not
+/// among them: it is an unconstrained string the update stores as submitted (see
+/// [`crate::job_command_references`]).
 #[tokio::test]
 async fn an_unservable_update_is_refused_with_the_modeled_error() {
     let router = emulator();
@@ -585,23 +587,6 @@ async fn an_unservable_update_is_refused_with_the_modeled_error() {
             "a definition naming no command",
             name,
             json!({ "Role": ROLE_ARN }),
-            "InvalidInputException",
-        ),
-        (
-            "a command naming no job kind at all",
-            name,
-            json!({ "Role": ROLE_ARN, "Command": { "ScriptLocation": "s3://etl/x.py" } }),
-            "InvalidInputException",
-        ),
-        (
-            // "For an Apache Spark ETL job, this must be glueetl. For a Python shell
-            // job, it must be pythonshell. … gluestreaming … glueray."
-            "a command the service does not run",
-            name,
-            json!({
-                "Role": ROLE_ARN,
-                "Command": { "Name": "sparkmagic", "ScriptLocation": "s3://etl/x.py" },
-            }),
             "InvalidInputException",
         ),
         (

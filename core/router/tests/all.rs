@@ -1245,3 +1245,19 @@ mod cloudformation_rest_api_redeployment;
 //! which is where it stays current and is read beside the test it explains.
 #[path = "all/lambda_in_function_assumed_role_session.rs"]
 mod lambda_in_function_assumed_role_session;
+//! Put a new suite at `tests/all/<name>.rs` and declare it below with one
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted in the sorted list: this file
+//! holds those pairs and NOTHING else, so two branches landing at once insert two lines in
+//! two places and have no prose to duplicate, re-word or mistype.
+//! A suite no `mod` names compiles nowhere and its tests never run; a suite left at the top
+//! level of `tests/` fails the build; and a suite declared twice is `E0428`, which compiles
+//! no suite of this target. THESE HEADER LINES ARE THE ONLY PLACE AN INNER DOC COMMENT
+//! (`//!`) MAY STAND IN THIS FILE: past the first item one is `E0753` and compiles nothing.
+//! Leave no note below, not even an ordinary `//` one — what a suite covers, and why it
+//! lives in this cross-service target rather than in one service crate, belongs in that
+//! suite's own module header, beside the test it explains (`all/appended_notes.rs` keeps the
+//! notes this file had collected).
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check those rules, for this root and for
+//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of it
+//! (`tests/boot_serve.rs`), which the layout check refuses: the `#[path]` above each `mod`
+//! is what points the declaration into `tests/all/`.

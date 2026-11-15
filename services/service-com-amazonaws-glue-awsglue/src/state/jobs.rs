@@ -5,12 +5,6 @@
 
 use super::*;
 
-/// `JobCommand$Name` values the model documents: "For an Apache Spark ETL job, this
-/// must be `glueetl`. For a Python shell job, it must be `pythonshell`. For an Apache
-/// Spark streaming ETL job, this must be `gluestreaming`. For a Ray job, this must be
-/// `glueray`." A command naming anything else is not a job this service can run.
-pub const JOB_COMMAND_NAMES: [&str; 4] = ["glueetl", "pythonshell", "gluestreaming", "glueray"];
-
 /// The `JobMode` stored for a create that named none: "When the JobMode field is
 /// missing or null, SCRIPT is assigned as the default value" (`CreateJob$JobMode`).
 pub const DEFAULT_JOB_MODE: &str = "SCRIPT";

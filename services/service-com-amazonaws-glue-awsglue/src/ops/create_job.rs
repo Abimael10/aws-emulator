@@ -286,23 +286,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "For an Apache Spark ETL job, this must be `glueetl`. For a Python shell job,
-        // it must be `pythonshell`. For an Apache Spark streaming ETL job, this must be
-        // `gluestreaming`. For a Ray job, this must be `glueray`." A command naming
-        // anything else names no job this service can run.
+        // `JobCommand$Name` is an OPTIONAL `GenericString` with no enum, length or pattern:
+        // the names the member documents per job kind ("for an Apache Spark ETL job, this
+        // must be `glueetl` …") tell a caller which name to use, they do not close the set
+        // the create admits. A job definition's references — its command, its role and its
+        // script location — are stored as submitted and resolved when a run of the job is
+        // started, so nothing about the command is refused here; the documented names only
+        // pick the defaults the service fills in (see [`crate::state::default_capacity`]).
         let command_name = input.command.name.as_deref().unwrap_or_default();
-        if !crate::state::JOB_COMMAND_NAMES.contains(&command_name) {
-            return Err(CreateJobErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(format!(
-                        "Command Name should be one of {:?}, got {command_name:?}",
-                        crate::state::JOB_COMMAND_NAMES
-                    )),
-                    from_federation_source: None,
-                },
-            )
-            .into());
-        }
 
         // "Jobs must have timeout values less than 7 days or 10080 minutes. Otherwise,
         // the jobs will throw an exception."

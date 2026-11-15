@@ -317,24 +317,6 @@ struct RefusalRow {
 fn refusal_rows() -> Vec<RefusalRow> {
     vec![
         RefusalRow {
-            case: "a command that names no job type Glue runs",
-            request: json!({
-                "Name": "bad-command",
-                "Role": role(),
-                "Command": command("sparketl", "s3://scripts-bucket/etl.py"),
-            }),
-            code: "InvalidInputException",
-        },
-        RefusalRow {
-            case: "a command with no name at all",
-            request: json!({
-                "Name": "nameless-command",
-                "Role": role(),
-                "Command": { "ScriptLocation": "s3://scripts-bucket/etl.py" },
-            }),
-            code: "InvalidInputException",
-        },
-        RefusalRow {
             case: "a timeout one minute past the documented maximum",
             request: json!({
                 "Name": "long-timeout",

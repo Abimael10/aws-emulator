@@ -235,6 +235,8 @@ mod job_bookmarks;
 mod job_capacity_refusal;
 #[path = "all/job_command_defaults.rs"]
 mod job_command_defaults;
+#[path = "all/job_command_references.rs"]
+mod job_command_references;
 #[path = "all/job_definition_listing.rs"]
 mod job_definition_listing;
 #[path = "all/job_deletion.rs"]
