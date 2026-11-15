@@ -208,9 +208,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::service::partition_indexes::TableIndexKey::of(table)
         };
 
-        // Each index's `IndexStatus` is a function of the due instant its registration
-        // recorded and the instant of THIS call, so reading one index never moves it and
-        // never moves another.
+        // Each index's `IndexStatus` is a function of the due instants its registration and
+        // its delete recorded and the instant of THIS call, so reading one index never moves
+        // it and never moves another. The one thing this read writes down is a removal the
+        // clock already owes — a delete's due instant that has been reached, which took the
+        // record out at that instant whether or not anybody looked — so what the next caller
+        // sees is what that instant decided and not what this read did.
         let descriptors = index_records
             .lock()
             .descriptors(&indexed_table, ::std::time::SystemTime::now());

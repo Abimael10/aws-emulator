@@ -323,6 +323,8 @@ mod mutations_are_applied;
 mod owed_status_materialisation;
 #[path = "all/pagination_tokens.rs"]
 mod pagination_tokens;
+#[path = "all/partition_index_deletion.rs"]
+mod partition_index_deletion;
 #[path = "all/partition_index_registration.rs"]
 mod partition_index_registration;
 #[path = "all/partition_indexes.rs"]

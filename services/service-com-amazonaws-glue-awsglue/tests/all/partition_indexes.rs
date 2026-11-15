@@ -978,6 +978,9 @@ async fn the_status_an_index_reports_is_the_one_its_due_instant_says() {
                 // An index whose build found nothing at fault is the one the clock owes
                 // ACTIVE; what a FAILED build reports is asserted by the registration suite.
                 backfill_errors: Vec::new(),
+                // Nothing has deleted this record; what a delete positions is asserted by
+                // the deletion suite.
+                removed_at: None,
             }],
         );
 

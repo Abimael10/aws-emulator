@@ -314,7 +314,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // often it is re-issued.
         if let Some(refusal) = index_records
             .lock()
-            .refusal_for(&indexed_table, &index.index_name)
+            .refusal_for(&indexed_table, &index.index_name, registered_at)
         {
             return Err(refused(
                 &input,
@@ -338,7 +338,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The store decides again as it writes, so the decision is the store's own and not a
         // claim made before it.
-        if let Err(refusal) = index_records.lock().add(indexed_table, index) {
+        if let Err(refusal) = index_records.lock().add(indexed_table, index, registered_at) {
             return Err(refused(
                 &input,
                 &catalog_id,

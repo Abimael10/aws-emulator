@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePartitionIndex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePartitionIndex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePartitionIndex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Deletes a specified partition index from an existing table": the index is addressed
+//! through a table the catalog holds and then by its own `IndexName`, in the single home of
+//! this resource's records ([`crate::service::partition_indexes`]) — the same records
+//! `CreatePartitionIndex` writes and `GetPartitionIndexes` reports.
+//!
+//! An index whose build has not finished cannot be deleted ("when an index is in a CREATING
+//! state, the index or its table cannot be deleted",
+//! `PartitionIndexDescriptor$IndexStatus`), and neither can one whose own removal is already
+//! under way. An accepted delete does not take the record out at once: the index is reported
+//! DELETING until its removal is due, and from that instant the table holds no index of that
+//! name — so the read settles to a list without it and the name is free for another
+//! registration.
 //!
 //! ## Shape of an operation
 //!
@@ -135,6 +139,67 @@ impl<Eng> DeletePartitionIndex<Eng> {
     }
 }
 
+/// The server error this operation answers when the engine mounted under this service keeps
+/// no state at all, so there is no catalog to delete an index from.
+fn store_unavailable() -> DeletePartitionIndexError {
+    DeletePartitionIndexErrorModeled::InternalServiceException(InternalServiceException {
+        message: Some("the Glue Data Catalog store is unavailable".into()),
+    })
+    .into()
+}
+
+/// The modelled error a store refusal is answered with: an `IndexName` the table holds no
+/// index under addresses no entity, while an index whose build or whose own removal is still
+/// under way is a resource this delete conflicts with.
+fn delete_refusal(
+    index_name: &str,
+    refusal: crate::service::partition_indexes::IndexDeleteRefusal,
+) -> DeletePartitionIndexErrorModeled {
+    match refusal {
+        crate::service::partition_indexes::IndexDeleteRefusal::NotFound => {
+            DeletePartitionIndexErrorModeled::EntityNotFoundException(EntityNotFoundException {
+                message: Some(
+                    crate::service::partition_indexes::messages::index_does_not_exist(index_name),
+                ),
+                from_federation_source: None,
+            })
+        }
+        crate::service::partition_indexes::IndexDeleteRefusal::NotDeletable { status } => {
+            DeletePartitionIndexErrorModeled::ConflictException(ConflictException {
+                message: Some(
+                    crate::service::partition_indexes::messages::index_not_deletable(
+                        index_name, status,
+                    ),
+                ),
+            })
+        }
+    }
+}
+
+/// Record one REFUSED delete and answer the error it is refused with, so an attempted delete
+/// leaves one record whatever its outcome.
+///
+/// The record carries what the success record carries — the operation, the resource the
+/// request addressed and how it ended — and nothing else: the identifiers come from the
+/// request, and no value a caller sent beyond them is logged.
+fn refused(
+    input: &DeletePartitionIndexInput,
+    catalog_id: &str,
+    outcome: &str,
+    error: DeletePartitionIndexErrorModeled,
+) -> DeletePartitionIndexError {
+    ::tracing::warn!(
+        operation = "DeletePartitionIndex",
+        catalog_id = %catalog_id,
+        database = %input.database_name,
+        table = %input.table_name,
+        index = %input.index_name,
+        outcome = %outcome,
+        "refused a Data Catalog partition index delete"
+    );
+    error.into()
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for DeletePartitionIndex<Eng>
 {
@@ -150,20 +215,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePartitionIndex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePartitionIndexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePartitionIndex"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+        let Some(index_records) =
+            crate::service::partition_indexes::partition_index_store(&*self.engine)
+        else {
+            return Err(store_unavailable());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // The instant this delete is served, which the record dates its removal from.
+        let deleted_at = ::std::time::SystemTime::now();
+
+        // The catalog's guard is held across the whole delete, and the records' guard taken
+        // inside it — the lock order every other handler that touches both takes them in — so
+        // no reader can resolve the table between the delete being accepted and the record
+        // being written.
+        let store = state.lock();
+        let Some(database) = store.database(&catalog_id, &input.database_name) else {
+            return Err(refused(
+                &input,
+                &catalog_id,
+                "database not found",
+                DeletePartitionIndexErrorModeled::EntityNotFoundException(EntityNotFoundException {
+                    message: Some(crate::state::messages::database_not_found(
+                        &input.database_name,
+                    )),
+                    from_federation_source: None,
+                }),
+            ));
+        };
+        let Some(table) = database
+            .tables
+            .get(&crate::state::fold_name(&input.table_name))
+        else {
+            return Err(refused(
+                &input,
+                &catalog_id,
+                "table not found",
+                DeletePartitionIndexErrorModeled::EntityNotFoundException(EntityNotFoundException {
+                    message: Some(crate::state::messages::table_not_found(&input.table_name)),
+                    from_federation_source: None,
+                }),
+            ));
+        };
+
+        // An index is a resource OF the STORED table, so the records are addressed by that
+        // table's own key — which is what keeps a table created under a recycled name from
+        // deleting an earlier table's index.
+        let indexed_table = crate::service::partition_indexes::TableIndexKey::of(table);
+        let database_name = database.name.clone();
+        let table_name = table.name.clone();
+
+        // The store decides: whether the table holds an index of this name, and whether that
+        // index is in a status a delete can be served in.
+        let removed_at = match index_records
+            .lock()
+            .delete(&indexed_table, &input.index_name, deleted_at)
+        {
+            Ok(removed_at) => removed_at,
+            Err(refusal) => {
+                return Err(refused(
+                    &input,
+                    &catalog_id,
+                    "refused",
+                    delete_refusal(&input.index_name, refusal),
+                ));
+            }
+        };
+        drop(store);
+
+        ::tracing::info!(
+            operation = "DeletePartitionIndex",
+            catalog_id = %catalog_id,
+            database = %database_name,
+            table = %table_name,
+            index = %input.index_name,
+            removed_in_secs = removed_at
+                .duration_since(deleted_at)
+                .map_or(0, |span| span.as_secs()),
+            "accepted the delete of a Data Catalog partition index"
+        );
+
+        // "Deletes a specified partition index from an existing table": the removal is the
+        // whole answer, and `DeletePartitionIndexResponse` carries no member at all, so
+        // nothing of the deleted index is handed back.
+        Ok(DeletePartitionIndexOutput {})
     }
 }

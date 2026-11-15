@@ -54,6 +54,13 @@ pub const INDEX_STATUS_ACTIVE: &str = "ACTIVE";
 /// [`INDEX_STATUS_ACTIVE`], and reports WHY in its `BackfillErrors`.
 pub const INDEX_STATUS_FAILED: &str = "FAILED";
 
+/// The `PartitionIndexStatus` an index a delete has accepted is in until its removal is due:
+/// "DELETING: The index is deleted from the list of indexes"
+/// (`PartitionIndexDescriptor$IndexStatus`). A record in this status is still reported, which
+/// is what the status is for; from the instant its removal is due the record is gone
+/// ([`PartitionIndexStore::delete`]).
+pub const INDEX_STATUS_DELETING: &str = "DELETING";
+
 /// The `BackfillErrorCode` of a stored partition whose value for an indexed key is not a
 /// value of the type that partition key declares: of the modelled `BackfillErrorCode`
 /// values, the one for invalid partition-type data.
@@ -74,12 +81,14 @@ pub const BACKFILL_MISSING_PARTITION_VALUE: &str = "MISSING_PARTITION_VALUE_ERRO
 pub const MAX_BACKFILL_ERROR_PARTITIONS: usize = 10;
 
 /// How long an index stays [`INDEX_STATUS_CREATING`] before the clock owes it
-/// [`INDEX_STATUS_ACTIVE`].
+/// [`INDEX_STATUS_ACTIVE`], and how long one a delete has accepted stays
+/// [`INDEX_STATUS_DELETING`] before the clock owes its removal.
 ///
 /// CHOSEN, not documented: Glue publishes no duration for building a partition index, so this
 /// is the emulator's own span — deliberately not zero, so a caller that reads
 /// `GetPartitionIndexes` straight after registering an index still observes the index being
-/// built. The due instant is stored on the record and compared with the instant of the call
+/// built, and one that reads straight after deleting it still observes the index being
+/// deleted. The due instant is stored on the record and compared with the instant of the call
 /// that reads it; nothing sleeps.
 pub const PARTITION_INDEX_SETTLES_AFTER: Duration = Duration::from_secs(3);
 
@@ -129,6 +138,27 @@ pub enum IndexRegisterRefusal {
     TooMany {
         /// How many indexes the table holds, which is what the refusal reports.
         held: usize,
+    },
+}
+
+/// Why a stored table cannot have the named partition index deleted.
+///
+/// The variants are the DISTINCTION the caller sees: an `IndexName` the table holds no index
+/// under addresses no resource, while an index whose build or whose own removal is still
+/// under way is a resource the delete conflicts with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexDeleteRefusal {
+    /// The table holds no index of the addressed `IndexName` — answered with
+    /// `EntityNotFoundException`.
+    NotFound,
+    /// The index is in a status a delete cannot be served in: "when an index is in a CREATING
+    /// state, the index or its table cannot be deleted"
+    /// (`PartitionIndexDescriptor$IndexStatus`), and an index already being deleted has a
+    /// removal under way. Answered with `ConflictException`.
+    NotDeletable {
+        /// The `PartitionIndexStatus` the index is in, which is what the refusal reports and
+        /// what the caller has to wait out.
+        status: &'static str,
     },
 }
 
@@ -195,6 +225,27 @@ pub mod messages {
     /// duplicate-create refusals (`Table already exists.`), the name is not disclosed: the
     /// request carries it.
     pub const PARTITION_INDEX_ALREADY_EXISTS: &str = "Partition index already exists.";
+
+    /// A delete addressing an `IndexName` the table holds no index under.
+    ///
+    /// RECORDED template: the fixed parts are `Index with the given indexName : ` and
+    /// ` does not exist.`, around the `IndexName` the request addressed, echoed as the
+    /// request spelled it — an index is addressed by the name it was registered under, which
+    /// the catalog does not fold. Neither the table nor the database it was looked for in is
+    /// named.
+    pub fn index_does_not_exist(index_name: &str) -> String {
+        format!("Index with the given indexName : {index_name} does not exist.")
+    }
+
+    /// A delete of an index that is not in a status it can be deleted in.
+    ///
+    /// NOT recorded: the model states the rule ("when an index is in a CREATING state, the
+    /// index or its table cannot be deleted", `PartitionIndexDescriptor$IndexStatus`), so the
+    /// refusal names the index the request addressed and the `PartitionIndexStatus` the
+    /// record itself is in, which is the one thing the caller has to wait out.
+    pub fn index_not_deletable(index_name: &str, status: &str) -> String {
+        format!("Partition index {index_name} is in {status} status and cannot be deleted.")
+    }
 }
 
 /// The table one set of index records belongs to.
@@ -256,6 +307,11 @@ pub struct PartitionIndexEntry {
     /// stored partition carries a value of the declared type for each indexed key, which is
     /// the only way the build succeeds.
     pub backfill_errors: Vec<BackfillError>,
+    /// The instant from which this index is NO LONGER one of its table's indexes: the due
+    /// instant the delete that accepted it recorded ([`PartitionIndexStore::delete`]), or
+    /// `None` while nothing has deleted it. Until that instant the index is still reported,
+    /// in [`INDEX_STATUS_DELETING`]; from it the record is gone.
+    pub removed_at: Option<SystemTime>,
 }
 
 impl PartitionIndexEntry {
@@ -264,13 +320,25 @@ impl PartitionIndexEntry {
     /// earned — [`INDEX_STATUS_ACTIVE`] when the backfill found nothing at fault,
     /// [`INDEX_STATUS_FAILED`] when it did.
     pub fn status(&self, at: SystemTime) -> &'static str {
-        if at < self.active_at {
+        if self.removed_at.is_some() {
+            // A delete is accepted only on an index whose build has finished, and from the
+            // instant its removal is due the record is gone, so a record that still carries
+            // one reports the status it is being deleted in.
+            INDEX_STATUS_DELETING
+        } else if at < self.active_at {
             INDEX_STATUS_CREATING
         } else if self.backfill_errors.is_empty() {
             INDEX_STATUS_ACTIVE
         } else {
             INDEX_STATUS_FAILED
         }
+    }
+
+    /// Whether this record's REMOVAL is already due at `at` — a delete accepted it and the
+    /// instant from which the table holds no such index has been reached, so nothing reports
+    /// it and nothing counts it any more.
+    pub fn removal_due(&self, at: SystemTime) -> bool {
+        self.removed_at.is_some_and(|removed_at| at >= removed_at)
     }
 
     /// This index as `GetPartitionIndexes` reports it.
@@ -310,11 +378,21 @@ pub struct PartitionIndexStore {
 impl PartitionIndexStore {
     /// The indexes of one table as `GetPartitionIndexes` reports them at `at`, in `IndexName`
     /// order. A table nothing has registered an index on has none.
+    ///
+    /// Takes `&mut self` because it MATERIALISES the removals the clock already owes this
+    /// table ([`Self::drop_removed`]) before projecting what is left: an index whose delete's
+    /// due instant has been reached is gone whether or not anybody reads it, so a read does
+    /// not decide it — it only writes down what that instant already decided.
+    ///
+    /// `at` is therefore the instant of the CALL: it is read as the clock, so a reader that
+    /// passes an instant of its own asks for the records as they stand then, and the removals
+    /// due by then are dropped.
     pub fn descriptors(
-        &self,
+        &mut self,
         table: &TableIndexKey,
         at: SystemTime,
     ) -> Vec<PartitionIndexDescriptor> {
+        self.drop_removed(table, at);
         self.tables
             .get(table)
             .into_iter()
@@ -351,14 +429,20 @@ impl PartitionIndexStore {
     /// that index reached — and a table takes at most [`MAX_INDEXES_PER_TABLE`] of them,
     /// counting every index it already holds. The records of any earlier table of the same
     /// name go, exactly as [`Self::record`] drops them.
+    ///
+    /// `at` is the instant the registration is served, which is what says which of the
+    /// table's records it still holds: an index whose removal that instant has reached is
+    /// gone, so neither its name nor its place against the per-table maximum is taken.
     pub fn add(
         &mut self,
         table: TableIndexKey,
         index: PartitionIndexEntry,
+        at: SystemTime,
     ) -> Result<(), IndexRegisterRefusal> {
+        self.drop_removed(&table, at);
         // Decided BEFORE anything is written, so a registration the table cannot take
         // leaves this store exactly as it was.
-        if let Some(refusal) = self.refusal_for(&table, &index.index_name) {
+        if let Some(refusal) = self.refusal_for(&table, &index.index_name, at) {
             return Err(refusal);
         }
         self.tables
@@ -370,22 +454,88 @@ impl PartitionIndexStore {
         Ok(())
     }
 
-    /// Why `table` cannot take one more index named `index_name`, or `None` when it can.
+    /// Why `table` cannot take one more index named `index_name` at `at`, or `None` when it
+    /// can.
     ///
     /// The decision [`Self::add`] makes, answered WITHOUT the record to store, so a caller
     /// can learn a registration is refused before it does the work of building that record —
-    /// and one place decides it either way.
+    /// and one place decides it either way. Only the records the table still holds at `at`
+    /// count: one whose removal is due is not an index of the table any more.
     pub fn refusal_for(
         &self,
         table: &TableIndexKey,
         index_name: &str,
+        at: SystemTime,
     ) -> Option<IndexRegisterRefusal> {
         let held = self.tables.get(table);
-        if held.is_some_and(|held| held.contains_key(index_name)) {
+        if held.is_some_and(|held| {
+            held.get(index_name)
+                .is_some_and(|index| !index.removal_due(at))
+        }) {
             return Some(IndexRegisterRefusal::AlreadyExists);
         }
-        let count = held.map_or(0, BTreeMap::len);
+        let count = held.map_or(0, |held| {
+            held.values()
+                .filter(|index| !index.removal_due(at))
+                .count()
+        });
         (count >= MAX_INDEXES_PER_TABLE).then_some(IndexRegisterRefusal::TooMany { held: count })
+    }
+
+    /// Accept the delete of ONE index of a stored table, or say why the table cannot have it
+    /// deleted; the accepted delete answers the instant from which the table holds no such
+    /// index.
+    ///
+    /// RULE: an index is addressed by its `IndexName` within its table, so a name the table
+    /// holds no index under addresses nothing to delete, and an index whose build has not
+    /// finished cannot be deleted at all ("when an index is in a CREATING state, the index or
+    /// its table cannot be deleted", `PartitionIndexDescriptor$IndexStatus`) — nor can one
+    /// whose own removal is already under way. An accepted delete does not take the record
+    /// out at once: the index reports [`INDEX_STATUS_DELETING`] until its removal is due, one
+    /// [`PARTITION_INDEX_SETTLES_AFTER`] after this call, and from that instant the table
+    /// holds no index of that name — which frees the name for another registration.
+    ///
+    /// `at` is the instant the delete is served. The removals this table already owes are
+    /// materialised first, so a delete decides against the records the table still holds.
+    pub fn delete(
+        &mut self,
+        table: &TableIndexKey,
+        index_name: &str,
+        at: SystemTime,
+    ) -> Result<SystemTime, IndexDeleteRefusal> {
+        self.drop_removed(table, at);
+        let Some(index) = self
+            .tables
+            .get_mut(table)
+            .and_then(|held| held.get_mut(index_name))
+        else {
+            return Err(IndexDeleteRefusal::NotFound);
+        };
+        let status = index.status(at);
+        if status == INDEX_STATUS_CREATING || status == INDEX_STATUS_DELETING {
+            return Err(IndexDeleteRefusal::NotDeletable { status });
+        }
+        // Checked, as every other due instant in this crate is: an instant the clock cannot
+        // represent removes the record straight away rather than taking the process down.
+        let removed_at = at.checked_add(PARTITION_INDEX_SETTLES_AFTER).unwrap_or(at);
+        index.removed_at = Some(removed_at);
+        Ok(removed_at)
+    }
+
+    /// Materialise the removals `table` already owes at `at`: drop every record whose delete's
+    /// due instant has been reached, and the table's whole entry once it holds no record.
+    ///
+    /// Not a decision of the caller's: the instant was written by the delete that accepted it,
+    /// so the record is gone from it whether or not anything looks. Bounded by the one table
+    /// addressed, which holds at most [`MAX_INDEXES_PER_TABLE`] records.
+    fn drop_removed(&mut self, table: &TableIndexKey, at: SystemTime) {
+        let Some(held) = self.tables.get_mut(table) else {
+            return;
+        };
+        held.retain(|_, index| !index.removal_due(at));
+        if held.is_empty() {
+            self.tables.remove(table);
+        }
     }
 
     /// Forget the records of every table in `tables`: the indexes of a table that is no
@@ -534,6 +684,8 @@ pub fn resolve_indexes(
             // An index registered WITH its table is registered over a table that holds no
             // partition yet, so its build has nothing to backfill and nothing to report.
             backfill_errors: Vec::new(),
+            // Nothing has deleted a record a create is only now writing.
+            removed_at: None,
         });
     }
     Ok(resolved)
@@ -635,6 +787,8 @@ pub fn resolve_index(
         // ([`backfill_errors`]), which is the only thing a registration on an existing table
         // has to backfill over.
         backfill_errors: Vec::new(),
+        // Nothing has deleted a record a registration is only now writing.
+        removed_at: None,
     })
 }
 
