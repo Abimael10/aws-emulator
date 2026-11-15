@@ -911,7 +911,11 @@ async fn a_stage_variable_is_drawn_from_the_sets_the_member_publishes() {
 
 /// One control-plane request signed with the credential `access_key_id` names, answered as
 /// [`Answer`] reports it.
-async fn call_as(
+///
+/// `pub(crate)` for the sibling `control_plane_authorization` suite, which drives the SAME
+/// gate over the table of documents, verbs and principals this rule's one row stands in for:
+/// one signing helper, so the two suites cannot address two different hosts or scopes.
+pub(crate) async fn call_as(
     gateway: &Gateway,
     access_key_id: &str,
     method: &str,

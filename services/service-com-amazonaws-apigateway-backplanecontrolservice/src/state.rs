@@ -3975,6 +3975,18 @@ pub fn usage_plan_has_api_stages(usage_plan_id: &str, api_id: &str, stage_name: 
 /// all of them say the same thing about the same failure.
 pub const NO_SUCH_DOMAIN_NAME: &str = "Invalid domain name identifier specified";
 
+/// The `BadRequestException` message for a `domainNameArn` that is READABLE as the ARN of a
+/// custom domain name but names none this account holds.
+///
+/// A DIFFERENT sentence from [`NO_SUCH_DOMAIN_NAME`], because it is a different refusal: the
+/// sibling is what an operation addressing a domain name by its own `domainName` path
+/// parameter answers for an identifier it cannot resolve, while this one is what an operation
+/// that takes the domain name's ARN as an INPUT MEMBER answers — the request named a resource
+/// to bind to and there is no such resource. ENTIRELY FIXED TEXT: it states the condition and
+/// quotes back neither the ARN the request carried nor the domain name its resource portion
+/// named, as a recorded refusal of an unresolvable `domainNameArn` shows.
+pub const DOMAIN_NAME_NOT_FOUND: &str = "Domain not found";
+
 /// The `BadRequestException` message for a `domainName` this account already holds a
 /// non-private custom domain name under.
 ///

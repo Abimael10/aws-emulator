@@ -23,8 +23,9 @@
 //!   route key names (see [`invoke`]).
 //! - `override_operation` — which operation serves a request. EDITED HERE: the key and
 //!   the handler stay the generated table's, but each operation is served through
-//!   [`StatedPerOperation`], which states a refused request the way this service states
-//!   it and, ahead of that, answers a query value that cannot be converted to its
+//!   [`StatedPerOperation`], which refuses a request IAM does not permit
+//!   ([`control_plane_authorization`]), then states a refused request the way this service
+//!   states it and, ahead of that, answers a query value that cannot be converted to its
 //!   member's modelled type through [`query_coercion`] — a deserialization failure, not
 //!   a constraint violation. A request addressed to a stage invoke URL is served by
 //!   [`StageDataPlane`] instead, which the model's routing key cannot
@@ -534,9 +535,7 @@ where
             // caller whose policies allow none of this service's actions on the resource
             // the request names is told it is not authorized, and the answer says nothing
             // about whether that resource exists here.
-            if let Some(denial) =
-                control_plane_authorization::denial(&*self.engine, ctx, req)
-            {
+            if let Some(denial) = control_plane_authorization::denial(&*self.engine, ctx, req) {
                 // The protocol is read, used and dropped inside this one statement:
                 // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across an
                 // await would make this future non-`Send`.
@@ -550,7 +549,8 @@ where
             // await below would make this future non-`Send`.
             //
             // A query value that cannot be CONVERTED to the modelled type of its member
-            // is refused FIRST, because deserialization precedes constraint validation:
+            // is refused ahead of the constraint walk, because deserialization precedes
+            // constraint validation:
             // such a value never becomes a value at all, so there are no violations to
             // state and no handler to run. The framework would otherwise report that
             // conversion failure as a constraint violation (`ValidationException`,

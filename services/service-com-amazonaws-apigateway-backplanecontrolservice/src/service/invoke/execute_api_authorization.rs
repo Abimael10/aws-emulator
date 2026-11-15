@@ -74,6 +74,17 @@
 //! [`::service_common::iam_role`], and the DECISION through the shared
 //! [`::service_common::iam_authorization`].
 //!
+//! ## The other plane asking the same question
+//!
+//! This service's CONTROL plane takes the same decision about its own actions and resources —
+//! `apigateway:<verb>` on the ARN of the resource the request addressed — and it asks it HERE,
+//! through [`refusing_reason`] ([`crate::service::control_plane_authorization`] is the gate
+//! that puts the question and states the sentence its caller reads). One reading of a caller
+//! and one evaluation order for both planes: the documents the IAM store holds cannot refuse a
+//! principal on one and admit it on the other, and the only difference is that a control-plane
+//! call has no resource-based document to combine with, since an api's policy is about
+//! invoking it.
+//!
 //! LOCK ORDER: the STS registry's lock and then the IAM store's, each taken and released in
 //! turn while this service's own store lock is held. Neither of those services reads this
 //! one's state, so that order is the only one taken.

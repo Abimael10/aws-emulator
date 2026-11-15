@@ -52,7 +52,12 @@ const EC2_API_VERSION: &str = "2016-11-15";
 
 /// The refusal AWS answers an `accessAssociationSource` naming no VPC endpoint of the
 /// account with: the identifier the request sent, then the fixed text.
-fn not_a_valid_endpoint_id(source: &str) -> String {
+///
+/// `pub(crate)` for the sibling `access_association_domain_resolution` suite, which asserts
+/// that this sentence is NOT the one answered once the domain name is the unresolvable half
+/// of the request: one wording, so a change to it cannot pass in one suite and fail in the
+/// other.
+pub(crate) fn not_a_valid_endpoint_id(source: &str) -> String {
     format!("{source} is not a valid VPC endpoint id")
 }
 
@@ -110,13 +115,17 @@ fn ec2_element(xml: &str, name: &str, case: &str) -> String {
 }
 
 /// The network an interface endpoint is created in: a VPC and one subnet of it.
-struct Network {
+pub(crate) struct Network {
     vpc: String,
     subnet: String,
 }
 
 /// One VPC with one subnet, created through EC2's own API.
-async fn network(gateway: &Gateway) -> Network {
+///
+/// `pub(crate)` with [`execute_api_endpoint`]: the sibling
+/// `access_association_domain_resolution` suite needs an endpoint the account really has, so
+/// that a row whose SOURCE resolves can show which of the two resources is resolved first.
+pub(crate) async fn network(gateway: &Gateway) -> Network {
     let case = "network";
     let vpc = ec2_element(
         &ec2(gateway, "CreateVpc", &[("CidrBlock", "10.0.0.0/16")], case).await,
@@ -143,7 +152,11 @@ async fn network(gateway: &Gateway) -> Network {
 
 /// One INTERFACE endpoint to the Region's `execute-api` service, which is the endpoint a
 /// private custom domain name is reached through, answering the id EC2 minted for it.
-async fn execute_api_endpoint(gateway: &Gateway, network: &Network, case: &str) -> String {
+pub(crate) async fn execute_api_endpoint(
+    gateway: &Gateway,
+    network: &Network,
+    case: &str,
+) -> String {
     let answered = ec2(
         gateway,
         "CreateVpcEndpoint",

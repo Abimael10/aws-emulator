@@ -3,15 +3,18 @@
 //! @op CreateDomainNameAccessAssociation
 //! IMPLEMENTED: stores one `DomainNameAccessAssociation` between an access association
 //! source and a stored PRIVATE custom domain name, and reports the record it wrote. BOTH
-//! resources the association binds are resolved before anything is written: the domain name
-//! against this service's own records, and the source against the VPC endpoints Amazon EC2
-//! holds for the account ([`crate::state::vpc_endpoints`]), because with
-//! `accessAssociationSourceType` `VPCE` the source "is the VPC endpoint ID" — so an
-//! identifier naming no endpoint is the modelled `BadRequestException` rather than a stored
-//! association that can never route. The pair `(domain name, access association source)` IS
-//! the association, so a second create of a pair this account already holds is the modelled
-//! `BadRequestException` — decided and written under one store lock, so concurrent creates
-//! of one pair store exactly one record.
+//! resources the association binds are resolved before anything is written, and the DOMAIN
+//! NAME is resolved FIRST — the association is "between an access association source and a
+//! private custom domain name", so a request naming neither resource is refused for the
+//! domain name it is for, and an ARN naming no stored domain name is the modelled
+//! `BadRequestException` ([`crate::state::DOMAIN_NAME_NOT_FOUND`]). The source is then
+//! resolved against the VPC endpoints Amazon EC2 holds for the account
+//! ([`crate::state::vpc_endpoints`]), because with `accessAssociationSourceType` `VPCE` the
+//! source "is the VPC endpoint ID" — so an identifier naming no endpoint is the modelled
+//! `BadRequestException` rather than a stored association that can never route. The pair
+//! `(domain name, access association source)` IS the association, so a second create of a
+//! pair this account already holds is the modelled `BadRequestException` — decided and
+//! written under one store lock, so concurrent creates of one pair store exactly one record.
 //!
 //! ## Shape of an operation
 //!
@@ -140,6 +143,62 @@ fn bound_input(input: &CreateDomainNameAccessAssociationInput) -> Result<(), Str
     Ok(())
 }
 
+/// Resolve, against the records THIS service holds, the private custom domain name an
+/// association is for, and refuse a pair the account already holds one for. `Ok` carries the
+/// domain name's OWN ARN, which is what the record stores and every read reports; `Err`
+/// carries the message of the `BadRequestException` the condition it found earns.
+///
+/// The whole decision this operation takes about its own records, in ONE place, because it is
+/// taken TWICE: once BEFORE the access association source is resolved against the service
+/// that owns VPC endpoints — "a domain name access association resource between an access
+/// association source and a private custom domain name" names the domain name as the resource
+/// the association is for, so a request naming no such domain name is refused for it whatever
+/// its source says — and once more under the hold of the store lock the record is written in,
+/// so nothing is stored for a domain name that went away while the source was being resolved.
+fn resolve_domain_name(
+    store: &crate::state::ComAmazonawsApigatewayBackplanecontrolserviceState,
+    domain_name_key: &str,
+    access_association_source: &str,
+) -> Result<String, String> {
+    // "Creates a domain name access association resource between an access association
+    // source and a PRIVATE custom domain name": the domain name the request names must be a
+    // record this emulator holds, and one whose endpoint configuration makes it private — a
+    // domain name reached through VPC endpoints, which is the only kind an access association
+    // is defined for. This operation models no `NotFoundException`, so a `domainNameArn` that
+    // resolves to no such domain name is the modelled bad request, carrying the one sentence
+    // this service answers an ARN naming no stored domain name with.
+    let domain = store
+        .domain_names
+        .get(domain_name_key)
+        .ok_or_else(|| crate::state::DOMAIN_NAME_NOT_FOUND.to_string())?;
+    let private = domain
+        .endpoint_configuration
+        .as_ref()
+        .and_then(|configuration| configuration.types.as_ref())
+        .is_some_and(|types| types.iter().any(|kind| kind == PRIVATE_ENDPOINT_TYPE));
+    if !private {
+        return Err(format!(
+            "A domain name access association may only be created for a \
+             {PRIVATE_ENDPOINT_TYPE} custom domain name, and {} is not one",
+            domain.domain_name
+        ));
+    }
+    // The domain name's OWN ARN is what the record stores and every read reports, so an
+    // association names the domain name this emulator resolved rather than the spelling one
+    // request happened to carry.
+    let domain_name_arn = domain.domain_name_arn.clone();
+    // An access association IS the pair `(domain name, source)`, so this account holds at
+    // most one for a pair: a second create of the same pair names a resource that is already
+    // there, which is the modelled BAD REQUEST rather than a conflict a retry could clear.
+    if store
+        .access_association_of(&domain_name_arn, access_association_source)
+        .is_some()
+    {
+        return Err(crate::state::ACCESS_ASSOCIATION_ALREADY_EXISTS.to_string());
+    }
+    Ok(domain_name_arn)
+}
+
 impl From<&DomainNameAccessAssociationEntry> for CreateDomainNameAccessAssociationOutput {
     /// The `DomainNameAccessAssociation` body for a stored association — the one place
     /// this crate renders that shape, so `CreateDomainNameAccessAssociation` and
@@ -260,6 +319,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
 
+        // The DOMAIN NAME the association is FOR is resolved FIRST, against this service's
+        // own records: it is the resource the association is created for, so a request that
+        // names no such domain name is refused for it whatever its source says. The lock is
+        // taken and released for that question alone, because the source below is resolved
+        // against ANOTHER service and nothing of this store may be held across that hop.
+        {
+            let store = state.lock();
+            resolve_domain_name(
+                &store,
+                &domain_name_key,
+                &input.access_association_source,
+            )
+            .map_err(bad_request)?;
+        }
+
         // The SOURCE is RESOLVED as the resource its type says it names: with
         // `accessAssociationSourceType` `VPCE`, "the value is the VPC endpoint ID"
         // (`accessAssociationSource`), and an access association binds a private custom
@@ -306,49 +380,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // "Creates a domain name access association resource between an access association
-        // source and a PRIVATE custom domain name": the domain name the request names must
-        // be a record this emulator holds, and one whose endpoint configuration makes it
-        // private — a domain name reached through VPC endpoints, which is the only kind an
-        // access association is defined for. This operation models no `NotFoundException`,
-        // so a `domainNameArn` that resolves to no such domain name is the modelled bad
-        // request, carrying the one sentence this service answers an unresolvable domain
-        // name identifier with.
-        let domain = store
-            .domain_names
-            .get(&domain_name_key)
-            .ok_or_else(|| bad_request(crate::state::NO_SUCH_DOMAIN_NAME.to_string()))?;
-        let private = domain
-            .endpoint_configuration
-            .as_ref()
-            .and_then(|configuration| configuration.types.as_ref())
-            .is_some_and(|types| types.iter().any(|kind| kind == PRIVATE_ENDPOINT_TYPE));
-        if !private {
-            return Err(bad_request(format!(
-                "A domain name access association may only be created for a \
-                 {PRIVATE_ENDPOINT_TYPE} custom domain name, and {} is not one",
-                domain.domain_name
-            )));
-        }
-        // The domain name's OWN ARN is what the record stores and every read reports, so an
-        // association names the domain name this emulator resolved rather than the spelling
-        // one request happened to carry.
-        let domain_name_arn = domain.domain_name_arn.clone();
-
-        // An access association IS the pair `(domain name, source)`, so this account holds
-        // at most one for a pair: a second create of the same pair names a resource that is
-        // already there, which is the modelled BAD REQUEST rather than a conflict a retry
-        // could clear. The check and the insert below share ONE hold of the store lock, so
-        // concurrent creates of one pair cannot both pass it — exactly one stores a record
-        // and every other is refused.
-        if store
-            .access_association_of(&domain_name_arn, &input.access_association_source)
-            .is_some()
-        {
-            return Err(bad_request(
-                crate::state::ACCESS_ASSOCIATION_ALREADY_EXISTS.to_string(),
-            ));
-        }
+        // Both halves are decided AGAIN here, under the hold of the lock the record is
+        // written in: the domain name may have gone while the source was being resolved
+        // against the service that owns VPC endpoints, and the pair check and the insert
+        // share ONE hold of the store lock, so concurrent creates of one pair cannot both
+        // pass it — exactly one stores a record and every other is refused.
+        let domain_name_arn =
+            resolve_domain_name(&store, &domain_name_key, &input.access_association_source)
+                .map_err(bad_request)?;
 
         let id = store.mint_id();
         let sequence = store.next_sequence();

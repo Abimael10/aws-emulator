@@ -775,3 +775,13 @@ mod control_plane_fidelity_rules;
 // and Amazon CloudWatch Logs at once.
 #[path = "all/stage_method_level_logging_level.rs"]
 mod stage_method_level_logging_level;
+// Appended for the reason the note above gives: WHICH of the two resources a domain name
+// access association binds is resolved first, and the sentence a `domainNameArn` naming no
+// stored custom domain name is refused with.
+#[path = "all/access_association_domain_resolution.rs"]
+mod access_association_domain_resolution;
+// Appended for the reason the note above gives: the IAM decision the CONTROL plane takes
+// about every modelled operation — the action the request's verb names, on the ARN of the
+// path it addressed, for the principal its credential speaks for.
+#[path = "all/control_plane_authorization.rs"]
+mod control_plane_authorization;

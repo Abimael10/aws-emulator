@@ -2011,3 +2011,17 @@ mod zz_probe_whole_emulator;
 // is read beside the test it explains; the notes earlier landings appended to the tail of
 // this file live in `all/appended_notes.rs`, `all/appended_header_notes.rs` and
 // `all/appended_prose.rs`, each declared below like any other suite.
+// suite file, sorted by name, and no other line — so two branches landing at once insert two
+// lines in two places and have no prose to duplicate, re-word or mistype.
+// the declarations compiles no suite of this target. With none anywhere in the file, no merge
+// of two landings can leave one past the first item.
+// at the top level of `tests/` fails the build; and a second `mod` for one name is `E0428`,
+// which fails every suite in this target. `tests/all.rs` is a test-target CRATE ROOT, so a
+// bare `mod` would resolve to a SIBLING of this file (`tests/<name>.rs`), which the layout
+// check refuses: the `#[path]` above each `mod` is what points it into `tests/all/`.
+// `all/declaration_roots_are_canonical_and_complete.rs` pin all of the above, for this file
+// here. What a suite covers, and why it drives the assembled router rather than one service
+// explains; the notes earlier landings had appended to this file live in
+// `all/appended_notes.rs`, declared below like any other suite.
+// module header is a note rather than a build failure. An inner attribute, like an inner doc
+// comment, is legal only before the first item, so it stands here rather than in the list.
