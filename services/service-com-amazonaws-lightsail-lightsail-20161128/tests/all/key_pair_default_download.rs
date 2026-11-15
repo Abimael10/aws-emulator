@@ -53,11 +53,6 @@ const ACCOUNT: &str = "000000000000";
 /// `smithy_query(query="shape",shape="DownloadDefaultKeyPairResult")`.
 const DOWNLOAD_MEMBERS: &[&str] = &["createdAt", "privateKeyBase64", "publicKeyBase64"];
 
-/// The algorithm name the modelled output fixes for the public half: "A
-/// base64-encoded public key of the `ssh-rsa` type"
-/// (`DownloadDefaultKeyPairResult$publicKeyBase64`).
-const SSH_RSA: &str = "ssh-rsa";
-
 /// The PEM header and footer the modelled output fixes for the private half: "A
 /// base64-encoded RSA private key"
 /// (`DownloadDefaultKeyPairResult$privateKeyBase64`), the PKCS#1 labels of
@@ -207,19 +202,10 @@ fn assert_real_key_pair(case: &str, body: &Value) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("case {case}: expected privateKeyBase64, got {body:?}"));
 
-    // The public half: the `ssh-rsa` OpenSSH line the model documents.
-    assert!(
-        public_key.starts_with(&format!("{SSH_RSA} ")),
-        "case {case}: expected an {SSH_RSA} public key line, got {public_key:?}"
-    );
-    let public = ::ssh_key::PublicKey::from_openssh(public_key).unwrap_or_else(|error| {
-        panic!("case {case}: expected an OpenSSH public key, got {public_key:?}: {error}")
-    });
-    assert_eq!(
-        public.algorithm().as_str(),
-        SSH_RSA,
-        "case {case}: expected the {SSH_RSA} algorithm, got {public_key:?}"
-    );
+    // The public half: the base64-encoded `ssh-rsa` key the model documents —
+    // base64 text alone, checked where that rule lives.
+    let public =
+        crate::key_pair_public_key_encoding::assert_base64_ssh_public_key(case, public_key);
 
     // The private half: the PKCS#1 `RSA PRIVATE KEY` PEM the model documents,
     // holding the same modulus — so the two halves are ONE pair.

@@ -69,11 +69,17 @@ impl StoredKeyPair {
 /// Not `Clone`: the private half is handed to the caller by the call that minted
 /// it, so a second copy of it has no reason to exist.
 pub struct MintedKeyPairMaterial {
-    /// The public half as an OpenSSH public key line — `ssh-rsa <body>`, the
-    /// type `CreateKeyPairResult$publicKeyBase64` documents ("A base64-encoded
-    /// public key of the ssh-rsa type"), which is the form an
-    /// `authorized_keys` file carries and the form `ImportKeyPair`'s own
-    /// `publicKeyBase64` is given.
+    /// The public half as "a base64-encoded public key of the ssh-rsa type"
+    /// (`CreateKeyPairResult$publicKeyBase64`): the base64 of the key's own
+    /// `ssh-rsa` encoding — the blob an SSH public key is published as, which
+    /// names its algorithm inside itself — and nothing else.
+    ///
+    /// The member is modelled as `Base64`, so the value is base64 text alone:
+    /// the base64 alphabet, no key-type prefix and no whitespace, which a
+    /// client base64-decodes to recover the key. It is the SAME rendering this
+    /// service reports an instance's SSH host key with
+    /// ([`witness_ssh_host_key`]), and prefixing the algorithm name to it gives
+    /// the `authorized_keys` line a caller saves.
     pub public_key: String,
     /// The private half as an `RSA PRIVATE KEY` PEM — the PKCS#1 encoding
     /// `privateKeyBase64` documents ("A base64-encoded RSA private key"), which
@@ -128,7 +134,7 @@ impl MintedKeyPairMaterial {
             .private_key
             .to_vec();
         let parsed = <::pkcs1::RsaPrivateKey as ::der::Decode>::from_der(&pkcs1_der).ok()?;
-        let public_key = openssh_rsa_public_key(&parsed)?;
+        let public_key = base64_rsa_public_key(&parsed)?;
         let private_key = ::der::Document::try_from(pkcs1_der.as_slice())
             .ok()?
             .to_pem(RSA_PRIVATE_KEY_PEM_LABEL, ::der::pem::LineEnding::LF)
@@ -155,7 +161,7 @@ impl MintedKeyPairMaterial {
 /// Not `Clone`: one copy of the private half is what the store holds, and a
 /// caller is answered a copy built where it is reported.
 pub struct HeldDefaultKeyPairMaterial {
-    /// The public half, in the OpenSSH `ssh-rsa` form
+    /// The public half, in the base64 form
     /// [`MintedKeyPairMaterial::public_key`] documents.
     pub public_key: String,
     /// The private half, in the PKCS#1 PEM form
@@ -222,16 +228,24 @@ const RSA_PRIVATE_KEY_PEM_LABEL: &str = "RSA PRIVATE KEY";
 /// published one.
 const KEY_PAIR_MODULUS_BITS: ::aws_lc_rs::rsa::KeySize = ::aws_lc_rs::rsa::KeySize::Rsa2048;
 
-/// The OpenSSH public key line of the RSA key `private`'s public half:
-/// `ssh-rsa <base64 body>`, built from the key's own modulus and public exponent
-/// by the crate that implements the OpenSSH key formats.
+/// "A base64-encoded public key of the ssh-rsa type"
+/// (`CreateKeyPairResult$publicKeyBase64`) for the RSA key `private`'s public
+/// half: the base64 of that key's own `ssh-rsa` encoding, built from the key's
+/// modulus and public exponent by the crate that implements the SSH key formats
+/// and cut from the OpenSSH line it writes ([`openssh_key_body`]).
 ///
-/// No comment is attached: the line is the key material a caller saves, and
+/// The member is modelled as `Base64`, so what it carries is base64 text alone
+/// — no algorithm prefix and no whitespace. The algorithm is named inside the
+/// blob the value decodes to, as it is for the SSH host key this service
+/// reports the same way ([`witness_ssh_host_key`]).
+///
+/// No comment is attached: the blob is the key material a caller saves, and
 /// Lightsail reports no comment for it.
-fn openssh_rsa_public_key(private: &::pkcs1::RsaPrivateKey<'_>) -> Option<String> {
+fn base64_rsa_public_key(private: &::pkcs1::RsaPrivateKey<'_>) -> Option<String> {
     let key = ::ssh_key::public::KeyData::Rsa(::ssh_key::public::RsaPublicKey {
         e: ::ssh_key::Mpint::from_positive_bytes(private.public_exponent.as_bytes()).ok()?,
         n: ::ssh_key::Mpint::from_positive_bytes(private.modulus.as_bytes()).ok()?,
     });
-    ::ssh_key::PublicKey::new(key, "").to_openssh().ok()
+    let openssh = ::ssh_key::PublicKey::new(key, "").to_openssh().ok()?;
+    Some(openssh_key_body(&openssh)?.to_string())
 }

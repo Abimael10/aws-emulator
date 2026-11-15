@@ -2002,3 +2002,12 @@ mod zz_probe_whole_emulator;
 // The `#[path]` attribute above each `mod` is what points it into `tests/all/`: this file
 // is a test-target CRATE ROOT, where a bare `mod` would resolve to a sibling of it
 // (`tests/<name>.rs`), which the layout check refuses.
+// file, no merge of two landings can leave one there. A name declared twice is `E0428`, and
+// a suite file no declaration names is compiled nowhere; `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/declaration_roots_are_canonical_and_complete.rs` pin those rules, for this root and
+// for every service crate's own, so a note about any of them belongs there.
+// is what points it into `tests/all/`. What a suite covers, and why it drives the assembled
+// router rather than one service crate, belongs in that suite's own module header, where it
+// is read beside the test it explains; the notes earlier landings appended to the tail of
+// this file live in `all/appended_notes.rs`, `all/appended_header_notes.rs` and
+// `all/appended_prose.rs`, each declared below like any other suite.

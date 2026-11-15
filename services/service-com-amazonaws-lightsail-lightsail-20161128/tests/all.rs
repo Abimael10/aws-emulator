@@ -265,6 +265,8 @@ mod key_pair_default_download;
 mod key_pair_delete;
 #[path = "all/key_pair_listing.rs"]
 mod key_pair_listing;
+#[path = "all/key_pair_public_key_encoding.rs"]
+mod key_pair_public_key_encoding;
 #[path = "all/key_pair_read.rs"]
 mod key_pair_read;
 #[path = "all/known_host_keys_delete.rs"]

@@ -317,7 +317,13 @@ fn temporary_access_certificate(
 
 /// The base64 body of an OpenSSH public key line, which is laid out as
 /// `<algorithm> <body>[ <comment>]`.
-fn openssh_key_body(openssh: &str) -> Option<&str> {
+///
+/// The body is the base64 of the key's own SSH encoding, which names the
+/// algorithm inside itself, so it is the whole key without the line's text
+/// prefix. The ONE owner of that rendering, so every SSH public key this store
+/// publishes as base64 is cut from an OpenSSH line the same way (see
+/// [`MintedKeyPairMaterial::public_key`]).
+pub fn openssh_key_body(openssh: &str) -> Option<&str> {
     openssh.split_whitespace().nth(1)
 }
 

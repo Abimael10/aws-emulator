@@ -11,7 +11,8 @@
 //! The rules under test:
 //!
 //! * A create mints a REAL RSA key pair, in the two encodings the modelled
-//!   output documents: an `ssh-rsa` OpenSSH line for the public half, a PKCS#1
+//!   output documents: the base64-encoded `ssh-rsa` key the sibling
+//!   public-key-encoding suite owns the rule for, a PKCS#1
 //!   `RSA PRIVATE KEY` PEM carrying the same modulus for the private half, and a
 //!   `fingerprint` that is the MD5 digest of that pair's DER-encoded public key
 //!   in the colon-hex form an AWS key pair fingerprint is published in. The
@@ -240,11 +241,6 @@ fn assert_reported(case: &str, row: &Row, key_pair: &Value) {
     );
 }
 
-/// The algorithm name the modelled output fixes for the public half: "A
-/// base64-encoded public key of the ssh-rsa type"
-/// (`CreateKeyPairResult$publicKeyBase64`).
-const SSH_RSA: &str = "ssh-rsa";
-
 /// The PEM header and footer the modelled output fixes for the private half: "A
 /// base64-encoded RSA private key" (`CreateKeyPairResult$privateKeyBase64`), the
 /// PKCS#1 labels of RFC 7468.
@@ -338,18 +334,11 @@ fn assert_real_key_material(case: &str, body: &Value) -> String {
         .unwrap_or_else(|| panic!("case {case}: expected privateKeyBase64, got {body:?}"))
         .to_string();
 
-    // The public half: the `ssh-rsa` OpenSSH line the model documents.
-    assert!(
-        public_key.starts_with(&format!("{SSH_RSA} ")),
-        "case {case}: expected an {SSH_RSA} public key line, got {public_key:?}"
-    );
-    let public = ::ssh_key::PublicKey::from_openssh(&public_key).unwrap_or_else(|error| {
-        panic!("case {case}: expected an OpenSSH public key, got {public_key:?}: {error}")
-    });
-    assert_eq!(
-        public.algorithm().as_str(),
-        SSH_RSA,
-        "case {case}: expected the {SSH_RSA} algorithm, got {public_key:?}"
+    // The public half: the base64-encoded `ssh-rsa` key the model documents —
+    // base64 text alone, checked where that rule lives.
+    let public = crate::key_pair_public_key_encoding::assert_base64_ssh_public_key(
+        case,
+        &public_key,
     );
 
     // The private half: the PKCS#1 `RSA PRIVATE KEY` PEM the model documents,
