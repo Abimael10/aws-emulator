@@ -1798,3 +1798,16 @@ mod zz_probe_whole_emulator;
 // `all/every_suite_file_is_declared.rs` pin those rules, so check there rather than leaving a
 // note here; `all/appended_notes.rs` records what the notes earlier landings had appended to
 // this file said.
+// suite file under `tests/all/`, sorted by name, and no other line — so two branches
+// landing at once insert two lines in two places and have no prose to duplicate, re-word or
+// mistype. Put a new suite at `tests/all/<name>.rs` and insert its pair where its name
+// sorts to; what that suite covers, and why it drives the assembled router rather than one
+// service crate, belongs in that suite's own module header, and a note about THIS file
+// belongs in `all/appended_notes.rs`.
+// `E0753` and compiles no suite of this target at all — and with none anywhere in the file,
+// no merge of two landings can leave one there. A suite file no `mod` here names is
+// compiled nowhere and its tests never run, and a second `mod` for one name is `E0428`,
+// which compiles neither copy.
+// The suites that check the rules above rather than restating them:
+// `all/declaration_roots_are_canonical_and_complete.rs` — for this file and for every
+// service crate's `tests/all.rs`.

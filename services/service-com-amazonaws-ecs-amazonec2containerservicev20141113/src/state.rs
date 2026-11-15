@@ -161,6 +161,13 @@ pub use cluster_refusal::{
     CLUSTER_INACTIVE_FOR_TAGGING_MESSAGE, CLUSTER_INACTIVE_MESSAGE,
 };
 
+/// Whether a repeated `CreateCluster` asks for the cluster already stored under the name
+/// it names — the same create — or for a different one, which is refused.
+mod cluster_idempotency;
+pub use cluster_idempotency::{
+    RequestedClusterArguments, CLUSTER_ARGUMENTS_INCONSISTENT_MESSAGE,
+};
+
 /// How an ARN a REQUEST supplies is read, and what it is refused for: the Region and the
 /// account segments checked before the identifier is resolved.
 mod request_arn;

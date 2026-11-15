@@ -2,8 +2,10 @@
 
 //! @op CreateCluster
 //! Creates a cluster and stores it; every response member is built from the stored
-//! record. A second create of a name that already exists returns the STORED cluster
-//! rather than adding a duplicate entry under the same name.
+//! record. A second create of a name that already exists is that create being made
+//! again: it returns the STORED cluster when every argument it supplies is the one the
+//! cluster carries, and is refused with `InvalidParameterException` when any of them
+//! differs, leaving the stored record untouched rather than rewriting it.
 //!
 //! ## Shape of an operation
 //!
@@ -319,6 +321,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // What this request asks the cluster to BE — every input member but the name,
+        // which is the identity a repeat is keyed on. Borrowed off the request before the
+        // store is locked, and read below only when the name is already taken.
+        let requested_arguments = crate::state::RequestedClusterArguments {
+            tags: input.tags.as_deref().unwrap_or_default(),
+            settings: input.settings.as_deref().unwrap_or_default(),
+            configuration: input.configuration.as_ref(),
+            capacity_providers: input.capacity_providers.as_deref().unwrap_or_default(),
+            default_capacity_provider_strategy: input
+                .default_capacity_provider_strategy
+                .as_deref()
+                .unwrap_or_default(),
+            service_connect_namespace: input
+                .service_connect_defaults
+                .as_ref()
+                .map(|defaults| defaults.namespace.as_str()),
+        };
+
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 
@@ -352,11 +372,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A cluster name identifies the cluster, so creating one that already exists is
-        // not a second cluster: the stored record is reported back unchanged. A DELETED
-        // cluster is only a tombstone, though ("The cluster has been deleted"), so its
-        // name is free again and this call creates a new, ACTIVE cluster over it.
+        // not a second cluster: it is this create being made again. A repeat that asks
+        // for the cluster that is stored is that call already having had its effect, so
+        // the stored record is reported back unchanged; a repeat that supplies a
+        // DIFFERENT argument asks for a cluster this one is not, and neither creates a
+        // second cluster nor rewrites the first — the configuration of an existing
+        // cluster is `UpdateCluster`'s and `UpdateClusterSettings`' to change
+        // ([`crate::state::RequestedClusterArguments`]). A DELETED cluster is only a
+        // tombstone, though ("The cluster has been deleted"), so its name is free again
+        // and this call creates a new, ACTIVE cluster over it.
         if let Some(existing) = guard.clusters.get(&name) {
             if existing.status != crate::state::CLUSTER_INACTIVE {
+                if let Some(message) = requested_arguments.inconsistency(existing) {
+                    return Err(CreateClusterErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(message.to_string()),
+                        },
+                    )
+                    .into());
+                }
                 // `CreateCluster`'s input shape models `tags`, so its answer materialises
                 // the cluster's tag set (see `cluster_mutation_view`).
                 let view = guard.cluster_mutation_view(existing, true);

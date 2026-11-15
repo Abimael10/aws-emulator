@@ -39,6 +39,8 @@ mod capacity_providers;
 mod classic_load_balancer_attachments;
 #[path = "all/cluster_capacity_and_statistics.rs"]
 mod cluster_capacity_and_statistics;
+#[path = "all/cluster_create_idempotency.rs"]
+mod cluster_create_idempotency;
 #[path = "all/cluster_mutations.rs"]
 mod cluster_mutations;
 #[path = "all/cluster_projection.rs"]
