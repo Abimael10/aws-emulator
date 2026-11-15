@@ -89,11 +89,12 @@ pub fn matches_glob(pattern: &str, subject: &str) -> bool {
 
 /// One response a distribution's edge holds in its cache.
 ///
-/// The ORIGIN'S OWN answer: the status, the bytes, and the two things the origin said about
-/// those bytes — their media type and the content coding they are already under — beside the
-/// instants that decide whether the entry may still be served. What the edge serves FROM it
-/// (the content coding one viewer negotiated) is computed per request rather than held, so
-/// one viewer's negotiation is never served to another.
+/// The ORIGIN'S OWN answer: the status, the bytes, and the headers the origin stated about
+/// them — the media type and the content coding the bytes are already under on their own
+/// members, and every other header the origin sent beside them — along with the instants that
+/// decide whether the entry may still be served. What the edge serves FROM it (the content
+/// coding one viewer negotiated) is computed per request rather than held, so one viewer's
+/// negotiation is never served to another.
 #[derive(Debug, Clone)]
 pub struct CachedEdgeResponse {
     /// The status the origin answered.
@@ -105,6 +106,10 @@ pub struct CachedEdgeResponse {
     /// `Content-Encoding` as the origin stated it — the coding its own bytes are under — or
     /// `None` for bytes the origin did not encode.
     pub content_encoding: Option<String>,
+    /// Every other response header the origin stated, lowercased and in the order it stated
+    /// them, so an answer served from this entry carries what the origin said about the
+    /// object exactly as an answer served from the origin does.
+    pub headers: Vec<(String, String)>,
     /// The path the viewer request carried, so an invalidation can be matched against
     /// this entry when a batch is created.
     pub path: String,

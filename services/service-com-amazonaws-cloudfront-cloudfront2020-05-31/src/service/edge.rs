@@ -140,6 +140,9 @@ pub mod access_logs;
 pub mod compression;
 /// WHICH headers, cookies and query strings the behaviour's policies key on and forward.
 pub mod forwarding;
+/// The CLOUDFRONT FUNCTION the matched behaviour associates, run on the viewer event it
+/// names.
+pub mod functions;
 /// The `CloudFront-*` request headers the edge generates itself, and the viewer-stated ones
 /// it drops.
 pub mod generated_headers;
@@ -163,8 +166,8 @@ use super::edge_metrics;
 use super::origin_access::{self, OriginAccess};
 use compression::Encoding;
 use crate::ops::types::{
-    AllowedMethods, CacheBehavior, DefaultCacheBehavior, ForwardedValues, Origin,
-    ResponseHeadersPolicyConfig, TrustedKeyGroups,
+    AllowedMethods, CacheBehavior, DefaultCacheBehavior, ForwardedValues, FunctionAssociations,
+    Origin, ResponseHeadersPolicyConfig, TrustedKeyGroups,
 };
 use crate::state::{
     managed_cache_policy, matches_path_pattern, same_domain, CachedEdgeResponse,
@@ -196,6 +199,16 @@ const CACHE_MISS: &str = "Miss from cloudfront";
 
 /// `X-Cache` for an answer CloudFront itself produced instead of the origin's.
 const CACHE_ERROR: &str = "Error from cloudfront";
+
+/// `X-Cache` for an answer a CloudFront FUNCTION generated: the function returned a response
+/// object on the viewer-request event, so neither the cache nor an origin produced the answer
+/// and CloudFront reports the function as what did ([`functions`]).
+const CACHE_FUNCTION_GENERATED: &str = "FunctionGeneratedResponse from cloudfront";
+
+/// `X-Cache` for the answer CloudFront produces when a function's RUN failed: the outcome
+/// names the function's execution as what went wrong, which is what separates it from a
+/// request the cache or an origin could not answer.
+const CACHE_FUNCTION_EXECUTION_ERROR: &str = "FunctionExecutionError from cloudfront";
 
 /// The response (and origin-request) header carrying the identifier of the request the
 /// edge served, from `X-Amz-Cf-Id`: "identifies the request that you're interested in".
@@ -256,6 +269,19 @@ const HTTPS_DEFAULT_PORT: i32 = 443;
 /// origin.
 const BAD_GATEWAY: u16 = 502;
 
+/// The status a viewer request gets when the CloudFront function the matched behaviour
+/// associates produced no event object for the edge to continue from — it raised, it did not
+/// compile, it returned something that is no event object, or a bound of the runtime stopped
+/// it. CloudFront answers a function failure `503`, having neither a request to fetch with
+/// nor a response to serve ([`functions`]).
+const FUNCTION_FAILED_STATUS: u16 = functions::FAILED_STATUS;
+
+/// The detail line CloudFront's generated page carries for that failure, which names the
+/// association rather than the request as the thing that could not be carried out.
+const FUNCTION_FAILED_DETAIL: &str =
+    "The CloudFront function associated with the CloudFront distribution is invalid or could \
+     not be executed.";
+
 /// The detail line CloudFront's generated page carries for a request it refused.
 const BAD_REQUEST_DETAIL: &str = "Bad request.";
 
@@ -308,6 +334,81 @@ const HEADERS_NEVER_FORWARDED: [&str; 12] = [
     // here rather than travelling on to an origin.
     response_headers::VIEWER_ORIGIN,
 ];
+
+/// The response headers an answer the edge serves does NOT carry over from the origin's own
+/// answer.
+///
+/// CloudFront serves the origin's response headers to the viewer — that is what carries an
+/// object's metadata, its validators and its cache directives through the edge — so this list
+/// is the exceptions, and each is here for one of three reasons:
+///
+/// * a HOP-BY-HOP header (RFC 9110 names them) describes the connection the edge made to the
+///   origin, not the object it fetched, so it cannot be relayed onto another connection;
+/// * `Content-Length`, `Content-Type` and `Content-Encoding` describe the bytes the edge is
+///   SERVING, which are not always the bytes the origin sent: an answer compressed for this
+///   viewer ([`compression`]) is a different length under a different coding, so the two the
+///   edge restates per request are held on [`OriginAnswer`] itself and the length is left to
+///   the connection that writes the body;
+/// * [`X_CACHE`] and [`X_AMZ_CF_ID`] are what the EDGE says about the request it just served
+///   ([`stamp`]), so a header an origin sent under those names describes a different request.
+const RESPONSE_HEADERS_NEVER_SERVED: [&str; 13] = [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+    CONTENT_TYPE,
+    CONTENT_ENCODING,
+    X_CACHE,
+    X_AMZ_CF_ID,
+];
+
+/// Whether the origin's own `name` response header travels on to the viewer
+/// ([`RESPONSE_HEADERS_NEVER_SERVED`] is the list of the ones that do not).
+///
+/// A header name is case-insensitive (RFC 9110), so the comparison is.
+fn is_served_from_origin(name: &str) -> bool {
+    !RESPONSE_HEADERS_NEVER_SERVED
+        .iter()
+        .any(|never| name.eq_ignore_ascii_case(never))
+}
+
+/// The most bytes of the origin's OWN response headers one answer carries over.
+///
+/// A bound of this EMULATOR's, not a CloudFront one: an answer held in the edge cache keeps
+/// these headers beside its bytes ([`MAX_CACHED_BODY_BYTES`] bounds those), so this is what
+/// bounds the rest of one entry however large a message an origin answers with. 8 KiB is the
+/// header budget a stock HTTP server allows a whole message, so an origin answering within what
+/// a server would accept loses nothing. The SAME set is served and cached, so an answer out of
+/// the cache carries exactly what the answer from the origin carried.
+const MAX_ORIGIN_HEADER_BYTES: usize = 8 * 1024;
+
+/// The origin's own response headers the edge carries over, lowercased and in the order the
+/// origin stated them, up to [`MAX_ORIGIN_HEADER_BYTES`].
+fn served_origin_headers(
+    headers: &::aws_smithy_runtime_api::http::Headers,
+    uri: &str,
+) -> Vec<(String, String)> {
+    let mut served: Vec<(String, String)> = Vec::new();
+    let mut bytes = 0usize;
+    for (name, value) in headers.iter().filter(|(name, _)| is_served_from_origin(name)) {
+        bytes = bytes.saturating_add(name.len()).saturating_add(value.len());
+        if bytes > MAX_ORIGIN_HEADER_BYTES {
+            ::tracing::warn!(
+                uri = %uri,
+                "this origin stated more response headers than the edge carries over, so the \
+                 rest of them are not served"
+            );
+            break;
+        }
+        served.push((name.to_ascii_lowercase(), value.to_string()));
+    }
+    served
+}
 
 /// The header a viewer asks for a content coding with, and the one an answer states its
 /// coding in: `Accept-Encoding` is normalized by the cache policy that enables gzip or
@@ -641,6 +742,9 @@ struct Behavior {
     /// `ResponseHeadersPolicyId` — the policy whose header groups the edge applies to the
     /// answer it serves this request ([`response_headers`]).
     response_headers_policy_id: Option<String>,
+    /// `FunctionAssociations` — "a list of CloudFront functions that are associated with a
+    /// cache behavior", each naming the viewer event its function runs on ([`functions`]).
+    function_associations: Option<FunctionAssociations>,
 }
 
 impl Behavior {
@@ -660,6 +764,7 @@ impl Behavior {
             max_ttl: behavior.max_ttl,
             forwarded_values: behavior.forwarded_values.clone(),
             response_headers_policy_id: behavior.response_headers_policy_id.clone(),
+            function_associations: behavior.function_associations.clone(),
         }
     }
 
@@ -679,6 +784,7 @@ impl Behavior {
             max_ttl: behavior.max_ttl,
             forwarded_values: behavior.forwarded_values.clone(),
             response_headers_policy_id: behavior.response_headers_policy_id.clone(),
+            function_associations: behavior.function_associations.clone(),
         }
     }
 
@@ -928,7 +1034,8 @@ enum Plan {
 }
 
 /// One answer an ORIGIN produced, as the edge holds it and serves it: the status, the bytes,
-/// and the two things the origin said about those bytes.
+/// and the headers the origin stated about them — the two the edge may have to restate per
+/// request held on their own members, and the rest as the origin sent them.
 ///
 /// What the edge serves FROM it — the content coding one viewer negotiated — is computed per
 /// request rather than held ([`served_origin_answer`]), so one viewer's negotiation is never
@@ -942,6 +1049,10 @@ struct OriginAnswer {
     /// `Content-Encoding` as the origin stated it — the coding its own bytes are under — or
     /// `None` for bytes the origin did not encode.
     content_encoding: Option<String>,
+    /// Every OTHER response header the origin stated, lowercased and in the order it stated
+    /// them: the edge serves the origin's own headers to the viewer, except the ones
+    /// [`RESPONSE_HEADERS_NEVER_SERVED`] names.
+    headers: Vec<(String, String)>,
 }
 
 /// One origin fetch the edge is to make, and what to do with what comes back.
@@ -988,19 +1099,25 @@ pub async fn serve<Eng: Send + Sync + 'static>(
     // When the edge RECEIVED this request, on the monotonic clock: the instant the origin
     // latency of an answer an origin produces is measured from ([`edge_metrics`]).
     let received = Instant::now();
+    let Some(state) = crate::state::service_state(engine) else {
+        return generated(BAD_GATEWAY, NO_ORIGIN_DETAIL, "");
+    };
+    // WHICH functions this request runs, read in the same pass that plans it: a CloudFront
+    // function runs on a request the edge is going to its cache or the origin for, so the
+    // association and its `LIVE` code are read here and the code runs further down, once the
+    // enforcement in front of the cache has had its say ([`functions`]).
     let cf_id;
+    let edge_functions;
     let served_for;
-    let plan;
+    let mut plan;
     let realtime_log;
     {
-        let Some(state) = crate::state::service_state(engine) else {
-            return generated(BAD_GATEWAY, NO_ORIGIN_DETAIL, "");
-        };
         let mut store = state.lock();
         // The edge reads the distribution as every other read does: through the clock,
         // which owes a just-created configuration its deployment.
         store.settle(now);
         cf_id = store.mint_edge_request_id();
+        edge_functions = associated_functions(&store, req);
         (served_for, plan) = plan_request(&store, req, &cf_id, now);
         // WHETHER this request's log data is delivered at all is the matched behaviour's
         // real-time log configuration to decide, and it is decided HERE, over the sequence of
@@ -1036,13 +1153,68 @@ pub async fn serve<Eng: Send + Sync + 'static>(
     if let Some(logged) = logged.as_ref() {
         ::service_com_amazonaws_wafv2_awswaf_20190729::service::logs::deliver(ctx, logged).await;
     }
-    let (mut response, served_from, origin_latency) = match edge_refusal {
-        Some(refusal) => (
+    // The viewer-REQUEST function, where the matched behaviour associates one, runs HERE: on a
+    // request the edge is about to read its cache or ask the origin for, and so only on one
+    // that got through everything CloudFront decides for itself in front of them — the
+    // distribution being enabled, its geographic restriction, the behaviour's
+    // `ViewerProtocolPolicy`, its `AllowedMethods`, its `TrustedKeyGroups` and the web ACL.
+    // A refusal any of those already decided is what the viewer receives, and no function of
+    // this distribution runs on it.
+    //
+    // What the function returns is what the edge continues with: the request it came back with
+    // is re-planned, so the cache key and the origin fetch are that request's; a response it
+    // generated itself is served with no origin request made at all; and a run that produced
+    // neither leaves the edge nothing to continue from ([`functions`]).
+    let mut rewritten = None;
+    let mut function_answer = None;
+    let running = edge_functions
+        .as_ref()
+        .filter(|_| edge_refusal.is_none() && matches!(plan, Plan::Hit { .. } | Plan::Fetch(_)))
+        .and_then(|running| {
+            running
+                .associations
+                .viewer_request
+                .as_ref()
+                .map(|associated| (running, associated))
+        });
+    if let Some((running, associated)) = running {
+        let event = function_event(running, req, &cf_id, &running.viewer_path, &running.query);
+        match functions::run_viewer_request(associated, &event).await {
+            functions::Rewritten::Request(request) => {
+                match rewritten_request(req, &running.viewer_path, &request) {
+                    Some(request) => {
+                        // Planned again, for the request the function returned: what the edge
+                        // keys on and asks the origin for is that request, and the enforcement
+                        // in front of the cache is applied to it as it was to the viewer's own.
+                        let store = state.lock();
+                        (_, plan) = plan_request(&store, &request, &cf_id, now);
+                        drop(store);
+                        rewritten = Some(request);
+                    }
+                    None => function_answer = Some(refused_by_function(&cf_id)),
+                }
+            }
+            functions::Rewritten::Response(response) => {
+                function_answer = Some(answer_of_function(response, &cf_id));
+            }
+            functions::Rewritten::Failed => {
+                function_answer = Some(refused_by_function(&cf_id));
+            }
+        }
+    }
+    // From here on the request is the one that function returned, where it returned one: the
+    // cache key, the origin fetch and the log record are all that request's.
+    let req = rewritten.as_ref().unwrap_or(req);
+    let (mut response, served_from, origin_latency) = match (edge_refusal, function_answer) {
+        (Some(refusal), _) => (
             refused_by_web_acl(refusal, &cf_id),
             edge_metrics::ServedFrom::CloudFront,
             None,
         ),
-        None => match plan {
+        // The answer a viewer-request function produced, or the page CloudFront generated
+        // because that function produced nothing: CloudFront's own either way.
+        (None, Some(answer)) => (answer, edge_metrics::ServedFrom::CloudFront, None),
+        (None, None) => match plan {
             Plan::Generated { status, detail } => (
                 generated(status, detail, &cf_id),
                 edge_metrics::ServedFrom::CloudFront,
@@ -1091,6 +1263,39 @@ pub async fn serve<Eng: Send + Sync + 'static>(
             response_headers::ViewerCors::of_request(req),
             &mut response,
         );
+    }
+    // The viewer-RESPONSE function, where the matched behaviour associates one: it is handed
+    // the answer the edge is about to serve and the answer it returns is the one the viewer
+    // gets, so it runs last — after everything else that touches the response — which is what
+    // the viewer-response event is. It runs on an answer an ORIGIN produced or the cache held,
+    // including an origin's own error: a page CloudFront generated itself is not an answer
+    // this event is raised for, and neither is a response a viewer-request function generated.
+    if let Some(associated) = edge_functions
+        .as_ref()
+        .filter(|_| {
+            matches!(
+                served_from,
+                edge_metrics::ServedFrom::Origin | edge_metrics::ServedFrom::EdgeCache
+            )
+        })
+        .and_then(|running| {
+            running
+                .associations
+                .viewer_response
+                .as_ref()
+                .map(|associated| (running, associated))
+        })
+    {
+        let (running, associated) = associated;
+        let (viewer_path, query) = match served_for.as_ref() {
+            Some(served) => (served.viewer_path.as_str(), served.query.as_str()),
+            None => (running.viewer_path.as_str(), running.query.as_str()),
+        };
+        let event = function_event(running, req, &cf_id, viewer_path, query);
+        response = match functions::run_viewer_response(associated, &event, &response).await {
+            Some(answered) => answered,
+            None => refused_by_function(&cf_id),
+        };
     }
     // What the edge DID with this request is reported as the distribution's own CloudWatch
     // series, whoever produced the answer: the counters and error rates a client watches a
@@ -1274,6 +1479,156 @@ struct ServedFor {
     /// account no longer holds). Its header groups are applied to whatever the edge serves
     /// ([`response_headers`]).
     response_headers_policy: Option<ResponseHeadersPolicyConfig>,
+}
+
+/// The distribution one viewer request resolved to and the CLOUDFRONT FUNCTIONS its matched
+/// cache behaviour associates, read in one pass under the store's lock before the edge does
+/// anything else with the request.
+///
+/// Held only for a request whose behaviour really associates a function: a behaviour that
+/// associates none costs this nothing beyond the resolution the plan makes anyway.
+#[derive(Debug)]
+struct EdgeFunctions {
+    /// `context.distributionId` of the event object.
+    distribution_id: String,
+    /// `context.distributionDomainName` of the event object — the name CloudFront assigned
+    /// the distribution, whichever of its names the viewer dialled.
+    domain_name: String,
+    /// The viewer path WITHIN the distribution, which is the `request.uri` the event states.
+    viewer_path: String,
+    /// The query string as the viewer sent it, which the event states as `request.querystring`.
+    query: String,
+    /// The functions the behaviour associates, by the event each runs on.
+    associations: functions::Associations,
+}
+
+/// The functions the behaviour this request's path selects associates, or `None` when the
+/// request resolves to no distribution of this account or its behaviour associates none.
+fn associated_functions(
+    store: &ComAmazonawsCloudfrontCloudfront20200531State,
+    req: &RtRequest,
+) -> Option<EdgeFunctions> {
+    let addressed = Addressed::of_request(req);
+    let resolved = resolve(store, &addressed)?;
+    // The SAME behaviour the plan is decided under: "CloudFront compares the path in the
+    // viewer request with the path patterns in the cache behaviors", and the path it compares
+    // is the one the viewer asked for — so which function runs is the viewer's own path to
+    // decide, whatever that function then rewrites.
+    let behavior = select_behavior(resolved.distribution, resolved.viewer_path);
+    let associations = functions::associations(store, behavior.function_associations.as_ref());
+    (!associations.is_empty()).then(|| EdgeFunctions {
+        distribution_id: resolved.distribution.id.clone(),
+        domain_name: resolved.distribution.domain_name.clone(),
+        viewer_path: resolved.viewer_path.to_string(),
+        query: addressed.query.to_string(),
+        associations,
+    })
+}
+
+/// The event object one of this request's functions is handed: what the edge resolved about
+/// the request, under the identifier of the request it is serving.
+fn function_event<'r>(
+    running: &'r EdgeFunctions,
+    req: &'r RtRequest,
+    cf_id: &'r str,
+    viewer_path: &'r str,
+    query: &'r str,
+) -> functions::Event<'r> {
+    functions::Event::of_request(
+        &running.distribution_id,
+        &running.domain_name,
+        cf_id,
+        // The ONE address this request has, read where every other reader of it reads it
+        // ([`generated_headers::viewer_address`]).
+        generated_headers::viewer_address(req),
+        req,
+        viewer_path,
+        query,
+    )
+}
+
+/// The request the edge plans after a viewer-request function rewrote it: the same request,
+/// under the URI, the query string and the headers that function returned.
+///
+/// The URI a function returns is the viewer path WITHIN the distribution, so it replaces
+/// exactly that part of the request's own URI: the scheme and authority the viewer dialled and
+/// the addressing that named the distribution belong to the connection rather than to the
+/// function, and are kept as they arrived.
+///
+/// `None` is a rewrite that renders no HTTP request at all — a URI or a header name the wire
+/// cannot carry — which leaves the edge no request to serve.
+fn rewritten_request(
+    req: &RtRequest,
+    viewer_path: &str,
+    rewrite: &functions::Request,
+) -> Option<RtRequest> {
+    let uri = req.uri();
+    let addressing = path_of(uri).strip_suffix(viewer_path).unwrap_or_default();
+    // "The request URI must begin with a forward slash": a URI a function returned without one
+    // names the same object at the root of the distribution.
+    let viewer_uri = if rewrite.uri.starts_with('/') {
+        rewrite.uri.clone()
+    } else {
+        format!("/{}", rewrite.uri)
+    };
+    let mut rebuilt = format!("{}{addressing}{viewer_uri}", uri_prefix(uri));
+    if !rewrite.query.is_empty() {
+        rebuilt.push('?');
+        rebuilt.push_str(&rewrite.query);
+    }
+    let body = req.body().bytes().map(<[u8]>::to_vec).unwrap_or_default();
+    // The METHOD is the viewer's: a CloudFront function does not choose the method of the
+    // request it was handed.
+    let mut builder = ::http::Request::builder()
+        .method(req.method())
+        .uri(&rebuilt);
+    for (name, value) in &rewrite.headers {
+        builder = builder.header(name, value);
+    }
+    let built = builder
+        .body(SdkBody::from(::bytes::Bytes::from(body)))
+        .map_err(|error| error.to_string())
+        .and_then(|request| RtRequest::try_from(request).map_err(|error| error.to_string()));
+    match built {
+        Ok(request) => Some(request),
+        Err(error) => {
+            ::tracing::warn!(
+                uri = %rebuilt,
+                %error,
+                "the request this cache behaviour's viewer-request function returned does not \
+                 render an HTTP request, so the edge has no request to serve"
+            );
+            None
+        }
+    }
+}
+
+/// The `scheme://authority` an ABSOLUTE request URI begins with, or the empty string for an
+/// origin-form one — the part of a request's URI that belongs to the connection it arrived on.
+fn uri_prefix(uri: &str) -> &str {
+    match uri.split_once("://") {
+        Some((scheme, rest)) => {
+            let authority = rest.find('/').unwrap_or(rest.len());
+            &uri[..scheme.len() + "://".len() + authority]
+        }
+        None => "",
+    }
+}
+
+/// The answer the edge serves for a response a viewer-request function GENERATED: the status,
+/// the headers and the bytes that function stated, reported as an answer CloudFront produced
+/// rather than one an origin did or the cache held.
+fn answer_of_function(answer: functions::Generated, cf_id: &str) -> RtResponse {
+    let mut response = served(
+        answer.status,
+        answer.body,
+        CACHE_FUNCTION_GENERATED,
+        cf_id,
+    );
+    for (name, value) in answer.headers {
+        let _ = response.headers_mut().try_append(name, value);
+    }
+    response
 }
 
 /// Decide what the edge does with one viewer request, under the store's lock, and name the
@@ -1466,6 +1821,7 @@ fn plan_resolved(
                     body: entry.body.clone(),
                     content_type: entry.content_type.clone(),
                     content_encoding: entry.content_encoding.clone(),
+                    headers: entry.headers.clone(),
                 },
                 encode,
             };
@@ -2073,6 +2429,9 @@ async fn fetch_origin<Eng: Send + Sync + 'static>(
         .headers()
         .get(CONTENT_ENCODING)
         .map(ToString::to_string);
+    // And everything ELSE the origin stated about its answer, which the edge serves to the
+    // viewer as the origin stated it ([`RESPONSE_HEADERS_NEVER_SERVED`] is what it does not).
+    let headers = served_origin_headers(response.headers(), &fetch.uri);
     let body = response
         .into_body()
         .bytes()
@@ -2091,6 +2450,7 @@ async fn fetch_origin<Eng: Send + Sync + 'static>(
         body,
         content_type,
         content_encoding,
+        headers,
     };
     if let Some(directive) = fetch.cache {
         // The status the edge may hold at all; the size bound the entry has to stay within is
@@ -2229,6 +2589,7 @@ fn cache<Eng: Send + Sync + 'static>(
             body: answer.body.clone(),
             content_type: answer.content_type.clone(),
             content_encoding: answer.content_encoding.clone(),
+            headers: answer.headers.clone(),
             path: viewer_path.to_string(),
             stored_at: now,
             expires_at,
@@ -2265,6 +2626,14 @@ fn served_origin_answer(
         }
     }
     let mut response = served(answer.status, body, x_cache, cf_id);
+    // The origin's own headers, as the origin stated them: appended rather than set, so a
+    // header the origin stated more than once (a `Set-Cookie` per cookie) reaches the viewer
+    // as many times as the origin sent it.
+    for (name, value) in &answer.headers {
+        let _ = response
+            .headers_mut()
+            .try_append(name.clone(), value.clone());
+    }
     if let Some(content_type) = content_type {
         let _ = response
             .headers_mut()
@@ -2289,6 +2658,12 @@ fn served(status: u16, body: Vec<u8>, x_cache: &str, cf_id: &str) -> RtResponse 
 /// status, the sentence it heads the page with, the detail line for that failure, and the
 /// identifier of the request it answered, which is what a report to AWS Support quotes.
 fn generated(status: u16, detail: &str, cf_id: &str) -> RtResponse {
+    generated_page(status, detail, cf_id, CACHE_ERROR)
+}
+
+/// [`generated`] under the cache outcome `x_cache` states: the page is the same one, and what
+/// differs is WHAT CloudFront reports as having produced it.
+fn generated_page(status: u16, detail: &str, cf_id: &str, x_cache: &str) -> RtResponse {
     let page = format!(
         "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \
          \"http://www.w3.org/TR/html4/loose.dtd\">\n\
@@ -2313,8 +2688,21 @@ fn generated(status: u16, detail: &str, cf_id: &str) -> RtResponse {
     let _ = response
         .headers_mut()
         .try_insert("server", SERVER.to_string());
-    stamp(&mut response, CACHE_ERROR, cf_id);
+    stamp(&mut response, x_cache, cf_id);
     response
+}
+
+/// The answer the edge serves when the CloudFront function the matched behaviour associates
+/// produced no event object to continue from: CloudFront's own `503` page, reported under the
+/// cache outcome that names the function's EXECUTION as what failed rather than the cache or
+/// an origin ([`CACHE_FUNCTION_EXECUTION_ERROR`]).
+fn refused_by_function(cf_id: &str) -> RtResponse {
+    generated_page(
+        FUNCTION_FAILED_STATUS,
+        FUNCTION_FAILED_DETAIL,
+        cf_id,
+        CACHE_FUNCTION_EXECUTION_ERROR,
+    )
 }
 
 /// The redirect CloudFront answers a viewer whose behaviour is `redirect-to-https`: the
@@ -2412,6 +2800,109 @@ mod tests {
 
     use super::*;
     use crate::ops::types::CustomOriginConfig;
+
+    #[test]
+    fn the_origins_own_response_headers_are_served_except_the_listed_ones() {
+        // Rows differ along WHY a header is or is not relayed: a header the origin stated
+        // about the object, each class the exclusion list carries (a hop-by-hop header, the
+        // three that describe the bytes being served, the two the edge states itself), the
+        // same names spelled in another case, and a name that merely resembles one of them.
+        let cases: [(&str, &str, bool); 13] = [
+            ("the object's entity tag", "etag", true),
+            ("a cache directive", "cache-control", true),
+            ("user metadata", "x-amz-meta-note", true),
+            ("a cookie the origin set", "set-cookie", true),
+            ("a header name in upper case", "ETag", true),
+            ("a hop-by-hop header", "connection", false),
+            ("another hop-by-hop header", "transfer-encoding", false),
+            ("a hop-by-hop header in mixed case", "Keep-Alive", false),
+            ("the length of the bytes served", "content-length", false),
+            ("the media type the edge restates", "content-type", false),
+            ("the coding the edge restates", "content-encoding", false),
+            ("the cache outcome the edge states", X_CACHE, false),
+            ("a name that merely resembles one", "x-connection-note", true),
+        ];
+        for (case, name, expected) in cases {
+            let actual = is_served_from_origin(name);
+            assert_eq!(
+                actual, expected,
+                "case {case:?} ({name:?}): expected is_served_from_origin == {expected}, got \
+                 {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rewritten_uri_keeps_the_addressing_the_viewer_dialled() {
+        // Rows differ along the addressing the request arrived under (a distribution's own
+        // host in origin form, the same absolute, the reserved data-plane path), along what
+        // the function returned for the URI (a path, a path with no leading slash) and along
+        // whether it returned a query string.
+        // (case, the request's URI, the viewer path within the distribution, the URI the
+        //  function returned, the query it returned, the URI the edge then serves)
+        type Row = (&'static str, &'static str, &'static str, &'static str, &'static str, &'static str);
+        let cases: [Row; 5] = [
+            (
+                "a host-addressed request",
+                "/original.txt",
+                "/original.txt",
+                "/rewritten.txt",
+                "",
+                "/rewritten.txt",
+            ),
+            (
+                "an absolute request URI",
+                "http://d111.cloudfront.net/original.txt",
+                "/original.txt",
+                "/rewritten.txt",
+                "",
+                "http://d111.cloudfront.net/rewritten.txt",
+            ),
+            (
+                "the reserved data-plane path",
+                "/_aws/cloudfront/E123/original.txt",
+                "/original.txt",
+                "/rewritten.txt",
+                "",
+                "/_aws/cloudfront/E123/rewritten.txt",
+            ),
+            (
+                "a URI the function returned without a leading slash",
+                "/original.txt",
+                "/original.txt",
+                "rewritten.txt",
+                "",
+                "/rewritten.txt",
+            ),
+            (
+                "a query string the function returned",
+                "/original.txt?a=1",
+                "/original.txt",
+                "/rewritten.txt",
+                "b=2",
+                "/rewritten.txt?b=2",
+            ),
+        ];
+        for (case, uri, viewer_path, rewritten, query, expected) in cases {
+            let mut req = RtRequest::new(SdkBody::empty());
+            req.set_uri(uri.to_string()).expect("a valid URI");
+            req.headers_mut()
+                .insert("host".to_string(), "d111.cloudfront.net".to_string());
+            let rewrite = functions::Request {
+                uri: rewritten.to_string(),
+                query: query.to_string(),
+                headers: vec![("host".to_string(), "d111.cloudfront.net".to_string())],
+            };
+            let request =
+                rewritten_request(&req, viewer_path, &rewrite).expect("the rewrite renders");
+            assert_eq!(
+                request.uri(),
+                expected,
+                "case {case:?}: expected the edge to serve {expected:?}, got {:?}",
+                request.uri()
+            );
+        }
+    }
 
     #[test]
     fn a_uri_is_split_into_its_path_and_its_query() {
@@ -2719,6 +3210,7 @@ mod tests {
                 max_ttl: None,
                 forwarded_values: None,
                 response_headers_policy_id: None,
+                function_associations: None,
             };
             let mut req = RtRequest::new(SdkBody::empty());
             req.set_uri("/index.html").expect("a valid URI");
@@ -3007,6 +3499,7 @@ mod tests {
             max_ttl: None,
             forwarded_values: None,
             response_headers_policy_id: None,
+            function_associations: None,
         }
     }
 
