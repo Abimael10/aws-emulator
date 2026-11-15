@@ -556,17 +556,22 @@ async fn a_repeat_create_of_one_name_is_refused_and_changes_nothing() {
             Some("ResourceAlreadyExistsException"),
             "case {label:?}: expected ResourceAlreadyExistsException, got {second:?}"
         );
-        // The refusal is built from the request: it names the rule that exists and
-        // the ARN it was minted with.
+        // The refusal is this family's sentence, with the rule name single-quoted, and
+        // carries no identity of the rule that exists.
         assert_eq!(
-            second.text("resourceId").as_deref(),
-            Some(rule_name),
-            "case {label:?}: the refusal must name the rule that exists, got {second:?}"
+            second.text("message"),
+            Some(format!("Topic Rule '{rule_name}' already exists for account")),
+            "case {label:?}: expected the topic-rule family's conflict sentence, got {second:?}"
         );
         assert_eq!(
-            second.text("resourceArn"),
-            Some(expected_arn(REGION, rule_name)),
-            "case {label:?}: the refusal must name the existing rule's ARN, got {second:?}"
+            second.body.get("resourceId"),
+            None,
+            "case {label:?}: this refusal sends no resourceId, got {second:?}"
+        );
+        assert_eq!(
+            second.body.get("resourceArn"),
+            None,
+            "case {label:?}: this refusal sends no resourceArn, got {second:?}"
         );
 
         let after = emulator.get_rule(rule_name).await;

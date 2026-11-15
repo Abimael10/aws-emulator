@@ -222,17 +222,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // namespace — the model binds `thingGroupName` as the `@httpLabel` of both
         // `/thing-groups/{thingGroupName}` and `/dynamic-thing-groups/{thingGroupName}`
         // — so a name already taken by a group of either kind is the modelled
-        // `ResourceAlreadyExistsException` (HTTP 409).
+        // `ResourceAlreadyExistsException` (HTTP 409), worded as the thing-group family
+        // words a taken name and carrying no identity of the group that holds it.
         if let Some(existing) = store.thing_groups.get(&input.thing_group_name) {
             return Err(
                 CreateDynamicThingGroupErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
-                        message: Some(format!(
-                            "Thing group {} already exists",
-                            existing.thing_group_name
+                        message: Some(crate::state::existing_thing_group_message(
+                            &existing.thing_group_name,
                         )),
-                        resource_id: Some(existing.thing_group_name.clone()),
-                        resource_arn: Some(existing.thing_group_arn.clone()),
+                        resource_id: None,
+                        resource_arn: None,
                     },
                 )
                 .into(),

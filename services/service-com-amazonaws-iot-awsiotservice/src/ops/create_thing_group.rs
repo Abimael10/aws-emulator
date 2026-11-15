@@ -213,14 +213,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ResourceAlreadyExistsException` (HTTP 409).
         if let Some(existing) = store.thing_groups.get(&input.thing_group_name) {
             if existing.configuration != requested {
+                // The 409 carries this family's sentence alone: the conflicting
+                // dimension for a group is its PROPERTIES, and AWS reports no
+                // `resourceId`/`resourceArn` for the group that already exists.
                 return Err(CreateThingGroupErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
-                        message: Some(format!(
-                            "Thing group {} already exists with a different configuration",
-                            existing.thing_group_name
+                        message: Some(crate::state::existing_thing_group_message(
+                            &existing.thing_group_name,
                         )),
-                        resource_id: Some(existing.thing_group_name.clone()),
-                        resource_arn: Some(existing.thing_group_arn.clone()),
+                        resource_id: None,
+                        resource_arn: None,
                     },
                 )
                 .into());

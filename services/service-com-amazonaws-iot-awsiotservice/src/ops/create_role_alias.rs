@@ -209,9 +209,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(existing) = store.role_aliases.get(&input.role_alias) {
             return Err(CreateRoleAliasErrorModeled::ResourceAlreadyExistsException(
                 ResourceAlreadyExistsException {
-                    message: Some(format!(
-                        "RoleAlias cannot be created - name already exists (name={})",
-                        existing.role_alias
+                    message: Some(crate::state::existing_role_alias_message(
+                        &existing.role_alias,
                     )),
                     resource_id: Some(existing.role_alias.clone()),
                     resource_arn: Some(existing.role_alias_arn.clone()),

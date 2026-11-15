@@ -184,10 +184,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // which is what this operation's `ConflictException` (HTTP 409, "The
             // request conflicts with the current state of the resource") names.
             // Changing a package that exists is `UpdatePackage`'s job, so nothing is
-            // overwritten here.
+            // overwritten here. This family states the collision as the conditional
+            // check that failed on a duplicate REQUEST, and sends no `resourceId`.
             return Err(CreatePackageErrorModeled::ConflictException(ConflictException {
-                message: Some(format!("Package {} already exists", existing.package_name)),
-                resource_id: Some(existing.package_name.clone()),
+                message: Some(crate::state::existing_package_message(
+                    &existing.package_name,
+                )),
+                resource_id: None,
             })
             .into());
         }

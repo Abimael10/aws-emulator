@@ -429,15 +429,24 @@ async fn recreating_a_thing_with_a_different_configuration_is_refused() {
             Some("ResourceAlreadyExistsException"),
             "case {label:?}: expected ResourceAlreadyExistsException, got {second:?}"
         );
+        // The 409 carries this family's sentence alone: AWS reports neither the
+        // existing record's id nor its ARN in it.
         assert_eq!(
-            second.text("resourceId").as_deref(),
-            Some(thing_name.as_str()),
-            "case {label:?}: the refusal names the resource that exists, got {second:?}"
+            second.text("message"),
+            Some(format!(
+                "Thing {thing_name} already exists in account with different attributes"
+            )),
+            "case {label:?}: expected the thing family's conflict sentence, got {second:?}"
         );
         assert_eq!(
-            second.text("resourceArn"),
-            Some(expected_arn(REGION, &thing_name)),
-            "case {label:?}: the refusal carries the existing thing's ARN, got {second:?}"
+            second.body.get("resourceId"),
+            None,
+            "case {label:?}: this refusal sends no resourceId, got {second:?}"
+        );
+        assert_eq!(
+            second.body.get("resourceArn"),
+            None,
+            "case {label:?}: this refusal sends no resourceArn, got {second:?}"
         );
 
         // The refused create wrote NOTHING: the registry still holds the first one.

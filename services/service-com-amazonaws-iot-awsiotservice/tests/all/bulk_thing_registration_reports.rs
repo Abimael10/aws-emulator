@@ -602,7 +602,7 @@ async fn a_tasks_reports_are_the_links_to_the_run_it_performed() {
             results: vec![result_row(2, "free-1")],
             errors: vec![error_row(
                 1,
-                "Thing taken-1 already exists with a different configuration",
+                "Thing taken-1 already exists in account with different attributes",
             )],
         },
         Row {

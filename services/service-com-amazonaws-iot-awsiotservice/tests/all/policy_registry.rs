@@ -650,6 +650,13 @@ async fn a_repeat_create_is_refused_and_changes_nothing() {
             "case {label:?}: expected ResourceAlreadyExistsException, got {second:?}"
         );
         assert_eq!(
+            second.text("message"),
+            Some(format!(
+                "Policy cannot be created - name already exists (name={policy_name})"
+            )),
+            "case {label:?}: expected the policy family's conflict sentence, got {second:?}"
+        );
+        assert_eq!(
             second.text("resourceId").as_deref(),
             Some(policy_name.as_str()),
             "case {label:?}: the refusal names the resource that exists, got {second:?}"

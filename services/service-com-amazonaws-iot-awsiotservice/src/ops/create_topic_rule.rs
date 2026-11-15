@@ -187,16 +187,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already holds is refused rather than silently replacing the rule — that is
         // what `ReplaceTopicRule` is for. `ResourceAlreadyExistsException` ("The
         // resource already exists", HTTP 409) is the modelled error for exactly this,
-        // and it names the rule and the ARN that already exist.
+        // and it carries this family's sentence alone: the rule name single-quoted,
+        // with no `resourceId`/`resourceArn` for the rule that already exists.
         if let Some(existing) = store.topic_rules.get(&input.rule_name) {
             return Err(CreateTopicRuleErrorModeled::ResourceAlreadyExistsException(
                 ResourceAlreadyExistsException {
-                    message: Some(format!(
-                        "Rule with given name already exists (name={})",
-                        existing.rule_name
+                    message: Some(crate::state::existing_topic_rule_message(
+                        &existing.rule_name,
                     )),
-                    resource_id: Some(existing.rule_name.clone()),
-                    resource_arn: Some(existing.rule_arn.clone()),
+                    resource_id: None,
+                    resource_arn: None,
                 },
             )
             .into());

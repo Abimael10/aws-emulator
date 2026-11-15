@@ -401,9 +401,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateOTAUpdateErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
-                        message: Some(format!("Job {} already exists", existing.job_id)),
-                        resource_id: Some(existing.job_id.clone()),
-                        resource_arn: Some(existing.job_arn.clone()),
+                        message: Some(crate::state::existing_job_message(&existing.job_id)),
+                        resource_id: None,
+                        resource_arn: None,
                     },
                 )
                 .into(),
@@ -483,7 +483,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             aws_iot_job_arn: Some(ota_update.aws_iot_job_arn.clone()),
             ota_update_status: Some(ota_update.status.clone()),
         };
-        let (job_id, job_arn) = (job.job_id.clone(), job.job_arn.clone());
+        let job_id = job.job_id.clone();
         // The store refuses the same two cases checked above, under the one lock this
         // whole decision is taken under — so each is answered with the modelled error
         // for that case here as well, and a refused register writes nothing.
@@ -492,9 +492,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::iot_jobs::RegisterRefusal::AlreadyRegistered => {
                     CreateOTAUpdateErrorModeled::ResourceAlreadyExistsException(
                         ResourceAlreadyExistsException {
-                            message: Some(format!("Job {job_id} already exists")),
-                            resource_id: Some(job_id),
-                            resource_arn: Some(job_arn),
+                            message: Some(crate::state::existing_job_message(&job_id)),
+                            resource_id: None,
+                            resource_arn: None,
                         },
                     )
                     .into()

@@ -286,14 +286,9 @@ pub enum ThingRegistrationRefusal {
     DeprecatedThingType(String),
     /// `billingGroupName` names no billing group this account holds.
     MissingBillingGroup(String),
-    /// The name is registered already, with a DIFFERENT configuration — carrying the
-    /// identity of the record it holds, which a conflict reports.
-    AlreadyRegistered {
-        /// The registered thing's name, as `ResourceAlreadyExistsException$resourceId`.
-        thing_name: String,
-        /// Its ARN, as `ResourceAlreadyExistsException$resourceArn`.
-        thing_arn: String,
-    },
+    /// The name is registered already, with a DIFFERENT configuration — carrying the name
+    /// the request asked for, which this family's conflict sentence states.
+    AlreadyRegistered(String),
 }
 
 impl ThingRegistrationRefusal {
@@ -312,9 +307,7 @@ impl ThingRegistrationRefusal {
             Self::MissingBillingGroup(billing_group_name) => {
                 format!("Billing group {billing_group_name} does not exist")
             }
-            Self::AlreadyRegistered { thing_name, .. } => {
-                format!("Thing {thing_name} already exists with a different configuration")
-            }
+            Self::AlreadyRegistered(thing_name) => existing_thing_message(thing_name),
         }
     }
 }
@@ -1083,10 +1076,9 @@ impl ComAmazonawsIotAwsiotserviceState {
         }
         if let Some(existing) = self.things.get(&thing_name) {
             if existing.configuration != configuration {
-                return Err(ThingRegistrationRefusal::AlreadyRegistered {
-                    thing_name: existing.thing_name.clone(),
-                    thing_arn: existing.thing_arn.clone(),
-                });
+                return Err(ThingRegistrationRefusal::AlreadyRegistered(
+                    existing.thing_name.clone(),
+                ));
             }
             // The repeat register names the SAME thing: it mints no new identity and writes
             // nothing, so a client that retried keeps the id and ARN of the first write.
@@ -3051,6 +3043,17 @@ pub use not_found::{
     missing_job_message, missing_thing_group_message, missing_thing_message,
     missing_thing_type_message, unrecognized_index_name_message,
     MISSING_THING_REGISTRATION_TASK_MESSAGE,
+};
+
+// How a create whose name is already taken is REFUSED — the fixed sentence each resource
+// family states such a collision with — lives in `state/already_exists.rs`, beside the
+// not-found sentences for the same reason. Its names are re-exported here so a handler
+// reaches them as `crate::state::<name>`.
+pub mod already_exists;
+pub use already_exists::{
+    existing_command_message, existing_job_message, existing_package_message,
+    existing_policy_message, existing_role_alias_message, existing_thing_group_message,
+    existing_thing_message, existing_thing_type_message, existing_topic_rule_message,
 };
 
 // What an AWS-MANAGED JOB TEMPLATE is — the published catalog `ListManagedJobTemplates`

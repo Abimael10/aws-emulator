@@ -256,11 +256,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "A unique identifier for the command": a second create under an id the store
         // already holds is the conflict `ConflictException` (HTTP 409, "The request
         // conflicts with the current state of the resource") names, and it leaves the
-        // command that exists exactly as it was.
+        // command that exists exactly as it was. The body carries the commands plane's
+        // sentence alone: `resourceId` is a member AWS does not send for this refusal.
         if let Some(existing) = store.commands.get(&input.command_id) {
             return Err(CreateCommandErrorModeled::ConflictException(ConflictException {
-                message: Some(format!("Command {} already exists", existing.command_id)),
-                resource_id: Some(existing.command_id.clone()),
+                message: Some(crate::state::existing_command_message(&existing.command_id)),
+                resource_id: None,
             })
             .into());
         }
@@ -273,8 +274,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(match refusal {
                 crate::state::iot_commands::RegisterRefusal::AlreadyRegistered => {
                     CreateCommandErrorModeled::ConflictException(ConflictException {
-                        message: Some(format!("Command {} already exists", input.command_id)),
-                        resource_id: Some(input.command_id.clone()),
+                        message: Some(crate::state::existing_command_message(&input.command_id)),
+                        resource_id: None,
                     })
                     .into()
                 }

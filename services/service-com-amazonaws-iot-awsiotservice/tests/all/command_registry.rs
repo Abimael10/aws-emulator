@@ -550,11 +550,17 @@ async fn a_repeat_create_of_one_command_id_is_refused_and_changes_nothing() {
             Some("ConflictException"),
             "case {label:?}: expected ConflictException, got {second:?}"
         );
-        // The refusal is built from the request: it names the command that exists.
+        // The refusal is the commands plane's sentence, built from the request, and
+        // carries no `resourceId` for the command that exists.
         assert_eq!(
-            second.text("resourceId").as_deref(),
-            Some(command_id),
-            "case {label:?}: the refusal must name the command that exists, got {second:?}"
+            second.text("message"),
+            Some(format!("Command {command_id} already exists.")),
+            "case {label:?}: expected the commands plane's conflict sentence, got {second:?}"
+        );
+        assert_eq!(
+            second.body.get("resourceId"),
+            None,
+            "case {label:?}: this refusal sends no resourceId, got {second:?}"
         );
 
         let after = emulator.get_command(command_id).await;

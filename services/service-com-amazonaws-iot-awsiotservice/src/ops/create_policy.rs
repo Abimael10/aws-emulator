@@ -207,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(existing) = store.policies.get(&input.policy_name) {
             return Err(CreatePolicyErrorModeled::ResourceAlreadyExistsException(
                 ResourceAlreadyExistsException {
-                    message: Some(format!("Policy {} already exists", existing.policy_name)),
+                    message: Some(crate::state::existing_policy_message(&existing.policy_name)),
                     resource_id: Some(existing.policy_name.clone()),
                     resource_arn: Some(existing.policy_arn.clone()),
                 },

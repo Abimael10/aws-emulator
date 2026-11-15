@@ -1350,3 +1350,21 @@ mod cloudtrail_iam_credential_write_audit;
 // `all/declaration_roots_are_canonical_and_complete.rs` check the shape rather than restate
 // it. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING
 // test it explains; the notes earlier landings appended here live in `all/appended_notes.rs`.
+// Single integration-test target for the router: a canonical DECLARATION LIST.
+// This file holds this header and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair
+// per suite file under `tests/all/`, sorted by name, and no other line. Put a new suite at
+// `tests/all/<name>.rs` and insert its pair where its name sorts to.
+// deliberate: an inner doc comment is legal only before the first item, so one appended past
+// the declarations is `E0753` and compiles no suite of this target — which is what the
+// re-typed copies of this header that concurrent landings kept appending had done. With no
+// inner doc comment anywhere in the file, no merge of two landings can leave one past the
+// level of `tests/` fails the build; and a suite declared twice is `E0428`. Each of those
+// fails every suite in this target. `tests/all.rs` is a test-target CRATE ROOT, so a bare
+// `mod` resolves to a SIBLING (`tests/<name>.rs`), which the layout check refuses: the
+// `#[path]` above each `mod` is what points it into `tests/all/`.
+// `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`
+// check those rules, for this file and for every service crate's `tests/all.rs`, so check
+// there rather than leaving a note here. What a suite covers, and why it belongs to this
+// cross-service target rather than to one service crate's own, is stated in that suite's own
+// module header; a note about this file itself belongs in `all/appended_notes.rs`, declared
+// below like any other module.

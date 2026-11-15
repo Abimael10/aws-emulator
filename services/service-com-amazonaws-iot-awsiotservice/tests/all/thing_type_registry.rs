@@ -756,15 +756,25 @@ async fn recreating_a_thing_type_with_a_different_configuration_is_refused() {
             Some("ResourceAlreadyExistsException"),
             "case {label:?}: expected ResourceAlreadyExistsException, got {second:?}"
         );
+        // The 409 carries this family's sentence alone — no identity of the type that
+        // already exists.
         assert_eq!(
-            second.text("resourceId").as_deref(),
-            Some(thing_type_name.as_str()),
-            "case {label:?}: the refusal must name the thing type as its resourceId, got {second:?}"
+            second.text("message"),
+            Some(format!(
+                "Thing Type {thing_type_name} already exists in current account with \
+                 different properties"
+            )),
+            "case {label:?}: expected the thing-type family's conflict sentence, got {second:?}"
         );
         assert_eq!(
-            second.text("resourceArn"),
-            Some(expected_arn(REGION, &thing_type_name)),
-            "case {label:?}: the refusal must name the stored ARN, got {second:?}"
+            second.body.get("resourceId"),
+            None,
+            "case {label:?}: this refusal sends no resourceId, got {second:?}"
+        );
+        assert_eq!(
+            second.body.get("resourceArn"),
+            None,
+            "case {label:?}: this refusal sends no resourceArn, got {second:?}"
         );
 
         // The refused create changed nothing: the first configuration is still what

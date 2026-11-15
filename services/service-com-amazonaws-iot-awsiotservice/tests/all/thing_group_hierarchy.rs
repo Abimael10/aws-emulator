@@ -662,15 +662,25 @@ async fn recreating_a_thing_group_with_a_different_configuration_is_refused() {
             Some("ResourceAlreadyExistsException"),
             "case {label:?}: expected ResourceAlreadyExistsException, got {second:?}"
         );
+        // The 409 carries this family's sentence alone — no identity of the group that
+        // already exists.
         assert_eq!(
-            second.text("resourceId").as_deref(),
-            Some(thing_group_name.as_str()),
-            "case {label:?}: the refusal names the resource that exists, got {second:?}"
+            second.text("message"),
+            Some(format!(
+                "Thing Group {thing_group_name} already exists in current account with \
+                 different properties"
+            )),
+            "case {label:?}: expected the thing-group family's conflict sentence, got {second:?}"
         );
         assert_eq!(
-            second.text("resourceArn"),
-            Some(expected_arn(REGION, &thing_group_name)),
-            "case {label:?}: the refusal carries the existing group's ARN, got {second:?}"
+            second.body.get("resourceId"),
+            None,
+            "case {label:?}: this refusal sends no resourceId, got {second:?}"
+        );
+        assert_eq!(
+            second.body.get("resourceArn"),
+            None,
+            "case {label:?}: this refusal sends no resourceArn, got {second:?}"
         );
 
         // The refused create wrote NOTHING: the registry still holds the first one.

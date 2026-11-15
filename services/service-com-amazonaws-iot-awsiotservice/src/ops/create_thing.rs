@@ -212,16 +212,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             message,
                         })
                     }
-                    crate::state::ThingRegistrationRefusal::AlreadyRegistered {
-                        thing_name,
-                        thing_arn,
-                    } => CreateThingErrorModeled::ResourceAlreadyExistsException(
-                        ResourceAlreadyExistsException {
-                            message,
-                            resource_id: Some(thing_name),
-                            resource_arn: Some(thing_arn),
-                        },
-                    ),
+                    // A name the registry holds with a DIFFERENT configuration is this
+                    // family's conflict. The 409 carries the family's sentence alone:
+                    // AWS does not report the record that already exists here, so
+                    // `resourceId`/`resourceArn` stay absent rather than echoing the
+                    // name and ARN back in a body shape the caller does not expect.
+                    crate::state::ThingRegistrationRefusal::AlreadyRegistered(_) => {
+                        CreateThingErrorModeled::ResourceAlreadyExistsException(
+                            ResourceAlreadyExistsException {
+                                message,
+                                resource_id: None,
+                                resource_arn: None,
+                            },
+                        )
+                    }
                 }
             })?;
 

@@ -386,13 +386,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "A job identifier which must be unique for your account": a second
         // CreateJob under a live job's id is the conflict
-        // `ResourceAlreadyExistsException` (HTTP 409) names.
+        // `ResourceAlreadyExistsException` (HTTP 409) names. The body carries the jobs
+        // plane's sentence alone — AWS reports neither `resourceId` nor `resourceArn`
+        // for the job that already exists.
         if let Some(existing) = registry.job(&job.job_id) {
             return Err(CreateJobErrorModeled::ResourceAlreadyExistsException(
                 ResourceAlreadyExistsException {
-                    message: Some(format!("Job {} already exists", existing.job_id)),
-                    resource_id: Some(existing.job_id.clone()),
-                    resource_arn: Some(existing.job_arn.clone()),
+                    message: Some(crate::state::existing_job_message(&existing.job_id)),
+                    resource_id: None,
+                    resource_arn: None,
                 },
             )
             .into());
@@ -455,7 +457,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             job_id: Some(job.job_id.clone()),
             description: job.description.clone(),
         };
-        let (job_id, job_arn) = (job.job_id.clone(), job.job_arn.clone());
+        let job_id = job.job_id.clone();
         // The store refuses the same two cases checked above, under the one lock this
         // whole decision is taken under — so each is answered with the modelled error
         // for that case here as well, and a refused register writes nothing.
@@ -464,9 +466,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::iot_jobs::RegisterRefusal::AlreadyRegistered => {
                     CreateJobErrorModeled::ResourceAlreadyExistsException(
                         ResourceAlreadyExistsException {
-                            message: Some(format!("Job {job_id} already exists")),
-                            resource_id: Some(job_id),
-                            resource_arn: Some(job_arn),
+                            message: Some(crate::state::existing_job_message(&job_id)),
+                            resource_id: None,
+                            resource_arn: None,
                         },
                     )
                     .into()

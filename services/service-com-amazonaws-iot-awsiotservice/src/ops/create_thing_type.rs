@@ -231,14 +231,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ResourceAlreadyExistsException is thrown."
         if let Some(existing) = store.thing_types.get(&input.thing_type_name) {
             if existing.configuration != requested {
+                // The 409 carries this family's sentence alone — the thing-group
+                // family's wording with this family's noun — and no identity of the
+                // type that already exists.
                 return Err(CreateThingTypeErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
-                        message: Some(format!(
-                            "Thing type {} already exists with a different configuration",
-                            existing.thing_type_name
+                        message: Some(crate::state::existing_thing_type_message(
+                            &existing.thing_type_name,
                         )),
-                        resource_id: Some(existing.thing_type_name.clone()),
-                        resource_arn: Some(existing.thing_type_arn.clone()),
+                        resource_id: None,
+                        resource_arn: None,
                     },
                 )
                 .into());

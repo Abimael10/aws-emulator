@@ -11,6 +11,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_audit_configuration.rs"]
 mod account_audit_configuration;
+#[path = "all/already_exists_wording.rs"]
+mod already_exists_wording;
 #[path = "all/authorization_decision.rs"]
 mod authorization_decision;
 #[path = "all/authorizer_registry.rs"]
