@@ -2465,3 +2465,17 @@ mod appended_prose;
 // The lint allowed below is for the suite files this root compiles: a wrapped paragraph in
 // one of their module headers is a note rather than a build failure. An inner attribute, like
 // an inner doc comment, is legal only before the first item, so it stands here.
+// duplicate, re-word or mistype. What a suite covers, and why it drives the assembled router
+// rather than one service crate, belongs in that suite's own module header, where it is read
+// beside the test it explains.
+// EVERY comment in this file is an ordinary one, this header included. An inner doc comment
+// and an inner attribute are both legal only ahead of the first item, so with neither
+// anywhere in the file no merge of two landings can leave one below the list, where it
+// compiles no suite of this target rather than failing one.
+// This file is a test-target crate root, where a bare `mod` would resolve to a sibling of it
+// under `tests/`: the `#[path]` above each `mod` is what points the declaration into
+// `tests/all/`. The `all_rs_*` suites, `all/every_suite_file_is_declared.rs` and
+// `all/declaration_roots_are_canonical_and_complete.rs` read the rules above, for this file
+// and for every service crate's `tests/all.rs`, so a note about one belongs there.
+#[path = "all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs"]
+mod declaration_roots_keep_inner_attributes_ahead_of_the_first_item;

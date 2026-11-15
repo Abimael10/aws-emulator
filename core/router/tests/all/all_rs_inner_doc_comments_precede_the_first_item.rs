@@ -37,7 +37,10 @@ use crate::all_rs_declares_each_suite_once::{
 /// outer attribute (`#[path = "..."]`) opens the item it decorates, so it counts as that
 /// item's start: an inner doc comment between an outer attribute and its `mod` is the same
 /// error as one after the `mod`.
-fn first_item_line(source: &str) -> Option<usize> {
+///
+/// Shared with the sibling that reads the same boundary for the other inner construct, so
+/// the two cannot disagree about where a file's header ends.
+pub(crate) fn first_item_line(source: &str) -> Option<usize> {
     source.lines().enumerate().find_map(|(index, line)| {
         let line = line.trim_start();
         let opens_an_item = !(line.is_empty()
