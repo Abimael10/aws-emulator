@@ -871,6 +871,38 @@ pub fn resource_policy_matches_permissions(document: &str, kind: SharedResource)
         .all(|action| permitted.contains(&action.as_str()))
 }
 
+/// The principal type whose values name an AWS account or one of its identities:
+/// the one whose account values [`stored_resource_policy`] writes as root ARNs.
+const AWS_PRINCIPAL_TYPE: &str = "AWS";
+
+/// A resource policy as this service HOLDS one, for the reads that report it.
+///
+/// The policy language lets a statement name a whole account by its bare account
+/// id, and that id and the account's root ARN name the SAME principal — so the
+/// document a policy store holds carries the root ARN whichever of the two was
+/// submitted ([`::service_common::iam_policy_principals::account_root_principal`],
+/// the tree's one spelling of an account principal), and a client comparing the
+/// document it reads against the one it sent sees one spelling rather than
+/// rewriting the policy forever.
+///
+/// Only a value of the `AWS` principal type that is a bare account id is written:
+/// every other value of that element — the wildcard, an identity's ARN, a root ARN
+/// already — is the caller's own, and so is every other byte of the document,
+/// member order, list form and the whitespace between the tokens included
+/// ([`::service_common::iam_policy_rendering::rewritten_values`], which walks the
+/// text rather than re-serialising it). That keeps this a FIXED POINT: a document
+/// it wrote is one it leaves alone, so re-putting what was read stores the same
+/// bytes again.
+pub fn stored_resource_policy(document: &str) -> String {
+    ::service_common::iam_policy_rendering::rewritten_values(
+        document,
+        &::service_common::iam_policy_rendering::ElementValues {
+            element: AWS_PRINCIPAL_TYPE,
+            written_as: &::service_common::iam_policy_principals::account_root_principal,
+        },
+    )
+}
+
 /// Sixteen bytes nothing else in this process will produce again: the first half
 /// of a SHA-256 (the `sha2` crate, not a hand-written hash) over a seed that is
 /// unique per call.

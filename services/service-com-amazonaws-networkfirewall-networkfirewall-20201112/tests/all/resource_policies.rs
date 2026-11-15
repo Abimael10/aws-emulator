@@ -19,7 +19,9 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_networkfirewall_networkfirewall_20201112::state;
 
-use crate::harness::{error_code, resource_policy_document, Harness, ACCOUNT, REGION};
+use crate::harness::{
+    error_code, resource_policy_document, stored_resource_policy_document, Harness, ACCOUNT, REGION,
+};
 
 /// RULE: a Network Firewall resource policy may grant only the actions the shared
 /// resource's TYPE permits, and the test is CONTAINMENT: any non-empty subset of
@@ -92,7 +94,7 @@ async fn only_the_permitted_action_set_is_attached_to_a_firewall_policy() {
                 .await;
             assert_eq!(
                 described["Policy"],
-                json!(document),
+                json!(stored_resource_policy_document(&actions, &arn)),
                 "case {label}: expected the attached document, got {described:?}"
             );
             harness

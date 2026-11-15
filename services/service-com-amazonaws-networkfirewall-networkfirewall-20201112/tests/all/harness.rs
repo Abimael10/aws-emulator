@@ -210,7 +210,8 @@ pub fn minimal_policy_document() -> Value {
 
 /// A resource-policy document granting exactly `actions` on `resource` to this
 /// account, in the form the AWS `PutResourcePolicy` documentation shows: one
-/// `Allow` statement carrying all of them.
+/// `Allow` statement carrying all of them, naming the account by its bare account
+/// id — the form a client writes and the one a policy store rewrites on store.
 pub fn resource_policy_document(actions: &[&str], resource: &str) -> String {
     split_resource_policy_document(&[actions], resource)
 }
@@ -218,12 +219,39 @@ pub fn resource_policy_document(actions: &[&str], resource: &str) -> String {
 /// The same document with its grants SPLIT across one `Allow` statement per entry
 /// of `statements`, so the policy's granted set is their union.
 pub fn split_resource_policy_document(statements: &[&[&str]], resource: &str) -> String {
+    policy_document(statements, resource, ACCOUNT)
+}
+
+/// The document a resource-policy READ reports for the one
+/// [`resource_policy_document`] submits: the same document with the account
+/// principal in the spelling a policy store holds it in — that account's root ARN
+/// ([`account_root_principal`]) — and every other byte as it was submitted.
+pub fn stored_resource_policy_document(actions: &[&str], resource: &str) -> String {
+    stored_split_resource_policy_document(&[actions], resource)
+}
+
+/// [`stored_resource_policy_document`] for the split-statement form
+/// [`split_resource_policy_document`] submits.
+pub fn stored_split_resource_policy_document(statements: &[&[&str]], resource: &str) -> String {
+    policy_document(statements, resource, &account_root_principal())
+}
+
+/// This account's ROOT principal, `arn:aws:iam::<account id>:root`: the spelling a
+/// policy store holds a whole-account principal in, written out here rather than
+/// read from the service so the tests pin the behaviour.
+pub fn account_root_principal() -> String {
+    format!("arn:aws:iam::{ACCOUNT}:root")
+}
+
+/// One `Allow` statement per entry of `statements`, each granting its actions on
+/// `resource` to `principal`.
+fn policy_document(statements: &[&[&str]], resource: &str, principal: &str) -> String {
     let statements: Vec<Value> = statements
         .iter()
         .map(|actions| {
             json!({
                 "Effect": "Allow",
-                "Principal": { "AWS": ACCOUNT },
+                "Principal": { "AWS": principal },
                 "Action": actions,
                 "Resource": resource,
             })

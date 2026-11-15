@@ -32,8 +32,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_networkfirewall_networkfirewall_20201112::state;
 
 use crate::harness::{
-    error_code, error_message, resource_policy_document, string_at, Harness, ACCOUNT,
-    NOT_FOUND_MESSAGE, REGION,
+    error_code, error_message, resource_policy_document, stored_resource_policy_document, string_at,
+    Harness, ACCOUNT, NOT_FOUND_MESSAGE, REGION,
 };
 
 /// The text a delete refused by delete protection carries, as recorded off the
@@ -702,10 +702,12 @@ async fn a_refused_resource_policy_carries_one_constant_message() {
         );
     }
 
-    // The positive control: a permitted subset is accepted and reads back
-    // verbatim, so the refusals above are the validation rule and not a blanket
-    // refusal.
+    // The positive control: a permitted subset is accepted and reads back as the
+    // store holds it, so the refusals above are the validation rule and not a
+    // blanket refusal.
     let accepted = resource_policy_document(&[state::FIREWALL_POLICY_POLICY_ACTIONS[0]], &policy_arn);
+    let held =
+        stored_resource_policy_document(&[state::FIREWALL_POLICY_POLICY_ACTIONS[0]], &policy_arn);
     harness
         .ok(
             "PutResourcePolicy",
@@ -720,7 +722,7 @@ async fn a_refused_resource_policy_carries_one_constant_message() {
         .await;
     assert_eq!(
         described["Policy"],
-        json!(accepted),
-        "the permitted subset must read back verbatim, got {described:?}"
+        json!(held),
+        "the permitted subset must read back as the store holds it, got {described:?}"
     );
 }

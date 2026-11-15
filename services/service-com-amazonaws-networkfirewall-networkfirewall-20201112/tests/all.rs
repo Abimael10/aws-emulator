@@ -43,6 +43,8 @@ mod refusal_message_shapes;
 mod resource_policies;
 #[path = "all/resource_policy_action_subsets.rs"]
 mod resource_policy_action_subsets;
+#[path = "all/resource_policy_principal_spelling.rs"]
+mod resource_policy_principal_spelling;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/response_projections.rs"]

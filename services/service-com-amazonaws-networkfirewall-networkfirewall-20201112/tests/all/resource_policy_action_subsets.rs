@@ -19,7 +19,8 @@ use serde_json::json;
 use service_com_amazonaws_networkfirewall_networkfirewall_20201112::state;
 
 use crate::harness::{
-    error_code, resource_policy_document, split_resource_policy_document, Harness,
+    error_code, resource_policy_document, split_resource_policy_document,
+    stored_resource_policy_document, stored_split_resource_policy_document, Harness,
 };
 
 /// Every non-empty subset of `permitted`, as a list of (label, actions) rows.
@@ -96,7 +97,7 @@ async fn any_non_empty_subset_of_the_permitted_actions_is_attached_and_read_back
                 .await;
             assert_eq!(
                 described["Policy"],
-                json!(document),
+                json!(stored_resource_policy_document(&actions, &arn)),
                 "case {case}: expected the attached document, got {described:?}"
             );
 
@@ -263,7 +264,7 @@ async fn containment_is_tested_on_the_union_of_the_statements() {
                 .await;
             assert_eq!(
                 described["Policy"],
-                json!(document),
+                json!(stored_split_resource_policy_document(&statements, &arn)),
                 "case {label}: expected the attached document, got {described:?}"
             );
         } else {

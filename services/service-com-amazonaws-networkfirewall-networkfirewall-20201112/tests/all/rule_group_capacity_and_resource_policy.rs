@@ -18,7 +18,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_networkfirewall_networkfirewall_20201112::state;
 
 use crate::harness::{
-    error_code, minimal_policy_document, resource_policy_document, string_at, with_tag_list, Harness,
+    error_code, minimal_policy_document, resource_policy_document,
+    stored_resource_policy_document, string_at, with_tag_list, Harness,
 };
 
 /// RULE: referencing a rule group from a firewall policy reserves that rule
@@ -204,7 +205,7 @@ async fn only_the_permitted_action_set_is_attached_to_a_shared_rule_group() {
                     .await;
                 assert_eq!(
                     described["Policy"],
-                    json!(document),
+                    json!(stored_resource_policy_document(&actions, arn)),
                     "case {case}: expected the attached document, got {described:?}"
                 );
             } else {

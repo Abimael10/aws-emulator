@@ -4,7 +4,9 @@
 //! IMPLEMENTED: validates the policy document against the actions the shared
 //! resource's type PERMITS — every granted action must be one of them, and a
 //! document that grants only some of them is a narrower grant, not a breach —
-//! then attaches it to that resource in `crate::state` for
+//! then attaches the service's own rendering of it
+//! (`crate::state::stored_resource_policy`, which holds an account principal as
+//! that account's root ARN) to that resource in `crate::state` for
 //! `DescribeResourcePolicy` to report.
 //!
 //! ## Shape of an operation
@@ -257,9 +259,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        state
-            .resource_policies
-            .insert(input.resource_arn, input.policy);
+        // What the store holds is the service's own rendering of the submitted
+        // document, not the bytes the caller sent: an account principal given as a
+        // bare account id is held as that account's root ARN, which is the
+        // spelling every read reports it in.
+        state.resource_policies.insert(
+            input.resource_arn,
+            crate::state::stored_resource_policy(&input.policy),
+        );
 
         Ok(PutResourcePolicyOutput {})
     }
