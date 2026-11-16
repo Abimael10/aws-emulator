@@ -82,10 +82,20 @@ pub mod unresolved_reference;
 use api_version::UnsupportedApiVersionOperation;
 use aws_smithy_schema_server::{envelope, Violation};
 use query_error_envelope::{RdsDefinition, RequestIdEnvelopeOperation};
+use service_common::query_boolean_values::QueryBooleanValues;
 use smithy_server_runtime::{
-    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, ServerHttpProtocol, Service,
 };
 use std::sync::Arc;
+
+/// This service's XML namespace, as the model declares it
+/// (`smithy_query(query="service_info")` reports `xmlNamespace.uri`).
+///
+/// Stated here because the protocol this service serves is CONSTRUCTED below rather than
+/// taken from the generated entry, and the namespace is part of the envelope that entry
+/// builds its own protocol with: the replacement has to be the SAME protocol, differing only
+/// in how it reads a boolean member's text.
+const XML_NAMESPACE: &str = "http://rds.amazonaws.com/doc/2014-10-31/";
 
 /// The Query API error code this service answers a parameter value its member does not
 /// accept with.
@@ -135,6 +145,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The envelope wrapper every other routable request is served through. Held in a
     /// field for the same reason.
     envelope: RequestIdEnvelopeOperation<Eng>,
+    /// The protocol this service reads a request with: the framework's `awsQuery`, reading a
+    /// boolean member's text in the lexical space the Query wire carries one in
+    /// (`service_common::query_boolean_values`). Held in a field for the same reason.
+    protocol: QueryBooleanValues,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -155,6 +169,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             ),
             entry: RdsDefinition::new(engine),
             unsupported_api_version: UnsupportedApiVersionOperation,
+            protocol: QueryBooleanValues::aws_query(XML_NAMESPACE),
         }
     }
 }
@@ -218,6 +233,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // it as the unroutable request it is — through the wrapped definition, which adds
         // the same element to that refusal.
         self.entry.routes(req).then_some(&self.envelope as _)
+    }
+
+    fn override_protocol(&self) -> Option<&dyn ServerHttpProtocol> {
+        // The one reading of a request this service does not take from the framework's own
+        // `awsQuery` codec: the TEXT of a boolean member, whose lexical space on this wire is
+        // `true`, `false`, `1` and `0`, where that codec takes the two words alone and
+        // reports its own parser diagnostic for anything else. The rule is the PROTOCOL's and
+        // is shared by every service behind this Query front door, so it lives in
+        // `service_common::query_boolean_values`; everything else about the protocol —
+        // routing, the response envelope, the error envelope, the namespace — is the
+        // framework's unchanged.
+        Some(&self.protocol)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

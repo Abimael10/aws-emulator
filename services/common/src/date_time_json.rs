@@ -102,12 +102,16 @@ fn date_time_text(value: &DateTime) -> Option<String> {
 // Request side
 // =================================================================================
 
-/// The inner deserializer one [`DateTimeReader`] forwards to, however it is held.
+/// The inner deserializer one wrapper forwards to, however it is held.
 ///
 /// The protocol seam hands back an owned `Box<dyn ShapeDeserializer>` while the nested walks
 /// hand each level a `&mut dyn ShapeDeserializer`, and both have to wear the same wrapper —
 /// so the wrapper is generic over this, and the forwarding body below is written once.
-trait InnerDeserializer {
+///
+/// `pub(crate)` so a second wrapper in this crate ([`crate::query_boolean_values`], which
+/// replaces one read of a Query request exactly as this one replaces one read of a JSON
+/// request) wears the same seam rather than restating it.
+pub(crate) trait InnerDeserializer {
     fn get(&mut self) -> &mut dyn ShapeDeserializer;
     fn peek(&self) -> &dyn ShapeDeserializer;
 }

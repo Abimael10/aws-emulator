@@ -598,6 +598,10 @@ pub mod public_resource_policy;
 /// A floating-point member of a response rendered the way AWS renders one — with a
 /// fractional part — which the framework's XML writer drops for a whole value.
 pub mod query_decimal_floats;
+/// A BOOLEAN member of an `awsQuery` request read in the lexical space the wire carries one
+/// in, with the one fixed sentence the protocol layer refuses text outside it with — where
+/// the framework's own form reader takes two literals and reports its own parser diagnostic.
+pub mod query_boolean_values;
 pub mod query_error_envelope;
 /// A refusal whose clause QUOTES the value the request carried, where the framework's own
 /// walk elides a long one into a prefix AWS never emits.

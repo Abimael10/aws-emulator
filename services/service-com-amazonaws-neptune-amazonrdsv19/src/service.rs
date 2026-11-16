@@ -13,7 +13,7 @@
 //! table — built from the Smithy model at compile time. You do not edit the
 //! entry; you edit the behavioral seams below.
 //!
-//! Five opt-in seams are yours to change; every one defaults to the framework's
+//! Six opt-in seams are yours to change; every one defaults to the framework's
 //! own behaviour, so an unedited service still routes and answers correctly:
 //!
 //! - `can_handle` — which requests this service claims. The default matches the
@@ -34,15 +34,19 @@
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
+//! - `override_protocol` — the codec this service reads a request with and answers in.
+//!   This service serves the framework's own `awsQuery` with ONE reading changed: the
+//!   lexical space of a boolean member's text (see [`xsd_boolean`]).
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+pub mod xsd_boolean;
+
+use service_common::query_boolean_values::QueryBooleanValues;
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, ServerHttpProtocol, Service};
 use std::sync::Arc;
 
 /// The routing key that names THIS service, as opposed to the SigV4 signing name it
@@ -78,6 +82,11 @@ const ROUTE_KEY: &str = "neptune";
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The protocol this service reads a request with: the framework's `awsQuery`, reading a
+    /// boolean member's text in the lexical space the Query wire carries one in (see
+    /// [`xsd_boolean`]). Held in a field, built once, because `override_protocol` hands back
+    /// a reference to it.
+    protocol: QueryBooleanValues,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -87,6 +96,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: xsd_boolean::protocol(),
         }
     }
 }
@@ -122,6 +132,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the `Action` form field on a query protocol, say — is reachable here.
         let _ = req;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn ServerHttpProtocol> {
+        // The one thing this service reads differently from the framework's own `awsQuery`
+        // codec: the TEXT of a boolean member, whose lexical space on this wire is wider
+        // than the two words that codec reads. Everything else about the protocol — routing,
+        // the response envelope, the error envelope, the namespace — is the framework's
+        // unchanged. See [`xsd_boolean`].
+        Some(&self.protocol)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

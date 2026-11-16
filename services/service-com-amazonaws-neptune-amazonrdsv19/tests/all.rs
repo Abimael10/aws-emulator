@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/announced_cluster_address.rs"]
 mod announced_cluster_address;
+#[path = "all/boolean_form_values.rs"]
+mod boolean_form_values;
 #[path = "all/db_cluster_associated_roles.rs"]
 mod db_cluster_associated_roles;
 #[path = "all/db_cluster_lifecycle.rs"]
@@ -23,3 +25,5 @@ mod duplicate_cluster_refusal_sentence;
 mod state_roundtrip;
 #[path = "all/unsupported_filter_name_sentence.rs"]
 mod unsupported_filter_name_sentence;
+#[path = "all/zzz_probe.rs"]
+mod zzz_probe;

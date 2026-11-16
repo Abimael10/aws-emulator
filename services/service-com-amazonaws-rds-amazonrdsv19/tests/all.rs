@@ -351,6 +351,8 @@ mod provisioned_network_snapshot_export;
 mod published_catalog_creates;
 #[path = "all/published_parameter_descriptions.rs"]
 mod published_parameter_descriptions;
+#[path = "all/query_boolean_member_values.rs"]
+mod query_boolean_member_values;
 #[path = "all/query_catalog_reads.rs"]
 mod query_catalog_reads;
 #[path = "all/query_error_envelope.rs"]
