@@ -1132,6 +1132,8 @@ mod s3_deployed_notification_copies_within_its_bucket;
 mod s3_form_post_upload_routes_by_event_bridge_reason;
 #[path = "all/s3_metadata_tables_live_in_s3tables.rs"]
 mod s3_metadata_tables_live_in_s3tables;
+#[path = "all/s3_notification_event_classes_run_their_lambda_targets.rs"]
+mod s3_notification_event_classes_run_their_lambda_targets;
 #[path = "all/s3_notification_granted_function_writes_back_into_the_bucket.rs"]
 mod s3_notification_granted_function_writes_back_into_the_bucket;
 #[path = "all/s3_notification_indexes_into_its_opensearch_domain.rs"]
