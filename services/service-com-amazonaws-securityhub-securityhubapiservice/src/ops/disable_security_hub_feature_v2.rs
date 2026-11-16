@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableSecurityHubFeatureV2
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableSecurityHubFeatureV2`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableSecurityHubFeatureV2::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Turns an opt-in feature OFF for the caller's account in the request's Region, on
+//! the hub V2 subscription `EnableSecurityHubV2` created: the feature's status becomes
+//! `DISABLED` and its `UpdatedAt` the instant of the change, which is what
+//! `DescribeSecurityHubV2` then reports. The call is idempotent — a feature that is
+//! already disabled is left exactly as it is — and an account/Region with no
+//! subscription has no feature to disable, which is the modelled
+//! `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +144,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableSecurityHubFeatureV2` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableSecurityHubFeatureV2ErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableSecurityHubFeatureV2"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DisableSecurityHubFeatureV2Error::Modeled(
+                DisableSecurityHubFeatureV2ErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(crate::state::STATE_UNAVAILABLE_MESSAGE.to_string()),
+                        code: Some("InternalServerException".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        // `FeatureName` is an enum the model binds to the URI path, so a value outside
+        // it names no feature this service has.
+        if !FEATURE_NAME_VALUES.contains(&input.feature_name.as_str()) {
+            return Err(DisableSecurityHubFeatureV2ErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::unknown_feature_message(&input.feature_name)),
+                    code: Some("ValidationException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let key = crate::state::hub_key(ctx);
+        let mut store = state.lock();
+        let hub = store.hubs_v2.get_mut(&key).ok_or_else(|| {
+            DisableSecurityHubFeatureV2Error::Modeled(
+                DisableSecurityHubFeatureV2ErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::hub_v2_not_found_message(&key.0)),
+                        code: Some("ResourceNotFoundException".to_string()),
+                    },
+                ),
+            )
+        })?;
+        crate::state::set_feature_status(
+            hub,
+            &input.feature_name,
+            crate::state::FEATURE_STATUS_DISABLED,
+        );
+
+        Ok(DisableSecurityHubFeatureV2Output::default())
     }
 }

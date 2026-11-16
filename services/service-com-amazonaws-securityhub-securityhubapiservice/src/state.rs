@@ -31,6 +31,13 @@ mod security_controls;
 
 pub use security_controls::*;
 
+/// The hub V2 subscription — the resource the V2 API family is enabled and described
+/// through — kept beside the CSPM hub below rather than inside it, because the two are
+/// separate resources with separate ARNs and separate lifecycles.
+mod hub_v2;
+
+pub use hub_v2::*;
+
 /// The hub resource is one per account and Region, named `hub/default`.
 pub type HubKey = (String, String);
 
@@ -309,6 +316,9 @@ pub struct ComAmazonawsSecurityhubSecurityhubapiserviceState {
     pub insights: HashMap<InsightKey, StoredInsight>,
     /// The subscribed hubs, one per `(account id, Region)`.
     pub hubs: HashMap<HubKey, Hub>,
+    /// The hub V2 subscriptions, one per `(account id, Region)`: the resource the V2
+    /// API family is enabled through, independent of the CSPM hub above.
+    pub hubs_v2: HashMap<HubKey, HubV2>,
     /// Imported findings, keyed by hub + `AwsSecurityFindingIdentifier`.
     pub findings: HashMap<FindingKey, StoredFinding>,
     /// Member associations, keyed by administrator account/Region + member account id.
@@ -1750,9 +1760,10 @@ pub fn is_well_formed_arn(arn: &str) -> bool {
 /// requesting account/Region: an ARN naming another Region's resource resolves to
 /// nothing here, which is the 404 the call owes it. Every resource kind this crate
 /// persists and the model gives a tag set is looked up here — today the
-/// `hub/default` resource `EnableSecurityHub` creates and the `automation-rule/...`
-/// resources `CreateAutomationRule` creates; a resource kind whose create operation
-/// is still a stub has nothing in state to find.
+/// `hub/default` resource `EnableSecurityHub` creates, the `hubv2/default` resource
+/// `EnableSecurityHubV2` creates and the `automation-rule/...` resources
+/// `CreateAutomationRule` creates; a resource kind whose create operation is still a
+/// stub has nothing in state to find.
 pub fn resource_tags<'a>(
     store: &'a ComAmazonawsSecurityhubSecurityhubapiserviceState,
     key: &HubKey,
@@ -1762,6 +1773,14 @@ pub fn resource_tags<'a>(
         .hubs
         .get(key)
         .filter(|hub| hub.hub_arn == resource_arn)
+        .map(|hub| &hub.tags)
+    {
+        return Some(tags);
+    }
+    if let Some(tags) = store
+        .hubs_v2
+        .get(key)
+        .filter(|hub| hub.hub_v2_arn == resource_arn)
         .map(|hub| &hub.tags)
     {
         return Some(tags);
@@ -1792,6 +1811,13 @@ pub fn resource_tags_mut<'a>(
         .is_some_and(|hub| hub.hub_arn == resource_arn)
     {
         return store.hubs.get_mut(key).map(|hub| &mut hub.tags);
+    }
+    if store
+        .hubs_v2
+        .get(key)
+        .is_some_and(|hub| hub.hub_v2_arn == resource_arn)
+    {
+        return store.hubs_v2.get_mut(key).map(|hub| &mut hub.tags);
     }
     store
         .automation_rules

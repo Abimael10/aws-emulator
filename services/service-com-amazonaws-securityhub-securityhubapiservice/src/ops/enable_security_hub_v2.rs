@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableSecurityHubV2
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableSecurityHubV2`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableSecurityHubV2::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Subscribes the calling account to the service's V2 API family in the request's
+//! Region: it creates the one `hubv2/default` resource that account/Region can hold,
+//! with the `Tags` the request carried and with every opt-in feature the model
+//! publishes still `DISABLED`, and answers that resource's ARN. The model declares no
+//! conflict error for this operation, so enabling an account/Region that is already
+//! subscribed changes nothing and answers the existing resource's ARN. The Region
+//! comes from the caller's own credential scope, so a subscription that would be the
+//! first in a Region past `crate::state::MAX_HUB_V2_REGIONS` is refused instead.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +145,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableSecurityHubV2` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableSecurityHubV2ErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableSecurityHubV2"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            EnableSecurityHubV2Error::Modeled(
+                EnableSecurityHubV2ErrorModeled::InternalServerException(InternalServerException {
+                    message: Some(crate::state::STATE_UNAVAILABLE_MESSAGE.to_string()),
+                    code: Some("InternalServerException".to_string()),
+                }),
+            )
+        })?;
+
+        let key = crate::state::hub_key(ctx);
+        let tags = input.tags.unwrap_or_default();
+        let mut store = state.lock();
+        // The Region a subscription is filed under comes from the request's own
+        // (unauthenticated) credential scope, so the one-subscription-per-Region rule
+        // bounds this store only together with a cap on how many Regions hold a
+        // subscription at all: this create, the only writer that can bring a new
+        // Region's record into being, is refused past it and writes nothing.
+        if crate::state::hub_v2_region_ceiling_reached(&store, &key) {
+            return Err(EnableSecurityHubV2ErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::hub_v2_region_ceiling_message(&key.1)),
+                    code: Some("ValidationException".to_string()),
+                },
+            )
+            .into());
+        }
+        // One subscription per account/Region: a repeated enable finds the resource
+        // already there and leaves it alone — its `SubscribedAt`, its tags and its
+        // feature statuses are the first enable's, not this call's.
+        let hub = store
+            .hubs_v2
+            .entry(key.clone())
+            .or_insert_with(|| crate::state::new_hub_v2(&key, tags));
+
+        Ok(EnableSecurityHubV2Output {
+            hub_v2_arn: Some(hub.hub_v2_arn.clone()),
+        })
     }
 }
