@@ -38,6 +38,11 @@
 //! the token that cannot be read, the letter case it was written in, how many fields the body
 //! carries, the shape of a rate expression and its unit, a value that is no expression at
 //! all, and both operations that take the member.
+//!
+//! The harness and the refusal wording below are `pub(crate)`: the sibling suite
+//! [`super::image_pipeline_schedule_listing`] reads the same rule from the account's listing
+//! and borrows them from here rather than keeping a second copy of them, so one wording
+//! cannot drift from the other.
 
 use std::sync::Arc;
 
@@ -66,7 +71,7 @@ const BUILD_DOCUMENT: &str = concat!(
 );
 
 /// One emulator with an empty store, mounted exactly as the router mounts it.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -101,7 +106,7 @@ fn request(method: &str, uri: &str, body: Option<&Value>) -> http::Request<bytes
 }
 
 /// Status and parsed body of one call. An empty body reads as `Value::Null`.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -137,7 +142,7 @@ fn encode_label(value: &str) -> String {
 }
 
 /// Read `name` out of an answer, panicking with the case when it is absent.
-fn text(case: &str, body: &Value, name: &str) -> String {
+pub(crate) fn text(case: &str, body: &Value, name: &str) -> String {
     body.get(name)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: expected text in {name} of {body}"))
@@ -145,7 +150,7 @@ fn text(case: &str, body: &Value, name: &str) -> String {
 }
 
 /// Assert the call succeeded and answer its body.
-fn assert_ok(case: &str, status: u16, body: Value) -> Value {
+pub(crate) fn assert_ok(case: &str, status: u16, body: Value) -> Value {
     assert_eq!(
         status, 200,
         "case {case:?}: expected HTTP 200, got {status} with {body}"
@@ -154,7 +159,7 @@ fn assert_ok(case: &str, status: u16, body: Value) -> Value {
 }
 
 /// The `__type` of an error answer, with any shape-id prefix dropped.
-fn error_code(case: &str, body: &Value) -> String {
+pub(crate) fn error_code(case: &str, body: &Value) -> String {
     let rendered = body
         .get("__type")
         .and_then(Value::as_str)
@@ -167,7 +172,7 @@ fn error_code(case: &str, body: &Value) -> String {
 }
 
 /// The `message` of an error answer.
-fn error_message(case: &str, body: &Value) -> String {
+pub(crate) fn error_message(case: &str, body: &Value) -> String {
     body.get("message")
         .or_else(|| body.get("Message"))
         .and_then(Value::as_str)
@@ -177,7 +182,7 @@ fn error_message(case: &str, body: &Value) -> String {
 
 /// The whole sentence a refused schedule expression is answered with: this service's
 /// parameter-value sentence about the member the value sat at, carrying `detail`.
-fn refusal_message(detail: &str) -> String {
+pub(crate) fn refusal_message(detail: &str) -> String {
     format!(
         "The value supplied for parameter 'schedule.scheduleExpression' is not valid. Invalid \
          schedule expression. Details: {detail}"
@@ -185,7 +190,7 @@ fn refusal_message(detail: &str) -> String {
 }
 
 /// The parser's statement about a cron body it stopped reading at `position` on `token`.
-fn illegal_characters(position: usize, token: &str) -> String {
+pub(crate) fn illegal_characters(position: usize, token: &str) -> String {
     format!(
         "Invalid CRON expression: error at position {position}, details: Illegal characters for \
          this position: '{token}'"
@@ -194,7 +199,7 @@ fn illegal_characters(position: usize, token: &str) -> String {
 
 /// The parser's statement about a cron body that ends before the field `missing` would have
 /// been, at `position`.
-fn unexpected_end(position: usize, missing: &str) -> String {
+pub(crate) fn unexpected_end(position: usize, missing: &str) -> String {
     format!(
         "Invalid CRON expression: error at position {position}, details: Unexpected end of \
          expression, the {missing} field is missing, the CRON format consists of 6 fields \
@@ -204,7 +209,7 @@ fn unexpected_end(position: usize, missing: &str) -> String {
 
 /// The statement a value that is no schedule expression at all is refused with: the grammar
 /// an expression has to be written in.
-const SCHEDULE_SYNTAX: &str = "Schedule expressions must have the following syntax: \
+pub(crate) const SCHEDULE_SYNTAX: &str = "Schedule expressions must have the following syntax: \
      rate(<number>\\s?(minutes?|hours?|days?)), cron(<cron_expression>) or \
      at(yyyy-MM-dd'T'HH:mm:ss).";
 
@@ -262,7 +267,7 @@ async fn create_configuration(router: &MultiServiceRouter, name: &str) -> String
 }
 
 /// The resources every pipeline these cases create references.
-struct Fixture {
+pub(crate) struct Fixture {
     /// The image recipe the pipeline builds.
     recipe: String,
     /// The infrastructure configuration it builds in.
@@ -271,7 +276,7 @@ struct Fixture {
 
 impl Fixture {
     /// Create the recipe and the configuration one emulator's cases share.
-    async fn given(router: &MultiServiceRouter) -> Self {
+    pub(crate) async fn given(router: &MultiServiceRouter) -> Self {
         let component = create_component(router, "schedule-component").await;
         Self {
             recipe: create_image_recipe(router, "schedule-recipe", &component).await,
@@ -280,7 +285,7 @@ impl Fixture {
     }
 
     /// A `CreateImagePipeline` body for `name` carrying `extra`.
-    fn create_body(&self, name: &str, client_token: &str, extra: Value) -> Value {
+    pub(crate) fn create_body(&self, name: &str, client_token: &str, extra: Value) -> Value {
         let mut body = Map::new();
         body.insert("name".to_string(), json!(name));
         body.insert("clientToken".to_string(), json!(client_token));
@@ -317,7 +322,7 @@ impl Fixture {
 }
 
 /// `CreateImagePipeline` with `body`.
-async fn create_pipeline(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+pub(crate) async fn create_pipeline(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
     call(router, "PUT", "/CreateImagePipeline", Some(body)).await
 }
 
@@ -338,7 +343,7 @@ async fn get_pipeline(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
 }
 
 /// The ARN a pipeline named `normalized` carries in [`REGION`].
-fn pipeline_arn(normalized: &str) -> String {
+pub(crate) fn pipeline_arn(normalized: &str) -> String {
     format!("arn:aws:imagebuilder:{REGION}:{ACCOUNT}:image-pipeline/{normalized}")
 }
 

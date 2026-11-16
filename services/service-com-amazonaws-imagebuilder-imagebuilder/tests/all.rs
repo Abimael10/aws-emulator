@@ -53,6 +53,8 @@ mod image_pipeline_execution;
 mod image_pipeline_listing;
 #[path = "all/image_pipeline_schedule.rs"]
 mod image_pipeline_schedule;
+#[path = "all/image_pipeline_schedule_listing.rs"]
+mod image_pipeline_schedule_listing;
 #[path = "all/image_pipeline_update.rs"]
 mod image_pipeline_update;
 #[path = "all/image_read.rs"]
