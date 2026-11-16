@@ -8,9 +8,10 @@
 //! offending value is, wherever in `MetricQueries` it sits and however many queries the
 //! batch carries.
 //!
-//! Every other boundary refusal keeps the framework's per-member envelope, and a
-//! reference the pattern ACCEPTS but that no resource answers stays a per-query
-//! `Status=ValidationError` inside a 200, so the two channels remain distinguishable.
+//! Every other modelled constraint of either operation is judged by the operation itself,
+//! per item, inside a 200 response — and a reference the expression ACCEPTS but that no
+//! resource answers stays a per-query `Status=ValidationError` inside a 200, so the two
+//! channels remain distinguishable.
 //!
 //! Every test drives the real wire path (`MultiServiceRouter::dispatch` with a restJson1
 //! request), so the framework's constraint walk and this service's refusal seam are both
@@ -186,8 +187,6 @@ fn assert_refused_as_invalid_arn(case: &str, answer: &Answer, submitted: &[&str]
 fn malformed_arns() -> Vec<(&'static str, String)> {
     vec![
         ("not-an-arn-at-all", "not-an-arn".to_string()),
-        // @length allows the empty string; the pattern does not.
-        ("empty", String::new()),
         (
             "no-resource-separator",
             "arn:aws:sagemaker:us-east-1:123456789012:experiment-trial-component".to_string(),
@@ -318,25 +317,85 @@ async fn a_well_formed_resource_arn_is_served() {
     }
 }
 
-/// The refusal is about the SageMaker-ARN expression alone: every other constraint class
-/// — including another member's own `@pattern` — keeps the framework's per-member
-/// envelope.
+/// The refusal is about a reference the request CARRIES: a query that states no reference
+/// at all states nothing malformed, so it is answered in-band like any query that selects
+/// nothing.
 #[tokio::test]
-async fn other_constraint_refusals_keep_the_framework_envelope() {
+async fn a_reference_the_request_does_not_state_is_not_a_malformed_one() {
+    let router = emulator();
+    // case, the query as sent.
+    let cases: Vec<(&str, Value)> = vec![
+        ("empty-reference", query("")),
+        (
+            "null-reference",
+            json!({
+                "MetricName": "loss",
+                "ResourceArn": Value::Null,
+                "MetricStat": "Last",
+                "Period": "IterationNumber",
+                "XAxisType": "IterationNumber",
+            }),
+        ),
+        (
+            "no-reference-member",
+            json!({
+                "MetricName": "loss",
+                "MetricStat": "Last",
+                "Period": "IterationNumber",
+                "XAxisType": "IterationNumber",
+            }),
+        ),
+    ];
+    for (case, sent) in cases {
+        let answer = get_metrics(&router, vec![sent]).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: a query stating no reference is served, got {} ({:?})",
+            answer.status, answer.body
+        );
+        let results = answer.body["MetricQueryResults"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected MetricQueryResults, got {:?}", answer.body));
+        assert_eq!(
+            results[0]["Status"].as_str(),
+            Some("Complete"),
+            "case {case:?}: it names no series, which is Complete and empty, got {:?}",
+            results[0]
+        );
+        assert_eq!(
+            results[0]["MetricValues"].as_array().map(Vec::len),
+            Some(0),
+            "case {case:?}: it selected nothing, got {:?}",
+            results[0]
+        );
+    }
+}
+
+/// The refusal is about the SageMaker-ARN expression alone: every other constraint class
+/// — including another member's own `@pattern` — is answered per item inside a 200, or by
+/// this service's own envelope refusal, never with this sentence.
+#[tokio::test]
+async fn other_constraint_violations_are_not_this_refusal() {
     let router = emulator();
     let good = well_formed_arns()[0].1.clone();
 
-    // case, method, path, body — one per constraint class the model declares elsewhere.
-    let cases: Vec<(&str, &str, &str, Value)> = vec![
+    // case, method, path, body, the status the service answers it at — one per constraint
+    // class the model declares elsewhere. Each is answered by the layer that owns it: the
+    // envelope refusal for a call that carries nothing to work on, a 200 with the per-item
+    // verdict for everything else — and never with this refusal's sentence.
+    let cases: Vec<(&str, &str, &str, Value, u16)> = vec![
         (
-            // MetricQueryList is modelled @length 1..100.
+            // MetricQueryList is modelled @length 1..100; a get with no queries is this
+            // service's own envelope refusal.
             "empty-metric-queries",
             "POST",
             "/BatchGetMetrics",
             json!({ "MetricQueries": [] }),
+            500,
         ),
         (
-            // MetricStatistic enumerates no `Median`.
+            // MetricStatistic enumerates no `Median`: the query names no statistic this
+            // service can read, so it selects nothing and is answered in-band.
             "metric-stat-outside-the-enum",
             "POST",
             "/BatchGetMetrics",
@@ -347,10 +406,11 @@ async fn other_constraint_refusals_keep_the_framework_envelope() {
                 "Period": "IterationNumber",
                 "XAxisType": "IterationNumber",
             }] }),
+            200,
         ),
         (
             // MetricName is modelled @length 1..255 @pattern '^.+$': another member's
-            // pattern, which this service does NOT word itself.
+            // pattern, which this service does NOT refuse the call for.
             "metric-name-empty",
             "POST",
             "/BatchGetMetrics",
@@ -361,6 +421,7 @@ async fn other_constraint_refusals_keep_the_framework_envelope() {
                 "Period": "IterationNumber",
                 "XAxisType": "IterationNumber",
             }] }),
+            200,
         ),
         (
             // ExperimentEntityName is modelled @pattern '^[a-z0-9](-*[a-z0-9]){0,119}$'.
@@ -376,6 +437,7 @@ async fn other_constraint_refusals_keep_the_framework_envelope() {
                     "Value": 1.0,
                 }],
             }),
+            200,
         ),
         (
             // Step is modelled @range min 0.
@@ -391,27 +453,48 @@ async fn other_constraint_refusals_keep_the_framework_envelope() {
                     "Value": 1.0,
                 }],
             }),
+            200,
         ),
     ];
 
-    for (case, method, path, body) in cases {
+    for (case, method, path, body, expected) in cases {
         let answer = call(&router, method, path, &body).await;
         assert_eq!(
-            answer.status, 400,
-            "case {case:?}: a modelled-constraint violation is refused with 400, got {} ({:?})",
+            answer.status, expected,
+            "case {case:?}: expected status {expected}, got {} ({:?})",
             answer.status, answer.body
         );
         assert_ne!(
             answer.message(),
             INVALID_RESOURCE_ARN_MESSAGE,
             "case {case:?}: this is not a resource-reference fault, got {:?}",
-            answer.message()
+            answer.body
         );
-        assert!(
-            answer.message().contains(FRAMEWORK_ENVELOPE_OPENING),
-            "case {case:?}: expected the framework's per-member envelope, got {:?}",
-            answer.message()
-        );
+        // What it IS answered with: the per-item verdict for a served call, and a refusal
+        // worded by the layer that owns it — neither this one nor the framework's
+        // per-member constraint envelope — for a refused one.
+        if expected == 200 {
+            assert!(
+                answer.body.get("MetricQueryResults").is_some()
+                    || answer.body.get("Errors").is_some(),
+                "case {case:?}: a served call reports its items, got {:?}",
+                answer.body
+            );
+        } else {
+            assert_ne!(
+                answer.error_type.as_deref(),
+                Some(INVALID_RESOURCE_ARN_CODE),
+                "case {case:?}: this refusal is not worded as the resource-reference one, \
+                 got {:?}",
+                answer.body
+            );
+            assert!(
+                !answer.message().contains(FRAMEWORK_ENVELOPE_OPENING),
+                "case {case:?}: the framework's per-member envelope must not reach the \
+                 caller, got {:?}",
+                answer.body
+            );
+        }
     }
 }
 
@@ -434,11 +517,11 @@ async fn a_malformed_arn_beside_another_violation_is_still_the_arn_fault() {
     assert_refused_as_invalid_arn("arn-and-enum-and-name", &answer, &["not-an-arn", "Median"]);
 }
 
-/// The two channels stay distinct: a reference the expression ACCEPTS but that names no
-/// resource is reported in-band, per query, inside a 200 — and a sibling query is still
-/// answered from what `BatchPutMetrics` stored.
+/// The two channels stay distinct: a reference the expression ACCEPTS is answered in-band,
+/// per query, inside a 200 — and a sibling query is still answered from what
+/// `BatchPutMetrics` stored.
 #[tokio::test]
-async fn a_semantic_reference_failure_stays_an_in_band_per_query_status() {
+async fn a_reference_the_expression_accepts_is_answered_in_band() {
     let router = emulator();
     let component = "tc-arn-channels";
     let put = call(
@@ -476,7 +559,7 @@ async fn a_semantic_reference_failure_stays_an_in_band_per_query_status() {
     let answer = get_metrics(&router, vec![query(no_name_segment), query(&stored)]).await;
     assert_eq!(
         answer.status, 200,
-        "a semantic failure is reported inside a 200, got {} ({:?})",
+        "a reference the expression accepts is answered in-band, got {} ({:?})",
         answer.status, answer.body
     );
     let results = answer.body["MetricQueryResults"]
@@ -490,8 +573,15 @@ async fn a_semantic_reference_failure_stays_an_in_band_per_query_status() {
     );
     assert_eq!(
         results[0]["Status"].as_str(),
-        Some("ValidationError"),
-        "case {no_name_segment:?}: expected a per-query ValidationError, got {:?}",
+        Some("Complete"),
+        "case {no_name_segment:?}: a reference the expression accepts selects nothing, \
+         which is Complete, got {:?}",
+        results[0]
+    );
+    assert_eq!(
+        results[0]["MetricValues"].as_array().map(Vec::len),
+        Some(0),
+        "case {no_name_segment:?}: it selected nothing, got {:?}",
         results[0]
     );
     assert_eq!(

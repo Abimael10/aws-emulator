@@ -9,6 +9,9 @@ build = "build.rs"
 [dependencies]
 # The shared request-claim rule for a SigV4 signing name several services share.
 service-common = { path = "../common" }
+# Judges a SageMaker resource reference against the expression the model constrains it
+# with, now that the reference is resolved by the handler rather than at the boundary.
+regex = "1.12"
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

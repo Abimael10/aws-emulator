@@ -782,8 +782,9 @@ async fn the_metrics_endpoint_round_trips_its_own_data_plane_through_the_whole_r
         answer.body
     );
     assert!(
-        !answer.body.contains("Errors"),
-        "case \"BatchPutMetrics\": a wholly accepted batch reports no Errors, got {}",
+        answer.body.contains("\"Errors\":[]"),
+        "case \"BatchPutMetrics\": a wholly accepted batch reports Errors as the empty list, \
+         got {}",
         answer.body
     );
 

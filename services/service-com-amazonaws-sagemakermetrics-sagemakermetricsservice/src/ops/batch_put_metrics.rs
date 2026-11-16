@@ -5,17 +5,26 @@
 //!
 //! Each `MetricData` entry is stored on its own: the batch is PARTIALLY successful, so a
 //! point this emulator cannot store is reported as a `BatchPutMetricsError` carrying its
-//! `MetricIndex` while every other point in the same call is persisted. A call in which
-//! nothing failed omits `Errors` entirely.
+//! `MetricIndex` while every other point in the same call is persisted. `Errors` is on
+//! EVERY answer of this operation, as the empty list when every point was ingested, so a
+//! client reads one member whatever happened.
 //!
-//! The modelled constraints (`MetricName` 1..255 matching `^.+$`, `Step` >= 0,
+//! The modelled constraints of a batch (`MetricName` 1..255 matching `^.+$`, `Step` >= 0,
 //! `TrialComponentName` matching `^[a-z0-9](-*[a-z0-9]){0,119}$`, 1..10 data points) are
-//! refused by the framework BEFORE this handler runs, so the per-index codes it reports
-//! are the rules the model cannot express:
+//! NOT refused in front of this handler (`skip_validation` in `super::types`): a
+//! questionable point is this operation's own per-index verdict, not a refusal of the
+//! whole batch, so a point outside one of them is stored as sent. What refuses a call
+//! before this handler runs is the envelope alone — a batch that names no trial component
+//! or carries no data at all ([`crate::service::envelope`]).
 //!
-//! * `VALIDATION_ERROR` — a `MetricName` that is only whitespace (the modelled `^.+$`
-//!   accepts `"   "`), a non-finite `Value`, or a `Timestamp` so far from the epoch that
-//!   it does not fit in epoch milliseconds.
+//! The per-index codes this handler reports:
+//!
+//! * `INTERNAL_ERROR` — the point never became a measurement: a `Value` that is NOT A
+//!   NUMBER (`NaN`, which the codec reads from a quoted value, so a request can carry
+//!   one), which has no position in any ordering and so can be neither stored at a
+//!   coordinate nor aggregated, or a `MetricName` with no non-blank character, which names
+//!   no series to store it in. The shared store being unreachable is the same code,
+//!   reported for every point of the batch.
 //! * `CONFLICT_ERROR` — a different `Value` at a `(MetricName, Timestamp, Step)`
 //!   coordinate the series already holds. Writing the SAME value there again is accepted
 //!   and stores nothing new, so a retried batch is idempotent.
@@ -23,7 +32,19 @@
 //!   [`crate::state::MAX_TRIAL_COMPONENTS`], the trial component past
 //!   [`crate::state::MAX_METRIC_NAMES_PER_TRIAL_COMPONENT`] or the series past
 //!   [`crate::state::MAX_DATA_POINTS_PER_SERIES`].
-//! * `INTERNAL_ERROR` — the shared store is unreachable, so no point could be stored.
+//!
+//! `VALIDATION_ERROR`, the fourth modelled code, is reported for no point: this service
+//! validates nothing about a point it can store. An INFINITE `Value` is a number and is
+//! stored as one; a `MetricName` is otherwise an opaque series key, so a point is stored
+//! under the name as sent — however long, whatever it holds — and read back under that same
+//! name; a `Step` is stored as sent; and every instant the modelled `Timestamp` can hold is
+//! stored at the instant it names.
+//!
+//! `VALIDATION_ERROR`, the fourth modelled code, is reported for no point: this service
+//! validates nothing about a point it can store. A `MetricName` is an opaque series key,
+//! so a point is stored under the name as sent — blank, long or absent — and read back
+//! under that same name; and every instant the modelled `Timestamp` can hold is stored at
+//! the instant it names.
 //!
 //! ## Reaching this service's state
 //!
@@ -77,11 +98,11 @@ use crate::state::{MetricDatum, RecordRejection};
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-sagemakermetrics-sagemakermetricsservice.json");
 
 /// `PutMetricsErrorCode` members, as `types::PUT_METRICS_ERROR_CODE_VALUES` lists them.
+/// `VALIDATION_ERROR` is the one member no point of this service draws (see the module
+/// docs), so it is not named here.
 const CODE_METRIC_LIMIT_EXCEEDED: &str = "METRIC_LIMIT_EXCEEDED";
 /// See [`CODE_METRIC_LIMIT_EXCEEDED`].
 const CODE_INTERNAL_ERROR: &str = "INTERNAL_ERROR";
-/// See [`CODE_METRIC_LIMIT_EXCEEDED`].
-const CODE_VALIDATION_ERROR: &str = "VALIDATION_ERROR";
 /// See [`CODE_METRIC_LIMIT_EXCEEDED`].
 const CODE_CONFLICT_ERROR: &str = "CONFLICT_ERROR";
 
@@ -139,14 +160,15 @@ fn failure(code: &str, index: usize) -> BatchPutMetricsError2 {
     }
 }
 
-/// The instant `timestamp` names, in epoch milliseconds, or `None` when it is so far
-/// from the epoch that milliseconds overflow `i64`.
+/// The instant `timestamp` names, as the epoch second it falls in and the millisecond
+/// within that second.
 ///
-/// `aws_smithy_types::DateTime` owns this conversion (`to_millis`), including the
-/// overflow check; a point whose timestamp it cannot express is reported as a per-index
-/// `VALIDATION_ERROR` rather than stored at a wrong instant.
-fn epoch_millis(timestamp: &::aws_smithy_types::DateTime) -> Option<i64> {
-    timestamp.to_millis().ok()
+/// `aws_smithy_types::DateTime` owns both parts (`secs`, `subsec_nanos`), so every instant
+/// it can hold is storable and no point is ever refused for the instant it names. The
+/// nanosecond remainder is quantised DOWN to the millisecond, which is the resolution this
+/// store keeps ([`crate::state::MetricDatum`]).
+fn instant(timestamp: &::aws_smithy_types::DateTime) -> (i64, u32) {
+    (timestamp.secs(), timestamp.subsec_nanos() / 1_000_000)
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
@@ -180,18 +202,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut errors: Vec<BatchPutMetricsError2> = Vec::new();
         let mut state = state.lock();
         for (index, raw) in input.metric_data.iter().enumerate() {
-            // Rules the model cannot express; the modelled ones were refused upstream.
-            if raw.metric_name.trim().is_empty() || !raw.value.is_finite() {
-                errors.push(failure(CODE_VALIDATION_ERROR, index));
+            // A point that never became a measurement is reported as this service's
+            // INTERNAL error for that index rather than as a validation fault: the
+            // ingesting side is what failed on it, and a client retries that code where it
+            // drops a validation one. Two values are such a point: a `Value` that is not a
+            // number at all (`NaN` has no position in any ordering, so it can be neither
+            // stored at a coordinate nor aggregated) and a `MetricName` with nothing in it
+            // (it names no series to store the point in). Nothing else about a point is
+            // judged — an infinite value is a number, a name is otherwise an opaque series
+            // key stored as sent, and every instant the modelled timestamp can hold is
+            // stored.
+            if raw.value.is_nan() || raw.metric_name.trim().is_empty() {
+                errors.push(failure(CODE_INTERNAL_ERROR, index));
                 continue;
             }
-            let Some(timestamp_millis) = epoch_millis(&raw.timestamp) else {
-                errors.push(failure(CODE_VALIDATION_ERROR, index));
-                continue;
-            };
+            let (epoch_second, subsec_millis) = instant(&raw.timestamp);
 
             let datum = MetricDatum {
-                timestamp_millis,
+                epoch_second,
+                subsec_millis,
                 step: raw.step,
                 value: raw.value,
             };
@@ -225,9 +254,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         Ok(BatchPutMetricsOutput {
-            // `BatchPutMetricsErrorList` is modelled 1..10, so a call in which nothing
-            // failed omits the member rather than sending an empty list.
-            errors: (!errors.is_empty()).then_some(errors),
+            // `Errors` is reported on every answer, as the empty list for a call in which
+            // nothing failed: the member's presence is not conditional on a failure, so a
+            // client that reads it unconditionally — the natural reading of a
+            // partial-success batch API — finds it on the success path too.
+            errors: Some(errors),
         })
     }
 }

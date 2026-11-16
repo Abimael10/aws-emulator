@@ -21,8 +21,10 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. EDITED HERE: a request whose ENVELOPE this service refuses is answered
+//!   in front of the modelled operation, because the status, the error code and the body
+//!   member each such refusal carries are this service's own and the refusal-wording
+//!   seam below chooses none of them. See [`envelope`].
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -35,33 +37,35 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
+//! A sixth seam, `override_protocol`, is one this service DOES take: the codec every
+//! modelled request is read with is the model's own `restJson1`, reading a batch's items
+//! the way this service reads them ([`unset_members`]).
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
-};
+mod envelope;
+mod unset_members;
+
+use aws_smithy_schema::Schema;
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
-use crate::ops::batch_get_metrics::{
-    INVALID_RESOURCE_ARN_CODE, INVALID_RESOURCE_ARN_MESSAGE, SAGEMAKER_RESOURCE_ARN_PATTERN,
-};
-
-/// Whether a boundary refusal is ABOUT a SageMaker resource reference: one of its
-/// violations is a `@pattern` violation of the expression every SageMaker resource ARN
-/// member is constrained with ([`SAGEMAKER_RESOURCE_ARN_PATTERN`]).
+/// The input shape of the operation a routing key names, for the layers in this module
+/// that read a request against the model rather than against a written-out list of
+/// members.
 ///
-/// Keyed to that EXPRESSION rather than to a member path, so the rule holds for whichever
-/// member of whichever operation carried the value, at whatever position in whatever
-/// collection. A refusal that ALSO carries other violations is still answered as the
-/// resource-reference fault: the reference is what this service resolves a call against
-/// before it reads anything else, so that is the fault it reports.
-fn refused_resource_arn(violations: &[Violation]) -> bool {
-    violations.iter().any(|violation| {
-        matches!(&violation.kind, ViolationKind::Pattern(pattern) if pattern == SAGEMAKER_RESOURCE_ARN_PATTERN)
-    })
+/// The ONE mapping from this service's routing keys to its modelled inputs, so the
+/// envelope layer and anything added beside it cannot come to different answers. `None`
+/// for a key this service does not serve.
+pub(crate) fn input_schema(routing_key: &str) -> Option<&'static Schema> {
+    match routing_key {
+        "BatchGetMetrics" => Some(crate::ops::types::BATCH_GET_METRICS_INPUT_SCHEMA),
+        "BatchPutMetrics" => Some(crate::ops::types::BATCH_PUT_METRICS_INPUT_SCHEMA),
+        _ => None,
+    }
 }
 
 /// The `com-amazonaws-sagemakermetrics-sagemakermetricsservice` emulated service: the generated [`ServiceDefinition`] plus
@@ -71,6 +75,9 @@ fn refused_resource_arn(violations: &[Violation]) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The codec every modelled request of this service is read with, built ONCE here
+    /// because [`Service::override_protocol`] hands back a borrow of it.
+    protocol: unset_members::ItemsReadLeniently,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -80,6 +87,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: unset_members::ItemsReadLeniently::new(),
         }
     }
 }
@@ -119,12 +127,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // A request whose ENVELOPE this service refuses — a member whose JSON type its
+        // shape cannot be read from, a call that names no trial component, a call that
+        // carries nothing to work on — is answered in front of the modelled operation,
+        // which is the only seam that owns the status, the error code and the body member
+        // such a refusal carries ([`envelope`] says why). Everything else resolves
+        // through the generated routing table and is served by the operation itself.
+        envelope::refuses(self.definition(), req).then_some(&envelope::REFUSED_ENVELOPE as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -136,20 +145,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // by every service on a JSON protocol, so it lives in `service-common`; the
         // check itself still uses the model's pattern as written.
         //
-        // A SageMaker resource reference is the exception: this service validates it
-        // itself, ahead of the rest of the request, and states only that the reference is
-        // not a SageMaker ARN — one constant sentence, with no member path, collection
-        // position, submitted value or expression quoted back. So a value the member's
-        // modelled `@pattern` rejects is answered with that sentence under the same
-        // `ValidationException` code, and the whole call is still refused rather than
-        // resolving to a per-query status.
-        match refusal {
-            Refusal::Invalid(violations) if refused_resource_arn(violations) => Some(Refused {
-                code: INVALID_RESOURCE_ARN_CODE.to_string(),
-                message: INVALID_RESOURCE_ARN_MESSAGE.to_string(),
-            }),
-            _ => service_common::aws_validation_refusal(refusal),
-        }
+        // This service's own refusals do not come through here at all: the modelled
+        // constraints of both its operations are judged per item by their handlers
+        // (`skip_validation` in `crate::ops::types`), the one reference it refuses the
+        // whole call for is refused by the handler that resolves it
+        // (`crate::ops::batch_get_metrics`), and an envelope it cannot serve is answered
+        // by [`envelope`] in front of the operation. What is left for this seam is a
+        // refusal of something this service does not word itself — a member added to the
+        // model without `skip_validation`, say — which keeps the framework's wording.
+        service_common::aws_validation_refusal(refusal)
     }
 
     fn override_routing_error(
@@ -178,5 +182,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own `restJson1`, reading a batch's items the way this service reads
+        // them: a member an item leaves out, or sends as `null`, is UNSET rather than a
+        // refusal of the whole call. Built once in `new` and borrowed from `self`, never
+        // per request.
+        Some(&self.protocol)
     }
 }

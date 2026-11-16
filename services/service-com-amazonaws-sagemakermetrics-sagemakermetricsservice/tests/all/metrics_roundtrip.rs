@@ -212,13 +212,14 @@ impl Query {
     }
 }
 
-/// One `MetricQueryResult`, as a test reads it.
+/// One `MetricQueryResult`, as a test reads it. The two value lists are `Option` because
+/// a result reporting a query's FAILURE carries neither member.
 #[derive(Debug, Clone, PartialEq)]
 struct QueryResult {
     status: String,
     message: Option<String>,
-    x_axis_values: Vec<i64>,
-    metric_values: Vec<f64>,
+    x_axis_values: Option<Vec<i64>>,
+    metric_values: Option<Vec<f64>>,
 }
 
 /// `POST /BatchGetMetrics`, returning one result per query, positionally aligned.
@@ -251,18 +252,22 @@ async fn get_metrics(router: &MultiServiceRouter, queries: &[Query]) -> Vec<Quer
                 METRIC_QUERY_RESULT_STATUS_VALUES.contains(&status.as_str()),
                 "status {status:?} is not a modelled MetricQueryResultStatus"
             );
-            let x_axis_values = result["XAxisValues"]
-                .as_array()
-                .unwrap_or_else(|| panic!("result without XAxisValues: {result:?}"))
-                .iter()
-                .map(|x| x.as_i64().expect("XAxisValues entries are longs"))
-                .collect();
-            let metric_values = result["MetricValues"]
-                .as_array()
-                .unwrap_or_else(|| panic!("result without MetricValues: {result:?}"))
-                .iter()
-                .map(|v| v.as_f64().expect("MetricValues entries are doubles"))
-                .collect();
+            let x_axis_values = result.get("XAxisValues").map(|values| {
+                values
+                    .as_array()
+                    .unwrap_or_else(|| panic!("XAxisValues must be a list: {result:?}"))
+                    .iter()
+                    .map(|x| x.as_i64().expect("XAxisValues entries are longs"))
+                    .collect()
+            });
+            let metric_values = result.get("MetricValues").map(|values| {
+                values
+                    .as_array()
+                    .unwrap_or_else(|| panic!("MetricValues must be a list: {result:?}"))
+                    .iter()
+                    .map(|v| v.as_f64().expect("MetricValues entries are doubles"))
+                    .collect()
+            });
             QueryResult {
                 status,
                 message: result
@@ -276,35 +281,62 @@ async fn get_metrics(router: &MultiServiceRouter, queries: &[Query]) -> Vec<Quer
         .collect()
 }
 
-/// Assert one result against the case it answers.
+/// Assert one SUCCESSFUL result against the case it answers: both value lists are present,
+/// the same length, and hold what the case expects.
 fn assert_result(case: &str, got: &QueryResult, status: &str, x: &[i64], values: &[f64]) {
     assert_eq!(
         got.status, status,
         "case {case}: expected Status {status}, got {got:?}"
     );
+    let got_x = got
+        .x_axis_values
+        .as_deref()
+        .unwrap_or_else(|| panic!("case {case}: an answered query carries XAxisValues: {got:?}"));
+    let got_values = got
+        .metric_values
+        .as_deref()
+        .unwrap_or_else(|| panic!("case {case}: an answered query carries MetricValues: {got:?}"));
     assert_eq!(
-        got.x_axis_values, x,
-        "case {case}: expected XAxisValues {x:?}, got {:?}",
-        got.x_axis_values
+        got_x, x,
+        "case {case}: expected XAxisValues {x:?}, got {got_x:?}"
     );
     assert_eq!(
-        got.metric_values.len(),
+        got_values.len(),
         values.len(),
-        "case {case}: expected {} MetricValues, got {:?}",
+        "case {case}: expected {} MetricValues, got {got_values:?}",
         values.len(),
-        got.metric_values
     );
     assert_eq!(
-        got.x_axis_values.len(),
-        got.metric_values.len(),
+        got_x.len(),
+        got_values.len(),
         "case {case}: XAxisValues and MetricValues must be the same length, got {got:?}"
     );
-    for (i, (actual, want)) in got.metric_values.iter().zip(values).enumerate() {
+    for (i, (actual, want)) in got_values.iter().zip(values).enumerate() {
         assert!(
             (actual - want).abs() < EPSILON,
             "case {case}: MetricValues[{i}] expected {want}, got {actual}"
         );
     }
+}
+
+/// Assert one FAILING result: the status, a `Message` saying what, and NO value lists at
+/// all — the channel a client tells a failed query from an empty one by.
+fn assert_failed_result(case: &str, got: &QueryResult, status: &str) -> String {
+    assert_eq!(
+        got.status, status,
+        "case {case}: expected Status {status}, got {got:?}"
+    );
+    assert_eq!(
+        got.x_axis_values, None,
+        "case {case}: a failing result carries no XAxisValues, got {got:?}"
+    );
+    assert_eq!(
+        got.metric_values, None,
+        "case {case}: a failing result carries no MetricValues, got {got:?}"
+    );
+    got.message
+        .clone()
+        .unwrap_or_else(|| panic!("case {case}: a failing result carries a Message: {got:?}"))
 }
 
 /// The whole aggregation surface: every `MetricStat` x `Period` x `XAxisType` the model
@@ -497,33 +529,17 @@ async fn get_metrics_aggregates_the_points_put_for_the_resource() {
             vec![1.5, 3.5],
         ),
         (
-            // Period and XAxisType need not agree: Period chooses the bucket key, so the
-            // x values here are minute-bucket starts, while the window (next row) is
-            // filtered on the iteration axis XAxisType names.
-            "mismatch-minute-period-iteration-axis",
-            Query::new("wide", component).aggregate("Avg", "OneMinute", iter),
-            "Complete",
-            MINUTE_BUCKETS.to_vec(),
-            vec![2.0, 4.0, 6.0],
-        ),
-        (
-            "mismatch-minute-period-iteration-window",
+            // Period and XAxisType must agree about the iteration axis, so the rows that
+            // paired them differently now belong to the pairing table in
+            // `envelope_and_per_item_reporting.rs`. What is still true here is that a
+            // timestamp period reads and windows on the timestamp axis.
+            "spread-window-to-second",
             Query::new("wide", component)
-                .aggregate("Avg", "OneMinute", iter)
-                .window(Some(1), None),
+                .aggregate("Avg", "OneMinute", ts)
+                .window(None, Some(T0 + 60)),
             "Complete",
-            vec![MINUTE_BUCKETS[1], MINUTE_BUCKETS[2]],
-            vec![4.0, 6.0],
-        ),
-        (
-            // The mirror image: buckets per iteration, window on the timestamp axis.
-            "mismatch-iteration-period-timestamp-window",
-            Query::new("wide", component)
-                .aggregate("Avg", iter, ts)
-                .window(Some(T0 + 1), None),
-            "Complete",
-            vec![1, 2],
-            vec![4.0, 6.0],
+            vec![MINUTE_BUCKETS[0], MINUTE_BUCKETS[1]],
+            vec![2.0, 4.0],
         ),
         (
             // Nothing was ever written for this metric: an empty answer, not a failure.
@@ -549,8 +565,9 @@ async fn get_metrics_aggregates_the_points_put_for_the_resource() {
     }
 }
 
-/// A query the service cannot evaluate answers `ValidationError` for ITSELF, and its
-/// siblings in the same batch are still answered from state.
+/// A query the service reports a failure for fails for ITSELF, and its siblings in the same
+/// batch are still answered from state — and a query that merely selects nothing is
+/// answered as the empty result it is.
 #[tokio::test]
 async fn a_failing_query_does_not_fail_its_siblings() {
     let router = emulator();
@@ -565,29 +582,33 @@ async fn a_failing_query_does_not_fail_its_siblings() {
 
     let good = Query::new("loss", component).aggregate("Last", "IterationNumber", "IterationNumber");
     let queries = vec![
-        // An ARN the modelled @pattern accepts but that names no resource: the resource
-        // path has no trailing name segment.
+        // The one failure a query reports: its Period and XAxisType disagree about the
+        // iteration axis.
+        good.clone().aggregate("Last", "IterationNumber", "Timestamp"),
+        good.clone(),
+        // Selects nothing, which is not a failure: an ARN the modelled @pattern accepts
+        // but that names no resource, and a window that cannot contain anything.
         good.clone()
             .arn("arn:aws:sagemaker:us-east-1:123456789012:experiment-trial-component/"),
-        good.clone(),
-        // A window that cannot contain anything.
         good.clone().window(Some(5), Some(1)),
         good.clone(),
     ];
     let results = get_metrics(&router, &queries).await;
 
-    for (index, case) in [(0, "arn-without-name"), (2, "start-after-end")] {
-        assert_result(case, &results[index], "ValidationError", &[], &[]);
-        let message = results[index]
-            .message
-            .as_deref()
-            .unwrap_or_else(|| panic!("case {case}: a ValidationError must carry a Message"));
-        assert!(
-            message.contains(&format!("MetricQueries[{index}]")),
-            "case {case}: the Message must name the query it is about, got {message:?}"
+    let message = assert_failed_result("contradicting-axis-members", &results[0], "ValidationError");
+    assert!(
+        message.contains("IterationNumber"),
+        "the Message names the member that must be IterationNumber, got {message:?}"
+    );
+    for (index, case) in [(2, "arn-without-name"), (3, "start-after-end")] {
+        assert_result(case, &results[index], "Complete", &[], &[]);
+        assert_eq!(
+            results[index].message, None,
+            "case {case}: a query that selects nothing says nothing, got {:?}",
+            results[index]
         );
     }
-    for index in [1, 3] {
+    for index in [1, 4] {
         assert_result(
             "sibling-of-a-failed-query",
             &results[index],
@@ -610,7 +631,7 @@ async fn put_metrics_reports_per_index_failures_and_persists_the_rest() {
     assert!(errors.is_empty(), "baseline must be accepted, got {errors:?}");
 
     let batch: &[RawPoint] = &[
-        // Whitespace-only name: the modelled `^.+$` accepts it, the service does not.
+        // A point that names no series: nothing to store it in.
         ("   ", T0 + 5, Some(5), 9.0),
         // A new coordinate: stored.
         ("loss", T0 + 1, Some(1), 0.5),
@@ -624,10 +645,10 @@ async fn put_metrics_reports_per_index_failures_and_persists_the_rest() {
     assert_eq!(
         errors,
         vec![
-            (0, "VALIDATION_ERROR".to_string()),
+            (0, "INTERNAL_ERROR".to_string()),
             (2, "CONFLICT_ERROR".to_string()),
         ],
-        "expected a per-index VALIDATION_ERROR and CONFLICT_ERROR, got {errors:?}"
+        "expected a per-index INTERNAL_ERROR and CONFLICT_ERROR, got {errors:?}"
     );
 
     let results = get_metrics(
@@ -724,22 +745,26 @@ async fn a_result_past_the_point_cap_is_truncated() {
         result.status, "Truncated",
         "a result past the cap is Truncated, got {result:?}"
     );
+    let x_axis_values = result
+        .x_axis_values
+        .as_deref()
+        .unwrap_or_else(|| panic!("a truncated result carries XAxisValues, got {result:?}"));
     assert_eq!(
-        result.x_axis_values.len(),
+        x_axis_values.len(),
         MAX_RESULT_POINTS_PER_QUERY,
         "a truncated result carries exactly the cap"
     );
     assert_eq!(
-        result.x_axis_values.first().copied(),
+        x_axis_values.first().copied(),
         Some(0),
         "truncation keeps the lowest x values, got {:?}",
-        result.x_axis_values.first()
+        x_axis_values.first()
     );
     assert_eq!(
-        result.x_axis_values.last().copied(),
+        x_axis_values.last().copied(),
         Some(i64::try_from(MAX_RESULT_POINTS_PER_QUERY).expect("the cap fits in a long") - 1),
         "truncation keeps the lowest x values, got {:?}",
-        result.x_axis_values.last()
+        x_axis_values.last()
     );
     assert!(
         result.message.is_some(),
@@ -861,61 +886,90 @@ async fn a_trial_component_past_the_cap_is_refused_and_leaves_no_entry() {
     );
 }
 
-/// The modelled constraints are refused by the framework BEFORE the handler runs, so a
-/// request that violates one is a 400 for the WHOLE call rather than a per-query status.
-/// This pins where that boundary is, which is why the handler only reports the residue
-/// the model cannot express.
-#[tokio::test]
-async fn requests_violating_a_modelled_constraint_are_refused_with_400() {
-    let router = emulator();
-    let valid = Query::new("loss", "tc-boundary")
-        .aggregate("Last", "IterationNumber", "IterationNumber")
-        .to_json();
+/// What a request that breaks one modelled constraint must be answered with, now that the
+/// framework's centralized walk judges none of this service's input members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServedAs {
+    /// `BatchGetMetrics`: the one query is answered with this `Status`.
+    Query(&'static str),
+    /// `BatchPutMetrics`: every point was ingested, so `Errors` is the empty list.
+    Ingested,
+}
 
-    // case, method, path, body.
-    let cases: Vec<(&str, &str, &str, Value)> = vec![
+/// A value outside a modelled constraint is NOT refused at the request boundary: this
+/// service judges its own members, per item, inside a 200 response (`skip_validation` in
+/// `src/ops/types`). This pins where that boundary is, which is why the two handlers do the
+/// judging — and the one exception, a reference that is not a SageMaker ARN, is pinned in
+/// `resource_arn_refusal.rs`.
+#[tokio::test]
+async fn a_modelled_constraint_violation_is_reported_per_item_inside_a_200() {
+    let router = emulator();
+    let arn = trial_component_arn("tc-boundary");
+    // A name far past `MetricName`'s modelled maximum of 255.
+    let long_name = "n".repeat(400);
+
+    // case, method, path, body, what it must be answered with — one row per constraint
+    // class the model declares on a member of either input.
+    let cases: Vec<(&str, &str, &str, Value, ServedAs)> = vec![
         (
-            // MetricQueryList is modelled len 1..100.
-            "empty-metric-queries",
-            "POST",
-            "/BatchGetMetrics",
-            json!({ "MetricQueries": [] }),
-        ),
-        (
-            // SageMakerResourceArn's @pattern requires an arn:…:sagemaker:… resource.
-            "resource-arn-is-not-an-arn",
-            "POST",
-            "/BatchGetMetrics",
-            json!({ "MetricQueries": [{
-                "MetricName": "loss",
-                "ResourceArn": "foo/my-trial-comp",
-                "MetricStat": "Last",
-                "Period": "IterationNumber",
-                "XAxisType": "IterationNumber",
-            }] }),
-        ),
-        (
-            // MetricStatistic has no `Median` member.
+            // MetricStatistic has no `Median` member: a value this service cannot read as
+            // the enumerated type names no statistic, so the query selects nothing.
             "metric-stat-outside-the-enum",
             "POST",
             "/BatchGetMetrics",
             json!({ "MetricQueries": [{
                 "MetricName": "loss",
-                "ResourceArn": trial_component_arn("tc-boundary"),
+                "ResourceArn": arn,
                 "MetricStat": "Median",
                 "Period": "IterationNumber",
                 "XAxisType": "IterationNumber",
             }] }),
+            ServedAs::Query("Complete"),
         ),
         (
-            // RawMetricDataList is modelled len 1..10.
-            "empty-metric-data",
-            "PUT",
-            "/BatchPutMetrics",
-            json!({ "TrialComponentName": "tc-boundary", "MetricData": [] }),
+            // Period's value set likewise.
+            "period-outside-the-enum",
+            "POST",
+            "/BatchGetMetrics",
+            json!({ "MetricQueries": [{
+                "MetricName": "loss",
+                "ResourceArn": arn,
+                "MetricStat": "Last",
+                "Period": "OneDay",
+                "XAxisType": "Timestamp",
+            }] }),
+            ServedAs::Query("Complete"),
         ),
         (
-            // ExperimentEntityName must be entirely lowercase.
+            // MetricName is modelled @length 1..255 @pattern '^.+$': a name with no
+            // character names no series, which matches nothing.
+            "metric-name-empty",
+            "POST",
+            "/BatchGetMetrics",
+            json!({ "MetricQueries": [{
+                "MetricName": "",
+                "ResourceArn": arn,
+                "MetricStat": "Last",
+                "Period": "IterationNumber",
+                "XAxisType": "IterationNumber",
+            }] }),
+            ServedAs::Query("Complete"),
+        ),
+        (
+            "metric-name-past-its-length",
+            "POST",
+            "/BatchGetMetrics",
+            json!({ "MetricQueries": [{
+                "MetricName": long_name,
+                "ResourceArn": arn,
+                "MetricStat": "Last",
+                "Period": "IterationNumber",
+                "XAxisType": "IterationNumber",
+            }] }),
+            ServedAs::Query("Complete"),
+        ),
+        (
+            // ExperimentEntityName must be entirely lowercase; the point is still ingested.
             "uppercase-trial-component-name",
             "PUT",
             "/BatchPutMetrics",
@@ -923,9 +977,10 @@ async fn requests_violating_a_modelled_constraint_are_refused_with_400() {
                 "TrialComponentName": "TC-Boundary",
                 "MetricData": raw_metric_data(&[("loss", T0, Some(0), 1.0)]),
             }),
+            ServedAs::Ingested,
         ),
         (
-            // Step is modelled range min 0.
+            // Step is modelled @range min 0.
             "negative-step",
             "PUT",
             "/BatchPutMetrics",
@@ -933,27 +988,79 @@ async fn requests_violating_a_modelled_constraint_are_refused_with_400() {
                 "TrialComponentName": "tc-boundary",
                 "MetricData": raw_metric_data(&[("loss", T0, Some(-1), 1.0)]),
             }),
+            ServedAs::Ingested,
+        ),
+        (
+            "metric-name-past-its-length-on-a-point",
+            "PUT",
+            "/BatchPutMetrics",
+            json!({
+                "TrialComponentName": "tc-boundary",
+                "MetricData": [{
+                    "MetricName": long_name,
+                    "Timestamp": T0,
+                    "Step": 0,
+                    "Value": 1.0,
+                }],
+            }),
+            ServedAs::Ingested,
+        ),
+        (
+            // RawMetricDataList is modelled @length 1..10; an eleventh point is ingested
+            // like the rest.
+            "more-points-than-the-modelled-maximum",
+            "PUT",
+            "/BatchPutMetrics",
+            json!({
+                "TrialComponentName": "tc-boundary",
+                "MetricData": Value::Array(
+                    (0..11)
+                        .map(|step| json!({
+                            "MetricName": "many",
+                            "Timestamp": T0 + i64::from(step),
+                            "Step": step,
+                            "Value": f64::from(step),
+                        }))
+                        .collect(),
+                ),
+            }),
+            ServedAs::Ingested,
         ),
     ];
 
-    for (case, method, path, body) in cases {
+    for (case, method, path, body, served) in cases {
         let (status, response) = call(&router, method, path, &body).await;
         assert_eq!(
-            status, 400,
-            "case {case}: a modelled-constraint violation is refused with 400, \
+            status, 200,
+            "case {case}: a modelled-constraint violation is served and reported per item, \
              got {status}: {response:?}"
         );
+        match served {
+            ServedAs::Query(expected) => {
+                let results = response["MetricQueryResults"].as_array().unwrap_or_else(|| {
+                    panic!("case {case}: expected MetricQueryResults, got {response:?}")
+                });
+                assert_eq!(
+                    results.len(),
+                    1,
+                    "case {case}: one result per query, got {results:?}"
+                );
+                assert_eq!(
+                    results[0]["Status"].as_str(),
+                    Some(expected),
+                    "case {case}: expected Status {expected}, got {:?}",
+                    results[0]
+                );
+            }
+            ServedAs::Ingested => {
+                assert_eq!(
+                    response["Errors"].as_array().map(Vec::len),
+                    Some(0),
+                    "case {case}: every point was ingested, so Errors is [], got {response:?}"
+                );
+            }
+        }
     }
-
-    // And the request those cases are variations of is served.
-    let (status, _) = call(
-        &router,
-        "POST",
-        "/BatchGetMetrics",
-        &json!({ "MetricQueries": [valid] }),
-    )
-    .await;
-    assert_eq!(status, 200, "the valid shape of the same request is served");
 }
 
 /// The points the write-order test uses: distinct iteration numbers, distinct values.
@@ -1014,7 +1121,11 @@ async fn every_write_order_reads_back_ascending_and_is_idempotent() {
             let results = get_metrics(&router, std::slice::from_ref(&query)).await;
             let got = &results[0];
             assert!(
-                got.x_axis_values.windows(2).all(|pair| pair[0] < pair[1]),
+                got.x_axis_values
+                    .as_deref()
+                    .unwrap_or_default()
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1]),
                 "case {order:?}: XAxisValues must ascend, got {:?}",
                 got.x_axis_values
             );

@@ -11,14 +11,29 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-sagemakermetrics-sagemakermetricsservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.sagemakermetrics#BatchPutMetricsRequest")]
+// `skip_validation` names both members: `ExperimentEntityName`'s `@length 1..120` and
+// `@pattern`, and `RawMetricDataList`'s `@length 1..10`. Neither is judged at the request
+// boundary — a call that names no trial component and one that carries no data point are
+// this service's own envelope refusals (`crate::service::envelope`), and everything else
+// about a batch is reported per data point inside a 200 response.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.sagemakermetrics#BatchPutMetricsRequest",
+    skip_validation = ["TrialComponentName", "MetricData"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct BatchPutMetricsInput {
     pub trial_component_name: String,
     pub metric_data: Vec<RawMetricData>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.sagemakermetrics#RawMetricData")]
+// `skip_validation` names the constrained members of one data point: `MetricName`'s
+// `@length 1..255`/`@pattern` and `Step`'s `@range min 0`. A point's fate is reported at
+// its own index inside a 200 response (`BatchPutMetricsError.Code`/`MetricIndex`), so
+// neither may refuse the whole batch from the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.sagemakermetrics#RawMetricData",
+    skip_validation = ["MetricName", "Step"]
+)]
 #[derive(Debug, Clone)]
 pub struct RawMetricData {
     pub metric_name: String,

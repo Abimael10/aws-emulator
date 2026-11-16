@@ -34,39 +34,73 @@ pub const MAX_METRIC_NAMES_PER_TRIAL_COMPONENT: usize = 40;
 /// test workload, not a number AWS states.
 pub const MAX_DATA_POINTS_PER_SERIES: usize = 2_000;
 
+/// How long a caller-chosen name this store will hold, in bytes — a `TrialComponentName`
+/// or a `MetricName`, each of which becomes a map key held for the life of the process.
+///
+/// The caps above bound how MANY names the store holds, and this one bounds their SIZE:
+/// without it a caller can grow the emulator's memory by the length of its names rather
+/// than by their number, and the length of a name is not what the counting caps bound.
+/// AWS publishes no number for it, so it is chosen by this emulator, an order of magnitude
+/// above the longest name either modelled member admits (`ExperimentEntityName` is
+/// `@length 1..120` and `MetricName` `@length 1..255`) — this service does not refuse a
+/// name for those bounds (see `crate::ops::batch_put_metrics`), so the resource bound has to
+/// be its own. A point naming something longer is refused for its own index with the
+/// modelled `PutMetricsErrorCode::METRIC_LIMIT_EXCEEDED`, and stores nothing.
+pub const MAX_NAME_BYTES: usize = 4_096;
+
+/// How many ITEMS one request of either operation may carry: `MetricQueries` for a read,
+/// `MetricData` for a write.
+///
+/// The model bounds a request at 100 queries and 10 data points, and this service does not
+/// refuse a request for those bounds (see `crate::service::envelope`), so this cap is the
+/// resource bound that takes their place: it is what keeps the WORK and the RESPONSE of one
+/// call bounded, since a read evaluates every query it carries and each query may return up
+/// to [`crate::ops::batch_get_metrics::MAX_RESULT_POINTS_PER_QUERY`] aggregated points. The
+/// product is what it bounds — 200 x 1 000 = 200 000 points at worst for one response — and
+/// it is chosen by this emulator, twice the modelled query maximum and twenty times the
+/// modelled data-point maximum, so no request either recorded operation serves comes near
+/// it.
+pub const MAX_ITEMS_PER_REQUEST: usize = 200;
+
 /// One raw metric data point, as `BatchPutMetrics` wrote it.
 ///
-/// The timestamp is kept as epoch MILLISECONDS rather than a `SystemTime`: the modelled
-/// `Timestamp` accepts instants before 1970 (which `SystemTime` cannot hold on every
-/// platform without signed arithmetic), and millisecond integers make the
-/// `BatchGetMetrics` period bucketing exact instead of float-rounded. The instant is
-/// therefore quantised to the millisecond: two points of one series that differ only
-/// BELOW the millisecond share a coordinate, so the second is a re-write of the first
-/// (identical value) or a conflict (different value).
+/// The instant is kept as the epoch SECOND plus the millisecond within it, which is the
+/// `aws_smithy_types::DateTime` the request carried, quantised to the millisecond: every
+/// instant that type can hold is storable (an epoch-millisecond count would overflow `i64`
+/// for the extremes of it), the modelled `Timestamp` accepts instants before 1970 (which
+/// `SystemTime` cannot hold on every platform without signed arithmetic), and integers make
+/// the `BatchGetMetrics` period bucketing exact instead of float-rounded. Two points of one
+/// series that differ only BELOW the millisecond therefore share a coordinate, so the
+/// second is a re-write of the first (identical value) or a conflict (different value).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MetricDatum {
-    /// `RawMetricData.Timestamp`, in epoch milliseconds (negative before 1970).
-    pub timestamp_millis: i64,
+    /// `RawMetricData.Timestamp`'s epoch second (negative before 1970).
+    pub epoch_second: i64,
+    /// The millisecond within that second, `0..1000`.
+    pub subsec_millis: u32,
     /// `RawMetricData.Step` — `None` when the caller omitted it.
     pub step: Option<i32>,
-    /// `RawMetricData.Value`. Always finite: the handler refuses anything else.
+    /// `RawMetricData.Value`. Never `NaN`: a value with no position in any ordering is
+    /// not stored, so every stored value is comparable and aggregatable.
     pub value: f64,
 }
 
 impl MetricDatum {
     /// The point's position on the timestamp axis, in whole epoch seconds.
     ///
-    /// Floors towards negative infinity (`div_euclid`), so a pre-1970 point lands in the
-    /// bucket that contains it rather than the one after it.
+    /// The stored second IS that position: a sub-second remainder is held separately, so
+    /// nothing has to be floored here and a pre-1970 point keeps the second it was
+    /// recorded in.
     #[must_use]
     pub fn epoch_seconds(&self) -> i64 {
-        self.timestamp_millis.div_euclid(1000)
+        self.epoch_second
     }
 
-    /// The point's identity within its series: the instant it was recorded at, plus the
-    /// iteration it belongs to. Two puts at the same coordinate describe the same point.
-    fn coordinate(&self) -> (i64, Option<i32>) {
-        (self.timestamp_millis, self.step)
+    /// The point's identity within its series: the instant it was recorded at, to the
+    /// millisecond, plus the iteration it belongs to. Two puts at the same coordinate
+    /// describe the same point.
+    fn coordinate(&self) -> (i64, u32, Option<i32>) {
+        (self.epoch_second, self.subsec_millis, self.step)
     }
 }
 
@@ -94,9 +128,10 @@ pub struct ComAmazonawsSagemakermetricsSagemakermetricsserviceState {
 /// `BatchPutMetrics` reports per-index failures and still persists every other point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordRejection {
-    /// Storing the point would take the trial component past
-    /// [`MAX_METRIC_NAMES_PER_TRIAL_COMPONENT`] or the series past
-    /// [`MAX_DATA_POINTS_PER_SERIES`].
+    /// Storing the point would take the store past [`MAX_TRIAL_COMPONENTS`], the trial
+    /// component past [`MAX_METRIC_NAMES_PER_TRIAL_COMPONENT`] or the series past
+    /// [`MAX_DATA_POINTS_PER_SERIES`], or it names something longer than
+    /// [`MAX_NAME_BYTES`].
     MetricLimitExceeded,
     /// The series already holds a DIFFERENT value at this point's
     /// `(timestamp, step)` coordinate. Re-writing the same value there is accepted and
@@ -120,6 +155,11 @@ impl ComAmazonawsSagemakermetricsSagemakermetricsserviceState {
         metric_name: &str,
         datum: MetricDatum,
     ) -> Result<(), RecordRejection> {
+        // A name longer than this store holds is refused before any entry is created: the
+        // counting caps below bound how many names are held, not how long one may be.
+        if trial_component_name.len() > MAX_NAME_BYTES || metric_name.len() > MAX_NAME_BYTES {
+            return Err(RecordRejection::MetricLimitExceeded);
+        }
         let component = self.components.get(trial_component_name);
         if component.is_none() && self.components.len() >= MAX_TRIAL_COMPONENTS {
             return Err(RecordRejection::MetricLimitExceeded);
