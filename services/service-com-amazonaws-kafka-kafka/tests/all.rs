@@ -103,6 +103,8 @@ mod delete_version_precondition_attribution;
 mod describe_cluster_v2;
 #[path = "all/guarded_update_sequences.rs"]
 mod guarded_update_sequences;
+#[path = "all/identity_permission_gate.rs"]
+mod identity_permission_gate;
 #[path = "all/identity_policy_gate.rs"]
 mod identity_policy_gate;
 #[path = "all/iso8601_timestamps.rs"]

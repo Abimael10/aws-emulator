@@ -180,12 +180,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Decided FIRST, on the ARN as submitted and from the request alone: the
-        // caller holds no resource-based policy over a cluster of another account,
-        // so such a request is refused rather than answered out of what this
-        // registry happens to hold under that ARN. See
-        // [`crate::state::authorization`].
-        crate::state::authorization::authorize_operation(Self::NAME, &input.cluster_arn)?;
+        // Decided FIRST, before anything the request names is resolved: AWS
+        // authorizes at the IAM layer ahead of the service, so a caller whose own
+        // identity policies do not permit this action is told it is not authorized
+        // rather than told whether the cluster exists — and the caller holds no
+        // resource-based policy over a cluster of another account either, so such a
+        // request is refused rather than answered out of what this registry happens
+        // to hold under that ARN. See [`crate::state::authorization`].
+        crate::state::authorization::authorize_caller_operation(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.cluster_arn,
+        )?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 BatchAssociateScramSecretErrorModeled::InternalServerErrorException(
@@ -233,11 +240,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // WHICH secrets of the batch can serve as this cluster's SASL/SCRAM
-        // credentials is Secrets Manager's to answer, so it is asked — before the
-        // store's guard is taken, because that call cannot be made while it is
-        // held. Each secret it reports on is decided on its own: the ones it
-        // cannot serve come back in `UnprocessedScramSecrets` below and are never
-        // stored, and the rest are what this call associates.
+        // credentials is Secrets Manager's to answer, so it is asked — over the
+        // IN-PROCESS callback, which dispatches to the Secrets Manager mounted on
+        // this same emulator ([`crate::state::scram_secret_admission`]): no socket
+        // is opened, nothing leaves the process, and nothing of the request picks a
+        // target. It is asked before the store's guard is taken, because that call
+        // cannot be made while it is held. Each secret it reports on is decided on
+        // its own: the ones it cannot serve come back in `UnprocessedScramSecrets`
+        // below and are never stored, and the rest are what this call associates.
         let admission = crate::state::scram_secret_admission::admit_for_association(
             ctx,
             &region,

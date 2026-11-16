@@ -191,12 +191,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ClusterArn` is optional in the model.
         let source_versions: Vec<String> = match input.cluster_arn.as_deref() {
             Some(cluster_arn) => {
-                // Decided FIRST, on the ARN as submitted and from the request
-                // alone: the caller holds no resource-based policy over a cluster
-                // of another account, so such a request is refused rather than
-                // answered out of what this registry happens to hold under that
-                // ARN. See [`crate::state::authorization`].
-                crate::state::authorization::authorize_operation(Self::NAME, cluster_arn)?;
+                // Decided FIRST, before anything the request names is resolved:
+                // AWS authorizes at the IAM layer ahead of the service, so a
+                // caller whose own identity policies do not permit this action is
+                // told it is not authorized rather than told whether the cluster
+                // exists — and the caller holds no resource-based policy over a
+                // cluster of another account either, so such a request is refused
+                // rather than answered out of what this registry happens to hold
+                // under that ARN. See [`crate::state::authorization`].
+                crate::state::authorization::authorize_caller_operation(
+                    &*self.engine,
+                    ctx,
+                    Self::NAME,
+                    cluster_arn,
+                )?;
                 if !crate::state::is_cluster_arn(cluster_arn) {
                     return Err(GetCompatibleKafkaVersionsErrorModeled::BadRequestException(
                         crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),

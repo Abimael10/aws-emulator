@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The resource-scoped authorization decision a cluster-scoped operation takes
-//! BEFORE it resolves the cluster its target ARN names.
+//! The resource-scoped and identity-based authorization decisions a cluster-scoped
+//! operation takes BEFORE it resolves the cluster its target ARN names.
 //!
 //! Every operation of this service that acts on ONE cluster names that cluster by
 //! ARN — in the URI (`ClusterArn` is an `@httpLabel` on all of them) or, for
@@ -23,8 +23,8 @@
 //! and a client acts on them differently.
 //!
 //! An ARN whose account segment IS the caller's is the owning account's own
-//! request, which this emulator has no identity-based policies to refuse it by, so
-//! it passes the gate and is resolved as usual. A value that is not an ARN at all
+//! request, and whether THAT request is permitted is the identity-based half of the
+//! decision below. A value that is not an ARN at all
 //! carries no account to decide against, so the account test passes it; whether it
 //! is then refused depends on where the request carried it. An `@httpLabel` ARN of
 //! a CONTROL-plane operation names a path segment the caller can only have
@@ -37,9 +37,11 @@
 //! before anything the request names is resolved or any member of the body is read.
 //!
 //! What the CALLER's own identity-based policies say about the action is the other
-//! half of the same question, and it is asked FIRST, inside [`authorize_action`]:
-//! AWS authorizes at the IAM layer ahead of the service, so every operation that
-//! authorizes a target takes that decision before this module's own. It is decided
+//! half of the same question, and it is asked FIRST, inside
+//! [`authorize_caller_action`]: AWS authorizes at the IAM layer ahead of the
+//! service, so every operation that authorizes a target takes that decision before
+//! this module's own — an explicit `Deny` about the request refuses it, and so does
+//! IAM's default deny of a request no readable document allows. It is decided
 //! in [`crate::state::identity_authorization`], which reads the IAM and STS stores
 //! for the principal the request's credential speaks for, where every decision here
 //! is taken from the request alone — which is why the two sit in separate modules.
@@ -50,8 +52,12 @@
 //! A cluster also carries a resource-based policy OF ITS OWN
 //! ([`authorize_cluster_policy`]), which the operations MSK's cluster policy
 //! governs ([`CLUSTER_POLICY_ACTIONS`]) take into account once the cluster is
-//! resolved: an explicit deny in it refuses the call whatever else allows it, and
-//! before the operation looks at anything else about the cluster or the request.
+//! resolved, before the operation looks at anything else about the cluster or the
+//! request: an explicit deny in it refuses the call whatever else allows it, and an
+//! allow of the calling principal GRANTS a call that principal's own policies do
+//! not — which is what a cluster policy is attached for. Those two decisions are
+//! therefore taken TOGETHER there, as IAM takes them, which is why the gate holds
+//! back the default deny for an action a cluster policy can grant.
 //!
 //! Passing a ROLE to the service ([`authorize_pass_role`]) is the same question
 //! read the other way round, and it is the one case where a value that names no
@@ -62,9 +68,8 @@
 //! A refusal that rests on a resource-based policy is worded in the shared IAM
 //! sentence ([`::service_common::iam_authorization::not_authorized_by_resource_policy`]),
 //! so this service cannot drift from the other services that refuse an
-//! unauthorized request; the two sentences AWS words the other decisions in — a
-//! request nothing grants, and one an attached document explicitly denied — are
-//! built here from the same parts.
+//! unauthorized request; so are the sentences AWS words the other decisions in — a
+//! request nothing grants, and one an attached document explicitly denied.
 //!
 //! The decision is taken by the operations whose target IS a cluster — the ones
 //! whose action applies to it. The TAGGING operations take any MSK resource ARN
@@ -176,9 +181,9 @@ pub fn caller_principal() -> String {
 /// `Ok(())` when nothing about the resource refuses the request; otherwise the
 /// refusal, ready to be returned from any operation's error channel. The CALLER's
 /// own identity policies are the other half of the question and are asked FIRST,
-/// in [`authorize_caller_action`] — the operations that take that fuller gate come
-/// through this one too, so the two decisions cannot drift apart.
-pub fn authorize_action<E>(
+/// in [`authorize_caller_action`] — the only caller of this half, so the two
+/// decisions cannot drift apart.
+fn authorize_action<E>(
     action: &str,
     target_arn: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
@@ -199,35 +204,36 @@ pub fn authorize_action<E>(
     ))
 }
 
-/// The same decision for the control-plane action of `operation` — the API name,
-/// which the caller passes as its own `Operation::NAME` so the action named can
-/// never drift from the operation taking it.
-pub fn authorize_operation<E>(
-    operation: &str,
-    target_arn: &str,
-) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    authorize_action(&control_plane_action(operation), target_arn)
-}
-
 /// BOTH authorization decisions, in AWS's own order, taken before the operation
 /// resolves anything the request names:
 ///
 /// 1. what the CALLING PRINCIPAL's own identity-based policies say about `action`
 ///    ([`crate::state::identity_authorization`]), which is the decision IAM takes
 ///    ahead of the service seeing the request at all, and which refuses the call
-///    whatever it would otherwise have been answered;
+///    whatever it would otherwise have been answered: an explicit `Deny` about the
+///    request, and the DEFAULT deny of a request no readable document allows;
 /// 2. the resource-scoped decision above.
 ///
 /// This is the gate an operation takes, and the ONE place that order lives.
+///
+/// For an action a cluster's OWN resource-based policy may grant
+/// ([`CLUSTER_POLICY_ACTIONS`]) only the explicit `Deny` is decided here: that
+/// document can allow the call on its own, and it cannot be read before the cluster
+/// is resolved, so the rest of the identity-based decision is taken together with it
+/// in [`authorize_cluster_policy`] — one combined decision, as IAM takes it.
 pub fn authorize_caller_action<Eng: Send + Sync + 'static, E>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     action: &str,
     target_arn: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    if let Some(refusal) =
-        crate::state::identity_authorization::denied(engine, ctx, action, target_arn)
-    {
+    let caller = crate::state::identity_authorization::caller_identity(engine, ctx);
+    let refusal = if grantable_by_cluster_policy(action) {
+        caller.explicit_deny(action, target_arn)
+    } else {
+        caller.refusal(action, target_arn)
+    };
+    if let Some(refusal) = refusal {
         return Err(refusal);
     }
     authorize_action(action, target_arn)
@@ -311,7 +317,13 @@ fn no_grant_for_cluster<Eng: Send + Sync + 'static, E>(
             ),
         );
     }
-    access_denied(not_authorized_as(&principal, action, ANY_RESOURCE))
+    access_denied(
+        ::service_common::iam_authorization::not_authorized_to_perform(
+            &principal,
+            action,
+            ANY_RESOURCE,
+        ),
+    )
 }
 
 /// The IAM actions an MSK CLUSTER POLICY governs — the resource-based policy
@@ -330,54 +342,111 @@ pub const CLUSTER_POLICY_ACTIONS: [&str; 4] = [
     "DescribeClusterV2",
 ];
 
+/// Whether a cluster's own resource-based policy can GRANT `action` (a fully
+/// qualified IAM action) — the question that decides where the identity-based
+/// default deny is taken, since a document that can allow the call on its own has
+/// to be read before the absence of an identity grant refuses it.
+fn grantable_by_cluster_policy(action: &str) -> bool {
+    CLUSTER_POLICY_ACTIONS
+        .iter()
+        .any(|operation| control_plane_action(operation) == action)
+}
+
 /// The decision the cluster's OWN resource-based policy takes about the
-/// control-plane action of `operation` on `cluster`, after the cluster has been
-/// resolved and before the operation does anything else.
+/// control-plane action of `operation` on `cluster`, COMBINED with the caller's
+/// identity-based policies, after the cluster has been resolved and before the
+/// operation does anything else.
 ///
 /// IAM's order, through the tree's one evaluation of policy documents
-/// ([`::service_common::iam_authorization`]): an explicit `Deny` about this request
-/// refuses it whatever else allows it, while the owning account's own request is
-/// allowed by its identity-based policies, so a document that merely states nothing
-/// about the request — or no document at all — leaves the call served. The
-/// principals a document may name the caller by are the calling principal itself
-/// and the account it belongs to, which is what a resource policy may name in its
-/// place.
+/// ([`::service_common::iam_authorization`]): an explicit `Deny` in either place
+/// refuses the request whatever else allows it; otherwise, within one account, "the
+/// resource-based policy and the identity-based policy are evaluated together, and
+/// access is granted if either allows it"
+/// ([`::service_common::iam_authorization::is_allowed`]), so an attached document
+/// that allows the calling principal grants a caller its own policies do not — which
+/// is exactly what a cluster policy is attached for — and a request neither allows
+/// falls to IAM's default deny.
+///
+/// The principals a document may name the caller by are every spelling of the
+/// calling principal ([`crate::state::identity_authorization::Caller::principals`]):
+/// the session ARN and, for an assumed-role session, the role the session speaks
+/// for. A DENY is decided against the whole ACCOUNT's spellings as well, because a
+/// statement denying an account refuses each of its principals, where one that
+/// ALLOWS an account delegates the decision to that account's own identity-based
+/// policies rather than granting it here
+/// ([`::service_common::iam_authorization::account_principals`]).
 ///
 /// Taken by the operations [`CLUSTER_POLICY_ACTIONS`] names, which are the ones a
 /// cluster policy governs. The work it does is bounded by the stored document
 /// rather than by the request: `PutClusterPolicy` caps what one cluster may hold
 /// ([`crate::state::MAX_CLUSTER_POLICY_BYTES`]), and the shared evaluation reads no
 /// document longer than its own ceiling.
-pub fn authorize_cluster_policy<E>(
+///
+/// It is taken with the cluster already resolved, so the caller may still hold this
+/// service's own guard while the IAM and STS stores are read for the principal —
+/// which is the only order in which this service reaches those stores.
+pub fn authorize_cluster_policy<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
     operation: &str,
     cluster: &crate::state::Cluster,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    let Some(policy) = cluster.policy.as_ref() else {
-        return Ok(());
-    };
     let action = control_plane_action(operation);
-    let caller = caller_principal();
-    let mut principals = vec![caller.clone()];
-    principals.extend(::service_common::iam_authorization::account_principals(
-        &caller,
-    ));
-    let stated = ::service_common::iam_authorization::resource_decision(
-        &policy.document,
-        &::service_common::iam_authorization::Request::new(&action, &cluster.arn, &principals),
-    );
-    // The resource belongs to the account this emulator serves, so that account's
-    // identity-based policies are the grant the combined decision starts from; only
-    // an explicit deny in the attached document overturns it.
-    if ::service_common::iam_authorization::is_allowed(
-        ::service_common::iam_authorization::Decision::Allowed,
-        stated,
-    ) {
+    let caller = crate::state::identity_authorization::caller_identity(engine, ctx);
+    let stated = cluster_policy_decision(&caller, &action, cluster);
+    if stated == ::service_common::iam_authorization::Decision::Denied {
+        return Err(access_denied(not_authorized_by_explicit_deny(
+            &caller.principal(),
+            &action,
+            &cluster.arn,
+        )));
+    }
+    if let Some(refusal) = caller.explicit_deny(&action, &cluster.arn) {
+        return Err(refusal);
+    }
+    let identity = if caller.grants(&action, &cluster.arn) {
+        ::service_common::iam_authorization::Decision::Allowed
+    } else {
+        ::service_common::iam_authorization::Decision::NotStated
+    };
+    if ::service_common::iam_authorization::is_allowed(identity, stated) {
         return Ok(());
     }
-    Err(access_denied(not_authorized_by_explicit_deny(
-        &action,
-        &cluster.arn,
-    )))
+    Err(caller.no_grant(&action, &cluster.arn))
+}
+
+/// What the document attached to `cluster` — if it carries one — says about `action`
+/// for this caller: `Denied` when a statement denies it, `Allowed` when one grants
+/// it, and `NotStated` when the cluster carries no policy or none of its statements
+/// is about the request.
+fn cluster_policy_decision(
+    caller: &crate::state::identity_authorization::Caller,
+    action: &str,
+    cluster: &crate::state::Cluster,
+) -> ::service_common::iam_authorization::Decision {
+    use ::service_common::iam_authorization as iam;
+    let Some(policy) = cluster.policy.as_ref() else {
+        return iam::Decision::NotStated;
+    };
+    let mut named: Vec<String> = caller.principals().to_vec();
+    if named.is_empty() {
+        named.push(caller.principal());
+    }
+    let mut denied_by: Vec<String> = named.clone();
+    for principal in &named {
+        denied_by.extend(iam::account_principals(principal));
+    }
+    if iam::resource_decision(
+        &policy.document,
+        &iam::Request::new(action, &cluster.arn, &denied_by),
+    ) == iam::Decision::Denied
+    {
+        return iam::Decision::Denied;
+    }
+    iam::resource_decision(
+        &policy.document,
+        &iam::Request::new(action, &cluster.arn, &named),
+    )
 }
 
 /// The refusal an authorization decision leaves, carrying `message`: the code and
@@ -387,31 +456,19 @@ pub(crate) fn access_denied<E>(message: String) -> crate::scaffolded::Scaffolded
     crate::scaffolded::Scaffolded::unmodeled(ACCESS_DENIED_CODE, ACCESS_DENIED_STATUS, message)
 }
 
-/// The sentence AWS refuses a request NOTHING grants with: fixed connectives
-/// around the calling principal, the action asked for and the resource the decision
-/// was taken over — and no clause about a document, because none of them refused
-/// it; the request simply reaches no grant.
-fn not_authorized(action: &str, resource: &str) -> String {
-    not_authorized_as(&caller_principal(), action, resource)
-}
-
-/// The same sentence about a principal the REQUEST's credential named rather than
-/// the ambient one — the form an identity-based decision needs, since the principal
-/// it refuses is the session that signed the call.
-///
-/// Built here, from the same parts, so a refusal reads alike whichever decision
-/// reached it.
-pub(crate) fn not_authorized_as(principal: &str, action: &str, resource: &str) -> String {
-    format!("User: {principal} is not authorized to perform: {action} on resource: {resource}")
-}
-
-/// The same sentence for a request a resource-based policy explicitly DENIED,
+/// The sentence AWS refuses a request a resource-based policy explicitly DENIED with,
 /// closed by the clause AWS names that document with: a client reading the message
-/// learns that fixing its own permissions will not help.
-fn not_authorized_by_explicit_deny(action: &str, resource: &str) -> String {
-    format!(
-        "{} with an explicit deny in a resource-based policy",
-        not_authorized(action, resource)
+/// learns that fixing its own permissions will not help. Every other wording of this
+/// refusal is the shared one ([`::service_common::iam_authorization`]), so two
+/// decisions that reach the same answer cannot word it differently. The principal is the one
+/// the REQUEST's credential speaks for, so the refusal blames the identity that
+/// signed the call.
+fn not_authorized_by_explicit_deny(principal: &str, action: &str, resource: &str) -> String {
+    ::service_common::iam_authorization::not_authorized_by_identity_policy(
+        principal,
+        action,
+        resource,
+        ::service_common::iam_authorization::RESOURCE_POLICY_EXPLICIT_DENY,
     )
 }
 
@@ -440,4 +497,35 @@ pub fn authorize_pass_role<E>(role_arn: &str) -> Result<(), crate::scaffolded::S
         ACCESS_DENIED_STATUS,
         CROSS_ACCOUNT_PASS_ROLE_MESSAGE,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RULE: the actions a cluster policy can grant are exactly the published set,
+    /// read as the fully qualified IAM actions the gate decides on — so the gate
+    /// holds back the default deny for those and for nothing else.
+    #[test]
+    fn exactly_the_published_actions_are_grantable_by_a_cluster_policy() {
+        for operation in CLUSTER_POLICY_ACTIONS {
+            let action = control_plane_action(operation);
+            assert!(
+                grantable_by_cluster_policy(&action),
+                "case {operation:?}: expected {action} to be grantable by a cluster policy"
+            );
+        }
+        for operation in ["ListScramSecrets", "ListNodes", "DeleteCluster"] {
+            let action = control_plane_action(operation);
+            assert!(
+                !grantable_by_cluster_policy(&action),
+                "case {operation:?}: a cluster policy does not govern {action}"
+            );
+        }
+        assert!(
+            !grantable_by_cluster_policy(CLUSTER_CONNECT_ACTION),
+            "case \"the data-plane action\": a cluster policy does not govern \
+             {CLUSTER_CONNECT_ACTION}"
+        );
+    }
 }

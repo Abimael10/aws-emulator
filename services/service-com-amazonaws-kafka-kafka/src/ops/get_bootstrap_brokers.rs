@@ -192,12 +192,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Decided FIRST, on the ARN as submitted and from the request alone: the
-        // caller holds no resource-based policy over a cluster of another account,
-        // so such a request is refused rather than answered out of what this
-        // registry happens to hold under that ARN. See
-        // [`crate::state::authorization`].
-        crate::state::authorization::authorize_operation(Self::NAME, &input.cluster_arn)?;
+        // Decided FIRST, before anything the request names is resolved: AWS
+        // authorizes at the IAM layer ahead of the service, so a caller whose own
+        // identity policies do not permit this action is told it is not authorized
+        // rather than told whether the cluster exists — and the caller holds no
+        // resource-based policy over a cluster of another account either, so such a
+        // request is refused rather than answered out of what this registry happens
+        // to hold under that ARN. See [`crate::state::authorization`].
+        crate::state::authorization::authorize_caller_operation(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.cluster_arn,
+        )?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 GetBootstrapBrokersErrorModeled::InternalServerErrorException(
@@ -273,10 +280,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
 
             // The cluster's own resource-based policy is in force on this action too
-            // — it is one of the actions an MSK cluster policy governs — and an
-            // explicit deny in it refuses the read before any endpoint is reported.
-            // See [`crate::state::authorization::CLUSTER_POLICY_ACTIONS`].
-            crate::state::authorization::authorize_cluster_policy(Self::NAME, cluster)?;
+            // — it is one of the actions an MSK cluster policy governs — and the
+            // combined decision over it and the caller's own identity policies is
+            // taken before any endpoint is reported: an explicit deny in either
+            // refuses the read, and a request neither allows reaches no grant. See
+            // [`crate::state::authorization::CLUSTER_POLICY_ACTIONS`].
+            crate::state::authorization::authorize_cluster_policy(
+                &*self.engine,
+                ctx,
+                Self::NAME,
+                cluster,
+            )?;
 
             // A cluster the service is still provisioning has no brokers yet, so
             // there are no endpoints to bootstrap against: the reader refuses rather

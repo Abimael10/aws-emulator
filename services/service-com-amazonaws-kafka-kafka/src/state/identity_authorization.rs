@@ -5,11 +5,11 @@
 //! resolves anything the request names.
 //!
 //! AWS authorizes at the IAM layer, ahead of the service evaluating the resource, so
-//! a caller whose identity policies deny the action is told it is not authorized
-//! rather than told whether the resource exists. This service's model declares no
-//! shape for that refusal, so it leaves through the same channel the
-//! resource-scoped decision's does ([`crate::state::authorization`]), carrying the
-//! code and status the real service answers.
+//! a caller IAM does not permit is told it is not authorized rather than told
+//! whether the resource exists. This service's model declares no shape for that
+//! refusal, so it leaves through the same channel the resource-scoped decision's
+//! does ([`crate::state::authorization`]), carrying the code and status the real
+//! service answers.
 //!
 //! Three pieces, each held in exactly one place:
 //!
@@ -35,15 +35,36 @@
 //!
 //! ## What is refused, and what is not
 //!
-//! An EXPLICIT `Deny` about the action is the decision this gate takes, and it is
-//! final whatever else the account holds. An ABSENT `Allow` is NOT evidence that the
-//! caller lacks the permission: the rest of a principal's permission set (its
-//! groups' policies, service control policies, a session policy the mint passed)
-//! does not all reach this store, so refusing on its absence would deny calls AWS
-//! permits. A request signed with a credential neither store knows — the emulator's
-//! own published credential, the position AWS account root credentials are in —
-//! carries no identity policy and so is never refused here, and neither is a
-//! request served by an engine carrying no IAM or STS store.
+//! IAM's own order, over the documents this emulator can read:
+//!
+//! * an EXPLICIT `Deny` about the action refuses the request whatever else the
+//!   account holds, and it is the decision that can be taken before anything about
+//!   the resource is known;
+//! * otherwise the request needs a GRANT — an `Allow` of the action covering the
+//!   resource the request addressed — because a request no policy allows falls to
+//!   IAM's default deny. A request addressing no resource of its own
+//!   ([`crate::state::authorization::ANY_RESOURCE`]) is granted by any `Allow` of
+//!   the action, whichever resources that statement is scoped to
+//!   ([`::service_common::iam_authorization::identity_may_allow_action`]): the
+//!   resource a statement would have to cover is not known, so withholding the
+//!   grant would refuse calls AWS permits.
+//!
+//! The callers this gate does not bound, because nothing it can read says what they
+//! may do — refusing them would deny calls AWS permits:
+//!
+//! * the account's own published credential, which holds no identity-based policy
+//!   at all (`sts_store::identity_is_account_credential`), the position AWS account
+//!   root credentials are in;
+//! * a principal whose permissions this emulator cannot read in full: one carrying
+//!   an attachment the IAM store resolves no document for (an entry of AWS's own
+//!   managed-policy catalog), and one whose identity-in-force the IAM store holds no
+//!   record of at all — a session of a role the account does not hold, a federated
+//!   user, or a request served by an engine carrying no IAM or STS store;
+//! * an expired session credential, which carries no documents and speaks for
+//!   nobody (the layer that authenticates a request is what rejects it).
+//!
+//! An explicit `Deny` in a document that CAN be read still refuses every one of
+//! them.
 
 use std::time::SystemTime;
 
@@ -62,57 +83,159 @@ pub fn calling_principal<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
 ) -> String {
-    let caller = caller(engine, ctx);
-    if caller.arn.is_empty() {
-        return crate::state::authorization::caller_principal();
-    }
-    caller.arn
+    caller_identity(engine, ctx).principal()
 }
 
-/// The refusal an operation returns for a request the calling principal's identity
-/// policies explicitly deny, and `None` for every request no readable document
-/// denies: the one call the shared authorization gate
-/// ([`crate::state::authorization::authorize_action`]) makes, so every operation
-/// that authorizes a target takes this decision first.
-///
-/// `action` is the fully qualified IAM action the call asks for — `kafka:<ApiName>`
-/// for a control-plane call ([`crate::state::authorization::control_plane_action`]),
-/// the data-plane action for a call that reaches a cluster's Apache Kafka plane —
-/// and `resource` is the ARN the request NAMES, passed as submitted, before
-/// anything is resolved, so the decision does not depend on whether that resource
-/// exists and a refused call tells an unauthorized caller nothing about whether it
-/// does.
-///
-/// Generic over the operation's own modelled error enum because the refusal is none
-/// of them: it leaves through the error channel's unmodelled variant, with the code
-/// and status [`crate::state::authorization`] names.
-pub fn denied<Eng: Send + Sync + 'static, E>(
-    engine: &Eng,
-    ctx: &::smithy_server_runtime::OperationContext<'_>,
-    action: &str,
-    resource: &str,
-) -> Option<crate::scaffolded::Scaffolded<E>> {
-    explicit_deny(engine, ctx, action, resource).map(crate::state::authorization::access_denied)
+/// The principal a request speaks for, and everything the identity-based decision
+/// is made from.
+#[derive(Debug, Clone, Default)]
+pub struct Caller {
+    /// The principal's ARN, as `sts:GetCallerIdentity` reports it — what a refusal
+    /// names. Empty for a credential that speaks for nobody.
+    arn: String,
+    /// Every spelling of the principal: the session ARN STS reports, and the ARN of
+    /// the IAM role behind an assumed-role session — which is what a resource-based
+    /// policy's `Principal` element may name the caller by.
+    principals: Vec<String>,
+    /// The identity-based policy documents in force on the principal.
+    documents: Vec<String>,
+    /// Set when this request presents the account's own published credential, which
+    /// holds no IAM policies (see the module docs).
+    account_credential: bool,
+    /// Set when the IAM store answered for the identity whose documents are in
+    /// force, so the documents collected ARE this principal's permission set.
+    policies_readable: bool,
+    /// Set when the principal carries an attachment the IAM store resolves no
+    /// document for — an entry of AWS's own catalog (see the module docs).
+    unreadable_attachment: bool,
 }
 
-/// `Some(message)` when the calling principal's identity policies explicitly deny
-/// `action` on `resource` — the sentence the refusal carries — and `None` when no
-/// readable document denies it.
-fn explicit_deny<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    ctx: &::smithy_server_runtime::OperationContext<'_>,
-    action: &str,
-    resource: &str,
-) -> Option<String> {
-    let caller = caller(engine, ctx);
-    if caller.documents.is_empty() {
-        return None;
+impl Caller {
+    /// The principal a refusal blames: the identity the credential speaks for, and
+    /// the account's own published principal for a credential that speaks for
+    /// nobody.
+    pub fn principal(&self) -> String {
+        if self.arn.is_empty() {
+            return crate::state::authorization::caller_principal();
+        }
+        self.arn.clone()
     }
-    // An identity-based document states no `Principal` element, so the decision
-    // rests on the action and the resource the request addressed.
-    let request = iam::Request::new(action, resource, &[]);
-    (iam::identity_decision(&caller.documents, &request) == Decision::Denied)
-        .then(|| not_authorized_by_explicit_deny(&caller.arn, action, resource))
+
+    /// Every spelling a policy's `Principal` element may name this caller by.
+    pub fn principals(&self) -> &[String] {
+        &self.principals
+    }
+
+    /// Whether nothing this gate can read says what the caller may do, so no
+    /// absence of a grant refuses it (see the module docs). An explicit `Deny` in a
+    /// readable document still does.
+    pub fn unbounded(&self) -> bool {
+        self.account_credential || self.unreadable_attachment || !self.policies_readable
+    }
+
+    /// Whether a readable identity-based document explicitly DENIES `action` on
+    /// `resource`.
+    pub fn denies(&self, action: &str, resource: &str) -> bool {
+        !self.documents.is_empty() && self.decision(action, resource) == Decision::Denied
+    }
+
+    /// Whether the identity-based half of the decision GRANTS `action` on
+    /// `resource`: an `Allow` about the request, or a caller nothing readable bounds.
+    pub fn grants(&self, action: &str, resource: &str) -> bool {
+        if self.unbounded() {
+            return true;
+        }
+        if self.documents.is_empty() {
+            return false;
+        }
+        // A request that addresses no resource of its own leaves no resource for a
+        // statement to cover, so the weaker question is the one IAM's grant can be
+        // read from here.
+        if resource == crate::state::authorization::ANY_RESOURCE {
+            return iam::identity_may_allow_action(&iam::prepare_documents(&self.documents), action);
+        }
+        self.decision(action, resource) == Decision::Allowed
+    }
+
+    /// IAM's whole identity-based decision as a refusal: the explicit deny first,
+    /// then the default deny of a request no readable document allows. `None` when
+    /// the identity-based half grants the call.
+    ///
+    /// `action` is the fully qualified IAM action the call asks for —
+    /// `kafka:<ApiName>` for a control-plane call
+    /// ([`crate::state::authorization::control_plane_action`]), the data-plane
+    /// action for a call that reaches a cluster's Apache Kafka plane — and
+    /// `resource` is the ARN the request NAMES, as submitted, before anything is
+    /// resolved: the decision does not depend on whether that resource exists, so a
+    /// refused call tells an unauthorized caller nothing about whether it does.
+    ///
+    /// Generic over the operation's own modelled error enum because the refusal is
+    /// none of them: it leaves through the error channel's unmodelled variant, with
+    /// the code and status [`crate::state::authorization`] names.
+    pub fn refusal<E>(
+        &self,
+        action: &str,
+        resource: &str,
+    ) -> Option<crate::scaffolded::Scaffolded<E>> {
+        if let Some(refusal) = self.explicit_deny(action, resource) {
+            return Some(refusal);
+        }
+        (!self.grants(action, resource)).then(|| self.no_grant(action, resource))
+    }
+
+    /// Only the EXPLICIT-DENY half of that decision — the half that can be taken
+    /// whatever else is in force, which is why it is the one an action a RESOURCE
+    /// policy may still grant takes before the resource is resolved
+    /// ([`crate::state::authorization::authorize_cluster_policy`] takes the rest).
+    pub fn explicit_deny<E>(
+        &self,
+        action: &str,
+        resource: &str,
+    ) -> Option<crate::scaffolded::Scaffolded<E>> {
+        self.denies(action, resource).then(|| {
+            crate::state::authorization::access_denied(not_authorized_by_explicit_deny(
+                &self.principal(),
+                action,
+                resource,
+            ))
+        })
+    }
+
+    /// The refusal of a request no readable document allows — IAM's default deny,
+    /// whose sentence names the action nothing granted.
+    pub fn no_grant<E>(&self, action: &str, resource: &str) -> crate::scaffolded::Scaffolded<E> {
+        crate::state::authorization::access_denied(iam::not_authorized_by_identity_policy(
+            &self.principal(),
+            action,
+            resource,
+            &iam::no_identity_policy_allows(action),
+        ))
+    }
+
+    /// What this caller's documents say about `action` on `resource`, through the
+    /// shared evaluation.
+    fn decision(&self, action: &str, resource: &str) -> Decision {
+        // An identity-based document states no `Principal` element, so the decision
+        // rests on the action and the resource the request addressed.
+        iam::identity_decision(&self.documents, &iam::Request::new(action, resource, &[]))
+    }
+
+    /// Read what the IAM identity `identity_arn` names may do, through the IAM
+    /// service's own accessor — where the collection rule lives.
+    fn read_policies_of(
+        &mut self,
+        store: &::service_com_amazonaws_iam_awsidentitymanagementv20100508::ComAmazonawsIamAwsidentitymanagementv20100508State,
+        identity_arn: &str,
+    ) {
+        let Some(policies) = store.principal_policies(identity_arn) else {
+            return;
+        };
+        self.policies_readable = true;
+        // An attachment the collection resolved no document for is an entry of
+        // AWS's own catalog this emulator does not carry: a grant it cannot read.
+        self.unreadable_attachment = !policies.uncarried.is_empty();
+        self.documents = policies.documents;
+    }
 }
 
 /// The sentence IAM states an explicit-deny decision with: the principal, the action
@@ -120,21 +243,12 @@ fn explicit_deny<Eng: Send + Sync + 'static>(
 /// closed by the clause AWS names an identity-based document with, so a client
 /// reading it learns that fixing the resource's own policy will not help.
 fn not_authorized_by_explicit_deny(principal: &str, action: &str, resource: &str) -> String {
-    format!(
-        "{} with an explicit deny in an identity-based policy",
-        crate::state::authorization::not_authorized_as(principal, action, resource)
+    iam::not_authorized_by_identity_policy(
+        principal,
+        action,
+        resource,
+        iam::IDENTITY_POLICY_EXPLICIT_DENY,
     )
-}
-
-/// The principal a request speaks for, and the identity-based documents in force on
-/// it.
-#[derive(Debug, Clone, Default)]
-struct Caller {
-    /// The principal's ARN, as `sts:GetCallerIdentity` reports it — what a refusal
-    /// names.
-    arn: String,
-    /// The identity-based policy documents in force on the principal.
-    documents: Vec<String>,
 }
 
 /// The principal this request speaks for, with the identity-based policies in force
@@ -144,7 +258,7 @@ struct Caller {
 /// the session expiries the clock has already made due before it answers: that write
 /// is owed at the same instant whether or not anybody called, which is why a
 /// REPORTING operation of this service may take this decision too.
-fn caller<Eng: Send + Sync + 'static>(
+pub fn caller_identity<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
 ) -> Caller {
@@ -160,15 +274,20 @@ fn caller<Eng: Send + Sync + 'static>(
         // the account's own published credential, which holds no identity policy.
         None => Ok(sts_store::ambient_identity()),
     };
-    // An expired session credential speaks for nobody: it carries no documents, so
-    // nothing here refuses it (the layer that authenticates a request is what
-    // rejects it).
+    // An expired session credential speaks for nobody: it carries no documents and
+    // no principal spelling, so nothing here refuses it (the layer that
+    // authenticates a request is what rejects it).
     let Ok(identity) = identity else {
         return Caller::default();
     };
     let mut caller = Caller {
+        // The ONE reading of "nothing identity-based bounds this credential"
+        // (`sts_store::identity_is_account_credential`), so this gate cannot drift
+        // from the other services that decide a request signed with it.
+        account_credential: sts_store::identity_is_account_credential(&identity.arn),
+        principals: vec![identity.arn.clone()],
         arn: identity.arn,
-        documents: Vec::new(),
+        ..Caller::default()
     };
     let Some(iam) = iam_store::service_state(engine) else {
         return caller;
@@ -178,27 +297,38 @@ fn caller<Eng: Send + Sync + 'static>(
     // identity for it — but IAM's store maps an access key id to the USER that owns
     // it, and a request signed with one speaks for that user and is judged on the
     // user's policies.
-    if let Some(user) = store
-        .access_keys
-        .get(&access_key_id)
-        .and_then(|record| store.users.get(&record.user_key))
-    {
-        caller.arn = user.arn.clone();
+    if caller.account_credential {
+        if let Some(user) = store
+            .access_keys
+            .get(&access_key_id)
+            .and_then(|record| store.users.get(&record.user_key))
+        {
+            caller.account_credential = false;
+            caller.arn = user.arn.clone();
+            caller.principals = vec![user.arn.clone()];
+        }
     }
     // The identity whose policies are in force: for an assumed-role session the
     // ROLE's, addressed by the ARN the account holds the role under (which carries
     // its path, where the session ARN does not); for an IAM user its own.
-    let identity_arn = match ::service_common::iam_role::assumed_role_session_role_name(&caller.arn)
-    {
-        Some(role_name) => store
-            .roles
-            .get(&iam_store::name_key(role_name))
-            .map(|held| held.arn.clone()),
-        None => ::service_common::iam_role::user_name(&caller.arn).map(|_| caller.arn.clone()),
-    };
-    if let Some(identity_arn) = identity_arn {
-        if let Some(policies) = store.principal_policies(&identity_arn) {
-            caller.documents = policies.documents;
+    match ::service_common::iam_role::assumed_role_session_role_name(&caller.arn) {
+        Some(role_name) => {
+            if let Some(role_arn) = store
+                .roles
+                .get(&iam_store::name_key(role_name))
+                .map(|held| held.arn.clone())
+            {
+                // A resource-based policy may name the caller by the ROLE as well
+                // as by the session, so both spellings travel with the request.
+                caller.principals.push(role_arn.clone());
+                caller.read_policies_of(&store, &role_arn);
+            }
+        }
+        None => {
+            if ::service_common::iam_role::user_name(&caller.arn).is_some() {
+                let user_arn = caller.arn.clone();
+                caller.read_policies_of(&store, &user_arn);
+            }
         }
     }
     caller
@@ -265,5 +395,87 @@ mod tests {
             ),
             "case \"an explicit deny\": expected IAM's wording, got {message:?}"
         );
+    }
+
+    /// RULE: a request no readable document allows falls to IAM's default deny,
+    /// whose sentence closes by naming the action nothing granted.
+    #[test]
+    fn the_default_deny_names_the_action_nothing_allowed() {
+        let principal = format!(
+            "arn:aws:sts::{}:assumed-role/kafka-unpermitted/session-1",
+            ::engine::emulator_account_id()
+        );
+        let cluster = ::engine::emulator_arn(
+            "kafka",
+            "us-west-2",
+            "cluster/orders/11111111-2222-3333-4444-555555555555-1",
+        );
+        let action = crate::state::authorization::control_plane_action("GetBootstrapBrokers");
+        let caller = Caller {
+            arn: principal.clone(),
+            principals: vec![principal.clone()],
+            policies_readable: true,
+            ..Caller::default()
+        };
+        assert!(
+            !caller.grants(&action, &cluster),
+            "case \"no document at all\": a caller whose readable permission set is empty \
+             must reach no grant"
+        );
+        let refusal: crate::scaffolded::Scaffolded<()> = caller.no_grant(&action, &cluster);
+        let crate::scaffolded::Scaffolded::Unmodeled(refused) = &refusal else {
+            panic!("case \"no document at all\": expected the unmodelled refusal, got {refusal:?}")
+        };
+        let message = refused.message.clone();
+        assert_eq!(
+            message,
+            format!(
+                "User: {principal} is not authorized to perform: {action} on resource: \
+                 {cluster} because no identity-based policy allows the {action} action"
+            ),
+            "case \"no document at all\": expected IAM's default-deny wording, got {message:?}"
+        );
+    }
+
+    /// RULE: the callers nothing readable bounds are granted every action no
+    /// readable document denies — the account's own credential, a principal
+    /// carrying an attachment this emulator cannot read, and one the IAM store
+    /// holds no record of.
+    #[test]
+    fn a_caller_this_emulator_cannot_read_is_not_refused_for_a_missing_grant() {
+        let action = crate::state::authorization::control_plane_action("ListScramSecrets");
+        let resource = ::engine::emulator_arn(
+            "kafka",
+            "us-west-2",
+            "cluster/orders/11111111-2222-3333-4444-555555555555-1",
+        );
+        let rows: Vec<(&str, Caller)> = vec![
+            (
+                "the account's own published credential",
+                Caller {
+                    account_credential: true,
+                    ..Caller::default()
+                },
+            ),
+            (
+                "a principal carrying an unreadable attachment",
+                Caller {
+                    policies_readable: true,
+                    unreadable_attachment: true,
+                    ..Caller::default()
+                },
+            ),
+            (
+                "a principal the IAM store holds no record of",
+                Caller::default(),
+            ),
+        ];
+        for (case, caller) in rows {
+            assert!(
+                caller.grants(&action, &resource),
+                "case {case:?}: nothing readable bounds this caller, so the absence of a \
+                 grant must not refuse it"
+            );
+        }
     }
 }

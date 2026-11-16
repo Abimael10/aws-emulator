@@ -230,6 +230,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             };
             cluster_admits_connection(
+                &*self.engine,
+                ctx,
                 Self::NAME,
                 cluster,
                 &input.authentication,
@@ -301,6 +303,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // only against a cluster that admits it at the instant it is registered.
         match state.settled_cluster_in(&region, &cluster_arn, now) {
             Some(cluster) => cluster_admits_connection(
+                &*self.engine,
+                ctx,
                 Self::NAME,
                 cluster,
                 &input.authentication,
@@ -393,26 +397,28 @@ fn bad_request(parameter: &str, message: String) -> CreateVpcConnectionError {
 }
 
 /// Every decision the TARGET CLUSTER takes about this create, in Amazon MSK's
-/// order: the cluster's own resource-based policy, then its state, then the
-/// client authentication the connection asks for — with the scheme checked
-/// against the published set in between, since a scheme this service does not
-/// publish is a bad parameter rather than something a cluster can be asked
-/// about — and last the placement, which is sized against the cluster's own
-/// client subnets.
+/// order: the authorization decision the cluster's own resource-based policy takes
+/// part in, then its state, then the client authentication the connection asks for
+/// — with the scheme checked against the published set in between, since a scheme
+/// this service does not publish is a bad parameter rather than something a cluster
+/// can be asked about — and last the placement, which is sized against the
+/// cluster's own client subnets.
 ///
-/// A function of the STORED record and the request alone: it writes nothing, so
-/// it is taken on the cluster as the first lock saw it and again on the cluster
-/// as the lock that registers the connection sees it.
-fn cluster_admits_connection(
+/// A function of the STORED records and the request alone: it changes nothing this
+/// service holds, so it is taken on the cluster as the first lock saw it and again
+/// on the cluster as the lock that registers the connection sees it.
+fn cluster_admits_connection<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
     operation: &str,
     cluster: &crate::state::Cluster,
     authentication: &str,
     client_subnets: &[String],
 ) -> Result<(), CreateVpcConnectionError> {
-    // An explicit deny refuses the call ahead of every precondition below: a
-    // caller told its permissions are the problem must not also learn how the
-    // cluster is configured.
-    crate::state::authorization::authorize_cluster_policy(operation, cluster)?;
+    // The combined authorization decision refuses the call ahead of every
+    // precondition below: a caller told its permissions are the problem must not
+    // also learn how the cluster is configured.
+    crate::state::authorization::authorize_cluster_policy(engine, ctx, operation, cluster)?;
 
     // The cluster's STATE next: a connection is placed onto brokers the cluster
     // has, and a cluster still being provisioned has none yet.

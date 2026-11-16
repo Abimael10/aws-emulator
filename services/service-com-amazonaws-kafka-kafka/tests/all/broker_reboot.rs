@@ -18,7 +18,8 @@
 //! 3. the cluster the URI names must be a provisioned one this endpoint holds and
 //!    must be `ACTIVE`, so a reboot while an operation is in flight is refused;
 //! 4. authorization is decided at the IAM layer FIRST: a caller whose
-//!    identity-based policy explicitly denies the action is refused
+//!    identity-based policies do not permit the action — because one of them
+//!    explicitly denies it, or because none of them allows it — is refused
 //!    `AccessDeniedException` naming the principal, the action and the resource —
 //!    before the cluster is resolved, so a denied caller learns nothing about
 //!    whether it exists.
@@ -640,11 +641,44 @@ fn explicit_deny_message(resource: &str) -> String {
     )
 }
 
+/// The sentence IAM refuses a request no readable policy ALLOWS with — its default
+/// deny — which closes by naming the action nothing granted rather than a document.
+fn no_grant_message(resource: &str) -> String {
+    format!(
+        "User: {} is not authorized to perform: kafka:RebootBroker on resource: {resource} \
+         because no identity-based policy allows the kafka:RebootBroker action",
+        session_arn()
+    )
+}
+
+/// What the gate answers one row: the refusal a readable document's explicit `Deny`
+/// leaves, the refusal of a request nothing allows, or this operation's own answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    ExplicitDeny,
+    NoGrant,
+    Served,
+}
+
+impl Gate {
+    /// The sentence the gate refuses `resource` with, and `None` for a row it
+    /// serves.
+    fn message(self, resource: &str) -> Option<String> {
+        match self {
+            Self::ExplicitDeny => Some(explicit_deny_message(resource)),
+            Self::NoGrant => Some(no_grant_message(resource)),
+            Self::Served => None,
+        }
+    }
+}
+
 /// RULE: a request is authorized at the IAM layer before the service evaluates the
-/// resource, so a caller whose identity-based policy explicitly denies
+/// resource, so a caller whose identity-based policies do not permit
 /// `kafka:RebootBroker` on the cluster the request names is refused
-/// `AccessDeniedException` carrying IAM's sentence — and a caller no readable
-/// document denies reaches this operation's own handling, whatever it answers.
+/// `AccessDeniedException` carrying IAM's sentence — the explicit-deny one where a
+/// readable document denies the action, and the default-deny one where none allows
+/// it — and a caller whose policies DO allow it reaches this operation's own
+/// handling, whatever it answers.
 #[tokio::test]
 async fn an_identity_policy_that_denies_the_action_refuses_the_reboot() {
     let emulator = Emulator::new();
@@ -657,9 +691,9 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_reboot() {
     // service, every action at all, another action of this service, another
     // service's), which RESOURCE it is scoped to (this cluster, every resource,
     // another cluster), and whether a `Deny` sits beside an `Allow` of the same
-    // action. `true` is a row the gate refuses.
-    let rows: Vec<(&str, Option<Value>, bool)> = vec![
-        ("no policy at all", None, false),
+    // action.
+    let rows: Vec<(&str, Option<Value>, Gate)> = vec![
+        ("no policy at all", None, Gate::NoGrant),
         (
             "a deny of exactly this action on every resource",
             Some(json!({
@@ -668,7 +702,7 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_reboot() {
                     { "Effect": "Deny", "Action": "kafka:RebootBroker", "Resource": "*" }
                 ],
             })),
-            true,
+            Gate::ExplicitDeny,
         ),
         (
             "a deny of this whole service beside an allow of exactly this action",
@@ -679,7 +713,7 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_reboot() {
                     { "Effect": "Deny", "Action": "kafka:*", "Resource": "*" },
                 ],
             })),
-            true,
+            Gate::ExplicitDeny,
         ),
         (
             "a deny of every action",
@@ -687,7 +721,7 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_reboot() {
                 "Version": "2012-10-17",
                 "Statement": [{ "Effect": "Deny", "Action": "*", "Resource": "*" }],
             })),
-            true,
+            Gate::ExplicitDeny,
         ),
         (
             "a deny scoped to this cluster",
@@ -697,7 +731,7 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_reboot() {
                     { "Effect": "Deny", "Action": "kafka:*", "Resource": arn.clone() }
                 ],
             })),
-            true,
+            Gate::ExplicitDeny,
         ),
         (
             "a deny scoped to another cluster",
@@ -707,7 +741,7 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_reboot() {
                     { "Effect": "Deny", "Action": "kafka:*", "Resource": other.clone() }
                 ],
             })),
-            false,
+            Gate::NoGrant,
         ),
         (
             "a deny of another action of this service",
@@ -717,7 +751,7 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_reboot() {
                     { "Effect": "Deny", "Action": "kafka:DeleteCluster", "Resource": "*" }
                 ],
             })),
-            false,
+            Gate::NoGrant,
         ),
         (
             "a deny of another service's actions",
@@ -725,7 +759,29 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_reboot() {
                 "Version": "2012-10-17",
                 "Statement": [{ "Effect": "Deny", "Action": "s3:*", "Resource": "*" }],
             })),
-            false,
+            Gate::NoGrant,
+        ),
+        (
+            "an allow scoped to another cluster",
+            Some(json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    { "Effect": "Allow", "Action": "kafka:*", "Resource": other.clone() }
+                ],
+            })),
+            Gate::NoGrant,
+        ),
+        (
+            "an allow of exactly this action scoped to this cluster",
+            Some(json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": "kafka:RebootBroker",
+                    "Resource": arn.clone(),
+                }],
+            })),
+            Gate::Served,
         ),
         (
             "an allow of every action of this service",
@@ -733,22 +789,18 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_reboot() {
                 "Version": "2012-10-17",
                 "Statement": [{ "Effect": "Allow", "Action": "kafka:*", "Resource": "*" }],
             })),
-            false,
+            Gate::Served,
         ),
     ];
 
-    for (case, document, refused) in rows {
+    for (case, document, gate) in rows {
         given_role_policy(&emulator.engine, document.as_ref());
         let reply = reboot_as(&emulator, SESSION_KEY_ID, &arn, &["1"]).await;
-        if refused {
+        if let Some(expected) = gate.message(&arn) {
             assert_eq!(
                 (reply.status, reply.error_code(), reply.error_message()),
-                (
-                    ACCESS_DENIED_STATUS,
-                    ACCESS_DENIED_CODE,
-                    explicit_deny_message(&arn).as_str()
-                ),
-                "case {case:?}: expected IAM's explicit-deny refusal, got {} {}",
+                (ACCESS_DENIED_STATUS, ACCESS_DENIED_CODE, expected.as_str()),
+                "case {case:?}: expected IAM's {gate:?} refusal, got {} {}",
                 reply.status,
                 reply.body
             );
@@ -763,8 +815,8 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_reboot() {
         } else {
             assert_eq!(
                 reply.status, 200,
-                "case {case:?}: nothing denies this caller, so the reboot must be served, got {} \
-                 {}",
+                "case {case:?}: this caller's policies allow the action, so the reboot must be \
+                 served, got {} {}",
                 reply.status, reply.body
             );
             sleep_past_broker_reboot();

@@ -190,12 +190,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Decided FIRST, on the ARN as submitted and from the request alone — and
-        // so BEFORE this handler's own body validation: the caller holds no
-        // resource-based policy over a cluster of another account, so such a
-        // request is refused rather than answered out of what this registry
-        // happens to hold under that ARN. See [`crate::state::authorization`].
-        crate::state::authorization::authorize_operation(Self::NAME, &input.cluster_arn)?;
+        // Decided FIRST, before anything the request names is resolved — and so
+        // BEFORE this handler's own body validation: AWS authorizes at the IAM
+        // layer ahead of the service, so a caller whose own identity policies do
+        // not permit this action is told it is not authorized rather than told
+        // what is wrong with its body — and the caller holds no resource-based
+        // policy over a cluster of another account either, so such a request is
+        // refused rather than answered out of what this registry happens to hold
+        // under that ARN. See [`crate::state::authorization`].
+        crate::state::authorization::authorize_caller_operation(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.cluster_arn,
+        )?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateChannelErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {

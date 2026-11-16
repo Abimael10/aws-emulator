@@ -151,11 +151,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Decided FIRST, on the ARN as submitted and from the request alone: the
-        // action applies to the CLUSTER whose client connections are being
-        // managed, and the caller holds no resource-based policy over a cluster
-        // of another account. See [`crate::state::authorization`].
-        crate::state::authorization::authorize_operation(Self::NAME, &input.cluster_arn)?;
+        // Decided FIRST, before anything the request names is resolved: the action
+        // applies to the CLUSTER whose client connections are being managed, AWS
+        // authorizes at the IAM layer ahead of the service, so a caller whose own
+        // identity policies do not permit this action is told it is not authorized
+        // rather than told whether the cluster exists — and the caller holds no
+        // resource-based policy over a cluster of another account either. See
+        // [`crate::state::authorization`].
+        crate::state::authorization::authorize_caller_operation(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.cluster_arn,
+        )?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 RejectClientVpcConnectionErrorModeled::InternalServerErrorException(

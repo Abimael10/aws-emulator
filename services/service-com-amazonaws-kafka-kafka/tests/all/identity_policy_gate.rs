@@ -7,13 +7,15 @@
 //! and `sts:AssumeRole` write them.
 //!
 //! RULE under test: AWS authorizes at the IAM layer before the service resolves
-//! anything the request names, so a request whose action an identity-based policy
-//! of the calling principal explicitly DENIES is refused `AccessDeniedException`
-//! — carrying IAM's explicit-deny sentence about the principal that signed, the
-//! action asked for and the resource the request addressed — whatever that request
-//! would otherwise have been answered, and without disclosing whether the resource
-//! exists. A request no readable document denies reaches the operation's own
-//! answer.
+//! anything the request names, so a request the calling principal's identity-based
+//! policies do not permit is refused `AccessDeniedException` — carrying IAM's own
+//! sentence about the principal that signed, the action asked for and the resource
+//! the request addressed — whatever that request would otherwise have been
+//! answered, and without disclosing whether the resource exists. Which sentence is
+//! IAM's order: a document that explicitly DENIES the action refuses the call
+//! whatever else is in force, and a request no readable document ALLOWS falls to
+//! IAM's default deny, whose sentence names the action nothing granted. A request a
+//! readable document allows reaches the operation's own answer.
 //!
 //! The rows differ along what the rule generalises over: which OPERATION is called
 //! (a create whose target is in the body, a cluster-scoped mutation whose target is
@@ -50,6 +52,16 @@ const ACCESS_DENIED_STATUS: u16 = 403;
 /// call, which no other decision's sentence carries.
 const EXPLICIT_DENY_CLAUSE: &str = "with an explicit deny in an identity-based policy";
 
+/// What the gate answers one row: the refusal a readable document's explicit `Deny`
+/// leaves, the refusal of a request no readable document allows, or the operation's
+/// own answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    ExplicitDeny,
+    NoGrant,
+    Served,
+}
+
 /// One request this suite makes, named by the operation that answers it, with the
 /// IAM action that operation asks for and the resource it addresses.
 struct Call {
@@ -72,6 +84,35 @@ fn explicit_deny_message(principal: &str, action: &str, resource: &str) -> Strin
     )
 }
 
+/// The sentence IAM refuses a request no readable document ALLOWS with — its
+/// default deny, which closes by naming the action nothing granted rather than a
+/// document.
+fn no_grant_message(principal: &str, action: &str, resource: &str) -> String {
+    format!(
+        "User: {principal} is not authorized to perform: {action} on resource: {resource} \
+         because no identity-based policy allows the {action} action"
+    )
+}
+
+/// The sentence the gate refuses `call` with for a row, and `None` for a row it
+/// serves.
+fn gate_message(gate: Gate, principal: &str, call: &Call) -> Option<String> {
+    match gate {
+        Gate::ExplicitDeny => Some(explicit_deny_message(principal, call.action, &call.resource)),
+        Gate::NoGrant => Some(no_grant_message(principal, call.action, &call.resource)),
+        Gate::Served => None,
+    }
+}
+
+/// The IAM action namespace `action` is published under, which `<namespace>:*` is
+/// the wildcard for every action of: this service publishes its control plane under
+/// one and its Apache Kafka data plane under another, so a document written about
+/// "every action of this service" has to be written about the namespace the call's
+/// own action carries.
+fn action_namespace(action: &str) -> &str {
+    action.split(':').next().unwrap_or(action)
+}
+
 /// The calls the rows below are made over: one per kind of target an MSK request
 /// can carry, so the gate is shown to be the service's rather than one handler's.
 fn calls(cluster_arn: &str) -> Vec<Call> {
@@ -92,10 +133,7 @@ fn calls(cluster_arn: &str) -> Vec<Call> {
             })),
             resource: cluster_arn.to_string(),
         },
-        // A reader-and-mutation whose target is the URI's path segment. (The
-        // operations that take this gate are the ones this issue's causes reach:
-        // the remaining cluster-scoped readers keep the resource-scoped decision
-        // alone until the gate is wired into them too.)
+        // A reader-and-mutation whose target is the URI's path segment.
         Call {
             operation: "RebootBroker",
             action: "kafka:RebootBroker",
@@ -137,11 +175,12 @@ async fn make(emulator: &Emulator, call: &Call, access_key_id: &str) -> Reply {
         .await
 }
 
-/// RULE: a document that explicitly denies the action refuses the call, and one
-/// that denies something else leaves it to the operation — over every operation of
-/// the table and every document of it.
+/// RULE: a document that explicitly denies the action refuses the call, one that
+/// allows it leaves the call to the operation, and one that says nothing about it
+/// leaves the request with no grant at all — over every operation of the table and
+/// every document of it.
 #[tokio::test]
-async fn an_identity_policy_that_denies_the_action_refuses_the_call() {
+async fn an_identity_policy_decides_every_cluster_scoped_call() {
     let emulator = Emulator::new();
     let principal = given_assumed_role_session(&emulator.engine, ROLE, SESSION, SESSION_KEY_ID);
     // A cluster this endpoint really holds, so a served call is answered from
@@ -151,10 +190,11 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_call() {
         .await;
 
     for call in calls(&cluster) {
-        // `true` is a row the gate must refuse. The documents are written about
-        // this call's own action, so one table serves every operation.
-        let rows: Vec<(&str, Option<Value>, bool)> = vec![
-            ("no policy at all", None, false),
+        // The documents are written about this call's own action, so one table
+        // serves every operation.
+        let every_action_of_this_service = format!("{}:*", action_namespace(call.action));
+        let rows: Vec<(&str, Option<Value>, Gate)> = vec![
+            ("no policy at all", None, Gate::NoGrant),
             (
                 "a deny of exactly this action on every resource",
                 Some(json!({
@@ -163,7 +203,7 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_call() {
                         { "Effect": "Deny", "Action": call.action, "Resource": "*" }
                     ],
                 })),
-                true,
+                Gate::ExplicitDeny,
             ),
             (
                 "a deny of every action",
@@ -171,7 +211,7 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_call() {
                     "Version": "2012-10-17",
                     "Statement": [{ "Effect": "Deny", "Action": "*", "Resource": "*" }],
                 })),
-                true,
+                Gate::ExplicitDeny,
             ),
             (
                 "a deny beside an allow of the same action",
@@ -182,7 +222,7 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_call() {
                         { "Effect": "Deny", "Action": call.action, "Resource": "*" },
                     ],
                 })),
-                true,
+                Gate::ExplicitDeny,
             ),
             (
                 "a deny scoped to the resource the request names",
@@ -192,7 +232,7 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_call() {
                         { "Effect": "Deny", "Action": call.action, "Resource": call.resource }
                     ],
                 })),
-                true,
+                Gate::ExplicitDeny,
             ),
             (
                 "a deny scoped to another resource",
@@ -206,7 +246,7 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_call() {
                         ),
                     }],
                 })),
-                false,
+                Gate::NoGrant,
             ),
             (
                 "a deny of another action of this service",
@@ -216,7 +256,7 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_call() {
                         { "Effect": "Deny", "Action": "kafka:DeleteCluster", "Resource": "*" }
                     ],
                 })),
-                false,
+                Gate::NoGrant,
             ),
             (
                 "a deny of another service's actions",
@@ -224,30 +264,50 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_call() {
                     "Version": "2012-10-17",
                     "Statement": [{ "Effect": "Deny", "Action": "s3:*", "Resource": "*" }],
                 })),
-                false,
+                Gate::NoGrant,
+            ),
+            (
+                "an allow of another action of this service",
+                Some(json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        { "Effect": "Allow", "Action": "kafka:DeleteCluster", "Resource": "*" }
+                    ],
+                })),
+                Gate::NoGrant,
+            ),
+            (
+                "an allow of exactly this action on every resource",
+                Some(json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        { "Effect": "Allow", "Action": call.action, "Resource": "*" }
+                    ],
+                })),
+                Gate::Served,
             ),
             (
                 "an allow of every action of this service",
                 Some(json!({
                     "Version": "2012-10-17",
-                    "Statement": [{ "Effect": "Allow", "Action": "kafka:*", "Resource": "*" }],
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Action": every_action_of_this_service,
+                        "Resource": "*",
+                    }],
                 })),
-                false,
+                Gate::Served,
             ),
         ];
 
-        for (case, document, refused) in rows {
+        for (case, document, gate) in rows {
             given_role_inline_policy(&emulator.engine, ROLE, document.as_ref());
             let reply = make(&emulator, &call, SESSION_KEY_ID).await;
-            if refused {
+            if let Some(expected) = gate_message(gate, &principal, &call) {
                 assert_eq!(
                     (reply.status, reply.error_code(), reply.error_message()),
-                    (
-                        ACCESS_DENIED_STATUS,
-                        ACCESS_DENIED_CODE,
-                        explicit_deny_message(&principal, call.action, &call.resource).as_str()
-                    ),
-                    "case {case:?}/{}: expected IAM's explicit-deny refusal, got {} {}",
+                    (ACCESS_DENIED_STATUS, ACCESS_DENIED_CODE, expected.as_str()),
+                    "case {case:?}/{}: expected IAM's {gate:?} refusal, got {} {}",
                     call.operation,
                     reply.status,
                     reply.body
@@ -256,8 +316,8 @@ async fn an_identity_policy_that_denies_the_action_refuses_the_call() {
                 assert_ne!(
                     reply.error_code(),
                     ACCESS_DENIED_CODE,
-                    "case {case:?}/{}: nothing denies this call, so the gate must not refuse \
-                     it, got {} {}",
+                    "case {case:?}/{}: this caller's policies allow the action, so the gate \
+                     must not refuse it, got {} {}",
                     call.operation,
                     reply.status,
                     reply.body
