@@ -291,15 +291,6 @@ pub(crate) async fn given_stage(
     .await;
 }
 
-/// The characters a `ConnectionId` may carry into a URI path segment without being encoded:
-/// the RFC 3986 unreserved set, which is what an SDK client leaves alone. A minted id is
-/// base64, whose alphabet carries `/`, `+` and `=`.
-const UNRESERVED: percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'.')
-    .remove(b'_')
-    .remove(b'~');
-
 /// Push `payload` to `connection_id` through the `@connections` management API, which must
 /// answer `200`: an out-of-band message the api sends the client.
 pub(crate) async fn pushed(
@@ -309,7 +300,7 @@ pub(crate) async fn pushed(
     payload: &str,
 ) {
     let host = format!("execute-api.{REGION}.amazonaws.com");
-    let addressed = percent_encoding::utf8_percent_encode(connection_id, &UNRESERVED).to_string();
+    let addressed = crate::path_label::addressed(connection_id);
     let request = smithy_server_runtime::http::Request::builder()
         .method("POST")
         .uri(format!("https://{host}/@connections/{addressed}"))

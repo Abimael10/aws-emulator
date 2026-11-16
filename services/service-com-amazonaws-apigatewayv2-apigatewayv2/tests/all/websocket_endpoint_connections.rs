@@ -41,9 +41,12 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::api_lifecycle::{as_str, call};
 use crate::websocket_transport_data_plane::{dial_loopback, handshake_at, ClientSocket};
 
-/// How long a case waits for one frame before failing: generous for a loaded test machine,
-/// and bounded so a case that will never be answered fails instead of hanging the suite.
-const FRAME_DEADLINE: Duration = Duration::from_secs(10);
+/// How long a case waits for one frame before failing: generous for a loaded test machine —
+/// these suites run beside every other test of the workspace, and a frame that has already
+/// been answered `200` can still be scheduled late on a host under that much contention — and
+/// bounded so a case that will never be answered fails instead of hanging the suite. The wait
+/// is for the FRAME, a condition, and nothing asserts on the clock.
+const FRAME_DEADLINE: Duration = Duration::from_secs(120);
 
 /// The `Data` maximum the `@connections` model declares (`@length(min: 0, max: 131072)` on
 /// the `Data` blob). Read from the owning crate's constant so the two cannot disagree.
@@ -75,10 +78,10 @@ pub(crate) fn emulator_with_connections() -> MultiServiceRouter {
 }
 
 /// One deployed WebSocket api, with the socket its `ApiEndpoint` announces.
-struct Deployed {
+pub(crate) struct Deployed {
     /// The `host:port` of the api's own socket, read off the announced `ApiEndpoint` rather
     /// than spelled out here.
-    authority: String,
+    pub(crate) authority: String,
 }
 
 /// Create a WEBSOCKET api whose `$default` route renders the connection's own id, deploy it
@@ -86,7 +89,7 @@ struct Deployed {
 ///
 /// The `$default` route is how a client learns the id AWS gives its handler in
 /// `$context.connectionId`, which is the id the `@connections` calls below address.
-async fn deploy(emulator: &MultiServiceRouter, case: &str, name: &str) -> Deployed {
+pub(crate) async fn deploy(emulator: &MultiServiceRouter, case: &str, name: &str) -> Deployed {
     let (status, created) = call(
         emulator,
         "POST",
@@ -198,7 +201,7 @@ pub(crate) struct Answer {
     pub(crate) status: u16,
     /// The `x-amzn-errortype` the answer named, or `"<absent>"` — the field a restJson1
     /// client resolves an error SHAPE from.
-    error_type: String,
+    pub(crate) error_type: String,
     pub(crate) body: Vec<u8>,
 }
 
@@ -215,7 +218,7 @@ impl Answer {
     }
 
     /// The `message` a restJson1 error body carries, or `"<no message>"`.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         let value: Value = serde_json::from_slice(&self.body).unwrap_or(Value::Null);
         value
             .get("message")
@@ -302,7 +305,7 @@ fn parse(case: &str, answered: &[u8]) -> Answer {
 
 /// Open a connection on the api's socket and learn the `ConnectionId` the handshake minted,
 /// as a client does: the `$default` route renders it.
-async fn open_connection(case: &str, authority: &str) -> (ClientSocket, String) {
+pub(crate) async fn open_connection(case: &str, authority: &str) -> (ClientSocket, String) {
     let mut socket = handshake_at(case, authority, &format!("/{STAGE}"))
         .await
         .unwrap_or_else(|status| panic!("case {case:?}: the handshake must complete, got {status}"));
@@ -330,7 +333,7 @@ async fn exchange_text(case: &str, socket: &mut ClientSocket, message: &str) -> 
 
 /// The next frame the client reads, or a panic naming the case when none arrives within
 /// [`FRAME_DEADLINE`].
-async fn next_frame(case: &str, socket: &mut ClientSocket) -> Message {
+pub(crate) async fn next_frame(case: &str, socket: &mut ClientSocket) -> Message {
     match tokio::time::timeout(FRAME_DEADLINE, socket.next()).await {
         Ok(Some(Ok(frame))) => frame,
         Ok(Some(Err(error))) => panic!("case {case:?}: the socket failed: {error}"),
@@ -343,7 +346,7 @@ async fn next_frame(case: &str, socket: &mut ClientSocket) -> Message {
 /// `CONNECTION_ID_BYTES` bytes carrying the format marker its encoding stamps — carrying
 /// `label`, so each case names its own. Built by the `@connections` registry's own encoder,
 /// the one place such a token is rendered.
-fn minted(label: &str) -> String {
+pub(crate) fn minted(label: &str) -> String {
     service_com_amazonaws_apigatewaymanagementapi_apigatewaymanagementapi::state::connection_id_for(
         label.as_bytes(),
     )

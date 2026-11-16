@@ -191,6 +191,8 @@ mod model_template;
 mod mutating_success_status;
 #[path = "all/not_found_sentence_per_addressing_operation.rs"]
 mod not_found_sentence_per_addressing_operation;
+#[path = "all/path_label.rs"]
+mod path_label;
 #[path = "all/portal_data_plane.rs"]
 mod portal_data_plane;
 #[path = "all/portal_deletion.rs"]
@@ -341,6 +343,8 @@ mod websocket_connect_authorization;
 mod websocket_connect_backend;
 #[path = "all/websocket_connect_identity_source_socket_answer.rs"]
 mod websocket_connect_identity_source_socket_answer;
+#[path = "all/websocket_connection_fan_out.rs"]
+mod websocket_connection_fan_out;
 #[path = "all/websocket_endpoint_connections.rs"]
 mod websocket_endpoint_connections;
 #[path = "all/websocket_error_class_exclusivity.rs"]

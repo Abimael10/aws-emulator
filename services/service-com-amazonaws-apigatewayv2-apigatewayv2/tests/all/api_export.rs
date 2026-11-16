@@ -942,7 +942,7 @@ async fn a_stage_export_states_the_configuration_that_stage_serves() {
             &api_id,
             &format!(
                 "outputType=JSON&stageName={}",
-                percent_encoding::utf8_percent_encode(stage_name, &UNRESERVED)
+                crate::path_label::addressed(stage_name)
             ),
         )
         .await;
@@ -1038,15 +1038,6 @@ async fn wire_route(
         "case {case:?}: expected 201 from CreateRoute, got {status} {route}"
     );
 }
-
-/// The characters a stage name may carry into a query value without being encoded: the RFC
-/// 3986 unreserved set, which is what an SDK client leaves alone. The name of the stage that
-/// serves an api's root opens with `$`, which is not one of them.
-const UNRESERVED: percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'.')
-    .remove(b'_')
-    .remove(b'~');
 
 #[tokio::test]
 async fn an_export_request_outside_what_the_operation_serves_is_refused() {

@@ -124,15 +124,6 @@ async fn signed(
     (status, parsed)
 }
 
-/// The characters a `ConnectionId` may carry into a URI path segment without being encoded:
-/// the RFC 3986 unreserved set, which is what an SDK client leaves alone. A minted id is
-/// base64, whose alphabet carries `/`, `+` and `=`.
-const UNRESERVED: percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'.')
-    .remove(b'_')
-    .remove(b'~');
-
 /// What one `@connections` operation on `connection_id` answered, addressed at the
 /// documented `…/{stage}/@connections/{id}` path with the id encoded the way an SDK client
 /// encodes a path label.
@@ -141,7 +132,7 @@ async fn connections_call(
     method: &str,
     connection_id: &str,
 ) -> (u16, Value) {
-    let addressed = percent_encoding::utf8_percent_encode(connection_id, &UNRESERVED).to_string();
+    let addressed = crate::path_label::addressed(connection_id);
     signed(
         emulator,
         &format!("execute-api.{REGION}.amazonaws.com"),
