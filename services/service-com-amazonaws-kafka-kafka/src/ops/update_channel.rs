@@ -18,10 +18,13 @@
 //! one fixed `NotFoundException` before anything the request carries is judged — the
 //! same first gate every channel operation applies; then the request's own payload (it
 //! must carry exactly one destination update — "Exactly one of icebergDestinationUpdate
-//! or s3DestinationUpdate must be supplied"); then the channel, where an ARN that
-//! cluster holds no channel for is a `BadRequestException`
-//! ([`crate::state::invalid_channel_arn`]), since once the cluster resolves an unknown
-//! channel ARN is a bad identifier in the caller's own request; then the
+//! or s3DestinationUpdate must be supplied"); then the channel, where the two absences
+//! are told apart exactly as `DeleteChannel` tells them apart: a channel this cluster
+//! HELD and holds no longer is a resource that went missing, so it is the service's one
+//! fixed `NotFoundException` ([`crate::state::RESOURCE_NOT_FOUND_MESSAGE`], as
+//! `DescribeChannel` answers for the same channel), while an ARN this cluster never held
+//! is a bad identifier in the caller's own request and stays the invalid link ARN
+//! ([`crate::state::invalid_channel_arn`]); then the
 //! `dataFreshnessInSeconds` the payload carries, which must be inside the range the
 //! member documents ([`crate::state::is_data_freshness_in_range`]). The update must then
 //! name the destination kind the channel actually has ("Use only when the channel was
@@ -272,10 +275,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some((status, destination_type)) =
             channel.map(|channel| (channel.status.clone(), channel.destination_type.clone()))
         else {
-            return Err(UpdateChannelErrorModeled::BadRequestException(
-                crate::state::invalid_channel_arn(),
-            )
-            .into());
+            return Err(unresolved_channel(
+                &state,
+                &input.cluster_arn,
+                &input.channel_arn,
+            ));
         };
         // Only now is the VALUE the payload carries judged: the cluster and the
         // channel the URI names are resolved first, so a request against a
@@ -332,25 +336,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Accepted through the one update path, which resolves the channel the way
         // the reader does before it writes anything, so a refused update leaves the
-        // registry exactly as it was.
-        let Some(channel) = state.begin_channel_update(
-            &region,
-            &input.cluster_arn,
-            &input.channel_arn,
-            now,
-            data_freshness_in_seconds,
-        ) else {
-            return Err(UpdateChannelErrorModeled::BadRequestException(
-                crate::state::invalid_channel_arn(),
+        // registry exactly as it was. What the answer reports is read off the record
+        // here, so the refusal below needs no borrow of it.
+        let accepted = state
+            .begin_channel_update(
+                &region,
+                &input.cluster_arn,
+                &input.channel_arn,
+                now,
+                data_freshness_in_seconds,
             )
-            .into());
+            .map(|channel| {
+                (
+                    channel.arn.clone(),
+                    // The operation carrying the change out, which the channel
+                    // stores, so this answer and a `DescribeChannel` inside the
+                    // `UPDATING` window report the same in-flight operation.
+                    channel.update_operation_arn.clone(),
+                )
+            });
+        let Some((channel_arn, cluster_operation_arn)) = accepted else {
+            return Err(unresolved_channel(
+                &state,
+                &input.cluster_arn,
+                &input.channel_arn,
+            ));
         };
         Ok(UpdateChannelOutput {
-            channel_arn: channel.arn.clone(),
-            // The operation carrying the change out, which the channel stores, so
-            // this answer and a `DescribeChannel` inside the `UPDATING` window
-            // report the same in-flight operation.
-            cluster_operation_arn: channel.update_operation_arn.clone(),
+            channel_arn,
+            cluster_operation_arn,
         })
+    }
+}
+
+/// How this operation refuses a `ChannelArn` that resolves to no channel of the
+/// cluster in its path, which has already resolved.
+///
+/// Two different absences, told apart by whether that cluster ever held the
+/// channel ([`crate::state::ComAmazonawsKafkaKafkaState::channel_was_held`]), as
+/// `DeleteChannel` tells them apart: a channel the cluster HELD and no longer
+/// holds is a resource that went missing, answered with the service's one fixed
+/// not-found sentence exactly as `DescribeChannel` answers for that same channel,
+/// while a reference the cluster never held is the caller's own identifier at
+/// fault and is refused as the invalid link ARN it is.
+fn unresolved_channel(
+    state: &crate::state::ComAmazonawsKafkaKafkaState,
+    cluster_arn: &str,
+    channel_arn: &str,
+) -> UpdateChannelError {
+    if state.channel_was_held(cluster_arn, channel_arn) {
+        UpdateChannelErrorModeled::NotFoundException(NotFoundException {
+            invalid_parameter: Some("ChannelArn".to_string()),
+            message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+        })
+        .into()
+    } else {
+        UpdateChannelErrorModeled::BadRequestException(crate::state::invalid_channel_arn()).into()
     }
 }

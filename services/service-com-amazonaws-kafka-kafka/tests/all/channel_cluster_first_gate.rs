@@ -16,18 +16,25 @@
 //!    `BadRequestException` with MSK's fixed invalid-link-ARN sentence, while a
 //!    channel the cluster HELD and the clock has since removed is the fixed
 //!    not-found — and a refused delete changes nothing the cluster's channel
-//!    listing reports.
+//!    listing reports;
+//! 3. that same separation is the whole channel-WRITE surface's, not one
+//!    operation's: `UpdateChannel` answers a channel reference the cluster never
+//!    held with the invalid-link-ARN bad request and one the cluster held and the
+//!    clock has removed with the fixed not-found, whatever destination update the
+//!    payload carries — so one gone channel yields ONE code across the lifecycle.
 //!
 //! The rows differ along what the rules generalise over: which operation answers,
 //! the shape of the channel reference (well formed with and without a channel id,
 //! of another cluster, of another service, not an ARN at all), the ghost cluster's
-//! name and resource id, and whether the cluster ever held the channel.
+//! name and resource id, whether the cluster ever held the channel, and — for the
+//! writes — which destination the update names and what freshness it asks for.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_kafka_kafka::state::RESOURCE_NOT_FOUND_MESSAGE;
 
 use crate::kafka_harness::{
-    pct, sleep_past_channel_activation, ClusterRequest, Emulator, Reply, ACCOUNT, REGION,
+    pct, sleep_past_channel_activation, sleep_past_channel_update, ClusterRequest, Emulator, Reply,
+    ACCOUNT, REGION,
 };
 
 /// MSK's fixed refusal for a channel reference the cluster in the request path
@@ -392,6 +399,229 @@ async fn a_delete_under_a_real_cluster_separates_a_bad_reference_from_a_removed_
         elsewhere_listed,
         vec![elsewhere.clone()],
         "a delete addressed at the wrong cluster must not remove the channel, got \
+         {elsewhere_listed:?}"
+    );
+}
+
+/// `UpdateChannel`: `PUT /v1/clusters/{ClusterArn}/channels/{ChannelArn}`.
+async fn update_channel(
+    emulator: &Emulator,
+    cluster_arn: &str,
+    channel_arn: &str,
+    body: Value,
+) -> Reply {
+    emulator
+        .call("PUT", &channel_uri(cluster_arn, channel_arn), Some(body))
+        .await
+}
+
+/// The URI both channel-scoped writes address, so a row builds it once.
+fn channel_uri(cluster_arn: &str, channel_arn: &str) -> String {
+    format!(
+        "/v1/clusters/{}/channels/{}",
+        pct(cluster_arn),
+        pct(channel_arn)
+    )
+}
+
+/// The channel-scoped WRITES, each as (case, method, body). Both resolve the
+/// channel the way the reader does, so both are judged on the channel reference
+/// alone once the cluster has resolved.
+///
+/// The `UpdateChannel` rows differ along the two things that handler judges only
+/// AFTER its channel has resolved — which destination the update names
+/// (`S3DestinationUpdate`/`IcebergDestinationUpdate`, "Use only when the channel
+/// was created with an … destination") and the `dataFreshnessInSeconds` it asks
+/// for, whose allowed range is 300 to 900 on both destinations
+/// (`smithy_query(query="shape",shape="S3DestinationUpdate")`), tested here at the
+/// published floor, inside the range and one value outside it — so a refusal about
+/// the channel reference cannot depend on either.
+fn channel_writes() -> Vec<(&'static str, &'static str, Option<Value>)> {
+    vec![
+        ("DeleteChannel", "DELETE", None),
+        ("UpdateChannel s3 600", "PUT", Some(update_body())),
+        (
+            "UpdateChannel s3 at the documented floor",
+            "PUT",
+            Some(json!({ "s3DestinationUpdate": { "dataFreshnessInSeconds": 300 } })),
+        ),
+        (
+            "UpdateChannel iceberg at the documented ceiling",
+            "PUT",
+            Some(json!({ "icebergDestinationUpdate": { "dataFreshnessInSeconds": 900 } })),
+        ),
+        (
+            "UpdateChannel s3 outside the documented range",
+            "PUT",
+            Some(json!({ "s3DestinationUpdate": { "dataFreshnessInSeconds": 10 } })),
+        ),
+    ]
+}
+
+/// Poll the channel's reader until the removal the clock owes it has landed, so
+/// the rows that follow address a channel that is GONE rather than one still
+/// `DELETING`. Waits for the CONDITION under a deadline generous enough for a
+/// loaded machine, never for a fixed time.
+async fn poll_until_channel_gone(
+    emulator: &Emulator,
+    cluster_arn: &str,
+    channel_arn: &str,
+    case: &str,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let read = emulator.describe_channel(cluster_arn, channel_arn).await;
+        if read.status != 200 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the channel's removal never fell due, last read {}",
+            read.body
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// RULE 3: the separation of the two absences belongs to the whole channel-write
+/// surface, not to one operation — `UpdateChannel` and `DeleteChannel` answer a
+/// channel reference the cluster never held with MSK's fixed invalid-link-ARN
+/// HTTP 400 and a channel that cluster HELD and the clock has removed with the
+/// service's fixed not-found HTTP 404, whatever destination update the payload
+/// carries, so one gone channel yields ONE code across its lifecycle.
+#[tokio::test]
+async fn every_channel_write_separates_a_bad_reference_from_a_removed_channel() {
+    let emulator = Emulator::new();
+    let owner = emulator
+        .create_ok(&ClusterRequest::named("write-owner"))
+        .await;
+    let other = emulator
+        .create_ok(&ClusterRequest::named("write-other"))
+        .await;
+    // A channel of ANOTHER cluster: it exists, but not under the cluster the rows
+    // below address it under.
+    let elsewhere = create_channel_ok(&emulator, &other, "owned-elsewhere").await;
+
+    // Rows: every way a channel reference can fail to be one of THIS cluster's
+    // channels without this cluster ever having held it.
+    let never_held: Vec<(&str, String)> = vec![
+        (
+            "a well-formed channel ARN of this cluster that was never created",
+            never_created_channel_arn(&owner, "never", true),
+        ),
+        (
+            "the same, without a channel id",
+            never_created_channel_arn(&owner, "never", false),
+        ),
+        ("a channel of another cluster", elsewhere.clone()),
+        (
+            "a channel ARN of another service",
+            format!("arn:aws:s3:{REGION}:{ACCOUNT}:channel/write-owner/abc-1/never/9"),
+        ),
+        ("a value that is not an ARN", "not-an-arn".to_string()),
+    ];
+
+    for (reference, channel_arn) in &never_held {
+        for (write, method, body) in channel_writes() {
+            let case = format!("{write} against {reference}");
+            let reply = emulator
+                .call(method, &channel_uri(&owner, channel_arn), body)
+                .await;
+            assert_eq!(
+                (reply.status, reply.error_code(), reply.error_message()),
+                (400, "BadRequestException", INVALID_LINK_ARN),
+                "case {case:?}: expected the invalid-link-ARN bad request, got {} {}",
+                reply.status,
+                reply.body
+            );
+            assert_eq!(
+                reply.at("/invalidParameter").as_str(),
+                Some("ChannelArn"),
+                "case {case:?}: the refusal must name ChannelArn as the parameter at fault, \
+                 got {}",
+                reply.body
+            );
+        }
+    }
+
+    // Channels this cluster DID hold, deleted and then removed by the clock. The
+    // rows differ along whether the channel accepted a destination change before
+    // it was deleted, so a channel with an update history is refused the same way
+    // as one without.
+    let held_rows = [
+        ("a channel deleted straight after it was created", "held", false),
+        (
+            "a channel that accepted an update before it was deleted",
+            "held-updated",
+            true,
+        ),
+    ];
+    for (case, name, update_first) in held_rows {
+        let arn = create_channel_ok(&emulator, &owner, name).await;
+        sleep_past_channel_activation();
+        if update_first {
+            let updated = update_channel(&emulator, &owner, &arn, update_body()).await;
+            assert_eq!(
+                updated.status, 200,
+                "case {case:?}: expected the update of a held channel to be accepted, got {} {}",
+                updated.status, updated.body
+            );
+            sleep_past_channel_update();
+        }
+        let accepted = delete_channel(&emulator, &owner, &arn).await;
+        assert_eq!(
+            accepted.status, 200,
+            "case {case:?}: expected the delete of a held channel to be accepted, got {} {}",
+            accepted.status, accepted.body
+        );
+        poll_until_channel_gone(&emulator, &owner, &arn, case).await;
+
+        // The reader of the removed channel, and EVERY write addressed at it, say
+        // the same thing: one gone channel, one code.
+        let read = emulator.describe_channel(&owner, &arn).await;
+        assert_eq!(
+            (read.status, read.error_code(), read.error_message()),
+            (404, "NotFoundException", RESOURCE_NOT_FOUND_MESSAGE),
+            "case {case:?}: expected the reader of a removed channel to answer the fixed \
+             not-found refusal, got {} {}",
+            read.status,
+            read.body
+        );
+        for (write, method, body) in channel_writes() {
+            let probe = format!("{write} against {case}");
+            let reply = emulator
+                .call(method, &channel_uri(&owner, &arn), body)
+                .await;
+            assert_eq!(
+                (reply.status, reply.error_code(), reply.error_message()),
+                (404, "NotFoundException", RESOURCE_NOT_FOUND_MESSAGE),
+                "case {probe:?}: expected the fixed not-found refusal for a channel this \
+                 cluster held and the clock removed, got {} {}",
+                reply.status,
+                reply.body
+            );
+            assert_eq!(
+                reply.at("/invalidParameter").as_str(),
+                Some("ChannelArn"),
+                "case {probe:?}: the refusal must name ChannelArn as the parameter at fault, \
+                 got {}",
+                reply.body
+            );
+        }
+    }
+
+    // Nothing above registered a channel or removed one it was not addressed at.
+    let after = listed_channels(&emulator, &owner, "after the refusals").await;
+    assert!(
+        after.is_empty(),
+        "every channel of this cluster was deleted and no refusal may register one, got \
+         {after:?}"
+    );
+    let elsewhere_listed = listed_channels(&emulator, &other, "the other cluster").await;
+    assert_eq!(
+        elsewhere_listed,
+        vec![elsewhere],
+        "a write addressed at the wrong cluster must not touch the channel, got \
          {elsewhere_listed:?}"
     );
 }
