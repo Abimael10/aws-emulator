@@ -29,6 +29,8 @@ mod export_and_replication_parameters;
 mod export_key;
 #[path = "all/import_key.rs"]
 mod import_key;
+#[path = "all/import_parameters.rs"]
+mod import_parameters;
 #[path = "all/key_lifecycle.rs"]
 mod key_lifecycle;
 #[path = "all/key_modes_of_use_discriminator.rs"]

@@ -73,6 +73,11 @@ const CREATE_KEY_BODY: &str = r#"{"KeyAttributes":{
 const EXPORT_PARAMETERS_BODY: &str =
     r#"{"KeyMaterialType":"TR34_KEY_BLOCK","SigningKeyAlgorithm":"RSA_2048"}"#;
 
+/// A `GetParametersForImport` input: both required members, with the one wrapping key
+/// algorithm `WrappingKeyAlgorithm`'s documentation allows for a TR-34 key block.
+const IMPORT_PARAMETERS_BODY: &str =
+    r#"{"KeyMaterialType":"TR34_KEY_BLOCK","WrappingKeyAlgorithm":"RSA_2048"}"#;
+
 /// A `GenerateMac` input, each member matching its modelled shape: the key identifier
 /// is the `alias/<name>` form `KeyArnOrKeyAliasType` admits, the message data is hex,
 /// and the attributes name one `MacAlgorithm`.
@@ -94,6 +99,11 @@ const REST_JSON: &str = "application/json";
 /// request named, so a body carrying this came from the data-plane crate serving the
 /// operation — the service whose key resolution produced it.
 const ROUTING_CHECK_RESOURCE_ID: &str = r#""ResourceId":"alias/routing-check""#;
+
+/// The control plane's answer to a key ARN no key of its store carries: the same
+/// modelled member, echoing the ARN the request named.
+const UNKNOWN_KEY_RESOURCE_ID: &str =
+    r#""ResourceId":"arn:aws:payment-cryptography:us-east-1:000000000000:key/abcdefghij123456""#;
 
 /// The rows differ along which service owns the request, the endpoint host it was
 /// addressed at, the operation's protocol and path, and whether the operation reads or
@@ -181,10 +191,25 @@ const CASES: &[Case] = &[
         marker: "ExportToken",
     },
     Case {
-        // A control-plane refusal: an operation the model declares but this emulator
-        // has not implemented answers its own 501, which only the control plane's
-        // routing table can resolve.
-        name: "a control-plane operation that is still a stub",
+        // …and the import side of the same exchange, which mints an import token.
+        name: "GetParametersForImport",
+        host: "controlplane.payment-cryptography.us-east-1.amazonaws.com",
+        target: "PaymentCryptographyControlPlane.GetParametersForImport",
+        method: "POST",
+        uri_path: "/",
+        content_type: JSON_1_0,
+        body: IMPORT_PARAMETERS_BODY,
+        who: "the control plane",
+        status: 200,
+        marker: "ImportToken",
+    },
+    Case {
+        // A control-plane refusal: an ARN naming no key earns this service's own
+        // modelled `ResourceNotFoundException`, whose `ResourceId` echoes what the
+        // request asked for — an answer only the control plane's key store can produce.
+        // Its status is this service's one client-error status, which is where the class
+        // is read from the body's `__type` rather than from the status line.
+        name: "a control-plane operation refusing an ARN that names no key",
         host: "controlplane.payment-cryptography.us-east-1.amazonaws.com",
         target: "PaymentCryptographyControlPlane.DeleteResourcePolicy",
         method: "POST",
@@ -192,8 +217,8 @@ const CASES: &[Case] = &[
         content_type: JSON_1_0,
         body: r#"{"ResourceArn":"arn:aws:payment-cryptography:us-east-1:000000000000:key/abcdefghij123456"}"#,
         who: "the control plane",
-        status: 501,
-        marker: "operation DeleteResourcePolicy is scaffolded",
+        status: 400,
+        marker: UNKNOWN_KEY_RESOURCE_ID,
     },
     Case {
         // The data plane's own traffic, under the same signing name and with no
@@ -302,6 +327,22 @@ fn payment_cryptography_control_and_data_planes_are_each_claimed_by_exactly_one_
                         case.name,
                         case.who,
                         case.marker
+                    );
+                    // The claiming service frames its answer in its OWN protocol, which
+                    // is the other half of the claim: the control plane is `awsJson1_0`
+                    // and the data plane `restJson1`, so each answer — a success or a
+                    // refusal — carries the media type that protocol posts and answers
+                    // with, which is the media type this case's request carried.
+                    let answered_content_type = response
+                        .headers()
+                        .get("content-type")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("<none>");
+                    assert_eq!(
+                        answered_content_type, case.content_type,
+                        "case {:?}: expected {} to answer in its own protocol's media type \
+                         {:?}, got {answered_content_type:?} with {status} {body}",
+                        case.name, case.who, case.content_type
                     );
                 }
             });

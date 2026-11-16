@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetParametersForImport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetParametersForImport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints the import token and the wrapping key certificate a key import is prepared with —
+//! this is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetParametersForImport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A minting operation: each call stores one parameter set in this service's state
+//! ([`crate::state::KeyExchangeParameters`]) and answers the set it stored, so the token a
+//! caller is handed names a wrapping key this store really holds the private half of. A
+//! call that asks to reuse the last generated token answers a stored set instead of
+//! minting, and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -214,18 +213,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetParametersForImport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetParametersForImportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetParametersForImport"))
+        // Every modelled constraint on this input is refused by the centralized walk
+        // before this body runs: `KeyMaterialType` and `WrappingKeyAlgorithm` being
+        // present, and both of those enums' value lists. What is left for this body is
+        // what the model cannot say: which wrapping key algorithm the material type a
+        // caller is preparing admits ("At this time, RSA_2048 is the allowed algorithm
+        // for TR-34 WrappedKeyBlock import. Additionally, RSA_2048, RSA_3072, RSA_4096
+        // are the allowed algorithms for RSA WrappedKeyCryptogram import",
+        // `WrappingKeyAlgorithm`'s own documentation), which the state module states
+        // once for both operations of this slice.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal)?;
+
+        let admitted = crate::state::wrapping_key_algorithms(&input.key_material_type);
+        if !admitted.contains(&input.wrapping_key_algorithm.as_str()) {
+            return Err(GetParametersForImportErrorModeled::ValidationException(
+                ValidationException {
+                    // Worded the way this service states a pair of attributes that
+                    // describe nothing together (`CreateKey`'s "KeyAlgorithm … is not
+                    // valid for the KeyUsage …"), naming the two members the request
+                    // carried rather than any value of one recorded call.
+                    message: Some(format!(
+                        "WrappingKeyAlgorithm {} is not valid for the KeyMaterialType {}.",
+                        input.wrapping_key_algorithm, input.key_material_type
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = crate::state::now();
+        let direction = crate::state::KeyExchangeDirection::Import;
+        // "To return a previously generated import token and wrapping key certificate
+        // instead of generating new ones, set ReuseLastGeneratedToken to true" (the
+        // operation's own documentation), and `ReuseLastGeneratedToken`'s own
+        // documentation gives what counts as reusable: a set for the same key material
+        // type and wrapping key algorithm with at least seven days of validity left.
+        // "The default value is false, which generates a new import token and wrapping
+        // key certificate on every call."
+        if input.reuse_last_generated_token == Some(true) {
+            let reusable = state
+                .lock()
+                .reusable_key_exchange_parameters(
+                    direction,
+                    &input.key_material_type,
+                    &input.wrapping_key_algorithm,
+                    now,
+                )
+                .map(answer);
+            if let Some(answer) = reusable {
+                return Ok(answer);
+            }
+        }
+
+        // The store is judged BEFORE any key pair is generated, so a call the store has
+        // no room for costs no key generation; the bound is enforced again under the one
+        // borrow that inserts (`remember_key_exchange_parameters`), which is what two
+        // concurrent calls are held to. The lock is released with this block, because
+        // generating two RSA key pairs is hundreds of milliseconds of CPU and must hold
+        // no other request out of this service's state while it runs.
+        if state.lock().valid_key_exchange_parameters(direction, now)
+            >= crate::state::MAX_KEY_EXCHANGE_PARAMETERS
+        {
+            return Err(quota_exceeded());
+        }
+
+        // The wrapping key pair and its certificate chain are minted on tokio's BOUNDED
+        // blocking pool, so hundreds of milliseconds of RSA key generation does not
+        // starve the runtime, and no lock is held while it runs.
+        let valid_until = now
+            .checked_add(crate::state::KEY_EXCHANGE_PARAMETERS_VALIDITY)
+            .ok_or_else(internal)?;
+        let wrapping_key_algorithm = input.wrapping_key_algorithm.clone();
+        let Ok(Some(wrapping_key)) = ::tokio::task::spawn_blocking(move || {
+            crate::state::mint_key_exchange_key(
+                direction,
+                &wrapping_key_algorithm,
+                now,
+                valid_until,
+            )
+        })
+        .await
+        else {
+            return Err(internal());
+        };
+
+        let stored = state
+            .lock()
+            .remember_key_exchange_parameters(
+                direction,
+                &input.key_material_type,
+                &input.wrapping_key_algorithm,
+                wrapping_key,
+                now,
+                valid_until,
+            )
+            .ok_or_else(quota_exceeded)?;
+
+        // Answered from the set that was just stored, so a later call that reuses the
+        // token reports the same certificate, token and expiry.
+        crate::state::record_mutation(ctx.parts(), Self::NAME, &stored.token);
+        Ok(answer(&stored))
     }
+}
+
+/// One stored import parameter set, as this operation's output.
+fn answer(parameters: &crate::state::KeyExchangeParameters) -> GetParametersForImportOutput {
+    GetParametersForImportOutput {
+        wrapping_key_certificate: parameters.certificate.clone(),
+        wrapping_key_certificate_chain: parameters.certificate_chain.clone(),
+        wrapping_key_algorithm: parameters.key_algorithm.clone(),
+        import_token: parameters.token.clone(),
+        parameters_valid_until_timestamp: ::aws_smithy_types::DateTime::from(
+            parameters.valid_until,
+        ),
+    }
+}
+
+/// This service's own failure, which is the modelled `InternalServerException`.
+fn internal() -> GetParametersForImportError {
+    GetParametersForImportErrorModeled::InternalServerException(InternalServerException {
+        message: Some(
+            "the payment cryptography import parameters could not be prepared".to_string(),
+        ),
+    })
+    .into()
+}
+
+/// Refuse a call the store has no room for: the modelled
+/// `ServiceQuotaExceededException`, naming the maximum this emulator holds.
+fn quota_exceeded() -> GetParametersForImportError {
+    GetParametersForImportErrorModeled::ServiceQuotaExceededException(
+        ServiceQuotaExceededException {
+            message: Some(format!(
+                "this account already holds the maximum of {} unexpired import tokens; \
+                 reuse one or wait for the outstanding ones to expire",
+                crate::state::MAX_KEY_EXCHANGE_PARAMETERS
+            )),
+        },
+    )
+    .into()
 }

@@ -232,6 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = crate::state::now();
+        let direction = crate::state::KeyExchangeDirection::Export;
         // "To return a previously generated export token and signing key certificate
         // instead of generating new ones, set ReuseLastGeneratedToken to true" (the
         // operation's own documentation), and `ReuseLastGeneratedToken`'s own
@@ -242,7 +243,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.reuse_last_generated_token == Some(true) {
             let reusable = state
                 .lock()
-                .reusable_export_parameters(
+                .reusable_key_exchange_parameters(
+                    direction,
                     &input.key_material_type,
                     &input.signing_key_algorithm,
                     now,
@@ -255,11 +257,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The store is judged BEFORE any key pair is generated, so a call the store has
         // no room for costs no key generation; the bound is enforced again under the one
-        // borrow that inserts (`remember_export_parameters`), which is what two
+        // borrow that inserts (`remember_key_exchange_parameters`), which is what two
         // concurrent calls are held to. The lock is released with this block, because
         // generating two RSA key pairs is hundreds of milliseconds of CPU and must hold
         // no other request out of this service's state while it runs.
-        if state.lock().valid_export_parameters(now) >= crate::state::MAX_EXPORT_PARAMETERS {
+        if state.lock().valid_key_exchange_parameters(direction, now)
+            >= crate::state::MAX_KEY_EXCHANGE_PARAMETERS
+        {
             return Err(quota_exceeded());
         }
 
@@ -267,11 +271,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // blocking pool, so hundreds of milliseconds of RSA key generation does not
         // starve the runtime, and no lock is held while it runs.
         let valid_until = now
-            .checked_add(crate::state::EXPORT_PARAMETERS_VALIDITY)
+            .checked_add(crate::state::KEY_EXCHANGE_PARAMETERS_VALIDITY)
             .ok_or_else(internal)?;
+        let signing_key_algorithm = input.signing_key_algorithm.clone();
         let Ok(Some(signing_key)) = ::tokio::task::spawn_blocking(move || {
-            crate::state::mint_tr34_signing_key(
-                crate::state::TR34_SIGNING_KEY_SUBJECT,
+            crate::state::mint_key_exchange_key(
+                direction,
+                &signing_key_algorithm,
                 now,
                 valid_until,
             )
@@ -283,7 +289,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let stored = state
             .lock()
-            .remember_export_parameters(
+            .remember_key_exchange_parameters(
+                direction,
                 &input.key_material_type,
                 &input.signing_key_algorithm,
                 signing_key,
@@ -294,18 +301,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Answered from the set that was just stored, so a later call that reuses the
         // token reports the same certificate, token and expiry.
-        crate::state::record_mutation(ctx.parts(), Self::NAME, &stored.export_token);
+        crate::state::record_mutation(ctx.parts(), Self::NAME, &stored.token);
         Ok(answer(&stored))
     }
 }
 
 /// One stored export parameter set, as this operation's output.
-fn answer(parameters: &crate::state::ExportParameters) -> GetParametersForExportOutput {
+fn answer(parameters: &crate::state::KeyExchangeParameters) -> GetParametersForExportOutput {
     GetParametersForExportOutput {
-        signing_key_certificate: parameters.signing_key_certificate.clone(),
-        signing_key_certificate_chain: parameters.signing_key_certificate_chain.clone(),
-        signing_key_algorithm: parameters.signing_key_algorithm.clone(),
-        export_token: parameters.export_token.clone(),
+        signing_key_certificate: parameters.certificate.clone(),
+        signing_key_certificate_chain: parameters.certificate_chain.clone(),
+        signing_key_algorithm: parameters.key_algorithm.clone(),
+        export_token: parameters.token.clone(),
         parameters_valid_until_timestamp: ::aws_smithy_types::DateTime::from(
             parameters.valid_until,
         ),
@@ -330,7 +337,7 @@ fn quota_exceeded() -> GetParametersForExportError {
             message: Some(format!(
                 "this account already holds the maximum of {} unexpired export tokens; \
                  reuse one or wait for the outstanding ones to expire",
-                crate::state::MAX_EXPORT_PARAMETERS
+                crate::state::MAX_KEY_EXCHANGE_PARAMETERS
             )),
         },
     )

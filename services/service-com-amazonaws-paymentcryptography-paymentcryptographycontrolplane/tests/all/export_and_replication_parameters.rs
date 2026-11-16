@@ -32,7 +32,7 @@ use service_com_amazonaws_paymentcryptography_paymentcryptographycontrolplane::o
     KEY_ALGORITHM_VALUES, KEY_MATERIAL_TYPE_VALUES, KEY_USAGE_VALUES,
 };
 use service_com_amazonaws_paymentcryptography_paymentcryptographycontrolplane::state::{
-    EXPORT_PARAMETERS_VALIDITY, EXPORT_TOKEN_PREFIX, MAX_ENABLED_REPLICATION_REGIONS,
+    EXPORT_TOKEN_PREFIX, KEY_EXCHANGE_PARAMETERS_VALIDITY, MAX_ENABLED_REPLICATION_REGIONS,
     TR34_SIGNING_KEY_ALGORITHM,
 };
 use service_com_amazonaws_paymentcryptography_paymentcryptographycontrolplane::ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState as KeyStore;
@@ -398,9 +398,8 @@ fn assert_export_token(case: &str, token: &str) {
     );
 }
 
-/// The DER of the one PEM certificate a `SigningKeyCertificate` member carries: the
-/// member is "the signing key certificate in PEM format (base64 encoded)", so the value
-/// is base64 of a PEM block.
+/// The DER of the one PEM certificate a certificate member carries: every such member is
+/// "in PEM format (base64 encoded)", so the value is base64 of a PEM block.
 fn certificate_der(case: &str, member: &str, value: &str) -> Vec<u8> {
     let pem = ::aws_smithy_types::base64::decode(value)
         .unwrap_or_else(|e| panic!("case {case}: {member} is not base64 ({e}): {value}"));
@@ -416,32 +415,31 @@ fn certificate_der(case: &str, member: &str, value: &str) -> Vec<u8> {
         .unwrap_or_else(|e| panic!("case {case}: {member}'s PEM body is not base64 ({e})"))
 }
 
-/// Check the signing key certificate and the chain it came with are real: both parse as
-/// X.509 certificates, the chain certificate issued the signing one, and the signature
-/// over the signing certificate verifies under the chain certificate's public key.
-fn assert_real_certificate_chain(case: &str, answer: &Value) {
+/// Check a certificate and the chain it came with are real: both parse as X.509
+/// certificates, the chain certificate issued the other one, and the signature over it
+/// verifies under the chain certificate's public key.
+///
+/// Shared with the import side of this slice, whose members carry the same two documents
+/// under their own names, which is why the members are named by the caller.
+pub(crate) fn assert_real_certificate_chain(
+    case: &str,
+    certificate_member: &str,
+    chain_member: &str,
+    answer: &Value,
+) -> ::x509_cert::Certificate {
     use x509_cert::der::{Decode, Encode};
 
-    let signing_der = certificate_der(
-        case,
-        "SigningKeyCertificate",
-        string(answer, "SigningKeyCertificate"),
-    );
-    let chain_der = certificate_der(
-        case,
-        "SigningKeyCertificateChain",
-        string(answer, "SigningKeyCertificateChain"),
-    );
+    let signing_der = certificate_der(case, certificate_member, string(answer, certificate_member));
+    let chain_der = certificate_der(case, chain_member, string(answer, chain_member));
     let signing = x509_cert::Certificate::from_der(&signing_der)
-        .unwrap_or_else(|e| panic!("case {case}: SigningKeyCertificate is not X.509 DER ({e})"));
-    let chain = x509_cert::Certificate::from_der(&chain_der).unwrap_or_else(|e| {
-        panic!("case {case}: SigningKeyCertificateChain is not X.509 DER ({e})")
-    });
+        .unwrap_or_else(|e| panic!("case {case}: {certificate_member} is not X.509 DER ({e})"));
+    let chain = x509_cert::Certificate::from_der(&chain_der)
+        .unwrap_or_else(|e| panic!("case {case}: {chain_member} is not X.509 DER ({e})"));
 
     assert_eq!(
         signing.tbs_certificate.issuer, chain.tbs_certificate.subject,
-        "case {case}: expected the chain certificate to be the issuer of the signing \
-         certificate, got issuer {:?} and chain subject {:?}",
+        "case {case}: expected the chain certificate to be the issuer of {certificate_member}, \
+         got issuer {:?} and chain subject {:?}",
         signing.tbs_certificate.issuer, chain.tbs_certificate.subject
     );
 
@@ -466,8 +464,9 @@ fn assert_real_certificate_chain(case: &str, answer: &Value) {
     )
     .unwrap_or_else(|e| panic!("case {case}: the issuer public key is not an RSA key ({e})"));
     parsed.verify_sig(&signed, signature).unwrap_or_else(|e| {
-        panic!("case {case}: the signing certificate's signature must verify under its issuer ({e})")
+        panic!("case {case}: {certificate_member}'s signature must verify under its issuer ({e})")
     });
+    signing
 }
 
 #[tokio::test]
@@ -497,12 +496,17 @@ async fn get_parameters_for_export_mints_a_real_signing_certificate_per_token() 
         );
         // "The export token expires in 30 days" (the operation's own documentation).
         let expires = timestamp(&answered, "ParametersValidUntilTimestamp");
-        let expected = now_secs() + EXPORT_PARAMETERS_VALIDITY.as_secs_f64();
+        let expected = now_secs() + KEY_EXCHANGE_PARAMETERS_VALIDITY.as_secs_f64();
         assert!(
             (expires - expected).abs() < 60.0,
             "case {case}: expected the parameters to expire around {expected}, got {expires}"
         );
-        assert_real_certificate_chain(&case, &answered);
+        assert_real_certificate_chain(
+            &case,
+            "SigningKeyCertificate",
+            "SigningKeyCertificateChain",
+            &answered,
+        );
 
         // Each call that does not reuse mints its own token and its own key pair.
         let token = string(&answered, "ExportToken").to_string();

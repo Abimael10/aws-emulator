@@ -52,6 +52,9 @@ use crate::ops::types::{
 mod block_cipher;
 /// The initial DUKPT key an IPEK export derives from a base derivation key.
 mod dukpt;
+/// The parameters a key exchange with this service is prepared with: the token that
+/// names one set and the certified key pair whose certificate the caller is handed.
+mod key_exchange_parameters;
 /// What `ExportKey` asks of this store, and the wrapped key it answers with.
 mod key_export;
 /// What `ImportKey` asks of this store: the key a caller's wrapped material carries.
@@ -84,6 +87,13 @@ pub use key_export::{
 };
 
 pub use key_import::{ImportRejection, KeyImport};
+
+pub use key_exchange_parameters::{
+    mint_key_exchange_key, wrapping_key_algorithms, KeyExchangeDirection, KeyExchangeParameters,
+    EXPORT_TOKEN_PREFIX, IMPORT_TOKEN_PREFIX, KEY_EXCHANGE_PARAMETERS_VALIDITY,
+    KEY_MATERIAL_TYPE_TR34_KEY_BLOCK, MAX_KEY_EXCHANGE_PARAMETERS, RSA_WRAPPING_KEY_ALGORITHMS,
+    TOKEN_ID_LEN, TOKEN_REUSE_REMAINING, TR34_SIGNING_KEY_ALGORITHM,
+};
 
 /// The ARN service namespace for this service (`arnNamespace` / sigv4 name
 /// `payment-cryptography`, from OPERATIONS.md's wire-protocol section).
@@ -281,97 +291,6 @@ pub const MAX_KEY_REPLICATION_REGIONS: usize = 64;
 /// The tag-key namespace AWS reserves for itself, in every service: a caller may not
 /// set a tag whose key starts with it.
 pub const RESERVED_TAG_PREFIX: &str = "aws:";
-
-// ---------------------------------------------------------------------------
-// TR-34 export parameters
-// ---------------------------------------------------------------------------
-
-/// The prefix every export token carries, from the modelled `ExportTokenId` pattern
-/// `^(export-token-[0-9a-zA-Z]{16,64})?$`.
-pub const EXPORT_TOKEN_PREFIX: &str = "export-token-";
-
-/// Length of the id segment of a generated export token: the minimum that pattern
-/// admits.
-pub const EXPORT_TOKEN_ID_LEN: usize = 16;
-
-/// How long an export token and its signing key certificate stay valid.
-///
-/// From `GetParametersForExport`'s own documentation: "The export token expires in 30
-/// days."
-pub const EXPORT_PARAMETERS_VALIDITY: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-
-/// How much validity a stored export token must have left for
-/// `ReuseLastGeneratedToken` to answer with it instead of minting a new one.
-///
-/// From that member's own documentation: "If set to true and a valid export token
-/// exists for the same key material type and signing key algorithm with at least 7
-/// days of remaining validity, the existing token and signing key certificate are
-/// returned."
-pub const EXPORT_TOKEN_REUSE_REMAINING: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-
-/// The only `KeyAlgorithm` a TR-34 signing key certificate is issued for, from
-/// `SigningKeyAlgorithm`'s own documentation: "RSA_2048 is the only signing key
-/// algorithm allowed."
-pub const TR34_SIGNING_KEY_ALGORITHM: &str = "RSA_2048";
-
-/// The most export parameter sets this emulator will hold at once.
-///
-/// Emulator resource guard, NOT an AWS quota: each call may mint a set, so the store
-/// needs a bound. Sets the clock has already expired do not count against it.
-pub const MAX_EXPORT_PARAMETERS: usize = 100;
-
-/// One TR-34 export parameter set: the export token a later `ExportKey` names, the
-/// signing key certificate that signs the wrapped key inside the TR-34 payload, and
-/// the instant both expire at.
-#[derive(Debug, Clone)]
-pub struct ExportParameters {
-    /// The modelled `ExportTokenId` naming this set; also its key in the store.
-    pub export_token: String,
-    /// The `KeyMaterialType` the set was minted for, which with
-    /// [`ExportParameters::signing_key_algorithm`] is what a reuse request matches on.
-    pub key_material_type: String,
-    /// The `KeyAlgorithm` of the signing key.
-    pub signing_key_algorithm: String,
-    /// The signing key certificate, as `SigningKeyCertificate` reports it.
-    pub signing_key_certificate: String,
-    /// The certificate of the root authority that signed it, as
-    /// `SigningKeyCertificateChain` reports it.
-    pub signing_key_certificate_chain: String,
-    /// When this set was minted.
-    pub created: SystemTime,
-    /// When it expires, as `ParametersValidUntilTimestamp` reports it.
-    pub valid_until: SystemTime,
-    /// The private half of the signing key pair, PKCS#8 DER.
-    ///
-    /// Held because it is what signs the wrapped key inside the TR-34 key block a
-    /// later `ExportKey` builds; never returned and never logged, and its `Debug` is
-    /// redacted like a key's own material. Private to this module, so every set is
-    /// minted through [`ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState::remember_export_parameters`]
-    /// and no handler can store one whose certificate is not the certificate of this
-    /// key.
-    signing_key_pkcs8: KeyMaterial,
-}
-
-impl ExportParameters {
-    /// The private half of this set's signing key pair, PKCS#8 DER: what signs the
-    /// wrapped key inside the TR-34 key block a later `ExportKey` builds, and the key
-    /// whose public half the signing key certificate carries.
-    pub fn signing_key_pkcs8(&self) -> &[u8] {
-        self.signing_key_pkcs8.bytes()
-    }
-
-    /// Whether this set is still valid at `now`.
-    pub fn is_valid(&self, now: SystemTime) -> bool {
-        now < self.valid_until
-    }
-
-    /// Whether this set still has `remaining` of its validity left at `now`, which is
-    /// what `ReuseLastGeneratedToken` requires of the set it answers with.
-    pub fn has_remaining(&self, now: SystemTime, remaining: Duration) -> bool {
-        now.checked_add(remaining)
-            .is_some_and(|deadline| deadline <= self.valid_until)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // The stored key
@@ -958,9 +877,11 @@ pub struct ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState {
     /// than a list: enabling a region twice enables it once, and
     /// `GetDefaultKeyReplicationRegions` answers it in one stable order.
     pub enabled_replication_regions: BTreeSet<String>,
-    /// The TR-34 export parameter sets `GetParametersForExport` has handed out, keyed
-    /// by the export token that names each one.
-    pub export_parameters: BTreeMap<String, ExportParameters>,
+    /// The parameter sets `GetParametersForExport` and `GetParametersForImport` have
+    /// handed out, keyed by the token that names each one — one map for both, because a
+    /// token's own prefix says which side of the exchange it prepares (see
+    /// [`key_exchange_parameters`]).
+    pub key_exchange_parameters: BTreeMap<String, KeyExchangeParameters>,
     /// The Multi-Party Approval team association of each protected operation, keyed by
     /// the modelled `Action` the association is for — so the store holds at most one per
     /// value `MpaOperation` declares.
@@ -1306,102 +1227,6 @@ impl ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState {
             self.enabled_replication_regions.remove(region);
         }
         self.default_replication_regions()
-    }
-
-    /// The export parameter set `ReuseLastGeneratedToken` answers with, if this store
-    /// holds one: the most recently minted set for the same key material type and
-    /// signing key algorithm that still has [`EXPORT_TOKEN_REUSE_REMAINING`] of its
-    /// validity left at `now`.
-    pub fn reusable_export_parameters(
-        &self,
-        key_material_type: &str,
-        signing_key_algorithm: &str,
-        now: SystemTime,
-    ) -> Option<&ExportParameters> {
-        self.export_parameters
-            .values()
-            .filter(|parameters| {
-                parameters.key_material_type == key_material_type
-                    && parameters.signing_key_algorithm == signing_key_algorithm
-                    && parameters.has_remaining(now, EXPORT_TOKEN_REUSE_REMAINING)
-            })
-            .max_by_key(|parameters| parameters.created)
-    }
-
-    /// How many export parameter sets are still valid at `now`.
-    pub fn valid_export_parameters(&self, now: SystemTime) -> usize {
-        self.export_parameters
-            .values()
-            .filter(|parameters| parameters.is_valid(now))
-            .count()
-    }
-
-    /// Store an export parameter set for `signing_key`, minted at `now` and expiring
-    /// at `valid_until`, and answer it.
-    ///
-    /// The sets the clock has already expired are dropped here: an expired token names
-    /// no parameters a later `ExportKey` could use, so it is not kept and does not
-    /// count against [`MAX_EXPORT_PARAMETERS`].
-    ///
-    /// `None` when the store already holds that many unexpired sets or when no unused
-    /// export token is available — both judged under the SAME borrow that inserts, so
-    /// concurrent calls cannot each pass a check and together push the store past the
-    /// bound. Nothing is stored on a refusal.
-    pub fn remember_export_parameters(
-        &mut self,
-        key_material_type: &str,
-        signing_key_algorithm: &str,
-        signing_key: MintedSigningKey,
-        now: SystemTime,
-        valid_until: SystemTime,
-    ) -> Option<ExportParameters> {
-        self.export_parameters
-            .retain(|_, parameters| parameters.is_valid(now));
-        if self.export_parameters.len() >= MAX_EXPORT_PARAMETERS {
-            return None;
-        }
-        let export_token = self.fresh_export_token()?;
-        let parameters = ExportParameters {
-            export_token: export_token.clone(),
-            key_material_type: key_material_type.to_string(),
-            signing_key_algorithm: signing_key_algorithm.to_string(),
-            signing_key_certificate: signing_key.certificate,
-            signing_key_certificate_chain: signing_key.certificate_chain,
-            created: now,
-            valid_until,
-            signing_key_pkcs8: signing_key.private_key_pkcs8,
-        };
-        self.export_parameters
-            .insert(export_token, parameters.clone());
-        Some(parameters)
-    }
-
-    /// An export token no stored parameter set is using, or `None` when every id this
-    /// generator can produce is taken.
-    ///
-    /// Drawn from the same mixing stream as a key id, and checked against the store
-    /// the same way, so no mint can ever replace a set a caller still holds the token
-    /// for.
-    fn fresh_export_token(&mut self) -> Option<String> {
-        let mut seed = self.draw();
-        for _ in 0..MAX_KEY_ID_ATTEMPTS {
-            let candidate: String = (0..EXPORT_TOKEN_ID_LEN)
-                .map(|_| {
-                    let draw = splitmix64(&mut seed);
-                    KEY_ID_ALPHABET[(draw % KEY_ID_ALPHABET.len() as u64) as usize] as char
-                })
-                .collect();
-            let token = format!("{EXPORT_TOKEN_PREFIX}{candidate}");
-            if !self.export_parameters.contains_key(&token) {
-                return Some(token);
-            }
-        }
-        // Bounded fallback, for the same reason as [`Self::fresh_key_id`]: the
-        // zero-padded decimals are also `[0-9a-zA-Z]{16}`, and there are always more
-        // of them than there are stored sets.
-        (0u64..=self.export_parameters.len() as u64)
-            .map(|n| format!("{EXPORT_TOKEN_PREFIX}{n:016}"))
-            .find(|token| !self.export_parameters.contains_key(token))
     }
 
     /// A key id no stored key in `region` is using, or `None` when every id this
@@ -2051,19 +1876,21 @@ fn tdes_key(key_algorithm: &str, material: &[u8]) -> Option<[u8; 24]> {
 }
 
 // ---------------------------------------------------------------------------
-// The TR-34 signing key certificate
+// The certified key pair a key exchange is prepared with
 // ---------------------------------------------------------------------------
 
-/// A freshly minted TR-34 signing key: its certificate, the certificate of the
-/// authority that signed it, and the private half of its key pair.
+/// A freshly minted, certified key pair: its certificate, the certificate of the
+/// authority that signed it, and the private half of the pair.
 #[derive(Debug)]
-pub struct MintedSigningKey {
-    /// The signing key certificate, as `SigningKeyCertificate` reports it.
+pub struct MintedCertifiedKey {
+    /// The key's certificate, as `SigningKeyCertificate` and `WrappingKeyCertificate`
+    /// report it.
     pub certificate: String,
-    /// The root authority's certificate, as `SigningKeyCertificateChain` reports it.
+    /// The root authority's certificate, as `SigningKeyCertificateChain` and
+    /// `WrappingKeyCertificateChain` report it.
     pub certificate_chain: String,
-    /// The private half of the signing key pair, PKCS#8 DER. Private to this module
-    /// and carried in the same redacted wrapper as a key's own material, so no
+    /// The private half of the key pair, PKCS#8 DER. Private to this module and its
+    /// children, and carried in the same redacted wrapper as a key's own material, so no
     /// formatter anywhere can print it.
     private_key_pkcs8: KeyMaterial,
 }
@@ -2108,34 +1935,34 @@ mod oid {
         ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.4");
 }
 
-/// Mint the TR-34 signing key an export token hands out: an RSA-2048 key pair whose
-/// certificate is signed by a freshly minted root authority of its own, both valid
-/// from `not_before` until `not_after`.
+/// Mint a certified key pair of `key_size`: an RSA key pair whose certificate is signed
+/// by a freshly minted root authority of its own, both valid from `not_before` until
+/// `not_after`.
 ///
 /// Every byte of this is real: both key pairs come from `aws-lc-rs`
 /// (`aws_lc_rs::rsa`), each certificate carries the DER `SubjectPublicKeyInfo` that
 /// library computes from the key it generated, and each signature is an
 /// RSASSA-PKCS1-v1_5 SHA-256 signature that same library makes over the DER of the
-/// certificate's own `TBSCertificate` — so a caller can verify the signing key
-/// certificate against the chain it is handed, and the private key the store keeps is
-/// the private half of the key the certificate names.
+/// certificate's own `TBSCertificate` — so a caller can verify the certificate against
+/// the chain it is handed, and the private key the store keeps is the private half of
+/// the key the certificate names.
 ///
-/// `subject_common_name` names the signing key the certificate is issued for.
-/// Generating two RSA key pairs is hundreds of milliseconds of CPU, so a caller runs
-/// this with no lock held.
+/// `subject_common_name` names what the certified key is for. Generating two RSA key
+/// pairs is hundreds of milliseconds of CPU, so a caller runs this with no lock held.
 ///
 /// `None` when the library refuses to produce or encode a key pair, or when a
 /// certificate field cannot be encoded (an instant X.509 cannot represent, say).
-pub fn mint_tr34_signing_key(
+pub fn mint_certified_rsa_key(
     subject_common_name: &str,
+    key_size: ::aws_lc_rs::rsa::KeySize,
     not_before: SystemTime,
     not_after: SystemTime,
-) -> Option<MintedSigningKey> {
+) -> Option<MintedCertifiedKey> {
     let root = RsaKeyPairDer::generate(::aws_lc_rs::rsa::KeySize::Rsa2048)?;
-    let signing = RsaKeyPairDer::generate(::aws_lc_rs::rsa::KeySize::Rsa2048)?;
+    let certified = RsaKeyPairDer::generate(key_size)?;
 
     let root_name = distinguished_name(TR34_ROOT_COMMON_NAME)?;
-    let signing_name = distinguished_name(subject_common_name)?;
+    let subject_name = distinguished_name(subject_common_name)?;
 
     let root_certificate = certificate(
         &root_name,
@@ -2145,29 +1972,25 @@ pub fn mint_tr34_signing_key(
         true,
         &root,
     )?;
-    let signing_certificate = certificate(
+    let subject_certificate = certificate(
         &root_name,
-        &signing_name,
-        &signing.public_key_spki,
+        &subject_name,
+        &certified.public_key_spki,
         (not_before, not_after),
         false,
         &root,
     )?;
 
-    Some(MintedSigningKey {
-        certificate: signing_certificate,
+    Some(MintedCertifiedKey {
+        certificate: subject_certificate,
         certificate_chain: root_certificate,
-        private_key_pkcs8: KeyMaterial(signing.private_key_pkcs8),
+        private_key_pkcs8: KeyMaterial(certified.private_key_pkcs8),
     })
 }
 
-/// The common name of the root authority a minted signing key certificate is signed
-/// by. It names the service and the key block standard the certificate is for.
+/// The common name of the root authority a minted certificate is signed by. It names the
+/// service and the key block standard the certificate is for.
 const TR34_ROOT_COMMON_NAME: &str = "Payment Cryptography TR-34 Root CA";
-
-/// The common name a minted TR-34 signing key certificate carries: the key it names is
-/// the service's own signing key for a TR-34 key export.
-pub const TR34_SIGNING_KEY_SUBJECT: &str = "Payment Cryptography TR-34 Signing Key";
 
 /// The organization name every minted certificate carries.
 const TR34_ORGANIZATION_NAME: &str = "Payment Cryptography";

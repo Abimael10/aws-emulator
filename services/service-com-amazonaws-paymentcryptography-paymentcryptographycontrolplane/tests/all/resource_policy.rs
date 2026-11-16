@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! A key's resource-based policy, end to end over the wire: `PutResourcePolicy` and
-//! `GetResourcePolicy`.
+//! A key's resource-based policy, end to end over the wire: `PutResourcePolicy`,
+//! `GetResourcePolicy` and `DeleteResourcePolicy`.
 //!
 //! Every call goes through the real `MultiServiceRouter` (`POST /` with
 //! `X-Amz-Target: PaymentCryptographyControlPlane.<Op>`, awsJson1_0) and the
@@ -16,6 +16,9 @@
 //!   re-serialized rather than echoed and re-attaching what was read changes nothing;
 //! * a key no call has attached a policy to reports the empty document rather than
 //!   refusing the read: the read refuses only an ARN that names no key;
+//! * a removal removes: once `DeleteResourcePolicy` has run, the key carries no policy at
+//!   all, so every later read reports that same empty document and a later attach starts
+//!   from nothing;
 //! * a document that would grant access to a principal nobody named is refused with
 //!   `PublicPolicyException` and nothing is written — a grant reaches everybody when its
 //!   principal element names the wildcard (bare or under any principal type) or excludes a
@@ -560,6 +563,108 @@ async fn a_text_that_is_not_a_policy_this_service_attaches_is_refused() {
             "case {case}: a refused attach stores no policy"
         );
     }
+}
+
+#[tokio::test]
+async fn a_removed_policy_leaves_the_key_with_the_empty_document() {
+    let (router, engine) = router_with_engine();
+
+    // The rows differ along what the removal rule generalises over: which document was
+    // attached before it (every form the attachable table spans), and whether anything
+    // was attached at all — the last row removes from a key no call has attached a policy
+    // to, which is the same end state reached from a different start.
+    let mut rows: Vec<(&str, Option<String>)> = attachable_documents()
+        .into_iter()
+        .map(|(case, document)| (case, Some(document)))
+        .collect();
+    rows.push(("no policy attached at all", None));
+
+    for (case, document) in rows {
+        let arn = create_key(&router).await;
+        if let Some(document) = &document {
+            ok_call(
+                &router,
+                "PutResourcePolicy",
+                &json!({"ResourceArn": arn, "Policy": document}),
+            )
+            .await;
+        }
+
+        let removed = ok_call(
+            &router,
+            "DeleteResourcePolicy",
+            &json!({"ResourceArn": arn}),
+        )
+        .await;
+        assert_eq!(
+            removed,
+            json!({}),
+            "case {case}: the removal is acknowledged with an empty body, got {removed}"
+        );
+
+        // The key really carries no policy afterwards: the record holds none, and the
+        // read reports the document a key with no policy is reported with rather than the
+        // one that was attached.
+        assert_eq!(
+            stored_policy(&engine, case, &arn),
+            None,
+            "case {case}: the removal must clear the stored document"
+        );
+        let got = ok_call(&router, "GetResourcePolicy", &json!({"ResourceArn": arn})).await;
+        assert_eq!(
+            string(&got, "Policy"),
+            NO_POLICY_DOCUMENT,
+            "case {case}: a key whose policy was removed reports the empty document, got {got}"
+        );
+
+        // Removing again changes nothing, and a later attach is attached to a key that
+        // carries nothing — so the removal is a removal rather than a flag.
+        ok_call(
+            &router,
+            "DeleteResourcePolicy",
+            &json!({"ResourceArn": arn}),
+        )
+        .await;
+        assert_eq!(
+            stored_policy(&engine, case, &arn),
+            None,
+            "case {case}: a second removal leaves the key with no policy"
+        );
+        let attachable = attachable_documents()
+            .into_iter()
+            .next()
+            .expect("the table is not empty")
+            .1;
+        let reattached = ok_call(
+            &router,
+            "PutResourcePolicy",
+            &json!({"ResourceArn": arn, "Policy": attachable}),
+        )
+        .await;
+        assert_eq!(
+            string(&reattached, "Policy"),
+            reported(&attachable),
+            "case {case}: a key whose policy was removed takes a new one, got {reattached}"
+        );
+    }
+
+    // A well-formed `KeyArn` that names no key is the not-found class, naming the ARN the
+    // request carried — the one refusal this operation models for an ARN it cannot
+    // resolve.
+    let unknown = key_arn(REGION, "zzzzzzzzzzzzzzzz");
+    let parsed = refused(
+        &router,
+        "an ARN naming no key",
+        "DeleteResourcePolicy",
+        &json!({"ResourceArn": unknown}),
+        "ResourceNotFoundException",
+    )
+    .await;
+    assert_eq!(
+        parsed.get("ResourceId").and_then(Value::as_str),
+        Some(unknown.as_str()),
+        "DeleteResourcePolicy: the refusal names the resource that was not found, got {parsed}"
+    );
 }
 
 #[tokio::test]
