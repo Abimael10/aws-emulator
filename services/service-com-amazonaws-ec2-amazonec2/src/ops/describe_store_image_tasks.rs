@@ -192,11 +192,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You cannot specify this parameter and the `ImageIds` parameter in the same call"
         // (`MaxResults`), refused through the one template this service words that pair with
-        // ([`crate::state::parameters_cannot_be_combined`]).
+        // ([`crate::state::parameters_cannot_be_combined`]), which names the id SELECTION
+        // first and the page size second.
         if input.max_results.is_some() && !requested_ids.is_empty() {
             return Err(crate::state::parameters_cannot_be_combined(
-                "MaxResults",
                 "ImageIds",
+                "MaxResults",
             ));
         }
 

@@ -199,11 +199,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same request" (`$MaxResults`): a page size over a list the request already bounds
         // names two different answers, so it is refused rather than one of them being picked
         // — through the one template this service words that pair with
-        // ([`crate::state::parameters_cannot_be_combined`]).
+        // ([`crate::state::parameters_cannot_be_combined`]), which names the id SELECTION
+        // first and the page size second.
         if input.max_results.is_some() && !requested_ids.is_empty() {
             return Err(crate::state::parameters_cannot_be_combined(
-                "maxResults",
                 "capacityReservationId",
+                "maxResults",
             ));
         }
 

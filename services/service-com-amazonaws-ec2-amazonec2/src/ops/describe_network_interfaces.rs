@@ -191,12 +191,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You cannot specify this parameter and the network interface IDs parameter in
         // the same request" (`DescribeNetworkInterfacesRequest$MaxResults`), refused through
         // the one template this service words that pair with
-        // ([`crate::state::parameters_cannot_be_combined`]).
+        // ([`crate::state::parameters_cannot_be_combined`]) — which names the id SELECTION
+        // first and the page size second. This operation's recorded refusal names both by
+        // their public member names, the id list in its plural form, so those are the names
+        // it carries here.
         let requested: &[String] = input.network_interface_ids.as_deref().unwrap_or_default();
         if input.max_results.is_some() && !requested.is_empty() {
             return Err(crate::state::parameters_cannot_be_combined(
+                "NetworkInterfaceIds",
                 "MaxResults",
-                "NetworkInterfaceId",
             ));
         }
         // The id list is caller-sized and each entry is resolved against the store, so it

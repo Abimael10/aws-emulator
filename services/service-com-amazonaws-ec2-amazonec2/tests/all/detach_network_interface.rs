@@ -609,7 +609,7 @@ async fn detach_refuses_what_cannot_be_detached_and_writes_nothing_for_a_dry_run
         );
         assert_eq!(
             error_message(&body),
-            "The network interface at device index 0 and networkcard index 0 cannot be \
+            "The network interface at device index 0 and networkCard index 0 cannot be \
              detached.",
             "case {case:?}: expected the refusal naming the attachment's two indexes, \
              got {body}"

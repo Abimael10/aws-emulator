@@ -292,6 +292,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The primary network interface is attached at device index 0" and every other
         // interface at an index of its own: an index the instance already has an interface at
         // cannot take a second one.
+        //
+        // The sentence is AWS's own for this class, on its own: the instance the request
+        // named and the index it asked for, both single-quoted, and the terminating full
+        // stop — no parameter-value clause in front of it, because what is wrong is the
+        // instance's existing attachment rather than the shape of the member's value.
         if held.iter().any(|interface| {
             interface
                 .attachment
@@ -300,9 +305,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 == Some(input.device_index)
         }) {
             return Err(state::invalid_parameter_value(format!(
-                "Value ({}) for parameter deviceIndex is invalid. Instance '{instance_id}' \
-                 already has an interface attached at device index '{}'",
-                input.device_index, input.device_index
+                "Instance '{instance_id}' already has an interface attached at device \
+                 index '{}'.",
+                input.device_index
             )));
         }
 

@@ -64,7 +64,8 @@ fn zone() -> String {
 /// One row of the combination table: a paged describe, the form field its id selector is
 /// sent as, a well-formed id of that kind, and the two parameter names that operation's own
 /// refusal names — EC2 spells the pair with the public member name on some operations and
-/// with the wire set name on others, and in either order.
+/// with the wire set name on others, but always names the id SELECTION first and the page
+/// size second.
 struct Combination {
     action: &'static str,
     id_field: &'static str,
@@ -106,22 +107,22 @@ const COMBINATIONS: [Combination; 6] = [
         action: "DescribeNetworkInterfaces",
         id_field: "NetworkInterfaceId.1",
         id: "eni-0123456789abcdef0",
-        first: "MaxResults",
-        second: "NetworkInterfaceId",
+        first: "NetworkInterfaceIds",
+        second: "MaxResults",
     },
     Combination {
         action: "DescribeHosts",
         id_field: "HostId.1",
         id: "h-0123456789abcdef0",
-        first: "maxResults",
-        second: "hostId",
+        first: "hostId",
+        second: "maxResults",
     },
     Combination {
         action: "DescribeStoreImageTasks",
         id_field: "ImageId.1",
         id: "ami-0123456789abcdef0",
-        first: "MaxResults",
-        second: "ImageIds",
+        first: "ImageIds",
+        second: "MaxResults",
     },
 ];
 

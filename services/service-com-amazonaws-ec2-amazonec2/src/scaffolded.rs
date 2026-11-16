@@ -472,6 +472,22 @@ impl<E> Scaffolded<E> {
         )
     }
 
+    /// `InvalidIPAddress.InUse` (HTTP 400) for the CREATE of a network interface: the
+    /// private address the request asked for is already held.
+    ///
+    /// The same cause as [`Self::invalid_ip_address_in_use`] and the same code, but the
+    /// sentence AWS words it with HERE is fixed text end to end — `The specified address is
+    /// already in use.` — naming no address, because the request named the one address this
+    /// refusal is about. Separate from the sentence above so neither path has to guess at
+    /// the other's wording.
+    pub fn specified_ip_address_already_in_use() -> Self {
+        Self::service_error(
+            "InvalidIPAddress.InUse",
+            400,
+            "The specified address is already in use.",
+        )
+    }
+
     /// `UnsupportedHibernationConfiguration` (HTTP 400): the instance was not
     /// launched with hibernation enabled, so it cannot be hibernated.
     pub fn unsupported_hibernation_configuration(instance_id: &str) -> Self {

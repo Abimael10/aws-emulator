@@ -442,10 +442,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `reserve_private_ip` answers `false` when anything in the account already
             // holds the address — including an address recorded on a route server endpoint
             // rather than in the pool — so ONE question decides it for every resource, and
-            // a request naming one address twice is refused the second time.
+            // a request naming one address twice is refused the second time. The sentence is
+            // the one AWS words this create's refusal with: fixed text that names no
+            // address ([`Scaffolded::specified_ip_address_already_in_use`]).
             if !store.reserve_private_ip(&address) {
                 store.release_private_ips(&addresses);
-                return Err(Scaffolded::invalid_ip_address_in_use(&address));
+                return Err(Scaffolded::specified_ip_address_already_in_use());
             }
             addresses.push(address);
         }

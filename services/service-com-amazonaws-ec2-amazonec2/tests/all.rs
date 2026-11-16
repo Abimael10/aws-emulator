@@ -9,6 +9,13 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/describe_vpcs.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+// The SENTENCE a refusal carries across the network-interface, security-group and VPC create
+// paths: one rule — a refusal's message is the one EC2 words that error class with — asserted
+// class by class over tables of requests. Declared FIRST for the reason the note below gives:
+// the sorted neighbourhood and the tail of this file are where every new ec2 suite inserts
+// its lines.
+#[path = "all/network_and_group_refusal_sentences.rs"]
+mod network_and_group_refusal_sentences;
 // Declared FIRST rather than in sorted position: a new ec2 suite lands every few minutes
 // and inserts its two lines in sorted order, so the sorted neighbourhood of this suite is
 // the contended region of this file — this fix lost several serialized squash merges to

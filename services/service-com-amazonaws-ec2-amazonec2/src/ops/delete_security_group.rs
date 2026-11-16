@@ -164,15 +164,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A group id this account holds no group for is a refusal, not a no-op — a caller
         // that deletes twice has to be able to tell the deletion it performed from one it
         // did not.
-        if !store.security_groups.contains_key(&group_id) {
+        let Some(group) = store.security_groups.get(&group_id) else {
             return Err(state::invalid_group_not_found(&group_id));
-        }
+        };
+        let group_name = group.group_name.clone().unwrap_or_default();
         // "When you delete the VPC, it deletes the default security group" (`DeleteVpc`):
         // the default group of a VPC lives exactly as long as its VPC, so deleting it on its
         // own is refused rather than leaving the VPC without the group an instance is
-        // launched into by default.
+        // launched into by default. The refusal names the group by id AND by name, both read
+        // off the stored group ([`state::cannot_delete`]).
         if store.is_default_security_group(&group_id) {
-            return Err(state::cannot_delete(&group_id));
+            return Err(state::cannot_delete(&group_id, &group_name));
         }
         // "If you attempt to delete a security group that is associated with an instance or
         // network interface, is referenced by another security group in the same VPC, or has

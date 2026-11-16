@@ -788,8 +788,13 @@ pub fn invalid_parameter_combination<E>(message: impl Into<String>) -> Scaffolde
 /// collection, so `MaxResults` and a resource-id list select mutually exclusively and EC2
 /// refuses them together rather than serving one and ignoring the other. Each caller names
 /// the two parameters as its OWN refusal spells them — EC2 words the same refusal with the
-/// public member name on some operations and with the wire set name on others, and in either
-/// order — so the template lives here and the names stay with the operation.
+/// public member name on some operations and with the wire set name on others — so the
+/// template lives here and the names stay with the operation.
+///
+/// For that pair the ORDER is EC2's and not the caller's choice: the recorded refusals name
+/// the ID SELECTION first and the page size second, whichever spelling the operation uses
+/// for the selection, so tooling that reads the offending parameter out of the sentence
+/// takes the selection out of the request rather than its page size.
 pub fn parameters_cannot_be_combined<E>(first: &str, second: &str) -> Scaffolded<E> {
     invalid_parameter_combination(format!(
         "The parameter {first} cannot be used with the parameter {second}"

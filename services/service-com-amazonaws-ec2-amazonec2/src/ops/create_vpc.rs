@@ -206,11 +206,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "A VPC must have an associated IPv4 CIDR block. You can choose an IPv4 CIDR
         // block or an IPAM-allocated IPv4 CIDR block." No IPAM pool was named, so the
-        // request has to carry the block itself.
+        // request has to carry the block itself. The sentence is AWS's own for this class:
+        // the two wire member names single-quoted, and "should be provided".
         let Some(requested_cidr) = input.cidr_block.as_deref().filter(|cidr| !cidr.is_empty())
         else {
             return Err(state::missing_parameter(
-                "Either 'cidrBlock' or 'ipv4IpamPoolId' must be specified",
+                "Either 'cidrBlock' or 'ipv4IpamPoolId' should be provided.",
             ));
         };
         // "We modify the specified CIDR block to its canonical form" (CidrBlock), within

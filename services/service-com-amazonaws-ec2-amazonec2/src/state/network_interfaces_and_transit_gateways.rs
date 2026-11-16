@@ -170,13 +170,14 @@ pub fn invalid_attachment_id_not_found<E>(attachment_id: &str) -> Scaffolded<E> 
 /// goes with the instance, so it is not an attachment a caller may take down — whatever
 /// `Force` says, since forcing is about an instance that is not answering rather than about
 /// which attachments exist. The sentence names the two indexes of the attachment the request
-/// selected, both read off the stored attachment rather than off the request.
+/// selected, both read off the stored attachment rather than off the request, and spells the
+/// second of them the way EC2 does: `networkCard`, in camel case.
 pub fn primary_network_interface_cannot_be_detached<E>(
     device_index: i32,
     network_card_index: i32,
 ) -> Scaffolded<E> {
     Scaffolded::operation_not_permitted(format!(
-        "The network interface at device index {device_index} and networkcard index \
+        "The network interface at device index {device_index} and networkCard index \
          {network_card_index} cannot be detached."
     ))
 }

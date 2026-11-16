@@ -1064,6 +1064,19 @@ pub fn insufficient_free_ipv6_addresses<E>() -> Scaffolded<E> {
     )
 }
 
+/// Refuse a request that would take an IPv6 address out of a subnet that has no IPv6 range
+/// at all: HTTP 400 `InvalidParameterValue`.
+///
+/// "Amazon EC2 automatically selects the IPv6 addresses from the subnet range"
+/// (`AssignIpv6AddressesRequest$Ipv6AddressCount`): with no range there is nothing to select
+/// from, whichever member asked for the address. The sentence is AWS's own for this class
+/// and is FIXED TEXT throughout — it names no subnet, so every operation that reads a
+/// subnet's IPv6 range refuses its absence with the same words rather than each inventing an
+/// id to quote.
+pub fn subnet_has_no_ipv6_range<E>() -> Scaffolded<E> {
+    invalid_parameter_value("Subnet does not contain any IPv6 CIDR block ranges")
+}
+
 impl ComAmazonawsEc2Amazonec2State {
     /// The IPv6 CIDR block the subnet `subnet_id` holds, or `None` when it holds none (or
     /// the store holds no such subnet).
@@ -1189,13 +1202,18 @@ pub fn dependency_violation<E>(message: impl Into<String>) -> Scaffolded<E> {
 /// Refuse a delete of the default security group of a VPC: HTTP 400 `CannotDelete`. That
 /// group exists for as long as its VPC does — "When you delete the VPC, it deletes the
 /// default security group" (`DeleteVpc`) — so only `DeleteVpc` removes it.
-pub fn cannot_delete<E>(group_id: &str) -> Scaffolded<E> {
+///
+/// The sentence is AWS's own for this class: it starts lower-case, and names the group by
+/// BOTH its id and its name, each double-quoted, read off the stored group rather than off
+/// the request — a caller that deleted by name is told the id, and one that deleted by id is
+/// told the name.
+pub fn cannot_delete<E>(group_id: &str, group_name: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         CANNOT_DELETE,
         400,
         format!(
-            "The security group '{group_id}' is the default group of its VPC \
-             and cannot be deleted"
+            "the specified group: \"{group_id}\" name: \"{group_name}\" cannot be \
+             deleted by a user"
         ),
     )
 }
@@ -2217,8 +2235,11 @@ pub fn validate_ip_permission_port_range<E>(
         // `$ToPort`), so there is no order between them to hold.
         && !protocol_is_icmp(protocol)
     {
-        return Err(invalid_permission_malformed(format!(
-            "{member} ends at {to_port}, before it starts at {from_port}"
+        // The range is the member EC2 reports as the bad VALUE, and the sentence it words
+        // that with is fixed text around the two ends as the request sent them, with no
+        // member name and no entry number of ours in it.
+        return Err(invalid_parameter_value(format!(
+            "Invalid TCP/UDP port range({from_port}:{to_port})"
         )));
     }
     Ok(())

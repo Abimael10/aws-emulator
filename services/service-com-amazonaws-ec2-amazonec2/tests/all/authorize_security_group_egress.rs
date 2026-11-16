@@ -1262,7 +1262,7 @@ async fn a_request_the_service_cannot_satisfy_is_refused_and_adds_nothing() {
                 vec![Dest::ipv4("10.0.0.0/8")],
             )]),
             names_group: false,
-            code: ec2::state::INVALID_PERMISSION_MALFORMED,
+            code: ec2::state::INVALID_PARAMETER_VALUE,
             status: 400,
         },
         Case {

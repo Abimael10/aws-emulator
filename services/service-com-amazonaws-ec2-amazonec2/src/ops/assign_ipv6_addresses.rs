@@ -270,11 +270,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Amazon EC2 automatically selects the IPv6 addresses from the subnet range"
         // (`Ipv6AddressCount`): the subnet's own IPv6 CIDR block is the range every address
         // and prefix this call assigns comes out of, so a subnet with no IPv6 block has
-        // nothing to assign.
+        // nothing to assign — refused with the one sentence this service words that class
+        // with ([`crate::state::subnet_has_no_ipv6_range`]).
         let Some(block) = store.subnet_ipv6_cidr_block(&subnet_id) else {
-            return Err(state::invalid_parameter_value(format!(
-                "The subnet '{subnet_id}' does not have an associated IPv6 CIDR block"
-            )));
+            return Err(state::subnet_has_no_ipv6_range());
         };
         // What the account already holds, read off the interface records that ARE the pool.
         // Both lists are read ONCE and grown with what this call assigns, so no refusal and

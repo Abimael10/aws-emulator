@@ -648,13 +648,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let assign = if enabled && ipv6_addresses_held == 0 {
                     // "If you're modifying a network interface in a dual-stack or IPv6-only
                     // subnet": a subnet with no IPv6 CIDR block has no GUA address to make
-                    // primary.
+                    // primary — the same class the assign path refuses, so it carries the
+                    // same sentence ([`crate::state::subnet_has_no_ipv6_range`]).
                     let Some(block) = store.subnet_ipv6_cidr_block(&subnet_id) else {
-                        return Err(state::invalid_parameter_value(format!(
-                            "Value (true) for parameter {ATTRIBUTE_ENABLE_PRIMARY_IPV6} is \
-                             invalid. The subnet '{subnet_id}' does not have an associated \
-                             IPv6 CIDR block"
-                        )));
+                        return Err(state::subnet_has_no_ipv6_range());
                     };
                     let taken_addresses = store.assigned_ipv6_addresses();
                     let taken_prefixes = store.assigned_ipv6_prefixes();
