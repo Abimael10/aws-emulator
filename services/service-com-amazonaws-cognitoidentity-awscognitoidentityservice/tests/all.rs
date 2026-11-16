@@ -45,6 +45,8 @@ mod developer_link_conflict_refusals;
 mod developer_login_credential_exchange;
 #[path = "all/developer_login_linking.rs"]
 mod developer_login_linking;
+#[path = "all/developer_provider_login_exchange.rs"]
+mod developer_provider_login_exchange;
 #[path = "all/developer_provider_name_immutability.rs"]
 mod developer_provider_name_immutability;
 #[path = "all/disabled_identity_projection.rs"]

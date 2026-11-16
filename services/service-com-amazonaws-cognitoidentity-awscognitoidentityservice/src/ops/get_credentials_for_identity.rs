@@ -72,7 +72,18 @@
 //! this service's own token form is the unverifiable token it claims to be, while a value
 //! that claims this service as its issuer in no way — a developer user identifier, an opaque
 //! credential of some other provider, a token of another issuer's form — is no Cognito token
-//! at all, the refusal a token another identity pool minted carries as well. Every presented
+//! at all, the refusal a token another identity pool minted carries as well.
+//!
+//! The pool's own `DeveloperProviderName` is no provider a login can be redeemed against
+//! here: it is "the 'domain' by which Cognito will refer to your users", this account's own
+//! back end rather than an identity provider, and it issues no token — a
+//! developer-authenticated identity reaches this exchange with the token
+//! `GetOpenIdTokenForDeveloperIdentity` minted for it, presented under THIS service's own
+//! provider name. So an entry keyed by that name carries a developer user identifier where a
+//! token has to be, which is no Cognito token either, whichever identity the pool has
+//! registered the identifier under.
+//!
+//! Every presented
 //! login is decided BEFORE the request's role-selection parameters are looked at, so a
 //! request whose login does not stand up is answered for the login, whatever else it asked
 //! for.
@@ -387,6 +398,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
                     return Err(GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
                         NotAuthorizedException {
                             message: Some(refusal.message(&identity_pool_id).into_owned()),
+                        },
+                    )
+                    .into());
+                }
+
+                // A `Logins` entry keyed by the pool's own `DeveloperProviderName` carries a
+                // developer user identifier where this exchange needs a TOKEN, so it is no
+                // Cognito token at all and buys no credential — the token a
+                // developer-authenticated identity reaches this exchange with is the one its
+                // own mint handed back, presented under THIS service's provider name
+                // ([`crate::state::IdentityPool::refuse_developer_provider_login`]).
+                if let Some(refusal) = pool.refuse_developer_provider_login(&logins) {
+                    return Err(GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
+                        NotAuthorizedException {
+                            message: Some(refusal.message().to_string()),
                         },
                     )
                     .into());

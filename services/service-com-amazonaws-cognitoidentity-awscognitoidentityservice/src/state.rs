@@ -477,6 +477,42 @@ impl IdentityPool {
             .err()
             .map(|_| LoginProviderRefusal::NotAnIdentityToken)
     }
+
+    /// Why a `Logins` map presented to the exchange that REDEEMS a login into a credential
+    /// carries no token for one of its entries, if so: an entry keyed by this pool's own
+    /// `DeveloperProviderName`.
+    ///
+    /// That name is not an identity provider of the pool
+    /// ([`Self::names_federated_provider`]) but "the 'domain' by which Cognito will refer to
+    /// your users … a placeholder that allows your backend and the Cognito service to
+    /// communicate about the developer provider"
+    /// (`smithy_query(query="doc",shape="CreateIdentityPoolInput",member="DeveloperProviderName")`),
+    /// so it issues no token at all and the value such an entry carries is a developer user
+    /// IDENTIFIER. The exchange validates "any provided logins … against supported login
+    /// providers" and redeems one only as a token — "If the token is for
+    /// cognito-identity.amazonaws.com, it will be passed through to Security Token Service
+    /// with the appropriate role for the token"
+    /// (`smithy_query(query="doc",shape="GetCredentialsForIdentityInput")`) — and the token a
+    /// developer-authenticated identity reaches it with is the one
+    /// `GetOpenIdTokenForDeveloperIdentity` minted for it, presented under THIS service's own
+    /// provider name ([`COGNITO_IDENTITY_LOGIN_PROVIDER`]). An identifier presented where a
+    /// token has to be is therefore no Cognito token at all
+    /// ([`NOT_A_COGNITO_TOKEN_MESSAGE`]), whatever identifier it is and whichever identity
+    /// the pool has registered it under.
+    ///
+    /// A pool that names no developer provider has no such entry to find, and the developer
+    /// identity operations that TAKE such an identifier — the mint, the lookup, the merge and
+    /// the developer unlink — are not this refusal's: they are the calls that name the
+    /// developer provider by design.
+    pub fn refuse_developer_provider_login(
+        &self,
+        logins: &HashMap<String, String>,
+    ) -> Option<LoginTokenRefusal> {
+        logins
+            .keys()
+            .any(|provider_name| self.names_developer_provider(provider_name))
+            .then_some(LoginTokenRefusal::NotACognitoToken)
+    }
 }
 
 /// The ISSUER an identity pool's `OpenIdConnectProviderARNs` entry names: the resource
