@@ -375,6 +375,10 @@ mod requests_aws_refuses;
 mod resource_member_projection;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/restore_db_cluster_from_s3.rs"]
+mod restore_db_cluster_from_s3;
+#[path = "all/restore_db_instance_from_s3.rs"]
+mod restore_db_instance_from_s3;
 #[path = "all/scratch_aurora_truth.rs"]
 mod scratch_aurora_truth;
 #[path = "all/serverless_v2_capacity_range.rs"]

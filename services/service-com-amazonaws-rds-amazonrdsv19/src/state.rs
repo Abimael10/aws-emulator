@@ -144,6 +144,10 @@ pub mod export_parquet;
 pub use export_access::*;
 pub use export_objects::*;
 pub mod integrations;
+// What a restore FROM Amazon S3 is accepted against: the engine pair the migration reads,
+// and the Percona XtraBackup backup the named bucket and prefix have to hold.
+pub mod restore_from_s3;
+pub use restore_from_s3::*;
 pub mod tags;
 pub mod tenant_databases;
 

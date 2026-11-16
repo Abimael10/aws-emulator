@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreDBClusterFromS3
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreDBClusterFromS3`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation creates an Amazon Aurora DB cluster from MySQL data backed up
+//! into an Amazon S3 bucket — it records the cluster `DescribeDBClusters` then reports, with
+//! its own engine endpoint — and is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreDBClusterFromS3::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -355,18 +352,798 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreDBClusterFromS3` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreDBClusterFromS3ErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let mut input = input;
+        let region =
+            crate::state::request_region(ctx).map_err(RestoreDBClusterFromS3Error::validation)?;
+
+        // THE ENGINE PAIR, decided from the REQUEST alone and therefore before the bucket is
+        // read: this operation "creates an Amazon Aurora DB cluster from MySQL data stored in
+        // an Amazon S3 bucket", so the cluster it creates is of the one engine `Engine`
+        // publishes and the backup it reads is of the one engine and the versions
+        // `SourceEngine` and `SourceEngineVersion` publish. A request naming any other triple
+        // asks for a migration this operation does not perform — the parameters cannot hold
+        // together, which is what this Query API answers `InvalidParameterCombination` — so it
+        // is refused here, above everything that resolves a resource the request NAMES. The
+        // rule is the one both restore-from-Amazon-S3 operations are accepted against
+        // ([`crate::state::S3RestorePair`]).
+        if let Some(refusal) = crate::state::S3_RESTORE_CLUSTER.refusal(
+            &input.engine,
+            &input.source_engine,
+            &input.source_engine_version,
+        ) {
+            return Err(RestoreDBClusterFromS3Error::invalid_parameter_combination(
+                refusal,
+            ));
+        }
+
+        // "This parameter isn't case-sensitive", and the cluster the restore creates is keyed
+        // the way every other cluster is: the folded identifier, checked against the
+        // constraints its engine gives it.
+        crate::state::check_identifier(
+            "DBClusterIdentifier",
+            &input.db_cluster_identifier,
+            crate::state::db_cluster_identifier_max_len(&input.engine),
+        )
+        .map_err(RestoreDBClusterFromS3Error::invalid_parameter_value)?;
+        let identifier = input.db_cluster_identifier.to_ascii_lowercase();
+
+        // Every stored list and every stored free-form value is BOUNDED before anything is
+        // resolved or stored, under the same caps `CreateDBCluster` writes a cluster under:
+        // these members publish no bound of their own and all of them enter the store.
+        let requested_tags = input.tags.take().unwrap_or_default();
+        crate::state::check_tags(&requested_tags)
+            .map_err(RestoreDBClusterFromS3Error::invalid_parameter_value)?;
+        let vpc_security_group_ids = input.vpc_security_group_ids.take().unwrap_or_default();
+        crate::state::check_security_group_memberships(
+            "VpcSecurityGroupIds",
+            &vpc_security_group_ids,
+        )
+        .map_err(RestoreDBClusterFromS3Error::invalid_parameter_value)?;
+        let requested_availability_zones = input.availability_zones.take().unwrap_or_default();
+        let cloudwatch_logs_exports = input
+            .enable_cloudwatch_logs_exports
+            .take()
+            .unwrap_or_default();
+        for (member, values) in [
+            ("AvailabilityZones", &requested_availability_zones),
+            ("EnableCloudwatchLogsExports", &cloudwatch_logs_exports),
+        ] {
+            crate::state::check_request_list_len(
+                member,
+                values.len(),
+                crate::state::MAX_CLUSTER_LIST_ENTRIES,
+            )
+            .map_err(RestoreDBClusterFromS3Error::invalid_parameter_value)?;
+            for value in values {
+                crate::state::check_free_form(member, value)
+                    .map_err(RestoreDBClusterFromS3Error::invalid_parameter_value)?;
+            }
+        }
+        // `AssociatedRoles` and both strings each entry carries are STORED on the restored
+        // cluster: `RoleArn`'s length is the model's, while `FeatureName` publishes none at
+        // all. The list's own length is the model's too (0..15), already refused at the
+        // boundary, so the cap here is this store's.
+        let associated_roles = input.associated_roles.take().unwrap_or_default();
+        crate::state::check_request_list_len(
+            "AssociatedRoles",
+            associated_roles.len(),
+            crate::state::MAX_CLUSTER_LIST_ENTRIES,
+        )
+        .map_err(RestoreDBClusterFromS3Error::invalid_parameter_value)?;
+        for role in &associated_roles {
+            crate::state::check_stored_text(
+                "AssociatedRoles.RoleArn",
+                &role.role_arn,
+                crate::state::MAX_IAM_ROLE_ARN_LEN,
+            )
+            .map_err(RestoreDBClusterFromS3Error::invalid_parameter_value)?;
+            if let Some(feature_name) = &role.feature_name {
+                crate::state::check_free_form("AssociatedRoles.FeatureName", feature_name)
+                    .map_err(RestoreDBClusterFromS3Error::invalid_parameter_value)?;
+            }
+        }
+        crate::state::check_stored_text(
+            "S3IngestionRoleArn",
+            &input.s3_ingestion_role_arn,
+            crate::state::MAX_IAM_ROLE_ARN_LEN,
+        )
+        .map_err(RestoreDBClusterFromS3Error::invalid_parameter_value)?;
+        for (member, value) in [
+            ("CharacterSetName", input.character_set_name.as_deref()),
+            ("DatabaseName", input.database_name.as_deref()),
+            (
+                "DBClusterParameterGroupName",
+                input.db_cluster_parameter_group_name.as_deref(),
+            ),
+            ("Domain", input.domain.as_deref()),
+            ("DomainIAMRoleName", input.domain_iam_role_name.as_deref()),
+            ("OptionGroupName", input.option_group_name.as_deref()),
+            ("PreferredBackupWindow", input.preferred_backup_window.as_deref()),
+            ("S3BucketName", Some(input.s3_bucket_name.as_str())),
+            ("S3Prefix", input.s3_prefix.as_deref()),
+            ("SourceEngineVersion", Some(input.source_engine_version.as_str())),
+        ] {
+            if let Some(value) = value {
+                crate::state::check_free_form(member, value)
+                    .map_err(RestoreDBClusterFromS3Error::invalid_parameter_value)?;
+            }
+        }
+
+        // The documented constraints of the remaining values this request carries, each
+        // refused with the Query API error code the real service answers it with — a value
+        // outside what a parameter accepts is `InvalidParameterValue`, parameters that cannot
+        // hold together are `InvalidParameterCombination` — never with a 501.
+        crate::state::check_master_username(&input.master_username)
+            .map_err(RestoreDBClusterFromS3Error::invalid_parameter_value)?;
+        if let Some(password) = &input.master_user_password {
+            crate::state::check_supplied_master_user_password(&input.engine, password)
+                .map_err(RestoreDBClusterFromS3Error::invalid_parameter_value)?;
+        }
+        // `ManageMasterUserPassword` has RDS "generate and manage the master user password
+        // with Amazon Web Services Secrets Manager". Its one documented constraint is that
+        // the request may not also carry the password itself — "Can't manage the master user
+        // password with Amazon Web Services Secrets Manager if MasterUserPassword is
+        // specified" — and `MasterUserSecretKmsKeyId` "is valid only if the master user
+        // password is managed by RDS", so naming a key for a secret this request creates none
+        // of names nothing. Both are the refusals `CreateDBCluster` answers, in its wording.
+        let manage_master_user_password = input.manage_master_user_password == Some(true);
+        if manage_master_user_password && input.master_user_password.is_some() {
+            return Err(RestoreDBClusterFromS3Error::invalid_parameter_value(
+                crate::state::manage_master_user_password_conflict_message("MasterUserPassword"),
+            ));
+        }
+        if !manage_master_user_password && input.master_user_secret_kms_key_id.is_some() {
+            return Err(RestoreDBClusterFromS3Error::invalid_parameter_combination(
+                crate::state::master_user_secret_kms_key_without_management_message(
+                    "ManageMasterUserPassword",
+                ),
+            ));
+        }
+        if let Some(port) = input.port {
+            // "Constraints: This value must be 1150-65535".
+            if !crate::state::PORT_RANGE.contains(&port) {
+                return Err(RestoreDBClusterFromS3Error::invalid_parameter_value(format!(
+                    "invalid value {port} for Port: must be a value from {} to {}",
+                    crate::state::PORT_RANGE.start(),
+                    crate::state::PORT_RANGE.end()
+                )));
+            }
+        }
+        if let Some(period) = input.backup_retention_period {
+            // "You must specify a minimum value of 1 … Must be a value from 1 to 35".
+            crate::state::check_backup_retention_period(
+                period,
+                &crate::state::CLUSTER_BACKUP_RETENTION_RANGE,
+            )
+            .map_err(RestoreDBClusterFromS3Error::invalid_parameter_value)?;
+        }
+        if let Some(window) = input.backtrack_window {
+            // "If specified, this value must be set to a number from 0 to 259,200 (72
+            // hours)"; the restored cluster is Aurora MySQL, the engine backtracking is
+            // supported for, so no engine refusal belongs here.
+            if !crate::state::BACKTRACK_WINDOW_RANGE.contains(&window) {
+                return Err(RestoreDBClusterFromS3Error::invalid_parameter_value(format!(
+                    "invalid value {window} for BacktrackWindow: must be a value from {} to \
+                     {} seconds",
+                    crate::state::BACKTRACK_WINDOW_RANGE.start(),
+                    crate::state::BACKTRACK_WINDOW_RANGE.end()
+                )));
+            }
+        }
+        if let Some(network_type) = &input.network_type {
+            // "Valid Values: IPV4 DUAL".
+            if !crate::state::NETWORK_TYPES
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(network_type))
+            {
+                return Err(RestoreDBClusterFromS3Error::invalid_parameter_value(format!(
+                    "invalid value {network_type} for NetworkType: must be one of {}",
+                    crate::state::NETWORK_TYPES.join(" | ")
+                )));
+            }
+        }
+        if let Some(storage_type) = &input.storage_type {
+            // "Valid Values: aurora, aurora-iopt1" — the per-cluster-type value list
+            // [`crate::state::db_cluster_storage_types`] publishes, refused with the modelled
+            // fault for a storage type the engine cannot be given.
+            let published = crate::state::db_cluster_storage_types(&input.engine);
+            if !published
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(storage_type))
+            {
+                return Err(
+                    RestoreDBClusterFromS3ErrorModeled::StorageTypeNotSupportedFault(
+                        StorageTypeNotSupportedFault {
+                            message: Some(format!(
+                                "Invalid storage type {storage_type} for engine {}: must be \
+                                 one of {}",
+                                input.engine,
+                                published.join(" | ")
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        crate::state::check_engine_lifecycle_support(
+            input
+                .engine_lifecycle_support
+                .as_deref()
+                .unwrap_or(crate::state::DEFAULT_ENGINE_LIFECYCLE_SUPPORT),
+        )
+        .map_err(RestoreDBClusterFromS3Error::invalid_parameter_value)?;
+        // `TagSpecifications` assigns tags to "resources associated with the DB cluster", and
+        // the one resource type this member publishes for it is `cluster-auto-backup`, "the
+        // DB cluster's automated backup". This service holds no DB cluster automated backup
+        // as a resource of its own, so there is nothing here for those tags to be assigned
+        // TO, and claiming otherwise would report tags on a resource no read of this service
+        // answers for. The cluster's own tags are `Tags`, which this member is not.
+        let _ = &input.tag_specifications;
+
+        // THE BACKUP the restore reads: the location is a resource of ANOTHER service, so it
+        // is resolved where that service holds it. A bucket Amazon S3 holds nothing under,
+        // and a prefix holding no file at all
+        // all leave this call nothing to migrate, which is the modelled `InvalidS3BucketFault`
+        // — and an engine with no object store beside this service establishes nothing and
+        // refuses nothing. It is read AFTER every request-only refusal above, so a request
+        // whose parameters cannot hold together is answered without the bucket being touched.
+        if crate::state::ingestion_backup_is_absent(
+            &*self.engine,
+            &region,
+            &input.s3_bucket_name,
+            input.s3_prefix.as_deref(),
+        ) == Some(true)
+        {
+            return Err(RestoreDBClusterFromS3ErrorModeled::InvalidS3BucketFault(
+                InvalidS3BucketFault {
+                    message: Some(crate::state::invalid_ingestion_bucket_message()),
+                },
+            )
+            .into());
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated cluster.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        // `DBSubnetGroupName`: "If supplied, must match the name of an existing DBSubnetGroup",
+        // folded the way `CreateDBSubnetGroup` stores it and resolved in the store below.
+        // Where the request names none, the restored cluster is placed in the DB subnet group
+        // the real service provides alongside the account's VPC, exactly as a created cluster
+        // is.
+        let named_subnet_group_name = input
+            .db_subnet_group_name
+            .as_ref()
+            .map(|name| name.to_ascii_lowercase());
+        let db_subnet_group_name = Some(
+            named_subnet_group_name
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_DB_SUBNET_GROUP.to_string()),
+        );
+        let key = (region.clone(), identifier.clone());
+
+        // What this restore is REFUSED for in THIS service's state, decided under the store's
+        // guard — which is then released, because minting the master user's secret and
+        // opening the restored cluster's engine endpoint are awaited work.
+        let resolved = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+
+            // "The version number of the database engine to use", resolved against the
+            // catalogue `DescribeDBEngineVersions` publishes rather than echoed.
+            let resolved_version = crate::ops::describe_db_engine_versions::resolve_version(
+                &input.engine,
+                input.engine_version.as_deref(),
+            )
+            .map_err(RestoreDBClusterFromS3Error::invalid_parameter_combination)?;
+            // A scaling configuration is held to the capacity range the restored cluster's
+            // engine version publishes, else the one the service publishes overall: the rule
+            // `CreateDBCluster` creates one by and `ModifyDBCluster` rescales one by.
+            if let Some(asked) = &input.serverless_v2_scaling_configuration {
+                crate::state::check_serverless_v2_scaling(
+                    resolved_version.and_then(|entry| entry.profile.serverless_v2_scaling_range()),
+                    asked.min_capacity,
+                    asked.max_capacity,
+                    asked.seconds_until_auto_pause,
+                )
+                .map_err(|rejection| match rejection {
+                    crate::state::ServerlessV2Rejection::Value(message) => {
+                        RestoreDBClusterFromS3Error::invalid_parameter_value(message)
+                    }
+                    crate::state::ServerlessV2Rejection::Combination(message) => {
+                        RestoreDBClusterFromS3Error::invalid_parameter_combination(message)
+                    }
+                })?;
+            }
+            // Every resource the request REFERENCES by name is resolved before the cluster is
+            // inserted, and a name that resolves to nothing is that resource type's modelled
+            // not-found fault: a restore AWS would never have accepted must leave no cluster
+            // behind for a later call to find.
+            if let Some(name) = &named_subnet_group_name {
+                if store.resolve_db_subnet_group(&region, name).is_none() {
+                    return Err(
+                        RestoreDBClusterFromS3ErrorModeled::DBSubnetGroupNotFoundFault(
+                            DBSubnetGroupNotFoundFault {
+                                message: Some(
+                                    crate::state::db_subnet_group_does_not_exist_message(name),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+            // `DBClusterParameterGroupName`: "If supplied, must match the name of an existing
+            // DBClusterParameterGroup." The groups RDS provides itself are there without any
+            // request having created them, so a name of that form resolves even though this
+            // store holds no record of it.
+            if let Some(named) = &input.db_cluster_parameter_group_name {
+                if !store.db_cluster_parameter_group_exists(&region, named) {
+                    return Err(
+                        RestoreDBClusterFromS3ErrorModeled::DBClusterParameterGroupNotFoundFault(
+                            DBClusterParameterGroupNotFoundFault {
+                                message: Some(
+                                    crate::state::db_cluster_parameter_group_not_found_message(
+                                        named,
+                                    ),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+            // "The user already has a DB cluster with the given identifier": a restore onto
+            // an identifier this region holds would otherwise overwrite a live cluster.
+            if store.db_clusters.contains_key(&key) {
+                return Err(RestoreDBClusterFromS3ErrorModeled::DBClusterAlreadyExistsFault(
+                    DBClusterAlreadyExistsFault {
+                        message: Some(crate::state::DB_CLUSTER_ALREADY_EXISTS_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+            // The region's DB cluster quota, and the number of regions this store keeps
+            // records for at all: a restore adds a DB cluster, so it is bounded exactly as a
+            // create is, and the modelled fault says so.
+            if store.clusters_in(&region).len() >= crate::state::DB_CLUSTER_QUOTA_PER_REGION
+                || !store.has_room_for_region(&region)
+            {
+                return Err(RestoreDBClusterFromS3ErrorModeled::DBClusterQuotaExceededFault(
+                    DBClusterQuotaExceededFault {
+                        message: Some(format!(
+                            "the request would exceed the allowed number of DB clusters ({} \
+                             per region, in at most {} regions)",
+                            crate::state::DB_CLUSTER_QUOTA_PER_REGION,
+                            crate::state::MAX_REGIONS
+                        )),
+                    },
+                )
+                .into());
+            }
+            Resolved {
+                engine_version: match resolved_version {
+                    Some(entry) => Some(entry.engine_version.to_string()),
+                    // An engine the catalogue publishes no available version for: there is
+                    // nothing to resolve against, so what the request named stands.
+                    None => input.engine_version.clone(),
+                },
+                default_parameter_group: resolved_version.map(|entry| {
+                    crate::state::default_db_parameter_group_name(entry.parameter_group_family)
+                }),
+                default_ca_certificate: store.default_ca_certificate(&region).to_string(),
+                // The mint the restored cluster's own identities are drawn from, taken last
+                // so a restore this scope refused draws none.
+                mint: store.next_mint(),
+            }
+        };
+        let Resolved {
+            mint,
+            engine_version,
+            default_parameter_group,
+            default_ca_certificate,
+        } = resolved;
+
+        // `KmsKeyId`: "The Amazon Web Services KMS key identifier for an encrypted DB
+        // cluster", so the restored cluster is encrypted only under a key KMS ANSWERS for —
+        // resolved against this emulator's own KMS over the in-process callback, which cannot
+        // be done under the store's guard, and a key KMS will not encrypt under is the
+        // modelled `KMSKeyNotAccessibleFault`.
+        if let Some(key_id) = input.kms_key_id.as_deref() {
+            if crate::state::kms_key_is_inaccessible(ctx, &region, key_id).await {
+                return Err(RestoreDBClusterFromS3ErrorModeled::KMSKeyNotAccessibleFault(
+                    KMSKeyNotAccessibleFault {
+                        message: Some(crate::state::kms_key_not_accessible_message(key_id)),
+                    },
+                )
+                .into());
+            }
+        }
+        // "If the StorageEncrypted parameter is enabled, and you do not specify a value for
+        // the KmsKeyId parameter, then Amazon RDS will use your default KMS key": a cluster
+        // restored with encryption on and no key named carries the account's default key for
+        // this service, and naming a key encrypts the cluster too.
+        let storage_encrypted = input.kms_key_id.is_some() || input.storage_encrypted == Some(true);
+        let kms_key_id = crate::state::storage_encryption_key_id(
+            ctx,
+            &region,
+            input.kms_key_id.clone(),
+            storage_encrypted,
+        )
+        .await;
+        // "A list of EC2 VPC security groups to associate with the restored DB cluster" are
+        // Amazon EC2's resources, so each one the request names is resolved against EC2 over
+        // the in-process callback — also impossible under the store's guard — and a group the
+        // account does not hold is refused for the value it carried rather than stored as a
+        // membership nothing could resolve.
+        let unresolved =
+            crate::state::unresolved_vpc_security_groups(ctx, &region, &vpc_security_group_ids)
+                .await;
+        if let Some(group_id) = unresolved.first() {
+            return Err(RestoreDBClusterFromS3Error::invalid_parameter_value(
+                crate::state::invalid_security_group_message(group_id),
+            ));
+        }
+
+        let resource_id = crate::state::mint_db_cluster_resource_id(mint);
+        // The secret RDS manages for this cluster's master user password, for a request that
+        // asked it to: generated, stored in Secrets Manager and reported as
+        // `MasterUserSecret`. The store's guard is NOT held here.
+        let (master_user_secret, master_user_password) = if manage_master_user_password {
+            let minted = crate::state::mint_master_user_secret(
+                &*self.engine,
+                ctx,
+                &region,
+                &crate::state::MasterSecretRequest {
+                    name: &crate::state::cluster_master_user_secret_name(&resource_id),
+                    username: Some(input.master_username.as_str()),
+                    engine: &input.engine,
+                    owner: crate::state::ManagedSecretOwner::db_cluster(
+                        &crate::state::db_cluster_arn(&region, &identifier),
+                    ),
+                    kms_key_id: input.master_user_secret_kms_key_id.as_deref(),
+                },
+            )
+            .await
+            .map_err(RestoreDBClusterFromS3Error::internal_failure)?;
+            // The generated password is the master user's, so a login on this cluster's own
+            // engine endpoint is verified against it exactly as it is against a password the
+            // request carried: it is digested here, while both halves are in hand, and the
+            // password itself goes nowhere.
+            let digested = crate::state::data_plane::wire_session::MasterPasswordHash::new(
+                &input.master_username,
+                &minted.password,
+            );
+            (Some(minted.secret), Some(digested))
+        } else {
+            // The password the request carried, kept only as the digests a login can be
+            // verified against; `MasterUserPassword` itself is `@sensitive` and is never
+            // stored or reported.
+            let digested = input.master_user_password.as_deref().map(|password| {
+                crate::state::data_plane::wire_session::MasterPasswordHash::new(
+                    &input.master_username,
+                    password,
+                )
+            });
+            (None, digested)
+        };
+        // The ARN of the secret this call minted, if any, kept here so a conflict below can
+        // delete it once the record that carries it has moved into the store.
+        let master_user_secret_arn = master_user_secret
+            .as_ref()
+            .map(|secret| secret.secret_arn.clone());
+
+        let mut record = crate::state::DbClusterRecord {
+            identifier: identifier.clone(),
+            region: region.clone(),
+            // The restored cluster is a NEW resource: its own resource id and its own
+            // endpoint host.
+            resource_id: resource_id.clone(),
+            endpoint_host: crate::state::mint_endpoint_host(mint),
+            // Filled in below from the cluster's own engine listener.
+            served_endpoint: None,
+            served_reader_endpoint: None,
+            // A restored DB cluster is not usable the instant the call returns: RDS answers
+            // `creating` and the cluster reaches `available` on its own — "You can create DB
+            // instances only after the RestoreDBClusterFromS3 operation has completed and the
+            // DB cluster is available."
+            status: crate::state::DB_CLUSTER_STATUS_CREATING.to_string(),
+            pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                crate::state::DB_CLUSTER_STATUS_AVAILABLE,
+            )),
+            engine: input.engine.clone(),
+            engine_version,
+            // `EngineMode` is not a member of this operation, so the restored cluster runs in
+            // the mode a created one runs in without it.
+            engine_mode: crate::state::DEFAULT_DB_CLUSTER_ENGINE_MODE.to_string(),
+            // "The database name for the restored DB cluster."
+            database_name: input.database_name.clone(),
+            // "The name of the master user for the restored DB cluster", which this operation
+            // requires, and the secret RDS manages for its password when the request asked it
+            // to: those two are what a caller reads the cluster's master user credential from.
+            master_username: Some(input.master_username.clone()),
+            master_user_secret,
+            master_user_password,
+            // `Port`: "Default: 3306" — the engine's own default port.
+            port: input
+                .port
+                .unwrap_or_else(|| crate::state::default_port(&input.engine)),
+            // "A list of Availability Zones (AZs) where instances in the restored DB cluster
+            // can be created": the request's, else the zones RDS picks for a cluster nobody
+            // named any for.
+            availability_zones: if requested_availability_zones.is_empty() {
+                crate::state::region_availability_zones(&region)
+            } else {
+                requested_availability_zones
+            },
+            // `BackupRetentionPeriod`: "Default: 1".
+            backup_retention_period: input.backup_retention_period.unwrap_or(1),
+            preferred_backup_window: input
+                .preferred_backup_window
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_PREFERRED_BACKUP_WINDOW.to_string()),
+            // `PreferredMaintenanceWindow` is stored with its day names folded, the form the
+            // service reports it in whatever case the request used.
+            preferred_maintenance_window: input
+                .preferred_maintenance_window
+                .as_deref()
+                .map(crate::state::stored_maintenance_window)
+                .unwrap_or_else(|| {
+                    crate::state::DEFAULT_PREFERRED_MAINTENANCE_WINDOW.to_string()
+                }),
+            // "If this argument is omitted, the default parameter group for the engine version
+            // is used."
+            db_cluster_parameter_group_name: input
+                .db_cluster_parameter_group_name
+                .clone()
+                .or(default_parameter_group),
+            db_subnet_group_name,
+            option_group_name: input.option_group_name.clone(),
+            character_set_name: input.character_set_name.clone(),
+            vpc_security_group_ids,
+            storage_encrypted,
+            kms_key_id,
+            // "The storage type isn't returned when you set it to `aurora`" — the default of
+            // this cluster's engine — so only a storage type the cluster was really given,
+            // rather than the one its engine would have given it anyway, is stored.
+            storage_type: input.storage_type.clone().filter(|storage_type| {
+                crate::state::default_db_cluster_storage_type(&input.engine)
+                    .is_none_or(|default| !storage_type.eq_ignore_ascii_case(default))
+            }),
+            // `Iops`, `AllocatedStorage`, `DBClusterInstanceClass` and `PubliclyAccessible`
+            // are not members of this operation: an Aurora DB cluster has none of them of its
+            // own — its storage grows with its data and its members carry their own class.
+            iops: None,
+            allocated_storage: None,
+            db_cluster_instance_class: None,
+            publicly_accessible: None,
+            // `AutoMinorVersionUpgrade` is not a member of this operation either, so the
+            // restored cluster carries the control plane's own default, as a created cluster
+            // does.
+            auto_minor_version_upgrade: crate::state::DEFAULT_CLUSTER_AUTO_MINOR_VERSION_UPGRADE,
+            // `DeletionProtection` / `CopyTagsToSnapshot` /
+            // `EnableIAMDatabaseAuthentication` each turn something ON that the request asks
+            // for, so a cluster restored without them has it off: "By default, deletion
+            // protection isn't enabled", "The default is not to copy them", "By default,
+            // mapping isn't enabled".
+            deletion_protection: input.deletion_protection.unwrap_or(false),
+            copy_tags_to_snapshot: input.copy_tags_to_snapshot.unwrap_or(false),
+            // The RDS Data API endpoint is not a member of this operation, so a restored
+            // cluster serves none until `EnableHttpEndpoint` turns it on.
+            http_endpoint_enabled: false,
+            iam_database_authentication_enabled: input
+                .enable_iam_database_authentication
+                .unwrap_or(false),
+            // `BacktrackWindow`: "Default: 0" — backtracking disabled.
+            backtrack_window: input.backtrack_window.unwrap_or(0),
+            enabled_cloudwatch_logs_exports: cloudwatch_logs_exports,
+            // "The network type is determined by the DBSubnetGroup specified for the DB
+            // cluster": a cluster the request named none for gets the IPv4 network every DB
+            // subnet group supports.
+            network_type: Some(
+                input
+                    .network_type
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_NETWORK_TYPE.to_string()),
+            ),
+            // Enhanced Monitoring, Performance Insights and the database insights mode are
+            // not members of this operation, so the restored cluster carries what a created
+            // one carries without them.
+            monitoring_interval: crate::state::DEFAULT_MONITORING_INTERVAL,
+            monitoring_role_arn: None,
+            database_insights_mode: crate::state::DEFAULT_DATABASE_INSIGHTS_MODE.to_string(),
+            performance_insights_enabled: false,
+            performance_insights_kms_key_id: None,
+            performance_insights_retention_period: None,
+            serverless_v2_scaling: input.serverless_v2_scaling_configuration.as_ref().map(
+                |asked| ServerlessV2ScalingConfigurationInfo {
+                    min_capacity: asked.min_capacity,
+                    max_capacity: asked.max_capacity,
+                    seconds_until_auto_pause: asked.seconds_until_auto_pause,
+                },
+            ),
+            // The Aurora Serverless v1 scaling configuration is not a member of this
+            // operation, so the restored cluster carries none.
+            scaling_configuration: None,
+            // "A list of Amazon Web Services Identity and Access Management (IAM) roles to
+            // associate with the DB cluster when it's restored from Amazon S3": each is in
+            // place from the restore onwards, so each reports the `ACTIVE` status of an
+            // association that holds.
+            associated_roles: associated_roles
+                .into_iter()
+                .map(|role| DBClusterRole {
+                    role_arn: Some(role.role_arn),
+                    feature_name: role.feature_name,
+                    status: Some(crate::state::DB_CLUSTER_ROLE_STATUS_ACTIVE.to_string()),
+                })
+                .collect(),
+            domain: input.domain.clone(),
+            domain_iam_role_name: input.domain_iam_role_name.clone(),
+            // The points a cluster can be backtracked to are its own, kept once its storage
+            // exists; a cluster restored with backtracking off keeps none.
+            backtrack_points: Vec::new(),
+            // A restored cluster joins no global database and replicates nothing: it is a new
+            // cluster of the backup's data, and this operation names neither.
+            global_cluster_identifier: None,
+            replication_source_arn: None,
+            // The restored cluster is created under the CA that is the default for new
+            // launches in this region, which this operation publishes no member to override.
+            ca_certificate_identifier: default_ca_certificate,
+            engine_lifecycle_support: input
+                .engine_lifecycle_support
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_ENGINE_LIFECYCLE_SUPPORT.to_string()),
+            // `ClusterScalabilityType` and `DBSystemId` are not members of this operation, so
+            // the restored cluster carries what a created one carries without them.
+            cluster_scalability_type: crate::state::DEFAULT_CLUSTER_SCALABILITY_TYPE.to_string(),
+            db_system_id: None,
+            // Neither form of write forwarding is a member of this operation, so a restored
+            // cluster has both off.
+            local_write_forwarding_enabled: false,
+            global_write_forwarding_requested: false,
+            // Every cluster this operation creates is placed in the account's VPC and is
+            // reached inside it: it publishes no member that turns the VPC network interface
+            // off or puts an internet access gateway in front of the cluster.
+            vpc_networking_enabled: true,
+            internet_access_gateway_enabled: false,
+            // The restored cluster was created NOW.
+            cluster_create_time: crate::state::now_as_wire_timestamp(),
+            // Nothing has moved the writer of a cluster this call has just restored.
+            writer_identifier: None,
+            // "The tags to be assigned to the restored DB cluster."
+            tags: requested_tags,
+        };
+
+        // The restored cluster's own ENGINE ENDPOINT, opened with the state lock released,
+        // exactly as a create opens one: binding is asynchronous and the core owns the socket,
+        // the bind interface and the port. It is opened AFTER every refusal above has been
+        // answered — so nothing binds for a restore that was going to fail — and before the
+        // record is admitted to the store, so a cluster this service holds is one whose
+        // endpoint is already listening.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreDBClusterFromS3"))
+        // The cluster's storage starts EMPTY: the backup this restore reads is a Percona
+        // XtraBackup copy of another server's data files, which nothing in this emulator can
+        // decode, so no row is claimed for it. What the cluster reports is its own — the
+        // control plane's record and the endpoint a client can open a session on.
+        let endpoint = match crate::state::cluster_engine_wire(&record.engine) {
+            Some(wire) => Some(
+                crate::state::open_engine_endpoint(
+                    &*self.engine,
+                    &state,
+                    crate::state::EngineEndpointPlan {
+                        target: crate::state::SessionTarget::DbCluster {
+                            region: region.clone(),
+                            resource_id: record.resource_id.clone(),
+                        },
+                        wire,
+                        role: crate::state::EndpointRole::Writer,
+                        // A DB cluster publishes a READER endpoint beside its writer one, so
+                        // both are opened: see `open_engine_endpoint`.
+                        reader: true,
+                        storage: None,
+                    },
+                )
+                .await
+                .map_err(RestoreDBClusterFromS3Error::internal_failure)?,
+            ),
+            // An engine whose native wire this emulator does not speak: no listener is opened
+            // and the cluster keeps the DNS-form endpoint this service reports for it.
+            None => None,
+        };
+        record.served_endpoint = endpoint.as_ref().map(|endpoint| endpoint.endpoint.clone());
+        record.served_reader_endpoint =
+            endpoint.as_ref().and_then(|endpoint| endpoint.reader.clone());
+        if record.served_endpoint.is_none() {
+            record.served_endpoint = crate::state::api_plane_endpoint(&record.engine, ctx);
+        }
+
+        // Another request may have taken this identifier while this one was minting and
+        // binding, so the conflict is answered again here rather than overwriting a stored
+        // cluster. Deciding it and admitting the record happen under ONE guard, so no third
+        // request can take the identifier in between, and the state it is decided against is
+        // the state AFTER the transitions the clock has made due.
+        let created = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+            if store.db_clusters.contains_key(&key) {
+                None
+            } else {
+                let db_cluster = store.cluster_to_wire(&record);
+                let engine = record.engine.clone();
+                let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
+                    performance_insights_enabled: record.performance_insights_enabled,
+                    database_insights_mode: Some(record.database_insights_mode.clone()),
+                };
+                let cluster_arn = record.arn();
+                store.db_clusters.insert(key.clone(), record);
+                // The listener is the cluster's: the store holds it, so it stays open for as
+                // long as the cluster does and closes with it.
+                if let Some(endpoint) = endpoint {
+                    store.db_cluster_engine_endpoints.insert(key, endpoint);
+                }
+                // A DB cluster came to exist, so the region's event log records it: the
+                // restore is how this one came to be, and `DescribeEvents` reports that entry
+                // for it from now on.
+                store.record_event(
+                    &region,
+                    crate::state::events::DB_CLUSTER_CREATED,
+                    &identifier,
+                    cluster_arn,
+                );
+                // The id just minted is recorded in the SHARED data-source directory, exactly
+                // as `CreateDBCluster` records one, so a service that monitors this cluster
+                // can tell that THIS service owns the id. The RDS store is already locked here
+                // and the directory is taken second, the order its doc fixes.
+                if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
+                    let mut directory = directory.lock();
+                    directory.register(
+                        &resource_id,
+                        ::service_common::db_data_sources::SERVICE_TYPE_RDS,
+                        &engine,
+                    );
+                    directory.record_monitoring(&resource_id, monitoring);
+                }
+                Some(db_cluster)
+            }
+        };
+        let Some(db_cluster) = created else {
+            if let Some(secret) = &master_user_secret_arn {
+                crate::state::release_orphaned_master_user_secret(
+                    &*self.engine,
+                    ctx,
+                    &region,
+                    &crate::state::db_cluster_arn(&region, &identifier),
+                    secret,
+                )
+                .await;
+            }
+            return Err(RestoreDBClusterFromS3ErrorModeled::DBClusterAlreadyExistsFault(
+                DBClusterAlreadyExistsFault {
+                    message: Some(crate::state::DB_CLUSTER_ALREADY_EXISTS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(RestoreDBClusterFromS3Output {
+            db_cluster: Some(db_cluster),
+        })
     }
+}
+
+/// What the store's guard answered for one restore: the values the record below is built from,
+/// each read under that guard and used once it is released.
+struct Resolved {
+    /// `EngineVersion`, resolved against the catalogue of available versions.
+    engine_version: Option<String>,
+    /// The default DB cluster parameter group of the resolved version's family, for a request
+    /// that named no group of its own.
+    default_parameter_group: Option<String>,
+    /// The CA certificate new launches in this region are created under.
+    default_ca_certificate: String,
+    /// The mint the restored cluster's own identities are drawn from.
+    mint: u64,
 }

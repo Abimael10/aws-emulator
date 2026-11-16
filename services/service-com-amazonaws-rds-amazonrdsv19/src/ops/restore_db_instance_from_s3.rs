@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreDBInstanceFromS3
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreDBInstanceFromS3`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation creates a DB instance from the data of a database backed up
+//! into an Amazon S3 bucket — it records the instance `DescribeDBInstances` then reports,
+//! with its own engine endpoint — and is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreDBInstanceFromS3::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -361,18 +358,673 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreDBInstanceFromS3` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreDBInstanceFromS3ErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region = crate::state::request_region(ctx)
+            .map_err(RestoreDBInstanceFromS3Error::validation)?;
+
+        // THE ENGINE PAIR, decided from the REQUEST alone and therefore before the bucket is
+        // read: this operation restores a DB instance from a database backed up into Amazon
+        // S3, so the instance it creates is of the one engine `Engine` publishes and the
+        // backup it reads is of the one engine and the versions `SourceEngine` and
+        // `SourceEngineVersion` publish. A request naming any other triple asks for a
+        // migration this operation does not perform — the parameters cannot hold together,
+        // which is what this Query API answers `InvalidParameterCombination`. It is the one
+        // rule both restore-from-Amazon-S3 operations are accepted against
+        // ([`crate::state::S3RestorePair`]), applied here with THIS operation's published
+        // pair.
+        if let Some(refusal) = crate::state::S3_RESTORE_INSTANCE.refusal(
+            &input.engine,
+            &input.source_engine,
+            &input.source_engine_version,
+        ) {
+            return Err(RestoreDBInstanceFromS3Error::invalid_parameter_combination(
+                refusal,
+            ));
+        }
+
+        // "This parameter isn't case-sensitive", so the folded form is what is stored and
+        // echoed, exactly as `CreateDBInstance` stores it, and every later lookup folds the
+        // same way.
+        crate::state::check_identifier("DBInstanceIdentifier", &input.db_instance_identifier, 63)
+            .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
+        let identifier = input.db_instance_identifier.to_ascii_lowercase();
+        crate::state::check_db_instance_class(&input.db_instance_class)
+            .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
+
+        // Every stored list and every stored free-form value is BOUNDED before anything is
+        // resolved or stored, under the same caps `CreateDBInstance` writes an instance under.
+        let tags = input.tags.clone().unwrap_or_default();
+        crate::state::check_tags(&tags)
+            .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
+        let vpc_security_group_ids = input.vpc_security_group_ids.clone().unwrap_or_default();
+        crate::state::check_security_group_memberships(
+            "VpcSecurityGroupIds",
+            &vpc_security_group_ids,
+        )
+        .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
+        let db_security_group_names = input.db_security_groups.clone().unwrap_or_default();
+        crate::state::check_security_group_memberships(
+            "DBSecurityGroups",
+            &db_security_group_names,
+        )
+        .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
+        crate::state::check_stored_text(
+            "S3IngestionRoleArn",
+            &input.s3_ingestion_role_arn,
+            crate::state::MAX_IAM_ROLE_ARN_LEN,
+        )
+        .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
+        for (member, value) in [
+            ("AvailabilityZone", input.availability_zone.as_deref()),
+            ("DBName", input.db_name.as_deref()),
+            ("DBParameterGroupName", input.db_parameter_group_name.as_deref()),
+            ("DBSubnetGroupName", input.db_subnet_group_name.as_deref()),
+            ("LicenseModel", input.license_model.as_deref()),
+            ("OptionGroupName", input.option_group_name.as_deref()),
+            ("PreferredBackupWindow", input.preferred_backup_window.as_deref()),
+            ("S3BucketName", Some(input.s3_bucket_name.as_str())),
+            ("S3Prefix", input.s3_prefix.as_deref()),
+            ("SourceEngineVersion", Some(input.source_engine_version.as_str())),
+        ] {
+            if let Some(value) = value {
+                crate::state::check_free_form(member, value)
+                    .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
+            }
+        }
+
+        // The documented constraints of the remaining values, each refused with the Query API
+        // error code the real service answers it with — never with a 501.
+        if let Some(username) = &input.master_username {
+            crate::state::check_master_username(username)
+                .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
+        }
+        if let Some(password) = &input.master_user_password {
+            crate::state::check_supplied_master_user_password(&input.engine, password)
+                .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
+        }
+        let manage_master_user_password = input.manage_master_user_password == Some(true);
+        if manage_master_user_password && input.master_user_password.is_some() {
+            return Err(RestoreDBInstanceFromS3Error::invalid_parameter_value(
+                crate::state::manage_master_user_password_conflict_message("MasterUserPassword"),
+            ));
+        }
+        if !manage_master_user_password && input.master_user_secret_kms_key_id.is_some() {
+            return Err(RestoreDBInstanceFromS3Error::invalid_parameter_combination(
+                crate::state::master_user_secret_kms_key_without_management_message(
+                    "ManageMasterUserPassword",
+                ),
+            ));
+        }
+        // "AvailabilityZone … can't be specified if the MultiAZ parameter is enabled": a
+        // Multi-AZ deployment spans zones, so it is placed in none of them by name.
+        if input.multi_az == Some(true) && input.availability_zone.is_some() {
+            return Err(RestoreDBInstanceFromS3Error::invalid_parameter_combination(
+                "AvailabilityZone can't be specified when MultiAZ is enabled",
+            ));
+        }
+        if let Some(port) = input.port {
+            if !crate::state::PORT_RANGE.contains(&port) {
+                return Err(RestoreDBInstanceFromS3Error::invalid_parameter_value(format!(
+                    "invalid value {port} for Port: must be a value from {} to {}",
+                    crate::state::PORT_RANGE.start(),
+                    crate::state::PORT_RANGE.end()
+                )));
+            }
+        }
+        if let Some(period) = input.backup_retention_period {
+            crate::state::check_backup_retention_period(
+                period,
+                &crate::state::BACKUP_RETENTION_RANGE,
+            )
+            .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
+        }
+        if let Some(period) = input.performance_insights_retention_period {
+            crate::state::check_performance_insights_retention_period(period)
+                .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
+        }
+        if let Some(network_type) = &input.network_type {
+            if !crate::state::NETWORK_TYPES
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(network_type))
+            {
+                return Err(RestoreDBInstanceFromS3Error::invalid_parameter_value(format!(
+                    "invalid value {network_type} for NetworkType: must be one of {}",
+                    crate::state::NETWORK_TYPES.join(" | ")
+                )));
+            }
+        }
+        crate::state::check_engine_lifecycle_support(
+            input
+                .engine_lifecycle_support
+                .as_deref()
+                .unwrap_or(crate::state::DEFAULT_ENGINE_LIFECYCLE_SUPPORT),
+        )
+        .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
+        // `ProcessorFeatures` / `UseDefaultProcessorFeatures` configure the CPU cores and
+        // threads of a DB instance class that publishes them, `AdditionalStorageVolumes` adds
+        // volumes beside the instance's own storage, `EnableCloudwatchLogsExports` names the
+        // engine logs published to CloudWatch Logs and `TagSpecifications` tags "resources
+        // associated with the DB instance". This service holds none of those as state of a DB
+        // instance — no read of it answers for any of them — so claiming otherwise would
+        // report a configuration nothing stands behind.
+        let _ = (
+            &input.processor_features,
+            &input.use_default_processor_features,
+            &input.additional_storage_volumes,
+            &input.enable_cloudwatch_logs_exports,
+            &input.tag_specifications,
+        );
+
+        // THE BACKUP the restore reads: the location is a resource of ANOTHER service, so it
+        // is resolved where that service holds it. A bucket Amazon S3 holds nothing under, one
+        // it holds outside this Region, and a prefix holding no file at all
+        // leave this call nothing to migrate, which is the modelled `InvalidS3BucketFault` —
+        // and an engine with no object store beside this service establishes nothing and
+        // refuses nothing. It is read AFTER every request-only refusal above, so a request
+        // whose parameters cannot hold together is answered without the bucket being touched.
+        if crate::state::ingestion_backup_is_absent(
+            &*self.engine,
+            &region,
+            &input.s3_bucket_name,
+            input.s3_prefix.as_deref(),
+        ) == Some(true)
+        {
+            return Err(RestoreDBInstanceFromS3ErrorModeled::InvalidS3BucketFault(
+                InvalidS3BucketFault {
+                    message: Some(crate::state::invalid_ingestion_bucket_message()),
+                },
+            )
+            .into());
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated instance.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        // The key the restored instance is stored under, in both the record map and the engine
+        // endpoint map, so the two always name the same instance.
+        let key = (region.clone(), identifier.clone());
+
+        // Everything this restore decides from the STORE is decided here, under the state
+        // lock, and the lock is released at the end of this block: the engine endpoint below
+        // is opened asynchronously, and a state guard cannot be held across an await.
+        let mut record = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+
+            // "The version number of the database engine to use", resolved against the
+            // catalogue `DescribeDBEngineVersions` publishes rather than echoed.
+            let resolved_version = crate::ops::describe_db_engine_versions::resolve_version(
+                &input.engine,
+                input.engine_version.as_deref(),
+            )
+            .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_combination)?;
+            let engine_version = match resolved_version {
+                Some(entry) => Some(entry.engine_version.to_string()),
+                // An engine the catalogue publishes no available version for: there is
+                // nothing to resolve against, so what the request named stands.
+                None => input.engine_version.clone(),
+            };
+
+            // Every resource this request REFERENCES by name is resolved in the store before
+            // the instance is inserted, and a name that resolves to nothing is that resource
+            // type's modelled not-found fault — the same resolution `CreateDBInstance` does,
+            // because the restored resource IS a DB instance.
+            let db_subnet_group_name = input
+                .db_subnet_group_name
+                .as_ref()
+                .map(|name| name.to_ascii_lowercase());
+            if let Some(name) = &db_subnet_group_name {
+                if store.resolve_db_subnet_group(&region, name).is_none() {
+                    return Err(
+                        RestoreDBInstanceFromS3ErrorModeled::DBSubnetGroupNotFoundFault(
+                            DBSubnetGroupNotFoundFault {
+                                message: Some(
+                                    crate::state::db_subnet_group_not_found_for_db_instance_message(
+                                        name,
+                                    ),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+            if let Some(named) = &input.db_parameter_group_name {
+                if !store.db_parameter_group_exists(&region, named) {
+                    return Err(
+                        RestoreDBInstanceFromS3ErrorModeled::DBParameterGroupNotFoundFault(
+                            DBParameterGroupNotFoundFault {
+                                message: Some(
+                                    crate::state::db_parameter_group_not_found_message(named),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+            // "RDS doesn't allow two DB instances with the same name": an identifier the
+            // region already holds is the modelled conflict.
+            if store.db_instances.contains_key(&key) {
+                return Err(
+                    RestoreDBInstanceFromS3ErrorModeled::DBInstanceAlreadyExistsFault(
+                        DBInstanceAlreadyExistsFault {
+                            message: Some(
+                                crate::state::DB_INSTANCE_ALREADY_EXISTS_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // The region's DB instance quota, and the number of regions this store keeps
+            // records for at all: a restore adds a DB instance, so it is bounded exactly as a
+            // create is, and the modelled fault says so.
+            if store.instances_in(&region).len() >= crate::state::DB_INSTANCE_QUOTA_PER_REGION
+                || !store.has_room_for_region(&region)
+            {
+                return Err(
+                    RestoreDBInstanceFromS3ErrorModeled::InstanceQuotaExceededFault(
+                        InstanceQuotaExceededFault {
+                            message: Some(format!(
+                                "the request would exceed the allowed number of DB instances \
+                                 ({} per region, in at most {} regions)",
+                                crate::state::DB_INSTANCE_QUOTA_PER_REGION,
+                                crate::state::MAX_REGIONS
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            let mint = store.next_mint();
+            let storage_type = input.storage_type.clone().unwrap_or_else(|| {
+                crate::state::default_storage_type(input.iops).to_string()
+            });
+            let db_parameter_group_name = input.db_parameter_group_name.clone().or_else(|| {
+                resolved_version.map(|entry| {
+                    crate::state::default_db_parameter_group_name(entry.parameter_group_family)
+                })
+            });
+            let option_group_name = input.option_group_name.clone().or_else(|| {
+                resolved_version.map(|entry| {
+                    crate::state::default_option_group_name(
+                        &input.engine,
+                        entry.major_engine_version,
+                    )
+                })
+            });
+            let mut record = crate::state::DbInstanceRecord {
+                identifier: identifier.clone(),
+                region: region.clone(),
+                // A restored instance replicates nothing: it is a new instance of the
+                // backup's data, not a replica of the server it was taken from, and no member
+                // of this operation names a DB cluster to replicate either.
+                read_replica_source_db_instance_identifier: None,
+                read_replica_source_db_cluster_identifier: None,
+                read_replica_db_instance_identifiers: Vec::new(),
+                // The restored instance is a NEW resource: its own resource id and its own
+                // endpoint host.
+                dbi_resource_id: crate::state::mint_dbi_resource_id(mint),
+                endpoint_host: crate::state::mint_endpoint_host(mint),
+                db_instance_class: input.db_instance_class.clone(),
+                engine: input.engine.clone(),
+                engine_version,
+                // A restored DB instance is not usable the instant the call returns: RDS
+                // answers `creating` and the instance reaches `available` on its own.
+                status: crate::state::DB_INSTANCE_STATUS_CREATING.to_string(),
+                pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                    crate::state::DB_INSTANCE_STATUS_AVAILABLE,
+                )),
+                // "The name of the database to create when the DB instance is created."
+                db_name: input.db_name.clone(),
+                allocated_storage: input.allocated_storage,
+                max_allocated_storage: input.max_allocated_storage,
+                // `MasterUserPassword` is `@sensitive` and RDS reports no member carrying it,
+                // so what the record keeps is the DIGESTS a login on the instance's own
+                // engine endpoint is verified against. A managed password is minted once this
+                // scope has released the store's guard, so a record built here carries none.
+                master_user_password: match (
+                    input.master_username.as_deref(),
+                    input.master_user_password.as_deref(),
+                ) {
+                    (Some(username), Some(password)) => Some(
+                        crate::state::data_plane::wire_session::MasterPasswordHash::new(
+                            username, password,
+                        ),
+                    ),
+                    _ => None,
+                },
+                master_username: input.master_username.clone(),
+                master_user_secret: None,
+                // `Port`: the port the engine's own default gives the instance where the
+                // request names none.
+                endpoint_port: input
+                    .port
+                    .unwrap_or_else(|| crate::state::default_port(&input.engine)),
+                // Filled in below, once the core has assigned the engine listener its port.
+                served_endpoint: None,
+                // "By default, the new DB instance is created as a Single-AZ deployment."
+                multi_az: input.multi_az.unwrap_or(false),
+                storage_throughput: input
+                    .storage_throughput
+                    .unwrap_or_else(|| crate::state::default_storage_throughput(&storage_type)),
+                storage_type,
+                // `StorageEncrypted`: "By default, it isn't encrypted." The key is resolved
+                // once this scope has released the store's guard, below.
+                storage_encrypted: input.storage_encrypted.unwrap_or(false),
+                kms_key_id: input.kms_key_id.clone(),
+                iops: input.iops,
+                license_model: input.license_model.clone().or_else(|| {
+                    crate::state::default_license_model(&input.engine).map(str::to_string)
+                }),
+                // "Default: A random, system-chosen Availability Zone"; this emulator picks
+                // the region's first zone, stores it, and reports it from the store.
+                availability_zone: input
+                    .availability_zone
+                    .clone()
+                    .unwrap_or_else(|| format!("{region}a")),
+                // `BackupRetentionPeriod`: "Default: 1".
+                backup_retention_period: input.backup_retention_period.unwrap_or(1),
+                preferred_backup_window: Some(
+                    input.preferred_backup_window.clone().unwrap_or_else(|| {
+                        crate::state::DEFAULT_PREFERRED_BACKUP_WINDOW.to_string()
+                    }),
+                ),
+                // `PreferredMaintenanceWindow` is stored with its day names folded, the form
+                // the service reports it in whatever case the request used.
+                preferred_maintenance_window: Some(
+                    input
+                        .preferred_maintenance_window
+                        .as_deref()
+                        .map(crate::state::stored_maintenance_window)
+                        .unwrap_or_else(|| {
+                            crate::state::DEFAULT_PREFERRED_MAINTENANCE_WINDOW.to_string()
+                        }),
+                ),
+                publicly_accessible: input.publicly_accessible.unwrap_or_else(|| {
+                    crate::state::default_publicly_accessible(
+                        &input.engine,
+                        db_subnet_group_name.as_deref(),
+                    )
+                }),
+                // `AutoMinorVersionUpgrade`: "By default, minor engine upgrades are applied
+                // automatically."
+                auto_minor_version_upgrade: input.auto_minor_version_upgrade.unwrap_or(true),
+                // `CopyTagsToSnapshot` / `DeletionProtection` /
+                // `EnableIAMDatabaseAuthentication` / `EnablePerformanceInsights` /
+                // `DedicatedLogVolume` each turn something ON that the request asks for, so an
+                // instance restored without them has it off.
+                copy_tags_to_snapshot: input.copy_tags_to_snapshot.unwrap_or(false),
+                deletion_protection: input.deletion_protection.unwrap_or(false),
+                db_subnet_group_name,
+                db_parameter_group_name,
+                option_group_name,
+                vpc_security_group_ids: vpc_security_group_ids.clone(),
+                db_security_group_names: db_security_group_names.clone(),
+                // A restored DB instance is a standalone instance: it joins no DB cluster,
+                // which this operation has no member to name either.
+                db_cluster_identifier: None,
+                // `Domain` is not a member of this operation, so the restored instance joins
+                // no Active Directory domain.
+                domain: None,
+                ca_certificate_identifier: input
+                    .ca_certificate_identifier
+                    .clone()
+                    .unwrap_or_else(|| store.default_ca_certificate(&region).to_string()),
+                // `MonitoringInterval`: "Default: 0" — Enhanced Monitoring off.
+                monitoring_interval: input
+                    .monitoring_interval
+                    .unwrap_or(crate::state::DEFAULT_MONITORING_INTERVAL),
+                performance_insights_enabled: input.enable_performance_insights.unwrap_or(false),
+                performance_insights_kms_key_id: input.performance_insights_kms_key_id.clone(),
+                // The period Performance Insights data is retained for: the documented
+                // default for an instance that collects it and named no period, and nothing
+                // at all for one that collects none, which retains none.
+                performance_insights_retention_period: input
+                    .enable_performance_insights
+                    .unwrap_or(false)
+                    .then(|| {
+                        input.performance_insights_retention_period.unwrap_or(
+                            crate::state::DEFAULT_PERFORMANCE_INSIGHTS_RETENTION_PERIOD,
+                        )
+                    }),
+                iam_database_authentication_enabled: input
+                    .enable_iam_database_authentication
+                    .unwrap_or(false),
+                database_insights_mode: input
+                    .database_insights_mode
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_DATABASE_INSIGHTS_MODE.to_string()),
+                dedicated_log_volume: input.dedicated_log_volume.unwrap_or(false),
+                // `EnableCustomerOwnedIp` is not a member of this operation, so the restored
+                // instance has the setting off.
+                customer_owned_ip_enabled: false,
+                network_type: input
+                    .network_type
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_NETWORK_TYPE.to_string()),
+                // `BackupTarget` is not a member of this operation either: "The default is
+                // region."
+                backup_target: crate::state::DEFAULT_BACKUP_TARGET.to_string(),
+                engine_lifecycle_support: input
+                    .engine_lifecycle_support
+                    .clone()
+                    .unwrap_or_else(|| {
+                        crate::state::DEFAULT_ENGINE_LIFECYCLE_SUPPORT.to_string()
+                    }),
+                // The restored instance was created NOW, and its engine's first run starts
+                // with it, the same as a create's.
+                instance_create_time: crate::state::now_as_wire_timestamp(),
+                engine_started_at: crate::state::now_as_wire_timestamp(),
+                tags: tags.clone(),
+                // This operation publishes no `AssociatedRoles` member, so the restored
+                // instance starts with none: each association is made against the instance
+                // that carries it.
+                associated_roles: Vec::new(),
+                // A restored instance has nothing staged for its maintenance window: a
+                // deferred modification belongs to the instance it was staged on.
+                deferred_modification: None,
+                engine_log: crate::state::InstanceLog::default(),
+            };
+            record.engine_log.record(format!(
+                "DB instance {} restored from the Amazon S3 bucket {}; status {}",
+                record.identifier, input.s3_bucket_name, record.status
+            ));
+            record
+        };
+
+        // `KmsKeyId`: the storage is encrypted only under a key KMS ANSWERS for — resolved
+        // against this emulator's own KMS over the in-process callback, which cannot be done
+        // under the store's guard, and a key KMS will not encrypt under is the modelled
+        // `KMSKeyNotAccessibleFault`.
+        if let Some(key_id) = record.kms_key_id.as_deref() {
+            if crate::state::kms_key_is_inaccessible(ctx, &region, key_id).await {
+                return Err(
+                    RestoreDBInstanceFromS3ErrorModeled::KMSKeyNotAccessibleFault(
+                        KMSKeyNotAccessibleFault {
+                            message: Some(crate::state::kms_key_not_accessible_message(key_id)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        // "If StorageEncrypted is enabled, and you do not specify a value for the KmsKeyId
+        // parameter, then Amazon RDS uses your default KMS key": an instance encrypted with no
+        // key named carries the account's default key for this service, never nothing.
+        record.storage_encrypted = record.storage_encrypted || record.kms_key_id.is_some();
+        record.kms_key_id = crate::state::storage_encryption_key_id(
+            ctx,
+            &region,
+            record.kms_key_id.clone(),
+            record.storage_encrypted,
+        )
+        .await;
+        // The VPC security groups the request names are Amazon EC2's resources, so each is
+        // resolved against EC2 over the in-process callback — also impossible under the
+        // store's guard — and a group the account does not hold is refused for the value it
+        // carried rather than stored as a membership nothing could resolve.
+        let unresolved =
+            crate::state::unresolved_vpc_security_groups(ctx, &region, &vpc_security_group_ids)
+                .await;
+        if let Some(group_id) = unresolved.first() {
+            return Err(RestoreDBInstanceFromS3Error::invalid_parameter_value(
+                crate::state::invalid_security_group_message(group_id),
+            ));
+        }
+
+        // The restored instance's own ENGINE ENDPOINT, opened with the state lock released,
+        // exactly as a create opens one: binding is asynchronous and the core owns the socket,
+        // the bind interface and the port. It is opened AFTER every refusal above has been
+        // answered — so nothing binds for a restore that was going to fail — and before the
+        // record is admitted to the store.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreDBInstanceFromS3"))
+        // The instance's storage starts EMPTY: the backup this restore reads is a Percona
+        // XtraBackup copy of another server's data files, which nothing in this emulator can
+        // decode, so no row is claimed for it. What the instance reports is its own — the
+        // control plane's record and the endpoint a client can open a session on.
+        let endpoint = match crate::state::engine_wire(&record.engine) {
+            Some(wire) => Some(
+                crate::state::open_engine_endpoint(
+                    &*self.engine,
+                    &state,
+                    crate::state::EngineEndpointPlan {
+                        target: crate::state::SessionTarget::DbInstance {
+                            region: region.clone(),
+                            resource_id: record.dbi_resource_id.clone(),
+                        },
+                        wire,
+                        role: crate::state::EndpointRole::Writer,
+                        // A DB instance publishes ONE address, its own `Endpoint`.
+                        reader: false,
+                        storage: None,
+                    },
+                )
+                .await
+                .map_err(RestoreDBInstanceFromS3Error::internal_failure)?,
+            ),
+            // An engine whose native wire this emulator does not speak: no listener is opened
+            // and the instance keeps the DNS-form endpoint this service reports for it.
+            None => None,
+        };
+        record.served_endpoint = endpoint.as_ref().map(|endpoint| endpoint.endpoint.clone());
+        // `ManageMasterUserPassword` has RDS "generate and manage the master user password
+        // with Amazon Web Services Secrets Manager" for the instance this call creates, and
+        // report the secret it created as `MasterUserSecret`. Minted with the store's guard
+        // released and after every refusal has been answered, exactly as `CreateDBInstance`
+        // mints one.
+        if manage_master_user_password {
+            let minted = crate::state::mint_master_user_secret(
+                &*self.engine,
+                ctx,
+                &region,
+                &crate::state::MasterSecretRequest {
+                    name: &crate::state::instance_master_user_secret_name(
+                        &record.dbi_resource_id,
+                    ),
+                    username: record.master_username.as_deref(),
+                    engine: &record.engine,
+                    owner: crate::state::ManagedSecretOwner::db_instance(
+                        &crate::state::db_instance_arn(&region, &record.identifier),
+                    ),
+                    kms_key_id: input.master_user_secret_kms_key_id.as_deref(),
+                },
+            )
+            .await
+            .map_err(RestoreDBInstanceFromS3Error::internal_failure)?;
+            record.master_user_password = record.master_username.as_deref().map(|username| {
+                crate::state::data_plane::wire_session::MasterPasswordHash::new(
+                    username,
+                    &minted.password,
+                )
+            });
+            record.master_user_secret = Some(minted.secret);
+        }
+
+        // Another request may have created this identifier while this one was binding, so the
+        // conflict is answered again here rather than overwriting a stored instance. Deciding
+        // it and admitting the record happen under ONE guard, so no third request can take the
+        // identifier in between, and the state it is decided against is the state AFTER the
+        // transitions the clock has made due. A secret minted for an instance this scope
+        // refuses is deleted below rather than left behind.
+        let dbi_resource_id = record.dbi_resource_id.clone();
+        let engine = record.engine.clone();
+        let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
+            performance_insights_enabled: record.performance_insights_enabled,
+            database_insights_mode: Some(record.database_insights_mode.clone()),
+        };
+        let minted_secret_arn = record
+            .master_user_secret
+            .as_ref()
+            .map(|secret| secret.secret_arn.clone());
+        let created = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+            if store.db_instances.contains_key(&key) {
+                None
+            } else {
+                let db_instance = store.instance_to_wire(&record);
+                let instance_arn = record.arn();
+                store.db_instances.insert(key.clone(), record);
+                // The listener is the instance's: the store holds it, so it stays open for as
+                // long as the instance does and closes with it.
+                if let Some(endpoint) = endpoint {
+                    store.db_engine_endpoints.insert(key, endpoint);
+                }
+                // A DB instance came to exist, so the region's event log records it: the
+                // restore is how this one came to be, and `DescribeEvents` reports that entry
+                // for it from now on.
+                store.record_event(
+                    &region,
+                    crate::state::events::DB_INSTANCE_CREATED,
+                    &identifier,
+                    instance_arn,
+                );
+                // The id just minted is recorded in the SHARED data-source directory, exactly
+                // as `CreateDBInstance` records one, so a service that monitors this instance
+                // can tell that THIS service owns the id. The RDS store is already locked here
+                // and the directory is taken second, the order its doc fixes.
+                if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
+                    let mut directory = directory.lock();
+                    directory.register(
+                        &dbi_resource_id,
+                        ::service_common::db_data_sources::SERVICE_TYPE_RDS,
+                        &engine,
+                    );
+                    directory.record_monitoring(&dbi_resource_id, monitoring);
+                }
+                Some(db_instance)
+            }
+        };
+        let Some(db_instance) = created else {
+            if let Some(secret_arn) = &minted_secret_arn {
+                crate::state::release_orphaned_master_user_secret(
+                    &*self.engine,
+                    ctx,
+                    &region,
+                    &crate::state::db_instance_arn(&region, &identifier),
+                    secret_arn,
+                )
+                .await;
+            }
+            return Err(
+                RestoreDBInstanceFromS3ErrorModeled::DBInstanceAlreadyExistsFault(
+                    DBInstanceAlreadyExistsFault {
+                        message: Some(
+                            crate::state::DB_INSTANCE_ALREADY_EXISTS_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(RestoreDBInstanceFromS3Output {
+            db_instance: Some(db_instance),
+        })
     }
 }
