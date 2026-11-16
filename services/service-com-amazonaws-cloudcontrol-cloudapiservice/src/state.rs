@@ -29,6 +29,7 @@
 //! resource can live.
 
 pub mod native;
+pub mod owning_api;
 mod primary_identifiers;
 mod request_listing;
 
@@ -286,6 +287,14 @@ pub enum ResourceEffect {
         /// Region the resource is removed from.
         region: String,
     },
+    /// Follow the lifecycle the OWNING service reports for the resource this request has
+    /// already handed to it, through that service's own API ([`owning_api`]): the request
+    /// stays `IN_PROGRESS` while that service reports the resource still changing, and
+    /// reaches its terminal status when that service's own lifecycle does.
+    Awaiting {
+        /// The Region the resource is being created, patched or removed in.
+        region: String,
+    },
 }
 
 /// The work a request owes, and the instant it falls due.
@@ -528,15 +537,20 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
     ///
     /// Every operation of this service calls this before it reads anything, so no two of
     /// them can disagree about which requests have completed or which resources exist.
+    ///
+    /// A request whose owed work is a CALL on an owning service's own API is not settled
+    /// here: that work is asynchronous, so it is carried out before this store is locked
+    /// ([`owning_api::settle`]), which every operation of this service calls just as it
+    /// calls this.
     pub fn materialise_due(&mut self, now: SystemTime, native: &NativeResources) {
         let due: Vec<String> = self
             .requests
             .iter()
             .filter(|(_, record)| {
-                record
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.due <= now)
+                record.pending.as_ref().is_some_and(|pending| {
+                    pending.due <= now
+                        && !owning_api::owed_elsewhere(&record.type_name, pending.effect.as_ref())
+                })
             })
             .map(|(token, _)| token.clone())
             .collect();
@@ -604,6 +618,7 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
                     .delete(&region, &identifier, now)
                     .map(|()| None)
                     .map_err(EffectFailure::from),
+                ResourceEffect::Awaiting { .. } => Ok(record.resource_model.clone()),
             };
         }
         let key = ResourceKey::new(&record.type_name, &identifier);
@@ -659,6 +674,13 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
                     .ok_or(EffectFailure::ResourceGone)?;
                 Ok(None)
             }
+            // The work of a request that is following an OWNING service's own lifecycle is
+            // that service's, and is never applied to a store: such a request is settled
+            // before this store is locked ([`owning_api::settle`]), and this pass skips it
+            // ([`Self::materialise_due`]). Reached only if a type stopped being one that
+            // service answers for while a request of it was in flight, where the honest
+            // answer is the model the record already carries: nothing was written anywhere.
+            ResourceEffect::Awaiting { .. } => Ok(record.resource_model.clone()),
         }
     }
 
@@ -2035,6 +2057,7 @@ const PROPERTY_POINTER_PREFIX: &str = "/properties/";
 /// cannot change while the resource stays the same resource. That is what
 /// [`create_only_properties`] adds for every type, catalogued or not.
 const CREATE_ONLY_PROPERTIES: &[(&str, &[&str])] = &[
+    ("AWS::CloudFormation::Stack", &["StackName"]),
     ("AWS::CloudWatch::Alarm", &["AlarmName"]),
     ("AWS::DynamoDB::Table", &["TableName", "KeySchema"]),
     ("AWS::EC2::VPC", &["CidrBlock", "Ipv4IpamPoolId"]),
@@ -2095,6 +2118,7 @@ pub fn not_updatable_message(properties: &[&str]) -> String {
 /// A read-only property is one the OWNING service computes: it is part of the model every
 /// read reports, and no desired state or patch may set it ([`read_only_properties`]).
 const READ_ONLY_PROPERTIES: &[(&str, &[&str])] = &[
+    ("AWS::CloudFormation::Stack", &["StackId", "ChangeSetId", "CreationTime", "Description", "LastUpdateTime", "Outputs", "ParentId", "RootId", "StackStatus", "StackStatusReason"]),
     ("AWS::CloudWatch::Alarm", &["Arn"]),
     ("AWS::DynamoDB::Table", &["Arn", "StreamArn"]),
     ("AWS::IAM::ManagedPolicy", &["PolicyArn", "PolicyId", "AttachmentCount", "CreateDate", "DefaultVersionId", "IsAttachable", "PermissionsBoundaryUsageCount", "UpdateDate"]),
@@ -2161,6 +2185,18 @@ fn invalid_patch_update_message(classification: &str, properties: &[&str]) -> St
 /// to update in place: such a property can only be `add`ed
 /// ([`write_only_properties`]). A type whose schema declares none is absent from here.
 const WRITE_ONLY_PROPERTIES: &[(&str, &[&str])] = &[
+    // `AWS::CloudFormation::Stack`: a stack's own read reports neither the template it was
+    // deployed from nor the policy document it carries, so neither is in the model a patch
+    // is applied to.
+    (
+        "AWS::CloudFormation::Stack",
+        &[
+            "TemplateBody",
+            "TemplateURL",
+            "StackPolicyBody",
+            "StackPolicyURL",
+        ],
+    ),
     // `AWS::SSM::Parameter`: the properties the type's read handler, which reads a
     // parameter through `ssm:GetParameter`, does not report — that call answers with the
     // parameter's name, type, value and data type and with none of these.

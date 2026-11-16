@@ -49,6 +49,13 @@ pub(crate) const SNS_SIGNING_NAME: &str = "sns";
 /// The API version an `awsQuery` call of that service carries, as its model declares it.
 pub(crate) const SNS_API_VERSION: &str = "2010-03-31";
 
+/// The sigv4 signing name of the CloudFormation service, which OWNS the stacks
+/// `AWS::CloudFormation::Stack` names — and provisions them through its own API.
+pub(crate) const CLOUDFORMATION_SIGNING_NAME: &str = "cloudformation";
+
+/// The API version an `awsQuery` call of that service carries, as its model declares it.
+pub(crate) const CLOUDFORMATION_API_VERSION: &str = "2010-05-15";
+
 /// The sigv4 signing name of the Amazon SQS service, whose own store holds the queues
 /// `AWS::SQS::Queue` names.
 pub(crate) const SQS_SIGNING_NAME: &str = "sqs";
@@ -110,6 +117,9 @@ pub(crate) const SETTLED_INTERVAL: Duration = Duration::from_millis(20);
 
 /// "`IN_PROGRESS`: The resource operation is currently in progress."
 pub(crate) const STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// "`PENDING`: The resource operation hasn't yet started."
+pub(crate) const STATUS_PENDING: &str = "PENDING";
 
 /// "`SUCCESS`: The resource operation has successfully completed."
 pub(crate) const STATUS_SUCCESS: &str = "SUCCESS";
@@ -274,6 +284,63 @@ impl Emulator {
             response.status().as_u16(),
             String::from_utf8_lossy(response.body()).to_string(),
         )
+    }
+
+    /// One emulator with the service that OWNS `AWS::CloudFormation::Stack` mounted beside
+    /// this one.
+    ///
+    /// A stack is provisioned by CloudFormation's OWN API, which this service calls in
+    /// process over the framework's callback — the same router, so the two services share
+    /// one engine exactly as the assembled router mounts them.
+    pub(crate) fn with_cloudformation() -> Self {
+        Self::mounted(|router, engine| {
+            router.register_service(
+                service_com_amazonaws_cloudformation_cloudformation::EmulatedService::new(engine),
+            );
+        })
+    }
+
+    /// One operation of the CloudFormation service — the OWNING service's own API, the one a
+    /// client uses to drive the stack a Cloud Control request is creating.
+    ///
+    /// CloudFormation speaks the `awsQuery` protocol, so the call is a form-encoded `POST`
+    /// naming the action in its own body and the answer is an XML envelope, handed back as
+    /// the `(status, body)` text it is rather than as JSON.
+    pub(crate) async fn cfn(&self, action: &str, params: &[(&str, &str)]) -> (u16, String) {
+        let mut body = format!("Action={action}&Version={CLOUDFORMATION_API_VERSION}");
+        for (name, value) in params {
+            body.push('&');
+            body.push_str(name);
+            body.push('=');
+            body.push_str(&form_encoded(value));
+        }
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{SIGNING_REGION}/\
+             {CLOUDFORMATION_SIGNING_NAME}/aws4_request, SignedHeaders=host, Signature=00"
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", format!("{CLOUDFORMATION_SIGNING_NAME}.localhost"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("authorization", authorization)
+            .body(Bytes::from(body))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        (
+            response.status().as_u16(),
+            String::from_utf8_lossy(response.body()).to_string(),
+        )
+    }
+
+    /// One operation of the CloudFormation service, required to succeed.
+    pub(crate) async fn cfn_ok(&self, action: &str, params: &[(&str, &str)]) -> String {
+        let (status, body) = self.cfn(action, params).await;
+        assert_eq!(
+            status, 200,
+            "{action}: expected HTTP 200 from CloudFormation, got {status} with body {body}"
+        );
+        body
     }
 
     /// One emulator with the service that OWNS `AWS::StepFunctions::StateMachine` mounted

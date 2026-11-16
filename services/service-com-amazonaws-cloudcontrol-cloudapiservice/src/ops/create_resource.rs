@@ -278,13 +278,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .assigned_identifier(&region, &properties)
                     .map(|identifier| (identifier, provider.identifier_property().to_string()))
             });
-        let (identifier, identifier_property, properties) = match assigned {
-            Some((identifier, property)) => (identifier, property, properties),
-            None => match crate::state::derive_identifier(&properties, &input.type_name) {
+        // A type the OWNING service answers for through its own API assigns the identifier
+        // when the create RUNS, so there is none to record yet: the request is accepted
+        // naming no resource and reports the identifier that service answered once it has
+        // ([`crate::state::owning_api`]).
+        let owned = crate::state::owning_api::identifier_property(&input.type_name);
+        let (identifier, identifier_property, properties) = match (owned, assigned) {
+            (Some(property), _) => (None, property.to_string(), properties),
+            (None, Some((identifier, property))) => (Some(identifier), property, properties),
+            (None, None) => match crate::state::derive_identifier(&properties, &input.type_name) {
                 crate::state::DerivedIdentifier::Carried {
                     property,
                     identifier,
-                } => (identifier, property, properties),
+                } => (Some(identifier), property, properties),
                 crate::state::DerivedIdentifier::Assigned {
                     property,
                     identifier,
@@ -300,7 +306,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             ::serde_json::Value::String(identifier.clone()),
                         );
                     }
-                    (identifier, property, properties)
+                    (Some(identifier), property, properties)
                 }
                 crate::state::DerivedIdentifier::Unusable { property } => {
                     return Err(invalid_request(format!(
@@ -313,6 +319,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // What this store owes an OWNING service's own API, carried out before the store is
+        // locked: a resource of such a type is created by that service's own call, and the
+        // request that owes it follows that service's lifecycle
+        // ([`crate::state::owning_api::settle`]).
+        crate::state::owning_api::settle(&*self.engine, ctx, now).await;
         let mut store = state.lock();
         store.materialise_due(now, &native);
 
@@ -365,8 +376,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this identifier is still running there is nothing to say whether the resource
         // will exist, so a second one is refused rather than racing it — naming the
         // resource under contention and the request that holds it.
-        if let Some(holding) = store.in_flight_request(&input.type_name, &identifier) {
-            let message = crate::state::concurrent_operation_message(&identifier, Some(holding));
+        //
+        // A create whose identifier the owning service has not assigned yet names no
+        // resource to contend for: what such a create would collide with is a resource of
+        // that service's own, which its create is what judges.
+        if let Some((identifier, holding)) = identifier.as_deref().and_then(|identifier| {
+            store
+                .in_flight_request(&input.type_name, identifier)
+                .map(|holding| (identifier, holding))
+        }) {
+            let message = crate::state::concurrent_operation_message(identifier, Some(holding));
             return Err(CreateResourceErrorModeled::ConcurrentOperationException(
                 ConcurrentOperationException {
                     message: Some(message),
@@ -404,7 +423,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::RequestRecord::accepted(
             request_token.clone(),
             input.type_name.clone(),
-            Some(identifier.clone()),
+            identifier.clone(),
             crate::state::OPERATION_CREATE,
             now,
             crate::state::ResourceEffect::Create {
@@ -434,7 +453,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::audit(
             ctx.parts(),
             Self::NAME,
-            &crate::state::resource_label(&input.type_name, &identifier),
+            &crate::state::resource_label(
+                &input.type_name,
+                identifier.as_deref().unwrap_or_default(),
+            ),
             &request_token,
             crate::state::OUTCOME_ACCEPTED,
         );

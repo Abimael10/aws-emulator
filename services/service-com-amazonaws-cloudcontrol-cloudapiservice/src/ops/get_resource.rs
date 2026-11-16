@@ -258,25 +258,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input.identifier = crate::state::addressed_identifier(
             &input.type_name,
             &input.identifier,
-            native
-                .provider(&input.type_name)
-                .map(crate::state::native::NativeResourceProvider::identifier_property),
+            crate::state::owning_api::identifier_property(&input.type_name).or_else(|| {
+                native
+                    .provider(&input.type_name)
+                    .map(crate::state::native::NativeResourceProvider::identifier_property)
+            }),
         )
         .map_err(crate::scaffolded::Scaffolded::validation)?;
 
+        let now = ::std::time::SystemTime::now();
+        // What this store owes an OWNING service's own API, carried out before the store is
+        // locked ([`crate::state::owning_api::settle`]).
+        crate::state::owning_api::settle(&*self.engine, ctx, now).await;
+        // ...and, for a type that service answers for, what its own read says about this
+        // resource: the read IS that service's own call, so it is made with no store
+        // locked, and the resource it reports is the one the owning API holds.
+        let resolution = crate::state::owning_api::Resolution::of(
+            ctx,
+            &region,
+            &input.type_name,
+            &input.identifier,
+        )
+        .await;
         let mut store = state.lock();
         // What the clock already owes the store: a create whose work has fallen due has
         // provisioned its resource and a delete whose work has fallen due has removed
         // one, whether or not anybody called in between.
-        store.materialise_due(::std::time::SystemTime::now(), &native);
+        store.materialise_due(now, &native);
         // "You can use this action to return information about an existing resource in
         // your account and Amazon Web Services Region, whether those resources were
         // provisioned using Cloud Control API": the resource is resolved wherever it
         // LIVES — the owning service's own state for a type that service holds the
         // resources of — so a resource this service never created still reads, and one
         // the owning service has since removed no longer does.
-        let Some(resolved) = store.resolve(&native, &region, &input.type_name, &input.identifier)
-        else {
+        let Some(resolved) = store.resolve_as(
+            &resolution,
+            &native,
+            &region,
+            &input.type_name,
+            &input.identifier,
+        ) else {
             // A not-found is the OWNING handler's verdict, so the refusal carries that
             // handler's whole answer: its diagnostic, the handler error code it failed
             // with and the token of the invocation that failed.

@@ -129,14 +129,17 @@ async fn every_action_against_a_type_with_no_provider_is_unsupported() {
 #[tokio::test]
 async fn a_type_a_provider_stands_behind_is_served() {
     let emulator = Emulator::new();
-    // The rows differ along the owning service — including CloudFormation's own
-    // `AWS::CloudFormation::Stack`, whose namespace is the one every refused row above
-    // lives in — and along where the primary identifier comes from: a desired state that
-    // carries it, and a type whose OWNING service assigns it (`AWS::SNS::Topic`'s
-    // `TopicArn`, which its schema declares read-only). Each row names the model a read
-    // must report: for a type whose resources live in the OWNING service's store
-    // (`AWS::Logs::LogGroup` is a CloudWatch Logs log group) that is the model that service
-    // holds, read-only properties included.
+    // The rows differ along the owning service — including `AWS::CloudFormation::Macro`,
+    // whose namespace is the one every refused row above lives in — and along where the
+    // primary identifier comes from: a desired state that carries it, and a type whose
+    // OWNING service assigns it (`AWS::SNS::Topic`'s `TopicArn`, which its schema declares
+    // read-only). Each row names the model a read must report: for a type whose resources
+    // live in the OWNING service's store (`AWS::Logs::LogGroup` is a CloudWatch Logs log
+    // group) that is the model that service holds, read-only properties included.
+    //
+    // `AWS::CloudFormation::Stack` is NOT a row here: its resources are stacks
+    // CloudFormation provisions through its own API, so it is served only where that
+    // service is reachable — which is `cloudformation_stack_provisioning`.
     let topic_arn =
         engine::emulator_arn("sns", super::emulator::SIGNING_REGION, "provisionable-topic");
     let rows = [
@@ -147,10 +150,10 @@ async fn a_type_a_provider_stands_behind_is_served() {
             json!({ "TopicArn": topic_arn, "TopicName": "provisionable-topic" }),
         ),
         (
-            "AWS::CloudFormation::Stack",
-            json!({ "StackName": "provisionable-stack" }),
-            "provisionable-stack".to_string(),
-            json!({ "StackName": "provisionable-stack" }),
+            "AWS::CloudFormation::Macro",
+            json!({ "Name": "provisionable-macro", "FunctionName": "transform" }),
+            "provisionable-macro".to_string(),
+            json!({ "Name": "provisionable-macro", "FunctionName": "transform" }),
         ),
         (
             "AWS::Logs::LogGroup",

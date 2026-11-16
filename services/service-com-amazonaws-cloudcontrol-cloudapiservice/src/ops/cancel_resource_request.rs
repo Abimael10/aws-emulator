@@ -154,6 +154,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // Where the OWNING service's own lifecycle has got to for every request that is
+        // following one, brought up to date before the store is locked
+        // ([`crate::state::owning_api::settle`]): the cancel window closes when the request
+        // becomes terminal, and for such a request that is when that service's lifecycle
+        // does.
+        crate::state::owning_api::settle(&*self.engine, ctx, now).await;
         let mut store = state.lock();
         // What the clock already owes the store, so a request whose work has fallen due is
         // seen in the status it has REACHED: the cancel window closes when the request

@@ -256,20 +256,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
         // The Region this call addressed, as its SigV4 credential scope names it: a
         // listing reports the resources of one account and Region, so a type whose owning
         // service holds one namespace per Region is enumerated THERE.
         let region = crate::state::request_region(ctx.parts());
-        // What the clock already owes the store, so one listing cannot report a resource
-        // another read says no longer exists.
         let native = crate::state::native::NativeResources::for_engine(&*self.engine);
-        store.materialise_due(::std::time::SystemTime::now(), &native);
+        // What this store owes an OWNING service's own API, carried out before the store is
+        // locked ([`crate::state::owning_api::settle`]).
+        crate::state::owning_api::settle(&*self.engine, ctx, now).await;
 
         // A continuation token carries the position it names, so only the authenticator
         // inside it tells one this store minted from one a caller wrote — and a token
         // minted for another type's listing resumes nothing here either.
-        let key = store.page_token_key();
+        let key = {
+            let mut store = state.lock();
+            // What the clock already owes the store, so one listing cannot report a
+            // resource another read says no longer exists.
+            store.materialise_due(now, &native);
+            store.page_token_key()
+        };
         let resume_after = match crate::state::requested_page_token(input.next_token.as_deref()) {
             Some(token) => Some(
                 crate::state::decode_page_token(&key, &input.type_name, token).ok_or_else(
@@ -297,14 +303,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The inventory is the one that EXISTS: for a type another service owns the
         // resources of, that service's own state is what is listed, so a resource it
-        // holds is reported whichever API created it.
-        let mut examined = store.resolve_type(
-            &native,
+        // holds is reported whichever API created it — and for a type that service answers
+        // for through its OWN API, the window is that service's own read, taken with no
+        // store locked.
+        let mut examined = match crate::state::owning_api::page(
+            ctx,
             &region,
             &input.type_name,
             resume_after.as_deref(),
             page_size + 1,
-        );
+        )
+        .await
+        {
+            Some(owned) => owned,
+            None => state.lock().resolve_type(
+                &native,
+                &region,
+                &input.type_name,
+                resume_after.as_deref(),
+                page_size + 1,
+            ),
+        };
         // A window that came back full may have more behind it; one that came back short
         // reached the end of the type, which is what tells a client to stop.
         let further = examined.len() > page_size;

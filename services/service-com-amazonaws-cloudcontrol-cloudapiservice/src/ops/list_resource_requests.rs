@@ -146,9 +146,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A listing of this service's own request records is selected by the request body
-        // alone, so nothing in the request metadata narrows it.
-        let _ = ctx;
         // This operation REPORTS the requests the store holds and models no failure at
         // all. A store that is not mounted holds no request, so that is an empty page
         // rather than some other answer.
@@ -159,11 +156,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         };
 
+        let now = ::std::time::SystemTime::now();
+        // Where the OWNING service's own lifecycle has got to for every request that is
+        // following one, brought up to date before the store is locked, so the status this
+        // listing reports for such a request is the same one `GetResourceRequestStatus`
+        // reports for it ([`crate::state::owning_api::settle`]).
+        crate::state::owning_api::settle(&*self.engine, ctx, now).await;
         let mut store = state.lock();
         // What the clock already owes the store, so the status this listing reports for a
         // request is the same one `GetResourceRequestStatus` reports for it.
         let native = crate::state::native::NativeResources::for_engine(&*self.engine);
-        store.materialise_due(::std::time::SystemTime::now(), &native);
+        store.materialise_due(now, &native);
 
         // A continuation token carries the position it names, so only the authenticator
         // inside it tells one this store minted from one a caller wrote — and a token

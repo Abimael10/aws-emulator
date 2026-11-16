@@ -19,6 +19,8 @@ mod arn_identified_resources;
 mod audit_records;
 #[path = "all/cancel_resource_request.rs"]
 mod cancel_resource_request;
+#[path = "all/cloudformation_stack_provisioning.rs"]
+mod cloudformation_stack_provisioning;
 #[path = "all/compound_identifiers.rs"]
 mod compound_identifiers;
 #[path = "all/deleted_resource_refusal.rs"]

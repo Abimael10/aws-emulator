@@ -271,11 +271,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input.identifier = crate::state::addressed_identifier(
             &input.type_name,
             &input.identifier,
-            native
-                .provider(&input.type_name)
-                .map(crate::state::native::NativeResourceProvider::identifier_property),
+            crate::state::owning_api::identifier_property(&input.type_name).or_else(|| {
+                native
+                    .provider(&input.type_name)
+                    .map(crate::state::native::NativeResourceProvider::identifier_property)
+            }),
         )
         .map_err(crate::scaffolded::Scaffolded::validation)?;
+        // What this store owes an OWNING service's own API, and where that service's
+        // lifecycle has got to for every request following one, brought up to date before
+        // the store is locked ([`crate::state::owning_api::settle`]) — so the guard below
+        // sees the request that holds this resource in the status it has really reached.
+        crate::state::owning_api::settle(&*self.engine, ctx, now).await;
+        // ...and, for a type that service answers for, what its own read says about the
+        // resource this delete names: a call, so it is made with no store locked.
+        let resolution = crate::state::owning_api::Resolution::of(
+            ctx,
+            &region,
+            &input.type_name,
+            &input.identifier,
+        )
+        .await;
         let mut store = state.lock();
         store.materialise_due(now, &native);
 
@@ -338,7 +354,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // syntactically valid request is admitted either way, and a request naming a
         // resource nothing holds is answered with the event the caller polls rather than
         // refused at the front door.
-        let resolved = store.resolve(&native, &region, &input.type_name, &input.identifier);
+        let resolved = store.resolve_as(
+            &resolution,
+            &native,
+            &region,
+            &input.type_name,
+            &input.identifier,
+        );
         // Where the resource resolves, the guard is asked again under the identifier the
         // RESOURCE answers to: a type whose owning service assigns that identifier
         // resolves more than one reference to one resource, and the operation already

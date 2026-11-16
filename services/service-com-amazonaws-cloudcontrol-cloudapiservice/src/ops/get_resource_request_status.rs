@@ -132,7 +132,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // This operation reports a request this service holds, and the only failure it
         // models is a token naming none. A store that is not mounted holds no request at
         // all, so that is the same answer rather than a different one. The refusal names
@@ -152,11 +151,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found());
         };
 
+        let now = ::std::time::SystemTime::now();
+        // Where the OWNING service's own lifecycle has got to for every request that is
+        // following one: a request of such a type reports that service's progress, so it is
+        // read — by a call on that service, with no store locked — before this one answers
+        // ([`crate::state::owning_api::settle`]). This is the poll a client drives such a
+        // request to its terminal status with.
+        crate::state::owning_api::settle(&*self.engine, ctx, now).await;
         let mut store = state.lock();
         // What the clock already owes the store, so a request whose work has fallen due
         // is reported in the status it has reached rather than the one it started in.
         let native = crate::state::native::NativeResources::for_engine(&*self.engine);
-        store.materialise_due(::std::time::SystemTime::now(), &native);
+        store.materialise_due(now, &native);
         let Some(record) = store.request(&input.request_token) else {
             return Err(not_found());
         };

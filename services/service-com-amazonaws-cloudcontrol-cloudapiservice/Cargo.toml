@@ -45,6 +45,13 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 # deleted table hands back, which that crate's own streams seam applies
 # (`state::native::tables`).
 service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
+# The owning service of a resource type whose create does work of its own — it provisions
+# the resources a template declares and reports a lifecycle of its own — is reached through
+# that service's own API rather than through its store: an `AWS::CloudFormation::Stack` is
+# created, read, patched and removed by CloudFormation's own calls, dispatched in process
+# over the framework's callback (`state::owning_api::stacks`). No network client feature:
+# the transport is the emulator's own.
+aws-sdk-cloudformation = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
@@ -77,6 +84,11 @@ uuid = { version = "1", features = ["v4"] }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The service that OWNS `AWS::CloudFormation::Stack`: a suite about that type mounts it
+# beside this one on the same engine, exactly as the assembled router does, and drives the
+# stack through its own API — `DescribeStackResource` and `SignalResource` — while the
+# Cloud Control request follows it.
+service-com-amazonaws-cloudformation-cloudformation = { workspace = true }
 # The test harness drives the services that OWN some resource types over their own
 # `awsQuery` wire, whose form values are percent-encoded by this crate rather than by an
 # encoder of ours.
