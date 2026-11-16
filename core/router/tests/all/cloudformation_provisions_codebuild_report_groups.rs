@@ -465,13 +465,16 @@ async fn a_stack_provisions_the_codebuild_report_group_its_template_declares() {
         );
 
         // What the stack provisioned is addressable as a resource of CodeBuild's own: a
-        // resource policy attaches to that ARN and reads back verbatim.
+        // resource policy attaches to that ARN and reads back. The document is written in
+        // the form CodeBuild RENDERS a policy in — compact, with the one action a scalar —
+        // so the read compares the very text this submitted; the rendering itself is that
+        // service's own suite (`resource_policy_rendering`).
         let policy = json!({
             "Version": "2012-10-17",
             "Statement": [{
                 "Effect": "Allow",
                 "Principal": {"AWS": "arn:aws:iam::222222222222:root"},
-                "Action": ["codebuild:BatchGetReportGroups"],
+                "Action": "codebuild:BatchGetReportGroups",
                 "Resource": arn,
             }],
         })

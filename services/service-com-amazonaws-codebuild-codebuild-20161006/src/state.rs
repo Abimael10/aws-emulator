@@ -78,6 +78,8 @@ mod identifiers;
 /// What a project identifier names: a project NAME, or an ARN whose fields are read
 /// before anything is looked up.
 mod project_reference;
+/// The FORM a resource policy is held in, and so the form every read of one reports.
+mod resource_policy_document;
 /// The runtimes a build environment has, and the ones a build's buildspec installs.
 mod runtime_versions;
 /// The ZIP archive a build's input and its output travel in.
@@ -100,6 +102,7 @@ pub use build_tools::{BuildPrograms, BuildTools};
 pub use buildspec::*;
 pub use identifiers::*;
 pub use project_reference::*;
+pub use resource_policy_document::*;
 pub use runtime_versions::*;
 
 /// The ARN service segment for this service, as `emulator_arn`'s first argument
@@ -1141,11 +1144,13 @@ pub struct StoredReportGroup {
 /// (`PutResourcePolicy`: "Stores a resource policy for the ARN of a Project or
 /// ReportGroup object"), so the attachment is what the shared-resource listings read
 /// and the policy document itself is what `GetResourcePolicy` hands back. The
-/// document is kept verbatim: it is a caller-supplied grant, not a credential, and a
-/// reader must report exactly the text that was stored.
+/// document is kept in the form the service RENDERS a policy in
+/// ([`stored_resource_policy`]): it is a caller-supplied grant, not a credential, so what
+/// is held is the policy the caller wrote, and a reader reports exactly the text that was
+/// stored.
 #[derive(Debug, Clone)]
 pub struct StoredResourcePolicy {
-    /// The policy document as the caller stored it.
+    /// The policy document as the service renders what the caller stored.
     pub policy: String,
     /// Epoch millis the policy was last written at, kept as the integer a list
     /// operation sorts on — the way [`StoredProject`]'s stamps are.
@@ -1375,9 +1380,10 @@ fn listed(value: &::serde_json::Value) -> Vec<&::serde_json::Value> {
 /// `PutResourcePolicyInput$policy` is "A JSON-formatted resource policy", and a policy
 /// document is a JSON OBJECT (its `Version` and `Statement` members), so a document
 /// that does not parse, or parses to anything else, is not one. Parsed with
-/// `serde_json`, already a dependency of this crate; the document itself is stored
-/// verbatim rather than re-serialized, so a reader hands back exactly the text the
-/// caller wrote.
+/// `serde_json`, already a dependency of this crate; what is STORED is the document in
+/// the form the service renders a policy in ([`stored_resource_policy`]), never a value
+/// re-serialized out of this parse, so every string literal, member order and number
+/// spelling the caller wrote survives.
 ///
 /// The JSON question only: which statement members a grant must carry, and which
 /// principals CodeBuild accepts in one, is not a rule any record of this service's

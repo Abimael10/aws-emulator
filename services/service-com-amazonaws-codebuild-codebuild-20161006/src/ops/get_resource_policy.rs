@@ -131,9 +131,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// stored.
     ///
     /// A resource-based policy is state keyed by the ARN it is attached to, so this
-    /// read is that one lookup: the document comes back byte for byte, because it is a
-    /// caller-supplied grant whose exact text a reader has to hand back, and an ARN
-    /// carrying no policy is a missing resource rather than an empty answer.
+    /// read is that one lookup: the stored document comes back byte for byte — it is the
+    /// policy the caller wrote, in the form the write rendered it in
+    /// (`crate::state::stored_resource_policy`), and nothing here renders it a
+    /// second time — and an ARN carrying no policy is a missing resource rather than an
+    /// empty answer.
     ///
     /// Purely reporting: nothing in the store changes, so a later caller sees exactly
     /// what this one saw.

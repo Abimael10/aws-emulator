@@ -136,9 +136,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// A resource-based policy is state keyed by the ARN it is attached to, so this
     /// write REPLACES whatever document that ARN already carried — the document is the
     /// whole grant rather than a delta, so the last writer wins and nothing of an
-    /// earlier one survives — and the document is persisted VERBATIM: it is a
-    /// caller-supplied grant whose exact text a reader has to hand back, so nothing
-    /// here re-serializes, escapes or normalises it.
+    /// earlier one survives — and what is persisted is the policy the caller wrote in
+    /// the form this service RENDERS one
+    /// (`crate::state::stored_resource_policy`): the whitespace between the
+    /// document's JSON tokens is dropped, a one-element list of one string is written as
+    /// that string where the policy language admits either, and an account principal
+    /// named by its bare id is written as that account's root ARN. Nothing else of the
+    /// caller's text moves — member order, every other value's spelling and every byte
+    /// inside a string literal are the caller's own — and a read hands back exactly the
+    /// stored text.
     ///
     /// The request is parsed before the store is read: `resourceArn` is typed only
     /// `NonEmptyString`, so a value that is not the ARN of a resource this service
@@ -243,9 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.resource_policies.insert(
             input.resource_arn.clone(),
             crate::state::StoredResourcePolicy {
-                // MOVED, not copied: the document is caller-sized, and nothing below
-                // reads it.
-                policy: input.policy,
+                // The document is held in the form the service renders it in, which is the
+                // form every later read of it reports
+                // (`crate::state::stored_resource_policy`).
+                policy: crate::state::stored_resource_policy(&input.policy),
                 last_modified_millis: now,
             },
         );

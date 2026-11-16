@@ -5,10 +5,11 @@
 //! `X-Amz-Target: CodeBuild_20161006.<Operation>` on awsJson1_1.
 //!
 //! RULE: a resource-based policy is state keyed by the ARN of the project or report
-//! group it is attached to. `PutResourcePolicy` stores the caller's document VERBATIM
-//! against a resource this account holds, replacing whatever document that ARN already
-//! carried (the document is the whole grant, so the last writer wins), and answers that
-//! ARN; `GetResourcePolicy` hands the stored document back byte for byte and refuses an
+//! group it is attached to. `PutResourcePolicy` stores the caller's document, in the form
+//! the service RENDERS a policy in, against a resource this account holds, replacing
+//! whatever document that ARN already carried (the document is the whole grant, so the
+//! last writer wins), and answers that ARN; `GetResourcePolicy` hands that stored text
+//! back byte for byte and refuses an
 //! ARN carrying no policy with `ResourceNotFoundException`; an ARN that names no
 //! resource of this account is refused with `ResourceNotFoundException`, and a value
 //! that is not the ARN of a resource a policy attaches to, or a policy that is not a
@@ -151,6 +152,12 @@ fn shareable_action(arn: &str) -> &'static str {
 /// A sharing policy document whose `Sid` is `label` — one of the grants the CodeBuild
 /// user guide's "Sharing a Project" describes. Built with `serde_json`, so the rows that
 /// vary the LABEL vary only the document's content, not its shape.
+///
+/// Written in the form the service RENDERS a policy in — compact, with the one action a
+/// scalar and the account principal its root ARN — so every row that merely asks which
+/// document is in force compares the text it submitted. The forms that are NOT already
+/// rendered are [`documents`]' own rows, and [`crate::resource_policy_rendering`] is the
+/// suite that pins the rendering itself.
 fn sharing_policy(arn: &str, label: &str) -> String {
     json!({
         "Version": "2012-10-17",
@@ -158,7 +165,7 @@ fn sharing_policy(arn: &str, label: &str) -> String {
             "Sid": label,
             "Effect": "Allow",
             "Principal": {"AWS": "arn:aws:iam::222222222222:root"},
-            "Action": [shareable_action(arn)],
+            "Action": shareable_action(arn),
             "Resource": arn,
         }],
     })
@@ -166,12 +173,15 @@ fn sharing_policy(arn: &str, label: &str) -> String {
 }
 
 /// The documents the round-trip rows store: every class of text a JSON policy document
-/// can be, so the assertion is about the bytes rather than about one recorded policy.
+/// can be, each beside the text the service renders it as, so the assertion is about the
+/// bytes rather than about one recorded policy. Every rendered form is written out by
+/// hand, so the expectation is the rule and not the emulator's own rendering.
 /// The labels span ASCII, scripts outside the basic plane (CJK, Cyrillic, Greek), a
 /// right-to-left script, combining marks, an astral-plane emoji, text that carries
-/// `\u` ESCAPES rather than the characters themselves (which only survive a store that
-/// does not re-serialize), and quoting that a re-serializer would normalise.
-fn documents(arn: &str) -> Vec<(String, String)> {
+/// `\u` ESCAPES rather than the characters themselves, and quoting a re-serializer would
+/// normalise — none of which the rendering touches, since it copies every string literal
+/// through whole.
+fn documents(arn: &str) -> Vec<(String, String, String)> {
     let labels = [
         ("ascii", "SharedWithPartner"),
         ("cjk", "共有プロジェクト-功能"),
@@ -182,12 +192,18 @@ fn documents(arn: &str) -> Vec<(String, String)> {
         ("escaped scalars", r"share-\u00e9-\u4f53"),
         ("quotes and escapes", r#"she said \"share\" \\ it"#),
     ];
-    let mut rows: Vec<(String, String)> = labels
+    // `sharing_policy` already writes a document in the rendered form, so these rows
+    // store the very text they submit.
+    let mut rows: Vec<(String, String, String)> = labels
         .into_iter()
-        .map(|(case, label)| (case.to_string(), sharing_policy(arn, label)))
+        .map(|(case, label)| {
+            let document = sharing_policy(arn, label);
+            (case.to_string(), document.clone(), document)
+        })
         .collect();
-    // Formatting a re-serializer would normalise away: newlines, tabs and padding
-    // between the members, and the members in an order no canonical form keeps.
+    // Formatting the rendering drops: newlines, tabs and padding between the members —
+    // with the members in an order the rendering keeps, since only the whitespace BETWEEN
+    // the document's tokens goes.
     let action = shareable_action(arn);
     rows.push((
         "pretty printed with tabs".to_string(),
@@ -197,36 +213,57 @@ fn documents(arn: &str) -> Vec<(String, String)> {
              \"Principal\": {{\"AWS\": \"*\"}}\n\t\t}}\n\t],\n\t\
              \"Version\":\"2012-10-17\"\n}}"
         ),
+        format!(
+            "{{\"Statement\":[{{\"Resource\":\"{arn}\",\"Action\":\"{action}\",\
+             \"Effect\":\"Allow\",\"Principal\":{{\"AWS\":\"*\"}}}}],\
+             \"Version\":\"2012-10-17\"}}"
+        ),
     ));
     // The smallest document that is still a JSON object, and one whose values are every
-    // other JSON type.
-    rows.push(("empty object".to_string(), "{}".to_string()));
+    // other JSON type — both already compact and carrying no one-element list, so the
+    // rendering leaves them as they are.
+    rows.push(("empty object".to_string(), "{}".to_string(), "{}".to_string()));
+    let every_type = json!({
+        "Version": "2012-10-17",
+        "Statement": [],
+        "numbers": [0, -1, 1.5e3],
+        "flags": {"yes": true, "no": false},
+        "nothing": Value::Null,
+    })
+    .to_string();
     rows.push((
         "every json value type".to_string(),
-        json!({
-            "Version": "2012-10-17",
-            "Statement": [],
-            "numbers": [0, -1, 1.5e3],
-            "flags": {"yes": true, "no": false},
-            "nothing": Value::Null,
-        })
-        .to_string(),
+        every_type.clone(),
+        every_type,
     ));
-    // The same GRANT written four ways, which is the dimension a store that decoded the
-    // document to a policy model and re-emitted it would collapse: a statement's `Action`
-    // and `Principal` are each a single value or a list of them, a principal is an account
-    // root ARN or the bare account id, and a document carries whatever padding its author
-    // wrote. Each form has to come back as it went in.
-    let principal_arn = format!("arn:aws:iam::{}:root", engine::EMULATOR_ACCOUNT_ID);
+    // The same GRANT written five ways, which is the dimension the rendering normalises:
+    // a statement's `Action` and the `AWS` principals are each a single value or a list of
+    // them, a whole account is named by its root ARN or by its bare id, and a document
+    // carries whatever padding its author wrote. Each form comes back in the ONE rendered
+    // spelling — compact, the one-element lists written as the string they hold, and the
+    // account named by its root ARN.
+    let account = engine::EMULATOR_ACCOUNT_ID;
+    let principal_arn = format!("arn:aws:iam::{account}:root");
     for (case, principal, granted) in [
         ("scalar action, root ARN principal", format!("\"{principal_arn}\""), format!("\"{action}\"")),
+        ("scalar action, bare account principal", format!("\"{account}\""), format!("\"{action}\"")),
         ("listed action, root ARN principal", format!("\"{principal_arn}\""), format!("[\"{action}\"]")),
         (
             "listed action, listed account principal",
-            format!("[\"{}\"]", engine::EMULATOR_ACCOUNT_ID),
+            format!("[\"{account}\"]"),
+            format!("[\"{action}\"]"),
+        ),
+        (
+            "listed action, listed root ARN principal",
+            format!("[\"{principal_arn}\"]"),
             format!("[\"{action}\"]"),
         ),
     ] {
+        let rendered = format!(
+            "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+             \"Principal\":{{\"AWS\":\"{principal_arn}\"}},\"Action\":\"{action}\",\
+             \"Resource\":\"{arn}\"}}]}}"
+        );
         rows.push((
             case.to_string(),
             format!(
@@ -234,6 +271,7 @@ fn documents(arn: &str) -> Vec<(String, String)> {
                  \"Principal\":{{\"AWS\":{principal}}},\"Action\":{granted},\
                  \"Resource\":\"{arn}\"}}]}}"
             ),
+            rendered.clone(),
         ));
         rows.push((
             format!("{case}, padded between every member"),
@@ -242,18 +280,20 @@ fn documents(arn: &str) -> Vec<(String, String)> {
                  \"Principal\": {{\"AWS\": {principal}}}, \"Action\": {granted}, \
                  \"Resource\": \"{arn}\"}}]}}"
             ),
+            rendered,
         ));
     }
     rows
 }
 
-/// RULE: a stored policy comes back byte for byte from the ARN it was stored against,
+/// RULE: a stored policy comes back from the ARN it was stored against in the form the
+/// service renders a policy in — and nothing else about the caller's document changes —
 /// for either resource kind a policy attaches to, and attaching one to a resource this
 /// account OWNS shares it OUT — so it stays in the account's own listing and appears in
 /// neither of the account's shared listings, which report what other accounts shared
 /// WITH it.
 #[tokio::test]
-async fn a_stored_policy_round_trips_byte_for_byte_for_either_resource_kind() {
+async fn a_stored_policy_comes_back_as_the_service_renders_it_for_either_resource_kind() {
     for kind in KINDS {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let router = emulator_on(Arc::clone(&engine));
@@ -262,13 +302,14 @@ async fn a_stored_policy_round_trips_byte_for_byte_for_either_resource_kind() {
         // by ARN, so one resource's policy must never answer for another's.
         let untouched = create_target(&router, kind, "policy-untouched").await;
 
-        for (case, document) in documents(&arn) {
+        for (case, document, stored) in documents(&arn) {
             let case = format!("{kind:?}, {case}");
             put(&router, &case, &arn, &document).await;
             let read = get(&router, &case, &arn).await;
             assert_eq!(
-                read, document,
-                "case {case:?}: the stored document must come back verbatim, got {read:?}"
+                read, stored,
+                "case {case:?}: the document must come back as the service renders it, \
+                 got {read:?}"
             );
             // The store holds exactly what the wire reported, so the read is computed
             // from state rather than from the request.
@@ -280,7 +321,7 @@ async fn a_stored_policy_round_trips_byte_for_byte_for_either_resource_kind() {
                 .map(|stored| stored.policy.clone());
             assert_eq!(
                 held.as_deref(),
-                Some(document.as_str()),
+                Some(stored.as_str()),
                 "case {case:?}: the store must hold the document the write persisted"
             );
 
@@ -289,6 +330,16 @@ async fn a_stored_policy_round_trips_byte_for_byte_for_either_resource_kind() {
             assert_eq!(
                 again, read,
                 "case {case:?}: a second read must answer the same document, got {again:?}"
+            );
+
+            // The rendering is a FIXED POINT: a client that puts back the document it
+            // read stores the same bytes again, so re-applying one policy converges.
+            put(&router, &case, &arn, &stored).await;
+            let reread = get(&router, &case, &arn).await;
+            assert_eq!(
+                reread, stored,
+                "case {case:?}: re-putting the reported document must store it unchanged, \
+                 got {reread:?}"
             );
 
             let message = refusal(
@@ -892,14 +943,15 @@ async fn a_policy_containing_an_action_outside_the_kinds_read_only_set_is_refuse
         }
 
         // The positive controls: the same resource takes a document whose actions are
-        // all read-only ones, and hands it back verbatim.
+        // all read-only ones, and hands it back unchanged — each row is already written in
+        // the form the service renders a policy in.
         for (case, document) in documents_containing_only_shareable_actions(kind, &arn) {
             let case = format!("{kind:?}, {case}");
             put(&router, &case, &arn, &document).await;
             let read = get(&router, &case, &arn).await;
             assert_eq!(
                 read, document,
-                "case {case:?}: a read-only grant must round-trip verbatim, got {read:?}"
+                "case {case:?}: a read-only grant must come back unchanged, got {read:?}"
             );
         }
 

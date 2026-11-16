@@ -109,6 +109,8 @@ mod report_group_reads;
 mod report_group_trend;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
+#[path = "all/resource_policy_rendering.rs"]
+mod resource_policy_rendering;
 #[path = "all/retry_build.rs"]
 mod retry_build;
 #[path = "all/runtime_versions.rs"]
