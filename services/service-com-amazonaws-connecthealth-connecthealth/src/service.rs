@@ -43,9 +43,12 @@
 //! One of those seams is taken here: `override_operation` routes the ONE operation the
 //! generated table cannot serve at all, `StartMedicalScribeListeningSession` — its output
 //! is a `@streaming` union, so the generated shim declines the request and this file hands
-//! it to the operation's own event-stream implementation instead. Every other request goes
-//! through the generated routing table untouched, so the status, the error code and the
-//! body of a refusal are the framework's own restJson1 rendering of the modelled shape
+//! it to the operation's own event-stream implementation instead. It also names the one
+//! class of request the generated table resolves NOTHING for although the model binds its
+//! method and path to an operation: one that left a `@required` query-bound member out, so
+//! the REST route lookup withheld the route ([`required_query_route`]). Every other request
+//! goes through the generated routing table untouched, so the status, the error code and
+//! the body of a refusal are the framework's own restJson1 rendering of the modelled shape
 //! (the detail text it carries is built in [`error_detail`]).
 //!
 //! A second seam is taken: `override_refusal` words the ONE framework-level refusal this
@@ -54,6 +57,7 @@
 
 pub mod domain_id_refusal;
 pub mod error_detail;
+pub mod required_query_route;
 pub mod tag_bounds;
 
 use crate::ops::start_medical_scribe_listening_session::{
@@ -129,6 +133,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             && request_path(req.uri()) == start_medical_scribe_listening_session::MODELED_PATH
         {
             return Some(&self.start_medical_scribe_listening_session);
+        }
+        // A SECOND class is named here, and only this class: a request the model's own
+        // routing key resolves nothing for, which nevertheless addressed the method and
+        // path of an operation of this service and was matched to no route only because a
+        // `@required` query-bound member of that route is absent. Handing it to the
+        // operation it addressed is what lets the centralized walk refuse it as the bad
+        // request it is — this service's `ValidationException` (400) naming the absent
+        // member — instead of the protocol's routing default claiming, with 501, that
+        // nobody has implemented the operation (see [`required_query_route`]).
+        if let Some(addressed) = required_query_route::addressed_operation(&self.entry, req) {
+            return Some(addressed);
         }
         // Every other request resolves through the generated routing table.
         None

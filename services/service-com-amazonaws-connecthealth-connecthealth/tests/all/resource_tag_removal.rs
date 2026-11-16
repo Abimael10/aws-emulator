@@ -592,10 +592,11 @@ async fn the_number_of_keys_one_call_may_name_is_bounded() {
             "case {case:?}: got {body}"
         );
     }
-    // A request that names NO key at all is not this operation's to refuse: `tagKeys` is
-    // required, and the REST router rejects a candidate route whose required bindings the
-    // request does not carry, so such a request reaches no operation of this service and
-    // is answered by the front door rather than by a handler.
+    // A request that names NO key at all is refused before this handler runs: `tagKeys` is
+    // required, so the request is handed to this operation and its boundary states the
+    // absent member — the modelled 400, never the scaffold's 501. That class is pinned over
+    // every route of this model that binds a required query parameter or header by
+    // `tests/all/absent_required_http_binding.rs`.
 
     // Nothing any of those calls named was carried, so the seeded key is still there.
     let reported = agreed_tags(&emulator, "after the bound rows", &domain_id, &arn).await;
