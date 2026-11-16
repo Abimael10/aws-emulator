@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Whether the IAM role a hybrid activation is handed is one Systems Manager can act as.
+//! Whether the IAM role a member of this service names is one Systems Manager can act as.
 //!
 //! A machine that registers with an activation is managed UNDER the role the activation
 //! names ("The name of the Identity and Access Management (IAM) role that you want to
@@ -8,7 +8,13 @@
 //! Amazon Web Services Systems Manager service principal ssm.amazonaws.com",
 //! `CreateActivationRequest$IamRole`), so the role has to exist and admit that assume
 //! before an activation is minted for it: an activation bound to a role this service
-//! could never take on is a code that can register nothing.
+//! could never take on is a code that can register nothing. The same holds of every other
+//! member of this service that hands it a role to act under — the role a hybrid node is
+//! moved to (`UpdateManagedInstanceRoleRequest$IamRole`), and the role a cloud connector
+//! "uses to communicate with the third-party cloud environment"
+//! (`CreateCloudConnectorRequest$RoleArn`) — so the one reading serves them all: a member
+//! carrying a role NAME goes through [`refusal`] and one carrying an ARN through
+//! [`arn_refusal`].
 //!
 //! The question is the tree's shared reading of a caller-supplied role
 //! ([`::service_common::iam_role::role_is_unassumable`]) — which role of this account the
@@ -21,8 +27,8 @@
 //! answer refuses anything — an answer this emulator could not read, or an emulator with
 //! no IAM mounted to ask at all.
 
-/// The service principal a hybrid-registration role's trust policy has to admit, in the
-/// global spelling a trust policy names a service by: this service is what assumes the
+/// The service principal a role this service acts under has to admit, in the global
+/// spelling a trust policy names a service by: this service is what assumes the
 /// role (`CreateActivationRequest$IamRole`: "AssumeRole permissions for the Amazon Web
 /// Services Systems Manager service principal ssm.amazonaws.com").
 pub const HYBRID_REGISTRATION_PRINCIPAL: &str = "ssm.amazonaws.com";
@@ -66,4 +72,33 @@ pub async fn refusal(
     )
     .await
     .then(|| unassumable_role_message(&role_arn))
+}
+
+/// [`refusal`] for a member that carries the role's ARN rather than its name, which is the
+/// same question about the same role: the ARN is read as handed, because it is already the
+/// spelling IAM holds the role under.
+///
+/// An ARN naming ANOTHER account is refused without asking IAM anything. The role a resource
+/// of this account acts under has to be a role of this account — IAM holds no record of
+/// another account's roles for this emulator to ask about, and "nonexistent role" is what
+/// naming one amounts to for the caller — so the decision is taken here rather than left to
+/// the shared reading, which stays silent about another account on purpose
+/// ([`::service_common::iam_role::role_is_unassumable`]). A member carrying a role NAME
+/// ([`refusal`]) names no account at all, so the question does not arise there.
+pub async fn arn_refusal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+) -> Option<String> {
+    if ::service_common::iam_role::role_name(role_arn).is_none() {
+        return Some(unassumable_role_message(role_arn));
+    }
+    ::service_common::iam_role::role_is_unassumable(
+        ctx,
+        region,
+        role_arn,
+        HYBRID_REGISTRATION_PRINCIPAL,
+    )
+    .await
+    .then(|| unassumable_role_message(role_arn))
 }

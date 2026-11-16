@@ -33,6 +33,8 @@ mod automation_step_actions;
 mod automation_step_executions;
 #[path = "all/boundary_refusal_wording.rs"]
 mod boundary_refusal_wording;
+#[path = "all/cloud_connector_role_and_deletion.rs"]
+mod cloud_connector_role_and_deletion;
 #[path = "all/document_content.rs"]
 mod document_content;
 #[path = "all/document_default_version.rs"]
@@ -53,6 +55,8 @@ mod command_history;
 mod command_invocation_listing;
 #[path = "all/constraint_set_refusal_wording.rs"]
 mod constraint_set_refusal_wording;
+#[path = "all/custom_inventory.rs"]
+mod custom_inventory;
 #[path = "all/default_patch_baselines.rs"]
 mod default_patch_baselines;
 #[path = "all/documents.rs"]
@@ -91,6 +95,8 @@ mod managed_node_filter_validation;
 mod managed_node_iam_role;
 #[path = "all/managed_node_information.rs"]
 mod managed_node_information;
+#[path = "all/managed_node_lifecycle.rs"]
+mod managed_node_lifecycle;
 #[path = "all/node_connection_status.rs"]
 mod node_connection_status;
 #[path = "all/node_inventory.rs"]
@@ -111,6 +117,8 @@ mod ops_item_related_items;
 mod ops_item_updates;
 #[path = "all/ops_items.rs"]
 mod ops_items;
+#[path = "all/ops_metadata.rs"]
+mod ops_metadata;
 #[path = "all/parameter_arn_spellings.rs"]
 mod parameter_arn_spellings;
 #[path = "all/parameter_deletion.rs"]

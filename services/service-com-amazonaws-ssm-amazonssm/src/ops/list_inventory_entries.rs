@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInventoryEntries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInventoryEntries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the inventory entries this endpoint holds of ONE type about ONE managed node:
+//! "the managed node ID for which you want inventory information" and "the type of inventory
+//! item for which you want information", read through
+//! [`crate::state::inventory::held_item`].
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInventoryEntries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The two kinds of item it reports are the two this endpoint holds: the
+//! `AWS:InstanceInformation` item every registered node has, which is the projection of the
+//! node record, and a `Custom:` item a caller's own `PutInventory` wrote
+//! ([`crate::state::custom_inventory`]) — so an entry a caller reads back is the one its own
+//! put supplied.
+//!
+//! The decisions, in order:
+//!
+//! 1. the type name has to name an inventory type this service knows
+//!    ([`crate::state::inventory::is_known_inventory_type`]), which is the modelled
+//!    `InvalidTypeNameException`;
+//! 2. every filter has to name an attribute of that type, which for the one type whose
+//!    schema this service publishes is one of that schema's attributes — the modelled
+//!    `InvalidFilter` ([`crate::state::inventory::entry_filter_key_rejection`]);
+//! 3. the entries: the ones the item this endpoint holds carries, narrowed to those meeting
+//!    EVERY filter and bounded by the page the request asked for. A node and type this
+//!    endpoint holds no item of reports no entry — what it holds — rather than a refusal:
+//!    the read reports what has been collected for a node, and nothing has been collected
+//!    for one nothing was written about.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +185,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInventoryEntries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInventoryEntriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInventoryEntries"))
+        use crate::state::inventory;
+
+        // `InstanceId`'s pattern, `TypeName`'s length and `^(AWS|Custom):.*$` pattern, the
+        // `Filters` list's 1..5 length and `MaxResults`' 1..50 range are MODELLED constraints
+        // the centralized walk has already refused anything outside of.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListInventoryEntriesErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the inventory store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        if !inventory::is_known_inventory_type(&input.type_name) {
+            return Err(ListInventoryEntriesErrorModeled::InvalidTypeNameException(
+                InvalidTypeNameException {
+                    message: Some(
+                        crate::state::custom_inventory::unknown_type_name_message(
+                            &input.type_name,
+                        ),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A filter narrows the entries by one attribute of the type the request named, so a
+        // key naming no attribute of a type whose schema this service publishes is refused
+        // before any entry is read.
+        let filters = input.filters.as_deref().unwrap_or_default();
+        for filter in filters {
+            if let Some(why) =
+                inventory::entry_filter_key_rejection(&input.type_name, &filter.key)
+            {
+                return Err(ListInventoryEntriesErrorModeled::InvalidFilter(InvalidFilter {
+                    message: Some(why.to_string()),
+                })
+                .into());
+            }
+        }
+
+        let page_size = inventory::inventory_entry_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // The registration an instance of this Region had already made by now was owed at the
+        // same instant whether or not anybody called, so it is materialised before the node's
+        // own item is projected — with no guard of it held.
+        crate::state::node_registration::settle_registrations(&*self.engine, &region);
+        let store = state.lock();
+        let held = inventory::held_item(&store, &region, &input.instance_id, &input.type_name);
+        let matching: Vec<&::std::collections::HashMap<String, String>> = held
+            .as_ref()
+            .map(|item| {
+                item.entries
+                    .iter()
+                    .filter(|entry| {
+                        filters.iter().all(|filter| {
+                            inventory::entry_matches(
+                                entry,
+                                &filter.key,
+                                &filter.values,
+                                filter.r#type.as_deref(),
+                            )
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // The token a page hands out is the position the next page starts at within the one
+        // item this read reports: an item's entries are a list with no key of their own, and
+        // the list changes only when a put replaces the whole item.
+        let start = match crate::state::non_empty(input.next_token.as_deref()) {
+            None => 0,
+            Some(token) => match token.parse::<usize>() {
+                Ok(at) if at <= matching.len() => at,
+                _ => {
+                    return Err(ListInventoryEntriesErrorModeled::InvalidNextToken(
+                        InvalidNextToken {
+                            message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+        // `start` is a position in `matching`, so the page is a suffix of it; `get` keeps
+        // that in-bounds without indexing on a value the request steers.
+        let page = matching.get(start..).unwrap_or_default();
+        let entries: Vec<::std::collections::HashMap<String, String>> =
+            page.iter().take(page_size).map(|entry| (*entry).clone()).collect();
+        // An entry is still waiting past this page: hand the caller the position it resumes
+        // at, so the next request continues where this one stopped.
+        let next_token = (page.len() > entries.len()).then(|| (start + entries.len()).to_string());
+
+        Ok(ListInventoryEntriesOutput {
+            // "The type of inventory item returned by the request" and "the managed node ID
+            // targeted by the request": the two the request named.
+            type_name: Some(input.type_name),
+            instance_id: Some(input.instance_id),
+            schema_version: held.as_ref().map(|item| item.schema_version.clone()),
+            capture_time: held.and_then(|item| item.capture_time),
+            entries: Some(entries),
+            next_token,
+        })
     }
 }

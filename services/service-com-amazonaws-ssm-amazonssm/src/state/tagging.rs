@@ -7,7 +7,8 @@
 //! `(ResourceType, ResourceId)` — "Use the ID of the resource", which for `Document` and
 //! `Parameter` is "the name of the resource", for `ManagedInstance` is the `mi-ID_number`
 //! node id (`AddTagsToResourceRequest$ResourceId`) and for an `OpsItem`, a
-//! `CloudConnector`, an `Association` or a `MaintenanceWindow` is the id its create minted
+//! `CloudConnector`, an `Association` or a `MaintenanceWindow` is the id its create minted,
+//! and for an `OpsMetadata` object is the ARN its create minted
 //! — and that pair
 //! resolves to the ONE record the Region holds for it. Each such record owns its tag
 //! set, so a tag written through `AddTagsToResource` is the tag `ListTagsForResource`
@@ -39,6 +40,11 @@ pub const TAGGING_TYPE_MANAGED_INSTANCE: &str = "ManagedInstance";
 
 /// The `ResourceTypeForTagging` value whose id is an OpsItem's own id (same enum).
 pub const TAGGING_TYPE_OPS_ITEM: &str = "OpsItem";
+
+/// The `ResourceTypeForTagging` value whose id is an OpsMetadata object's ARN (same enum):
+/// an OpsMetadata object is addressed by the ARN its create minted and by nothing else, so
+/// that ARN is the "ID of the resource" a tag request names it by.
+pub const TAGGING_TYPE_OPS_METADATA: &str = "OpsMetadata";
 
 /// The `ResourceTypeForTagging` value whose id is a cloud connector's minted id
 /// (`super::cloud_connectors::CLOUD_CONNECTOR_RESOURCE_TYPE`, from the same enum).
@@ -149,6 +155,9 @@ impl ComAmazonawsSsmAmazonssmState {
                 .managed_node(region, resource_id)
                 .map(|held| &held.tags),
             TAGGING_TYPE_OPS_ITEM => self.ops_item(region, resource_id).map(|held| &held.tags),
+            TAGGING_TYPE_OPS_METADATA => self
+                .ops_metadata_object(region, resource_id)
+                .map(|held| &held.tags),
             TAGGING_TYPE_CLOUD_CONNECTOR => self
                 .cloud_connector(region, resource_id)
                 .map(|held| &held.tags),
@@ -185,6 +194,9 @@ impl ComAmazonawsSsmAmazonssmState {
                 .map(|held| &mut held.tags),
             TAGGING_TYPE_OPS_ITEM => self
                 .ops_item_mut(region, resource_id)
+                .map(|held| &mut held.tags),
+            TAGGING_TYPE_OPS_METADATA => self
+                .ops_metadata_object_mut(region, resource_id)
                 .map(|held| &mut held.tags),
             TAGGING_TYPE_CLOUD_CONNECTOR => self
                 .cloud_connector_mut(region, resource_id)

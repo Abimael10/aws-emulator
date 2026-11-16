@@ -21,9 +21,10 @@
 //! reported by nothing and selected by no filter — the same rule
 //! [`super::ManagedNodeRecord::filter_values`] follows for the node describes. The other
 //! types are types this service knows and holds no item of, because the only item derived
-//! here is the node's own and `PutInventory` — the operation a caller writes an item
-//! with — is still a scaffold: a query for one of those types is answered with the nothing
-//! that has been collected for it, never refused.
+//! here is the node's own and the only items a caller writes are the `Custom:` ones
+//! ([`super::custom_inventory`], written by `PutInventory` and removed by `DeleteInventory`):
+//! a query for one of those types is answered with the nothing that has been collected for
+//! it, never refused.
 //!
 //! AGGREGATION is narrower than filtering: only some attributes of a type can be counted
 //! over. "Returns inventory schemas that support aggregation. For example, this call
@@ -33,7 +34,9 @@
 //! expression over this type may name ([`INSTANCE_INFORMATION_AGGREGATABLE_ATTRIBUTES`]),
 //! and an expression naming another attribute of it is refused rather than counted.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use crate::ops::types::{InventoryItemAttribute, InventoryItemSchema};
 
 use super::ManagedNodeRecord;
 
@@ -276,6 +279,13 @@ pub fn inventory_page_size(max_results: Option<i32>) -> Result<usize, String> {
     )
 }
 
+/// The page a read of ONE node's inventory entries serves (`ListInventoryEntriesRequest`'s
+/// `MaxResults`, range 1..50 — the same bounds the cross-node query carries, so the one
+/// reading answers both).
+pub fn inventory_entry_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    inventory_page_size(max_results)
+}
+
 /// The inventory type and the attribute of it a dotted name carries
 /// (`AWS:InstanceInformation.PlatformType` → `("AWS:InstanceInformation",
 /// "PlatformType")`), or `None` when the name is not that form.
@@ -335,6 +345,187 @@ pub fn aggregator_expression_rejection(expression: &str) -> Option<&'static str>
     let not_aggregatable = type_name == INVENTORY_TYPE_INSTANCE_INFORMATION
         && !INSTANCE_INFORMATION_AGGREGATABLE_ATTRIBUTES.contains(&attribute);
     not_aggregatable.then_some(INVALID_AGGREGATOR)
+}
+
+/// The published bounds of a schema read's page (`GetInventorySchemaMaxResults`, range
+/// 50..200). The maximum is also the page a request naming no `MaxResults` is served: "the
+/// maximum number of items to return for this call" bounds a page the caller asked to be
+/// bounded, so a caller asking for no bound is served the whole page the operation allows.
+pub const MIN_INVENTORY_SCHEMA_PAGE_SIZE: i32 = 50;
+
+/// See [`MIN_INVENTORY_SCHEMA_PAGE_SIZE`].
+pub const MAX_INVENTORY_SCHEMA_PAGE_SIZE: i32 = 200;
+
+/// The page a schema read serves, or the refusal message for a `MaxResults` outside the
+/// modelled range — which the boundary validator already refuses, so this is a backstop
+/// rather than the first line of defence.
+pub fn schema_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    super::page_size(
+        max_results,
+        MIN_INVENTORY_SCHEMA_PAGE_SIZE,
+        MAX_INVENTORY_SCHEMA_PAGE_SIZE,
+    )
+}
+
+/// The inventory schemas this endpoint reports for `region`, keyed by type name — the order
+/// a schema read walks them in, which is what lets a page resume from the type name it
+/// stopped at rather than from an offset.
+///
+/// A schema is reported for a type whose ATTRIBUTES this endpoint knows:
+///
+/// * [`INVENTORY_TYPE_INSTANCE_INFORMATION`], whose schema this service publishes
+///   ([`INSTANCE_INFORMATION_ATTRIBUTES`]) because the item is the projection of the node
+///   record;
+/// * every custom type the Region holds items of, whose schema is what those items say
+///   ([`super::custom_inventory::custom_type_schema`]).
+///
+/// The other default type NAMES this service knows ([`DEFAULT_INVENTORY_TYPES`]) are types it
+/// holds no schema of — nothing here describes what an `AWS:Network` item carries — and
+/// `InventoryItemSchema$Attributes` is `@required` with at least one attribute, so there is no
+/// schema to report for them rather than one with no attributes.
+///
+/// `aggregatable_only` reports the schemas that "support aggregation", with only the
+/// attributes an aggregator may count over (`GetInventorySchemaRequest$Aggregator`): for the
+/// one type whose aggregatable attributes this service knows that is
+/// [`INSTANCE_INFORMATION_AGGREGATABLE_ATTRIBUTES`], and a custom type supports no
+/// aggregation this service knows of, so none is reported.
+pub fn reported_schemas(
+    store: &super::ComAmazonawsSsmAmazonssmState,
+    region: &str,
+    aggregatable_only: bool,
+) -> BTreeMap<String, InventoryItemSchema> {
+    let mut schemas = BTreeMap::new();
+    let attributes: &[&str] = if aggregatable_only {
+        INSTANCE_INFORMATION_AGGREGATABLE_ATTRIBUTES
+    } else {
+        INSTANCE_INFORMATION_ATTRIBUTES
+    };
+    schemas.insert(
+        INVENTORY_TYPE_INSTANCE_INFORMATION.to_string(),
+        InventoryItemSchema {
+            type_name: INVENTORY_TYPE_INSTANCE_INFORMATION.to_string(),
+            version: Some(INSTANCE_INFORMATION_SCHEMA_VERSION.to_string()),
+            attributes: attributes
+                .iter()
+                .map(|name| InventoryItemAttribute {
+                    name: (*name).to_string(),
+                    // Every property of a node record is text, including the ones whose
+                    // values look like numbers (an agent version, a platform version).
+                    data_type: super::custom_inventory::ATTRIBUTE_DATA_TYPE_STRING.to_string(),
+                })
+                .collect(),
+            // "The alias name of the inventory type … used for display purposes": Systems
+            // Manager publishes this type under its own name and this service holds no alias
+            // beside it, so none is invented.
+            display_name: None,
+        },
+    );
+    if aggregatable_only {
+        return schemas;
+    }
+    let custom: BTreeSet<&str> = store.custom_inventory_types_in_region(region).collect();
+    for type_name in custom {
+        if let Some(schema) = super::custom_inventory::custom_type_schema(
+            type_name,
+            store.custom_inventory_of_type(region, type_name),
+        ) {
+            schemas.insert(type_name.to_string(), schema);
+        }
+    }
+    schemas
+}
+
+/// One inventory item this endpoint holds about one node, as a read of that node's entries
+/// reports it.
+#[derive(Debug, Clone)]
+pub struct HeldInventoryItem {
+    /// "The inventory schema version used by the managed nodes."
+    pub schema_version: String,
+    /// "The time that inventory information was collected for the managed nodes", or `None`
+    /// when nothing recorded it.
+    pub capture_time: Option<String>,
+    /// "A list of inventory items on the managed nodes": the entries the item carries.
+    pub entries: Vec<HashMap<String, String>>,
+}
+
+/// The item `region` holds of `type_name` about the node `node_id`, or `None` when it holds
+/// none.
+///
+/// The two kinds of item this endpoint holds, and nothing else:
+///
+/// * [`INVENTORY_TYPE_INSTANCE_INFORMATION`] is the PROJECTION of the registered node
+///   ([`instance_information_content`]), so it exists exactly for a node the Region holds and
+///   carries one entry — the node's own properties;
+/// * a `Custom:` type is what a put wrote ([`super::custom_inventory`]), with the schema
+///   version, the capture time and the entries that put supplied.
+///
+/// A default type this service publishes no schema of holds no item: nothing collects one
+/// (see the module docs), so a read of it reports nothing rather than inventing it.
+pub fn held_item(
+    store: &super::ComAmazonawsSsmAmazonssmState,
+    region: &str,
+    node_id: &str,
+    type_name: &str,
+) -> Option<HeldInventoryItem> {
+    if type_name == INVENTORY_TYPE_INSTANCE_INFORMATION {
+        let node = store.managed_node(region, node_id)?;
+        return Some(HeldInventoryItem {
+            schema_version: INSTANCE_INFORMATION_SCHEMA_VERSION.to_string(),
+            capture_time: capture_time(node),
+            entries: vec![instance_information_content(node)],
+        });
+    }
+    let item = store
+        .custom_inventory_of_node(region, node_id)
+        .find(|held| held.type_name == type_name)?;
+    Some(HeldInventoryItem {
+        schema_version: item.schema_version.clone(),
+        capture_time: Some(item.capture_time.clone()),
+        entries: item.content.clone(),
+    })
+}
+
+/// Whether one inventory ENTRY satisfies one filter: the entry's value for the filter's key
+/// stands in the filter's relation to one of its values.
+///
+/// The same rule [`matches_filter`] follows for a node's own item, over the entries of an
+/// item instead: `Exists` asks only whether the attribute is reported, every other operator
+/// is the comparison this service makes wherever it filters
+/// ([`super::operator_matches`]), and an entry that reports no value for the attribute
+/// satisfies no filter on it.
+pub fn entry_matches(
+    entry: &HashMap<String, String>,
+    key: &str,
+    values: &[String],
+    operator: Option<&str>,
+) -> bool {
+    let Some(held) = entry.get(key) else {
+        return false;
+    };
+    // The modelled operator defaults to `Equal`, the comparison a filter that names none
+    // makes.
+    let operator = operator.unwrap_or(super::OPERATOR_EQUAL);
+    if operator == OPERATOR_EXISTS {
+        return true;
+    }
+    values
+        .iter()
+        .any(|wanted| super::operator_matches(operator, held, wanted))
+}
+
+/// Why a filter key cannot be served by a read of ONE inventory type's entries, or `None`
+/// when it can.
+///
+/// Such a filter names an attribute of the type the read already named, so the key is a bare
+/// attribute name rather than the dotted form a cross-type query carries
+/// ([`filter_key_rejection`]). For the one type whose schema this service publishes the
+/// attribute has to be one of that schema's ([`INSTANCE_INFORMATION_ATTRIBUTES`]); for a
+/// custom type the attributes are whatever its items carry, so any name is one that type may
+/// publish and the filter is served — against the entries that hold it — rather than refused.
+pub fn entry_filter_key_rejection(type_name: &str, key: &str) -> Option<&'static str> {
+    let unknown_attribute = type_name == INVENTORY_TYPE_INSTANCE_INFORMATION
+        && !INSTANCE_INFORMATION_ATTRIBUTES.contains(&key);
+    (key.is_empty() || unknown_attribute).then_some(INVALID_FILTER)
 }
 
 /// The value `node` reports for one attribute of its `AWS:InstanceInformation` item, or

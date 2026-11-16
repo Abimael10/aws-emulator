@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCloudConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCloudConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes the cloud connector an id names at the Region this request was signed for, so it
+//! leaves [`crate::state::cloud_connectors`] and no later read reports it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCloudConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `CloudConnectorId` is minted by the create and chosen by no caller, so an id this
+//! Region holds no connector under names one that was never created, was created through
+//! another Region's endpoint, or has already been deleted — which is what the modelled
+//! `ResourceNotFoundException` reports, in the one sentence every operation of this service
+//! that resolves a connector id states
+//! ([`crate::state::cloud_connectors::CLOUD_CONNECTOR_NOT_FOUND`]), so a read and a delete of
+//! the same absent connector are worded alike.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +145,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCloudConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCloudConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCloudConnector"))
+        // `CloudConnectorId`'s presence, its 36-character length and its hex-UUID pattern are
+        // MODELLED constraints the centralized walk has already refused anything outside of:
+        // reaching here means the id is shaped like one this service mints, and the only
+        // question left is whether this Region holds a connector under it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteCloudConnectorErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the cloud connector store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let removed = state
+            .lock()
+            .remove_cloud_connector(&region, &input.cloud_connector_id);
+        if !removed {
+            return Err(DeleteCloudConnectorErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(
+                        crate::state::cloud_connectors::CLOUD_CONNECTOR_NOT_FOUND.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "The ID of the cloud connector that was deleted": the id this call resolved, which
+        // is the key the connector was held under.
+        Ok(DeleteCloudConnectorOutput {
+            cloud_connector_id: Some(input.cloud_connector_id),
+        })
     }
 }

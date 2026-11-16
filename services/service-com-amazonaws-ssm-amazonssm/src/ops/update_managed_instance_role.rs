@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateManagedInstanceRole
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateManagedInstanceRole`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Changes the IAM role a registered hybrid node is managed under: the node the request
+//! names in [`crate::state::ComAmazonawsSsmAmazonssmState::managed_nodes`] takes the role the
+//! request carries, which is what the node describes then report as its `IamRole`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateManagedInstanceRole::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The decisions, in the order they are taken:
+//!
+//! 1. the Region has to hold a node under that id — "the ID of the managed node where you
+//!    want to update the role" — and an id it holds none under is answered with the modelled
+//!    `InvalidInstanceId`, carrying no message of its own (recorded behaviour, see the
+//!    handler);
+//! 2. the role has to be one this service can act as: "this IAM role must provide AssumeRole
+//!    permissions for the … Systems Manager service principal ssm.amazonaws.com"
+//!    (`UpdateManagedInstanceRoleRequest$IamRole`), which is the same reading of a
+//!    caller-supplied role `CreateActivation` takes ([`crate::state::activation_role`]) and
+//!    is grounded in what IAM answered about it.
+//!
+//! A refused update writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +157,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateManagedInstanceRole` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateManagedInstanceRoleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `InstanceId`'s pattern and length and `IamRole`'s presence and length are MODELLED
+        // constraints the centralized walk has already refused anything outside of.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateManagedInstanceRoleErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the managed node store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        // Whether this endpoint holds the node at all is decided first, with no guard held
+        // across the role question below: an id this Region holds no node under names nothing
+        // to update, whatever role the request carries.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateManagedInstanceRole"))
+        // RECORDED BEHAVIOUR (corpus `simparity-behavioral-aws-v1`, unit
+        // `ssm.update-managed-instance-role-invalid-instance-rejected`): that refusal is 400
+        // `InvalidInstanceId` carrying an EMPTY message, so the error code is the whole
+        // statement and none is invented here.
+        let invalid_instance = || {
+            UpdateManagedInstanceRoleError::from(
+                UpdateManagedInstanceRoleErrorModeled::InvalidInstanceId(InvalidInstanceId {
+                    message: None,
+                }),
+            )
+        };
+        if state.lock().managed_node(&region, &input.instance_id).is_none() {
+            return Err(invalid_instance());
+        }
+
+        // The node is managed UNDER the role this update names, so the role has to exist and
+        // admit this service the assume before the node takes it. The refusal is grounded in
+        // what IAM answered about the role, and nothing is written when it is refused.
+        if let Some(why) =
+            crate::state::activation_role::refusal(ctx, &region, &input.iam_role).await
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+
+        let mut store = state.lock();
+        let Some(node) = store.managed_node_mut(&region, &input.instance_id) else {
+            // The node was deregistered while the role was being resolved, which leaves the
+            // id naming no node exactly as it would have a moment earlier.
+            return Err(invalid_instance());
+        };
+        // "The name of the … role that you want to assign to the managed node": the node
+        // reports the role it is managed under, so the update replaces that member and
+        // nothing else about the node.
+        node.properties.iam_role = Some(input.iam_role);
+
+        Ok(UpdateManagedInstanceRoleOutput {})
     }
 }

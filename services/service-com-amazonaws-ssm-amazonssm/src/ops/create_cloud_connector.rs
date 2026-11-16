@@ -16,6 +16,13 @@
 //! ([`crate::state::cloud_connectors::MAX_CLOUD_CONNECTORS`]): a create past that
 //! ceiling is refused with `ServiceQuotaExceededException` and writes nothing.
 //!
+//! One member is resolved before anything is minted: the connector "uses [the IAM role
+//! `RoleArn` names] to communicate with the third-party cloud environment", so that role
+//! has to exist and admit this service the assume, which is the reading
+//! [`crate::state::activation_role`] holds for every member of this service that hands it a
+//! role. A create naming a role IAM answered about that way is refused 400
+//! `ValidationException` and writes nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -175,6 +182,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let region = crate::state::request_region(ctx.parts());
+        // A connector "uses [this role] to communicate with the third-party cloud
+        // environment", so the role has to exist and admit this service the assume before a
+        // connector is minted against it — the same reading of a caller-supplied role every
+        // other member of this service that hands it one takes
+        // ([`crate::state::activation_role`]). The refusal is grounded in what IAM answered
+        // about the role, and nothing is written when it is refused.
+        if let Some(why) =
+            crate::state::activation_role::arn_refusal(ctx, &region, &input.role_arn).await
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 

@@ -159,6 +159,17 @@
 //! what it persisted once the service has had time to work it out. Nothing is run and no
 //! resource is touched: a preview is the report of what an execution WOULD do.
 //!
+//! Then the **OpsMetadata objects** Application Manager holds ([`ops_metadata`]), keyed by
+//! `(region, OpsMetadata ARN)`: `CreateOpsMetadata` registers one for an application,
+//! `GetOpsMetadata` reports the metadata it holds and `DeleteOpsMetadata` removes it. The
+//! ARN is minted by the create, so an ARN nothing created names no object — and one naming
+//! another account names no object of this requester's at all.
+//!
+//! Beside the node inventory is the **custom inventory** a caller writes
+//! ([`custom_inventory`]), keyed by `(region, node id, type name)`: `PutInventory` writes one
+//! item per custom type per node and `DeleteInventory` removes the items of a type, which is
+//! what makes the custom types a Region holds exactly the types its items are written under.
+//!
 //! Last is the account's **service settings** ([`service_settings`]):
 //! `GetServiceSetting` reports one, `UpdateServiceSetting` overwrites it and
 //! `ResetServiceSetting` restores the value its service team provisioned. The settings an
@@ -277,6 +288,18 @@ pub mod patch_properties;
 /// `AWS:InstanceInformation` item every registered node has — and how a query filters and
 /// aggregates it.
 pub mod inventory;
+
+/// The CUSTOM inventory a caller writes about its nodes, the types those items register, and
+/// the deletions that remove them again.
+pub mod custom_inventory;
+
+/// The per-patch compliance data a patching operation reported for one node, and the filter
+/// keys and page a read of it accepts.
+pub mod instance_patches;
+
+/// The OpsMetadata objects Application Manager holds for this account: what a create
+/// persists, the ARN it is reached by, and the two ways an ARN can name none.
+pub mod ops_metadata;
 
 /// Which of the account's Amazon EC2 instances are registered with Systems Manager as
 /// managed nodes, and the node record that registration writes.
@@ -1977,6 +2000,24 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// ([`ComAmazonawsSsmAmazonssmState::next_related_item_association_id`]).
     pub ops_item_related_item_sequence: u64,
 
+    /// Every OpsMetadata object, keyed by `(region, OpsMetadata ARN)`: an object is created
+    /// through one Region's endpoint and is reached there by the ARN the create minted
+    /// ([`ops_metadata::ops_metadata_arn`]), which is the only thing the reads take. A
+    /// `BTreeMap` so a listing walks a stable, total order.
+    pub ops_metadata: BTreeMap<(String, String), ops_metadata::OpsMetadataRecord>,
+
+    /// Every custom inventory item a caller wrote, keyed by `(region, node id, type name)`:
+    /// one item per inventory type per node, which is what makes a second put of that type
+    /// an update of the item rather than a second one. See [`custom_inventory`].
+    pub custom_inventory:
+        BTreeMap<(String, String, String), custom_inventory::CustomInventoryItemRecord>,
+
+    /// Every inventory deletion a `DeleteInventory` recorded, keyed by `(region, deletion
+    /// id)`: the id a delete hands back resolves to the deletion it names, and the client
+    /// token a delete carried is what makes a repeat of it the same deletion.
+    pub inventory_deletions:
+        BTreeMap<(String, String), custom_inventory::InventoryDeletionRecord>,
+
     /// Every service setting an account has MODIFIED, keyed by `(region, setting id)`: a
     /// setting is reached through one Region's endpoint and its ARN names that Region. A
     /// setting nobody has modified holds no entry and is reported from the catalogue
@@ -2117,6 +2158,9 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             ops_item_event_sequence: 0,
             ops_item_related_items: BTreeMap::new(),
             ops_item_related_item_sequence: 0,
+            ops_metadata: BTreeMap::new(),
+            custom_inventory: BTreeMap::new(),
+            inventory_deletions: BTreeMap::new(),
             service_settings: BTreeMap::new(),
             created_at: SystemTime::now(),
             resource_policies: resource_policies::ResourcePolicyStore::default(),
@@ -2601,6 +2645,18 @@ impl ComAmazonawsSsmAmazonssmState {
         };
         self.managed_nodes.insert((region.to_string(), id), node);
         true
+    }
+
+    /// Drop the managed node `id` names in `region`, answering whether one was held.
+    ///
+    /// This is a node DEREGISTRATION — "removes the server or virtual machine from the list
+    /// of registered servers" (`DeregisterManagedInstance`) — so the node goes whole, with
+    /// the tags it carried; an id the Region holds no node under is what the deregister
+    /// refuses as an invalid node id.
+    pub fn remove_managed_node(&mut self, region: &str, id: &str) -> bool {
+        self.managed_nodes
+            .remove(&(region.to_string(), id.to_string()))
+            .is_some()
     }
 }
 

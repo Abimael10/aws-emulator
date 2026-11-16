@@ -311,6 +311,14 @@ impl super::ComAmazonawsSsmAmazonssmState {
         self.cloud_connectors.insert(key, record);
     }
 
+    /// Drop the cloud connector `id` names in `region`, answering whether one was held —
+    /// which is what tells a delete that removed a connector from one whose id names none.
+    pub fn remove_cloud_connector(&mut self, region: &str, id: &str) -> bool {
+        self.cloud_connectors
+            .remove(&(region.to_string(), id.to_string()))
+            .is_some()
+    }
+
     /// Every cloud connector `region` holds, in ascending connector-id order.
     ///
     /// The order is what makes a listing's resume cursor total: the token a page hands back

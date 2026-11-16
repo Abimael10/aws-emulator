@@ -398,6 +398,18 @@ pub const COMPARISON_LESS_THAN: &str = "LessThan";
 pub const COMPARISON_GREATER_THAN: &str = "GreaterThan";
 
 impl ComAmazonawsSsmAmazonssmState {
+    /// The patch compliance report `region` holds for the node `instance_id`, or `None` when
+    /// no patching operation has reported for that node — which is what a read of one node's
+    /// patches resolves before it reports anything.
+    pub fn instance_patch_state(
+        &self,
+        region: &str,
+        instance_id: &str,
+    ) -> Option<&InstancePatchStateRecord> {
+        self.instance_patch_states
+            .get(&(region.to_string(), instance_id.to_string()))
+    }
+
     /// Store `report` as the patch compliance state of its node in `region`, superseding
     /// whatever the previous patching operation on that node reported.
     ///

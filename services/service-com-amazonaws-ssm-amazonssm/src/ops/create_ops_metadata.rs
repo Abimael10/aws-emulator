@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOpsMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOpsMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Registers an OpsMetadata object for an Application Manager application and persists it in
+//! [`crate::state::ops_metadata`], where `GetOpsMetadata` reads it back and
+//! `DeleteOpsMetadata` removes it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOpsMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The object is held at the Region whose endpoint created it, under the
+//! `OpsMetadataArn` this call MINTS from the application the `ResourceId` names
+//! ([`crate::state::ops_metadata::ops_metadata_arn`]) — no input member carries an ARN, so a
+//! create is the only thing that admits one, and a second create for the same application is
+//! the `OpsMetadataAlreadyExistsException` rather than a second object.
+//!
+//! Everything a read reports is what this call persisted: the `ResourceId` exactly as it was
+//! supplied, and the metadata entries it carried. The store is bounded
+//! ([`crate::state::ops_metadata::MAX_OPS_METADATA`]): a create past that ceiling is refused
+//! with `OpsMetadataLimitExceededException` and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +164,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOpsMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOpsMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOpsMetadata"))
+        use crate::state::ops_metadata as metadata;
+
+        // `ResourceId`'s presence and its 1..1024 length, the `Metadata` map's 1..5 size and
+        // every tag's shape are MODELLED constraints the centralized walk has already refused
+        // anything outside of.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateOpsMetadataErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the OpsMetadata store is unavailable".to_string()),
+            })
+        })?;
+
+        // The ARN this object is reached by carries the application's own name, and the
+        // modelled `OpsMetadataArn` admits a narrower character set than a `ResourceId` does:
+        // an id whose name could not be spelled inside that ARN names no application an
+        // object can be registered for.
+        let Some(application) = metadata::application_name(&input.resource_id) else {
+            return Err(
+                CreateOpsMetadataErrorModeled::OpsMetadataInvalidArgumentException(
+                    OpsMetadataInvalidArgumentException {
+                        message: Some(metadata::OPS_METADATA_RESOURCE_ID_INVALID.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = metadata::ops_metadata_arn(&region, application);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // "An OpsMetadata object already exists for the specified resource": the ARN is
+        // derived from the application, so an object already held under it is this
+        // application's own.
+        if store.ops_metadata_object(&region, &arn).is_some() {
+            return Err(
+                CreateOpsMetadataErrorModeled::OpsMetadataAlreadyExistsException(
+                    OpsMetadataAlreadyExistsException {
+                        message: Some(metadata::ops_metadata_already_exists_message(&arn)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store is BOUNDED: past the emulator's own ceiling a create is refused rather
+        // than admitting another record, through the modelled refusal for exactly that.
+        if !store.can_hold_another_ops_metadata() {
+            return Err(
+                CreateOpsMetadataErrorModeled::OpsMetadataLimitExceededException(
+                    OpsMetadataLimitExceededException {
+                        message: Some(metadata::ops_metadata_ceiling_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store.insert_ops_metadata(metadata::OpsMetadataRecord {
+            arn: arn.clone(),
+            region,
+            resource_id: input.resource_id,
+            metadata: metadata::to_metadata_entries(input.metadata),
+            tags: crate::state::to_btree_map(input.tags),
+            created_at: now,
+        });
+
+        // "The Amazon Resource Name (ARN) of the OpsMetadata Object": the ARN this call
+        // minted, which is the key the object is now held under.
+        Ok(CreateOpsMetadataOutput {
+            ops_metadata_arn: Some(arn),
+        })
     }
 }

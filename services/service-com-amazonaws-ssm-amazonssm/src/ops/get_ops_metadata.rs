@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetOpsMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetOpsMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the OpsMetadata object an `OpsMetadataArn` names at the Region this request was
+//! signed for: the `ResourceId` the create supplied and the metadata entries it persisted,
+//! read out of [`crate::state::ops_metadata`].
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetOpsMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The two ways an ARN names no object of this requester's are DIFFERENT refusals, and the
+//! order between them is what keeps a caller from learning what another account holds:
+//!
+//! 1. an ARN naming another ACCOUNT is answered `OpsMetadataInvalidArgumentException`
+//!    ([`crate::state::ops_metadata::OPS_METADATA_NOT_THE_OWNER`]), before the store is
+//!    looked at;
+//! 2. an ARN of this account that this Region holds no object under is answered
+//!    `OpsMetadataNotFoundException`
+//!    ([`crate::state::ops_metadata::OPS_METADATA_NOT_FOUND`]).
+//!
+//! The entries are served one page at a time — `MaxResults` bounds the page and the
+//! `NextToken` a page hands back is the metadata key the next one resumes at, so a resume is
+//! a key rather than an offset into a map that may have changed.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +158,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetOpsMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetOpsMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetOpsMetadata"))
+        use crate::state::ops_metadata as metadata;
+
+        // `OpsMetadataArn`'s presence, its 1..1011 length and its ARN pattern are MODELLED
+        // constraints the centralized walk has already refused anything outside of, and so is
+        // `MaxResults`' 1..10 range: reaching here means the value is shaped like an
+        // OpsMetadata ARN, and what is left is whose it is and whether it names an object.
+        let invalid_argument = |message: String| {
+            GetOpsMetadataError::from(
+                GetOpsMetadataErrorModeled::OpsMetadataInvalidArgumentException(
+                    OpsMetadataInvalidArgumentException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetOpsMetadataError::from(GetOpsMetadataErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the OpsMetadata store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // Whose the ARN is comes first: an object of another account is not this requester's
+        // to read, and answering that before the store is read is what keeps a not-found from
+        // reporting on another account's resources.
+        if !metadata::names_this_account(&input.ops_metadata_arn) {
+            return Err(invalid_argument(
+                metadata::OPS_METADATA_NOT_THE_OWNER.to_string(),
+            ));
+        }
+
+        let page_size = metadata::ops_metadata_page_size(input.max_results)
+            .map_err(invalid_argument)?;
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        let Some(record) = store.ops_metadata_object(&region, &input.ops_metadata_arn) else {
+            return Err(GetOpsMetadataErrorModeled::OpsMetadataNotFoundException(
+                OpsMetadataNotFoundException {
+                    message: Some(metadata::OPS_METADATA_NOT_FOUND.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The token a page hands out is the metadata key the next page starts at, so a value
+        // that is no key of this object names no page of this object to resume.
+        let resume_from = match crate::state::non_empty(input.next_token.as_deref()) {
+            None => None,
+            Some(token) if record.metadata.contains_key(token) => Some(token),
+            Some(_) => return Err(invalid_argument(crate::state::INVALID_NEXT_TOKEN.to_string())),
+        };
+
+        let entries: Vec<(&String, &String)> = record
+            .metadata
+            .iter()
+            .skip_while(|(key, _)| resume_from.is_some_and(|from| key.as_str() != from))
+            .collect();
+        let page = entries.iter().take(page_size).copied();
+        // An entry is still waiting past this page: hand the caller the key it resumes at.
+        let next_token = entries.get(page_size).map(|(key, _)| (*key).clone());
+
+        Ok(GetOpsMetadataOutput {
+            resource_id: Some(record.resource_id.clone()),
+            metadata: Some(metadata::to_metadata_map(page)),
+            next_token,
+        })
     }
 }

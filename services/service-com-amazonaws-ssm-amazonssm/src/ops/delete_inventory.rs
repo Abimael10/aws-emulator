@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteInventory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteInventory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes the CUSTOM inventory a Region holds of one type and records the deletion in
+//! [`crate::state::custom_inventory`], so the id it hands back names the deletion it
+//! performed.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteInventory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Delete a custom inventory type or the data associated with a custom Inventory type" — so
+//! the type has to be a custom one ([`crate::state::custom_inventory::is_custom_type`]): a
+//! name in the `AWS:` namespace is a type Systems Manager publishes and gathers itself, and
+//! a custom name this Region holds no inventory of names no schema to delete. Both are the
+//! modelled `InvalidTypeNameException`.
+//!
+//! What each form of the request does to the store:
+//!
+//! * `DryRun` "views a summary of the deletion request without deleting any data or the data
+//!   type", so the items are COUNTED and left where they are, and the summary reports every
+//!   one of them as remaining.
+//! * Every other form removes the items of that type. A custom type's schema is not a record
+//!   of its own here — the type exists exactly while some node holds an item under it — so
+//!   deleting the data, deleting the schema (`DeleteSchema`) and ignoring "all inventory data
+//!   for the specified version, and any earlier versions" (`DisableSchema`, after which "you
+//!   must call the `PutInventory` operation for a version greater than the disabled
+//!   version") all leave the same store: the type holds nothing, and a later put admits it
+//!   again. Which option the request carried is recorded with the deletion.
+//!
+//! `ClientToken` is an `@idempotencyToken`, so a repeat of a request this Region has already
+//! served is answered with the deletion it recorded then rather than performing a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +190,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteInventory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteInventoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteInventory"))
+        use crate::state::custom_inventory as custom;
+
+        // `TypeName`'s presence, its 1..100 length and its `^(AWS|Custom):.*$` pattern, the
+        // `SchemaDeleteOption` value set and the `ClientToken` form are MODELLED constraints
+        // the centralized walk has already refused anything outside of.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteInventoryError::from(DeleteInventoryErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the inventory store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let invalid_type_name = |message: String| {
+            DeleteInventoryError::from(DeleteInventoryErrorModeled::InvalidTypeNameException(
+                InvalidTypeNameException {
+                    message: Some(message),
+                },
+            ))
+        };
+
+        // Only a custom type can be deleted: a name in the `AWS:` namespace names a type
+        // Systems Manager publishes, which is not the account's to delete.
+        if !custom::is_custom_type(&input.type_name) {
+            return Err(invalid_type_name(
+                custom::PREDEFINED_TYPE_NOT_DELETABLE.to_string(),
+            ));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A repeat of a request this Region has already served is the SAME deletion: the
+        // token makes the call idempotent, so it neither counts nor removes anything twice.
+        let client_token = crate::state::non_empty(input.client_token.as_deref());
+        if let Some(held) = client_token
+            .and_then(|token| store.inventory_deletion_of_token(&region, token))
+        {
+            return Ok(DeleteInventoryOutput {
+                deletion_id: Some(held.deletion_id.clone()),
+                type_name: Some(held.type_name.clone()),
+                deletion_summary: Some(held.to_summary()),
+            });
+        }
+
+        // The schema exists exactly while some node holds an item under it, so a type nothing
+        // was ever put under names no schema to delete.
+        let mut counts_by_version: ::std::collections::BTreeMap<String, i32> =
+            ::std::collections::BTreeMap::new();
+        for item in store.custom_inventory_of_type(&region, &input.type_name) {
+            *counts_by_version
+                .entry(item.schema_version.clone())
+                .or_default() += 1;
+        }
+        if counts_by_version.is_empty() {
+            return Err(invalid_type_name(custom::unknown_custom_type_message(
+                &input.type_name,
+            )));
+        }
+
+        // The record of this deletion is what the id it hands back resolves to, so a store
+        // that can hold no more of them cannot serve the request either.
+        if !store.can_record_another_inventory_deletion() {
+            return Err(
+                DeleteInventoryErrorModeled::InvalidInventoryRequestException(
+                    InvalidInventoryRequestException {
+                        message: Some(custom::custom_item_ceiling_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let total_count = counts_by_version.values().sum();
+        let record = custom::InventoryDeletionRecord {
+            // The id is the SERVICE's to choose: no input member carries one, and it is drawn
+            // from the crate's one identifier source.
+            deletion_id: crate::state::new_uuid(),
+            region: region.clone(),
+            type_name: input.type_name.clone(),
+            client_token: client_token.map(str::to_string),
+            total_count,
+            counts_by_version,
+            dry_run: input.dry_run,
+            schema_delete_option: input.schema_delete_option,
+            deleted_at: now,
+        };
+        if !record.dry_run {
+            store.remove_custom_inventory_of_type(&region, &input.type_name);
+        }
+        let summary = record.to_summary();
+        let deletion_id = record.deletion_id.clone();
+        store.insert_inventory_deletion(record);
+
+        Ok(DeleteInventoryOutput {
+            deletion_id: Some(deletion_id),
+            // "The name of the inventory data type specified in the request."
+            type_name: Some(input.type_name),
+            deletion_summary: Some(summary),
+        })
     }
 }

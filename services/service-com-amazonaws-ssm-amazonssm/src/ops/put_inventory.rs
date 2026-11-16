@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutInventory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutInventory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Writes the CUSTOM inventory items a request carries about one managed node and persists
+//! them in [`crate::state::custom_inventory`]: "bulk update custom inventory items on one or
+//! more managed nodes. The request adds an inventory item, if it doesn't already exist, or
+//! updates an inventory item, if it does exist" — so a second put of a type the node already
+//! holds an item of REPLACES that item rather than adding a second one.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutInventory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The decisions, in the order AWS takes them:
+//!
+//! 1. the CALLER's own identity-based IAM policies, which decide the call before the node is
+//!    resolved ([`crate::state::identity_authorization`]), so a caller holding no grant is
+//!    told it is not authorized rather than told whether the account holds that node;
+//! 2. the node: an id this Region has no registration of names no managed node to write
+//!    inventory about, which is the modelled `InvalidInstanceId`, carrying no message of its
+//!    own (recorded behaviour, see the handler);
+//! 3. each item's type name, which has to be one of the caller's own
+//!    ([`crate::state::custom_inventory::is_custom_type`]) — the `AWS:` namespace is the one
+//!    Systems Manager publishes schemas for and gathers itself, and
+//!    `AWS:InstanceInformation` in particular is the projection of the node record
+//!    ([`crate::state::inventory`]) rather than anything a caller writes;
+//! 4. the emulator's own ceilings on how many custom types and items this store holds.
+//!
+//! A refused put writes NOTHING: every item of the request is checked before the first one
+//! is persisted, so a request carrying one bad item leaves the node's inventory as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -107,9 +121,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssm-amazonssm.json");
 // here — hence the `PutInventoryError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssm#PutInventory")]
+// The operation's MODELED errors, plus the refusal a caller holding no grant gets:
+// `AccessDeniedException` is a shape this SERVICE models ("the requester doesn't have
+// permissions to perform the requested operation") that this operation's own `errors` list
+// omits, so it is widened in through `extra_errors` rather than answered as some other
+// status — an identity-based policy decides a signed call before the service resolves
+// anything the request names.
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssm#PutInventory",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum PutInventoryErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     CustomSchemaCountLimitExceededException(CustomSchemaCountLimitExceededException),
     InternalServerError(InternalServerError),
     InvalidInstanceId(InvalidInstanceId),
@@ -175,18 +199,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutInventory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutInventoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutInventory"))
+        use crate::state::custom_inventory as custom;
+
+        // `InstanceId`'s pattern, the `Items` list's 1..30 length and every item member's
+        // own shape — the type name's `^(AWS|Custom):.*$`, the schema version, the capture
+        // time — are MODELLED constraints the centralized walk has already refused anything
+        // outside of.
+        let region = crate::state::request_region(ctx.parts());
+
+        // The caller's own identity-based policies decide this call before the node is
+        // resolved. The resource is the node the request NAMED, built from the id it carried
+        // rather than from anything looked up, so a caller holding no grant cannot learn from
+        // the refusal whether that node exists.
+        if let Some(message) = crate::state::identity_authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::identity_authorization::instance_resource(&region, &input.instance_id),
+        ) {
+            return Err(
+                PutInventoryErrorModeled::AccessDeniedException(AccessDeniedException {
+                    message,
+                })
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutInventoryError::from(PutInventoryErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the inventory store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // RECORDED BEHAVIOUR (corpus `simparity-behavioral-aws-v1`, unit
+        // `ssm.put-inventory-unauthorized-principal-denied`): a put naming a node this
+        // account holds none of is answered 400 `InvalidInstanceId` carrying an EMPTY
+        // message, so the error code is the whole statement and none is invented here.
+        let invalid_instance = || {
+            PutInventoryError::from(PutInventoryErrorModeled::InvalidInstanceId(
+                InvalidInstanceId { message: None },
+            ))
+        };
+
+        // The registration an instance of this Region had already made by now was owed at the
+        // same instant whether or not anybody called, so it is materialised before the node
+        // store is read — with no guard of it held.
+        crate::state::node_registration::settle_registrations(&*self.engine, &region);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        if store.managed_node(&region, &input.instance_id).is_none() {
+            return Err(invalid_instance());
+        }
+
+        // Every item is checked before the first one is written, so a refused put leaves the
+        // node's inventory exactly as it was.
+        for item in &input.items {
+            if !custom::is_custom_type(&item.type_name) {
+                return Err(PutInventoryErrorModeled::InvalidTypeNameException(
+                    InvalidTypeNameException {
+                        message: Some(custom::uncustomizable_type_name_message(&item.type_name)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // What the put would leave this Region holding: the types it already holds items of,
+        // plus the ones these items would admit. The ceilings are the EMULATOR's own — the
+        // store is in memory for as long as the process runs — and a put past either of them
+        // writes nothing.
+        let mut types: ::std::collections::BTreeSet<&str> =
+            store.custom_inventory_types_in_region(&region).collect();
+        types.extend(input.items.iter().map(|item| item.type_name.as_str()));
+        if types.len() > custom::MAX_CUSTOM_INVENTORY_TYPES {
+            return Err(
+                PutInventoryErrorModeled::CustomSchemaCountLimitExceededException(
+                    CustomSchemaCountLimitExceededException {
+                        message: Some(custom::custom_schema_ceiling_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+        let admitted = input
+            .items
+            .iter()
+            .filter(|item| {
+                store
+                    .custom_inventory_of_node(&region, &input.instance_id)
+                    .all(|held| held.type_name != item.type_name)
+            })
+            .count();
+        if store.custom_inventory.len() + admitted > custom::MAX_CUSTOM_INVENTORY_ITEMS {
+            return Err(PutInventoryErrorModeled::TotalSizeLimitExceededException(
+                TotalSizeLimitExceededException {
+                    message: Some(custom::custom_item_ceiling_message()),
+                },
+            )
+            .into());
+        }
+
+        for item in input.items {
+            store.insert_custom_inventory(custom::CustomInventoryItemRecord {
+                region: region.clone(),
+                node_id: input.instance_id.clone(),
+                type_name: item.type_name,
+                schema_version: item.schema_version,
+                capture_time: item.capture_time,
+                content_hash: item.content_hash,
+                content: item.content.unwrap_or_default(),
+                written_at: now,
+            });
+        }
+
+        // `Message` is "information about the request", which Systems Manager sends nothing
+        // in for a put it accepted: the 200 is the whole answer, so none is invented here.
+        Ok(PutInventoryOutput { message: None })
     }
 }

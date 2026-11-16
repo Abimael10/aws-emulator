@@ -203,8 +203,9 @@ fn rows() -> Vec<Row> {
 }
 
 /// This service and IAM over ONE engine, so the role a create names is the record IAM's
-/// own handlers hold.
-fn router_with_iam() -> MultiServiceRouter {
+/// own handlers hold. Shared with the sibling suite that resolves a cloud connector's role
+/// through IAM ([`crate::cloud_connector_role_and_deletion`]).
+pub(crate) fn router_with_iam() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The signature itself is not under test here; the router still reads the SigV4
@@ -219,8 +220,9 @@ fn router_with_iam() -> MultiServiceRouter {
     router
 }
 
-/// One awsQuery call to IAM that must succeed, answering the XML body it served.
-async fn iam(router: &MultiServiceRouter, case: &str, action: &str, params: &[(&str, String)]) -> String {
+/// One awsQuery call to IAM that must succeed, answering the XML body it served. Shared with
+/// the sibling suite above.
+pub(crate) async fn iam(router: &MultiServiceRouter, case: &str, action: &str, params: &[(&str, String)]) -> String {
     let mut body = format!("Action={action}&Version=2010-05-08");
     for (name, value) in params {
         body.push('&');
@@ -252,8 +254,9 @@ async fn iam(router: &MultiServiceRouter, case: &str, action: &str, params: &[(&
     text
 }
 
-/// Create `role_name` under `path` carrying `trust` through IAM's own `CreateRole`.
-async fn create_role(
+/// Create `role_name` under `path` carrying `trust` through IAM's own `CreateRole`. Shared
+/// with the sibling suite above.
+pub(crate) async fn create_role(
     router: &MultiServiceRouter,
     case: &str,
     path: &str,
@@ -279,8 +282,8 @@ async fn create_role(
 
 /// `value` as an `application/x-www-form-urlencoded` field: everything but the unreserved
 /// characters percent-encoded, which is how an awsQuery client writes a policy document
-/// into a form body.
-fn form_encode(value: &str) -> String {
+/// into a form body. Shared with the sibling suite above.
+pub(crate) fn form_encode(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {

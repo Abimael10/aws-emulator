@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterManagedInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterManagedInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the registration of the managed node an id names at the Region this request was
+//! signed for, so it is no longer "in the list of registered servers": the node leaves
+//! [`crate::state::ComAmazonawsSsmAmazonssmState::managed_nodes`] with the tags it carried
+//! and the inventory written about it ([`crate::state::custom_inventory`]), because that
+//! inventory is inventory ABOUT a node no read resolves any more.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterManagedInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An id this Region holds no node under names nothing to deregister, which is what the
+//! modelled `InvalidInstanceId` reports — with no message of its own (recorded behaviour,
+//! see the handler), so the error code is the whole statement.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +145,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterManagedInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterManagedInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterManagedInstance"))
+        // `InstanceId`'s presence, its 20..124 length and its `mi-`/`eks_c:` pattern are
+        // MODELLED constraints the centralized walk has already refused anything outside of,
+        // so reaching here means the id is shaped like a managed node's and the only question
+        // left is whether this Region holds one under it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeregisterManagedInstanceErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the managed node store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        if !store.remove_managed_node(&region, &input.instance_id) {
+            // The id names no node this endpoint holds: it was never registered, or it has
+            // already been deregistered.
+            //
+            // RECORDED BEHAVIOUR (corpus `simparity-behavioral-aws-v1`, unit
+            // `ssm.deregister-managed-instance-rejects-unknown-id`): the refusal is 400
+            // `InvalidInstanceId` carrying an EMPTY message, so the error code is the whole
+            // statement and none is invented here — the sentence-carrying form of this
+            // refusal ([`crate::state::commands::NODES_NOT_IN_A_VALID_STATE`]) is what the
+            // operations that resolve a SET of nodes word it with.
+            return Err(DeregisterManagedInstanceErrorModeled::InvalidInstanceId(
+                InvalidInstanceId { message: None },
+            )
+            .into());
+        }
+        // The inventory written about that node is about a node that is no longer registered,
+        // so it goes with it rather than being left for an id nothing resolves.
+        store.remove_custom_inventory_of_node(&region, &input.instance_id);
+
+        Ok(DeregisterManagedInstanceOutput {})
     }
 }

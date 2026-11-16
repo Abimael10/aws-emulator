@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstancePatches
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstancePatches`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the patches one managed node has reported and their state against the patch
+//! baseline it is patched with ([`crate::state::instance_patches`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstancePatches::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The decisions, in order:
+//!
+//! 1. every `Filters` entry has to name a property of a patch this read knows
+//!    ([`crate::state::instance_patches::INSTANCE_PATCH_FILTER_KEYS`]) and carry a value to
+//!    search for. A filter that names neither is a refusal of the REQUEST, taken before any
+//!    node is resolved and worded as this service words an unknown patch filter key
+//!    ([`crate::state::instance_patch_states::unknown_filter_key`]);
+//! 2. the patches themselves, which are the ones that have been REPORTED for that node id.
+//!    Patch compliance is gathered inside the node by the patching operation Patch Manager
+//!    runs there, and no call of this service's model reports one, so an id nothing has
+//!    reported about is answered with the empty list — what this endpoint knows — rather than
+//!    compliance nobody collected, and rather than a refusal: the read reports what was
+//!    reported for an id, so it neither resolves a registration nor invents one.
+//!    `InvalidInstanceId` is this operation's refusal for a node that cannot be reached at
+//!    all ("you don't have permission to access the managed node … SSM Agent isn't
+//!    running"), which is not the same thing as a node nothing has reported about.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +173,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstancePatches` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstancePatchesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstancePatches"))
+        use crate::state::instance_patches as patches;
+
+        // `InstanceId`'s presence and its pattern, the `Filters` list's 0..5 length and
+        // `MaxResults`' 10..100 range are MODELLED constraints the centralized walk has
+        // already refused anything outside of — so a malformed node id never reaches here.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeInstancePatchesErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the patch compliance store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The filters are read first: a filter naming no property of a patch is a request
+        // this read cannot serve, whichever node id it was about.
+        for filter in input.filters.as_deref().unwrap_or_default() {
+            if let Some(why) = patches::instance_patch_filter_rejection(
+                filter.key.as_deref().unwrap_or_default(),
+                filter.values.as_deref().unwrap_or_default(),
+            ) {
+                return Err(crate::scaffolded::Scaffolded::validation(why));
+            }
+        }
+
+        let page_size = patches::instance_patch_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // What has been reported for this node id. The patching operation that runs ON the
+        // node leaves a compliance report ([`crate::state::instance_patch_states`]), and that
+        // report records HOW MANY patches of each state it found rather than WHICH they
+        // were — so a node whose report this endpoint holds lists no patch ROW either, and
+        // naming patches from a count would be inventing them. No call of this service's model
+        // performs such a run, so an id this endpoint holds no report for reports the nothing
+        // it holds rather than compliance nobody collected.
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        let reported: Vec<PatchComplianceData> = store
+            .instance_patch_state(&region, &input.instance_id)
+            .map(|_counts_only| Vec::new())
+            .unwrap_or_default();
+
+        // The token this read hands out is the position the next page starts at within the
+        // patches reported for one node: a patch row carries no key of its own, and the list
+        // changes only when a patching operation reports for that node again. A token outside
+        // it names no page of this read to resume.
+        let start = match crate::state::non_empty(input.next_token.as_deref()) {
+            None => 0,
+            Some(token) => match token.parse::<usize>() {
+                Ok(at) if at <= reported.len() => at,
+                _ => {
+                    return Err(DescribeInstancePatchesErrorModeled::InvalidNextToken(
+                        InvalidNextToken {
+                            message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+        // `start` is a position in `reported`, so the page is a suffix of it; `get` keeps that
+        // in-bounds without indexing on a value the request steers.
+        let page = reported.get(start..).unwrap_or_default();
+        let patches: Vec<PatchComplianceData> =
+            page.iter().take(page_size).cloned().collect();
+        // A patch is still waiting past this page: hand the caller the position it resumes at.
+        let next_token = (page.len() > patches.len()).then(|| (start + patches.len()).to_string());
+
+        Ok(DescribeInstancePatchesOutput {
+            patches: Some(patches),
+            next_token,
+        })
     }
 }

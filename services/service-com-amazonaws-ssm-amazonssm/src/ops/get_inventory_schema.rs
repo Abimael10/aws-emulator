@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInventorySchema
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInventorySchema`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the inventory schemas this endpoint holds for the Region this request was signed
+//! for: "return a list of inventory type names for the account, or return a list of attribute
+//! names for a specific Inventory item type"
+//! ([`crate::state::inventory::reported_schemas`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInventorySchema::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A schema is reported for a type whose ATTRIBUTES this endpoint knows: the
+//! `AWS:InstanceInformation` type Systems Manager publishes, whose item is the projection of
+//! the node record, and every custom type the Region holds items of, whose schema is what
+//! those items say ([`crate::state::custom_inventory`]) — so a schema a caller reads back is
+//! the one its own `PutInventory` wrote.
+//!
+//! What the request may narrow it by:
+//!
+//! * `TypeName` — "the type of inventory item to return": a name outside the types this
+//!   service knows ([`crate::state::inventory::is_known_inventory_type`]) is the modelled
+//!   `InvalidTypeNameException`, and a known name this endpoint holds no schema of reports
+//!   nothing;
+//! * `Aggregator` — "returns inventory schemas that support aggregation", with only the
+//!   attributes an aggregator may count over;
+//! * `SubType` — "returns the sub-type schema for a specified inventory type". No type here
+//!   has a sub-type: a node's own item and a caller's custom item are each one flat set of
+//!   attributes, so a request asking for sub-type schemas is served the nothing this
+//!   endpoint holds of them.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +167,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInventorySchema` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInventorySchemaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInventorySchema"))
+        use crate::state::inventory;
+
+        // `TypeName`'s 0..100 length and `MaxResults`' 50..200 range are MODELLED constraints
+        // the centralized walk has already refused anything outside of.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetInventorySchemaErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the inventory store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A `TypeName` that names no inventory type at all cannot be served: the member
+        // carries no pattern, so a value that is not `AWS:` or `Custom:` followed by a type
+        // reaches here and names nothing this endpoint could hold a schema of.
+        let wanted = crate::state::non_empty(input.type_name.as_deref());
+        if let Some(type_name) = wanted {
+            if !inventory::is_known_inventory_type(type_name) {
+                return Err(GetInventorySchemaErrorModeled::InvalidTypeNameException(
+                    InvalidTypeNameException {
+                        message: Some(
+                            crate::state::custom_inventory::unknown_type_name_message(type_name),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let page_size = inventory::schema_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        // A request for the SUB-TYPE schemas is served the nothing this endpoint holds of
+        // them (see the module docs); every other request is served the schemas it holds.
+        let held = if input.sub_type.unwrap_or_default() {
+            ::std::collections::BTreeMap::new()
+        } else {
+            inventory::reported_schemas(&store, &region, input.aggregator)
+        };
+        let matching: Vec<&InventoryItemSchema> = held
+            .iter()
+            .filter(|(type_name, _)| wanted.is_none_or(|wanted| wanted == type_name.as_str()))
+            .map(|(_, schema)| schema)
+            .collect();
+
+        // The token a page hands out is the type name the next page starts at, so a value
+        // that names no schema this read holds names no page of it to resume.
+        let start = match crate::state::non_empty(input.next_token.as_deref()) {
+            None => 0,
+            Some(token) => {
+                let Some(at) = matching
+                    .iter()
+                    .position(|schema| schema.type_name == token)
+                else {
+                    return Err(GetInventorySchemaErrorModeled::InvalidNextToken(
+                        InvalidNextToken {
+                            message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
+                        },
+                    )
+                    .into());
+                };
+                at
+            }
+        };
+        // `start` is a position in `matching`, so the page is a suffix of it; `get` keeps
+        // that in-bounds without indexing on a value the request steers.
+        let page: &[&InventoryItemSchema] = matching.get(start..).unwrap_or_default();
+        let schemas = page
+            .iter()
+            .take(page_size)
+            .map(|schema| (*schema).clone())
+            .collect();
+        // A schema is still waiting past this page: hand the caller the type name it resumes
+        // at, so the next request continues where this one stopped.
+        let next_token = page.get(page_size).map(|schema| schema.type_name.clone());
+
+        Ok(GetInventorySchemaOutput {
+            schemas: Some(schemas),
+            next_token,
+        })
     }
 }

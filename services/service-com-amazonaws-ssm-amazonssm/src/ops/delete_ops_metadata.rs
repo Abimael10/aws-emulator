@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteOpsMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteOpsMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes the OpsMetadata object an `OpsMetadataArn` names at the Region this request was
+//! signed for, so it leaves [`crate::state::ops_metadata`] and no later read reports it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteOpsMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It classifies an ARN that names no object of this requester's exactly as
+//! [`crate::ops::get_ops_metadata`] does, because the question is the same one: an ARN naming
+//! another ACCOUNT is answered `OpsMetadataInvalidArgumentException`
+//! ([`crate::state::ops_metadata::OPS_METADATA_NOT_THE_OWNER`]) before the store is looked
+//! at, and an ARN of this account that this Region holds no object under is answered
+//! `OpsMetadataNotFoundException`
+//! ([`crate::state::ops_metadata::OPS_METADATA_NOT_FOUND`]).
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +138,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteOpsMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteOpsMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteOpsMetadata"))
+        use crate::state::ops_metadata as metadata;
+
+        // `OpsMetadataArn`'s presence, its 1..1011 length and its ARN pattern are MODELLED
+        // constraints the centralized walk has already refused anything outside of.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteOpsMetadataErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the OpsMetadata store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Whose the ARN is comes first, for the reason the read states: an object of another
+        // account is not this requester's to delete, and a not-found must not report on one.
+        if !metadata::names_this_account(&input.ops_metadata_arn) {
+            return Err(
+                DeleteOpsMetadataErrorModeled::OpsMetadataInvalidArgumentException(
+                    OpsMetadataInvalidArgumentException {
+                        message: Some(metadata::OPS_METADATA_NOT_THE_OWNER.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        if !state
+            .lock()
+            .remove_ops_metadata(&region, &input.ops_metadata_arn)
+        {
+            return Err(DeleteOpsMetadataErrorModeled::OpsMetadataNotFoundException(
+                OpsMetadataNotFoundException {
+                    message: Some(metadata::OPS_METADATA_NOT_FOUND.to_string()),
+                },
+            )
+            .into());
+        }
+
+        Ok(DeleteOpsMetadataOutput {})
     }
 }
