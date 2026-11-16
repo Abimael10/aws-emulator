@@ -561,6 +561,30 @@ pub fn backup_plan_arn(region: &str, plan_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("backup-plan:{plan_id}"))
 }
 
+/// How wide the `VersionId` of a stored plan version is: one opaque run of
+/// characters of a FIXED width, carrying no separator and no field a reader can
+/// pick out. It is the base64 text of a 36-character identifier, so the width
+/// follows from that encoding; stated here because it is what every token
+/// [`minted_plan_version_id`] draws is, and what a caller may size a column by.
+pub const PLAN_VERSION_ID_LENGTH: usize = 48;
+
+/// A fresh `VersionId` for ONE stored version of a backup plan — the only place
+/// this service mints one.
+///
+/// "Unique, randomly generated, Unicode, UTF-8 encoded strings that are at most
+/// 1,024 bytes long. Version Ids cannot be edited" (model doc for `VersionId`):
+/// a version token is DRAWN FROM ENTROPY, not derived, so nothing about the plan
+/// it versions — the plan's id, its name, or how many versions the account has
+/// stored — can be read out of a token, and holding one tells a caller nothing
+/// about the next one. The drawn identifier travels base64-encoded, which is
+/// what makes a token one long run of [`PLAN_VERSION_ID_LENGTH`] letters and
+/// digits, safe to carry in the `versionId` query a plan read pins a version
+/// with and opaque to its holder: unlike the plan's own id, a version token has
+/// no internal structure to read, only to round-trip.
+pub fn minted_plan_version_id() -> String {
+    ::aws_smithy_types::base64::encode(::uuid::Uuid::new_v4().hyphenated().to_string())
+}
+
 /// The ARN of a framework:
 /// `arn:aws:backup:<region>:<account>:framework:<name>-<uniquifier>`.
 ///
@@ -3203,7 +3227,7 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
         plan: BackupPlanInput,
         now: SystemTime,
     ) -> BackupPlanVersion {
-        let version_id = self.next_id(now);
+        let version_id = minted_plan_version_id();
         let rules = plan
             .rules
             .into_iter()

@@ -37,8 +37,9 @@ const VERSION_UNREADABLE_CODE: &str = "ERROR_2202";
 /// `GetBackupPlan`: `ResourceNotFoundException`, `httpError` 400).
 const NOT_FOUND: &str = "ResourceNotFoundException";
 
-/// A version id of the form this service mints but no plan of a fresh account
-/// carries.
+/// A version id no plan of a fresh account carries — nothing this service
+/// mints is addressable by it (a minted token is one opaque run of letters and
+/// digits, `state::minted_plan_version_id`).
 const UNHELD_VERSION: &str = "00000000-0000-0000-0000-000000000000";
 
 /// `PUT /backup/plans` — `CreateBackupPlan`'s HTTP binding.

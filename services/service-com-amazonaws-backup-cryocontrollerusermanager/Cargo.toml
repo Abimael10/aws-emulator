@@ -23,6 +23,10 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Opaque, URL-safe encoding for the pagination cursors this service vends.
 hex = { workspace = true }
+# Draws the random identifier the opaque version token of a stored backup plan
+# version is the text of, so the token comes from entropy rather than from the
+# plan it versions (`state::minted_plan_version_id`).
+uuid = { version = "1", features = ["v4"] }
 # Parses the cron expression a backup rule schedules its jobs with, so a plan's
 # upcoming runs are computed from that expression (and `chrono`, which it is
 # built on, carries the date and time arithmetic).

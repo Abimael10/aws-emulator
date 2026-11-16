@@ -71,6 +71,8 @@ mod mpa_approval_team_disassociation;
 mod plan_and_selection_refusals;
 #[path = "all/plan_rule_schedule_timezone.rs"]
 mod plan_rule_schedule_timezone;
+#[path = "all/plan_version_token.rs"]
+mod plan_version_token;
 #[path = "all/recovery_point_cross_account_authorization.rs"]
 mod recovery_point_cross_account_authorization;
 #[path = "all/recovery_point_deletion.rs"]
