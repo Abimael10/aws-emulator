@@ -63,6 +63,25 @@ impl InstanceConfiguration {
             _ => None,
         }
     }
+
+    /// Whether this candidate type is one an instance's recommendation REPORTS as an option.
+    ///
+    /// Two preferences select which candidates a recommendation consists of, so both are
+    /// applied wherever options are built — the reader of these recommendations, their export
+    /// and the projection of their metrics: the request's own `cpuVendorArchitectures`
+    /// ([`architecture_admitted`]), and the account's stored preferred-resource lists, "the
+    /// preference to control which resource type values are considered when generating
+    /// rightsizing recommendations" ([`EffectivePreferences::admits_instance_type`]). So an
+    /// instance type the preference leaves out of the candidates is an option of no answer,
+    /// and no reader contradicts the candidate set a read of that preference resolves.
+    pub fn option_admitted(
+        &self,
+        preferences: &EffectivePreferences,
+        requested_architectures: &[String],
+    ) -> bool {
+        architecture_admitted(requested_architectures, &self.architecture)
+            && preferences.admits_instance_type(&self.instance_type)
+    }
 }
 
 /// One utilization figure the analysis observed on an instance: the `MetricName` measured,

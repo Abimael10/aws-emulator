@@ -65,7 +65,7 @@ use std::sync::Arc;
 use ::service_com_amazonaws_s3_amazons3 as s3;
 
 use super::{
-    architecture_admitted, external_metric_status, look_back_period_in_days, parse_resource_arn,
+    external_metric_status, look_back_period_in_days, parse_resource_arn,
     percentage_of, round_hundredths, stated_architectures, AnalysedResource, AnalyzedAutoScalingGroup,
     ComAmazonawsComputeoptimizerComputeoptimizerserviceState, EffectivePreferences, ExportJob,
     GroupConfiguration, IdleResourceAnalysis, InstanceConfiguration, ObservedInstance,
@@ -1007,17 +1007,19 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
                 continue;
             };
             let preferences = self.effective_preferences(&arn, parsed);
-            // The candidates the preference admits, and "the CPU vendor and architecture for an
-            // instance or Auto Scaling group recommendations" the exported options then consist
-            // of: the crate's one rule for both ([`architecture_admitted`]), which is what the
-            // reader of these recommendations applies — "when you specify AWS_ARM64 with an
-            // ExportAutoScalingGroupRecommendations request, Compute Optimizer exports
-            // recommendations that consist of Graviton instance types only".
+            // The candidates the preferences in force admit, and "the CPU vendor and
+            // architecture for an instance or Auto Scaling group recommendations" the exported
+            // options then consist of: the crate's one rule for which candidate configurations
+            // a recommendation consists of ([`GroupConfiguration::option_admitted`]), which is
+            // what the reader of these recommendations applies — "when you specify AWS_ARM64
+            // with an ExportAutoScalingGroupRecommendations request, Compute Optimizer exports
+            // recommendations that consist of Graviton instance types only", and the account's
+            // preferred-resource lists.
             let options: Vec<&GroupConfiguration> = group
                 .candidates
                 .iter()
                 .filter(|candidate| {
-                    architecture_admitted(requested_architectures, &candidate.architecture)
+                    candidate.option_admitted(&preferences, requested_architectures)
                 })
                 .collect();
             let architectures = stated_architectures(
@@ -1074,17 +1076,19 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             let arn = instance.instance_arn(region);
             let preferences =
                 self.effective_preferences_for(&arn, RESOURCE_TYPE_EC2_INSTANCE, account_id);
-            // The candidates the preference admits, and "the CPU vendor and architecture for an
-            // instance or Auto Scaling group recommendations" the exported options then consist
-            // of: the crate's one rule for both ([`architecture_admitted`]), which is what the
-            // reader of these recommendations applies — "when you specify AWS_ARM64 with an
-            // ExportEC2InstanceRecommendations request, Compute Optimizer exports
-            // recommendations that consist of Graviton instance types only".
+            // The candidates the preferences in force admit, and "the CPU vendor and
+            // architecture for an instance or Auto Scaling group recommendations" the exported
+            // options then consist of: the crate's one rule for which candidate types a
+            // recommendation consists of ([`InstanceConfiguration::option_admitted`]), which is
+            // what the reader of these recommendations applies — "when you specify AWS_ARM64
+            // with an ExportEC2InstanceRecommendations request, Compute Optimizer exports
+            // recommendations that consist of Graviton instance types only", and the account's
+            // preferred-resource lists.
             let options: Vec<&InstanceConfiguration> = instance
                 .candidates
                 .iter()
                 .filter(|candidate| {
-                    architecture_admitted(requested_architectures, &candidate.architecture)
+                    candidate.option_admitted(&preferences, requested_architectures)
                 })
                 .collect();
             let architectures =

@@ -12,7 +12,10 @@
 //! through. Every reader of a preference goes through
 //! [`super::effective_preferred_resource`], so the preference reader, the effective-preference
 //! reader and the default preference cannot disagree about which candidates a preference
-//! leaves.
+//! leaves. A reader that reports a RECOMMENDATION asks that same matching rule of one candidate
+//! instead of the catalog ([`preferred_resources_admit`], reached through
+//! [`EffectivePreferences::admits_instance_type`]), so the options it reports are exactly the
+//! candidates the resolution above leaves.
 //!
 //! The resolution is bounded by construction, because a caller chooses how many values a
 //! stored list holds. The catalog is sorted once ([`sorted_catalog`]), so the types under one
@@ -156,9 +159,150 @@ pub fn effective_include_list(resource: &PreferredResource) -> Vec<String> {
     candidates
 }
 
+/// Whether the preferred-resource lists `resources` state leave `instance_type` a
+/// rightsizing-recommendation candidate.
+///
+/// The same resolution [`effective_include_list`] reports, decided for ONE instance type
+/// instead of expanded into the whole candidate set: the type has to be named by the include
+/// list — or by no include list at all, since "if this isn't specified, all supported
+/// resources are included by default" — and not by the exclude list, whose values are the ones
+/// "to exclude from the recommendation candidates". Every entry has to leave it, because each
+/// entry names a preferred resource list of its own.
+///
+/// Deciding one type asks the same matching rule the expansion applies
+/// ([`value_names_instance_type`]) of each written value, which costs one pass of the lists and
+/// allocates nothing: a reader admitting the candidates of one page therefore touches neither
+/// the catalog nor the heap.
+pub fn preferred_resources_admit(resources: &[PreferredResource], instance_type: &str) -> bool {
+    resources
+        .iter()
+        .all(|resource| preferred_resource_admits(resource, instance_type))
+}
+
+/// Whether ONE preferred-resource entry leaves `instance_type` a candidate — see
+/// [`preferred_resources_admit`], whose rule this states for a single list.
+fn preferred_resource_admits(resource: &PreferredResource, instance_type: &str) -> bool {
+    let names = |values: &[String]| {
+        values
+            .iter()
+            .any(|value| value_names_instance_type(value, instance_type))
+    };
+    let included = resource.include_list.as_deref().unwrap_or_default();
+    // An include list the request leaves out, or leaves empty, includes every candidate.
+    (included.is_empty() || names(included))
+        && !names(resource.exclude_list.as_deref().unwrap_or_default())
+}
+
+impl EffectivePreferences {
+    /// Whether the preferences in force leave `instance_type` a candidate of the resource's
+    /// rightsizing recommendation — the stored preferred-resource lists applied to one
+    /// candidate instance type ([`preferred_resources_admit`]).
+    ///
+    /// `PreferredResource` is "the preference to control which resource type values are
+    /// considered when generating rightsizing recommendations", so a candidate the lists do
+    /// not leave is considered by no reader of the recommendation: the one rule for every
+    /// reader, so no answer can report an option the candidate set
+    /// `GetEffectiveRecommendationPreferences` resolves for the same resource leaves out.
+    pub fn admits_instance_type(&self, instance_type: &str) -> bool {
+        preferred_resources_admit(&self.preferred_resources, instance_type)
+    }
+
+    /// Whether they leave a configuration running `instance_types` a candidate: one is a
+    /// candidate only where EVERY instance type it runs is, since a configuration that ran an
+    /// excluded type would consider that type.
+    pub fn admits_instance_types(&self, instance_types: &[String]) -> bool {
+        instance_types
+            .iter()
+            .all(|instance_type| self.admits_instance_type(instance_type))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whichever lists a preference states, the candidates it ADMITS one at a time are
+    /// exactly the candidates it RESOLVES into an effective include list — the set a reader
+    /// reports — so the options a recommendation reports cannot contradict the candidate set
+    /// a read of the same preference reports.
+    #[test]
+    fn admission_agrees_with_the_resolved_candidate_set() {
+        // (case, includeList, excludeList)
+        let cases: [(&str, &[&str], &[&str]); 6] = [
+            ("the service default", &["*"], &[]),
+            ("an exclude list naming one type", &[], &["m6g.large"]),
+            ("an exclude list naming a family", &[], &["t2"]),
+            ("an include list of exact types", &["c5.large", "m5.xlarge"], &[]),
+            ("an include list naming a family", &["m6g"], &[]),
+            ("an include and an exclude list", &["m6g"], &["m6g.large"]),
+        ];
+        for (case, included, excluded) in cases {
+            let values = |values: &[&str]| {
+                Some(
+                    values
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect::<Vec<String>>(),
+                )
+            };
+            let resource = PreferredResource {
+                name: Some(PREFERRED_RESOURCE_NAME_EC2_INSTANCE_TYPES.to_string()),
+                include_list: values(included),
+                exclude_list: values(excluded),
+            };
+            let resolved = effective_include_list(&resource);
+            for instance_type in sorted_catalog() {
+                let admitted = preferred_resources_admit(
+                    std::slice::from_ref(&resource),
+                    instance_type,
+                );
+                let reported = resolved.iter().any(|candidate| candidate == instance_type);
+                assert_eq!(
+                    admitted, reported,
+                    "case {case:?}: expected {instance_type:?} admitted={reported}, got \
+                     {admitted}"
+                );
+            }
+        }
+    }
+
+    /// A configuration running SEVERAL instance types — an Auto Scaling group's mixed
+    /// instance types — is a candidate only where every type it runs is one.
+    #[test]
+    fn a_configuration_is_a_candidate_only_where_every_type_it_runs_is() {
+        let preferences = EffectivePreferences {
+            enhanced_infrastructure_metrics: DEFAULT_ENHANCED_INFRASTRUCTURE_METRICS.to_string(),
+            inferred_workload_types: INFERRED_WORKLOAD_TYPES_ACTIVE.to_string(),
+            external_metrics_preference: None,
+            look_back_period: DEFAULT_LOOK_BACK_PERIOD.to_string(),
+            utilization_preferences: Vec::new(),
+            preferred_resources: vec![PreferredResource {
+                name: Some(PREFERRED_RESOURCE_NAME_EC2_INSTANCE_TYPES.to_string()),
+                include_list: None,
+                exclude_list: Some(vec!["m6g".to_string()]),
+            }],
+            savings_estimation_mode: None,
+        };
+        // (case, the instance types the configuration runs, whether it is a candidate)
+        let cases: [(&str, &[&str], bool); 4] = [
+            ("one admitted type", &["m5.large"], true),
+            ("one excluded type", &["m6g.large"], false),
+            ("admitted types only", &["m5.large", "c5.xlarge"], true),
+            ("one excluded type among them", &["m5.large", "m6g.xlarge"], false),
+        ];
+        for (case, instance_types, expected) in cases {
+            let running: Vec<String> = instance_types
+                .iter()
+                .map(|instance_type| (*instance_type).to_string())
+                .collect();
+            let admitted = preferences.admits_instance_types(&running);
+            assert_eq!(
+                admitted, expected,
+                "case {case:?}: expected admitted={expected} for {instance_types:?}, got \
+                 {admitted}"
+            );
+        }
+    }
 
     /// A written list is reduced to the prefixes that name the same types and nothing more:
     /// duplicates collapse, a value a shorter one already covers is dropped, and an explicit

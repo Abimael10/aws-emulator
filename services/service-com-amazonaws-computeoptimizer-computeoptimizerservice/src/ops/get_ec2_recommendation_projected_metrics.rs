@@ -316,16 +316,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 recommended_option_projected_metrics: Some(Vec::new()),
             });
         };
+        // The preferences in force for the instance, resolved the way the reader of its
+        // recommendation resolves them ([`crate::state::effective_preferences_for`]): the
+        // account's preferred-resource lists narrow which candidate types are considered at
+        // all, so they narrow the options there are projected metrics for.
+        let preferences = guard.effective_preferences_for(
+            &input.instance_arn,
+            crate::state::RESOURCE_TYPE_EC2_INSTANCE,
+            &instance.account_id,
+        );
 
         let options: Vec<RecommendedOptionProjectedMetric> = instance
             .candidates
             .iter()
-            // The candidates the request's CPU vendor architecture preference admits; a
-            // request that states no preference restricts nothing.
-            .filter(|candidate| {
-                requested_architectures.is_empty()
-                    || requested_architectures.contains(&candidate.architecture)
-            })
+            // The candidates the preferences in force admit: the crate's one rule for which
+            // candidate types a recommendation consists of
+            // ([`crate::state::InstanceConfiguration::option_admitted`]) — the request's
+            // `cpuVendorArchitectures`, which restricts nothing when it states none, and the
+            // account's preferred-resource lists, resolved for this instance the way the
+            // reader of its recommendation resolves them — so this projection covers exactly
+            // the options that reader reports.
+            .filter(|candidate| candidate.option_admitted(&preferences, &requested_architectures))
             .enumerate()
             .map(|(index, candidate)| {
                 let projected: Vec<ProjectedMetric> = instance

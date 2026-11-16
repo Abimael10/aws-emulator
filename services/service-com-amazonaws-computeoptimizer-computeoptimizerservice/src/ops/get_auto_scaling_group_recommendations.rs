@@ -463,17 +463,16 @@ fn recommendation(
     requested_architectures: &[String],
     last_refresh_timestamp: Option<::aws_smithy_types::DateTime>,
 ) -> AutoScalingGroupRecommendation {
-    // The candidates the request's CPU vendor architecture preference admits, and the
-    // architectures the options it leaves consist of: the crate's one rule for both
-    // ([`crate::state::architecture_admitted`]), shared with the EXPORT of these
-    // recommendations, so a read and an export under one preference cannot report different
-    // options.
+    // The candidates the preferences in force admit, and the architectures the options they
+    // leave consist of: the crate's one rule for which candidate configurations a
+    // recommendation consists of ([`crate::state::GroupConfiguration::option_admitted`]) — the
+    // request's `cpuVendorArchitectures` and the account's preferred-resource lists — shared
+    // with the EXPORT of these recommendations, so a read and an export under one preference
+    // cannot report different options.
     let options: Vec<&crate::state::GroupConfiguration> = group
         .candidates
         .iter()
-        .filter(|candidate| {
-            crate::state::architecture_admitted(requested_architectures, &candidate.architecture)
-        })
+        .filter(|candidate| candidate.option_admitted(preferences, requested_architectures))
         .collect();
     let architectures = crate::state::stated_architectures(
         options.iter().map(|option| option.architecture.as_str()),

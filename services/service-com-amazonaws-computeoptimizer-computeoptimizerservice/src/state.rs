@@ -1468,6 +1468,24 @@ impl GroupConfiguration {
         self.memory_gib * f64::from(self.desired_capacity)
     }
 
+    /// Whether this candidate configuration is one a group's recommendation REPORTS as an
+    /// option.
+    ///
+    /// The same two preferences an instance's candidate type is admitted by
+    /// ([`InstanceConfiguration::option_admitted`]) — the preferred-resource lists are
+    /// "available for the Amazon EC2 instance and Auto Scaling group resource types"
+    /// (`PreferredResource`) — applied to the instance types this configuration RUNS: a
+    /// configuration is a candidate only where every type it runs is one, since one running an
+    /// excluded type would consider that type.
+    pub fn option_admitted(
+        &self,
+        preferences: &EffectivePreferences,
+        requested_architectures: &[String],
+    ) -> bool {
+        architecture_admitted(requested_architectures, &self.architecture)
+            && preferences.admits_instance_types(&self.instance_types)
+    }
+
     /// Whether `other` is a different configuration of the same group — a different set
     /// of instance types or a different capacity. A candidate that differs from the
     /// group's own configuration IS a recommendation, which is what makes the group

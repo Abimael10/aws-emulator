@@ -89,6 +89,8 @@ mod preference_records_hold_a_preference;
 mod preference_resource_type_support;
 #[path = "all/preference_support_refusal_wording.rs"]
 mod preference_support_refusal_wording;
+#[path = "all/preferred_resource_recommendation_candidates.rs"]
+mod preferred_resource_recommendation_candidates;
 #[path = "all/rds_database_inventory_analysis.rs"]
 mod rds_database_inventory_analysis;
 #[path = "all/rds_database_recommendation_options.rs"]
