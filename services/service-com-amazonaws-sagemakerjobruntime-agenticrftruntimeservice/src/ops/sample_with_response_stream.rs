@@ -113,12 +113,6 @@ impl From<SampleWithResponseStreamErrorModeled> for SampleWithResponseStreamErro
     }
 }
 
-/// The `SampleWithResponseStream` operation.
-///
-/// Owns the shared engine (the constructor seam) and implements
-/// [`smithy_server_runtime::Operation`]. Generic over the engine type `Eng`, so this
-/// crate names no concrete engine type: a migrated service that needs state picks a
-/// concrete engine where it mounts the service, not here.
 /// This operation's own modelled 400 `ValidationException`.
 fn validation(message: String) -> SampleWithResponseStreamError {
     SampleWithResponseStreamErrorModeled::ValidationException(ValidationException { message })
@@ -133,6 +127,12 @@ fn quota_exceeded(message: String) -> SampleWithResponseStreamError {
     .into()
 }
 
+/// The `SampleWithResponseStream` operation.
+///
+/// Owns the shared engine (the constructor seam) and implements
+/// [`smithy_server_runtime::Operation`]. Generic over the engine type `Eng`, so this
+/// crate names no concrete engine type: a migrated service that needs state picks a
+/// concrete engine where it mounts the service, not here.
 pub struct SampleWithResponseStream<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }

@@ -46,7 +46,9 @@
 //! An EIGHTH run had grown back in both places again while that repair was under review, with
 //! one more landing's declaration pair appended past the end of the prose. The header was left
 //! as the one block the seventh repair wrote, that pair was moved into the place its name sorts
-//! to, and the prose was dropped, for the same reason as the seven runs before it.
+//! to, and the prose was dropped, for the same reason as the seven runs before it. The same run
+//! reached a branch already in review, which dropped the prose it had grown there and re-sorted
+//! the pair stranded in it; the two cleanups agree, so the list carries that pair once.
 //!
 //! The module stays declared because it is a file under `tests/all/`, which this crate's
 //! build script requires a declaration for.

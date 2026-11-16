@@ -37,6 +37,9 @@ mod job_resolution_is_documented_once;
 #[path = "all/modelled_rejections.rs"]
 mod modelled_rejections;
 
+#[path = "all/operation_struct_is_documented.rs"]
+mod operation_struct_is_documented;
+
 #[path = "all/refusal_fits_the_modelled_message_member.rs"]
 mod refusal_fits_the_modelled_message_member;
 

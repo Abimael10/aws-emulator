@@ -113,12 +113,6 @@ impl From<CompleteRolloutErrorModeled> for CompleteRolloutError {
     }
 }
 
-/// The `CompleteRollout` operation.
-///
-/// Owns the shared engine (the constructor seam) and implements
-/// [`smithy_server_runtime::Operation`]. Generic over the engine type `Eng`, so this
-/// crate names no concrete engine type: a migrated service that needs state picks a
-/// concrete engine where it mounts the service, not here.
 /// The status an absent `Status` member means.
 ///
 /// `Status` is optional in the model, and the operation's own documentation
@@ -200,6 +194,12 @@ fn not_found(message: String) -> CompleteRolloutError {
         .into()
 }
 
+/// The `CompleteRollout` operation.
+///
+/// Owns the shared engine (the constructor seam) and implements
+/// [`smithy_server_runtime::Operation`]. Generic over the engine type `Eng`, so this
+/// crate names no concrete engine type: a migrated service that needs state picks a
+/// concrete engine where it mounts the service, not here.
 pub struct CompleteRollout<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }

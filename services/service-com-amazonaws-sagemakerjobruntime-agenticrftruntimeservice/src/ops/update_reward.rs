@@ -112,12 +112,6 @@ impl From<UpdateRewardErrorModeled> for UpdateRewardError {
     }
 }
 
-/// The `UpdateReward` operation.
-///
-/// Owns the shared engine (the constructor seam) and implements
-/// [`smithy_server_runtime::Operation`]. Generic over the engine type `Eng`, so this
-/// crate names no concrete engine type: a migrated service that needs state picks a
-/// concrete engine where it mounts the service, not here.
 /// This operation's own modelled 409 `ConflictException`.
 fn conflict(message: String) -> UpdateRewardError {
     UpdateRewardErrorModeled::ConflictException(ConflictException { message }).into()
@@ -175,6 +169,12 @@ fn same_rewards(recorded: &[f64], requested: &[f64]) -> bool {
             .all(|(left, right)| left.to_bits() == right.to_bits())
 }
 
+/// The `UpdateReward` operation.
+///
+/// Owns the shared engine (the constructor seam) and implements
+/// [`smithy_server_runtime::Operation`]. Generic over the engine type `Eng`, so this
+/// crate names no concrete engine type: a migrated service that needs state picks a
+/// concrete engine where it mounts the service, not here.
 pub struct UpdateReward<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
