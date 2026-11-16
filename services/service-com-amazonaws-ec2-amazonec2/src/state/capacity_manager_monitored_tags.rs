@@ -189,7 +189,11 @@ impl ComAmazonawsEc2Amazonec2State {
     ///   stops the key being monitored;
     /// * a key named for deactivation starts `deactivating` and is monitored no more once
     ///   that falls due, while a key the account does not monitor is not affected at all and
-    ///   so is not among the answered keys.
+    ///   so is not among the answered keys;
+    /// * a key already `deactivating` keeps the instant its first deactivation falls due, so
+    ///   asking again for a move that is already under way neither restarts it nor postpones
+    ///   the moment the account stops monitoring the key — the same reading the repeat
+    ///   activation above gets.
     ///
     /// Idempotent in both directions, which is what makes a repeated request — the same
     /// `ClientToken` presented twice — leave the account exactly where the first one did.
@@ -229,7 +233,13 @@ impl ComAmazonawsEc2Amazonec2State {
                 .capacity_manager_monitored_tag_keys
                 .get_mut(tag_key.as_str())
             {
-                record.deactivation_due = Some(now + TRANSITION_DELAY);
+                // Only a key that is not already on its way out gets a due instant: a repeat
+                // of the same deactivation leaves the account exactly where the first one
+                // did, rather than pushing the end of monitoring one further span away every
+                // time the request is presented.
+                if record.deactivation_due.is_none() {
+                    record.deactivation_due = Some(now + TRANSITION_DELAY);
+                }
             }
         }
         // Which keys the update affected: those it activated, and those it deactivated that

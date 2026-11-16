@@ -2190,6 +2190,8 @@ mod delete_local_gateway_route_table;
 // `UpdateCapacityManagerMonitoredTagKeys` activates and deactivates, the statuses the clock
 // carries a key through, and what `GetCapacityManagerMonitoredTagKeys` reports and pages over
 // — declared at the tail of this file, which is where every new ec2 suite lands.
+#[path = "all/capacity_manager_monitored_tag_key_repeats.rs"]
+mod capacity_manager_monitored_tag_key_repeats;
 #[path = "all/capacity_manager_monitored_tag_keys.rs"]
 mod capacity_manager_monitored_tag_keys;
 // `DescribeLaunchTemplates` for a template that is GONE: a key this service itself resolved
