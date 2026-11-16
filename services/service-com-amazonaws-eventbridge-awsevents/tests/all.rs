@@ -183,6 +183,8 @@ mod reserved_event_source;
 mod resource_tagging;
 #[path = "all/routing_counter_metric_reads.rs"]
 mod routing_counter_metric_reads;
+#[path = "all/rule_detail_type_discrimination.rs"]
+mod rule_detail_type_discrimination;
 #[path = "all/rule_fan_out_and_target_repointing.rs"]
 mod rule_fan_out_and_target_repointing;
 #[path = "all/rule_invocation_metrics.rs"]
