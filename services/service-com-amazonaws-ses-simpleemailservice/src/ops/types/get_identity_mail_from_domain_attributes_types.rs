@@ -23,11 +23,148 @@ pub struct GetIdentityMailFromDomainAttributesOutput {
     pub mail_from_domain_attributes: std::collections::HashMap<String, IdentityMailFromDomainAttributes>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ses#IdentityMailFromDomainAttributes")]
+/// The custom MAIL FROM attributes of one identity, as this service reports
+/// them.
+///
+/// `MailFromDomain` is `@required` in the on-disk model
+/// (`smithy_query(query="shape", shape="IdentityMailFromDomainAttributes")`) but
+/// the WIRE omits it for an identity that has no custom MAIL FROM domain to
+/// report — absence is how that is said, which is RECORDED BEHAVIOUR rather than
+/// modelled. A `@required` member is a bare, always-written field under
+/// `#[smithy_macros::smithy(shape = …)]`, which rejects an `Option` one, so the
+/// schema, the serializer and the deserializer below are written out instead of
+/// derived: the items are the ones that derive emits — one member schema per
+/// member at the index the model's member list gives it, the struct `SCHEMA`
+/// naming them in that order, the `…_SCHEMA` static and the
+/// serializer/deserializer pair — with `MailFromDomain` carried as the optional
+/// member the wire makes it. The members, their order and their wire names are
+/// the model's, unchanged.
+///
+/// Nothing else the derive bakes on applies here: this shape is output-only, so
+/// the constraint traits the boundary walk reads on an operation INPUT would be
+/// inert, and no member of it carries an `@xmlName`, so each member's wire
+/// element is its Smithy member name.
 #[derive(Debug, Clone, Default)]
 pub struct IdentityMailFromDomainAttributes {
-    pub mail_from_domain: String,
+    /// The custom MAIL FROM domain the identity is configured to use, and `None`
+    /// for an identity that has none — which is reported by leaving the member
+    /// out.
+    pub mail_from_domain: Option<String>,
     pub mail_from_domain_status: String,
     pub behavior_on_mx_failure: String,
 }
 
+#[allow(non_upper_case_globals)]
+impl IdentityMailFromDomainAttributes {
+    pub const M_MAIL_FROM_DOMAIN: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ses#IdentityMailFromDomainAttributes$MailFromDomain",
+                "com.amazonaws.ses",
+                "MailFromDomain",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "MailFromDomain",
+            0usize,
+        );
+
+    pub const M_MAIL_FROM_DOMAIN_STATUS: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ses#IdentityMailFromDomainAttributes$MailFromDomainStatus",
+                "com.amazonaws.ses",
+                "MailFromDomainStatus",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "MailFromDomainStatus",
+            1usize,
+        );
+
+    pub const M_BEHAVIOR_ON_MX_FAILURE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ses#IdentityMailFromDomainAttributes$BehaviorOnMXFailure",
+                "com.amazonaws.ses",
+                "BehaviorOnMXFailure",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "BehaviorOnMXFailure",
+            2usize,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.ses#IdentityMailFromDomainAttributes",
+            "com.amazonaws.ses",
+            "IdentityMailFromDomainAttributes",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_MAIL_FROM_DOMAIN,
+            &Self::M_MAIL_FROM_DOMAIN_STATUS,
+            &Self::M_BEHAVIOR_ON_MX_FAILURE,
+        ],
+    );
+}
+
+pub static IDENTITY_MAIL_FROM_DOMAIN_ATTRIBUTES_SCHEMA: &::aws_smithy_schema::Schema =
+    &IdentityMailFromDomainAttributes::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for IdentityMailFromDomainAttributes {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let ::std::option::Option::Some(domain) = self.mail_from_domain.as_ref() {
+            s.write_string(&Self::M_MAIL_FROM_DOMAIN, domain.as_str())?;
+        }
+        s.write_string(
+            &Self::M_MAIL_FROM_DOMAIN_STATUS,
+            self.mail_from_domain_status.as_str(),
+        )?;
+        s.write_string(
+            &Self::M_BEHAVIOR_ON_MX_FAILURE,
+            self.behavior_on_mx_failure.as_str(),
+        )?;
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for IdentityMailFromDomainAttributes {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut mail_from_domain = ::std::option::Option::None;
+        let mut mail_from_domain_status = ::std::option::Option::None;
+        let mut behavior_on_mx_failure = ::std::option::Option::None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                ::std::option::Option::Some(0usize) => {
+                    mail_from_domain =
+                        ::std::option::Option::Some(d.read_string(&Self::M_MAIL_FROM_DOMAIN)?);
+                }
+                ::std::option::Option::Some(1usize) => {
+                    mail_from_domain_status = ::std::option::Option::Some(
+                        d.read_string(&Self::M_MAIL_FROM_DOMAIN_STATUS)?,
+                    );
+                }
+                ::std::option::Option::Some(2usize) => {
+                    behavior_on_mx_failure = ::std::option::Option::Some(
+                        d.read_string(&Self::M_BEHAVIOR_ON_MX_FAILURE)?,
+                    );
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            mail_from_domain,
+            mail_from_domain_status: mail_from_domain_status.ok_or_else(|| {
+                ::aws_smithy_schema_server::missing_member("MailFromDomainStatus")
+            })?,
+            behavior_on_mx_failure: behavior_on_mx_failure.ok_or_else(|| {
+                ::aws_smithy_schema_server::missing_member("BehaviorOnMXFailure")
+            })?,
+        })
+    }
+}

@@ -5,7 +5,8 @@
 //! Sets whether the original email headers travel with one class of an
 //! identity's notifications: the flag it writes onto the identity's record is
 //! what `GetIdentityNotificationAttributes` reports as
-//! `HeadersIn<Type>NotificationsEnabled`.
+//! `HeadersIn<Type>NotificationsEnabled`. The flag is taken for a class whose
+//! Amazon SNS topic is not set yet, and takes effect once one is.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "This value can only be set when `NotificationType` is already set to
         // use a particular Amazon SNS topic" (the `Enabled` member's own
-        // documentation): the headers travel with a notification SES PUBLISHES,
-        // so with no topic for that class there is no notification to carry them
-        // and the request is refused rather than stored.
-        if record.notifications.topic(notification_type).is_none() {
-            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                format!(
-                    "Enabled can only be set when NotificationType is already set to use a \
-                     particular Amazon SNS topic; {named} has no {} topic",
-                    notification_type.as_wire()
-                ),
-            ));
-        }
+        // documentation) says when the flag has an EFFECT — the headers travel
+        // with a notification Amazon SES publishes, and a class with no topic
+        // publishes none — not what the call admits: Amazon SES takes the flag for
+        // a class whose topic is not set yet and reports it back, so it is stored
+        // per class whether or not a topic is bound and takes effect as soon as
+        // one is.
         record
             .notifications
             .set_headers_enabled(notification_type, input.enabled);

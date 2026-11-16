@@ -23,11 +23,192 @@ pub struct GetIdentityDkimAttributesOutput {
     pub dkim_attributes: std::collections::HashMap<String, IdentityDkimAttributes>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ses#IdentityDkimAttributes")]
+/// The DKIM attributes of one identity, as this service reports them: the three
+/// members the on-disk model declares, plus the `SigningKeyOrigin` the wire
+/// carries.
+///
+/// `SigningKeyOrigin` is RECORDED BEHAVIOUR rather than modelled — the on-disk
+/// `IdentityDkimAttributes` declares `DkimEnabled`, `DkimVerificationStatus` and
+/// `DkimTokens` alone (`smithy_query(query="shape",
+/// shape="IdentityDkimAttributes")`) — so the schema, the serializer and the
+/// deserializer below are written out instead of derived:
+/// `#[smithy_macros::smithy(shape = …)]` admits EXACTLY the model's member list
+/// and rejects a field no member stands behind, so the member cannot be declared
+/// through the derive at all. The items are the ones that derive emits, over a
+/// member list given here: one member schema per member (its index being that
+/// member's position in the list), the struct `SCHEMA` naming them in order, the
+/// `…_SCHEMA` static, and the serializer/deserializer pair. The model's own
+/// members keep the indices and the order the model gives them and the
+/// unmodelled one is appended LAST, so a later model refresh that declares it
+/// only has to move the field into place and put the derive back.
+///
+/// Nothing else the derive bakes on applies here: this shape is output-only, so
+/// the constraint traits the boundary walk reads on an operation INPUT would be
+/// inert, and no member of it carries an `@xmlName`, so each member's wire
+/// element is its Smithy member name.
 #[derive(Debug, Clone, Default)]
 pub struct IdentityDkimAttributes {
     pub dkim_enabled: bool,
     pub dkim_verification_status: String,
     pub dkim_tokens: Option<Vec<String>>,
+    /// Who owns the DKIM signing key Amazon SES signs the identity's mail with
+    /// (`crate::state::dkim::SIGNING_KEY_ORIGIN`).
+    pub signing_key_origin: Option<String>,
 }
 
+#[allow(non_upper_case_globals)]
+impl IdentityDkimAttributes {
+    pub const M_DKIM_ENABLED: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ses#IdentityDkimAttributes$DkimEnabled",
+                "com.amazonaws.ses",
+                "DkimEnabled",
+            ),
+            ::aws_smithy_schema::ShapeType::Boolean,
+            "DkimEnabled",
+            0usize,
+        );
+
+    pub const M_DKIM_VERIFICATION_STATUS: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ses#IdentityDkimAttributes$DkimVerificationStatus",
+                "com.amazonaws.ses",
+                "DkimVerificationStatus",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "DkimVerificationStatus",
+            1usize,
+        );
+
+    /// The element each token of `DkimTokens` occupies: the Smithy default
+    /// `member`, which the XML codec reads off this sub-member schema on both
+    /// the serialize and the deserialize path.
+    pub const M_DKIM_TOKENS_MEMBER: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ses#IdentityDkimAttributes$DkimTokens$member",
+                "com.amazonaws.ses",
+                "member",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "member",
+            0usize,
+        );
+
+    pub const M_DKIM_TOKENS: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ses#IdentityDkimAttributes$DkimTokens",
+                "com.amazonaws.ses",
+                "DkimTokens",
+            ),
+            ::aws_smithy_schema::ShapeType::List,
+            "DkimTokens",
+            2usize,
+        )
+        .with_list_member(&Self::M_DKIM_TOKENS_MEMBER);
+
+    pub const M_SIGNING_KEY_ORIGIN: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ses#IdentityDkimAttributes$SigningKeyOrigin",
+                "com.amazonaws.ses",
+                "SigningKeyOrigin",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "SigningKeyOrigin",
+            3usize,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.ses#IdentityDkimAttributes",
+            "com.amazonaws.ses",
+            "IdentityDkimAttributes",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_DKIM_ENABLED,
+            &Self::M_DKIM_VERIFICATION_STATUS,
+            &Self::M_DKIM_TOKENS,
+            &Self::M_SIGNING_KEY_ORIGIN,
+        ],
+    );
+}
+
+pub static IDENTITY_DKIM_ATTRIBUTES_SCHEMA: &::aws_smithy_schema::Schema =
+    &IdentityDkimAttributes::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for IdentityDkimAttributes {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        s.write_boolean(&Self::M_DKIM_ENABLED, self.dkim_enabled)?;
+        s.write_string(
+            &Self::M_DKIM_VERIFICATION_STATUS,
+            self.dkim_verification_status.as_str(),
+        )?;
+        if let ::std::option::Option::Some(tokens) = self.dkim_tokens.as_ref() {
+            s.write_list(&Self::M_DKIM_TOKENS, &|sl| {
+                for token in tokens.iter() {
+                    sl.write_string(&Self::M_DKIM_TOKENS, token.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let ::std::option::Option::Some(origin) = self.signing_key_origin.as_ref() {
+            s.write_string(&Self::M_SIGNING_KEY_ORIGIN, origin.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for IdentityDkimAttributes {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut dkim_enabled = ::std::option::Option::None;
+        let mut dkim_verification_status = ::std::option::Option::None;
+        let mut dkim_tokens = ::std::option::Option::None;
+        let mut signing_key_origin = ::std::option::Option::None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                ::std::option::Option::Some(0usize) => {
+                    dkim_enabled =
+                        ::std::option::Option::Some(d.read_boolean(&Self::M_DKIM_ENABLED)?);
+                }
+                ::std::option::Option::Some(1usize) => {
+                    dkim_verification_status = ::std::option::Option::Some(
+                        d.read_string(&Self::M_DKIM_VERIFICATION_STATUS)?,
+                    );
+                }
+                ::std::option::Option::Some(2usize) => {
+                    let mut read: Vec<String> = Vec::new();
+                    d.read_list(&Self::M_DKIM_TOKENS, &mut |dl| {
+                        read.push(dl.read_string(&Self::M_DKIM_TOKENS)?);
+                        Ok(())
+                    })?;
+                    dkim_tokens = ::std::option::Option::Some(read);
+                }
+                ::std::option::Option::Some(3usize) => {
+                    signing_key_origin =
+                        ::std::option::Option::Some(d.read_string(&Self::M_SIGNING_KEY_ORIGIN)?);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            dkim_enabled: dkim_enabled
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("DkimEnabled"))?,
+            dkim_verification_status: dkim_verification_status.ok_or_else(|| {
+                ::aws_smithy_schema_server::missing_member("DkimVerificationStatus")
+            })?,
+            dkim_tokens,
+            signing_key_origin,
+        })
+    }
+}

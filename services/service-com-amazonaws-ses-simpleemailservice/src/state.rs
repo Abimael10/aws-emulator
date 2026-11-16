@@ -52,6 +52,11 @@ pub mod receipt_destinations;
 /// resource rather than decided here.
 pub mod event_destination_targets;
 
+/// Whether the Amazon SNS topic an identity's notifications would be published to EXISTS —
+/// the admission check the operation that binds one runs, asked of Amazon SNS rather than
+/// decided here.
+pub mod notification_topics;
+
 /// Whether Amazon SES may really write a received message into the Amazon S3 destination an
 /// `S3Action` names — the bucket's own policy and the KMS key's — which is read against those
 /// services' own stores rather than decided here.
@@ -2682,7 +2687,7 @@ fn names_a_resource_here(value: &str, vendor: &str, region: &str) -> bool {
     })
 }
 
-/// The Amazon SNS topic ARN a request names, or the reason the value names no
+/// The Amazon SNS topic ARN a request names, and `None` when the value names no
 /// topic SES could publish to for this caller.
 ///
 /// What a member the model documents as "the Amazon Resource Name (ARN) of the
@@ -2697,20 +2702,15 @@ fn names_a_resource_here(value: &str, vendor: &str, region: &str) -> bool {
 /// ([`names_a_resource_here`]), as a notification topic of an identity is.
 ///
 /// Read on the ARN alone: whether the topic EXISTS is Amazon SNS's own state,
-/// which this service does not hold.
-pub fn resolve_sns_topic<'value>(value: &'value str, region: &str) -> Result<&'value str, String> {
+/// which this service does not hold — [`notification_topics`] is what asks it.
+/// The value is answered TRIMMED, which is the form a later lookup of this
+/// service matches; each caller words its own refusal for a value this rejects,
+/// because the member the value arrived in is the caller's.
+pub fn resolve_sns_topic<'value>(value: &'value str, region: &str) -> Option<&'value str> {
     let trimmed = value.trim();
     let names_a_topic = names_a_resource_here(trimmed, SNS_ARN_VENDOR, region)
         && ::service_common::arn::resource(trimmed).is_some_and(is_sns_topic_name);
-    if names_a_topic {
-        Ok(trimmed)
-    } else {
-        Err(format!(
-            "Invalid SnsTopic {trimmed:?}: SnsTopic must be the ARN of an Amazon SNS topic of \
-             account {} in {region}",
-            ::engine::EMULATOR_ACCOUNT_ID
-        ))
-    }
+    names_a_topic.then_some(trimmed)
 }
 
 /// Why an `EventDestination` a request supplies is not one Amazon SES could
@@ -2938,7 +2938,7 @@ pub fn check_event_destination(
     if let Some(sns) = &destination.sns_destination {
         // The same reading of a topic ARN every member of this service that
         // names one makes.
-        if resolve_sns_topic(&sns.topic_arn, region).is_err() {
+        if resolve_sns_topic(&sns.topic_arn, region).is_none() {
             return Err(EventDestinationFault::Sns(format!(
                 "Invalid TopicARN {:?}: TopicARN must be the ARN of an Amazon SNS topic of \
                  account {} in {region}",

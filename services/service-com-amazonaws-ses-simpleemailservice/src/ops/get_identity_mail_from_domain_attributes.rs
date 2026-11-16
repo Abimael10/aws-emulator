@@ -180,17 +180,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let attributes = match identity.mail_from.as_mut() {
                 // An identity with no custom MAIL FROM domain still has a behaviour
                 // to report — `BehaviorOnMXFailure` is `@required` — and no custom
-                // domain and no setup status to report with it, so both of those
-                // read back empty.
+                // domain and no setup status to report with it. There being no
+                // domain is said by leaving `MailFromDomain` OUT: the member
+                // reports the domain the identity is configured to use, and an
+                // identity configured with none has none to name, which an empty
+                // one would read as a configured domain whose name is blank.
                 None => IdentityMailFromDomainAttributes {
-                    mail_from_domain: String::new(),
+                    mail_from_domain: None,
                     mail_from_domain_status: String::new(),
                     behavior_on_mx_failure: crate::state::BehaviorOnMxFailure::default()
                         .as_wire()
                         .to_string(),
                 },
                 Some(settings) => IdentityMailFromDomainAttributes {
-                    mail_from_domain: settings.domain.clone(),
+                    mail_from_domain: Some(settings.domain.clone()),
                     // The move out of `Pending` the clock already owes is
                     // materialised here, so the status reported is the one that was
                     // due at `now` rather than the one last written.

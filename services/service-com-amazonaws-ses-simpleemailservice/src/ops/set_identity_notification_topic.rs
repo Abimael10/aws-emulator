@@ -4,7 +4,9 @@
 //!
 //! Points one class of an identity's notifications at an Amazon SNS topic, or
 //! clears it: the topic it writes onto the identity's record is what
-//! `GetIdentityNotificationAttributes` reads back.
+//! `GetIdentityNotificationAttributes` reads back. A topic has to be one Amazon
+//! SNS really holds for this account before it is bound
+//! ([`crate::state::notification_topics`]).
 //!
 //! ## Shape of an operation
 //!
@@ -170,11 +172,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of the Amazon SNS topic", and the model targets it at a bare string, so
         // the ARN is read here. A value that names no such topic names nothing to
         // publish to, which is a bad request rather than a topic that happens to
-        // be missing.
+        // be missing — reported with the one sentence this service refuses the
+        // whole class with
+        // (`crate::state::notification_topics::invalid_sns_topic_message`).
         let stored_topic = match requested_topic {
             Some(topic) => Some(
                 crate::state::resolve_sns_topic(topic, &region)
-                    .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::invalid_parameter_value(
+                            crate::state::notification_topics::invalid_sns_topic_message(topic),
+                        )
+                    })?
                     .to_string(),
             ),
             None => None,
@@ -188,7 +196,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "SetIdentityNotificationTopic",
             ));
         };
-        let mut state = state.lock();
 
         // "You can only specify a verified identity for this parameter" (the
         // `Identity` member's own documentation), so an identity this account has
@@ -201,10 +208,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The identity as the REQUEST named it, which is what the refusal below
         // reports: the key above is what the list is looked up by.
         let named = crate::state::named_identity(&input.identity).to_string();
+        let unverified = || -> SetIdentityNotificationTopicError {
+            crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
+                "Identity {named} is not verified"
+            ))
+        };
+        // The identity the request IDENTIFIES is resolved first, before any
+        // question is put to another service about the topic it would bind: an
+        // identity this account has not verified is reported as that, not as a
+        // fault of the topic it would have been given.
+        if !state.lock().identities.contains_key(&identity) {
+            return Err(unverified());
+        }
+
+        // The topic then has to BE there: it is Amazon SNS's resource, so it is
+        // resolved against Amazon SNS before anything is stored, and a value
+        // naming a topic Amazon SNS holds nothing under is refused instead of
+        // being bound to a destination no notification could ever reach. Asked
+        // with no lock held, because the answer is another service's.
+        if let Some(topic) = stored_topic.as_deref() {
+            if let Some(message) =
+                crate::state::notification_topics::unreachable_notification_topic(
+                    ctx, &region, topic,
+                )
+                .await
+            {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    message,
+                ));
+            }
+        }
+
+        let mut state = state.lock();
+        // Read again under the lock the write is made under: the identity resolved
+        // above was resolved before the question went out, and the store is shared.
         let Some(record) = state.identities.get_mut(&identity) else {
-            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                format!("Identity {named} is not verified"),
-            ));
+            return Err(unverified());
         };
         record
             .notifications

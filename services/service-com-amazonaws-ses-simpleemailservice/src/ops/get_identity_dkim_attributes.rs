@@ -3,9 +3,10 @@
 //! @op GetIdentityDkimAttributes
 //! Reports the Easy DKIM state of each identity named, read from that
 //! identity's own record: whether DKIM signing is on for it, whether Amazon SES
-//! has verified the published CNAME records, and the tokens of the Easy DKIM
+//! has verified the published CNAME records, the tokens of the Easy DKIM
 //! setup that covers it — its own for a domain, its domain's for an email
-//! address. An identity this account has not verified is absent from the report.
+//! address — and who owns the signing key behind it. An identity this account
+//! has not verified is absent from the report.
 //!
 //! ## Shape of an operation
 //!
@@ -201,6 +202,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // setup covers has none to report — there is nothing stored
                     // to publish, rather than an empty set of records.
                     dkim_tokens: covering.map(|dkim| dkim.tokens.clone()),
+                    // Who owns the key Amazon SES would sign the identity's mail
+                    // with: reported for every identity in the list, because
+                    // every identity has a signing key behind it whether or not
+                    // its records have been published yet
+                    // (`crate::state::dkim::SIGNING_KEY_ORIGIN` is which owner,
+                    // and why).
+                    signing_key_origin: Some(
+                        crate::state::dkim::SIGNING_KEY_ORIGIN.to_string(),
+                    ),
                 },
             );
         }

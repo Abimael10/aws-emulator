@@ -65,6 +65,20 @@ const SIGNED_FIELDS: &[&str] = &[
 /// How many bytes an Ed25519 signing key is seeded from (RFC 8032 §5.1.5).
 pub const SIGNING_KEY_BYTES: usize = 32;
 
+/// Who owns the DKIM signing key Amazon SES signs an identity of this account's mail with,
+/// which is what `GetIdentityDkimAttributes` reports as each entry's `SigningKeyOrigin`.
+///
+/// Amazon SES itself owns every one of them here: the key pair of an identity is MINTED and
+/// held by this service ([`signing_key`]), and the only DKIM setup any API over the account's
+/// identities records for it is the Easy DKIM one whose tokens Amazon SES generates
+/// (`VerifyDomainDkim`, and the account identity registry's own
+/// [`::service_common::ses_identities::SesDkimSetup`], which carries an Easy DKIM setup
+/// alone). A key the IDENTITY'S OWNER supplies — the other origin the attribute reports —
+/// would have to be imported through an operation that takes one, and no operation of this
+/// surface does; so the origin reported for an identity is the service-managed one for as
+/// long as that holds.
+pub const SIGNING_KEY_ORIGIN: &str = "AWS_SES";
+
 /// An identity's DKIM signing key.
 ///
 /// Key MATERIAL, so it is held in a type whose `Debug` carries NONE of it: a derived one would put

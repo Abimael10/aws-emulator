@@ -19,9 +19,9 @@
 //! * a `SnsTopic` that is not the ARN of an Amazon SNS topic of this account in
 //!   this Region is refused with HTTP 400 `InvalidParameterValue` and the stored
 //!   topic is left as it was;
-//! * headers in notifications are set per type, and only for a type that has a
-//!   topic; feedback forwarding is turned off only with a bounce AND a complaint
-//!   topic;
+//! * headers in notifications are set per type, whether or not that type carries
+//!   a topic yet; feedback forwarding is turned off only with a bounce AND a
+//!   complaint topic;
 //! * an identity this account has not verified is refused and nothing is stored;
 //! * only identities in the list are reported, and a call may ask about at most
 //!   100 of them;
@@ -622,73 +622,50 @@ fn reported_headers_flag(attributes: &str, notification_type: &str) -> String {
 }
 
 #[tokio::test]
-async fn headers_in_notifications_are_set_per_type_and_only_where_a_topic_is_set() {
+async fn headers_in_notifications_are_set_per_type_whether_or_not_a_topic_is_set() {
     let router = emulator();
     let identity = "headers@example.com";
     verify_email(&router, identity).await;
 
-    // "This value can only be set when NotificationType is already set to use a
-    // particular Amazon SNS topic" (the `Enabled` member's own documentation):
-    // with no topic for that type, both values are refused and nothing is
-    // stored.
-    for kind in NOTIFICATION_TYPE_VALUES {
-        for enabled in [true, false] {
-            let (status, body) = set_headers_enabled(&router, identity, kind, enabled).await;
-            assert_eq!(
-                (status, element(&body, "Code").as_deref()),
-                (400, Some("InvalidParameterValue")),
-                "case {kind} enabled={enabled} with no topic: expected 400 \
-                 InvalidParameterValue, got {status} with {body}"
-            );
-        }
-        let attributes = attributes_of(&router, identity)
-            .await
-            .expect("a verified identity is reported");
-        assert_eq!(
-            reported_headers_flag(&attributes, kind),
-            "false",
-            "case {kind} with no topic: the flag must stay off, got {attributes:?}"
-        );
-    }
+    // The flag every type starts at, tracked as each row writes one of them.
+    let mut expected: Vec<String> = NOTIFICATION_TYPE_VALUES
+        .iter()
+        .map(|_| "false".to_string())
+        .collect();
 
-    // With a topic set for one type, that type's flag follows the request and the
-    // other two stay off.
-    for kind in NOTIFICATION_TYPE_VALUES {
-        let topic = topic_arn(&format!("ses-headers-{}", kind.to_lowercase()));
-        set_topic_ok(&router, identity, kind, Some(&topic)).await;
-        for enabled in [true, false, true] {
-            let (status, body) = set_headers_enabled(&router, identity, kind, enabled).await;
-            assert_eq!(
-                status, 200,
-                "case {kind} enabled={enabled}: expected 200, got {status} with {body}"
-            );
-            let attributes = attributes_of(&router, identity)
-                .await
-                .expect("a verified identity is reported");
-            let expected: Vec<String> = NOTIFICATION_TYPE_VALUES
-                .iter()
-                .map(|other| {
-                    let on = *other == *kind && enabled;
-                    // Only the type just written is on: a type whose turn has
-                    // not come has no topic yet, and one already done was left
-                    // on `true` by its last row.
-                    let done = NOTIFICATION_TYPE_VALUES
-                        .iter()
-                        .position(|candidate| candidate == other)
-                        < NOTIFICATION_TYPE_VALUES
-                            .iter()
-                            .position(|candidate| candidate == kind);
-                    if on || done { "true" } else { "false" }.to_string()
-                })
-                .collect();
-            let reported: Vec<String> = NOTIFICATION_TYPE_VALUES
-                .iter()
-                .map(|other| reported_headers_flag(&attributes, other))
-                .collect();
-            assert_eq!(
-                reported, expected,
-                "case {kind} enabled={enabled}: expected the flags {expected:?}"
-            );
+    // "This value can only be set when NotificationType is already set to use a
+    // particular Amazon SNS topic" (the `Enabled` member's own documentation)
+    // says when the flag has an EFFECT, not what the call admits: the rows below
+    // write each type's flag both ways BEFORE that type carries a topic and again
+    // once it does, and the flag follows the request either way while the other
+    // types keep what they held.
+    for topic_set in [false, true] {
+        for (index, kind) in NOTIFICATION_TYPE_VALUES.iter().enumerate() {
+            if topic_set {
+                let topic = topic_arn(&format!("ses-headers-{}", kind.to_lowercase()));
+                set_topic_ok(&router, identity, kind, Some(&topic)).await;
+            }
+            for enabled in [true, false, true] {
+                let (status, body) = set_headers_enabled(&router, identity, kind, enabled).await;
+                assert_eq!(
+                    status, 200,
+                    "case {kind} enabled={enabled} with a topic={topic_set}: expected 200, got \
+                     {status} with {body}"
+                );
+                expected[index] = if enabled { "true" } else { "false" }.to_string();
+                let attributes = attributes_of(&router, identity)
+                    .await
+                    .expect("a verified identity is reported");
+                let reported: Vec<String> = NOTIFICATION_TYPE_VALUES
+                    .iter()
+                    .map(|other| reported_headers_flag(&attributes, other))
+                    .collect();
+                assert_eq!(
+                    reported, expected,
+                    "case {kind} enabled={enabled} with a topic={topic_set}: expected the flags \
+                     {expected:?}, got {reported:?}"
+                );
+            }
         }
     }
 }

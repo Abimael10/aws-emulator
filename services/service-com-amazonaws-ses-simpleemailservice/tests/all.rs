@@ -61,10 +61,14 @@ mod ses_delete_configuration_set_event_destination;
 mod ses_delete_receipt_rule;
 #[path = "all/ses_event_destination_sns_topic_existence.rs"]
 mod ses_event_destination_sns_topic_existence;
+#[path = "all/ses_identity_attribute_projection.rs"]
+mod ses_identity_attribute_projection;
 #[path = "all/ses_identity_dkim.rs"]
 mod ses_identity_dkim;
 #[path = "all/ses_identity_domain_case.rs"]
 mod ses_identity_domain_case;
+#[path = "all/ses_identity_notification_topic_existence.rs"]
+mod ses_identity_notification_topic_existence;
 #[path = "all/ses_identity_policies.rs"]
 mod ses_identity_policies;
 #[path = "all/ses_identity_policy_delete.rs"]
