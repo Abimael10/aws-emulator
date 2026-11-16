@@ -35,10 +35,12 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::support::{call, emulator, member, ok};
 
-/// The sentence a refusal of an agent space the account does not hold states: wholly
-/// FIXED text, naming the resource class under the name the service's own records use
-/// for an agent space and carrying nothing the request sent.
-const AGENT_SPACE_NOT_FOUND: &str = "The specified agent instance does not exist.";
+/// The sentence an artifact operation's refusal of an agent space the account does not
+/// hold states: its fixed text names the resource class as the service's artifact path
+/// words it, and the `agentSpaceId` the request named is its ONLY variable part.
+fn agent_space_not_found(agent_space_id: &str) -> String {
+    format!("AgentSpace under the provided id: {agent_space_id} does not exist")
+}
 
 /// The sentence a refusal of an artifact the named agent space does not hold states:
 /// the `artifactId` the request named is its ONLY variable part, so a refusal names the
@@ -463,8 +465,8 @@ async fn a_delete_of_an_artifact_the_space_does_not_hold_succeeds_and_removes_no
 
 /// RULE: a delete the service cannot act on at all is refused and removes nothing — an
 /// `agentSpaceId` the account does not hold is HTTP 404 `ResourceNotFoundException` with
-/// the agent space's own not-found sentence, and an empty id of either member is HTTP
-/// 400 `ValidationException` naming that member.
+/// the artifact path's not-found sentence for that space, and an empty id of either
+/// member is HTTP 400 `ValidationException` naming that member.
 #[tokio::test]
 async fn a_delete_the_service_cannot_act_on_is_refused() {
     let router = emulator();
@@ -481,7 +483,7 @@ async fn a_delete_the_service_cannot_act_on_is_refused() {
             kept.clone(),
             404,
             "ResourceNotFoundException",
-            AGENT_SPACE_NOT_FOUND.to_string(),
+            agent_space_not_found(&"f".repeat(32)),
         ),
         (
             "an agentSpaceId that is a readable label",
@@ -489,7 +491,7 @@ async fn a_delete_the_service_cannot_act_on_is_refused() {
             kept.clone(),
             404,
             "ResourceNotFoundException",
-            AGENT_SPACE_NOT_FOUND.to_string(),
+            agent_space_not_found("no-such-space"),
         ),
         (
             "the stored agentSpaceId with a suffix",
@@ -497,7 +499,7 @@ async fn a_delete_the_service_cannot_act_on_is_refused() {
             kept.clone(),
             404,
             "ResourceNotFoundException",
-            AGENT_SPACE_NOT_FOUND.to_string(),
+            agent_space_not_found(&format!("{holder}0")),
         ),
         (
             "the empty agentSpaceId",

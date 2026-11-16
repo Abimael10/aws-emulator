@@ -218,13 +218,32 @@ pub const MAX_AGENT_SPACES: usize = 1_000;
 /// plausible client's association count, so normal use never meets it.
 pub const MAX_AGENT_SPACE_TARGET_DOMAINS: usize = 100;
 
-/// The sentence a refusal of an agent space the account does not hold states.
+/// The sentence the AGENT SPACE API's own operations state when they refuse an agent
+/// space the account does not hold.
 ///
-/// RECORDED, not modelled: the recorded 404 for an `agentSpaceId` that resolves to no
-/// agent space carries this sentence, which is wholly FIXED — it names the resource
-/// CLASS under the name the service's own records use for an agent space, and carries no
-/// value from the request, so a refusal never echoes a caller's own identifier back.
+/// RECORDED, not modelled: the recorded 404 an operation OF an agent space answers for
+/// an `agentSpaceId` that resolves to nothing carries this sentence, which is wholly
+/// FIXED — it names the resource CLASS under the name the service's own records use for
+/// an agent space, and carries no value from the request, so such a refusal never echoes
+/// a caller's own identifier back. An operation of a space's ARTIFACTS words the same
+/// failure differently ([`artifact_agent_space_not_found`]), which is why this sentence
+/// does not serve every path.
 pub const AGENT_SPACE_NOT_FOUND: &str = "The specified agent instance does not exist.";
+
+/// The sentence an artifact operation's refusal of an agent space the account does not
+/// hold states, for the `agentSpaceId` the request named.
+///
+/// RECORDED, not modelled: this service words a not-found refusal per the PATH that
+/// raises it, so the sentence the artifact sub-API answers when the space an artifact
+/// would live in resolves to nothing is not the one the agent space API's own operations
+/// answer ([`AGENT_SPACE_NOT_FOUND`]). Its fixed text names the resource class as
+/// `AgentSpace` and its only variable part is the `agentSpaceId` taken from the request,
+/// so a caller reading the refusal of a batch of uploads knows WHICH space was rejected.
+/// Stated here once, so every artifact operation that fails to resolve the space it was
+/// pointed at answers the same sentence.
+pub fn artifact_agent_space_not_found(agent_space_id: &str) -> String {
+    format!("AgentSpace under the provided id: {agent_space_id} does not exist")
+}
 
 /// The sentence a refusal of an artifact the named agent space does not hold states,
 /// for the `artifactId` the request named.
@@ -736,11 +755,29 @@ pub struct ArtifactRecord {
     /// The bytes the upload carried, stored exactly as they arrived, so a read reports
     /// the content that was uploaded rather than a value rebuilt from anything else.
     pub content: Vec<u8>,
+    /// Which upload of this account's artifacts this record is: the never-reused draw of
+    /// the mint behind its id ([`IdentifierMint`]).
+    ///
+    /// The id itself is opaque and carries no order, so this is what gives the artifacts
+    /// of one agent space the ONE stable order a listing walks them in and a page cursor
+    /// resumes in — the order they were uploaded in.
+    pub sequence: u64,
     /// When the artifact was last written — the instant it was uploaded, until something
     /// updates it. The only timestamp any artifact shape of this service carries
     /// (`smithy_query(query="shape",shape="ArtifactMetadataItem,ArtifactSummary")` and
     /// `GetArtifact`'s output: `updatedAt` and nothing beside it).
     pub updated_at: SystemTime,
+}
+
+/// The identity of a newly uploaded artifact, as
+/// [`ComAmazonawsSecurityagentSecurityagentState::mint_artifact_identity`] hands it out:
+/// the id the artifact is addressed by, and the upload order its stored record carries.
+#[derive(Debug, Clone)]
+pub struct ArtifactIdentity {
+    /// The `artifactId` every response and every store key carries for this artifact.
+    pub artifact_id: String,
+    /// See [`ArtifactRecord::sequence`].
+    pub sequence: u64,
 }
 
 impl ArtifactRecord {
@@ -1525,6 +1562,16 @@ pub const SECURITY_REQUIREMENT_PACK_ID_PREFIX: &str = "srp-cm-";
 /// client telling one of this service's ids from another relies on.
 pub const TARGET_DOMAIN_ID_PREFIX: &str = "td-";
 
+/// The prefix every `artifactId` this service hands out carries.
+///
+/// RECORDED, not modelled: `ArtifactId` carries neither a `@pattern` nor a `@length`,
+/// and the artifact ids the recording holds take the FORM every resource class of this
+/// service takes — a short lowercase class abbreviation, a hyphen, then a body freshly
+/// generated for that one resource ([`AGENT_SPACE_ID_PREFIX`],
+/// [`TARGET_DOMAIN_ID_PREFIX`]) — which is what lets a client tell an artifact id from
+/// the id of the space that holds it.
+pub const ARTIFACT_ID_PREFIX: &str = "a-";
+
 /// What the body after one of those prefixes is drawn over, so the uuid body of an
 /// identifier cannot collide with the digest of a verification token drawn from the same
 /// mint.
@@ -1608,6 +1655,12 @@ impl IdentifierMint {
     /// version and variant bits and its `8-4-4-4-12` groups — comes from the shared
     /// renderer, so it is not spelled out again here.
     pub fn next_uuid(&mut self) -> String {
+        self.next_uuid_draw().id
+    }
+
+    /// [`Self::next_uuid`] with this draw's own never-reused number beside it, for a
+    /// resource whose record also carries the ORDER it was created in.
+    pub fn next_uuid_draw(&mut self) -> MintedIdentifier {
         let sequence = self.next_sequence();
         let mut digest = Sha256::new();
         digest.update(IDENTIFIER_BODY_CONTEXT.as_bytes());
@@ -1616,7 +1669,10 @@ impl IdentifierMint {
         let digest = digest.finalize();
         let mut body = [0u8; UUID_BYTES];
         body.copy_from_slice(&digest[..UUID_BYTES]);
-        ::service_common::uuid_from_random_bytes(body)
+        MintedIdentifier {
+            id: ::service_common::uuid_from_random_bytes(body),
+            sequence,
+        }
     }
 
     /// A fresh secret of this mint for the challenge `context`: 64 lowercase hex
@@ -1713,9 +1769,10 @@ pub struct ComAmazonawsSecurityagentSecurityagentState {
     /// requirements and for a cursor to resume in.
     pub security_requirements: BTreeMap<(String, String), SecurityRequirement>,
     /// Every stored artifact, keyed by its `artifactId`. A `BTreeMap` for the same
-    /// reason as [`Self::applications`]: the ids come from the counter below, so one
-    /// stable order — the upload order — for a read that walks the artifacts of an
-    /// agent space.
+    /// reason as [`Self::applications`]: one stable key order for a read that resolves an
+    /// artifact by id. The ORDER a listing of an agent space's artifacts walks them in is
+    /// the upload order the records themselves carry ([`ArtifactRecord::sequence`]), since
+    /// a minted id is opaque and carries no order.
     pub artifacts: BTreeMap<String, ArtifactRecord>,
     /// The one generator every identifier and verification token this account's
     /// resources are minted from — whatever their type — so no two of them are ever
@@ -2004,14 +2061,21 @@ impl ComAmazonawsSecurityagentSecurityagentState {
             .remove(&(pack_id.to_string(), name.to_string()))
     }
 
-    /// Mint the `artifactId` of a newly uploaded artifact.
+    /// Mint the identity of a newly uploaded artifact: the `artifactId` it is addressed
+    /// by and the upload order the stored record carries.
     ///
-    /// A fresh draw of the account's one mint, taken while the store is locked, so two
-    /// uploads — including two carrying the same file name and bytes — are two distinct
-    /// artifacts and neither overwrites the other. `ArtifactId` carries no `@pattern`
-    /// or `@length` in the model, so the form is this emulator's to choose.
-    pub fn mint_artifact_id(&mut self) -> String {
-        self.identifiers.next_identifier().id
+    /// The artifact class's own form ([`ARTIFACT_ID_PREFIX`]) over a fresh draw of the
+    /// account's one mint, taken while the store is locked, so two uploads — including
+    /// two carrying the same file name and bytes — are two distinct artifacts and neither
+    /// overwrites the other, and no artifact id can coincide with the id of an agent
+    /// space, a pack or a target domain. The draw's own number is the order: the id is
+    /// opaque, so nothing of the order can be read off it.
+    pub fn mint_artifact_identity(&mut self) -> ArtifactIdentity {
+        let drawn = self.identifiers.next_uuid_draw();
+        ArtifactIdentity {
+            artifact_id: format!("{ARTIFACT_ID_PREFIX}{}", drawn.id),
+            sequence: drawn.sequence,
+        }
     }
 
     /// How many artifacts the agent space `agent_space_id` holds, i.e. how many count
@@ -2404,16 +2468,23 @@ pub fn decode_connection_page_token(token: &str) -> Option<String> {
     decode_cursor(PRIVATE_CONNECTION_PAGE_TOKEN_PREFIX, token)
 }
 
-/// Encode the `artifactId` a `ListArtifacts` page resumes at as an opaque `nextToken`,
-/// on [`encode_page_token`]'s resume-AT rule.
-pub fn encode_artifact_page_token(artifact_id: &str) -> String {
-    encode_cursor(ARTIFACT_PAGE_TOKEN_PREFIX, artifact_id)
+/// Encode the point a `ListArtifacts` page resumes at as an opaque `nextToken`, on
+/// [`encode_page_token`]'s resume-AT rule.
+///
+/// A listing of an agent space's artifacts walks them in upload order
+/// ([`ArtifactRecord::sequence`]), so the cursor names the upload to resume AT rather
+/// than an id: an artifact removed between two pages cannot make the next page skip or
+/// repeat one, and a record the walk has not reached keeps its place however the ids
+/// compare.
+pub fn encode_artifact_page_token(sequence: u64) -> String {
+    encode_cursor(ARTIFACT_PAGE_TOKEN_PREFIX, &format!("{sequence:016x}"))
 }
 
-/// The `artifactId` a `ListArtifacts` `nextToken` resumes at, or `None` when the token is
-/// not one this listing minted.
-pub fn decode_artifact_page_token(token: &str) -> Option<String> {
-    decode_cursor(ARTIFACT_PAGE_TOKEN_PREFIX, token)
+/// The upload a `ListArtifacts` `nextToken` resumes at, or `None` when the token is not
+/// one this listing minted.
+pub fn decode_artifact_page_token(token: &str) -> Option<u64> {
+    let body = decode_cursor(ARTIFACT_PAGE_TOKEN_PREFIX, token)?;
+    u64::from_str_radix(&body, 16).ok()
 }
 
 /// Encode the pack and the security requirement name a `ListSecurityRequirements` page

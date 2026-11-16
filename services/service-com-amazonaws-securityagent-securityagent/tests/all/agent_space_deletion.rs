@@ -31,10 +31,12 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::support::{call, emulator, member, ok, Answer};
 
-/// The sentence a refusal of an agent space the account does not hold states: wholly
-/// FIXED text, naming the resource class under the name the service's own records use for
-/// an agent space and carrying nothing the request sent.
-const AGENT_SPACE_NOT_FOUND: &str = "The specified agent instance does not exist.";
+/// The sentence an artifact operation's refusal of an agent space the account does not
+/// hold states: its fixed text names the resource class as the service's artifact path
+/// words it, and the `agentSpaceId` the request named is its ONLY variable part.
+fn artifact_agent_space_not_found(agent_space_id: &str) -> String {
+    format!("AgentSpace under the provided id: {agent_space_id} does not exist")
+}
 
 /// The sentence a refusal of an artifact the named agent space does not hold states:
 /// the `artifactId` the request named is its only variable part.
@@ -287,10 +289,11 @@ async fn a_delete_removes_the_named_space_and_only_what_it_held() {
                 through_deleted.error_code,
                 through_deleted.body
             );
+            let expected = artifact_agent_space_not_found(&deleted);
             assert_eq!(
                 member(&through_deleted.body, "message").as_deref(),
-                Some(AGENT_SPACE_NOT_FOUND),
-                "case {case:?}: expected the agent space not-found sentence, got {}",
+                Some(expected.as_str()),
+                "case {case:?}: expected {expected:?}, got {}",
                 through_deleted.body
             );
 

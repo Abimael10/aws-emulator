@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_securityagent_securityagent::state::{
-    agent_space_arn, default_vpc_id, region_subnets, AGENT_SPACE_ID_PREFIX,
+    agent_space_arn, default_vpc_id, region_subnets, AGENT_SPACE_ID_PREFIX, ARTIFACT_ID_PREFIX,
     LATTICE_ID_SUFFIX_LEN, RESOURCE_CONFIGURATION_ID_PREFIX, RESOURCE_GATEWAY_ID_PREFIX,
     SECURITY_REQUIREMENT_PACK_ID_PREFIX, TARGET_DOMAIN_ID_PREFIX, VERIFICATION_METHOD_DNS_TXT,
     VERIFICATION_METHOD_HTTP_ROUTE, VERIFICATION_METHOD_PRIVATE_VPC,
@@ -368,7 +368,7 @@ async fn mint_every_resource(router: &MultiServiceRouter) -> Vec<Minted> {
             case: case.to_string(),
             member: "artifactId",
             value: id,
-            form: Form::OpaqueId,
+            form: Form::ClassId(ARTIFACT_ID_PREFIX),
         });
     }
 

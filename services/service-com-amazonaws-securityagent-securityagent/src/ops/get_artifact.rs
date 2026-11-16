@@ -188,12 +188,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
 
         // An artifact is retrieved FROM an agent space, so a space the account does not
-        // hold has no artifact to retrieve: refused with the service's fixed sentence
-        // for an agent space it cannot resolve, before the artifact id is looked at.
+        // hold has no artifact to retrieve: refused with the sentence the artifact path
+        // states for an agent space it cannot resolve — naming the id the request pointed
+        // at — before the artifact id is looked at.
         if !state.agent_spaces.contains_key(&input.agent_space_id) {
             return Err(GetArtifactErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: crate::state::AGENT_SPACE_NOT_FOUND.to_string(),
+                    message: crate::state::artifact_agent_space_not_found(&input.agent_space_id),
                 },
             )
             .into());

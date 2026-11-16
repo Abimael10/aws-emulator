@@ -36,10 +36,12 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::support::{call, emulator, member, ok, Answer};
 
-/// The sentence a refusal of an agent space the account does not hold states: wholly
-/// FIXED text, naming the resource class under the name the service's own records use
-/// for an agent space and carrying nothing the request sent.
-const AGENT_SPACE_NOT_FOUND: &str = "The specified agent instance does not exist.";
+/// The sentence an artifact operation's refusal of an agent space the account does not
+/// hold states: its fixed text names the resource class as the service's artifact path
+/// words it, and the `agentSpaceId` the request named is its ONLY variable part.
+fn agent_space_not_found(agent_space_id: &str) -> String {
+    format!("AgentSpace under the provided id: {agent_space_id} does not exist")
+}
 
 /// Every member `ArtifactMetadataItem` declares, and nothing beside it
 /// (`smithy_query(query="shape",shape="ArtifactMetadataItem",
@@ -579,13 +581,14 @@ async fn a_batch_metadata_read_of_ids_that_name_nothing_is_refused() {
                     "case {case:?}: expected the field list to name {path:?}, got {paths:?}"
                 );
             }
-            // A missing agent space is the agent space's own fixed sentence, carrying
-            // nothing the request sent.
+            // A missing agent space is the artifact path's own sentence for a space it
+            // cannot resolve, naming the id the request pointed at.
             None => {
                 let message = member(&answer.body, "message").unwrap_or_default();
+                let expected = agent_space_not_found(&agent_space_id);
                 assert_eq!(
-                    message, AGENT_SPACE_NOT_FOUND,
-                    "case {case:?}: expected {AGENT_SPACE_NOT_FOUND:?}, got {message:?}"
+                    message, expected,
+                    "case {case:?}: expected {expected:?}, got {message:?}"
                 );
             }
         }

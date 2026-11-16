@@ -39,10 +39,12 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::support::{call, emulator, member, ok};
 
-/// The sentence a refusal of an agent space the account does not hold states: wholly
-/// FIXED text, naming the resource class under the name the service's own records use
-/// for an agent space and carrying nothing the request sent.
-const AGENT_SPACE_NOT_FOUND: &str = "The specified agent instance does not exist.";
+/// The sentence an artifact operation's refusal of an agent space the account does not
+/// hold states: its fixed text names the resource class as the service's artifact path
+/// words it, and the `agentSpaceId` the request named is its ONLY variable part.
+fn agent_space_not_found(agent_space_id: &str) -> String {
+    format!("AgentSpace under the provided id: {agent_space_id} does not exist")
+}
 
 /// The sentence a refusal of an artifact the named agent space does not hold states:
 /// the `artifactId` the request named is its ONLY variable part, so the refusal of an id
@@ -542,7 +544,7 @@ async fn an_artifact_is_reachable_only_through_the_space_that_holds_it() {
             orphaned.clone(),
             404,
             "ResourceNotFoundException",
-            AGENT_SPACE_NOT_FOUND.to_string(),
+            agent_space_not_found(&doomed),
         ),
         (
             "an agentSpaceId no create minted",
@@ -550,7 +552,7 @@ async fn an_artifact_is_reachable_only_through_the_space_that_holds_it() {
             held.clone(),
             404,
             "ResourceNotFoundException",
-            AGENT_SPACE_NOT_FOUND.to_string(),
+            agent_space_not_found(&unknown_hex),
         ),
         (
             "the empty agentSpaceId",
@@ -736,10 +738,11 @@ async fn a_refused_upload_persists_nothing() {
             answer.body
         );
         if status == 404 {
+            let expected = agent_space_not_found(&space);
             assert_eq!(
                 member(&answer.body, "message").as_deref(),
-                Some(AGENT_SPACE_NOT_FOUND),
-                "case {case:?}: expected the agent space's own not-found sentence, got {}",
+                Some(expected.as_str()),
+                "case {case:?}: expected {expected:?}, got {}",
                 answer.body
             );
         }

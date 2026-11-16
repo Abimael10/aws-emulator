@@ -167,14 +167,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Where this page starts. An absent token starts at the first artifact of the
-        // space; a token THIS listing minted names the `artifactId` to resume at. A token
+        // space; a token THIS listing minted names the upload to resume at. A token
         // another listing of this service minted names a resume point in another key
         // space, so it is refused here exactly as a token nothing minted is, rather than
         // read as a resume point among the artifacts.
         let resume_from = match input.next_token.as_deref() {
             None => None,
             Some(token) => match crate::state::decode_artifact_page_token(token) {
-                Some(artifact_id) => Some(artifact_id),
+                Some(sequence) => Some(sequence),
                 None => {
                     return Err(refused(
                         "nextToken",
@@ -206,39 +206,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
 
         // Artifacts are listed FOR an agent space, so a space the account does not hold
-        // has no artifacts to list: refused with the service's fixed sentence for an agent
-        // space it cannot resolve, rather than answered with an empty page.
+        // has no artifacts to list: refused with the sentence the artifact path states
+        // for an agent space it cannot resolve — naming the id the request pointed at —
+        // rather than answered with an empty page.
         if !state.agent_spaces.contains_key(&input.agent_space_id) {
             return Err(ListArtifactsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: crate::state::AGENT_SPACE_NOT_FOUND.to_string(),
+                    message: crate::state::artifact_agent_space_not_found(&input.agent_space_id),
                 },
             )
             .into());
         }
 
-        // Borrowed bounds, so resuming copies no id.
-        let start = match resume_from.as_deref() {
-            Some(artifact_id) => ::std::ops::Bound::Included(artifact_id),
-            None => ::std::ops::Bound::Unbounded,
-        };
-        // Only the artifacts of THIS agent space: an artifact is reachable only through
-        // the space that holds it, so another space's record is not in this listing even
-        // though both live in the one store.
-        let mut remaining = state
+        // Only the artifacts of THIS agent space, from the upload this page resumes at
+        // onwards: an artifact is reachable only through the space that holds it, so
+        // another space's record is not in this listing even though both live in the one
+        // store. The order is the UPLOAD order the records carry, since a minted id is
+        // opaque and carries none — one stable order, which is what lets a cursor resume
+        // where the previous page ended.
+        let mut held: Vec<&crate::state::ArtifactRecord> = state
             .artifacts
-            .range::<str, _>((start, ::std::ops::Bound::Unbounded))
-            .filter(|(_, artifact)| artifact.agent_space_id == input.agent_space_id);
+            .values()
+            .filter(|artifact| artifact.agent_space_id == input.agent_space_id)
+            .filter(|artifact| resume_from.is_none_or(|from| artifact.sequence >= from))
+            .collect();
+        held.sort_by_key(|artifact| artifact.sequence);
 
-        let mut artifact_summaries = Vec::new();
-        for (_, artifact) in remaining.by_ref().take(page_size) {
-            artifact_summaries.push(artifact.summary());
-        }
+        let artifact_summaries = held
+            .iter()
+            .take(page_size)
+            .map(|artifact| artifact.summary())
+            .collect();
         // The cursor is the first artifact of this space AFTER this page, so `nextToken`
         // is present exactly when one remains.
-        let next_token = remaining
-            .next()
-            .map(|(artifact_id, _)| crate::state::encode_artifact_page_token(artifact_id));
+        let next_token = held
+            .get(page_size)
+            .map(|artifact| crate::state::encode_artifact_page_token(artifact.sequence));
 
         Ok(ListArtifactsOutput {
             artifact_summaries,

@@ -193,12 +193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An artifact is uploaded INTO an agent space, so a space the account does not
         // hold has nothing to upload to: the operation's own `ResourceNotFoundException`
-        // (HTTP 404), with the service's fixed sentence for an agent space it cannot
-        // resolve, and nothing written to the store.
+        // (HTTP 404), with the sentence the artifact path states for an agent space it
+        // cannot resolve — naming the id the request pointed at — and nothing written to
+        // the store.
         if !state.agent_spaces.contains_key(&input.agent_space_id) {
             return Err(AddArtifactErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: crate::state::AGENT_SPACE_NOT_FOUND.to_string(),
+                    message: crate::state::artifact_agent_space_not_found(&input.agent_space_id),
                 },
             )
             .into());
@@ -226,16 +227,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A fresh identity per call: the id is the service's to choose, so two uploads
         // of the same file are two distinct artifacts, and the record is stamped with
-        // the instant it was written.
-        let artifact_id = state.mint_artifact_id();
+        // the instant it was written and with its place in the upload order.
+        let identity = state.mint_artifact_identity();
         let record = crate::state::ArtifactRecord {
-            artifact_id,
+            artifact_id: identity.artifact_id,
             agent_space_id: input.agent_space_id,
             file_name: input.file_name,
             artifact_type: input.artifact_type,
             // The uploaded bytes, verbatim: what a read of the artifact reports is the
             // content this call persisted.
             content: input.artifact_content,
+            sequence: identity.sequence,
             updated_at: ::std::time::SystemTime::now(),
         };
 

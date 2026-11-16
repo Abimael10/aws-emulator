@@ -18,14 +18,48 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::support::{call, call_in, emulator, member, ok};
 
-/// The sentence a refusal of an agent space the account does not hold states.
+/// The sentence the agent space API's own operations state when they refuse an agent
+/// space the account does not hold.
 ///
-/// Source: the recorded 404 for an `agentSpaceId` that resolves to no agent space. The
+/// Source: the recorded 404 of an operation OF an agent space whose `agentSpaceId`
+/// resolves to no agent space. The
 /// whole sentence is FIXED — it names the resource CLASS, under the name the service's own
 /// records use for an agent space, and carries no value from the request — and it is
 /// written out here independently of the constant the handlers report it from, so a change
 /// to that constant is a failure rather than a silently agreed-on new wording.
 const AGENT_SPACE_NOT_FOUND: &str = "The specified agent instance does not exist.";
+
+/// The sentence an operation OF a space's ARTIFACTS states when the space it was
+/// pointed at resolves to nothing.
+///
+/// Source: the recorded 404 of an artifact operation whose `agentSpaceId` names no agent
+/// space. Its fixed text names the resource class as the artifact path words it, and the
+/// `agentSpaceId` taken from the request is its ONLY variable part — so this path, unlike
+/// the agent space API's own, tells a caller WHICH space it could not resolve. Written
+/// out here independently of the helper the handlers build it with, so a change to that
+/// helper is a failure rather than a silently agreed-on new wording.
+fn artifact_agent_space_not_found(agent_space_id: &str) -> String {
+    format!("AgentSpace under the provided id: {agent_space_id} does not exist")
+}
+
+/// Which of this service's two not-found wordings an operation's agent-space lookup
+/// failure states: the agent space API's own fixed sentence, or the artifact path's
+/// id-bearing one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Path {
+    AgentSpaceApi,
+    ArtifactApi,
+}
+
+impl Path {
+    /// The sentence this path states for the `agentSpaceId` it could not resolve.
+    fn message(self, agent_space_id: &str) -> String {
+        match self {
+            Self::AgentSpaceApi => AGENT_SPACE_NOT_FOUND.to_string(),
+            Self::ArtifactApi => artifact_agent_space_not_found(agent_space_id),
+        }
+    }
+}
 
 /// The ARN form every agent space carries: the service's own `arnNamespace`
 /// (`smithy_query(query="service_info")`: `securityagent`), the region the create was
@@ -224,8 +258,9 @@ async fn update_answers_the_agent_instance_identity_of_the_stored_record() {
 /// associates — `None` where the request omits the member.
 type AssociationRow = (&'static str, Option<Vec<String>>, Option<Vec<String>>);
 
-/// One operation that resolves an `agentSpaceId`, with the request body for one id.
-type OperationRow = (&'static str, fn(&str) -> Value);
+/// One operation that resolves an `agentSpaceId`, with the request body for one id and
+/// the sentence its 404 states for an id that resolves to nothing.
+type OperationRow = (&'static str, fn(&str) -> Value, Path);
 
 /// RULE: an association of no ids is the same state as no association at all — the agent
 /// space is associated with nothing — and an ECHO of the record reports that state by the
@@ -347,11 +382,12 @@ async fn an_association_of_no_ids_is_absent_from_the_echo_and_empty_on_the_read(
 }
 
 /// RULE: an `agentSpaceId` that resolves to no stored agent space is refused with the
-/// service's `ResourceNotFoundException` (HTTP 404) stating the one FIXED sentence this
-/// service words that refusal with — the same sentence on every operation that resolves an
-/// agent space, carrying nothing the request sent.
+/// service's `ResourceNotFoundException` (HTTP 404) stating the sentence the PATH that
+/// raised it words that refusal with — the agent space API's own operations the one fixed
+/// sentence that carries nothing the request sent, the operations of a space's artifacts
+/// the sentence that names the id they could not resolve.
 #[tokio::test]
-async fn an_unresolvable_agent_space_is_refused_with_the_services_fixed_sentence() {
+async fn an_unresolvable_agent_space_is_refused_with_the_sentence_of_its_path() {
     let router = emulator();
     let created = ok(
         &router,
@@ -386,31 +422,51 @@ async fn an_unresolvable_agent_space_is_refused_with_the_services_fixed_sentence
     // Every operation that resolves an `agentSpaceId` before it does anything else, with
     // the rest of its required members filled in so the row is about the lookup alone.
     let operations: Vec<OperationRow> = vec![
-        ("UpdateAgentSpace", |id| {
-            json!({"agentSpaceId": id, "name": "should-not-be-written"})
-        }),
-        ("DeleteAgentSpace", |id| json!({"agentSpaceId": id})),
-        ("ListArtifacts", |id| json!({"agentSpaceId": id})),
-        ("AddArtifact", |id| {
-            json!({
-                "agentSpaceId": id,
-                "fileName": "upload.txt",
-                "artifactType": "TXT",
-                "artifactContent": aws_smithy_types::base64::encode(b"artifact bytes"),
-            })
-        }),
-        ("DeleteArtifact", |id| {
-            json!({"agentSpaceId": id, "artifactId": "f".repeat(32)})
-        }),
-        ("GetArtifact", |id| {
-            json!({"agentSpaceId": id, "artifactId": "f".repeat(32)})
-        }),
-        ("BatchGetArtifactMetadata", |id| {
-            json!({"agentSpaceId": id, "artifactIds": ["f".repeat(32)]})
-        }),
+        (
+            "UpdateAgentSpace",
+            |id| json!({"agentSpaceId": id, "name": "should-not-be-written"}),
+            Path::AgentSpaceApi,
+        ),
+        (
+            "DeleteAgentSpace",
+            |id| json!({"agentSpaceId": id}),
+            Path::AgentSpaceApi,
+        ),
+        (
+            "ListArtifacts",
+            |id| json!({"agentSpaceId": id}),
+            Path::ArtifactApi,
+        ),
+        (
+            "AddArtifact",
+            |id| {
+                json!({
+                    "agentSpaceId": id,
+                    "fileName": "upload.txt",
+                    "artifactType": "TXT",
+                    "artifactContent": aws_smithy_types::base64::encode(b"artifact bytes"),
+                })
+            },
+            Path::ArtifactApi,
+        ),
+        (
+            "DeleteArtifact",
+            |id| json!({"agentSpaceId": id, "artifactId": "f".repeat(32)}),
+            Path::ArtifactApi,
+        ),
+        (
+            "GetArtifact",
+            |id| json!({"agentSpaceId": id, "artifactId": "f".repeat(32)}),
+            Path::ArtifactApi,
+        ),
+        (
+            "BatchGetArtifactMetadata",
+            |id| json!({"agentSpaceId": id, "artifactIds": ["f".repeat(32)]}),
+            Path::ArtifactApi,
+        ),
     ];
 
-    for (operation, request_for) in operations {
+    for (operation, request_for, path) in operations {
         for (form, unknown) in &unknown_ids {
             assert_ne!(
                 unknown, &stored,
@@ -427,15 +483,20 @@ async fn an_unresolvable_agent_space_is_refused_with_the_services_fixed_sentence
                 answer.body
             );
             let message = member(&answer.body, "message").unwrap_or_default();
+            let expected = path.message(unknown);
             assert_eq!(
-                message, AGENT_SPACE_NOT_FOUND,
-                "case {case:?}: expected {AGENT_SPACE_NOT_FOUND:?}, got {message:?}"
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
             );
-            assert!(
-                !message.contains(unknown.as_str()),
-                "case {case:?}: the refusal must carry nothing the request sent, got \
-                 {message:?}"
-            );
+            // The agent space API's own sentence is wholly fixed, so it echoes none of
+            // the caller's input back.
+            if path == Path::AgentSpaceApi {
+                assert!(
+                    !message.contains(unknown.as_str()),
+                    "case {case:?}: the refusal must carry nothing the request sent, got \
+                     {message:?}"
+                );
+            }
         }
     }
 

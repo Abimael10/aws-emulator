@@ -182,12 +182,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The artifacts are read FROM an agent space, so a space the account does not
         // hold has no artifact metadata to report: the operation's own
-        // `ResourceNotFoundException` (HTTP 404), with the service's fixed sentence for
-        // an agent space it cannot resolve, before any artifact id is looked at.
+        // `ResourceNotFoundException` (HTTP 404), with the sentence the artifact path
+        // states for an agent space it cannot resolve — naming the id the request pointed
+        // at — before any artifact id is looked at.
         if !state.agent_spaces.contains_key(&input.agent_space_id) {
             return Err(BatchGetArtifactMetadataErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: crate::state::AGENT_SPACE_NOT_FOUND.to_string(),
+                    message: crate::state::artifact_agent_space_not_found(&input.agent_space_id),
                 },
             )
             .into());
