@@ -26,6 +26,10 @@
 //! line is read by what it says rather than by how far it is indented, so a copy pasted one
 //! level in is still a copy.
 //!
+//! The LIST half of the reader is read for the OTHER declaration roots of the workspace by
+//! [`super::declaration_roots_hold_canonical_lists`], which is why it is `pub(crate)`: one
+//! reading of what a copied line is, so the two suites cannot disagree about it.
+//!
 //! It reads one file; it writes nothing, starts no router and reaches no network.
 
 use std::collections::BTreeMap;
@@ -52,7 +56,11 @@ fn says_something(line: &str) -> bool {
 /// always against the FIRST line that said it: three copies of one line are two reports against
 /// the original rather than a chain. A root with no item at all has no list, which is what the
 /// sibling guards report; it is answered nothing here.
-fn repeated_list_lines(source: &str) -> Vec<String> {
+///
+/// `pub(crate)` because the sibling that reads this rule for the other declaration roots of the
+/// workspace ([`super::declaration_roots_hold_canonical_lists`]) reads it through this reader
+/// rather than a second copy of it.
+pub(crate) fn repeated_list_lines(source: &str) -> Vec<String> {
     let Some(first_item) = first_item_line(source) else {
         return Vec::new();
     };

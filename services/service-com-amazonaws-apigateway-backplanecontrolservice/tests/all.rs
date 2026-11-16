@@ -68,6 +68,11 @@ mod stage_scoped_lambda_permission;
 // and reuses the suite above's wiring and per-leg check.
 #[path = "all/stage_lambda_permission_arn_halves.rs"]
 mod stage_lambda_permission_arn_halves;
+// Two stages of ONE deployment addressed AT THE SAME TIME, and a grant added for the stage that
+// was refused — spans API Gateway, AWS Lambda and Amazon CloudWatch Logs at once, and reuses the
+// wiring and the per-leg check of the suite above.
+#[path = "all/stage_scoped_permission_burst.rs"]
+mod stage_scoped_permission_burst;
 // Declared here, at the head, for the reason the entry at the top of this file records: what
 // ONE function's resource policy decides for the DEPLOYED stage's caller and for the simulated
 // one spans API Gateway, AWS Lambda and Amazon CloudWatch Logs at once.

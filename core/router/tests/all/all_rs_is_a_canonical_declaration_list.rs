@@ -15,6 +15,15 @@
 //! sibling reports, and a declaration appended past the end of the list rather than into it
 //! is caught before it collides with the next branch's.
 //!
+//! It is read for this crate's own root while its target keeps one; where its suites are
+//! declared with `automod` instead, the rule has no subject here. The OTHER declaration roots
+//! of the workspace are not held to it and this reader is not run over them: they separate
+//! their pairs with blank lines and append a pair past their sorted span, which this reader
+//! reports by the hundred — how such a root is written, not the hazard the rule is about.
+//! Bringing one under the rule means changing that root first; the half of a canonical list
+//! those roots DO hold, that no line of the list copies a line the root already said, is read
+//! for them by [`super::declaration_roots_hold_canonical_lists`].
+//!
 //! It reads one file; it starts no router and reaches no network.
 
 // The declaration root this rule is about, read through the sibling declaration suite rather

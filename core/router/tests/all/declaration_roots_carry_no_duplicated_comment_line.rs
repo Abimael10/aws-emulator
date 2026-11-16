@@ -33,7 +33,7 @@ use crate::all_rs_inner_doc_comments_precede_the_first_item::first_item_line;
 
 /// Whether the declaration list of `source` — everything from its first item on — holds no
 /// prose, which is what makes a root one this rule is read for.
-fn the_list_is_prose_free(source: &str) -> bool {
+pub(crate) fn the_list_is_prose_free(source: &str) -> bool {
     let Some(item_line) = first_item_line(source) else {
         return true;
     };

@@ -19,6 +19,12 @@
 //! the inner attribute that closes the header contribute no sentence, so they only break a
 //! paragraph.
 //!
+//! It is read for this crate's own root while its target keeps one; where its suites are
+//! declared with `automod` instead, the rule has no subject here, and what the workspace's
+//! hand-kept roots are held to is the PARAGRAPH rule of
+//! [`super::declaration_roots_state_each_header_paragraph_once`], which reads them through this
+//! module's [`paragraph_prose_of`].
+//!
 //! It reads one file; it starts no router and reaches no network.
 
 // The declaration root this rule is about, the header boundary it is read against, and which

@@ -16,6 +16,11 @@
 //! separators (a blank line, or a comment with nothing after the slashes) carry no prose, so
 //! they may repeat; everything else, an inner attribute included, is owed one place.
 //!
+//! It is read for this crate's own root while its target keeps one; where its suites are
+//! declared with `automod` instead, the rule has no subject here, and the roots the workspace
+//! keeps by hand are read against it — through this reader — by
+//! [`super::declaration_roots_carry_no_duplicated_comment_line`].
+//!
 //! It reads one file; it starts no router and reaches no network.
 
 // The declaration root this rule is about, read through the sibling declaration suite rather

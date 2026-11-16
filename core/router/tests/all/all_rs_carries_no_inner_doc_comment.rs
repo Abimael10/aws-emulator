@@ -10,12 +10,18 @@
 //! it only as long as every landing keeps its own prose below the list in the other comment
 //! style.
 //!
-//! This root is the one every cross-service landing appends to, and it has lost that bet: its
-//! tail collected re-typed fragments of a `//!` header, past the first declaration, until the
-//! whole target failed to compile and no suite in it ran — including the siblings that pin the
-//! rule. What this suite pins is the stronger property that takes the bet away for this file:
-//! with no inner doc comment ANYWHERE in it, no appended, re-typed or merged copy of a line of
-//! it can be one past the first item, because there is no such line to copy.
+//! This crate's own root is the one every cross-service landing used to append to, and it lost
+//! that bet: its tail collected re-typed fragments of a `//!` header, past the first
+//! declaration, until the whole target failed to compile and no suite in it ran — including the
+//! siblings that pin the rule. What this suite pins is the stronger property that takes the bet
+//! away for such a file: with no inner doc comment ANYWHERE in it, no appended, re-typed or
+//! merged copy of a line of it can be one past the first item, because there is no such line to
+//! copy.
+//!
+//! It is read for this crate's own root while its target keeps one; where its suites are
+//! declared with `automod` instead, the rule has no subject here, and the workspace's hand-kept
+//! roots cannot be held to it as written: each one's header IS an inner doc comment, which is
+//! the weaker bet the sibling above reads them under.
 //!
 //! It reads one file; it starts no router and reaches no network.
 

@@ -31,7 +31,9 @@
 //! The harness is `pub(crate)` because the sibling suite that drives the REMAINING halves of
 //! the same method ARN ([`crate::stage_lambda_permission_arn_halves`]) wires the same api, the
 //! same function and the same two stages, and judges each leg by the same rule: one wiring and
-//! one per-leg check, so the two suites cannot disagree about either.
+//! one per-leg check, so the two suites cannot disagree about either. The suite that drives
+//! both stages AT ONCE ([`crate::stage_scoped_permission_burst`]) reuses the same wiring and the
+//! same per-leg check for the same reason.
 
 use std::io::Write as _;
 use std::sync::Arc;
@@ -107,20 +109,20 @@ def lambda_handler(event, context):
 "#;
 
 /// One answered request: its status, its body verbatim and the id it was reported under.
-struct Answered {
-    status: u16,
-    body: Bytes,
-    request_id: Option<String>,
+pub(crate) struct Answered {
+    pub(crate) status: u16,
+    pub(crate) body: Bytes,
+    pub(crate) request_id: Option<String>,
 }
 
 impl Answered {
     /// The body as text.
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 
     /// The body as JSON, `Null` when it is not JSON at all.
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
 }
@@ -265,7 +267,12 @@ async fn logs(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16
 /// `{rest-api-id}.execute-api.{region}.amazonaws.com` — through `stage`, carrying the marker
 /// this request is identified by and no credential at all, as a client of a public method
 /// sends none.
-async fn invoke(router: &MultiServiceRouter, api: &str, stage: &str, marker: &str) -> Answered {
+pub(crate) async fn invoke(
+    router: &MultiServiceRouter,
+    api: &str,
+    stage: &str,
+    marker: &str,
+) -> Answered {
     dispatch(
         router,
         "GET",
@@ -319,7 +326,7 @@ async fn delivered(router: &MultiServiceRouter, group: &str) -> Option<Vec<Strin
 
 /// What the FUNCTION's own log group holds: how many runs it frames, and whether the marker
 /// of this request's own run is among the lines.
-async fn runs_logged(router: &MultiServiceRouter, marker: &str) -> (usize, bool) {
+pub(crate) async fn runs_logged(router: &MultiServiceRouter, marker: &str) -> (usize, bool) {
     let messages = delivered(router, FUNCTION_GROUP).await.unwrap_or_default();
     let runs = messages
         .iter()
@@ -679,6 +686,40 @@ pub(crate) async fn one_leg(
     // counted against.
     let (runs_before, _) = runs_logged(router, marker).await;
     let answered = invoke(router, api, stage, marker).await;
+
+    // What a status alone cannot show: whether the function RAN. A request served by an
+    // invocation is one run's log, carrying that request's marker, in the function's own
+    // group; a request the policy refused leaves none.
+    let (runs_after, marked) = runs_logged(router, marker).await;
+    assert_eq!(
+        (runs_after - runs_before, marked),
+        (usize::from(invoked), invoked),
+        "case {case:?}: expected {} run(s) of the function logged by this request and \
+         its marker present={invoked}, got {} and {marked}",
+        usize::from(invoked),
+        runs_after - runs_before
+    );
+
+    judged_leg(router, api, case, stage, marker, &answered, invoked).await;
+}
+
+/// The half of [`one_leg`] that judges ONE request this api already ANSWERED: the status and
+/// the body it carries, and the records the stage's execution log holds about it.
+///
+/// Split out of [`one_leg`] because an answer can be judged where this helper did not make the
+/// invoke at all — the suite that drives both stages of one deployment AT ONCE
+/// ([`crate::stage_scoped_permission_burst`]) issues its requests concurrently and accounts for
+/// the function's runs over the burst as a whole, then judges each answered leg by this same
+/// rule: one reading of what a served and a refused leg look like.
+pub(crate) async fn judged_leg(
+    router: &MultiServiceRouter,
+    api: &str,
+    case: &str,
+    stage: &str,
+    marker: &str,
+    answered: &Answered,
+    invoked: bool,
+) {
     let request_id = answered
         .request_id
         .clone()
@@ -694,19 +735,6 @@ pub(crate) async fn one_leg(
         "case {case:?}: expected {expected:?}, got {} with {:?}",
         answered.status,
         answered.text()
-    );
-
-    // What a status alone cannot show: whether the function RAN. A request served by an
-    // invocation is one run's log, carrying that request's marker, in the function's own
-    // group; a request the policy refused leaves none.
-    let (runs_after, marked) = runs_logged(router, marker).await;
-    assert_eq!(
-        (runs_after - runs_before, marked),
-        (usize::from(invoked), invoked),
-        "case {case:?}: expected {} run(s) of the function logged by this request and \
-         its marker present={invoked}, got {} and {marked}",
-        usize::from(invoked),
-        runs_after - runs_before
     );
 
     // And what the STAGE logged about it, read back through CloudWatch Logs' own reader: the
