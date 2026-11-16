@@ -25,8 +25,8 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
     self, ERROR_CODE_INVALID_INPUT, ERROR_CODE_INVALID_QUERY_EXECUTION_STATE,
-    ERROR_CODE_QUERY_EXECUTION_NOT_FOUND, NO_OUTPUT_LOCATION, QUERY_STATE_CANCELLED,
-    WORK_GROUP_ALREADY_CREATED, WORK_GROUP_NOT_FOUND,
+    ERROR_CODE_QUERY_EXECUTION_NOT_FOUND, NO_OUTPUT_LOCATION, WORK_GROUP_ALREADY_CREATED,
+    WORK_GROUP_NOT_FOUND,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -302,7 +302,7 @@ async fn a_refusal_carries_its_class_code_under_both_names_with_its_own_sentence
             "GetQueryResults",
             json!({ "QueryExecutionId": cancelled }),
             ERROR_CODE_INVALID_QUERY_EXECUTION_STATE,
-            state::query_did_not_succeed(QUERY_STATE_CANCELLED),
+            state::RESULTS_NOT_FOUND.to_string(),
         ),
     ];
 

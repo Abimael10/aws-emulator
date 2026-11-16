@@ -528,6 +528,18 @@ pub fn data_catalog_not_found_on_update(catalog_name: &str) -> String {
     format!("DataCatalog {catalog_name} does not exist.")
 }
 
+/// The refusal message a create of a data catalog under a name this account already
+/// holds one under answers with.
+///
+/// Athena words a name already taken as the entity, the name the request carried, and
+/// "has already been created." — the create path's own sentence, which says that the
+/// NAME was registered before rather than that something merely exists. Held beside the
+/// three miss sentences for the same reason they are held apart from one another: each
+/// path keeps its own wording and none can drift onto another's.
+pub fn data_catalog_already_created(catalog_name: &str) -> String {
+    format!("DataCatalog {catalog_name} has already been created.")
+}
+
 /// The refusal message for a delete that asks for the Athena catalog alone to be removed
 /// from a catalog whose type does not take that request.
 ///
@@ -989,13 +1001,62 @@ pub fn data_catalog_name_error(name: &str, catalog_type: &str) -> Option<String>
     None
 }
 
+/// The refusal message a create or update whose `Parameters` map is EMPTY answers with,
+/// for a catalog type whose parameters are required.
+///
+/// Its own rule, separate from the missing-key one ([`data_catalog_parameter_keys_error`]):
+/// a map that carries nothing names no parameter at all, so what the caller is told is
+/// that the type's parameters cannot be empty — not which keys a non-empty map would
+/// still be missing. The only part of the request in the sentence is the
+/// `DataCatalogType` whose parameters they are, spelled as the sentence spells it: the
+/// enum value capitalised.
+pub fn data_catalog_parameters_empty(catalog_type: &str) -> String {
+    format!(
+        "{} catalog parameters cannot be empty.",
+        capitalised(catalog_type)
+    )
+}
+
+/// `value` with its first character upper-case and the rest lower-case, which is how a
+/// `DataCatalogType` is spelled inside a sentence rather than as a wire value.
+fn capitalised(value: &str) -> String {
+    let mut characters = value.chars();
+    match characters.next() {
+        None => String::new(),
+        Some(first) => first
+            .to_uppercase()
+            .chain(characters.flat_map(char::to_lowercase))
+            .collect(),
+    }
+}
+
 /// Why `parameters` does not describe a catalog of `catalog_type`, if it does not.
+///
+/// Two rules, each with its own sentence. A map that carries NOTHING fails the
+/// empty-map rule ([`data_catalog_parameters_empty`]) wherever the type requires
+/// parameters at all; a map that carries something but not what the type documents fails
+/// the missing-key rule ([`data_catalog_parameter_keys_error`]), which names those keys.
+/// A type the documentation states no requirement for constrains nothing here, so an
+/// empty map is no refusal for it either.
+pub fn data_catalog_parameters_error(
+    catalog_type: &str,
+    parameters: &HashMap<String, String>,
+) -> Option<String> {
+    let keys_error = data_catalog_parameter_keys_error(catalog_type, parameters)?;
+    if parameters.is_empty() {
+        return Some(data_catalog_parameters_empty(catalog_type));
+    }
+    Some(keys_error)
+}
+
+/// Why the KEYS `parameters` carries do not describe a catalog of `catalog_type`, if they
+/// do not.
 ///
 /// `DataCatalog$Parameters` is "a mapping whose values depend on the catalog type" and
 /// states, per type, which keys are required and which sets are mutually exclusive; a
 /// map that satisfies none of those sets names no catalog Athena could register. A type
 /// the documentation states no requirement for constrains nothing here.
-pub fn data_catalog_parameters_error(
+fn data_catalog_parameter_keys_error(
     catalog_type: &str,
     parameters: &HashMap<String, String>,
 ) -> Option<String> {
@@ -1918,6 +1979,39 @@ pub fn query_not_yet_finished(state: &str) -> String {
 /// SUCCEEDED with: there are no results to read from a query that did not succeed.
 pub fn query_did_not_succeed(state: &str) -> String {
     format!("Query did not finish successfully. Final query state: {state}")
+}
+
+/// The message a read of the results of a query that was INTERRUPTED answers with:
+/// wholly fixed text, naming neither the execution nor the state it is in.
+///
+/// A query a caller stopped never ran to an end, so no results of it were ever written
+/// anywhere: what the read reports is therefore the ABSENCE of the results rather than
+/// the state the execution is in — the distinction a client branches on to tell "nothing
+/// was produced" from "the run ended badly".
+pub const RESULTS_NOT_FOUND: &str = "Could not find results";
+
+/// The message a read of results it cannot serve answers with, for an execution in
+/// `state`.
+///
+/// One function for the whole class, so every path that cannot serve a result set words
+/// the three cases the same way: a query still on its way to a terminal state is not
+/// finished yet ([`query_not_yet_finished`]), a query a caller interrupted produced no
+/// results to find ([`RESULTS_NOT_FOUND`]), and a query that ran to an unsuccessful end
+/// reports that final state ([`query_did_not_succeed`]).
+pub fn results_not_readable(state: &str) -> String {
+    // Called only where there is no result set to serve, and a SUCCEEDED query's results
+    // are readable — so this is never asked to word a refusal for one.
+    debug_assert_ne!(
+        state, QUERY_STATE_SUCCEEDED,
+        "a succeeded query's results are served rather than refused"
+    );
+    match state {
+        QUERY_STATE_QUEUED | QUERY_STATE_RUNNING => query_not_yet_finished(state),
+        QUERY_STATE_CANCELLED => RESULTS_NOT_FOUND.to_string(),
+        // Every other terminal state is a run that ended without succeeding, which today
+        // is [`QUERY_STATE_FAILED`].
+        _ => query_did_not_succeed(state),
+    }
 }
 
 /// The message a paginated read refuses a `NextToken` it did not mint with.

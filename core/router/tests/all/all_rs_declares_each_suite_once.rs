@@ -218,7 +218,7 @@ pub(crate) fn workspace_root() -> PathBuf {
 }
 
 /// Every integration-test declaration root in the workspace: one `tests/all.rs` per
-/// service crate that has one, plus this crate's own where it has one.
+/// service crate that has one, plus this crate's own.
 ///
 /// The rule the tests above pin belongs to the single-target layout rather than to this
 /// crate, and the crate that breaks it cannot pin it itself: a repeated `mod` makes that

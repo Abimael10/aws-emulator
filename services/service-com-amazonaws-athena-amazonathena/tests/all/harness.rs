@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_athena_amazonathena::state::{QUERY_STATE_QUEUED, QUERY_STATE_RUNNING};
 use service_com_amazonaws_athena_amazonathena::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -110,6 +111,24 @@ pub async fn execution(router: &MultiServiceRouter, id: &str) -> Value {
         "GetQueryExecution({id}) must answer 200, got {status} with {body:?}"
     );
     body["QueryExecution"].clone()
+}
+
+/// Poll until the execution `id` has reached a terminal state, and return it.
+///
+/// The CONDITION is what is waited on, not a span: every look asks the service what state
+/// the execution is in, and the deadline is far above the span a completion is due after,
+/// so a loaded host cannot turn a slow run into a failure. Shared here because every suite
+/// that reads a finished query needs it.
+pub async fn settled(router: &MultiServiceRouter, id: &str) -> Value {
+    for _ in 0..600 {
+        let found = execution(router, id).await;
+        let state = found["Status"]["State"].as_str().unwrap_or_default();
+        if state != QUERY_STATE_QUEUED && state != QUERY_STATE_RUNNING {
+            return found;
+        }
+        ::tokio::time::sleep(::std::time::Duration::from_millis(100)).await;
+    }
+    panic!("the execution {id} never reached a terminal state");
 }
 
 /// The ids `work_group`'s query history holds.

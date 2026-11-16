@@ -41,11 +41,6 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 /// documented rule that one must be given; nothing is written to it.
 const OUTPUT_LOCATION: &str = "s3://athena-results/lifecycle/";
 
-/// How long a test waits past [`QUERY_EXECUTION_COMPLETION`] for a started query to be
-/// terminal: the span is owed from the submit, and this leaves room for the engine run
-/// and the request walk around it.
-const SETTLE_GRACE: Duration = Duration::from_millis(600);
-
 /// One service mounted on its own engine, reached the way the production router reaches
 /// it.
 fn router() -> MultiServiceRouter {
@@ -128,22 +123,12 @@ async fn state_of(router: &MultiServiceRouter, id: &str) -> String {
         .to_string()
 }
 
-/// Wait out the span a started query's completion is due after, then return the
-/// execution once it is terminal.
+/// Wait until a started query is terminal, then return the execution.
 ///
-/// The completion is owed [`QUERY_EXECUTION_COMPLETION`] after the submit, so this
-/// sleeps rather than spins, and then polls a few times in case the host was busy.
+/// The shared poll-until helper of the harness: the CONDITION is what is waited on, so a
+/// slow host only takes more looks.
 async fn settled(router: &MultiServiceRouter, id: &str) -> Value {
-    ::tokio::time::sleep(QUERY_EXECUTION_COMPLETION + SETTLE_GRACE).await;
-    for _ in 0..20 {
-        let found = execution(router, id).await;
-        let state = found["Status"]["State"].as_str().unwrap_or_default();
-        if state != QUERY_STATE_QUEUED && state != QUERY_STATE_RUNNING {
-            return found;
-        }
-        ::tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    panic!("the execution {id} never reached a terminal state");
+    crate::harness::settled(router, id).await
 }
 
 /// Read every row of `id`'s result set, `page_size` rows at a time, following the
@@ -1076,7 +1061,8 @@ async fn stopping_a_query_cancels_it_and_a_finished_query_is_left_as_it_is() {
         QUERY_STATE_CANCELLED,
         "a repeated stop must leave the query cancelled"
     );
-    // There are no results to read from a query that did not succeed.
+    // A cancelled query wrote no results, so the read reports that there are none to
+    // find rather than the state the execution ended in.
     let (status, refused) = call(
         &router,
         "GetQueryResults",
@@ -1089,8 +1075,8 @@ async fn stopping_a_query_cancels_it_and_a_finished_query_is_left_as_it_is() {
     );
     assert_eq!(
         refused["Message"].as_str(),
-        Some(state::query_did_not_succeed(QUERY_STATE_CANCELLED).as_str()),
-        "the refusal must name the final state, got {refused:?}"
+        Some(state::RESULTS_NOT_FOUND),
+        "the refusal must report the absence of results, got {refused:?}"
     );
 
     // A query that already finished is not interrupted by a stop.

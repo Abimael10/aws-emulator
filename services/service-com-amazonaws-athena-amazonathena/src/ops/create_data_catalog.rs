@@ -222,9 +222,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // under a name the registry already holds would either overwrite a catalog this
         // call never made or report success for one it did not create. Refused instead.
         if store.data_catalogs.contains_key(&input.name) {
-            return Err(invalid_request(format!(
-                "DataCatalog {} already exists.",
-                input.name
+            return Err(invalid_request(crate::state::data_catalog_already_created(
+                &input.name,
             )));
         }
 

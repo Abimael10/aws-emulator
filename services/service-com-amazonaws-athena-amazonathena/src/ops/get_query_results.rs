@@ -218,11 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the request got wrong, which is the class the code reports.
             return Err(invalid_request(
                 crate::state::ERROR_CODE_INVALID_QUERY_EXECUTION_STATE,
-                if record.is_terminal_at(now) {
-                    crate::state::query_did_not_succeed(state_name)
-                } else {
-                    crate::state::query_not_yet_finished(state_name)
-                },
+                crate::state::results_not_readable(state_name),
             ));
         };
 
