@@ -14,7 +14,11 @@
 //! * a record that does not exist, or that has been soft-deleted, is `ResourceNotFound`
 //!   (404) — `PutRecord`, not `UpdateRecord`, is what creates a record;
 //! * a `TtlDuration` recomputes `ExpiresAt = EventTime + TtlDuration` and requires an
-//!   `EventTime` in the same request.
+//!   `EventTime` in the same request;
+//! * a feature of a record has ONE value, so a request that names the same feature more
+//!   than once — which the modelled `Features` list admits, carrying no `uniqueItems` —
+//!   settles that feature on the value it names LAST and leaves no earlier value of it
+//!   observable.
 //!
 //! Each test is a TABLE spanning the class its rule generalises over — how many
 //! features are updated, which ones, the shape of their values, the two accepted
@@ -1014,6 +1018,565 @@ async fn a_feature_group_arn_and_its_name_reach_one_record() {
         assert_eq!(
             actual, expected,
             "case {case:?}: expected the updated record, got {actual:?}"
+        );
+    }
+}
+
+// A feature named MORE THAN ONCE in one request.
+//
+// `Features` is modelled `list<FeatureValue>` with `length min 1` and NO `uniqueItems`
+// (`smithy_query(query="shape", shape="FeatureValues,Record")`), so a request may
+// legitimately name one feature twice and the constraint walk passes it to the handler.
+// A feature of a record nevertheless HAS one value — a `FeatureValue` is "The value
+// associated with a feature" and a read reports "the latest value for all the Features"
+// (`GetRecord$FeatureNames`) — so the value a request settles a repeated name on is the
+// LAST it names for it, and the record the OnlineStore holds afterwards carries that
+// feature exactly once. Everything the operation derives from a posted feature (the
+// `EventTime` it orders by, the identifier it checks) is derived from that same held
+// value, so a read can never disagree with what the merge stored.
+
+/// The event time the record these tests update is stored with.
+const HELD_EVENT_TIME: &str = "2025-06-01T00:00:00Z";
+
+/// An event time NEWER than [`HELD_EVENT_TIME`], which an update may apply.
+const NEWER_EVENT_TIME: &str = "2026-01-01T00:00:00Z";
+
+/// An event time newer still, for a request that names the event-time feature twice.
+const NEWEST_EVENT_TIME: &str = "2027-02-03T04:05:06Z";
+
+/// An event time OLDER than [`HELD_EVENT_TIME`], which an update is refused for.
+const OLDER_EVENT_TIME: &str = "2024-01-01T00:00:00Z";
+
+/// One `FeatureValue` carrying a list, which is what a collection-typed feature carries.
+fn list_feature(name: &str, values: &[&str]) -> Value {
+    json!({ "FeatureName": name, "ValueAsStringList": values })
+}
+
+/// The record the repeated-name tests update: the group's own record-identifier and
+/// event-time features followed by two ordinary features, one scalar and one collection.
+///
+/// Every value is a word that occurs in no other value of the record, so a value a later
+/// occurrence of the same name superseded can be looked for in the whole rendered
+/// response rather than in one member of it.
+fn held_record() -> Vec<Value> {
+    vec![
+        feature("customer_id", "C1"),
+        feature("event_time", HELD_EVENT_TIME),
+        feature("city", "Seattle"),
+        list_feature("tags", &["tagone", "tagtwo"]),
+    ]
+}
+
+/// The pairs [`held_record`] reads back as, i.e. the record an update must leave
+/// unchanged when it is refused.
+fn held_pairs() -> Vec<(String, Value)> {
+    vec![
+        ("customer_id".to_owned(), json!("C1")),
+        ("event_time".to_owned(), json!(HELD_EVENT_TIME)),
+        ("city".to_owned(), json!("Seattle")),
+        ("tags".to_owned(), json!(["tagone", "tagtwo"])),
+    ]
+}
+
+/// Ingest `record` into `group` through `PutRecord`, which must be served.
+async fn seed_record(emulator: &Emulator, case: &str, group: &str, record: Vec<Value>) {
+    let (status, body) = emulator
+        .put_record(group, json!({ "Record": record }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: seeding {group:?} must succeed, got {status} {body:?}"
+    );
+}
+
+/// How many times `name` occurs among the `(FeatureName, value)` pairs of a read record.
+fn occurrences(pairs: &[Pair], name: &str) -> usize {
+    pairs.iter().filter(|(held, _)| held == name).count()
+}
+
+/// One row of the event-time ordering table: the case, the `Features` the update posts,
+/// the status and error code it is answered with (an empty code for a served update), and
+/// the record it leaves behind.
+type OrderingCase<'a> = (&'a str, Vec<Value>, u16, &'a str, Vec<Pair>);
+
+/// One row of the identity-check table: the case, the `Features` the update posts, the
+/// status it is answered with and the record it leaves behind.
+type IdentityCase<'a> = (&'a str, Vec<Value>, u16, Vec<Pair>);
+
+/// One row of the repeated-name merge table: the case, the `Features` the update posts,
+/// the record it must leave behind, and the values it must leave nowhere.
+struct RepeatedCase<'a> {
+    case: &'a str,
+    features: Vec<Value>,
+    expected: Vec<(&'a str, Value)>,
+    superseded: Vec<&'a str>,
+}
+
+#[tokio::test]
+async fn an_update_that_names_a_feature_twice_settles_on_the_last_value_named() {
+    // The class the rule spans: HOW MANY times a name is repeated, WHICH feature is
+    // repeated (an ordinary one, one the record does not carry yet, the group's
+    // event-time feature, its record-identifier feature), and the FORM of the values the
+    // repeated name carries (`ValueAsString`, `ValueAsStringList`, one after the other) —
+    // with an update whose names are all distinct as the control row.
+    let rows = vec![
+        RepeatedCase {
+            case: "an ordinary feature named twice",
+            features: vec![feature("city", "Boston"), feature("city", "Austin")],
+            expected: vec![
+                ("customer_id", json!("C1")),
+                ("event_time", json!(HELD_EVENT_TIME)),
+                ("city", json!("Austin")),
+                ("tags", json!(["tagone", "tagtwo"])),
+            ],
+            superseded: vec!["Seattle", "Boston"],
+        },
+        RepeatedCase {
+            case: "an ordinary feature named three times",
+            features: vec![
+                feature("city", "Boston"),
+                feature("city", "Austin"),
+                feature("city", "Denver"),
+            ],
+            expected: vec![
+                ("customer_id", json!("C1")),
+                ("event_time", json!(HELD_EVENT_TIME)),
+                ("city", json!("Denver")),
+                ("tags", json!(["tagone", "tagtwo"])),
+            ],
+            superseded: vec!["Seattle", "Boston", "Austin"],
+        },
+        RepeatedCase {
+            case: "a feature the record does not carry yet, named twice",
+            features: vec![
+                feature("note", "notefirst"),
+                feature("note", "notelast"),
+            ],
+            expected: vec![
+                ("customer_id", json!("C1")),
+                ("event_time", json!(HELD_EVENT_TIME)),
+                ("city", json!("Seattle")),
+                ("tags", json!(["tagone", "tagtwo"])),
+                ("note", json!("notelast")),
+            ],
+            superseded: vec!["notefirst"],
+        },
+        RepeatedCase {
+            case: "a scalar value superseded by a list value",
+            features: vec![
+                feature("tags", "tagscalar"),
+                list_feature("tags", &["taglistone", "taglisttwo"]),
+            ],
+            expected: vec![
+                ("customer_id", json!("C1")),
+                ("event_time", json!(HELD_EVENT_TIME)),
+                ("city", json!("Seattle")),
+                ("tags", json!(["taglistone", "taglisttwo"])),
+            ],
+            superseded: vec!["tagscalar", "tagone", "tagtwo"],
+        },
+        RepeatedCase {
+            case: "a list value superseded by a scalar value",
+            features: vec![
+                list_feature("tags", &["taglistone", "taglisttwo"]),
+                feature("tags", "tagscalar"),
+            ],
+            expected: vec![
+                ("customer_id", json!("C1")),
+                ("event_time", json!(HELD_EVENT_TIME)),
+                ("city", json!("Seattle")),
+                ("tags", json!("tagscalar")),
+            ],
+            superseded: vec!["taglistone", "taglisttwo", "tagone", "tagtwo"],
+        },
+        RepeatedCase {
+            case: "the group's event-time feature named twice",
+            features: vec![
+                feature("event_time", NEWER_EVENT_TIME),
+                feature("event_time", NEWEST_EVENT_TIME),
+                feature("city", "Boston"),
+            ],
+            expected: vec![
+                ("customer_id", json!("C1")),
+                ("event_time", json!(NEWEST_EVENT_TIME)),
+                ("city", json!("Boston")),
+                ("tags", json!(["tagone", "tagtwo"])),
+            ],
+            superseded: vec![HELD_EVENT_TIME, NEWER_EVENT_TIME, "Seattle"],
+        },
+        RepeatedCase {
+            case: "the group's record-identifier feature named twice",
+            features: vec![
+                feature("customer_id", "C1"),
+                feature("customer_id", "C1"),
+                feature("city", "Boston"),
+            ],
+            expected: vec![
+                ("customer_id", json!("C1")),
+                ("event_time", json!(HELD_EVENT_TIME)),
+                ("city", json!("Boston")),
+                ("tags", json!(["tagone", "tagtwo"])),
+            ],
+            superseded: vec!["Seattle"],
+        },
+        RepeatedCase {
+            case: "every feature named once",
+            features: vec![feature("city", "Boston"), feature("tags", "tagscalar")],
+            expected: vec![
+                ("customer_id", json!("C1")),
+                ("event_time", json!(HELD_EVENT_TIME)),
+                ("city", json!("Boston")),
+                ("tags", json!("tagscalar")),
+            ],
+            superseded: vec!["Seattle", "tagone", "tagtwo"],
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let emulator = Emulator::new();
+        seed_record(&emulator, case, "customers", held_record()).await;
+
+        let (status, body) = emulator
+            .update_record(
+                "customers",
+                json!({
+                    "RecordIdentifierValueAsString": "C1",
+                    "Features": row.features
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected UpdateRecord 200, got {status} {body:?}"
+        );
+
+        let (status, body) = emulator
+            .get_record("customers", "RecordIdentifierValueAsString=C1")
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected GetRecord 200, got {status} {body:?}"
+        );
+        let actual = record_pairs(&body);
+        let expected: Vec<Pair> = row
+            .expected
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), value.clone()))
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected the merged record {expected:?}, got {actual:?}"
+        );
+
+        // Each feature of the record is reported ONCE: a repeated name updates the one
+        // value the record holds for it instead of adding a second.
+        for (name, _) in &expected {
+            let held = occurrences(&actual, name);
+            assert_eq!(
+                held, 1,
+                "case {case:?}: expected exactly one {name:?} value in the record, got \
+                 {held} in {actual:?}"
+            );
+        }
+
+        // A value a later occurrence of the same name superseded is held nowhere, so no
+        // pre-update value of an updated feature stays observable.
+        let rendered = body.to_string();
+        for gone in &row.superseded {
+            assert!(
+                !rendered.contains(gone),
+                "case {case:?}: expected the record not to carry the superseded value \
+                 {gone:?}, got {rendered}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_last_event_time_an_update_names_is_the_one_the_update_is_ordered_by() {
+    // The `EventTime` of an update is the value the group's own `EventTimeFeatureName`
+    // carries among the posted features, and a feature named twice carries the value
+    // named LAST — so that value, and not the one named first, is what the ordering rule
+    // ("If you provide an EventTime that is older than the record's current EventTime,
+    // the service rejects the update with a ConflictException") is applied to.
+    let rows: Vec<OrderingCase> = vec![
+        (
+            "the newer of two event times named last",
+            vec![
+                feature("event_time", OLDER_EVENT_TIME),
+                feature("event_time", NEWER_EVENT_TIME),
+                feature("city", "Boston"),
+            ],
+            200,
+            "",
+            vec![
+                ("customer_id".to_owned(), json!("C1")),
+                ("event_time".to_owned(), json!(NEWER_EVENT_TIME)),
+                ("city".to_owned(), json!("Boston")),
+                ("tags".to_owned(), json!(["tagone", "tagtwo"])),
+            ],
+        ),
+        (
+            "the older of two event times named last",
+            vec![
+                feature("event_time", NEWER_EVENT_TIME),
+                feature("event_time", OLDER_EVENT_TIME),
+                feature("city", "Boston"),
+            ],
+            409,
+            "ConflictException",
+            held_pairs(),
+        ),
+    ];
+
+    for (case, features, expected_status, expected_code, expected_record) in rows {
+        let emulator = Emulator::new();
+        seed_record(&emulator, case, "customers", held_record()).await;
+
+        let (status, body) = emulator
+            .update_record(
+                "customers",
+                json!({
+                    "RecordIdentifierValueAsString": "C1",
+                    "Features": features
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} {body:?}"
+        );
+        if !expected_code.is_empty() {
+            let code = error_code(&body);
+            assert_eq!(
+                code, expected_code,
+                "case {case:?}: expected the {expected_code} error code, got {code:?} in \
+                 {body:?}"
+            );
+        }
+
+        let (_, read_back) = emulator
+            .get_record("customers", "RecordIdentifierValueAsString=C1")
+            .await;
+        let actual = record_pairs(&read_back);
+        assert_eq!(
+            actual, expected_record,
+            "case {case:?}: expected the record {expected_record:?}, got {actual:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_last_identifier_value_an_update_names_is_the_one_it_is_checked_against() {
+    // `RecordIdentifierValueAsString` "must match the value defined by the feature
+    // group's record identifier feature", and the value a feature named twice carries is
+    // the one named LAST — so the check is made against that value: an update whose last
+    // occurrence carries the record's own identifier is served, and one whose last
+    // occurrence carries another value is refused and changes nothing.
+    let rows: Vec<IdentityCase> = vec![
+        (
+            "the record's own identifier value named last",
+            vec![
+                feature("customer_id", "C9"),
+                feature("customer_id", "C1"),
+                feature("city", "Boston"),
+            ],
+            200,
+            vec![
+                ("customer_id".to_owned(), json!("C1")),
+                ("event_time".to_owned(), json!(HELD_EVENT_TIME)),
+                ("city".to_owned(), json!("Boston")),
+                ("tags".to_owned(), json!(["tagone", "tagtwo"])),
+            ],
+        ),
+        (
+            "another record's identifier value named last",
+            vec![
+                feature("customer_id", "C1"),
+                feature("customer_id", "C9"),
+                feature("city", "Boston"),
+            ],
+            400,
+            held_pairs(),
+        ),
+    ];
+
+    for (case, features, expected_status, expected_record) in rows {
+        let emulator = Emulator::new();
+        seed_record(&emulator, case, "customers", held_record()).await;
+
+        let (status, body) = emulator
+            .update_record(
+                "customers",
+                json!({
+                    "RecordIdentifierValueAsString": "C1",
+                    "Features": features
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} {body:?}"
+        );
+        if expected_status == 400 {
+            let code = error_code(&body);
+            assert!(
+                matches!(code.as_str(), "ValidationError" | "ValidationException"),
+                "case {case:?}: expected the modelled validation error code, got {code:?} \
+                 in {body:?}"
+            );
+        }
+
+        let (_, read_back) = emulator
+            .get_record("customers", "RecordIdentifierValueAsString=C1")
+            .await;
+        let actual = record_pairs(&read_back);
+        assert_eq!(
+            actual, expected_record,
+            "case {case:?}: expected the record {expected_record:?}, got {actual:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_feature_written_twice_by_one_write_is_updated_as_one_value() {
+    // A whole-record write that names a feature twice stores that feature ONCE, so the
+    // record an update merges onto holds one value per name whichever write ingested it —
+    // and after an update of that feature neither read of this data plane serves a
+    // pre-update value beside the new one. The class: the two whole-record writes that
+    // ingest a record, and the two reads that serve one.
+    for (case, via) in [
+        ("written by PutRecord", "PutRecord"),
+        ("written by BatchWriteRecord", "BatchWriteRecord"),
+    ] {
+        let emulator = Emulator::new();
+        let posted = vec![
+            feature("customer_id", "C1"),
+            feature("event_time", HELD_EVENT_TIME),
+            feature("city", "Seattle"),
+            feature("city", "Boston"),
+            list_feature("tags", &["tagone", "tagtwo"]),
+        ];
+        if via == "PutRecord" {
+            seed_record(&emulator, case, "customers", posted).await;
+        } else {
+            let (status, body) = emulator
+                .send(
+                    "POST",
+                    "/BatchWriteRecord",
+                    Some(json!({ "Entries": [
+                        { "FeatureGroupName": "customers", "Record": posted }
+                    ] })),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected BatchWriteRecord 200, got {status} {body:?}"
+            );
+            let errors = body
+                .get("Errors")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                errors.is_empty(),
+                "case {case:?}: expected the batch entry to be written, got {errors:?}"
+            );
+        }
+
+        // The ingested record already holds the repeated feature once, under the value
+        // the write named last.
+        let (_, body) = emulator
+            .get_record("customers", "RecordIdentifierValueAsString=C1")
+            .await;
+        let written = record_pairs(&body);
+        let expected_written: Vec<Pair> = vec![
+            ("customer_id".to_owned(), json!("C1")),
+            ("event_time".to_owned(), json!(HELD_EVENT_TIME)),
+            ("city".to_owned(), json!("Boston")),
+            ("tags".to_owned(), json!(["tagone", "tagtwo"])),
+        ];
+        assert_eq!(
+            written, expected_written,
+            "case {case:?}: expected the written record {expected_written:?}, got \
+             {written:?}"
+        );
+
+        let (status, body) = emulator
+            .update_record(
+                "customers",
+                json!({
+                    "RecordIdentifierValueAsString": "C1",
+                    "Features": [
+                        feature("event_time", NEWER_EVENT_TIME),
+                        feature("city", "Denver")
+                    ]
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected UpdateRecord 200, got {status} {body:?}"
+        );
+
+        let expected_merged: Vec<Pair> = vec![
+            ("customer_id".to_owned(), json!("C1")),
+            ("event_time".to_owned(), json!(NEWER_EVENT_TIME)),
+            ("city".to_owned(), json!("Denver")),
+            ("tags".to_owned(), json!(["tagone", "tagtwo"])),
+        ];
+
+        // GetRecord: the updated feature has one value, the updated one.
+        let (_, body) = emulator
+            .get_record("customers", "RecordIdentifierValueAsString=C1")
+            .await;
+        let merged = record_pairs(&body);
+        assert_eq!(
+            merged, expected_merged,
+            "case {case:?}: expected GetRecord to serve {expected_merged:?}, got {merged:?}"
+        );
+        let rendered = body.to_string();
+        for gone in ["Seattle", "Boston", HELD_EVENT_TIME] {
+            assert!(
+                !rendered.contains(gone),
+                "case {case:?}: expected GetRecord not to serve the pre-update value \
+                 {gone:?}, got {rendered}"
+            );
+        }
+
+        // BatchGetRecord: the same record, read through the other reader of this plane.
+        let (status, body) = emulator
+            .send(
+                "POST",
+                "/BatchGetRecord",
+                Some(json!({ "Identifiers": [
+                    {
+                        "FeatureGroupName": "customers",
+                        "RecordIdentifiersValueAsString": ["C1"]
+                    }
+                ] })),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected BatchGetRecord 200, got {status} {body:?}"
+        );
+        let details = body
+            .get("Records")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            details.len(),
+            1,
+            "case {case:?}: expected one record detail, got {details:?}"
+        );
+        let batched = record_pairs(&details[0]);
+        assert_eq!(
+            batched, expected_merged,
+            "case {case:?}: expected BatchGetRecord to serve {expected_merged:?}, got \
+             {batched:?}"
         );
     }
 }
