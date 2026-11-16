@@ -313,6 +313,8 @@ mod cloudformation_activates_acmpca_certificate_authorities;
 mod cloudformation_admits_acmpca_resource_types;
 #[path = "all/cloudformation_alb_fargate_service_converges.rs"]
 mod cloudformation_alb_fargate_service_converges;
+#[path = "all/cloudformation_api_child_name_scope.rs"]
+mod cloudformation_api_child_name_scope;
 #[path = "all/cloudformation_apigateway_access_control.rs"]
 mod cloudformation_apigateway_access_control;
 #[path = "all/cloudformation_apigateway_base_path_mappings.rs"]
@@ -651,6 +653,8 @@ mod cloudformation_s3tables_table_bucket_maintenance;
 mod cloudformation_sam_function_writes_its_table;
 #[path = "all/cloudformation_sam_http_api_definitions.rs"]
 mod cloudformation_sam_http_api_definitions;
+#[path = "all/cloudformation_sam_http_api_event_serves_its_route.rs"]
+mod cloudformation_sam_http_api_event_serves_its_route;
 #[path = "all/cloudformation_scripted_queue_deploy.rs"]
 mod cloudformation_scripted_queue_deploy;
 #[path = "all/cloudformation_search_indexing_pipeline_outputs.rs"]

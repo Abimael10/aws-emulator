@@ -972,7 +972,14 @@ pub(super) fn adopt_composite_identity(resource: &mut StoredResource) {
 ///   `PutSubscriptionFilter`/`DeleteSubscriptionFilter` take `logGroupName` beside
 ///   `filterName`, and the two describes list the filters of one group);
 /// * a stage belongs to ONE REST API (`GetStage` and `DeleteStage` take `restApiId` beside
-///   `stageName`).
+///   `stageName`);
+/// * a stage of an HTTP or WebSocket API belongs to ONE of those APIs the same way
+///   (API Gateway v2's `GetStage` and `DeleteStage` take `ApiId` beside `StageName`, both
+///   `@httpLabel`s of `/v2/apis/{ApiId}/stages/{StageName}`), and "Ref returns the stage
+///   name" for that type too — so two apis of one stack each carrying the `$default` stage
+///   every auto-deployed HTTP api is served on are two stages, and AWS creates both;
+/// * a model belongs to ONE REST API (`GetModel` and `DeleteModel` take `restApiId` beside
+///   `modelName`, and a method's `requestModels` names one by that name).
 ///
 /// A type whose physical id its owning service ASSIGNS needs no row: that identifier is
 /// unique by construction, so two resources of the type never resolve to one name.
@@ -984,6 +991,8 @@ pub fn name_scope_properties(resource_type: &str) -> &'static [&'static str] {
             &["LogGroupName"]
         }
         "AWS::ApiGateway::Stage" => &["RestApiId"],
+        APIGATEWAY_MODEL => &["RestApiId"],
+        APIGATEWAYV2_STAGE => &["ApiId"],
         _ => &[],
     }
 }

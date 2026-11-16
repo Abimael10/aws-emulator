@@ -295,6 +295,90 @@ mod tests {
         }
     }
 
+    /// RULE: the same holds for every type whose owning service addresses one of its
+    /// resources together with its parent — a stage or a model of an API Gateway api among
+    /// them: the name is taken only by a resource under the SAME parent, so two apis of one
+    /// stack each carrying a stage of one name are two stages.
+    ///
+    /// The rows differ along the type, the property that names its parent, the kind of child
+    /// (a stage, a data model, a log stream) and whether the two declarations name one parent
+    /// or two.
+    #[test]
+    fn a_stage_or_model_is_taken_only_inside_its_own_api() {
+        // Each row: the type, the property its declaration names its parent in, and the name
+        // two declarations of it contest.
+        let types: &[(&str, &str, &str)] = &[
+            // API Gateway v2's `GetStage`/`DeleteStage` take `ApiId` beside `StageName`.
+            ("AWS::ApiGatewayV2::Stage", "ApiId", "$default"),
+            // The REST control plane's take `restApiId` beside `stageName`.
+            ("AWS::ApiGateway::Stage", "RestApiId", "prod"),
+            // `GetModel`/`DeleteModel` take `restApiId` beside `modelName`.
+            ("AWS::ApiGateway::Model", "RestApiId", "Payload"),
+            // The log stream the sibling rule above is stated on, for contrast: a type
+            // scoped by something other than an api holds the same way.
+            ("AWS::Logs::LogStream", "LogGroupName", "app"),
+        ];
+        let child = |resource_type: &str,
+                     parent_property: &str,
+                     logical_id: &str,
+                     parent: &str,
+                     name: &str| StoredResource {
+            logical_id: logical_id.to_string(),
+            resource_type: resource_type.to_string(),
+            physical_resource_id: name.to_string(),
+            attributes: ::std::collections::BTreeMap::new(),
+            metadata: None,
+            properties: ::serde_json::json!({ parent_property: parent }),
+            materialised: true,
+            deletion_policy: None,
+            update_replace_policy: None,
+        };
+        // Whether the two declarations name one parent, and so whether the second collides.
+        let parents: &[(&str, &str, bool)] = &[
+            ("two different parents", "parent-two", false),
+            ("one parent twice", "parent-one", true),
+        ];
+        for (resource_type, parent_property, name) in types {
+            for (parenting, candidate_parent, collides) in parents {
+                let case = format!("{resource_type} named {name:?} under {parenting}");
+                let candidate =
+                    child(resource_type, parent_property, "Second", candidate_parent, name);
+                let held = [child(
+                    resource_type,
+                    parent_property,
+                    "First",
+                    "parent-one",
+                    name,
+                )];
+                let taken = taken_in_the_stack(&candidate, held.iter());
+                assert_eq!(
+                    taken.is_some(),
+                    *collides,
+                    "case {case:?}: expected the name to be taken in the stack: {collides}, got \
+                     {taken:?}"
+                );
+                let managed = vec![ManagedName {
+                    resource_type: (*resource_type).to_string(),
+                    physical_resource_id: (*name).to_string(),
+                    stack_id: "arn:aws:cloudformation:us-east-1:000000000000:stack/theirs/1"
+                        .to_string(),
+                    scope: scope_of(&held[0]),
+                }];
+                let elsewhere = taken_by_another_stack(
+                    &candidate,
+                    &managed,
+                    "arn:aws:cloudformation:us-east-1:000000000000:stack/mine/0",
+                );
+                assert_eq!(
+                    elsewhere.is_some(),
+                    *collides,
+                    "case {case:?}: expected another stack to hold the name: {collides}, got \
+                     {elsewhere:?}"
+                );
+            }
+        }
+    }
+
     /// RULE: a name is taken by ANOTHER resource of the same type that really exists — never
     /// by the resource itself, by a record nothing created, by a resource of another type or
     /// by an empty name.
