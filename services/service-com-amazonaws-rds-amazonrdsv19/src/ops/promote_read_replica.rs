@@ -238,21 +238,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // Only a READ REPLICA can be promoted: `DBInstanceIdentifier` "must match the
         // identifier of an existing read replica DB instance", and an instance is one
-        // exactly while it carries the source `CreateDBInstanceReadReplica` resolved for it.
+        // exactly while it carries the source `CreateDBInstanceReadReplica` resolved for it —
+        // a source DB instance or a source Multi-AZ DB cluster, since a replica of either is
+        // a read replica DB instance this call promotes to a standalone one.
         // A standalone instance — one created without a source, or one an earlier promotion
         // already made standalone — is in no state this call can be performed in, which is
         // the modelled instance state fault rather than a promotion that changed nothing. It
         // is decided BEFORE the instance's lifecycle status: this is a precondition on what
         // the identifier names, which no waiting changes, so the caller is told that rather
         // than to poll.
-        let Some(source_identifier) = instance
-            .read_replica_source_db_instance_identifier
-            .clone()
-        else {
+        if !instance.is_read_replica() {
             return Err(invalid_state(
                 crate::state::PROMOTE_INSTANCE_NOT_A_READ_REPLICA_MESSAGE.to_string(),
             ));
-        };
+        }
+        // The source DB INSTANCE this replica replicates, for the half of the relationship
+        // recorded on that instance below. `None` for a replica of a Multi-AZ DB cluster,
+        // whose source keeps no list to drop this replica from: a cluster's replicas are read
+        // off the instances that name it, so clearing the relationship on this record is the
+        // whole of it.
+        let source_identifier = instance
+            .read_replica_source_db_instance_identifier
+            .clone();
         // A promotion is work done ON a running instance — "a read replica cannot be
         // promoted to a standalone instance when it is in the backing-up status", and no
         // more so while it is still coming up, going down or stopped — so every status but
@@ -290,8 +297,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instance", and this one is associated with it no longer. The source may itself be
         // gone by now (a delete promotes the replicas of the instance it removes), in which
         // case there is no list to drop it from.
-        let source_key = (region.clone(), source_identifier);
-        if let Some(source) = store.db_instances.get_mut(&source_key) {
+        if let Some(source) = source_identifier.and_then(|source_identifier| {
+            store
+                .db_instances
+                .get_mut(&(region.clone(), source_identifier))
+        }) {
             source.detach_read_replica(&identifier);
         }
 

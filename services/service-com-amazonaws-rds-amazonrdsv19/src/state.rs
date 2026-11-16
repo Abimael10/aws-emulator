@@ -1064,7 +1064,11 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                 .collect(),
             // "Contains one or more identifiers of the read replicas associated with this
             // DB cluster": the clusters in this region whose replication source is this
-            // one, read from those records rather than copied onto this one.
+            // one, and the DB instances created as read replicas OF it
+            // (`CreateDBInstanceReadReplica$SourceDBClusterIdentifier`, the Multi-AZ DB
+            // cluster that "will act as the source for the read replica"). Both are read
+            // from those records rather than copied onto this one, so a replica this store
+            // no longer holds is not one the cluster reports.
             read_replica_identifiers: self
                 .clusters_in(&record.region)
                 .into_iter()
@@ -1075,6 +1079,19 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                         .is_some_and(|source| *source == record.arn())
                 })
                 .map(|other| other.identifier.clone())
+                .chain(
+                    self.instances_in(&record.region)
+                        .into_iter()
+                        .filter(|instance| {
+                            instance
+                                .read_replica_source_db_cluster_identifier
+                                .as_ref()
+                                .is_some_and(|source| {
+                                    source.eq_ignore_ascii_case(&record.identifier)
+                                })
+                        })
+                        .map(|instance| instance.identifier.clone()),
+                )
                 .collect(),
             // The global database cluster the cluster belongs to, read from that global
             // cluster's own record: the cluster stores only its identifier, and the

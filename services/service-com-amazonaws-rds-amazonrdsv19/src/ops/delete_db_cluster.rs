@@ -539,6 +539,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 other.replication_source_arn = None;
             }
         }
+        // The same for the DB INSTANCES that replicate this cluster — the read replicas
+        // `CreateDBInstanceReadReplica` created from it, which are not members of it and so
+        // are not terminated with it: each is promoted to a standalone DB instance rather
+        // than left naming a cluster this store is about to drop.
+        let instance_replicas: Vec<String> = store
+            .instances_in(&region)
+            .into_iter()
+            .filter(|instance| {
+                instance
+                    .read_replica_source_db_cluster_identifier
+                    .as_ref()
+                    .is_some_and(|source| source.eq_ignore_ascii_case(&identifier))
+            })
+            .map(|instance| instance.identifier.clone())
+            .collect();
+        for replica in instance_replicas {
+            if let Some(instance) = store.db_instances.get_mut(&(region.clone(), replica)) {
+                instance.promote_from_read_replica();
+            }
+        }
         // A cluster on its way out is no longer a member of the global database it joined:
         // the membership lives on the global cluster's own record, so that is the record
         // updated, exactly as `CreateDBCluster` adds it there.

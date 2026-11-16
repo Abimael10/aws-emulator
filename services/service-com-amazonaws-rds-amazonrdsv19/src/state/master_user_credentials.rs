@@ -135,6 +135,7 @@ mod tests {
             db_security_group_names: Vec::new(),
             db_cluster_identifier: None,
             read_replica_source_db_instance_identifier: None,
+            read_replica_source_db_cluster_identifier: None,
             read_replica_db_instance_identifiers: Vec::new(),
             domain: None,
             ca_certificate_identifier: DEFAULT_CA_CERTIFICATE_IDENTIFIER.to_string(),

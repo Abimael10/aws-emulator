@@ -91,6 +91,16 @@ pub struct DbInstanceRecord {
     /// if this DB instance is a read replica", as `CreateDBInstanceReadReplica` resolved it,
     /// and `None` for an instance that replicates nothing.
     pub read_replica_source_db_instance_identifier: Option<String>,
+    /// `ReadReplicaSourceDBClusterIdentifier` — "the identifier of the source DB cluster if
+    /// this DB instance is a read replica", for the OTHER source
+    /// `CreateDBInstanceReadReplica` creates a replica from: a Multi-AZ DB cluster
+    /// (`SourceDBClusterIdentifier`). `None` for an instance that replicates no cluster.
+    ///
+    /// At most one of the two source members is ever set, because a replica replicates ONE
+    /// source. The cluster's half of the relationship is NOT stored on the cluster: it is
+    /// read off the instances that name it, as everything a cluster reports about the
+    /// records around it is ([`ClusterMembership`]).
+    pub read_replica_source_db_cluster_identifier: Option<String>,
     /// `ReadReplicaDBInstanceIdentifiers` — "the identifiers of the read replicas associated
     /// with this DB instance", in the order the replicas were created.
     ///
@@ -262,8 +272,21 @@ impl DbInstanceRecord {
 
     /// Stop replicating: an instance whose source DB instance is being deleted is promoted
     /// to a standalone DB instance, so it reports no source from then on.
+    ///
+    /// Both sources are cleared, because a promotion ends the replication whichever kind of
+    /// resource it was from — a DB instance or a Multi-AZ DB cluster.
     pub fn promote_from_read_replica(&mut self) {
         self.read_replica_source_db_instance_identifier = None;
+        self.read_replica_source_db_cluster_identifier = None;
+    }
+
+    /// Whether this instance REPLICATES another resource, which is what makes it a read
+    /// replica: the source DB instance or the source Multi-AZ DB cluster
+    /// `CreateDBInstanceReadReplica` resolved for it, and nothing once a promotion has
+    /// cleared the relationship.
+    pub fn is_read_replica(&self) -> bool {
+        self.read_replica_source_db_instance_identifier.is_some()
+            || self.read_replica_source_db_cluster_identifier.is_some()
     }
 
     /// The name of the log file this instance writes, which follows from its engine; see
@@ -326,10 +349,10 @@ impl DbInstanceRecord {
     /// `StatusInfos`: "The status of a read replica. If the DB instance isn't a read
     /// replica, the value is blank."
     ///
-    /// So an instance reports one entry exactly while it REPLICATES another — the
-    /// relationship [`Self::read_replica_source_db_instance_identifier`] holds, which
-    /// `PromoteReadReplica` clears — and an instance that replicates nothing reports no
-    /// member at all, which is the blank value the member documents. The entry's
+    /// So an instance reports one entry exactly while it REPLICATES another resource — the
+    /// relationship [`Self::is_read_replica`] reads, which `PromoteReadReplica` clears — and
+    /// an instance that replicates nothing reports no member at all, which is the blank value
+    /// the member documents. The entry's
     /// `StatusType` "is currently \"read replication\"", `Normal` "indicates whether the
     /// instance is operating normally (TRUE) or is in an error state (FALSE)" and `Status`
     /// is one of the values the member publishes for that status type
@@ -342,16 +365,14 @@ impl DbInstanceRecord {
     /// the instance ... if the instance isn't in an error state, this value is blank") is
     /// left out rather than carrying an error nothing reported.
     pub fn status_infos(&self) -> Option<Vec<DBInstanceStatusInfo>> {
-        self.read_replica_source_db_instance_identifier
-            .as_ref()
-            .map(|_| {
-                vec![DBInstanceStatusInfo {
-                    status_type: Some(READ_REPLICATION_STATUS_TYPE.to_string()),
-                    normal: Some(true),
-                    status: Some(READ_REPLICATION_STATUS_REPLICATING.to_string()),
-                    message: None,
-                }]
-            })
+        self.is_read_replica().then(|| {
+            vec![DBInstanceStatusInfo {
+                status_type: Some(READ_REPLICATION_STATUS_TYPE.to_string()),
+                normal: Some(true),
+                status: Some(READ_REPLICATION_STATUS_REPLICATING.to_string()),
+                message: None,
+            }]
+        })
     }
 
     /// `PendingModifiedValues`: what this service has accepted for the instance and not
@@ -557,6 +578,12 @@ impl DbInstanceRecord {
             ),
             read_replica_source_db_instance_identifier: self
                 .read_replica_source_db_instance_identifier
+                .clone(),
+            // The other source a replica may have: the Multi-AZ DB cluster it replicates.
+            // Reported from the same stored relationship, so a replica of a cluster names
+            // its cluster here exactly as a replica of an instance names its instance above.
+            read_replica_source_db_cluster_identifier: self
+                .read_replica_source_db_cluster_identifier
                 .clone(),
             // `StatusInfos`: the replication status of a READ REPLICA, and blank for an
             // instance that is not one ([`Self::status_infos`]).

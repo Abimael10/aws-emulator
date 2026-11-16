@@ -839,9 +839,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             db_security_group_names: input.db_security_groups.unwrap_or_default(),
             db_cluster_identifier,
             // Nothing is replicated: a DB instance this operation creates replicates no
-            // source, and a replica of it exists only once
-            // `CreateDBInstanceReadReplica` has created one.
+            // source — neither a DB instance nor a Multi-AZ DB cluster — and a replica of it
+            // exists only once `CreateDBInstanceReadReplica` has created one.
             read_replica_source_db_instance_identifier: None,
+            read_replica_source_db_cluster_identifier: None,
             read_replica_db_instance_identifiers: Vec::new(),
             domain: input.domain,
             ca_certificate_identifier: input.ca_certificate_identifier.unwrap_or_else(|| {

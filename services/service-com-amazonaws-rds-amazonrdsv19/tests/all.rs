@@ -103,6 +103,8 @@ mod db_instance_event_pattern_precision;
 mod db_instance_read_replica_promotion;
 #[path = "all/db_instance_read_replicas.rs"]
 mod db_instance_read_replicas;
+#[path = "all/db_instance_read_replicas_of_clusters.rs"]
+mod db_instance_read_replicas_of_clusters;
 #[path = "all/db_instance_refused_change_publishes_no_event.rs"]
 mod db_instance_refused_change_publishes_no_event;
 #[path = "all/db_instance_role_association_messages.rs"]

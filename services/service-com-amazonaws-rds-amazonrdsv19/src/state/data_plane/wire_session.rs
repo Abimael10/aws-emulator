@@ -259,7 +259,7 @@ impl SessionContext {
                 // relationship is what says so, so an instance `PromoteReadReplica` has
                 // promoted — which clears it — serves writes from then on, under the same
                 // session.
-                read_only: record.read_replica_source_db_instance_identifier.is_some(),
+                read_only: record.is_read_replica(),
                 runtime: engine_runtime_of(&store, record),
             },
             &self.database,
@@ -285,7 +285,7 @@ impl SessionContext {
                 resource_id,
             } => {
                 let record = store.instance_by_resource_id(region, resource_id)?;
-                let read_only = record.read_replica_source_db_instance_identifier.is_some();
+                let read_only = record.is_read_replica();
                 Some((
                     replaying(engine_runtime_of(&store, record), read_only),
                     read_only,
