@@ -23,15 +23,26 @@
 //!   (`KinesisStreamConfig$RoleARN`, "an IAM role that CloudFront can use to send real-time
 //!   log data to your Kinesis data stream"), so an endpoint whose role is not allowed
 //!   `kinesis:PutRecord` on its stream receives NOTHING while every other endpoint of the
-//!   same configuration still receives its record.
+//!   same configuration still receives its record;
+//! * the configuration a record goes through is the one the cache behaviour the viewer's
+//!   PATH selected names, and no other: "CloudFront compares the path in the viewer request
+//!   with the path patterns in the cache behaviors" and `RealtimeLogConfigArn` is "the real
+//!   time log configuration that is attached to this cache behavior", so of two behaviours
+//!   of one distribution only the matched one's streams receive the request, and the record
+//!   names that behaviour's own pattern;
+//! * what the delivery role allows is asked of IAM at the moment of DELIVERY, so a role
+//!   granted `kinesis:PutRecord` after a request was served delivers nothing for that
+//!   request and delivers for every request served after the grant.
 //!
 //! Every record read back here is read from KINESIS — `ListShards`, `GetShardIterator` and
 //! `GetRecords` on the stream the configuration names — so a record this suite sees is a
 //! record a client polling that stream sees.
 //!
 //! The origin is this service's own control-plane endpoint, whose
-//! `GET /2020-05-31/distribution` answers a `DistributionList`: an origin this emulator
-//! really serves, so a served request has an origin answer to be a cache miss of.
+//! `GET /2020-05-31/distribution` answers a `DistributionList` and whose
+//! `GET /2020-05-31/origin-access-control` answers an `OriginAccessControlList`: an origin
+//! this emulator really serves, so a served request has an origin answer to be a cache miss
+//! of, on either of two paths.
 
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -344,6 +355,19 @@ fn config_xml(
     let ttl = default_ttl
         .map(|seconds| format!("<DefaultTTL>{seconds}</DefaultTTL>"))
         .unwrap_or_default();
+    distribution_config_xml(reference, &format!("{logging}{ttl}"), "")
+}
+
+/// The one `DistributionConfig` envelope this suite submits: the served origin, a default
+/// cache behaviour over it carrying `default_members`, and `ordered_behaviors` where the
+/// configuration states any.
+///
+/// Written once so a second shape of configuration states only what it differs in.
+fn distribution_config_xml(
+    reference: &str,
+    default_members: &str,
+    ordered_behaviors: &str,
+) -> String {
     format!(
         "<DistributionConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
          <CallerReference>{reference}</CallerReference>\
@@ -351,8 +375,8 @@ fn config_xml(
          <Origin><Id>primary</Id><DomainName>{HOST}</DomainName></Origin>\
          </Items></Origins>\
          <DefaultCacheBehavior><TargetOriginId>primary</TargetOriginId>\
-         <ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy>{logging}{ttl}\
-         </DefaultCacheBehavior>\
+         <ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy>{default_members}\
+         </DefaultCacheBehavior>{ordered_behaviors}\
          <Comment>{reference}</Comment>\
          <PriceClass>PriceClass_All</PriceClass>\
          <Enabled>true</Enabled>\
@@ -379,11 +403,25 @@ async fn distribution(
     realtime_log_config_arn: Option<&str>,
     default_ttl: Option<i64>,
 ) -> Distribution {
+    let body = config_xml(reference, realtime_log_config_arn, default_ttl);
+    distribution_from_xml(router, reference, &body).await
+}
+
+/// Create one distribution from the `DistributionConfig` `body` states, WITHOUT waiting for
+/// its configuration to reach the edge locations.
+///
+/// The one place a create is submitted and its answer read, for every shape of configuration
+/// this suite drives.
+async fn distribution_from_xml(
+    router: &MultiServiceRouter,
+    reference: &str,
+    body: &str,
+) -> Distribution {
     let answer = call(
         router,
         "POST",
         &format!("/{API_VERSION}/distribution"),
-        Some(&config_xml(reference, realtime_log_config_arn, default_ttl)),
+        Some(body),
         None,
     )
     .await;
@@ -446,9 +484,16 @@ struct Probe {
     status: u16,
     result_type: &'static str,
     request_id: String,
+    /// The `PathPattern` of the cache behaviour that served the request: the ordered
+    /// behaviour's own pattern, or [`DEFAULT_BEHAVIOR_PATTERN`] for the default behaviour.
+    pattern: String,
     /// The caller's own clock window the record's `timestamp` has to fall inside.
     window: (u64, u64),
 }
+
+/// The pattern a record reports for the DEFAULT cache behaviour, which matches by being last
+/// rather than by a pattern of its own: the pattern that matches every path.
+const DEFAULT_BEHAVIOR_PATTERN: &str = "*";
 
 /// Assert `record` is the record `probe` owes, read by the field list the configuration
 /// reported: one value per field, in that order.
@@ -545,8 +590,10 @@ fn assert_record(case: &str, fields: &[String], record: &str, probe: &Probe) {
                 "case {case}: a viewer that sent no Referer has none, got {value:?}"
             ),
             "cache-behavior-path-pattern" => assert_eq!(
-                value, "*",
-                "case {case}: expected the default behaviour's own pattern, got {value:?}"
+                value, probe.pattern,
+                "case {case}: expected the pattern of the behaviour that served the request \
+                 ({:?}), got {value:?}",
+                probe.pattern
             ),
             other => panic!("case {case}: the suite asserts nothing about the field {other:?}"),
         }
@@ -798,6 +845,7 @@ async fn a_served_viewer_request_delivers_one_record_to_the_configured_stream() 
                 status: 200,
                 result_type: "Miss",
                 request_id,
+                pattern: DEFAULT_BEHAVIOR_PATTERN.to_string(),
                 window,
             };
             assert_record(case, reported, record, &probe);
@@ -874,6 +922,7 @@ async fn a_record_reports_how_the_edge_classified_the_answer_it_served() {
                 status,
                 result_type,
                 request_id: answer.request_id,
+                pattern: DEFAULT_BEHAVIOR_PATTERN.to_string(),
                 window,
             },
         ));
@@ -1028,5 +1077,261 @@ async fn an_endpoint_whose_role_may_not_put_a_record_receives_nothing() {
             owed,
             "case {case}: expected {owed} record(s) on this stream, got {records:?}"
         );
+    }
+}
+
+/// One `DistributionConfig` over the served origin with TWO cache behaviours, each naming its
+/// OWN real-time log configuration: the default behaviour names `default_config_arn`, and the
+/// one ordered behaviour, on `path_pattern`, names `ordered_config_arn`.
+///
+/// Neither behaviour caches, so every request of either is answered by the origin.
+fn config_xml_two_behaviors(
+    reference: &str,
+    default_config_arn: &str,
+    path_pattern: &str,
+    ordered_config_arn: &str,
+) -> String {
+    distribution_config_xml(
+        reference,
+        &format!("<RealtimeLogConfigArn>{default_config_arn}</RealtimeLogConfigArn>"),
+        &format!(
+            "<CacheBehaviors><Quantity>1</Quantity><Items><CacheBehavior>\
+             <PathPattern>{path_pattern}</PathPattern>\
+             <TargetOriginId>primary</TargetOriginId>\
+             <ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy>\
+             <RealtimeLogConfigArn>{ordered_config_arn}</RealtimeLogConfigArn>\
+             </CacheBehavior></Items></CacheBehaviors>"
+        ),
+    )
+}
+
+/// One Kinesis stream of this table, and the one request every record on it is owed to
+/// describe: the path of the behaviour whose configuration delivers through it, and that
+/// behaviour's own `PathPattern`.
+struct Delivered {
+    case: &'static str,
+    name: &'static str,
+    arn: String,
+    /// The field list the configuration delivering here reported.
+    fields: Vec<String>,
+    path: String,
+    pattern: String,
+}
+
+/// One step of the table: the path the viewer requested, the policy the ordered behaviour's
+/// delivery role is given BEFORE this request (where the step changes it), and how many
+/// records each stream holds once it has been served.
+struct Step {
+    case: &'static str,
+    path: String,
+    /// The statements the restricted endpoint's role policy is replaced with ahead of this
+    /// request, as `(effect, action)` pairs on its own stream, or `None` to leave it as the
+    /// step before left it.
+    policy_first: Option<&'static [(&'static str, &'static str)]>,
+    control_records: usize,
+    restricted_records: usize,
+}
+
+/// Each record goes through the configuration of the cache behaviour the viewer's PATH
+/// selected and through no other, and whether the endpoint's role may write is asked at the
+/// moment of delivery — so granting that role the put makes the same stream start receiving,
+/// for the requests served after the grant and not for the ones served before it.
+#[tokio::test]
+async fn each_record_goes_through_the_matched_behaviours_own_configuration() {
+    let router = emulator_with_kinesis_and_iam();
+    let fields = &[
+        "timestamp",
+        "sc-status",
+        "cs-uri-stem",
+        "cache-behavior-path-pattern",
+    ];
+    // The stream the DEFAULT behaviour delivers to, whose role may put a record throughout,
+    // and the stream the ORDERED behaviour delivers to, whose role starts without the put.
+    let control = "realtime-logs-default-behaviour";
+    let restricted = "realtime-logs-ordered-behaviour";
+    let control_stream = data_stream(&router, control).await;
+    let restricted_stream = data_stream(&router, restricted).await;
+    let control_role = delivery_role(
+        &router,
+        control,
+        &policy(&[("Allow", "kinesis:PutRecord")], &control_stream),
+    )
+    .await;
+    let restricted_role = delivery_role(
+        &router,
+        restricted,
+        &policy(
+            &[("Allow", "kinesis:DescribeStreamSummary")],
+            &restricted_stream,
+        ),
+    )
+    .await;
+
+    // TWO configurations, one per behaviour: what decides where a record lands is which
+    // behaviour matched, and nothing about the request itself.
+    let (control_config, control_fields) = realtime_log_config(
+        &router,
+        "default-behaviour",
+        100,
+        fields,
+        &[EndPoint {
+            role_arn: control_role,
+            stream_arn: control_stream.clone(),
+        }],
+    )
+    .await;
+    let (restricted_config, restricted_fields) = realtime_log_config(
+        &router,
+        "ordered-behaviour",
+        100,
+        fields,
+        &[EndPoint {
+            role_arn: restricted_role,
+            stream_arn: restricted_stream.clone(),
+        }],
+    )
+    .await;
+
+    // The ordered behaviour's pattern names a second path this origin serves, so a request on
+    // it is served by the origin exactly as one on the default behaviour's path is. The pattern
+    // is written as a WILDCARD, so what a record reports for it is not the requested path: a
+    // record reporting the path where the pattern belongs fails the row.
+    let ordered_path = format!("/{API_VERSION}/origin-access-control");
+    let ordered_pattern = format!("/{API_VERSION}/origin-access-contro*");
+    let default_path = format!("/{API_VERSION}/distribution");
+    let distribution = distribution_from_xml(
+        &router,
+        "realtime-logs-behaviours",
+        &config_xml_two_behaviors(
+            "realtime-logs-behaviours",
+            &control_config,
+            &ordered_pattern,
+            &restricted_config,
+        ),
+    )
+    .await;
+    awaited_active(&router, control).await;
+    awaited_active(&router, restricted).await;
+    awaited_deployment(&router, "two behaviours", &distribution.id).await;
+
+    let streams = [
+        Delivered {
+            case: "the default behaviour's own stream",
+            name: control,
+            arn: control_stream,
+            fields: control_fields,
+            path: default_path.clone(),
+            // The default behaviour matches by being last rather than by a pattern of its
+            // own, which the record reports as the pattern matching every path.
+            pattern: DEFAULT_BEHAVIOR_PATTERN.to_string(),
+        },
+        Delivered {
+            case: "the ordered behaviour's own stream",
+            name: restricted,
+            arn: restricted_stream.clone(),
+            fields: restricted_fields,
+            path: ordered_path.clone(),
+            pattern: ordered_pattern.clone(),
+        },
+    ];
+
+    // Steps differ along which behaviour the path selects and what the ordered behaviour's
+    // role is allowed when the request is served: not allowed, granted the put, and denied it
+    // again — so a decision cached at any point before the request fails one of them.
+    let steps = [
+        Step {
+            case: "the default behaviour's path",
+            path: default_path.clone(),
+            policy_first: None,
+            control_records: 1,
+            restricted_records: 0,
+        },
+        Step {
+            case: "the ordered behaviour's path, its role not allowed the put",
+            path: ordered_path.clone(),
+            policy_first: None,
+            control_records: 1,
+            restricted_records: 0,
+        },
+        Step {
+            case: "the ordered behaviour's path, after its role is granted the put",
+            path: ordered_path.clone(),
+            policy_first: Some(&[("Allow", "kinesis:PutRecord")]),
+            control_records: 1,
+            restricted_records: 1,
+        },
+        Step {
+            case: "the default behaviour's path again, after the grant",
+            path: default_path.clone(),
+            policy_first: None,
+            control_records: 2,
+            restricted_records: 1,
+        },
+        Step {
+            case: "the ordered behaviour's path, after its role is denied the put again",
+            path: ordered_path.clone(),
+            policy_first: Some(&[("Allow", "kinesis:*"), ("Deny", "kinesis:PutRecord")]),
+            control_records: 2,
+            restricted_records: 1,
+        },
+    ];
+
+    let window = window();
+    for step in &steps {
+        let case = step.case;
+        if let Some(statements) = step.policy_first {
+            iam(
+                &router,
+                "PutRolePolicy",
+                &[
+                    ("RoleName", restricted.to_string()),
+                    ("PolicyName", "deliver".to_string()),
+                    (
+                        "PolicyDocument",
+                        policy(statements, &restricted_stream),
+                    ),
+                ],
+            )
+            .await;
+        }
+        let answer = view(&router, &distribution.domain, "GET", &step.path).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected the origin's answer to the viewer request, got {}",
+            answer.status
+        );
+        let owed = [step.control_records, step.restricted_records];
+        for (stream, owed) in streams.iter().zip(owed) {
+            let records = stream_records(&router, &stream.arn).await;
+            assert_eq!(
+                records.len(),
+                owed,
+                "case {case}: expected {owed} record(s) on {} ({}), got {records:?}",
+                stream.name,
+                stream.case
+            );
+            for record in &records {
+                // Every value a record on this stream carries is the one a request of THIS
+                // behaviour's path carries: a record of the other behaviour's request, or one
+                // naming the other behaviour's pattern, fails the row.
+                let probe = Probe {
+                    method: "GET",
+                    path: stream.path.clone(),
+                    query: "",
+                    domain: distribution.domain.clone(),
+                    status: 200,
+                    // The field set this table configures names neither
+                    // `x-edge-response-result-type` nor `x-edge-request-id`, so neither of
+                    // these is asserted: which request of this behaviour's path a record
+                    // describes is read off the counts the steps state. A record carrying
+                    // either field would be read against these values and fail the row.
+                    result_type: "Miss",
+                    request_id: String::new(),
+                    pattern: stream.pattern.clone(),
+                    window,
+                };
+                assert_record(case, &stream.fields, record, &probe);
+            }
+        }
     }
 }
