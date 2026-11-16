@@ -128,6 +128,12 @@ pub const FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
 /// [`FIELD_VALIDATION_FAILED`].
 pub const RESOURCE_CONFLICT: &str = "ResourceConflict";
 
+/// The fixed text this service refuses a submission with when the record it addresses is
+/// not in a status a submission can be made from; the status the record IS in follows it,
+/// read from the stored record. The ONE place this sentence is written.
+pub const NOT_SUBMITTABLE_IN_STATUS: &str =
+    "Cannot submit the record for approval in current status: ";
+
 /// How many `@idempotencyToken` replays are remembered at once. Entries are dropped
 /// when the resource they name is removed; this cap bounds what is left, oldest first,
 /// so a long-lived process cannot accumulate tokens for ever.
@@ -337,10 +343,13 @@ pub enum RegistryTransition {
 }
 
 /// What a record's pending transition turns it into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordTransition {
     /// `CREATING` -> `DRAFT`: creation finished; the record can be submitted for approval.
     Draft,
+    /// `UPDATING` -> the status the update settles the record at: the one it held when
+    /// the update was accepted, unless the edit took it out of the approval workflow.
+    Settled(String),
 }
 
 /// A registry, exactly as `CreateRegistry` stored it.
@@ -512,13 +521,12 @@ impl ComAmazonawsAgentregistrycontrolAgentregistrycontrolState {
             for record in registry.records.values_mut() {
                 if let Some(pending) = record.pending.clone() {
                     if pending.due_at <= now {
-                        match pending.to {
-                            RecordTransition::Draft => {
-                                record.status = RECORD_DRAFT.to_string();
-                                record.updated_at = pending.at;
-                                record.pending = None;
-                            }
-                        }
+                        record.status = match &pending.to {
+                            RecordTransition::Draft => RECORD_DRAFT.to_string(),
+                            RecordTransition::Settled(status) => status.clone(),
+                        };
+                        record.updated_at = pending.at;
+                        record.pending = None;
                     } else {
                         arm(pending.due_at);
                     }

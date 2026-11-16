@@ -498,7 +498,9 @@ async fn a_submitted_record_is_found_by_a_status_filter_and_hidden_from_the_othe
 #[tokio::test]
 async fn a_record_that_is_not_draft_cannot_be_submitted() {
     // Rows differ along WHY the record is not submittable: it is still being created,
-    // or it has already been through the submission once.
+    // or it has already been through the submission once. Either way the refusal is the
+    // one AWS answers for a record whose status admits no submission — a 400
+    // `ValidationException` whose sentence names that status.
     let router = router();
 
     for (case, auto_approve) in [("manual review", false), ("auto-approved", true)] {
@@ -522,21 +524,20 @@ async fn a_record_that_is_not_draft_cannot_be_submitted() {
         let fresh = id_of(created.str_field("recordArn")).to_string();
         let refused = submit_record(&router, &registry_id, &fresh).await;
         assert_eq!(
-            refused.status, 409,
-            "case {case:?} / CREATING: a record that is not DRAFT is a 409, got {} {:?}",
-            refused.status, refused.body
-        );
-        assert_eq!(
-            refused.error_code.as_deref(),
-            Some("ConflictException"),
-            "case {case:?} / CREATING: expected ConflictException, got {:?}",
-            refused.error_code
-        );
-        assert!(
-            refused.message().contains("CREATING") && refused.message().contains(&fresh),
-            "case {case:?} / CREATING: the message must name the record and its status, \
-             got {:?}",
-            refused.message()
+            (
+                refused.status,
+                refused.error_code.as_deref(),
+                refused.message()
+            ),
+            (
+                400,
+                Some("ValidationException"),
+                "Cannot submit the record for approval in current status: CREATING".to_string()
+            ),
+            "case {case:?} / CREATING: a record that is not DRAFT is refused with the \
+             modelled 400 naming its status, got {} {:?}",
+            refused.status,
+            refused.body
         );
 
         // Already submitted: the second submission is refused and the status the first
@@ -546,10 +547,16 @@ async fn a_record_that_is_not_draft_cannot_be_submitted() {
         let settled = first.str_field("status").to_string();
         let again = submit_record(&router, &registry_id, &record_id).await;
         assert_eq!(
-            again.status, 409,
+            (again.status, again.error_code.as_deref(), again.message()),
+            (
+                400,
+                Some("ValidationException"),
+                format!("Cannot submit the record for approval in current status: {settled}")
+            ),
             "case {case:?} / resubmitted: a record in {settled} cannot be submitted again, \
              got {} {:?}",
-            again.status, again.body
+            again.status,
+            again.body
         );
         let after = get_record(&router, &registry_id, &record_id).await;
         assert_eq!(

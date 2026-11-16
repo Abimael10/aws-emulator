@@ -21,6 +21,8 @@ mod idempotency_token_binding;
 mod idempotency_tokens;
 #[path = "all/record_approval.rs"]
 mod record_approval;
+#[path = "all/record_patch_semantics.rs"]
+mod record_patch_semantics;
 #[path = "all/record_status_curation.rs"]
 mod record_status_curation;
 #[path = "all/registry_delete_precondition.rs"]

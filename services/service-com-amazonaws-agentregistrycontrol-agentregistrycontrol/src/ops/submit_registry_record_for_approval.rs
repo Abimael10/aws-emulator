@@ -216,18 +216,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Deprecation retires a record, so the status it is stored in is terminal and no
+        // later change applies to it — including a submission.
+        if crate::state::is_terminal_record_status(&record.status) {
+            return Err(SubmitRegistryRecordForApprovalErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::terminal_record_status_message(&record.status),
+                    reason: crate::state::RESOURCE_CONFLICT.to_string(),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
         // Only a DRAFT record enters the approval workflow: one that is still being
         // created has nothing to review yet, and one that has already been through the
-        // workflow is moved on with `UpdateRegistryRecordStatus` instead.
+        // workflow is moved on with `UpdateRegistryRecordStatus` or taken back to DRAFT
+        // by an edit instead. The refusal names the status the record is in, which is
+        // what tells the caller which of those it is.
         if record.status != crate::state::RECORD_DRAFT {
-            return Err(SubmitRegistryRecordForApprovalErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "record {record_id} is in status {}; only a {} record can be submitted \
-                         for approval",
-                        record.status,
-                        crate::state::RECORD_DRAFT
-                    )),
+            return Err(SubmitRegistryRecordForApprovalErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "{}{}",
+                        crate::state::NOT_SUBMITTABLE_IN_STATUS, record.status
+                    ),
+                    // The request's fields are all well formed; what does not hold is the
+                    // state of the resource they address.
+                    reason: crate::state::RESOURCE_CONFLICT.to_string(),
+                    field_list: None,
                 },
             )
             .into());

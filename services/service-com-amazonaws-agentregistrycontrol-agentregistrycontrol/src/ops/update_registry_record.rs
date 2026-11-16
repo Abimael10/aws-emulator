@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRegistryRecord
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRegistryRecord`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRegistryRecord::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -222,18 +213,415 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRegistryRecord` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRegistryRecordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRegistryRecord"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateRegistryRecordErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the agent registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.materialise_due_transitions();
+
+        // Both labels accept the resource's ARN or its bare id.
+        let registry_id = crate::state::identifier_to_id(&input.registry_id).to_string();
+        let record_id = crate::state::identifier_to_id(&input.record_id).to_string();
+
+        // `provenance` "is reserved for the Amazon Web Services Agent Registry
+        // auto-detection service principal. Requests that include this field from other
+        // callers are rejected." A caller of this control plane signs as an account
+        // principal, never as that service principal, so the member is refused rather
+        // than written: a lineage a caller asserted for itself would claim the record was
+        // detected from a source nothing detected it from.
+        if input.provenance.is_some() {
+            return Err(UpdateRegistryRecordErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(
+                        "provenance is reserved for the Agent Registry auto-detection service \
+                         principal and cannot be asserted by this caller"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let Some(registry) = state.registries.get(&registry_id) else {
+            return Err(UpdateRegistryRecordErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::registry_not_found_message(
+                        &input.registry_id,
+                    )),
+                },
+            )
+            .into());
+        };
+        let Some(record) = registry.records.get(&record_id) else {
+            return Err(UpdateRegistryRecordErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::record_not_found_message(&record_id)),
+                },
+            )
+            .into());
+        };
+
+        // A registry is usable once it reaches READY, so its records cannot be edited
+        // while it is still being created or is being deleted — the same rule every
+        // other record-writing operation of this service holds a write to.
+        if registry.status != crate::state::REGISTRY_READY {
+            return Err(UpdateRegistryRecordErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "registry {registry_id} is in status {}; a record can be updated once \
+                         it is {}",
+                        registry.status,
+                        crate::state::REGISTRY_READY
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Deprecation retires a record, so the status it is stored in is terminal and no
+        // later change applies to it — including an edit.
+        if crate::state::is_terminal_record_status(&record.status) {
+            return Err(UpdateRegistryRecordErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::terminal_record_status_message(&record.status),
+                    reason: crate::state::RESOURCE_CONFLICT.to_string(),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
+        // One asynchronous change at a time: a record whose create or previous update is
+        // still in flight has no settled content for a patch to apply to.
+        if crate::state::is_asynchronous_record_status(&record.status) {
+            return Err(UpdateRegistryRecordErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "record {record_id} is in status {}; it can be updated once that \
+                         change has finished",
+                        record.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Record "names are unique within a registry", so a rename onto a name another
+        // record of the registry already holds is refused — the same sentence
+        // `CreateRegistryRecord` refuses a duplicate name with. Renaming a record to the
+        // name it already has is not a duplicate: it is the same record.
+        if let Some(wanted) = input.name.as_deref() {
+            if registry
+                .records
+                .values()
+                .any(|other| other.record_id != record_id && other.name == wanted)
+            {
+                return Err(UpdateRegistryRecordErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(crate::state::duplicate_record_name_message(
+                            wanted,
+                            &input.registry_id,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Where the record lands once the asynchronous update has been processed: an edit
+        // to a record under review takes it back out of the approval workflow, so it
+        // settles at DRAFT and can be submitted again; any other record settles back at
+        // the status it was in, since an edit decides nothing about its curation.
+        let settles_at = if [
+            crate::state::RECORD_PENDING_APPROVAL,
+            crate::state::RECORD_REJECTED,
+        ]
+        .contains(&record.status.as_str())
+        {
+            crate::state::RECORD_DRAFT.to_string()
+        } else {
+            record.status.clone()
+        };
+        let withdrawn = settles_at != record.status;
+        let updated_at = crate::state::now();
+        // The update is asynchronous: the record carries UPDATING while it is processed,
+        // and the clock owes it the status above. Nothing sleeps for it.
+        let pending = crate::state::DueTransition::after_async_span(
+            crate::state::RecordTransition::Settled(settles_at),
+        );
+        state.arm_transition(pending.due_at);
+
+        // Resolved under this same lock above, so both are still there; a lookup that
+        // somehow fails is a server error rather than a 202 for an edit that was never
+        // applied.
+        let record = state
+            .registries
+            .get_mut(&registry_id)
+            .and_then(|registry| registry.records.get_mut(&record_id));
+        let Some(record) = record else {
+            return Err(UpdateRegistryRecordErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!(
+                        "record {record_id} disappeared while it was being updated"
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // PATCH semantics, for every member the operation declares: an omitted member
+        // leaves the stored value alone, a member carrying a value replaces it, and a
+        // patch wrapper supplied empty unsets the optional field it wraps.
+        if let Some(name) = input.name {
+            record.name = name;
+        }
+        if let Some(record_type) = input.record_type {
+            record.record_type = record_type;
+        }
+        if let Some(record_version) = input.record_version {
+            record.record_version = record_version;
+        }
+        patch_optional(
+            &mut record.display_name,
+            input.display_name.map(|wrapper| wrapper.optional_value),
+        );
+        patch_optional(
+            &mut record.description,
+            input.description.map(|wrapper| wrapper.optional_value),
+        );
+        // The metadata wrapper replaces the whole set or, supplied with no value, clears
+        // it: "supply the wrapper with a full replacement set to update, or with a null
+        // value to clear all metadata".
+        patch_optional(
+            &mut record.custom_metadata,
+            input.custom_metadata.map(|wrapper| wrapper.optional_value),
+        );
+        patch_structure(
+            &mut record.descriptors,
+            input.descriptors.map(|wrapper| wrapper.optional_value),
+            patch_descriptors,
+        );
+        // `triggerSynchronization` asks the service to re-read the record's descriptor
+        // content from the source the descriptors name. Nothing in this emulator reaches
+        // that source, so the flag changes no descriptor content and nothing here reports
+        // a synchronisation: the descriptors a later read serves are the ones this call
+        // stored.
+        let _ = input.trigger_synchronization;
+
+        record.status = crate::state::RECORD_UPDATING.to_string();
+        if withdrawn {
+            // The reason described the status the edit took the record out of.
+            record.status_reason = None;
+        }
+        record.updated_at = updated_at;
+        record.pending = Some(pending);
+
+        Ok(UpdateRegistryRecordOutput {
+            registry_arn: record.registry_arn.clone(),
+            record_arn: record.record_arn.clone(),
+            record_id: record.record_id.clone(),
+            name: record.name.clone(),
+            display_name: record.display_name.clone(),
+            description: record.description.clone(),
+            record_type: record.record_type.clone(),
+            descriptors: record.descriptors.clone(),
+            record_version: Some(record.record_version.clone()),
+            status: record.status.clone(),
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            status_reason: record.status_reason.clone(),
+            // An empty provenance list is reported as absent rather than as an empty
+            // list: the member is only populated for records with a lineage.
+            provenance: (!record.provenance.is_empty()).then(|| record.provenance.clone()),
+            created_by_auto_detection: record.created_by_auto_detection,
+            created_by: record.created_by.clone(),
+            custom_metadata: record.custom_metadata.clone(),
+            custom_metadata_schema_compliance_status: record
+                .custom_metadata_schema_compliance_status
+                .clone(),
+        })
     }
+}
+
+/// Apply a LEAF patch wrapper to the optional field it patches, which is what the model's
+/// "Omit to leave the field unchanged; provide an empty wrapper to unset it" means: no
+/// wrapper at all (`None`) leaves the stored value, a wrapper carrying a value replaces
+/// it, and a wrapper carrying none unsets it.
+fn patch_optional<T>(field: &mut Option<T>, wrapper: Option<Option<T>>) {
+    if let Some(value) = wrapper {
+        *field = value;
+    }
+}
+
+/// Apply a STRUCTURE patch wrapper: a wrapper carrying no value clears the structure
+/// ("supply an empty object to clear them"), and one carrying a per-field patch applies
+/// `apply` to the stored structure — materialising it first when the record holds none,
+/// so a patch can fill a structure that was never set.
+fn patch_structure<T: Default, P>(
+    field: &mut Option<T>,
+    wrapper: Option<Option<P>>,
+    apply: impl FnOnce(&mut T, P),
+) {
+    match wrapper {
+        None => {}
+        Some(None) => *field = None,
+        Some(Some(patch)) => {
+            let mut current = field.take().unwrap_or_default();
+            apply(&mut current, patch);
+            *field = Some(current);
+        }
+    }
+}
+
+/// The per-descriptor patch `UpdatedDescriptorsFields` carries: "each field is
+/// independently patchable", so one descriptor of the typed set can be patched, cleared
+/// or left alone without touching the others.
+fn patch_descriptors(current: &mut Descriptors, patch: UpdatedDescriptorsFields) {
+    patch_structure(
+        &mut current.mcp_server,
+        patch.mcp_server.map(|wrapper| wrapper.optional_value),
+        |descriptor: &mut McpServerDescriptor, fields: UpdatedMcpServerDescriptorFields| {
+            patch_optional(
+                &mut descriptor.data,
+                fields.data.map(|wrapper| wrapper.optional_value),
+            );
+            patch_optional(
+                &mut descriptor.data_schema_version,
+                fields
+                    .data_schema_version
+                    .map(|wrapper| wrapper.optional_value),
+            );
+            patch_optional(
+                &mut descriptor.source,
+                fields.source.map(|wrapper| wrapper.optional_value),
+            );
+            patch_structure(
+                &mut descriptor.additional_data,
+                fields.additional_data.map(|wrapper| wrapper.optional_value),
+                |additional: &mut McpServerAdditionalData,
+                 fields: UpdatedMcpServerAdditionalDataFields| {
+                    patch_structure(
+                        &mut additional.tools,
+                        fields.tools.map(|wrapper| wrapper.optional_value),
+                        |tools: &mut McpToolsDescriptor,
+                         fields: UpdatedMcpToolsDescriptorFields| {
+                            patch_optional(
+                                &mut tools.data,
+                                fields.data.map(|wrapper| wrapper.optional_value),
+                            );
+                            patch_optional(
+                                &mut tools.data_schema_version,
+                                fields
+                                    .data_schema_version
+                                    .map(|wrapper| wrapper.optional_value),
+                            );
+                        },
+                    );
+                },
+            );
+        },
+    );
+    patch_structure(
+        &mut current.a2a_agent_card,
+        patch.a2a_agent_card.map(|wrapper| wrapper.optional_value),
+        |descriptor: &mut A2aAgentCardDescriptor, fields: UpdatedA2aAgentCardDescriptorFields| {
+            patch_optional(
+                &mut descriptor.data,
+                fields.data.map(|wrapper| wrapper.optional_value),
+            );
+            patch_optional(
+                &mut descriptor.data_schema_version,
+                fields
+                    .data_schema_version
+                    .map(|wrapper| wrapper.optional_value),
+            );
+            patch_optional(
+                &mut descriptor.source,
+                fields.source.map(|wrapper| wrapper.optional_value),
+            );
+        },
+    );
+    patch_structure(
+        &mut current.agent_skills_definition,
+        patch
+            .agent_skills_definition
+            .map(|wrapper| wrapper.optional_value),
+        |descriptor: &mut AgentSkillsDefinitionDescriptor,
+         fields: UpdatedAgentSkillsDefinitionDescriptorFields| {
+            patch_optional(
+                &mut descriptor.data,
+                fields.data.map(|wrapper| wrapper.optional_value),
+            );
+            patch_optional(
+                &mut descriptor.data_schema_version,
+                fields
+                    .data_schema_version
+                    .map(|wrapper| wrapper.optional_value),
+            );
+            patch_structure(
+                &mut descriptor.additional_data,
+                fields.additional_data.map(|wrapper| wrapper.optional_value),
+                |additional: &mut AgentSkillsAdditionalData,
+                 fields: UpdatedAgentSkillsAdditionalDataFields| {
+                    patch_structure(
+                        &mut additional.skill_md,
+                        fields.skill_md.map(|wrapper| wrapper.optional_value),
+                        |skill: &mut AgentSkillsMdDescriptor,
+                         fields: UpdatedAgentSkillsMdDescriptorFields| {
+                            patch_optional(
+                                &mut skill.data,
+                                fields.data.map(|wrapper| wrapper.optional_value),
+                            );
+                            patch_optional(
+                                &mut skill.data_schema_version,
+                                fields
+                                    .data_schema_version
+                                    .map(|wrapper| wrapper.optional_value),
+                            );
+                            patch_optional(
+                                &mut skill.source,
+                                fields.source.map(|wrapper| wrapper.optional_value),
+                            );
+                        },
+                    );
+                },
+            );
+        },
+    );
+    patch_structure(
+        &mut current.custom,
+        patch.custom.map(|wrapper| wrapper.optional_value),
+        |descriptor: &mut CustomDescriptor, fields: UpdatedCustomDescriptorFields| {
+            patch_optional(
+                &mut descriptor.data,
+                fields.data.map(|wrapper| wrapper.optional_value),
+            );
+        },
+    );
+    patch_structure(
+        &mut current.http,
+        patch.http.map(|wrapper| wrapper.optional_value),
+        |descriptor: &mut HttpDescriptor, fields: UpdatedHttpDescriptorFields| {
+            patch_optional(
+                &mut descriptor.source,
+                fields.source.map(|wrapper| wrapper.optional_value),
+            );
+        },
+    );
+    patch_structure(
+        &mut current.agui,
+        patch.agui.map(|wrapper| wrapper.optional_value),
+        |descriptor: &mut AgUiDescriptor, fields: UpdatedAgUiDescriptorFields| {
+            patch_optional(
+                &mut descriptor.source,
+                fields.source.map(|wrapper| wrapper.optional_value),
+            );
+        },
+    );
 }
