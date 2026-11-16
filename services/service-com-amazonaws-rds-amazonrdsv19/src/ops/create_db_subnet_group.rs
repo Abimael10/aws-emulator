@@ -156,11 +156,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let region =
             crate::state::request_region(ctx).map_err(CreateDBSubnetGroupError::validation)?;
-        // "This value is stored as a lowercase string" — so the name is folded before it
-        // is validated, stored or echoed, and every later lookup folds the same way.
-        let name = input.db_subnet_group_name.to_ascii_lowercase();
-        check_subnet_group_name(&name)
+        // "This value is stored as a lowercase string" — so the name is folded before it is
+        // stored and resolved, and every later lookup folds the same way. Its own constraints
+        // are checked on the value the REQUEST carried, which is the spelling the refusal
+        // echoes.
+        crate::state::check_db_subnet_group_name(&input.db_subnet_group_name)
             .map_err(CreateDBSubnetGroupError::invalid_parameter_value)?;
+        let name = input.db_subnet_group_name.to_ascii_lowercase();
+        // The reserved name is matched on the FOLDED spelling — the name is "stored as a
+        // lowercase string", so every spelling of it names the one reserved group — while the
+        // refusal names the value the request carried.
+        if name == crate::state::DEFAULT_DB_SUBNET_GROUP {
+            return Err(CreateDBSubnetGroupError::invalid_parameter_value(
+                crate::state::db_subnet_group_name_reserved_message(
+                    &input.db_subnet_group_name,
+                ),
+            ));
+        }
         // `DBSubnetGroupDescription` is a required member, so it carries a value: a blank
         // one is refused rather than stored (see `crate::state::check_not_empty`).
         crate::state::check_not_empty(
@@ -319,46 +331,7 @@ fn subnet_list_refusal(rejection: crate::state::SubnetListRejection) -> CreateDB
     .into()
 }
 
-/// The longest `DBSubnetGroupName` this operation accepts, as its member documents
-/// ("Must contain no more than 255 letters, numbers, periods, underscores, spaces, or
-/// hyphens").
-const MAX_NAME_LEN: usize = 255;
-
-/// The name AWS reserves for the DB subnet group of an account's default VPC, which
-/// `DBSubnetGroupName` refuses: "Must not be default."
-const RESERVED_NAME: &str = "default";
-
-/// Refuse a `DBSubnetGroupName` outside the constraints its member documents, naming
-/// the member and the constraint it broke. The alphabet is wider than the one the
-/// identifier members share (`crate::state::check_identifier`): this member also admits
-/// periods, underscores and spaces.
-fn check_subnet_group_name(name: &str) -> Result<(), String> {
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ' ' | '-'))
-    {
-        return Err(format!(
-            "DBSubnetGroupName must contain only letters, numbers, periods, underscores, \
-             spaces, or hyphens; got '{name}'"
-        ));
-    }
-    let length = name.chars().count();
-    if length == 0 || length > MAX_NAME_LEN {
-        return Err(format!(
-            "DBSubnetGroupName must contain no more than {MAX_NAME_LEN} letters, numbers, \
-             periods, underscores, spaces, or hyphens; got {length} characters"
-        ));
-    }
-    if !name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
-        return Err(format!(
-            "the first character of DBSubnetGroupName must be a letter; got '{name}'"
-        ));
-    }
-    if name == RESERVED_NAME {
-        return Err(format!(
-            "DBSubnetGroupName must not be {RESERVED_NAME}: that name is reserved for the \
-             DB subnet group of the account's default VPC"
-        ));
-    }
-    Ok(())
-}
+// The longest `DBSubnetGroupName` this operation accepts and the name it reserves are the
+// member's own constraints, stated once in `crate::state` beside the wording each refusal
+// carries (`crate::state::check_db_subnet_group_name`,
+// `crate::state::db_subnet_group_name_reserved_message`).

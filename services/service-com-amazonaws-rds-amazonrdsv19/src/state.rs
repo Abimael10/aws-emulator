@@ -1998,6 +1998,20 @@ pub fn failover_needs_two_instances_message(identifier: &str) -> String {
 /// documents a default that branches on a request naming it.
 pub const DEFAULT_DB_SUBNET_GROUP: &str = "default";
 
+/// The message a `CreateDBSubnetGroup` naming the one name this member reserves is refused
+/// with ("Must not be default"): the group of that name is the one AWS provides alongside the
+/// account's default VPC, so RDS states that the name is taken and what to do about it.
+///
+/// Amazon RDS words it as a statement about the name the request carried, which is the only
+/// variable part — echoed as the request spelled it, the way the member's other refusal
+/// echoes a value ([`check_db_subnet_group_name`]) — followed by the fixed instruction.
+///
+/// It lives here, beside the name the sentence is about, so the create that answers it and
+/// any later caller word it the same way.
+pub fn db_subnet_group_name_reserved_message(name: &str) -> String {
+    format!("Subnet group name {name} is reserved. Please specify another name.")
+}
+
 /// The message the `DBSubnetGroupNotFoundFault` carries for `name` where the call LOOKS the
 /// group UP in order to REPORT it (`DescribeDBSubnetGroups`, a tag read). The fault names
 /// the group the request could not resolve, in the folded spelling the group would be
@@ -3759,6 +3773,10 @@ fn identifier_wording(member: &str) -> IdentifierWording {
         "DBClusterIdentifier" | "NewDBClusterIdentifier" => {
             IdentifierWording::Subject("database cluster identifier")
         }
+        // The name of a DB SUBNET group, which RDS words by its own subject — the one it
+        // calls that member by, which names neither the resource type's `DB` nor the member
+        // — for every clause of the name rule, the way a DB cluster's identifier is worded.
+        "DBSubnetGroupName" => IdentifierWording::Subject("subnet group name"),
         // The name of an option group: on create, on modify, and the name a COPY of a
         // group is created under, which is an option group's name too — so a caller
         // reading the refusal cannot tell those paths apart by its wording.
@@ -3861,6 +3879,50 @@ pub fn check_parameter_group_name(member: &str, value: &str) -> Result<(), Strin
         value,
         MAX_PARAMETER_GROUP_NAME_LEN,
     ))
+}
+
+/// The longest `DBSubnetGroupName` this front door accepts, as that member documents it:
+/// "Must contain no more than 255 letters, numbers, periods, underscores, spaces, or
+/// hyphens."
+pub const MAX_DB_SUBNET_GROUP_NAME_LEN: usize = 255;
+
+/// Refuse a `DBSubnetGroupName` outside the constraints its member documents — "Must contain
+/// no more than 255 letters, numbers, periods, underscores, spaces, or hyphens. ... First
+/// character must be a letter."
+///
+/// The RULE is this member's own: its alphabet is WIDER than the one the identifier members
+/// share ([`check_identifier`]), admitting periods, underscores and spaces as well. The
+/// WORDING is not — it comes from [`identifier_refusal_message`], the one place every named
+/// member of this front door is worded from, so this member cannot drift from its neighbours
+/// into a sentence of the emulator's own.
+///
+/// The value is echoed as the REQUEST spelled it: the refusal is about the value the caller
+/// sent, not about the folded spelling the group would have been stored under ("This value is
+/// stored as a lowercase string"), and the rule itself does not look at case.
+///
+/// The caller answers this with `InvalidParameterValue`, the Query API common error a value
+/// outside its member's published constraints is reported with.
+pub fn check_db_subnet_group_name(value: &str) -> Result<(), String> {
+    if db_subnet_group_name_is_well_formed(value) {
+        return Ok(());
+    }
+    Err(identifier_refusal_message(
+        "DBSubnetGroupName",
+        value,
+        MAX_DB_SUBNET_GROUP_NAME_LEN,
+    ))
+}
+
+/// The constraint walk behind [`check_db_subnet_group_name`]: a value of 1 to
+/// [`MAX_DB_SUBNET_GROUP_NAME_LEN`] characters, drawn from the letters, numbers, periods,
+/// underscores, spaces and hyphens the member names, whose first character is a letter.
+fn db_subnet_group_name_is_well_formed(value: &str) -> bool {
+    let length = value.chars().count();
+    (1..=MAX_DB_SUBNET_GROUP_NAME_LEN).contains(&length)
+        && value.starts_with(|c: char| c.is_ascii_alphabetic())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ' ' | '-'))
 }
 
 /// Whether `value` is written as an identifier TOKEN at all: it begins with an ASCII letter,

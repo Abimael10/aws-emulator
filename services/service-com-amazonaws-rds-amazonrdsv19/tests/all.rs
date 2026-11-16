@@ -169,6 +169,8 @@ mod db_subnet_group_discovered_zone_coverage;
 mod db_subnet_group_ec2_zones;
 #[path = "all/db_subnet_group_in_use_wording.rs"]
 mod db_subnet_group_in_use_wording;
+#[path = "all/db_subnet_group_name_wording.rs"]
+mod db_subnet_group_name_wording;
 #[path = "all/db_subnet_group_not_found_wording.rs"]
 mod db_subnet_group_not_found_wording;
 #[path = "all/db_subnet_group_owning_vpc.rs"]
