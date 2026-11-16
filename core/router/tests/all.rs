@@ -823,6 +823,8 @@ mod declaration_roots_carry_one_header_block;
 mod declaration_roots_end_with_their_last_declaration;
 #[path = "all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs"]
 mod declaration_roots_keep_inner_attributes_ahead_of_the_first_item;
+#[path = "all/declaration_roots_state_each_header_paragraph_once.rs"]
+mod declaration_roots_state_each_header_paragraph_once;
 #[path = "all/default_vpc_internet_path_runs_ecs_tasks.rs"]
 mod default_vpc_internet_path_runs_ecs_tasks;
 #[path = "all/directory_data_access_cycle.rs"]

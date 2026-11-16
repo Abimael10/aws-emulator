@@ -31,7 +31,10 @@ use crate::all_rs_declares_each_suite_once::all_rs;
 /// contributes none and so breaks the paragraph: a blank line, a marker with nothing after it,
 /// or the inner attribute that closes a header, which is a line of the block but no sentence of
 /// it.
-fn paragraph_prose_of(line: &str) -> Option<&str> {
+///
+/// Shared with the sibling that reads a header block one PARAGRAPH at a time, so the two cannot
+/// disagree about which lines a paragraph is made of.
+pub(crate) fn paragraph_prose_of(line: &str) -> Option<&str> {
     prose_of(line).filter(|_| line.trim_start().starts_with("//"))
 }
 
