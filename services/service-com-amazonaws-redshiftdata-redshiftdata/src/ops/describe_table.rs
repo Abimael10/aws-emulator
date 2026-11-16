@@ -132,7 +132,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    decode_cursor, encode_cursor, non_empty, ConnectionRequest, TargetSelectors,
+    decode_cursor, encode_cursor, non_empty, BadConnection, ConnectionRequest, TargetSelectors,
     ABSENT_ENDPOINT_MESSAGE, CURSOR_COLUMNS, DEFAULT_PAGE_SIZE, INVALID_TOKEN_MESSAGE,
 };
 
@@ -239,12 +239,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let connection = match requested.resolve() {
             // Every other combination — both warehouses, neither of them, no
-            // database, two authorization methods — is a malformed request, and
-            // how a request SELECTS its target is a fault of the request
-            // itself, so it is reported before any target is resolved.
-            // `DescribeTable` takes no `SessionId`, so no connection of its
-            // own can live on a session.
-            Err(problem) => return Err(validation(&problem.message(SELECTORS))),
+            // database, two authorization methods — is a malformed request.
+            // WHAT the request named is resolved before HOW MANY it named is
+            // judged: a request whose every named warehouse is absent from the
+            // Region it was signed for has no catalog to describe whichever of
+            // them it meant, so it is answered as naming no endpoint rather
+            // than as an ambiguous selection. `DescribeTable` takes no
+            // `SessionId`, so no connection of its own can live on a session.
+            Err(problem) => {
+                if problem == BadConnection::SeveralTargets
+                    && crate::state::warehouse::names_only_absent_targets(ctx, requested, false)
+                        .await
+                {
+                    return Err(validation(ABSENT_ENDPOINT_MESSAGE));
+                }
+                return Err(validation(&problem.message(SELECTORS)));
+            }
             Ok(connection) => connection,
         };
 

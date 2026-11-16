@@ -273,12 +273,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             Err(problem) => {
-                // How a request SELECTS its target, and whether it names a
-                // database and one authorization method, are faults of the
-                // REQUEST: they are reported as they stand, before any cluster,
-                // workgroup or session is resolved, so a request that selected
-                // two targets is told exactly that whatever either of them
-                // resolves to.
+                // WHAT the request named is resolved before HOW MANY it named is
+                // judged: a request whose every named cluster and workgroup is
+                // absent from the Region it was signed for has no endpoint to
+                // run on, whichever of them it meant, so it is answered as
+                // naming none rather than as an ambiguous selection. One that
+                // named a target that exists — or one no owner could be asked
+                // about — is answered on its selection, as is a request that
+                // named no target at all and a request that is wrong about its
+                // database or its authorization method.
+                let live_session = non_empty(input.session_id.as_ref())
+                    .is_some_and(|session| state.lock().session_connection(&session).is_some());
+                if problem == BadConnection::SeveralTargets
+                    && crate::state::warehouse::names_only_absent_targets(
+                        ctx,
+                        requested,
+                        live_session,
+                    )
+                    .await
+                {
+                    return Err(validation(ABSENT_ENDPOINT_MESSAGE));
+                }
                 return Err(validation(&problem.message(SELECTORS)));
             }
         };

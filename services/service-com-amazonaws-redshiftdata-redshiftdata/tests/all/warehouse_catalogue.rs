@@ -13,11 +13,12 @@
 //!    exists, so the Data API lists that database and resolves a connection
 //!    through it before any statement has ever run, while a database no warehouse
 //!    of that name holds is still a missing resource;
-//! 2. how a request SELECTS its compute target is a fault of the REQUEST, judged
-//!    before any cluster, workgroup or session is resolved: a request that names
-//!    none of the targets an operation accepts, or more than one of them, is
-//!    refused with that operation's own one-target sentence whether or not the
-//!    warehouses it named exist, and nothing is recorded for it.
+//! 2. how a request SELECTS its compute target is judged against the targets it
+//!    NAMED: a request that names none of the targets an operation accepts, or
+//!    more than one of them where at least one really exists, is refused with
+//!    that operation's own one-target sentence — while one whose every named
+//!    warehouse is absent from the Region is refused as naming no endpoint at
+//!    all, and nothing is recorded for either.
 
 use serde_json::{json, Value};
 
@@ -36,9 +37,13 @@ const SUBMIT_ONE_TARGET: &str = "There should be only one of the following: Clus
 const WAREHOUSE_ONE_TARGET: &str = "There should be only one of the following: ClusterIdentifier, \
                                     WorkgroupName";
 
-/// A `SessionId` in the form the modelled `UUID` pattern accepts. Whether a
-/// session with it exists is never reached: a selection that names two targets is
-/// refused before any session is looked up.
+/// The fixed sentence the service refuses a selection whose every named
+/// warehouse is absent from the Region with: there is no endpoint for it
+/// whichever of them it meant.
+const NO_ENDPOINT: &str = "Redshift endpoint doesn't exist in this region.";
+
+/// A `SessionId` in the form the modelled `UUID` pattern accepts, which names no
+/// session this service holds.
 const SESSION_ID: &str = "3dc6a4b5-5e2b-4b5a-9f1d-6b6d2b6c7a8e";
 
 /// The schema this emulator's engine holds every table of a database in, which
@@ -363,51 +368,62 @@ async fn describe_table_reads_the_provisioned_databases_catalogue() {
     }
 }
 
-/// How a request SELECTS its target is judged BEFORE any target is resolved: the
-/// one-target refusal is the same whether the warehouses it named exist or not,
-/// and no statement is recorded for a refused request.
+/// A bad target selection is judged against the targets it NAMED: it is refused
+/// on the SELECTION as long as one of them exists, and as naming no endpoint when
+/// none of them does — and no statement is recorded for a refused request.
 #[tokio::test]
-async fn a_bad_target_selection_is_refused_before_any_target_is_resolved() {
+async fn a_bad_target_selection_is_judged_against_the_targets_it_named() {
     let warehouses = Warehouses::new();
     warehouses.create_cluster("present-cluster").await;
     warehouses.create_workgroup("present-workgroup").await;
 
-    // Each row is a target SELECTION. They differ in how many targets they
-    // select, in which ones, and — the point of this table — in whether the
-    // warehouses they name exist in the Region at all.
-    let selections: [(&str, Value); 7] = [
-        ("no target at all", json!({})),
+    // Each row is a target SELECTION and whether the refusal reports the
+    // selection or the endpoint. They differ in how many targets they select, in
+    // which ones, and — the point of this table — in whether the warehouses they
+    // name exist in the Region at all.
+    let selections: [(&str, Value, bool); 7] = [
+        // Nothing was named, so there is nothing to resolve: the caller is told
+        // which selectors it must name one of.
+        ("no target at all", json!({}), true),
         (
             "both warehouses, both present",
             json!({"ClusterIdentifier": "present-cluster", "WorkgroupName": "present-workgroup"}),
+            true,
         ),
         (
             "both warehouses, the cluster absent",
             json!({"ClusterIdentifier": "absent-cluster", "WorkgroupName": "present-workgroup"}),
+            true,
         ),
         (
             "both warehouses, the workgroup absent",
             json!({"ClusterIdentifier": "present-cluster", "WorkgroupName": "absent-workgroup"}),
+            true,
         ),
+        // Neither of the warehouses it named is there, so which of them it meant
+        // decides nothing: the request names no endpoint.
         (
             "both warehouses, neither present",
             json!({"ClusterIdentifier": "absent-cluster", "WorkgroupName": "absent-workgroup"}),
+            false,
         ),
         (
-            "an absent cluster beside a session",
+            "an absent cluster beside a session that is not live",
             json!({"ClusterIdentifier": "absent-cluster", "SessionId": SESSION_ID}),
+            false,
         ),
         (
             "a present workgroup beside a session",
             json!({"WorkgroupName": "present-workgroup", "SessionId": SESSION_ID}),
+            true,
         ),
     ];
 
-    for (case, selection) in &selections {
+    for (case, selection, on_selection) in &selections {
         // Each operation that takes these members, with the sentence IT states:
         // a submit enumerates every target it accepts, a catalogue reader only
         // the two it models.
-        for (operation, base, expected) in [
+        for (operation, base, selectors) in [
             (
                 "ExecuteStatement",
                 json!({"Database": "dev", "DbUser": "awsuser", "Sql": "SELECT 1"}),
@@ -431,9 +447,10 @@ async fn a_bad_target_selection_is_refused_before_any_target_is_resolved() {
         ] {
             // A catalogue reader models no `SessionId`, so a selection naming one
             // cannot be sent to it at all.
-            if selection.get("SessionId").is_some() && expected == WAREHOUSE_ONE_TARGET {
+            if selection.get("SessionId").is_some() && selectors == WAREHOUSE_ONE_TARGET {
                 continue;
             }
+            let expected = if *on_selection { selectors } else { NO_ENDPOINT };
             let mut request = base;
             for (member, value) in selection.as_object().expect("an object of members") {
                 request[member] = value.clone();
@@ -451,13 +468,13 @@ async fn a_bad_target_selection_is_refused_before_any_target_is_resolved() {
             assert_eq!(
                 message(&response),
                 Some(expected),
-                "case {case:?} on {operation}: expected the one-target sentence, got {response}"
+                "case {case:?} on {operation}: expected {expected:?}, got {response}"
             );
         }
     }
 
-    // Nothing above was admitted: a request refused on its selection leaves no
-    // statement behind.
+    // Nothing above was admitted: a request refused on its selection, or for
+    // naming no endpoint, leaves no statement behind.
     let page = warehouses.data_ok("ListStatements", &json!({})).await;
     assert!(
         list(&page, "Statements").is_empty(),

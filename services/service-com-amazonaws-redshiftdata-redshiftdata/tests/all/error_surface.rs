@@ -8,8 +8,8 @@
 //!
 //! 1. a submit request names ONE of the targets the service accepts — a
 //!    provisioned cluster, a serverless workgroup, a Glue resource or a session —
-//!    and naming none of them or more than one is refused with one canonical,
-//!    request-independent message;
+//!    and naming none of them, or more than one of them where one really exists,
+//!    is refused with one canonical, request-independent message;
 //! 2. an `Id` the service holds no query for is refused with the missing-resource
 //!    error at HTTP 400 — the status the service answers that path with, not the
 //!    shape's own — in fixed words that carry no part of the id asked for;
@@ -357,12 +357,14 @@ async fn a_target_that_resolves_to_no_endpoint_is_refused() {
         }
     }
 
-    // How a request SELECTS its target is a fault of the REQUEST, judged before
-    // any endpoint is resolved: a request that names both warehouses is refused
-    // as a selection that names two of them whether or not either one exists, so
-    // a caller that wired two targets is never sent after a provisioning or
-    // Region problem instead. A request that is wrong about its DATABASE or its
-    // authorization method is told so on the same terms.
+    // How a request SELECTS its target is judged against the targets it NAMED:
+    // a request that names both warehouses is refused as a selection that names
+    // two of them as long as one of them exists, so a caller that wired two
+    // targets is never sent after a provisioning or Region problem instead —
+    // while a request whose every named warehouse is absent names no endpoint at
+    // all, whichever of them it meant, and is told that. A request that is wrong
+    // about its DATABASE or its authorization method is told so on the same
+    // terms.
     for (case, overrides, expected) in [
         (
             "both warehouses, the cluster absent",
@@ -372,7 +374,7 @@ async fn a_target_that_resolves_to_no_endpoint_is_refused() {
         (
             "both warehouses, both absent",
             json!({"ClusterIdentifier": "absent-cluster", "WorkgroupName": "absent-workgroup"}),
-            ONE_TARGET,
+            NO_SUCH_ENDPOINT,
         ),
         (
             "both warehouses, the cluster present",

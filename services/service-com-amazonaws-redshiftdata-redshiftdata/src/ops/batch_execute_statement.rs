@@ -289,9 +289,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             Err(problem) => {
-                // How a request SELECTS its target is a fault of the REQUEST,
-                // reported before any cluster, workgroup or session is
-                // resolved, exactly as `ExecuteStatement` does it.
+                // WHAT the request named is resolved before HOW MANY it named
+                // is judged, exactly as `ExecuteStatement` does it: a request
+                // whose every named warehouse is absent from the Region has no
+                // endpoint to run on, whichever of them it meant.
+                let live_session = non_empty(input.session_id.as_ref())
+                    .is_some_and(|session| state.lock().session_connection(&session).is_some());
+                if problem == BadConnection::SeveralTargets
+                    && crate::state::warehouse::names_only_absent_targets(
+                        ctx,
+                        requested,
+                        live_session,
+                    )
+                    .await
+                {
+                    return Err(validation(ABSENT_ENDPOINT_MESSAGE));
+                }
                 return Err(validation(&problem.message(SELECTORS)));
             }
         };

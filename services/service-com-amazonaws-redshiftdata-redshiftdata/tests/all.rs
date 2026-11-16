@@ -80,6 +80,9 @@ mod statement_submission_surface;
 #[path = "all/statement_wait.rs"]
 mod statement_wait;
 
+#[path = "all/target_endpoint_resolution.rs"]
+mod target_endpoint_resolution;
+
 #[path = "all/unwaited_submit_answer.rs"]
 mod unwaited_submit_answer;
 

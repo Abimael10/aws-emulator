@@ -302,6 +302,12 @@ impl TargetSelectors {
     /// The message the Data API answers a request that does not name exactly one
     /// of these selectors with — the same sentence whether the request named none
     /// of them or more than one, since neither decides an endpoint.
+    ///
+    /// A request that named more than one is answered this way only once the
+    /// targets it DID name have been resolved: when every one of them is absent
+    /// from the Region there is no endpoint to be ambiguous about, which is
+    /// [`ABSENT_ENDPOINT_MESSAGE`]
+    /// ([`warehouse::names_only_absent_targets`](crate::state::warehouse::names_only_absent_targets)).
     pub fn one_target_message(self) -> String {
         format!(
             "There should be only one of the following: {}",
@@ -310,9 +316,12 @@ impl TargetSelectors {
     }
 }
 
-/// The message the Data API answers a target that resolves to no endpoint in the
-/// caller's Region with. Fixed text: it names neither the cluster nor the
-/// workgroup that could not be resolved.
+/// The message the Data API answers a request whose target resolves to no
+/// endpoint in the caller's Region with — the one target it named, or, when it
+/// named several, every one of them
+/// ([`warehouse::names_only_absent_targets`](crate::state::warehouse::names_only_absent_targets)).
+/// Fixed text: it names neither the cluster nor the workgroup that could not be
+/// resolved.
 pub const ABSENT_ENDPOINT_MESSAGE: &str = "Redshift endpoint doesn't exist in this region.";
 
 /// Ceiling on the wall-clock bound one submission's execution runs under. The
@@ -3079,7 +3088,10 @@ pub enum BadConnection {
     /// The request names NO compute target at all: no warehouse and no session.
     NoTarget,
     /// The request names more than one compute target at once, so which endpoint
-    /// it addresses is not decided.
+    /// it addresses is not decided — unless none of the targets it named exists
+    /// in the Region, in which case there is no endpoint for it at all and that
+    /// is what the service reports
+    /// ([`warehouse::names_only_absent_targets`](crate::state::warehouse::names_only_absent_targets)).
     SeveralTargets,
     /// No warehouse, but a `SessionId`: the warehouse and database this
     /// request runs against are the ones its SESSION was opened with, so they

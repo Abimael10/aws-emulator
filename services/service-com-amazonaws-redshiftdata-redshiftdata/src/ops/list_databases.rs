@@ -117,8 +117,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    decode_cursor, encode_cursor, ConnectionRequest, TargetSelectors, ABSENT_ENDPOINT_MESSAGE,
-    CURSOR_DATABASES, DEFAULT_PAGE_SIZE, INVALID_TOKEN_MESSAGE,
+    decode_cursor, encode_cursor, BadConnection, ConnectionRequest, TargetSelectors,
+    ABSENT_ENDPOINT_MESSAGE, CURSOR_DATABASES, DEFAULT_PAGE_SIZE, INVALID_TOKEN_MESSAGE,
 };
 
 /// The compute-target selectors THIS operation accepts: its input shape models
@@ -223,9 +223,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             secret_arn: input.secret_arn.as_ref(),
         };
         let connection = match requested.resolve() {
-            // How a request SELECTS its target is a fault of the request
-            // itself, so it is reported before any target is resolved.
-            Err(problem) => return Err(validation(&problem.message(SELECTORS))),
+            // WHAT the request named is resolved before HOW MANY it named is
+            // judged: a request whose every named warehouse is absent from the
+            // Region it was signed for holds no databases whichever of them it
+            // meant, so it is answered as naming no endpoint rather than as an
+            // ambiguous selection. This operation models no session selector,
+            // so no session can carry an endpoint for it.
+            Err(problem) => {
+                if problem == BadConnection::SeveralTargets
+                    && crate::state::warehouse::names_only_absent_targets(ctx, requested, false)
+                        .await
+                {
+                    return Err(validation(ABSENT_ENDPOINT_MESSAGE));
+                }
+                return Err(validation(&problem.message(SELECTORS)));
+            }
             Ok(connection) => connection,
         };
 

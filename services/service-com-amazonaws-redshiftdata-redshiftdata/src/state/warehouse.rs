@@ -365,6 +365,50 @@ pub async fn resolve_target(
     describe_target(ctx, target).await.resolution
 }
 
+/// Whether the compute targets a request NAMED are all decided not to exist in
+/// the Region it was signed for — so there is no endpoint for it whichever of
+/// them was meant.
+///
+/// This is asked of a request that named more than one target: the service
+/// resolves what the request named before it judges how many were named, so a
+/// request whose every named cluster and workgroup is absent is answered as
+/// naming no endpoint ([`super::ABSENT_ENDPOINT_MESSAGE`]) rather than as an
+/// ambiguous selection — which endpoint it meant does not matter when none of
+/// them is there. One that named at least one target that DOES exist has an
+/// endpoint to be ambiguous about, so it is answered on its selection.
+///
+/// Nothing is assumed from silence, exactly as everywhere else here: only an
+/// owner that ANSWERED can decide a target absent
+/// ([`TargetResolution::Unresolvable`] decides nothing), and a target this
+/// emulator could not ask about therefore leaves the request on its selection.
+/// `live_session` says whether a `SessionId` the request named is a session this
+/// service holds; a session that is live carries its own endpoint, and an
+/// operation whose input models no session selector passes `false`.
+pub async fn names_only_absent_targets(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    request: super::ConnectionRequest<'_>,
+    live_session: bool,
+) -> bool {
+    let mut named = false;
+    let warehouses = [
+        super::non_empty(request.cluster_identifier).map(ConnectionTarget::Cluster),
+        super::non_empty(request.workgroup_name).map(ConnectionTarget::Workgroup),
+    ];
+    for target in warehouses.into_iter().flatten() {
+        named = true;
+        if resolve_target(ctx, &target).await != TargetResolution::Absent {
+            return false;
+        }
+    }
+    if super::non_empty(request.session_id).is_some() {
+        named = true;
+        if live_session {
+            return false;
+        }
+    }
+    named
+}
+
 /// Ask the control plane that owns `target` everything this service needs to
 /// know about it: whether it exists, and the databases it was provisioned with.
 ///
