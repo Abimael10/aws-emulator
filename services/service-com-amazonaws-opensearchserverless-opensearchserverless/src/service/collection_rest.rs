@@ -836,7 +836,10 @@ fn ok(body: &Value) -> RtResponse {
     rendered(200, body)
 }
 
-/// A status with no body at all — what a `HEAD` answers.
+/// A status with no body at all — what a `HEAD` answers, and what a refusal taken before
+/// the collection's cluster is addressed carries ([`authorization`]): no layer that builds
+/// an error document has run, so there are no bytes to send and no content type to send
+/// them under.
 fn status_only(status: u16) -> RtResponse {
     RtResponse::new(
         StatusCode::try_from(status).unwrap_or_else(|_| fallback_status()),

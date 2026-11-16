@@ -34,7 +34,8 @@ use serde_json::{json, Value};
 
 use crate::collection_endpoint_authorization::{
     active_collection, create_access_policy, create_security_policy, data_policy, emulator,
-    endpoint_host, iam_user, knn_index_body, network_policy, rest, AMBIENT_ACCESS_KEY_ID,
+    endpoint_host, iam_user, knn_index_body, network_policy, rest, rest_bytes,
+    AMBIENT_ACCESS_KEY_ID,
 };
 use crate::collection_lifecycle::text;
 
@@ -44,10 +45,6 @@ const COLLECTION: &str = "policy-order";
 /// The index a case that READS or WRITES documents addresses, seeded by the account's own
 /// credential wherever the endpoint is reachable at all.
 const SEEDED_INDEX: &str = "seeded-index";
-
-/// The error type a collection the network policies do not cover is refused under: the type
-/// the endpoint's security layer answers an authentication failure with.
-const SECURITY_EXCEPTION: &str = "security_exception";
 
 /// The error type a principal no data access policy grants is refused under.
 const FORBIDDEN: &str = "forbidden";
@@ -238,14 +235,19 @@ async fn the_network_policies_decide_before_the_data_access_policies() {
                     // data-access decision only where the endpoint is reachable, and a
                     // served answer for a caller those policies admit or do not bound.
                     let (expected, expected_type) = if !admitted {
-                        (401, Some(SECURITY_EXCEPTION))
+                        // The network front door refuses before the collection's cluster is
+                        // addressed, so there is no error document to carry: the refusal is
+                        // the status and zero bytes.
+                        (401, None)
                     } else if grants_the_caller || !caller.bounded_by_data_access() {
                         (served, None)
                     } else {
                         (403, Some(FORBIDDEN))
                     };
-                    let (status, answer) =
-                        rest(&router, &host, key, method, &path, body.as_ref()).await;
+                    let (status, payload) =
+                        rest_bytes(&router, &host, key, method, &path, body.as_ref()).await;
+                    let answer: Value =
+                        serde_json::from_slice(&payload).unwrap_or(Value::Null);
                     assert_eq!(
                         status, expected,
                         "case {case}: expected {method} {path} to answer {expected}, got \
@@ -256,6 +258,18 @@ async fn the_network_policies_decide_before_the_data_access_policies() {
                         "case {case}: the published endpoint must be served by the REST data \
                          plane, not by the RPC front door, got {answer}"
                     );
+                    if !admitted {
+                        // The network front door refuses before any error document is built,
+                        // so the refusal carries no bytes for a client to parse at all.
+                        assert!(
+                            payload.is_empty(),
+                            "case {case}: a refusal of an unreachable endpoint carries no \
+                             body, got {} byte(s): {:?}",
+                            payload.len(),
+                            String::from_utf8_lossy(&payload)
+                        );
+                        continue;
+                    }
                     if let Some(expected_type) = expected_type {
                         assert_eq!(
                             (

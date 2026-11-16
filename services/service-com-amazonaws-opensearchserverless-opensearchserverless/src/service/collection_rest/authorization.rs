@@ -48,13 +48,25 @@
 //!
 //! # How a refusal is worded
 //!
-//! Each of the two decisions answers the status its own layer refuses with and an
-//! OpenSearch error document carrying it: a collection no network policy admits answers 401,
-//! which a client of the endpoint reads as an authentication failure, and a principal no
-//! data access policy grants answers 403 with the fixed error type `forbidden` ([`forbidden`])
-//! — the document the endpoint's authorization layer answers a denial with, as recorded for a
-//! role absent from every data access policy. Neither is an error of the ENGINE: the request
-//! is refused before an index, a document or a query is read.
+//! Each of the two decisions answers the status its own layer refuses with, and WHICH layer
+//! took the decision is what decides whether there is a body at all:
+//!
+//! * the NETWORK decision is taken at the endpoint's front door, before the collection's
+//!   cluster is addressed at all, so nothing has built an error document yet: a request no
+//!   network policy admits is answered [`NETWORK_REFUSAL_STATUS`] and ZERO BYTES. That is the
+//!   recorded answer of a live collection whose only network policy was deleted — the read and
+//!   the write that had just been served, correctly scoped and granted by its data access
+//!   policy, were both answered that status with no JSON object at all, repeatedly and with
+//!   the collection still ACTIVE. A client of the endpoint reads that status as an
+//!   authentication failure, and the empty body is what tells this refusal class apart from
+//!   the two that carry one;
+//! * the DATA ACCESS decision is the collection's own authorization layer answering, so it
+//!   carries that layer's OpenSearch error document: 403 with the fixed error type
+//!   `forbidden` ([`forbidden`]), as recorded for a role absent from every data access policy
+//!   and for one whose policy withholds the permission the route takes.
+//!
+//! Neither is an error of the ENGINE: the request is refused before an index, a document or a
+//! query is read.
 
 use ::aws_smithy_runtime_api::http::Response as RtResponse;
 
@@ -62,16 +74,14 @@ use crate::state::{
     data_access, ComAmazonawsOpensearchserverlessOpensearchserverlessState as ServiceState,
 };
 
-/// The OpenSearch engine error type an authorization failure carries, which is the type
-/// the engine's security layer answers one under.
-const SECURITY_EXCEPTION: &str = "security_exception";
-
-/// The reason a request to a collection the network policies do not cover is refused with.
+/// The status a request the network policies do not admit is refused with: a client of the
+/// endpoint reads it as an authentication failure, which is what the recorded refusal of a
+/// collection no network policy covers is.
 ///
-/// The STATUS is the requirement — a client of the endpoint reads a 401 as an
-/// authentication failure, which is what the recorded refusal of a collection with no
-/// network policy is — and this names what was not admitted.
-const UNAUTHORIZED: &str = "Unauthorized";
+/// It is answered with NO body (see the module docs): the network front door refuses before
+/// the collection's cluster is reached, so no error document of the collection's own
+/// authorization or engine layer exists to send.
+const NETWORK_REFUSAL_STATUS: u16 = 401;
 
 /// The error type a request whose principal no data access policy grants is refused under:
 /// the fixed text the endpoint's own authorization layer answers a denial with
@@ -206,7 +216,7 @@ pub(super) fn refusal(
     request: &super::Request<'_>,
 ) -> Option<RtResponse> {
     if !store.network_policy_admits(collection_name) {
-        return Some(super::error(401, SECURITY_EXCEPTION, UNAUTHORIZED));
+        return Some(super::status_only(NETWORK_REFUSAL_STATUS));
     }
     if caller.unbounded {
         return None;

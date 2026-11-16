@@ -91,6 +91,8 @@ mod metadata_update_keeps_the_collection_deletable;
 mod minted_identifier_form;
 #[path = "all/minted_identifiers.rs"]
 mod minted_identifiers;
+#[path = "all/network_boundary_refusal.rs"]
+mod network_boundary_refusal;
 #[path = "all/policies_stats.rs"]
 mod policies_stats;
 #[path = "all/policy_and_group_writes.rs"]

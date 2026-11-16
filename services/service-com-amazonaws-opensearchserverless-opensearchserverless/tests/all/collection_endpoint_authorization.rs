@@ -247,14 +247,17 @@ pub(crate) fn endpoint_host(detail: &Value) -> String {
 /// One OpenSearch REST request to a collection endpoint, as `opensearch-py` sends it:
 /// addressed to the published host, signed for the `aoss` signing name presenting `akid`,
 /// and carrying NO `x-amz-target`, because the REST API has no RPC target.
-pub(crate) async fn rest(
+///
+/// The answer comes back as the BYTES the wire carried, so a suite can tell an answer
+/// carrying no body from one carrying a document ([`rest`] parses it).
+pub(crate) async fn rest_bytes(
     router: &MultiServiceRouter,
     host: &str,
     akid: &str,
     method: &str,
     path: &str,
     body: Option<&Value>,
-) -> (u16, Value) {
+) -> (u16, Vec<u8>) {
     let request = http::Request::builder()
         .method(method)
         .uri(path)
@@ -273,7 +276,21 @@ pub(crate) async fn rest(
         .expect("a well-formed data-plane request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
-    let parsed: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+    (status, response.body().to_vec())
+}
+
+/// One OpenSearch REST request ([`rest_bytes`]) whose answer is read as the JSON document it
+/// carries, or `Value::Null` where it carries no document at all.
+pub(crate) async fn rest(
+    router: &MultiServiceRouter,
+    host: &str,
+    akid: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> (u16, Value) {
+    let (status, payload) = rest_bytes(router, host, akid, method, path, body).await;
+    let parsed: Value = serde_json::from_slice(&payload).unwrap_or(Value::Null);
     (status, parsed)
 }
 
