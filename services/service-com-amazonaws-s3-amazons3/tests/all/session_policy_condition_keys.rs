@@ -62,7 +62,12 @@ const AWAY_REGION: &str = "us-east-2";
 /// The access-key id standing for the account's own published credential, which writes this
 /// suite's fixtures: neither STS nor IAM holds a record of it, so it resolves to the account's
 /// ambient identity.
-const ACCOUNT_KEY: &str = "AKIDEMULATOR";
+///
+/// `pub(crate)`, like the harness below it: the suite that drives a role's OWN permissions
+/// policy across Regions and the principal forms of a bucket policy
+/// ([`super::role_policy_region_and_principal_forms`]) writes its fixtures as the same
+/// account rather than spelling a second credential for it.
+pub(crate) const ACCOUNT_KEY: &str = "AKIDEMULATOR";
 
 /// The code S3 answers an authorization refusal with, and the status it carries (Amazon S3
 /// "Error responses": `AccessDenied`, HTTP 403).
@@ -82,19 +87,24 @@ const BODY: &[u8] = b"session-condition-subject";
 
 /// An emulator holding S3 beside the two services a decision about a minted session reads
 /// from: IAM (the role or user and its identity-based documents) and STS (the mint).
-struct Emulator {
+///
+/// `pub(crate)`: the suite that drives a role's OWN permissions policy across Regions and the
+/// principal forms of a bucket policy ([`super::role_policy_region_and_principal_forms`])
+/// needs the same three services over one engine, and reaches them through this one harness
+/// instead of standing up a second one.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 /// One credential a row calls with: the access key id a request is presented with, and the ARN
 /// a refusal names it by.
-struct Credential {
-    access_key_id: String,
-    principal_arn: String,
+pub(crate) struct Credential {
+    pub(crate) access_key_id: String,
+    pub(crate) principal_arn: String,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing: the `Authorization` header carries only the credential
@@ -118,7 +128,7 @@ impl Emulator {
 
     /// One S3 request presented as signed with `access_key_id` for `region` — the credential
     /// scope is where this emulator reads both the calling principal and the Region addressed.
-    async fn s3(
+    pub(crate) async fn s3(
         &self,
         access_key_id: &str,
         region: &str,
@@ -150,7 +160,7 @@ impl Emulator {
     }
 
     /// One awsQuery call to IAM or STS, presented as signed with `access_key_id`.
-    async fn query(
+    pub(crate) async fn query(
         &self,
         access_key_id: &str,
         signing_name: &str,
@@ -189,7 +199,7 @@ impl Emulator {
     /// `PUT /<bucket>` as the account, addressed to `region`'s endpoint — with the location
     /// constraint that Region needs, since "an endpoint for one Region can only create a bucket
     /// in that Region" (`CreateBucket`).
-    async fn create_bucket(&self, bucket: &str, region: &str) {
+    pub(crate) async fn create_bucket(&self, bucket: &str, region: &str) {
         let body = if region == "us-east-1" {
             String::new()
         } else {
@@ -217,7 +227,7 @@ impl Emulator {
     }
 
     /// `PUT /<bucket>/<key>` as the account — a fixture the read rows address.
-    async fn write_fixture(&self, bucket: &str, region: &str, key: &str) {
+    pub(crate) async fn write_fixture(&self, bucket: &str, region: &str, key: &str) {
         let written = self
             .s3(
                 ACCOUNT_KEY,
@@ -238,7 +248,7 @@ impl Emulator {
 
     /// Create the IAM role `role_name` with `policy` as its inline document, and answer its ARN
     /// and the `RoleId` IAM minted for it — the id `aws:userid` is built from for its sessions.
-    async fn create_role(&self, role_name: &str, policy: &str) -> (String, String) {
+    pub(crate) async fn create_role(&self, role_name: &str, policy: &str) -> (String, String) {
         let account = engine::emulator_account_id();
         let trust = json!({
             "Version": "2012-10-17",
@@ -288,7 +298,7 @@ impl Emulator {
     }
 
     /// Assume `role_arn` under `session_name`, passing the session policy `policy`.
-    async fn assume(
+    pub(crate) async fn assume(
         &self,
         case: &str,
         role_arn: &str,
@@ -322,7 +332,7 @@ impl Emulator {
     /// An IAM user carrying `actions` on `"*"` as its inline policy, and the long-term access
     /// key id a request speaks for it with. Answers the key id and the user's own unique id —
     /// the value `aws:userid` holds for a request that key signs.
-    async fn iam_user(&self, name: &str, actions: &[&str]) -> (String, String) {
+    pub(crate) async fn iam_user(&self, name: &str, actions: &[&str]) -> (String, String) {
         let (status, body) = self
             .query(
                 ACCOUNT_KEY,
@@ -468,7 +478,12 @@ const SESSION_DENY: &str = "with an explicit deny in a session policy";
 
 /// Assert `answer` is S3's `AccessDenied` refusal, worded for `principal`, `action` and
 /// `resource` with the clause `reason`.
-fn assert_refused(
+///
+/// `pub(crate)`, like the harness above it: the suite that drives a role's own
+/// Region-conditioned policy and the principal forms of a bucket policy
+/// ([`super::role_policy_region_and_principal_forms`]) asserts the same refusal through this
+/// one reading rather than a second copy of it.
+pub(crate) fn assert_refused(
     case: &str,
     answer: &Answer,
     principal: &str,
@@ -494,7 +509,9 @@ fn assert_refused(
 }
 
 /// Assert `answer` served the fixture's bytes.
-fn assert_served(case: &str, answer: &Answer) {
+///
+/// `pub(crate)` beside [`assert_refused`], and for the same reason.
+pub(crate) fn assert_served(case: &str, answer: &Answer) {
     assert_eq!(
         answer.status,
         200,

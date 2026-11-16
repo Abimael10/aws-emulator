@@ -431,6 +431,8 @@ mod replication_role_trust;
 mod replication_role_write_paths;
 #[path = "all/reserved_tag_key_prefix.rs"]
 mod reserved_tag_key_prefix;
+#[path = "all/role_policy_region_and_principal_forms.rs"]
+mod role_policy_region_and_principal_forms;
 #[path = "all/role_session_object_authorization.rs"]
 mod role_session_object_authorization;
 #[path = "all/scalar_query_parameters.rs"]

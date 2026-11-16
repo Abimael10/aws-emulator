@@ -142,13 +142,21 @@ async fn s3(
 }
 
 /// The account this emulator serves, which owns every bucket it holds.
-fn account() -> String {
+///
+/// `pub(crate)`: the suite that builds a principal ARN of this account per row
+/// ([`super::role_policy_region_and_principal_forms`]) reads the account through this one
+/// helper rather than a second copy of it.
+pub(crate) fn account() -> String {
     engine::emulator_account_id().to_string()
 }
 
 /// The ARN of the IAM user `name` of this account: the spelling `aws:PrincipalArn` answers
 /// with for a request signed by that user's long-term key.
-fn user_arn(name: &str) -> String {
+///
+/// `pub(crate)`, like [`account`] above it: the suite that names a same-named user and role in
+/// a bucket policy ([`super::role_policy_region_and_principal_forms`]) builds that ARN through
+/// this one spelling rather than a second copy of it.
+pub(crate) fn user_arn(name: &str) -> String {
     format!("arn:aws:iam::{}:user/{name}", account())
 }
 

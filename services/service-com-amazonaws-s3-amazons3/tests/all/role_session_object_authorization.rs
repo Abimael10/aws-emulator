@@ -441,10 +441,18 @@ pub(crate) fn denial_message(principal: &str, action: &str, resource: &str, reas
 const RESOURCE_DENY: &str = "with an explicit deny in a resource-based policy";
 
 /// The clause IAM publishes for a request an IDENTITY-based document explicitly denies.
-const IDENTITY_DENY: &str = "with an explicit deny in an identity-based policy";
+///
+/// `pub(crate)`, like [`no_grant`] beside it: the suite that drives a role's own
+/// Region-conditioned policy ([`super::role_policy_region_and_principal_forms`]) expects the
+/// same clause.
+pub(crate) const IDENTITY_DENY: &str = "with an explicit deny in an identity-based policy";
 
 /// The clause IAM publishes for a request no readable grant reaches at all.
-fn no_grant(action: &str) -> String {
+///
+/// `pub(crate)`: the suite that drives a role's own Region-conditioned policy and the
+/// principal forms of a bucket policy ([`super::role_policy_region_and_principal_forms`])
+/// expects the same clause, read from here rather than copied.
+pub(crate) fn no_grant(action: &str) -> String {
     format!("because no identity-based policy allows the {action} action")
 }
 

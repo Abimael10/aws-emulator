@@ -52,7 +52,11 @@ use super::bucket_lifecycle::{create_bucket, router, send, send_in_region};
 use super::object_and_tagging_roundtrip::put_object;
 
 /// The bucket name element S3's bucket-scoped error document carries.
-const BUCKET_NAME_ELEMENT: &str = "BucketName";
+///
+/// `pub(crate)`: the suite that pins the OBJECT-plane half of the same rule
+/// ([`super::role_policy_region_and_principal_forms`]) reads the element through this one
+/// spelling rather than a second copy of it.
+pub(crate) const BUCKET_NAME_ELEMENT: &str = "BucketName";
 
 /// A bucket whose name is the SHORTEST one the naming rules allow ("bucket names must be
 /// between 3 (min) and 63 (max) characters long", Amazon S3 User Guide, *Bucket naming
