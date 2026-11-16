@@ -89,6 +89,8 @@ mod refused_job_start_publishes_no_event;
 mod refused_vault_create_tag_side_effects;
 #[path = "all/report_plan.rs"]
 mod report_plan;
+#[path = "all/report_plan_deletion.rs"]
+mod report_plan_deletion;
 #[path = "all/restore_access_vault.rs"]
 mod restore_access_vault;
 #[path = "all/resource_tags.rs"]

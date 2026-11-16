@@ -27,15 +27,20 @@
 //! * the deployment of a stored plan is not finished the instant the create
 //!   answers: a plan starts in the non-terminal status AWS reports for one and
 //!   reaches [`REPORT_PLAN_DEPLOYMENT_STATUS_COMPLETED`] when the clock makes
-//!   that due ([`ComAmazonawsBackupCryocontrollerusermanagerState::settle_report_plans`]).
+//!   that due ([`ComAmazonawsBackupCryocontrollerusermanagerState::settle_report_plans`]);
+//! * Backup performs ONE action on a report plan at a time, so a mutation that
+//!   arrives while that plan's deployment is still in flight is refused
+//!   ([`report_plan_action_in_progress`]) and the stored plan is left as it was,
+//!   exactly as the sibling framework's mutations are refused
+//!   ([`super::framework_action_in_progress`]).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use super::ComAmazonawsBackupCryocontrollerusermanagerState;
 use crate::ops::types::{
-    AlreadyExistsException, InvalidParameterValueException, ReportDeliveryChannel, ReportPlan,
-    ReportSetting, ResourceNotFoundException,
+    AlreadyExistsException, ConflictException, InvalidParameterValueException,
+    ReportDeliveryChannel, ReportPlan, ReportSetting, ResourceNotFoundException,
 };
 
 /// The most report plans this emulator keeps.
@@ -132,6 +137,31 @@ pub fn report_plan_already_exists_message(name: &str) -> String {
 pub fn report_plan_not_found(name: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(report_plan_not_found_message(name)),
+        ..Default::default()
+    }
+}
+
+/// The sentence AWS states for "a previous action on this report plan is still
+/// running, so the one just requested cannot be performed": the sentence this
+/// service states for the sibling Backup Audit Manager resource
+/// ([`super::framework_action_in_progress_message`]) around the report plan the
+/// call addressed and the account it was made in, which are its variable parts.
+/// No `Code`: this condition has no observed token.
+pub fn report_plan_action_in_progress_message(name: &str) -> String {
+    format!(
+        "Operation failed because of a concurrent update for the report plan {name} in account \
+         {}. Try again later.",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The modelled refusal for an action on a report plan whose previous action has
+/// not finished — see [`report_plan_action_in_progress_message`]. Backup
+/// serializes the deployment of one report plan, so the action that loses the
+/// race is refused rather than blended into the one already running.
+pub fn report_plan_action_in_progress(name: &str) -> ConflictException {
+    ConflictException {
+        message: Some(report_plan_action_in_progress_message(name)),
         ..Default::default()
     }
 }
