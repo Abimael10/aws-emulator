@@ -151,6 +151,8 @@ mod pattern_refusal_quoting;
 mod refusal_class_and_rendering_rules;
 #[path = "all/refusal_message_templates.rs"]
 mod refusal_message_templates;
+#[path = "all/release_settle_barriers.rs"]
+mod release_settle_barriers;
 #[path = "all/request_derived_refusal_templates.rs"]
 mod request_derived_refusal_templates;
 #[path = "all/resource_deletes.rs"]

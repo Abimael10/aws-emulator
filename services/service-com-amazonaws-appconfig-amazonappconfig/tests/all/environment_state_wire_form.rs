@@ -49,6 +49,17 @@ const PUBLISHED_ENVIRONMENT_STATES: &[(&str, &str)] = &[
     ("REVERTED", "Reverted"),
 ];
 
+/// Whether `value` is one of the values `Environment$State` goes on the wire as.
+///
+/// `pub(crate)` because every suite that asserts a served environment state checks it
+/// against this one catalog rather than against the model's member names, exactly as the
+/// sibling `DeploymentState` catalog is shared.
+pub(crate) fn is_a_published_environment_state(value: &str) -> bool {
+    PUBLISHED_ENVIRONMENT_STATES
+        .iter()
+        .any(|(_, wire_value)| *wire_value == value)
+}
+
 /// The value the crate serves for one modelled member — the single place it spells the
 /// wire form, which is what every handler reads.
 fn served_for(member: &str) -> Option<&'static str> {
