@@ -4621,6 +4621,12 @@ pub struct DeleteMarker {
 pub mod account_public_access_block;
 // One general purpose bucket and everything it carries.
 mod bucket;
+// The schema an analytics configuration document has to validate against, and how S3
+// refuses one that does not.
+mod analytics_document;
+// The one reading of whether a request document validates against the schema published for
+// it, which each document's own table is walked against.
+mod document_schema;
 // The continuation token every listing of a bucket's id-addressed configurations pages
 // with, and the reading of a token a caller hands back.
 mod configuration_tokens;
@@ -4658,7 +4664,9 @@ mod uploads;
 mod website;
 
 pub use account_public_access_block::*;
+pub use analytics_document::*;
 pub use bucket::*;
+pub use document_schema::*;
 pub use configuration_tokens::*;
 pub use inline_tagging::*;
 pub use lifecycle::*;

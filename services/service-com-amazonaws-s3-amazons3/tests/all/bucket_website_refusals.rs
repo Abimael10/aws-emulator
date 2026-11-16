@@ -66,10 +66,6 @@ const MALFORMED_XML: &str =
 const REDIRECT_EVERYTHING: &str =
     "<RedirectAllRequestsTo><HostName>www.example.com</HostName></RedirectAllRequestsTo>";
 
-/// The host [`REDIRECT_EVERYTHING`] names, which the exclusivity refusal echoes as the value
-/// of the member it names.
-const REDIRECT_EVERYTHING_HOST: &str = "www.example.com";
-
 /// The `RoutingRules` container holding the one rule `condition` (omitted when empty) and
 /// `redirect` make, through the helpers the round-trip suite beside this one already owns.
 fn routing_rule(condition: &str, redirect: &str) -> String {
@@ -197,10 +193,7 @@ fn redirect_all_rows() -> Vec<Row> {
             format!("{REDIRECT_EVERYTHING}{sibling}"),
             "InvalidArgument",
             REDIRECT_ALL_NOT_EXCLUSIVE.to_string(),
-            Some((
-                "RedirectAllRequestsTo",
-                REDIRECT_EVERYTHING_HOST.to_string(),
-            )),
+            Some(("RedirectAllRequestsTo", "not null".to_string())),
         )
     })
     .collect()

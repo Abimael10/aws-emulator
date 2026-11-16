@@ -440,7 +440,7 @@ fn inventory_document_fault(
 
 /// Why an S3 Inventory configuration document is not one S3 records — which is what decides
 /// the refusal a put carrying it answers with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum InventoryDocumentFault {
     /// A member of the document carries a value the schema the API publishes for it does not
     /// admit, so the document "did not validate against our published schema".

@@ -1002,14 +1002,13 @@ async fn the_per_bucket_ceiling_is_the_published_one() {
 /// crate so that a change to the handler's wording fails this suite — the way the
 /// subresource-message suite beside this one pins its published texts.
 const PUBLISHED_INVALID_CONFIG_ID_MESSAGE: &str =
-    "Config Id should be more than 1 character and less than 64 characters in length.";
+    "Config Id should not be more than 1 char and less than 64 chars in length";
 
 /// The published id-length bound, tested at each end and one past it.
 ///
-/// The bound's wording — "Config Id should be more than 1 character and less than 64
-/// characters in length." — is not literal at either end: a 64-character id IS recorded, so
-/// `64` is the inclusive maximum, and by the same reading a one-character id is inside the
-/// bound while an empty one is not.
+/// The bound's wording — "Config Id should not be more than 1 char and less than 64 chars in
+/// length" — is not literal at either end: a 64-character id IS recorded, so `64` is the
+/// inclusive maximum, and a one-character id is inside the bound while an empty one is not.
 #[tokio::test]
 async fn an_id_outside_the_published_length_bound_is_refused() {
     let router = router();

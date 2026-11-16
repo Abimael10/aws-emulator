@@ -649,6 +649,25 @@ pub const MALFORMED_XML_MESSAGE: &str =
     "The XML you provided was not well-formed or did not validate against our published \
      schema";
 
+/// The code S3 answers an analytics configuration document that names no storage class
+/// analysis with: `MissingStorageClassAnalysis`, under HTTP 400.
+///
+/// Distinct from [`MALFORMED_XML_CODE`]: the document validates against the published schema
+/// everywhere else and what is absent is the one container the configuration IS —
+/// `AnalyticsConfiguration$StorageClassAnalysis` is `@required`
+/// (`smithy_query(query="shape",shape="AnalyticsConfiguration")`) — so the refusal names that
+/// container rather than reporting the document as unreadable, which is what tells the caller
+/// which element to add.
+pub const MISSING_STORAGE_CLASS_ANALYSIS_CODE: &str = "MissingStorageClassAnalysis";
+
+/// See [`MISSING_STORAGE_CLASS_ANALYSIS_CODE`] — the fixed text S3 sends for that condition,
+/// nothing of which comes from the request.
+pub const MISSING_STORAGE_CLASS_ANALYSIS_MESSAGE: &str = "Storage Class Analysis cannot be null.";
+
+/// The HTTP status [`MISSING_STORAGE_CLASS_ANALYSIS_CODE`] is rendered with: 400, the status
+/// S3 gives a configuration it cannot apply.
+pub const MISSING_STORAGE_CLASS_ANALYSIS_STATUS: u16 = 400;
+
 /// Whether an optional member a submitted configuration document carries is PRESENT and
 /// EMPTY, which is a document that "did not validate against our published schema"
 /// ([`MALFORMED_XML_CODE`]) rather than one that left the member out.
@@ -1409,12 +1428,14 @@ pub const INVALID_CONFIG_ID_CODE: &str = "InvalidConfigId";
 /// states the bound rather than repeating the id the request named, so nothing of the
 /// request reaches it.
 ///
-/// Its wording is NOT literal at either end, and the enforced bound is the inclusive range
-/// `1..=`[`MAX_CONFIGURATION_ID_CHARS`]: an id of exactly that many characters is recorded,
-/// and the shortest id S3 records is one character. Do not narrow the check to match the
-/// prose.
+/// Its wording is the service's own, down to the missing full stop, and it is NOT literal at
+/// either end: the enforced bound is the inclusive range `1..=`[`MAX_CONFIGURATION_ID_CHARS`]
+/// — an id of exactly that many characters is recorded, and the shortest id S3 records is one
+/// character. Do not narrow the check to match the prose, and do not re-word the prose to
+/// match the check: a client that recognises an id-length rejection by this sentence reads
+/// it verbatim.
 pub const INVALID_CONFIG_ID_MESSAGE: &str =
-    "Config Id should be more than 1 character and less than 64 characters in length.";
+    "Config Id should not be more than 1 char and less than 64 chars in length";
 
 /// The HTTP status [`INVALID_CONFIG_ID_CODE`] is rendered with: 400, the status S3 gives a
 /// configuration it cannot apply.
@@ -1516,29 +1537,112 @@ pub const ID_MISMATCH_MESSAGE: &str = "Document ID does not match the specified 
 /// The HTTP status [`ID_MISMATCH_CODE`] is rendered with: 400.
 pub const ID_MISMATCH_STATUS: u16 = 400;
 
+/// The code S3 answers a filter whose `Prefix` predicate is STATED EMPTY with:
+/// `InvalidPrefix`, under HTTP 400.
+///
+/// Distinct from [`MALFORMED_XML_CODE`] for the reason [`INVALID_AND_CODE`] is: the document
+/// validates against the published schema and what S3 cannot act on is the PREDICATE, so the
+/// refusal names the prefix. Leaving the member out is a different matter, which the schema
+/// admits and which means the filter puts no prefix condition on the objects it describes.
+pub const INVALID_PREFIX_CODE: &str = "InvalidPrefix";
+
+/// See [`INVALID_PREFIX_CODE`] — the fixed text S3 sends for that condition, which states
+/// the two states the member may be in rather than echoing what it held.
+pub const INVALID_PREFIX_MESSAGE: &str =
+    "Filter Prefix should be set to a valid non-empty value or not set at all.";
+
+/// The HTTP status [`INVALID_PREFIX_CODE`] is rendered with: 400.
+pub const INVALID_PREFIX_STATUS: u16 = 400;
+
+/// The code S3 answers a filter whose `And` conjunction is not one it can evaluate with:
+/// `InvalidAnd`, under HTTP 400.
+///
+/// Distinct from [`MALFORMED_XML_CODE`]: the document validates against the published schema
+/// — every element is declared where it arrived — and what S3 cannot act on is the
+/// CONJUNCTION itself, so the refusal names the operator rather than the document.
+pub const INVALID_AND_CODE: &str = "InvalidAnd";
+
+/// The HTTP status [`INVALID_AND_CODE`] is rendered with: 400.
+pub const INVALID_AND_STATUS: u16 = 400;
+
+/// The `<Message>` S3 sends beside [`INVALID_AND_CODE`]: the two rules a conjunction has to
+/// satisfy, stated as the bounds themselves with nothing of the request in it.
+///
+/// Built from the bounds rather than spelled as one string so the sentence and the check
+/// cannot drift: the tag count is [`AND_OPERATOR_TAGS`] — a filter matches an object's tag
+/// set, and an object carries at most [`MAX_TAGS_PER_OBJECT`] tags — and the element count is
+/// [`MIN_AND_OPERATOR_ELEMENTS`], "a logical AND … to two or more predicates".
+pub fn invalid_and_message() -> String {
+    format!(
+        "Number of tags should not be less than {minimum} and more than {maximum} within \
+         And. And cannot contain less than {elements} elements.",
+        minimum = AND_OPERATOR_TAGS.start(),
+        maximum = AND_OPERATOR_TAGS.end(),
+        elements = MIN_AND_OPERATOR_ELEMENTS,
+    )
+}
+
+/// How many tag predicates a filter's `And` conjunction may name: at least one, and at most
+/// [`MAX_TAGS_PER_OBJECT`] — the tag set a filter evaluates against is an object's, so a
+/// conjunction over more tags than an object may carry can never hold. The bounds S3's own
+/// refusal of a conjunction outside them states ([`invalid_and_message`]).
+pub const AND_OPERATOR_TAGS: ::std::ops::RangeInclusive<usize> = 1..=MAX_TAGS_PER_OBJECT;
+
+/// The fewest elements a filter's `And` conjunction may name: two, as the refusal that states
+/// it spells the rule ([`invalid_and_message`]) and as the member itself documents —
+/// "a conjunction (logical AND) of predicates … The operator must have at least two
+/// predicates" (`AnalyticsFilter$And`). A prefix and each tag count one element each.
+pub const MIN_AND_OPERATOR_ELEMENTS: usize = 2;
+
 /// Why a value is not the ARN of a BUCKET data may be exported to — which is what decides
 /// the sentence a write naming it is refused with.
 ///
 /// ONE type for every member that takes a bucket ARN as an export destination, because the
 /// rule is one rule: a bucket ARN names neither a Region nor an account id, "because a
 /// bucket name is globally unique" ([`is_s3_bucket_arn`] carries the grammar).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BucketArnFault {
-    /// The value is not a bucket ARN at all — a bare bucket name, say, or an ARN of another
-    /// service.
+    /// The member carries no value at all: it is there and EMPTY, which names no destination
+    /// — and S3 words that as the member being null or empty, since the two reach its
+    /// validator the same way.
+    Empty,
+    /// The value is not an ARN at all — a bare bucket name, say, or text no ARN grammar
+    /// reads.
     NotAnArn,
+    /// The value is a well-formed ARN of ANOTHER service: it names a resource, and the
+    /// service namespace that says whose resource it is is not S3's.
+    ForeignVendor,
     /// The value is an S3 ARN whose Region field carries a value, which a bucket ARN never
     /// does.
     RegionQualified,
+    /// The value is an S3 ARN whose ACCOUNT field carries a value, which a bucket ARN never
+    /// does either — the field S3's own refusal of it calls the ARN's namespace.
+    NamespaceQualified,
+    /// The value has the shape of a bucket ARN and its resource part is not a name S3 can
+    /// address a bucket by ([`crate::service::names_a_bucket`]) — a bucket name with a key
+    /// prefix after it, say, which names no bucket.
+    InvalidBucketName {
+        /// The resource part the ARN carried, as the request spelled it: the only part of
+        /// this class of refusal that comes from the request, because S3's sentence for it
+        /// names the value that is not a bucket name.
+        name: String,
+    },
 }
 
 impl BucketArnFault {
-    /// The `<Message>` a write naming such a destination is refused with: the fixed sentence
-    /// S3 publishes for the rule the value broke, with nothing of the request in it.
-    pub fn message(self) -> &'static str {
+    /// The `<Message>` a write naming such a destination is refused with: the sentence S3
+    /// publishes for the rule the value broke — fixed text, except the one class whose
+    /// published sentence names the value that is not a bucket name.
+    pub fn message(&self) -> String {
         match self {
-            Self::NotAnArn => "Invalid bucket ARN.",
-            Self::RegionQualified => "Bucket ARN should not specify a region.",
+            Self::Empty => {
+                "S3BucketDestination bucket arn cannot be null or empty".to_string()
+            }
+            Self::NotAnArn => "Invalid bucket ARN.".to_string(),
+            Self::ForeignVendor => "Bucket ARN must have the s3 vendor.".to_string(),
+            Self::RegionQualified => "Bucket ARN should not specify a region.".to_string(),
+            Self::NamespaceQualified => "Bucket ARN should not specify a namespace.".to_string(),
+            Self::InvalidBucketName { name } => format!("Invalid Bucket Name: {name}"),
         }
     }
 }
@@ -1547,26 +1651,50 @@ impl BucketArnFault {
 ///
 /// The one reading of the destination rule, shared by every member that takes an export
 /// destination bucket, so two configuration families cannot drift apart on which values they
-/// record. The REGION-qualified case is told apart from the rest because S3 states a rule of
-/// its own for it: a bucket ARN carries no Region.
+/// record. Each class is told apart from the rest because S3 states a rule of its own for it,
+/// and they are read in the ARN's own field ORDER: the value has to be an ARN, of the S3
+/// vendor, with no Region and no account id, and what it then names has to be a BUCKET NAME.
 pub fn bucket_arn_fault(value: &str) -> Option<BucketArnFault> {
+    if value.is_empty() {
+        return Some(BucketArnFault::Empty);
+    }
     if is_s3_bucket_arn(value) {
+        // The shape of a bucket ARN, so what is left to judge is the one thing it names: the
+        // resource part IS the bucket name, and a value that is no name S3 can address a
+        // bucket by ([`crate::service::names_a_bucket`], the crate's one reading of that
+        // rule) names no bucket for an export to be written to.
+        let name = ::service_common::arn::parse(value)?.resource;
+        if !crate::service::names_a_bucket(name) {
+            return Some(BucketArnFault::InvalidBucketName {
+                name: name.to_string(),
+            });
+        }
         return None;
     }
     match ::service_common::arn::parse(value) {
-        // An S3 ARN naming a resource and a Region: the Region is the one thing wrong with
+        // Not an ARN at all: there are no fields to report a rule against.
+        None => Some(BucketArnFault::NotAnArn),
+        // An ARN of another service: the VENDOR field is the first one wrong with it, so that
+        // is the rule S3 states, whatever the fields after it carry.
+        Some(parsed) if parsed.vendor != S3_ARN_VENDOR => Some(BucketArnFault::ForeignVendor),
+        // An S3 ARN naming a resource and a Region: the Region is the next thing wrong with
         // it, whether or not it also names an account, which is the rule S3 states its own
         // sentence for.
-        Some(parsed)
-            if parsed.vendor == "s3"
-                && !parsed.region.is_empty()
-                && !parsed.resource.is_empty() =>
-        {
+        Some(parsed) if !parsed.region.is_empty() && !parsed.resource.is_empty() => {
             Some(BucketArnFault::RegionQualified)
+        }
+        // An S3 ARN naming a resource and an ACCOUNT: the account is what a bucket ARN never
+        // states, which S3 reports as the ARN's namespace.
+        Some(parsed) if !parsed.account.is_empty() && !parsed.resource.is_empty() => {
+            Some(BucketArnFault::NamespaceQualified)
         }
         _ => Some(BucketArnFault::NotAnArn),
     }
 }
+
+/// The service namespace an S3 resource's ARN carries in its vendor field, as S3's own
+/// refusal of an ARN carrying another one names it ("must have the s3 vendor").
+const S3_ARN_VENDOR: &str = "s3";
 
 /// How many decimal digits an AWS account id carries: twelve, the form every account id in
 /// this emulator takes ([`::engine::emulator_account_id`] mints one).

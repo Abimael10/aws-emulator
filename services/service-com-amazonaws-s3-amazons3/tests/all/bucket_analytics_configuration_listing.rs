@@ -162,7 +162,11 @@ fn listing_rows() -> Vec<(&'static str, Vec<Configuration>)> {
                     Some(Filter::Prefix("documents/".to_string())),
                     Some(DataExport::new("analytics-destination", None, None)),
                 ),
-                configuration("c-empty-prefix", Some(Filter::Prefix(String::new())), None),
+                configuration(
+                    "c-separator-prefix",
+                    Some(Filter::Prefix("/".to_string())),
+                    None,
+                ),
                 configuration(
                     "d_tag",
                     Some(Filter::Tag("team".to_string(), "billing".to_string())),

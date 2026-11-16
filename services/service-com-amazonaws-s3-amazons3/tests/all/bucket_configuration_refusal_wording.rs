@@ -48,7 +48,7 @@ const LIMIT_MESSAGE: &str = "You have attempted to create more configurations th
 /// The sentence S3 sends beside `InvalidConfigId` for an id longer than the bound, likewise
 /// written out: it states the bound and echoes nothing of the id.
 const INVALID_ID_MESSAGE: &str =
-    "Config Id should be more than 1 character and less than 64 characters in length.";
+    "Config Id should not be more than 1 char and less than 64 chars in length";
 
 /// The two values `IntelligentTieringAccessTier` publishes
 /// (`smithy_query(query="shape",shape="IntelligentTieringAccessTier")`), and the fewest days a

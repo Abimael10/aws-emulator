@@ -181,6 +181,15 @@ pub struct BucketWebsite {
 /// empty.
 pub const ABSENT_ARGUMENT_VALUE: &str = "null";
 
+/// The `<ArgumentValue>` S3's refusal of a member that may not be STATED AT ALL beside
+/// another carries: the member held a value, which is the whole of what is wrong with it, so
+/// the element names the STATE the member was in rather than the value it carried.
+///
+/// The negation of [`ABSENT_ARGUMENT_VALUE`], and fixed text for the same reason: a client
+/// that reads the pair to understand the constraint is told that the member it may not
+/// combine was provided, not that the host, suffix or key it provided is an invalid value.
+pub const PRESENT_ARGUMENT_VALUE: &str = "not null";
+
 /// Why a website configuration is not one S3 would apply to a bucket, and how S3 refuses it.
 ///
 /// Each variant names the member that is wrong and carries what that member held, and
@@ -201,11 +210,11 @@ pub enum WebsiteConfigurationRejection {
     /// `RedirectAllRequestsTo` beside another member of the container: "If you specify this
     /// property, you can't specify any other property"
     /// (`WebsiteConfiguration$RedirectAllRequestsTo`).
-    RedirectAllNotExclusive {
-        /// `RedirectAllRequestsTo$HostName`, the "name of the host where requests are
-        /// redirected" — the value the container the refusal names carries, as sent.
-        host_name: String,
-    },
+    ///
+    /// Carries nothing of the request: what is wrong is that the container was STATED beside
+    /// another property, so the refusal names the container and the state it was in
+    /// ([`PRESENT_ARGUMENT_VALUE`]) rather than the host it named.
+    RedirectAllNotExclusive,
     /// A configuration that neither redirects every request nor names an index document:
     /// "the website configuration must provide an index document for the bucket, because
     /// some requests might not be redirected" (`PutBucketWebsite`'s own documentation).
@@ -264,7 +273,7 @@ impl WebsiteConfigurationRejection {
     pub fn code(&self) -> &'static str {
         match self {
             Self::MalformedDocument => MALFORMED_XML_CODE,
-            Self::RedirectAllNotExclusive { .. }
+            Self::RedirectAllNotExclusive
             | Self::NoIndexDocument
             | Self::MalformedIndexDocumentSuffix { .. }
             | Self::MalformedErrorDocumentKey { .. } => INVALID_ARGUMENT_CODE,
@@ -292,9 +301,10 @@ impl WebsiteConfigurationRejection {
     /// rule inside it, rather than about one member of the container.
     ///
     /// The name is the CONTAINER element the value arrived in, as the API publishes it, and
-    /// the value is what that container held: the scalar the member carries, the host a
-    /// redirect-everything container names, or [`ABSENT_ARGUMENT_VALUE`] where the refusal is
-    /// that the member held nothing at all.
+    /// the value is the state that container was in where THAT is what the refusal is about —
+    /// [`ABSENT_ARGUMENT_VALUE`] for a member that held nothing at all and
+    /// [`PRESENT_ARGUMENT_VALUE`] for one that may not be stated beside another — else the
+    /// scalar the member carries.
     ///
     /// Only a refusal [`Self::code`] answers [`INVALID_ARGUMENT_CODE`] names an argument: the
     /// pair is that code's own document (Amazon S3 API Reference, *Error responses*).
@@ -307,8 +317,8 @@ impl WebsiteConfigurationRejection {
             Self::MalformedErrorDocumentKey { key } => {
                 Some(("ErrorDocument", Some(key.as_str())))
             }
-            Self::RedirectAllNotExclusive { host_name } => {
-                Some(("RedirectAllRequestsTo", Some(host_name.as_str())))
+            Self::RedirectAllNotExclusive => {
+                Some(("RedirectAllRequestsTo", Some(PRESENT_ARGUMENT_VALUE)))
             }
             _ => None,
         }
@@ -321,7 +331,7 @@ impl std::fmt::Display for WebsiteConfigurationRejection {
             // The code's own FIXED published text, which states the fault class rather than
             // anything about this document.
             Self::MalformedDocument => write!(f, "{MALFORMED_XML_MESSAGE}"),
-            Self::RedirectAllNotExclusive { .. } => write!(
+            Self::RedirectAllNotExclusive => write!(
                 f,
                 "RedirectAllRequestsTo cannot be provided in conjunction with other Routing \
                  Rules."
@@ -401,9 +411,7 @@ pub fn validate_website_configuration(
             || configuration.error_document_key.is_some()
             || !configuration.routing_rules.is_empty()
         {
-            return Err(WebsiteConfigurationRejection::RedirectAllNotExclusive {
-                host_name: redirect_all.host_name.clone(),
-            });
+            return Err(WebsiteConfigurationRejection::RedirectAllNotExclusive);
         }
         check_protocol(&redirect_all.protocol)?;
         return Ok(());
@@ -543,15 +551,6 @@ pub const WEBSITE_DOCUMENT_REQUIRED_ELEMENTS: &[(&str, &str)] = &[
     ("RedirectAllRequestsTo", "HostName"),
     ("RoutingRule", "Redirect"),
 ];
-
-/// The child element the schema requires inside `element`, or `None` for one that requires
-/// none.
-pub(super) fn required_element(element: &str) -> Option<&'static str> {
-    WEBSITE_DOCUMENT_REQUIRED_ELEMENTS
-        .iter()
-        .find(|(container, _)| *container == element)
-        .map(|(_, required)| *required)
-}
 
 /// What S3 refuses the website document `document` for, read from the DOCUMENT itself rather
 /// than from the configuration parsed out of it, or `None` for a document it refuses nothing
@@ -693,80 +692,13 @@ pub(super) fn website_document_names_empty_error_document_key(document: &[u8]) -
 /// element whatever — which is the same refusal: the code's own sentence states both ("not
 /// well-formed or did not validate against our published schema").
 pub(super) fn website_document_validates(document: &[u8]) -> bool {
-    let mut reader = ::quick_xml::Reader::from_reader(document);
-    // The trail of element names from the root down to the element being read, each with the
-    // child the schema requires inside it until that child is seen: an element is judged
-    // against the children its PARENT declares, and a container against the child it owes.
-    let mut open: Vec<(&'static str, Option<&'static str>)> = Vec::new();
-    // Whether the document has a root element at all, which an XML document has by
-    // definition and bytes that are not markup do not.
-    let mut rooted = false;
-    loop {
-        let event = match reader.read_event() {
-            Ok(event) => event,
-            // Not well formed.
-            Err(_) => return false,
-        };
-        let parent = open.last().map(|(element, _)| *element);
-        match event {
-            ::quick_xml::events::Event::Start(start) => {
-                let Some(element) = declared_element(parent, start.name().as_ref()) else {
-                    return false;
-                };
-                rooted = true;
-                satisfy_required(&mut open, element);
-                open.push((element, required_element(element)));
-            }
-            // A self-closing element (`<Condition/>`) is an element with no children at
-            // all: the name is judged the same way, and a container that owes one is not
-            // satisfied by it.
-            ::quick_xml::events::Event::Empty(start) => {
-                let Some(element) = declared_element(parent, start.name().as_ref()) else {
-                    return false;
-                };
-                if required_element(element).is_some() {
-                    return false;
-                }
-                rooted = true;
-                satisfy_required(&mut open, element);
-            }
-            ::quick_xml::events::Event::End(_) => match open.pop() {
-                // A container that never named the child the schema requires inside it.
-                Some((_, Some(_))) => return false,
-                Some((_, None)) => {}
-                None => return false,
-            },
-            ::quick_xml::events::Event::Eof => return rooted && open.is_empty(),
-            _ => {}
-        }
-    }
+    document_fault(&WEBSITE_DOCUMENT, document).is_none()
 }
 
-/// Note `element` as named inside the container it arrived in, which is what satisfies that
-/// container's required child.
-pub(super) fn satisfy_required(open: &mut [(&'static str, Option<&'static str>)], element: &'static str) {
-    if let Some((_, required)) = open.last_mut() {
-        if *required == Some(element) {
-            *required = None;
-        }
-    }
-}
-
-/// The element [`WEBSITE_DOCUMENT_SCHEMA`] declares under `parent` (or as the ROOT, for a
-/// `parent` of `None`) whose name is `element`, or `None` for a name the schema does not
-/// declare there.
-pub(super) fn declared_element(parent: Option<&str>, element: &[u8]) -> Option<&'static str> {
-    let declared: &[&'static str] = match parent {
-        // The root element of the document: the container the payload IS.
-        None => &[WEBSITE_DOCUMENT_SCHEMA[0].0],
-        Some(parent) => WEBSITE_DOCUMENT_SCHEMA
-            .iter()
-            .find(|(name, _)| *name == parent)
-            // A LEAF carries text, not elements, so nothing is declared inside it.
-            .map_or(&[], |(_, children)| *children),
-    };
-    declared
-        .iter()
-        .copied()
-        .find(|name| name.as_bytes() == element)
-}
+/// The two tables above as the one schema a website document is walked against
+/// (`super::document_schema`), which is the one reading of "validates" every document of this
+/// service is judged by.
+const WEBSITE_DOCUMENT: DocumentSchema = DocumentSchema {
+    elements: WEBSITE_DOCUMENT_SCHEMA,
+    required: WEBSITE_DOCUMENT_REQUIRED_ELEMENTS,
+};

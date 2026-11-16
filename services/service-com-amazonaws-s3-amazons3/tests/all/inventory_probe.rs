@@ -285,7 +285,7 @@ async fn a_document_outside_the_published_schema_is_refused_and_records_nothing(
                 .publishing_to("arn:aws:sqs:us-east-1:123456789012:reports"),
             400,
             Some(INVALID_S3_DESTINATION_BUCKET_CODE),
-            BucketArnFault::NotAnArn.message().to_string(),
+            BucketArnFault::ForeignVendor.message().to_string(),
         ),
         (
             "a destination ARN qualified by a Region",

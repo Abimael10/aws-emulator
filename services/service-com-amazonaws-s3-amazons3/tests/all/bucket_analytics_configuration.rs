@@ -47,9 +47,10 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use service_com_amazonaws_s3_amazons3::ops::put_bucket_analytics_configuration::PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS;
 use service_com_amazonaws_s3_amazons3::state::{
-    INVALID_CONFIGURATION_ID_CODE, INVALID_CONFIG_ID_CODE, INVALID_DESTINATION_CODE,
-    MALFORMED_XML_CODE, MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET, MAX_ANALYTICS_ID_CHARS,
-    NO_SUCH_BUCKET_CODE, NO_SUCH_CONFIGURATION_CODE, TOO_MANY_CONFIGURATIONS_CODE,
+    INVALID_AND_CODE, INVALID_CONFIGURATION_ID_CODE, INVALID_CONFIG_ID_CODE,
+    INVALID_DESTINATION_CODE, INVALID_PREFIX_CODE, MALFORMED_XML_CODE,
+    MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET, MAX_ANALYTICS_ID_CHARS, NO_SUCH_BUCKET_CODE,
+    NO_SUCH_CONFIGURATION_CODE, TOO_MANY_CONFIGURATIONS_CODE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -487,10 +488,10 @@ fn round_trip_rows() -> Vec<(&'static str, Configuration)> {
             ),
         ),
         (
-            "an empty prefix predicate",
+            "a prefix predicate that is a single separator",
             configuration(
-                "empty-prefix",
-                Some(Filter::Prefix(String::new())),
+                "root-prefix",
+                Some(Filter::Prefix("/".to_string())),
                 Some(DataExport::new("analytics-destination", None, None)),
             ),
         ),
@@ -847,7 +848,7 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
                  </AnalyticsConfiguration>"
             ),
             400,
-            MALFORMED_XML_CODE,
+            INVALID_AND_CODE,
         ),
         (
             "an And naming no predicate at all",
@@ -857,7 +858,17 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
                  <Filter><And></And></Filter>{analysis}</AnalyticsConfiguration>"
             ),
             400,
-            MALFORMED_XML_CODE,
+            INVALID_AND_CODE,
+        ),
+        (
+            "a prefix predicate stated empty, which names no prefix",
+            "empty-prefix".to_string(),
+            format!(
+                "<AnalyticsConfiguration xmlns=\"{XMLNS}\"><Id>empty-prefix</Id>\
+                 <Filter><Prefix></Prefix></Filter>{analysis}</AnalyticsConfiguration>"
+            ),
+            400,
+            INVALID_PREFIX_CODE,
         ),
         (
             "a filter naming two predicates where the choice is exactly one",

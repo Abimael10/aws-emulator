@@ -807,6 +807,34 @@ const WEBSITE_CONFIGURATION_MEMBER: &str = "WebsiteConfiguration";
 /// (`request_document`) and refuses it from that, so nothing is read from this stand-in.
 const EMPTY_WEBSITE_CONFIGURATION: &[u8] = b"<WebsiteConfiguration></WebsiteConfiguration>";
 
+/// Whether the input's XML document payload is an `AnalyticsConfiguration` — the one
+/// configuration document whose own refusals `PutBucketAnalyticsConfiguration` is the place
+/// that states them, so the withholding below is scoped to it by the member the codec would
+/// bind rather than by anything the document happens to spell.
+fn carries_analytics_document(input_schema: &Schema) -> bool {
+    input_schema
+        .members()
+        .iter()
+        .find(|member| is_xml_document_payload(member))
+        .and_then(|payload| payload.member_name())
+        == Some(ANALYTICS_CONFIGURATION_MEMBER)
+}
+
+/// The input member `PutBucketAnalyticsConfiguration` binds its document as
+/// (`smithy_query(query="operation",operation="PutBucketAnalyticsConfiguration")` reports
+/// `AnalyticsConfiguration` as the `@httpPayload`).
+const ANALYTICS_CONFIGURATION_MEMBER: &str = "AnalyticsConfiguration";
+
+/// The analytics document handed to the codec in place of one the published schema rejects:
+/// the container with each member the model REQUIRES and nothing in them, so the codec binds
+/// a configuration rather than refusing the request for a member the rejected document is not
+/// read for. `PutBucketAnalyticsConfiguration` reads the document the request actually
+/// carried ([`request_document`]) and refuses it from that before it reads the configuration
+/// at all, so nothing is read from this stand-in.
+const EMPTY_ANALYTICS_CONFIGURATION: &[u8] =
+    b"<AnalyticsConfiguration><Id></Id><StorageClassAnalysis></StorageClassAnalysis>\
+      </AnalyticsConfiguration>";
+
 /// Whether the input's XML document payload is a `NotificationConfiguration` — the one
 /// document whose events and filter rule names Amazon S3 judges itself, so the two rewrites
 /// below are scoped to it by the member the codec would bind rather than by anything the
@@ -3266,8 +3294,20 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         }
         // And when a UNION member of that document does not carry exactly one member, which
         // is not a document of the shape it claims to be. See [`union_arity_violation`].
-        if let Some(violation) = union_arity_violation(request, input_schema) {
-            return Err(ProtocolError::Invalid(vec![violation]));
+        //
+        // Not for a document whose own operation refuses it
+        // (`crate::state::analytics_document_rejection`, withheld from the codec below): S3
+        // reports the configuration's missing analysis ahead of the shape of its filter, and
+        // this refusal would report the filter instead.
+        let withheld_analytics_document = carries_analytics_document(input_schema)
+            && request
+                .body()
+                .bytes()
+                .is_some_and(|body| crate::state::analytics_document_rejection(body).is_some());
+        if !withheld_analytics_document {
+            if let Some(violation) = union_arity_violation(request, input_schema) {
+                return Err(ProtocolError::Invalid(vec![violation]));
+            }
         }
         // The PATH the `@httpLabel` members are bound from, when it is not the path the
         // request arrived with — the PATH-STYLE address resolved above
@@ -3403,6 +3443,20 @@ impl ServerProtocol for UnwrappedXmlRestXml {
                 } else if let Some(document) = filter_rule_names_folded(current) {
                     normalized = Some(document);
                 }
+            }
+            // And an EIGHTH, for the one configuration document whose own refusals
+            // `PutBucketAnalyticsConfiguration` is the one place that states them: a document
+            // the published schema rejects, or one naming no storage class analysis, is
+            // withheld from the codec in full — replaced by
+            // [`EMPTY_ANALYTICS_CONFIGURATION`] — so that operation answers the code S3
+            // publishes for the fault, which for a configuration naming no analysis at all is
+            // a code of its own, rather than the boundary reporting every such document as
+            // one that does not validate. Judged on the body AS IT ARRIVED, which is the same
+            // bytes the handler reads it from ([`request_document`]), so the two cannot
+            // disagree about which documents that operation is the one to refuse. See
+            // `crate::state::analytics_document_rejection`.
+            if withheld_analytics_document {
+                normalized = Some(EMPTY_ANALYTICS_CONFIGURATION.to_vec());
             }
             if let Some(document) = normalized {
                 let uri = request.uri();

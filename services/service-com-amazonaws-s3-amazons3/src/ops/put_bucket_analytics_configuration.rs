@@ -8,7 +8,10 @@
 //! of it, down to the export destination's own account id — and
 //! `GetBucketAnalyticsConfiguration` reports it back. Success is
 //! [`PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS`] with an empty body. Refused before
-//! anything is written when the request is not one S3 records: an id outside the id rule
+//! anything is written when the request is not one S3 records: a payload that does not
+//! validate against the schema the API publishes for it (`MalformedXML`), or that names no
+//! `StorageClassAnalysis` at all (`MissingStorageClassAnalysis`; see
+//! [`crate::state::analytics_document_rejection`]), an id outside the id rule
 //! every bucket configuration id shares (`InvalidConfigurationId` for an id the request
 //! states none of, else `InvalidConfigId`; see
 //! [`crate::state::configuration_id_fault`]), an id that disagrees with the payload's own
@@ -236,6 +239,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The DOCUMENT is judged first, from the bytes the request carried: the payload IS
+        // the configuration, and a codec reads an element it does not know by ignoring it, so
+        // a document that misspells, misnests or invents one parses to a configuration
+        // missing the member that element was meant to carry — and what S3 answers such a
+        // document is that it did not validate against the published schema, not that the
+        // configuration it parsed to is wrong. A document naming no storage class analysis at
+        // all gets the code S3 publishes for that one container
+        // ([`crate::state::analytics_document_rejection`] tells the two apart). Before the
+        // store is reached, which is where the boundary's own refusal of this document would
+        // have been answered too.
+        if let Some(rejection) = crate::service::wire::request_document()
+            .as_deref()
+            .and_then(crate::state::analytics_document_rejection)
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                rejection.code(),
+                rejection.status(),
+                rejection.message(),
+            ));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The store is unreachable only when this service is mounted on an engine that
             // is not the shared `InMemoryEngine`; nothing can then be persisted, and this
@@ -276,17 +300,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(malformed_analytics_configuration());
         }
 
-        // "A conjunction (logical AND) of predicates … The operator must have at least two
-        // predicates" (`AnalyticsFilter$And`): a prefix and each tag are one predicate each,
-        // and that minimum is part of the schema the API publishes for this payload as much
-        // as the `Id` rule is, so an `And` carrying fewer is the same schema refusal — the
-        // reading `PutBucketMetricsConfiguration` gives its own filter.
-        if let Some(AnalyticsFilter::And(operator)) = &input.analytics_configuration.filter {
-            let predicates =
-                usize::from(operator.prefix.is_some()) + operator.tags.as_ref().map_or(0, Vec::len);
-            if predicates < MIN_AND_OPERATOR_PREDICATES {
-                return Err(malformed_analytics_configuration());
-            }
+        // The FILTER is "the filter used to describe a set of objects for analyses"
+        // (`AnalyticsConfiguration$Filter`), and a filter that describes no such set describes
+        // nothing a report could be based on. Which refusal S3 answers depends on WHAT about
+        // it is not a filter ([`AnalyticsFilterFault`]): each of its predicates has a rule,
+        // and a refusal names the predicate it is about rather than the document.
+        if let Some(fault) = input
+            .analytics_configuration
+            .filter
+            .as_ref()
+            .and_then(analytics_filter_fault)
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                fault.code(),
+                fault.status(),
+                fault.message(),
+            ));
         }
 
         // "The Amazon Resource Name (ARN) of the bucket to which data is exported"
@@ -362,6 +391,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// Why `filter` is not one of the shapes the API publishes for an analytics filter, or `None`
+/// when it is one.
+///
+/// Each rule is from the members' own documentation, and each is about a PREDICATE rather
+/// than about the union's arity — which the request boundary judges from the document itself
+/// (`crate::state::analytics_document_rejection`), since a union naming two members or none
+/// parses to the same absent filter a document naming one unknown element does:
+///
+/// * a conjunction has to be one S3 can evaluate — "a conjunction (logical AND) of
+///   predicates … The operator must have at least two predicates" (`AnalyticsFilter$And`),
+///   over a tag set an object could actually carry — which S3 reports against the OPERATOR
+///   ([`crate::state::invalid_and_message`] states both bounds);
+/// * a `Prefix` predicate names "the prefix to use when evaluating an analytics filter"
+///   (`AnalyticsFilter$Prefix`), and the EMPTY string names no prefix to evaluate, which S3
+///   reports against the PREFIX ([`crate::state::INVALID_PREFIX_MESSAGE`] states the two
+///   states the member may be in). Judged on both members that carry one, since it is the
+///   same predicate inside a conjunction as it is on its own.
+fn analytics_filter_fault(filter: &AnalyticsFilter) -> Option<AnalyticsFilterFault> {
+    match filter {
+        AnalyticsFilter::Prefix(prefix) => {
+            prefix.is_empty().then_some(AnalyticsFilterFault::Prefix)
+        }
+        AnalyticsFilter::Tag(_) => None,
+        AnalyticsFilter::And(operator) => {
+            let tags = operator.tags.as_ref().map_or(0, Vec::len);
+            let elements = usize::from(operator.prefix.is_some()) + tags;
+            if !crate::state::AND_OPERATOR_TAGS.contains(&tags)
+                || elements < crate::state::MIN_AND_OPERATOR_ELEMENTS
+            {
+                return Some(AnalyticsFilterFault::And);
+            }
+            operator
+                .prefix
+                .as_deref()
+                .is_some_and(str::is_empty)
+                .then_some(AnalyticsFilterFault::Prefix)
+        }
+    }
+}
+
+/// What about a filter S3 cannot take — which is what decides the refusal a put carrying it
+/// answers with ([`analytics_filter_fault`] is the one reading).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalyticsFilterFault {
+    /// The conjunction is not one S3 can evaluate: it names too few elements, or a number of
+    /// tags no object's tag set could satisfy.
+    And,
+    /// A `Prefix` predicate is stated EMPTY, which names no prefix to evaluate.
+    Prefix,
+}
+
+impl AnalyticsFilterFault {
+    /// The S3 error code a put carrying such a filter is refused with: each predicate's own,
+    /// since the refusal names the predicate rather than the document.
+    fn code(self) -> &'static str {
+        match self {
+            Self::And => crate::state::INVALID_AND_CODE,
+            Self::Prefix => crate::state::INVALID_PREFIX_CODE,
+        }
+    }
+
+    /// The HTTP status that refusal is rendered with — 400 for both: the filter is an
+    /// argument of the request, and a request S3 cannot act on is a bad request.
+    fn status(self) -> u16 {
+        match self {
+            Self::And => crate::state::INVALID_AND_STATUS,
+            Self::Prefix => crate::state::INVALID_PREFIX_STATUS,
+        }
+    }
+
+    /// The `<Message>` that refusal carries: the fixed sentence S3 publishes for the rule the
+    /// predicate broke, which states the rule and echoes nothing of the request.
+    fn message(self) -> String {
+        match self {
+            Self::And => crate::state::invalid_and_message(),
+            Self::Prefix => crate::state::INVALID_PREFIX_MESSAGE.to_string(),
+        }
+    }
+}
+
 /// The refusal for an `Id` whose value is not an analytics configuration id: the code and
 /// the fixed sentence S3 publishes for the rule the value broke, which is what a caller
 /// fixes the request from. Nothing of the request is echoed into it — S3's wording for each
@@ -391,10 +500,6 @@ fn malformed_analytics_configuration() -> PutBucketAnalyticsConfigurationError {
 /// The HTTP status [`crate::state::MALFORMED_XML_CODE`] is rendered with: 400, as that
 /// code's own entry in Amazon S3's "Error responses" list publishes it.
 const MALFORMED_XML_STATUS: u16 = 400;
-
-/// The fewest predicates `AnalyticsFilter$And` may carry: "The operator must have at least
-/// two predicates" (that member's own documentation).
-const MIN_AND_OPERATOR_PREDICATES: usize = 2;
 
 /// The status `ExpectedBucketOwner` names for a mismatch: "the request fails with the HTTP
 /// status code 403 Forbidden (access denied)".

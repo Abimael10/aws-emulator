@@ -19,6 +19,8 @@ mod account_credential_federation_sessions;
 mod account_public_access_block;
 #[path = "all/account_wide_listing_authorization.rs"]
 mod account_wide_listing_authorization;
+#[path = "all/analytics_document_rules.rs"]
+mod analytics_document_rules;
 #[path = "all/anonymous_object_reads.rs"]
 mod anonymous_object_reads;
 #[path = "all/announced_response_urls.rs"]
