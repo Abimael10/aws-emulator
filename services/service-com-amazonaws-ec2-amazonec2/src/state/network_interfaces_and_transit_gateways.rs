@@ -1996,6 +1996,18 @@ impl TransitGatewayPropagationRecord {
         }
     }
 
+    /// The propagation as `GetTransitGatewayAttachmentPropagations` reports it: the route
+    /// table the routes go INTO and the propagation's state, which is all
+    /// `TransitGatewayAttachmentPropagation` carries — the attachment is the one the request
+    /// named, so that report does not repeat it, exactly as [`Self::route_table_view`] does
+    /// not repeat the route table its request named.
+    pub fn attachment_view(&self) -> TransitGatewayAttachmentPropagation {
+        TransitGatewayAttachmentPropagation {
+            transit_gateway_route_table_id: Some(self.transit_gateway_route_table_id.clone()),
+            state: Some(self.state.clone()),
+        }
+    }
+
     /// Put the propagation into `transient` now and owe it `to` [`TRANSITION_DELAY`] later.
     ///
     /// The span is never zero, so a caller acting straight after the enabling or disabling
@@ -2206,6 +2218,28 @@ impl ComAmazonawsEc2Amazonec2State {
         self.transit_gateway_propagations
             .range((route_table_id.to_string(), String::new())..)
             .take_while(move |((table, _), _)| table == route_table_id)
+            .map(|(_, record)| record)
+    }
+
+    /// The route propagations of one attachment, in route-table-id order — the stable order
+    /// `GetTransitGatewayAttachmentPropagations` reports and pages over.
+    ///
+    /// The store is keyed by (route table, attachment), so the attachment is the SECOND
+    /// component and this is a scan rather than a range: its cost is proportional to the
+    /// propagations the account holds, which [`MAX_STORED_RECORDS_PER_STORE`] bounds. The key
+    /// order visits each route table once and in order, so the propagations come out already
+    /// sorted by the id the report pages on.
+    ///
+    /// A read, so it writes nothing: the caller applies the clock-owed moves
+    /// ([`Self::materialize_due_transitions`]) before asking, exactly as
+    /// [`Self::transit_gateway_route_table_propagations`]'s caller does.
+    pub fn transit_gateway_attachment_propagations<'a>(
+        &'a self,
+        attachment_id: &'a str,
+    ) -> impl Iterator<Item = &'a TransitGatewayPropagationRecord> {
+        self.transit_gateway_propagations
+            .iter()
+            .filter(move |((_, attachment), _)| attachment == attachment_id)
             .map(|(_, record)| record)
     }
 }

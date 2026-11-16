@@ -16,6 +16,9 @@
 // its lines.
 #[path = "all/network_and_group_refusal_sentences.rs"]
 mod network_and_group_refusal_sentences;
+// The propagation route tables one transit gateway attachment's routes propagate into.
+#[path = "all/transit_gateway_attachment_propagations.rs"]
+mod transit_gateway_attachment_propagations;
 // Declared FIRST rather than in sorted position: a new ec2 suite lands every few minutes
 // and inserts its two lines in sorted order, so the sorted neighbourhood of this suite is
 // the contended region of this file — this fix lost several serialized squash merges to
