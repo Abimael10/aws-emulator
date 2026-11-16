@@ -625,7 +625,7 @@ async fn an_arn_that_names_no_taggable_resource_is_refused_by_every_tag_operatio
                 (
                     400,
                     "NotFoundException",
-                    format!("Failed to find resource: {resource_arn}")
+                    format!("Resource with ARN {resource_arn} not found")
                 ),
                 "case {label:?} on {operation}: an ARN naming no taggable resource must be refused, got {status} with {parsed}"
             );

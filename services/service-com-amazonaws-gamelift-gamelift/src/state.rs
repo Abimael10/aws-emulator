@@ -663,11 +663,13 @@ pub fn repeated_tag_key_message(key: &str) -> String {
 /// created yet or deleted"), shared by the tag operations so the same missing resource
 /// reads the same way whichever of them was called.
 ///
-/// The ARN the CALLER supplied is the sentence's one variable part, and the sentence is
-/// the shape this service answers a failed lookup in elsewhere
-/// ([`matchmaking_rule_set_lookup_failure_message`]).
+/// The service names the thing it could not resolve by its ARN and ends the sentence
+/// without a full stop: `Resource with ARN <ResourceARN> not found`. The ARN the CALLER
+/// supplied is the sentence's one variable part, carried verbatim, since the resource is
+/// identified by nothing else — an ARN that names a kind this service does not tag, or a
+/// resource it no longer holds, reads the same way.
 pub fn tagged_resource_not_found_message(resource_arn: &str) -> String {
-    format!("Failed to find resource: {resource_arn}")
+    format!("Resource with ARN {resource_arn} not found")
 }
 
 /// The resource segment of an ARN, split into the kind it names and the resource id:

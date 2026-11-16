@@ -83,6 +83,8 @@ mod server_process_capacity;
 mod service_owned_upload_locations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_lookup_failure_wording.rs"]
+mod tag_lookup_failure_wording;
 #[path = "all/unknown_resource_lookups.rs"]
 mod unknown_resource_lookups;
 #[path = "all/upload_credential_scope.rs"]
