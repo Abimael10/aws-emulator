@@ -35,7 +35,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every request below is signed for, and therefore the one both endpoints
 /// serve and the one the ARNs connecthealth mints belong to.
-const REGION: &str = "eu-west-1";
+pub(crate) const REGION: &str = "eu-west-1";
 
 /// The SigV4 signing name this API is routed on.
 const TAGGING: &str = "tagging";
@@ -43,11 +43,11 @@ const TAGGING: &str = "tagging";
 /// The SigV4 signing name connecthealth is routed on — its `endpointPrefix` /
 /// `arnNamespace`, which is also the service field of every ARN it mints
 /// (`smithy_query(query="service_info",model_path="services/service-com-amazonaws-connecthealth-connecthealth/smithy-model/com-amazonaws-connecthealth-connecthealth.json")`).
-const HEALTH_AGENT: &str = "health-agent";
+pub(crate) const HEALTH_AGENT: &str = "health-agent";
 
 /// A router carrying this API and connecthealth over ONE engine — the arrangement
 /// `core/router` builds.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The tests exercise handler behaviour, not SigV4: the `Authorization` header below is
@@ -67,7 +67,11 @@ fn authorization(signing_name: &str) -> String {
 }
 
 /// One tagging-API operation, over the awsJson wire this API publishes.
-async fn tagging(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn tagging(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let target = format!("ResourceGroupsTaggingAPI_20170126.{operation}");
     let request = http::Request::builder()
         .method("POST")
@@ -88,7 +92,7 @@ async fn tagging(router: &MultiServiceRouter, operation: &str, body: Value) -> (
 }
 
 /// One connecthealth operation, over the restJson1 routes that model publishes.
-async fn connecthealth(
+pub(crate) async fn connecthealth(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -116,13 +120,17 @@ async fn connecthealth(
 
 /// `/tags/{resourceArn}`, connecthealth's tagging route, with the ARN percent-encoded
 /// into its single non-greedy label exactly as an SDK encodes it.
-fn tags_path(arn: &str) -> String {
+pub(crate) fn tags_path(arn: &str) -> String {
     format!("/tags/{}", arn.replace(':', "%3A").replace('/', "%2F"))
 }
 
 /// A Domain created through connecthealth's own `CreateDomain`, with `tags` as given:
 /// `(domainId, domain ARN)`.
-async fn domain(router: &MultiServiceRouter, name: &str, tags: Value) -> (String, String) {
+pub(crate) async fn domain(
+    router: &MultiServiceRouter,
+    name: &str,
+    tags: Value,
+) -> (String, String) {
     let mut body = json!({ "name": name });
     if !tags.is_null() {
         body["tags"] = tags;
@@ -142,7 +150,7 @@ async fn domain(router: &MultiServiceRouter, name: &str, tags: Value) -> (String
 }
 
 /// The tag map connecthealth's own `ListTagsForResource` reports for one ARN.
-async fn owner_tags(router: &MultiServiceRouter, arn: &str) -> BTreeMap<String, String> {
+pub(crate) async fn owner_tags(router: &MultiServiceRouter, arn: &str) -> BTreeMap<String, String> {
     let (status, listed) = connecthealth(router, "GET", &tags_path(arn), None).await;
     assert_eq!(
         status, 200,
@@ -164,7 +172,7 @@ async fn owner_tags(router: &MultiServiceRouter, arn: &str) -> BTreeMap<String, 
 }
 
 /// The ARNs a `GetResources` page carries.
-fn page_arns(body: &Value) -> Vec<String> {
+pub(crate) fn page_arns(body: &Value) -> Vec<String> {
     body["ResourceTagMappingList"]
         .as_array()
         .unwrap_or_else(|| panic!("a GetResources body with no ResourceTagMappingList: {body}"))
@@ -179,7 +187,7 @@ fn page_arns(body: &Value) -> Vec<String> {
 }
 
 /// The tag map a `GetResources` page reports for one ARN.
-fn page_tags(body: &Value, arn: &str) -> BTreeMap<String, String> {
+pub(crate) fn page_tags(body: &Value, arn: &str) -> BTreeMap<String, String> {
     let mapping = body["ResourceTagMappingList"]
         .as_array()
         .unwrap_or_else(|| panic!("a GetResources body with no ResourceTagMappingList: {body}"))
@@ -200,7 +208,11 @@ fn page_tags(body: &Value, arn: &str) -> BTreeMap<String, String> {
 }
 
 /// `GetResources` with the filters given, asserting the modelled success.
-async fn get_resources(router: &MultiServiceRouter, case: &str, filters: Value) -> Value {
+pub(crate) async fn get_resources(
+    router: &MultiServiceRouter,
+    case: &str,
+    filters: Value,
+) -> Value {
     let (status, body) = tagging(router, "GetResources", filters).await;
     assert_eq!(
         status, 200,

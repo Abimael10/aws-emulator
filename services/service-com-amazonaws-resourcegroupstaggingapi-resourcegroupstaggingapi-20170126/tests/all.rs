@@ -63,3 +63,6 @@ mod health_agent_tagged_resource_index;
 
 #[path = "all/tag_batch_partial_failure.rs"]
 mod tag_batch_partial_failure;
+
+#[path = "all/namespace_filter_discovery.rs"]
+mod namespace_filter_discovery;
