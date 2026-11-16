@@ -28,7 +28,8 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_sfn_awsstepfunctions::state::{
     asl::{EXPRESS_CALLBACK_UNSUPPORTED, RUNTIME_ERROR, TIMEOUT_ERROR},
-    read_task_token, EVENT_TASK_SUBMITTED, EVENT_TASK_SUCCEEDED, EVENT_TASK_TIMED_OUT,
+    read_task_token, EVENT_EXECUTION_FAILED, EVENT_TASK_SUBMITTED, EVENT_TASK_SUCCEEDED,
+    EVENT_TASK_TIMED_OUT,
 };
 
 use crate::state_machine_lifecycle::{string, PAST_THE_EXECUTION_DELAY, ROLE_ARN};
@@ -45,10 +46,32 @@ const REPLY_OUTPUT: &str = r#"{"approved":true,"by":"the worker outside"}"#;
 const CHILD: &str =
     r#"{"StartAt":"Done","States":{"Done":{"Type":"Pass","Result":{"ok":true},"End":true}}}"#;
 
-/// How long a test waits for an outcome a `TimeoutSeconds`/`HeartbeatSeconds` of one
-/// second makes due: that second, plus the settle delay the outcome is owed after.
-const PAST_A_ONE_SECOND_BOUND: Duration =
-    Duration::from_millis(1_400).saturating_add(PAST_THE_EXECUTION_DELAY);
+/// How long a poll below waits for a status the clock owes before giving up — generous
+/// next to every bound those rows declare, because what each one waits for is the
+/// CONDITION and never this span.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(90);
+
+/// How long one poll pauses between looks.
+const POLL_PAUSE: Duration = Duration::from_millis(25);
+
+/// Describe `execution_arn` until it reports `status`, and answer what it then says.
+///
+/// The wait is for the STATUS and not for a span: a bound the clock has to run out of,
+/// and the settle the outcome is owed after it, take as long as the host takes.
+async fn reported_as(chain: &Chain, case: &str, execution_arn: &str, status: &str) -> Value {
+    let deadline = ::tokio::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let described = chain.describe(execution_arn).await;
+        if described.get("status").and_then(Value::as_str) == Some(status) {
+            return described;
+        }
+        assert!(
+            ::tokio::time::Instant::now() < deadline,
+            "case {case:?}: expected {execution_arn} to report {status}, got {described:?}"
+        );
+        ::tokio::time::sleep(POLL_PAUSE).await;
+    }
+}
 
 /// The integrations the tests drive the pattern over, and how the token each one
 /// carried is read back out of the far end of its call.
@@ -600,8 +623,8 @@ async fn an_answer_re_enters_the_states_own_data_flow() {
 // ---------------------------------------------------------------------------
 
 /// A callback task whose token is NOT answered in time fails the state with ASL's own
-/// `States.Timeout`, naming the bound that ran out — and a token answered inside its
-/// bounds finishes the task, heartbeats included.
+/// `States.Timeout` and nothing beside it — and a token answered inside its bounds
+/// finishes the task, heartbeats included.
 ///
 /// The rows differ along which bound the state declares: the whole task's
 /// `TimeoutSeconds`, the gap between heartbeats its `HeartbeatSeconds` allows, and a
@@ -653,41 +676,21 @@ async fn a_callback_token_that_is_not_answered_in_time_times_the_task_out() {
                     &json!({ "taskToken": token, "output": REPLY_OUTPUT }),
                 )
                 .await;
-            std::thread::sleep(PAST_THE_EXECUTION_DELAY);
-            let settled = chain.describe(&execution).await;
-            assert_eq!(
-                settled.get("status").and_then(Value::as_str),
-                Some("SUCCEEDED"),
-                "case {case:?}: expected SUCCEEDED, got {settled:?}"
-            );
+            reported_as(&chain, case, &execution, "SUCCEEDED").await;
             continue;
         }
 
-        std::thread::sleep(PAST_A_ONE_SECOND_BOUND);
-        let settled = chain.describe(&execution).await;
-        assert_eq!(
-            settled.get("status").and_then(Value::as_str),
-            Some("FAILED"),
-            "case {case:?}: expected FAILED, got {settled:?}"
-        );
+        let settled = reported_as(&chain, case, &execution, "FAILED").await;
         assert_eq!(
             settled.get("error").and_then(Value::as_str),
             Some(TIMEOUT_ERROR),
             "case {case:?}: expected {TIMEOUT_ERROR}, got {settled:?}"
         );
-        // The cause names the bound that ran out and the state that declared it, both
-        // read from the definition.
-        let bound = match bounds.get("HeartbeatSeconds") {
-            Some(_) => "HeartbeatSeconds",
-            None => "TimeoutSeconds",
-        };
-        let cause = settled
-            .get("cause")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        // The bound that ran out is the whole report: the error name alone, with no
+        // cause member beside it.
         assert!(
-            cause.contains(bound) && cause.contains("WaitForCallback"),
-            "case {case:?}: expected a cause naming {bound} and the state, got {cause:?}"
+            settled.get("cause").is_none_or(Value::is_null),
+            "case {case:?}: expected no cause beside the error name, got {settled:?}"
         );
         let present = event_types(&chain, &execution).await;
         assert!(
@@ -704,6 +707,132 @@ async fn a_callback_token_that_is_not_answered_in_time_times_the_task_out() {
         assert_eq!(
             code, "TaskTimedOut",
             "case {case:?}: expected a closed task to refuse an answer, got {code}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What a bound that ran out reports
+// ---------------------------------------------------------------------------
+
+/// A bound that RAN OUT is reported by its error name alone: the execution's `cause`
+/// is ABSENT, and so is the `cause` of the `ExecutionFailed` event that ends the
+/// history.
+///
+/// RULE: `cause` ("a more detailed explanation of the cause of the failure") is an
+/// optional member of everything that projects a failure — `DescribeExecution`'s
+/// output and an `ExecutionFailedEventDetails` — and a span that elapsed leaves
+/// nothing to explain: nobody answered the token, so the service reports the
+/// language's `States.Timeout` and writes no cause at all. The `cause` a
+/// `SendTaskFailure` carried IS reported, which
+/// `a_callback_task_is_finished_by_the_answer_to_the_token_it_handed_out` pins: the
+/// rule below is about what the CLOCK closed, not about causes in general.
+///
+/// The rows differ along what the rule generalises over: which bound of the state ran
+/// out (`TimeoutSeconds`, the `HeartbeatSeconds` window, both with the window the
+/// shorter), which integration handed the token out (a DynamoDB write, a nested
+/// execution), and how many heartbeats the window was restarted by before it lapsed
+/// (none, one).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bound_that_ran_out_reports_its_error_name_and_no_cause() {
+    // (case, the integration, the bounds the state declares, heartbeats sent before
+    // the window is let lapse)
+    let rows: [(&str, Integration, Value, usize); 5] = [
+        (
+            "a DynamoDB write whose TimeoutSeconds ran out",
+            Integration::PutItem,
+            json!({ "TimeoutSeconds": 1 }),
+            0,
+        ),
+        (
+            "a DynamoDB write whose heartbeat window lapsed",
+            Integration::PutItem,
+            json!({ "HeartbeatSeconds": 1 }),
+            0,
+        ),
+        (
+            "a heartbeat window that lapsed after one heartbeat restarted it",
+            Integration::PutItem,
+            json!({ "HeartbeatSeconds": 3 }),
+            1,
+        ),
+        (
+            "a nested execution whose TimeoutSeconds ran out",
+            Integration::StartExecution,
+            json!({ "TimeoutSeconds": 1 }),
+            0,
+        ),
+        (
+            "both bounds, the heartbeat window being the shorter",
+            Integration::StartExecution,
+            json!({ "TimeoutSeconds": 300, "HeartbeatSeconds": 1 }),
+            0,
+        ),
+    ];
+
+    let chain = Chain::new();
+    chain.create_table(TABLE).await;
+    let child_machine = chain
+        .create(
+            "lapse-child",
+            &serde_json::from_str::<Value>(CHILD).expect("the child definition is JSON"),
+        )
+        .await;
+
+    for (index, (case, integration, bounds, heartbeats)) in rows.into_iter().enumerate() {
+        let key = format!("lapse-{index}");
+        let machine = chain
+            .create(
+                &format!("lapse-{index}"),
+                &definition(integration, &key, &child_machine, &bounds),
+            )
+            .await;
+        let execution = chain.start(&machine, &key, &json!({})).await;
+        // The token really travelled, so what the clock closes below is a task the
+        // state handed out.
+        let token = delivered_token(&chain, case, integration, &key, &execution).await;
+        for _ in 0..heartbeats {
+            chain
+                .sfn("SendTaskHeartbeat", &json!({ "taskToken": token }))
+                .await;
+        }
+
+        let settled = reported_as(&chain, case, &execution, "FAILED").await;
+        assert_eq!(
+            settled.get("error").and_then(Value::as_str),
+            Some(TIMEOUT_ERROR),
+            "case {case:?}: expected {TIMEOUT_ERROR}, got {settled:?}"
+        );
+        assert!(
+            settled.get("cause").is_none_or(Value::is_null),
+            "case {case:?}: expected no cause beside the error name, got {settled:?}"
+        );
+
+        // The event that records the closure is there, and the terminal event reports it
+        // the same way the execution does: the error name, and no cause.
+        let present = event_types(&chain, &execution).await;
+        assert!(
+            present.iter().any(|event| event == EVENT_TASK_TIMED_OUT),
+            "case {case:?}: expected a {EVENT_TASK_TIMED_OUT} event, got {present:?}"
+        );
+        let failed = events(&chain, &execution)
+            .await
+            .into_iter()
+            .find(|event| {
+                event.get("type").and_then(Value::as_str) == Some(EVENT_EXECUTION_FAILED)
+            })
+            .unwrap_or_else(|| panic!("case {case:?}: expected a {EVENT_EXECUTION_FAILED} event"));
+        let details = failed
+            .get("executionFailedEventDetails")
+            .unwrap_or_else(|| panic!("case {case:?}: expected the failure's details on {failed:?}"));
+        assert_eq!(
+            details.get("error").and_then(Value::as_str),
+            Some(TIMEOUT_ERROR),
+            "case {case:?}: expected the terminal event to carry {TIMEOUT_ERROR}, got {details:?}"
+        );
+        assert!(
+            details.get("cause").is_none_or(Value::is_null),
+            "case {case:?}: expected the terminal event to carry no cause, got {details:?}"
         );
     }
 }

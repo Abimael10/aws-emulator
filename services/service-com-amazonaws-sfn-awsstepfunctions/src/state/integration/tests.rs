@@ -785,6 +785,69 @@ fn a_call_that_does_not_answer_inside_its_bound_times_the_task_out() {
     );
 }
 
+/// What a state REPORTS for one of this module's failures: the error name the work
+/// answered with the cause it gave — and, for a BOUND that ran out, the error name
+/// ALONE.
+///
+/// RULE: a span that simply elapsed has no explanation to carry (nobody answered), so
+/// the language's timeout name is the whole report and the optional `cause` member is
+/// absent; every OTHER failure of this module carries exactly what it stated, because
+/// something did say why. The conversion is one function
+/// ([`super::super::asl::reported`]), so a `Task` state's own call, the poll of a job a
+/// task parked at and a `Map` state's dataset reads cannot report one closure three
+/// ways.
+///
+/// The rows span the failures this module raises: the bound a call was given running
+/// out, the two declines that make no call at all, and a refusal the invoked service
+/// itself answered.
+#[test]
+fn a_state_reports_this_modules_timeout_without_a_cause() {
+    let call = read("arn:aws:states:::dynamodb:putItem").expect("this names a call");
+    // (case, the failure this module raised, whether the state reports a cause)
+    let rows: [(&str, Failed, bool); 4] = [
+        (
+            "the bound the state's call was given, run out",
+            timed_out(&call, Duration::from_secs(5)),
+            false,
+        ),
+        (
+            "a call the previous one has not come back from",
+            still_calling(&call),
+            true,
+        ),
+        (
+            "a chain already as deep as this emulator carries one",
+            too_deep(&call),
+            true,
+        ),
+        (
+            "a refusal the invoked service answered",
+            Failed {
+                error: "DynamoDb.AmazonDynamoDBException".to_string(),
+                cause: "the table is not there".to_string(),
+            },
+            true,
+        ),
+    ];
+
+    for (case, failed, carries_a_cause) in rows {
+        let stated = failed.clone();
+        let reported = super::super::asl::reported(failed);
+        assert_eq!(
+            reported.error.as_deref(),
+            Some(stated.error.as_str()),
+            "case {case:?}: expected the error the work answered, got {reported:?}"
+        );
+        assert_eq!(
+            reported.cause.as_deref(),
+            carries_a_cause.then_some(stated.cause.as_str()),
+            "case {case:?}: expected the cause {:?}, got {:?}",
+            carries_a_cause.then_some(stated.cause.as_str()),
+            reported.cause
+        );
+    }
+}
+
 /// The result of a request-response OPTIMIZED integration is the literal SDK
 /// response of the call: the operation's own members, plus the envelope the SDK
 /// puts that response's HTTP facts in, with every value read off the answer.

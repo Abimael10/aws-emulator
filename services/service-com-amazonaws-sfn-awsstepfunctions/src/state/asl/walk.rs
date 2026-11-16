@@ -193,10 +193,7 @@ impl Interpreter<'_> {
             // outcome of a run the definition already bounded.
             if self.past_timeout(at) {
                 return Branch {
-                    outcome: Err(Failure {
-                        error: Some(super::TIMEOUT_ERROR.to_string()),
-                        cause: None,
-                    }),
+                    outcome: Err(super::timed_out()),
                     end: at,
                     suspended: false,
                 };
@@ -2079,10 +2076,7 @@ impl Interpreter<'_> {
             // request goes anywhere — so the attempt that started closes as a failure
             // and no submission is claimed.
             if let Some(refused) = me.tasks.authorize(&call, &request) {
-                let failure = Failure {
-                    error: Some(refused.error),
-                    cause: Some(refused.cause),
-                };
+                let failure = super::reported(refused);
                 me.push_task_failure(name, &work, &failure, at);
                 return (Err(failure), at);
             }
@@ -2156,10 +2150,7 @@ impl Interpreter<'_> {
                         Err(failure) => Err(failure),
                     }
                 }
-                Err(Failed { error, cause }) => Err(Failure {
-                    error: Some(error),
-                    cause: Some(cause),
-                }),
+                Err(failed) => Err(super::reported(failed)),
             };
             // What the ANSWER to this attempt's token decided, for a callback task whose
             // token was answered while its call was in flight: it is the attempt's

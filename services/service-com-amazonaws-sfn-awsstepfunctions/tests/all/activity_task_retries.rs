@@ -49,6 +49,14 @@ use crate::state_machine_lifecycle::{
 /// Long enough that a one-second bound a scheduling state declared has run out.
 const PAST_A_ONE_SECOND_BOUND: Duration = Duration::from_millis(1_300);
 
+/// How long a poll waits for a status the clock owes before giving up — generous next
+/// to every bound the rows declare, because a poll waits for the CONDITION and never
+/// for this span.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(90);
+
+/// How long one poll pauses between looks.
+const POLL_PAUSE: Duration = Duration::from_millis(25);
+
 /// The error a worker reports in the rows that drive `SendTaskFailure`.
 const REPORTED_ERROR: &str = "WorkerSaidNo";
 
@@ -72,6 +80,30 @@ async fn outcome(emulator: &Emulator, execution_arn: &str) -> (String, String, S
             .to_string()
     };
     (member("status"), member("error"), member("cause"))
+}
+
+/// The `(status, error, cause)` of `execution_arn` once it reports `status`.
+///
+/// The wait is for the STATUS and not for a span: the bound the clock has to run out
+/// of, and the settle the outcome is owed after it, take as long as the host takes.
+async fn outcome_once(
+    emulator: &Emulator,
+    case: &str,
+    execution_arn: &str,
+    status: &str,
+) -> (String, String, String) {
+    let deadline = ::tokio::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let reported = outcome(emulator, execution_arn).await;
+        if reported.0 == status {
+            return reported;
+        }
+        assert!(
+            ::tokio::time::Instant::now() < deadline,
+            "case {case:?}: expected {execution_arn} to report {status}, got {reported:?}"
+        );
+        ::tokio::time::sleep(POLL_PAUSE).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -136,9 +168,7 @@ async fn an_unclaimed_activity_task_is_never_timed_out() {
             "case {case:?}: expected the just-claimed task to leave the execution {RUNNING}, got \
              {status:?} error {error:?} cause {cause:?}"
         );
-        std::thread::sleep(PAST_A_ONE_SECOND_BOUND);
-        std::thread::sleep(PAST_A_ONE_SECOND_BOUND);
-        let (status, error, cause) = outcome(&emulator, &execution).await;
+        let (status, error, cause) = outcome_once(&emulator, case, &execution, FAILED).await;
         assert_eq!(
             (status.as_str(), error.as_str()),
             (FAILED, TIMEOUT_ERROR),
@@ -146,8 +176,8 @@ async fn an_unclaimed_activity_task_is_never_timed_out() {
              of its bound, got {status:?} error {error:?} cause {cause:?}"
         );
         assert!(
-            !cause.is_empty(),
-            "case {case:?}: expected a cause saying which bound ran out, got {cause:?}"
+            cause.is_empty(),
+            "case {case:?}: expected no cause beside the error name, got {cause:?}"
         );
     }
 }
@@ -356,7 +386,8 @@ async fn a_failed_activity_task_is_retried_until_its_retrier_is_spent() {
     let emulator = Emulator::new();
 
     // (case, whether the clock fails the task, the Retry array, how many claims the
-    // whole run hands out, the error and cause the execution must end with)
+    // whole run hands out, the error and cause the execution must end with — a bound the
+    // clock ran out of reports its error name alone, so its row expects no cause)
     let cases: Vec<(&str, bool, Value, usize, &str, &str)> = vec![
         (
             "the clock, retried once",
@@ -471,27 +502,19 @@ async fn a_failed_activity_task_is_retried_until_its_retrier_is_spent() {
         );
 
         // The error that survives the retries is the task's own.
-        if !by_clock {
-            std::thread::sleep(PAST_THE_EXECUTION_DELAY);
-        }
-        let (status, seen_error, seen_cause) = outcome(&emulator, &execution).await;
+        let (status, seen_error, seen_cause) =
+            outcome_once(&emulator, case, &execution, FAILED).await;
         assert_eq!(
             (status.as_str(), seen_error.as_str()),
             (FAILED, error),
             "case {case:?}: expected {FAILED} with {error}, got {status:?} error {seen_error:?} \
              cause {seen_cause:?}"
         );
-        if !cause.is_empty() {
-            assert_eq!(
-                seen_cause, cause,
-                "case {case:?}: expected the cause the worker reported, got {seen_cause:?}"
-            );
-        } else {
-            assert!(
-                !seen_cause.is_empty(),
-                "case {case:?}: expected a cause saying what ran out, got {seen_cause:?}"
-            );
-        }
+        assert_eq!(
+            seen_cause, cause,
+            "case {case:?}: expected the cause {cause:?} — the one the worker reported, and none \
+             at all for a bound that ran out — got {seen_cause:?}"
+        );
         // Nothing is left queued for a worker once the state has failed.
         let (held, _) = queued_tasks(&emulator, &activity);
         assert_eq!(

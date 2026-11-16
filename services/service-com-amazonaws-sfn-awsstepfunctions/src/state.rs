@@ -1259,16 +1259,6 @@ impl ActivityTask {
         }
     }
 
-    /// Why the clock closes this task: its heartbeat window rather than the whole
-    /// task's timeout. Reads the same two instants [`ActivityTask::closes_at`] chose
-    /// between, so the reason cannot disagree with the instant.
-    fn closed_by_heartbeat(&self) -> bool {
-        match (self.heartbeat_due_at(), self.timeout_due_at()) {
-            (Some(heartbeat), Some(timeout)) => heartbeat <= timeout,
-            (heartbeat, _) => heartbeat.is_some(),
-        }
-    }
-
     /// The bytes this record would retain; see [`StateMachine::measure`].
     ///
     /// The `workerName` a later claim may write is RESERVED rather than counted (see

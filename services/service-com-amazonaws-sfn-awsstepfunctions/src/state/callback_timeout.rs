@@ -113,20 +113,20 @@ pub async fn continue_due<Eng: Send + Sync + 'static>(
         // itself.
         let claimed = {
             let mut store = state.lock();
-            let Some((task, due, cause)) = store.claim_timed_out_callback(now) else {
+            let Some((task, due)) = store.claim_timed_out_callback(now) else {
                 break;
             };
             let facts = Facts::read(&store, &task);
-            (task, due, cause, facts)
+            (task, due, facts)
         };
-        let (task, due, cause, facts) = claimed;
+        let (task, due, facts) = claimed;
         continued += 1;
         let Some(facts) = facts else {
             // The execution went while the claim was taken, or its state machine is no
             // longer there: there is nothing left to continue, and nothing to fail.
             continue;
         };
-        if !continue_one(engine, callback, &state, &task, due, cause, facts).await {
+        if !continue_one(engine, callback, &state, &task, due, facts).await {
             // Nothing could be continued from the claim, so the bound the clock reached
             // is the execution's failure after all — the same failure a state that
             // answers the timeout in neither way takes.
@@ -213,7 +213,6 @@ async fn continue_one<Eng: Send + Sync + 'static>(
     state: &::engine::ServiceState<super::ComAmazonawsSfnAwsstepfunctionsState>,
     task: &super::ActivityTask,
     due: SystemTime,
-    cause: String,
     facts: Facts,
 ) -> bool {
     let Facts {
@@ -233,11 +232,8 @@ async fn continue_one<Eng: Send + Sync + 'static>(
         // the state was really entered with.
         state_input: task.state_input.clone(),
         // The bound that ran out IS the task's outcome, under the name the language
-        // gives it, carrying why the clock closed it.
-        outcome: Err(asl::Failure {
-            error: Some(asl::TIMEOUT_ERROR.to_string()),
-            cause: Some(cause),
-        }),
+        // gives it and with nothing beside it ([`asl::timed_out`]).
+        outcome: Err(asl::timed_out()),
         // What this state's retriers have already spent, so the continuation takes that
         // budget up rather than restarting it.
         retries_taken: task.retries_taken.clone(),

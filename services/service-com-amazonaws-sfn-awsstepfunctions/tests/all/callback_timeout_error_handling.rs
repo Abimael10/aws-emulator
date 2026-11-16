@@ -418,14 +418,13 @@ async fn a_callback_bound_is_answered_by_the_states_own_error_handling() {
                 Some(TIMEOUT_ERROR),
                 "case {case:?}: expected the error output to name {TIMEOUT_ERROR}, got {output:?}"
             );
-            let carried = output
-                .get("Cause")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+            // The error output is the `{Error, Cause}` document of the failure the bound
+            // raised, and that failure carries no cause: the `Cause` member is absent
+            // from the document the catcher passes on, exactly as it is absent from the
+            // execution's own report.
             assert!(
-                carried.contains(WAITING_STATE),
-                "case {case:?}: expected the cause to name the state that timed out, got \
-                 {carried:?}"
+                output.get("Cause").is_none(),
+                "case {case:?}: expected the error output to carry no Cause, got {output:?}"
             );
         } else {
             assert_eq!(

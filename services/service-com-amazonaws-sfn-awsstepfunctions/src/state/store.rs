@@ -671,8 +671,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
 
     /// CLAIM the callback task whose bound the clock has made due and whose state
     /// answers that timeout itself, for the continuation that applies the state's own
-    /// error handling: the task as it stood, the instant its bound ran out, and why the
-    /// clock closed it.
+    /// error handling: the task as it stood, and the instant its bound ran out.
     ///
     /// The record is DISCARDED in the same critical section it is read in, so exactly
     /// one caller continues one timed-out task however many look at once — and the token
@@ -684,7 +683,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     pub fn claim_timed_out_callback(
         &mut self,
         now: SystemTime,
-    ) -> Option<(ActivityTask, SystemTime, String)> {
+    ) -> Option<(ActivityTask, SystemTime)> {
         let claimed = self.activity_tasks.values().find_map(|task| {
             let due = task.closes_at().filter(|due| *due <= now)?;
             let live = self
@@ -696,8 +695,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         });
         let (token, due) = claimed?;
         let task = self.discard_activity_task(&token)?;
-        let cause = task_timeout_cause(&task);
-        Some((task, due, cause))
+        Some((task, due))
     }
 
     /// Whether the task `token` names has run out of the time its state allowed it, so
@@ -726,7 +724,6 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// claim that could not be continued ([`super::callback_timeout`]), which owes the
     /// same failure this store's own settle records.
     pub fn fail_timed_out_task(&mut self, task: &ActivityTask, due: SystemTime) {
-        let cause = task_timeout_cause(task);
         // The event the language names this closure with is the one for the kind of
         // work that ran out of time: an activity's task times out as an activity,
         // while a callback task's work is the `Task` state's own integration.
@@ -745,7 +742,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         execution.status = EXECUTION_STATUS_FAILED.to_string();
         execution.stop_date = Some(due);
         execution.error = Some(TASK_TIMEOUT_ERROR.to_string());
-        execution.cause = Some(cause);
+        // A bound that ran out is reported by its ERROR NAME alone: nobody answered, so
+        // the optional cause member carries nothing ([`asl::timed_out`]).
+        execution.cause = None;
         // The attempt stopped AT this task's state, so that is the step a later
         // redrive continues from — the same step a worker's reported failure leaves.
         execution.redrive_step = Some(asl::RedriveStep {
@@ -1052,7 +1051,6 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         let Some(task) = self.discard_job_task(execution_arn) else {
             return;
         };
-        let cause = job_task_timeout_cause(&task);
         let Some(execution) = self.executions.get_mut(execution_arn) else {
             return;
         };
@@ -1064,7 +1062,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         execution.status = EXECUTION_STATUS_FAILED.to_string();
         execution.stop_date = Some(due);
         execution.error = Some(TASK_TIMEOUT_ERROR.to_string());
-        execution.cause = Some(cause);
+        // The bound that ran out is the whole of what this failure reports
+        // ([`asl::timed_out`]).
+        execution.cause = None;
         // The attempt stopped AT the state that started the job, so that is the step a
         // later redrive continues from — the same step a failed task leaves.
         execution.redrive_step = Some(asl::RedriveStep {
@@ -3039,58 +3039,6 @@ fn newest_first(left: &Execution, right: &Execution) -> std::cmp::Ordering {
         .cmp(&left_key)
         .then_with(|| right.start_date.cmp(&left.start_date))
         .then_with(|| left.arn.cmp(&right.arn))
-}
-
-/// Why the clock closed an outstanding task, for the `cause` the execution it failed
-/// reports.
-///
-/// The error NAME is the language's own ([`TASK_TIMEOUT_ERROR`]); this says which of
-/// the scheduling state's two bounds ran out, what that bound was, and what the state
-/// was waiting for — a worker's reply to an activity task, or the answer to the token
-/// its callback integration handed out. All of it is built from the definition rather
-/// than from any one request.
-fn task_timeout_cause(task: &ActivityTask) -> String {
-    let waited_for = match task.activity_arn {
-        Some(_) => "its activity task",
-        None => "its task token",
-    };
-    if task.closed_by_heartbeat() {
-        let seconds = task.heartbeat_seconds.unwrap_or_default();
-        return format!(
-            "state '{}' sent no heartbeat for {waited_for} within the {seconds} seconds its \
-             'HeartbeatSeconds' allows",
-            task.state_name
-        );
-    }
-    let seconds = task.timeout_seconds.unwrap_or_default();
-    format!(
-        "state '{}' ran {waited_for} for longer than the {seconds} seconds its \
-         'TimeoutSeconds' allows",
-        task.state_name
-    )
-}
-
-/// Why the task that started a parked job ran out of time, for the `cause` the
-/// execution it failed reports.
-///
-/// The error NAME is the language's own ([`TASK_TIMEOUT_ERROR`]); this says which
-/// span ran out — the state's own `TimeoutSeconds` where it declares one, else how
-/// long this emulator polls one job for — and how long that span was.
-fn job_task_timeout_cause(task: &JobTask) -> String {
-    match task.timeout_seconds {
-        Some(seconds) => format!(
-            "state '{}' ran the '{}' job it started for longer than the {seconds} seconds its \
-             'TimeoutSeconds' allows",
-            task.state_name, task.job.starts
-        ),
-        None => format!(
-            "state '{}' ran the '{}' job it started for longer than the {} seconds this emulator \
-             waits for one to finish",
-            task.state_name,
-            task.job.starts,
-            MAX_PARKED_JOB_DURATION.as_secs()
-        ),
-    }
 }
 
 /// What stopping an execution left: the `stopDate` it carries, and the job it was

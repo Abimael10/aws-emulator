@@ -53,6 +53,38 @@ const MAX_TASK_TOKEN_CHARS: usize = 2048;
 /// Long enough that a one-second bound the scheduling state declared has run out.
 const PAST_A_ONE_SECOND_BOUND: Duration = Duration::from_millis(1_300);
 
+/// How long a poll waits for a status the clock owes before giving up — generous next
+/// to the bounds the rows below declare, because what a poll waits for is the
+/// CONDITION and never this span.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(90);
+
+/// How long one poll pauses between looks.
+const POLL_PAUSE: Duration = Duration::from_millis(25);
+
+/// Describe `execution_arn` until it reports `status`, and answer what it then says.
+///
+/// The wait is for the STATUS and not for a span: the bound the clock has to run out
+/// of, and the settle the outcome is owed after it, take as long as the host takes.
+async fn reported_as(
+    emulator: &Emulator,
+    case: &str,
+    execution_arn: &str,
+    status: &str,
+) -> Value {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let described = describe_execution(emulator, execution_arn).await;
+        if described.get("status").and_then(Value::as_str) == Some(status) {
+            return described;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected {execution_arn} to report {status}, got {described:?}"
+        );
+        ::tokio::time::sleep(POLL_PAUSE).await;
+    }
+}
+
 /// The ARN an activity of `name` carries in the region every request here signs for.
 ///
 /// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so the suite
@@ -560,24 +592,15 @@ async fn a_bound_the_state_declared_closes_the_task_and_fails_the_execution() {
             claimed(&emulator, case, &activity, Some("w-1")).await;
         }
 
-        std::thread::sleep(PAST_A_ONE_SECOND_BOUND);
-        let described = describe_execution(&emulator, &execution).await;
-        assert_eq!(
-            described.get("status").and_then(Value::as_str),
-            Some("FAILED"),
-            "case {case:?}: expected the execution to have failed, got {described:?}"
-        );
+        let described = reported_as(&emulator, case, &execution, "FAILED").await;
         assert_eq!(
             described.get("error").and_then(Value::as_str),
             Some(TIMEOUT_ERROR),
             "case {case:?}: expected the error {TIMEOUT_ERROR}, got {described:?}"
         );
         assert!(
-            described
-                .get("cause")
-                .and_then(Value::as_str)
-                .is_some_and(|cause| !cause.is_empty()),
-            "case {case:?}: expected a cause saying which bound ran out, got {described:?}"
+            described.get("cause").is_none_or(Value::is_null),
+            "case {case:?}: expected no cause beside the error name, got {described:?}"
         );
         // The task went with it: there is nothing left for a worker to be handed.
         let (held, _) = queued_tasks(&emulator, &activity);

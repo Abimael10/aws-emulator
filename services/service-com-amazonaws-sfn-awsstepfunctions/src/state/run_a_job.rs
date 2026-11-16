@@ -135,10 +135,7 @@ async fn poll<Eng: Send + Sync + 'static>(
                     resource,
                 )
             })
-            .map(|refused| asl::Failure {
-                error: Some(refused.error),
-                cause: Some(refused.cause),
-            });
+            .map(asl::reported);
         if let Some(refusal) = denied {
             resolve(engine, callback, depth, execution_arn, &task, Err(refusal)).await;
             continue;
@@ -160,11 +157,11 @@ async fn poll<Eng: Send + Sync + 'static>(
             },
             // The call that reports the job was refused, or could not be made at all:
             // what the job is doing cannot be known, so the task fails with what the
-            // service answered rather than with a status nothing reported.
-            Err(integration::Failed { error, cause }) => Err(asl::Failure {
-                error: Some(error),
-                cause: Some(cause),
-            }),
+            // service answered rather than with a status nothing reported — converted
+            // the one way this service converts what a call answered
+            // ([`asl::reported`]), so a bound that ran out is reported by its error
+            // name alone here too.
+            Err(failed) => Err(asl::reported(failed)),
         };
 
         // Resolved: the continuation of this execution is interpreted and recorded.

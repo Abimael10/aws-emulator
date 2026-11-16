@@ -168,7 +168,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Map, Value};
 use serde_json_path::JsonPath;
 
-use super::integration::{Failed, Tasks, TASK_FAILED_ERROR};
+use super::integration::{Tasks, TASK_FAILED_ERROR};
 
 mod diagnose;
 mod echo;
@@ -1771,13 +1771,43 @@ fn named(error: &str, cause: String) -> Failure {
     }
 }
 
+/// What a time bound that simply RAN OUT reports: [`TIMEOUT_ERROR`] and NOTHING
+/// beside it.
+///
+/// "If the task runs longer than the specified seconds, this state fails with a
+/// States.Timeout error name" — the error NAME is the whole report. `cause` is an
+/// optional member of everything that projects a failure (the `SensitiveCause` on
+/// `DescribeExecution`'s output, on a `TaskTimedOut`/`ActivityTimedOut` event's details
+/// and on the `{Error, Cause}` document a `Catch` hands the state it transitions to),
+/// and a span that elapsed leaves nothing to put in it: nobody answered, so there is no
+/// payload to report. This is the ONE place that says so, for every bound this service
+/// runs out of — a state's `TimeoutSeconds` or `HeartbeatSeconds` over an activity
+/// task, over a callback (`.waitForTaskToken`) token or over a job a task parked at,
+/// the call a state waited for, and the definition's own `TimeoutSeconds` over the
+/// whole run — so no two of them report one closure differently.
+pub fn timed_out() -> Failure {
+    Failure {
+        error: Some(TIMEOUT_ERROR.to_string()),
+        cause: None,
+    }
+}
+
 /// What a state REPORTS for work outside the walk that failed: the error name and the
 /// cause that work answered, which is what `Retry` and `Catch` are matched against.
 ///
 /// The one conversion between the two halves of a failure — what a call or a read
 /// answered ([`super::integration::Failed`]) and what a state reports ([`Failure`]) —
-/// so neither side restates the other's shape.
-fn reported(failed: super::integration::Failed) -> Failure {
+/// so neither side restates the other's shape. `pub(super)`, so the work this service
+/// reports OUTSIDE a walk goes through it too: the poll of a job a task parked at
+/// ([`super::run_a_job`]) converts what its own call answered exactly as the walk
+/// converts what a task's call answered.
+pub(super) fn reported(failed: super::integration::Failed) -> Failure {
+    // A call that did not answer inside the bound its state allowed it ran out of time
+    // like every other bound, and is reported like every other one: the error name
+    // alone ([`timed_out`]).
+    if failed.error == TIMEOUT_ERROR {
+        return timed_out();
+    }
     Failure {
         error: Some(failed.error),
         cause: Some(failed.cause),

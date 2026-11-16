@@ -289,7 +289,8 @@ async fn an_activity_tasks_events_carry_what_the_task_carried() {
 }
 
 /// A task the clock closed writes the failure it closed with, and the execution's
-/// terminal event carries the same error and cause the record reports.
+/// terminal event carries the same error — which, for a bound that ran out, is the
+/// whole of what either event reports.
 #[tokio::test]
 async fn a_timed_out_task_writes_the_failure_it_closed_with() {
     let emulator = Emulator::new();
@@ -301,9 +302,26 @@ async fn a_timed_out_task_writes_the_failure_it_closed_with() {
 
     let case = "an activity task the clock closed";
     claimed(&emulator, case, &activity, Some("worker-1")).await;
-    std::thread::sleep(std::time::Duration::from_millis(1_300));
 
-    let events = history(&emulator, &execution, json!({})).await;
+    // The bound the clock has to run out of takes as long as the host takes, so the
+    // wait is for the EVENT the closure writes and never for a span of its own.
+    let events = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            let events = history(&emulator, &execution, json!({})).await;
+            if events
+                .iter()
+                .any(|event| event.get("type").and_then(Value::as_str) == Some("ExecutionFailed"))
+            {
+                break events;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "case {case:?}: expected the closure to be recorded, got {events:?}"
+            );
+            ::tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    };
     let timed_out = only(&events, case, "ActivityTimedOut");
     let details = timed_out
         .get("activityTimedOutEventDetails")
@@ -314,11 +332,8 @@ async fn a_timed_out_task_writes_the_failure_it_closed_with() {
         "case {case:?}: expected the language's own timeout error, got {details:?}"
     );
     assert!(
-        details
-            .get("cause")
-            .and_then(Value::as_str)
-            .is_some_and(|cause| cause.contains("TimeoutSeconds")),
-        "case {case:?}: expected a cause naming the bound that ran out, got {details:?}"
+        details.get("cause").is_none_or(Value::is_null),
+        "case {case:?}: expected no cause beside the error name, got {details:?}"
     );
     let failed = only(&events, case, "ExecutionFailed");
     assert_eq!(
@@ -328,6 +343,13 @@ async fn a_timed_out_task_writes_the_failure_it_closed_with() {
             .and_then(Value::as_str),
         Some("States.Timeout"),
         "case {case:?}: expected the terminal event to carry the same error, got {failed:?}"
+    );
+    assert!(
+        failed
+            .get("executionFailedEventDetails")
+            .and_then(|details| details.get("cause"))
+            .is_none_or(Value::is_null),
+        "case {case:?}: expected the terminal event to carry no cause either, got {failed:?}"
     );
 }
 
