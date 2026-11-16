@@ -87,6 +87,8 @@ mod deployment_pagination;
 mod deployment_stage_release;
 #[path = "all/disabled_execute_api_endpoint.rs"]
 mod disabled_execute_api_endpoint;
+#[path = "all/disabled_execute_api_endpoint_backend.rs"]
+mod disabled_execute_api_endpoint_backend;
 #[path = "all/domain_name_deletion.rs"]
 mod domain_name_deletion;
 #[path = "all/domain_name_deletion_identity.rs"]
@@ -151,6 +153,8 @@ mod http_api_stage_metrics;
 mod http_api_step_functions_subtype;
 #[path = "all/http_api_throttle_burst.rs"]
 mod http_api_throttle_burst;
+#[path = "all/http_api_undeployed_stage.rs"]
+mod http_api_undeployed_stage;
 #[path = "all/integration_deletion.rs"]
 mod integration_deletion;
 #[path = "all/integration_lifecycle.rs"]

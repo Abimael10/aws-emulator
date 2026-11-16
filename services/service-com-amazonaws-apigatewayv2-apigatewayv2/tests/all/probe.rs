@@ -384,8 +384,9 @@ async fn an_announced_endpoint_is_claimed_in_every_state_of_the_api() {
     assert_eq!(status, 201, "CreateStage must answer 201, got {status} {stage}");
     let answer = send(&emulator, &host, "GET", "/orders", &[]).await;
     assert_eq!(
-        answer.status, FORBIDDEN,
-        "a stage with no deployment serves nothing, got {}",
+        answer.status, NOT_FOUND,
+        "a stage with no deployment is not callable, so the endpoint has nothing at that \
+         address, got {}",
         answer.summary()
     );
 

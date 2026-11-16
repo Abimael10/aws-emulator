@@ -9,10 +9,10 @@
 //!
 //! > Every status an `execute-api` invoke is answered with is computed from the api's own
 //! > stored records and names the fault class it met, never the emulator's scaffold channel
-//! > and never a success no backend produced: a stage with no deployment released to it
-//! > serves nothing and is `403` `{"message":"Forbidden"}`; a path naming no stage of the api,
-//! > and a method and path no route key of the api matches, name nothing the endpoint has and
-//! > are `404` `{"message":"Not Found"}`; and a matched route whose integration produced no
+//! > and never a success no backend produced: a stage with no deployment released to it is not
+//! > callable, a path naming no stage of the api, and a method and path no route key of the
+//! > api matches, all name nothing the endpoint has and are `404` `{"message":"Not Found"}`;
+//! > and a matched route whose integration produced no
 //! > response is `500` `{"message":"Internal Server Error"}`, the status an HTTP api maps an
 //! > integration fault to, whatever that integration's `TimeoutInMillis`,
 //! > `PayloadFormatVersion` or target is.
@@ -60,12 +60,9 @@ const ROOT_STAGE: &str = "$default";
 const INTEGRATION_FAULT: u16 = 500;
 const INTEGRATION_FAULT_MESSAGE: &str = "Internal Server Error";
 
-/// The status and sentence for an endpoint that serves nothing: an api or stage this
-/// endpoint does not serve, and a stage with no deployment released to it.
-const FORBIDDEN: u16 = 403;
-const FORBIDDEN_MESSAGE: &str = "Forbidden";
-
-/// The status and sentence for a method and path no route key of the api matches.
+/// The status and sentence for a request a served endpoint has nothing at: a path naming no
+/// stage of the api, a stage with no deployment released to it, and a method and path no
+/// route key of the api matches.
 const NOT_FOUND: u16 = 404;
 const NOT_FOUND_MESSAGE: &str = "Not Found";
 
@@ -378,13 +375,13 @@ struct ClassRow {
 fn class_rows() -> &'static [ClassRow] {
     &[
         ClassRow {
-            case: "a stage with no deployment released to it serves nothing",
+            case: "a stage with no deployment released to it is not callable",
             stage: || json!({ "stageName": ROOT_STAGE }),
             route_keys: &["GET /x"],
             method: "GET",
             request_path: "/x",
-            status: FORBIDDEN,
-            message: FORBIDDEN_MESSAGE,
+            status: NOT_FOUND,
+            message: NOT_FOUND_MESSAGE,
         },
         ClassRow {
             case: "a path naming no stage of the api, where the api has no root stage",
@@ -434,9 +431,9 @@ fn class_rows() -> &'static [ClassRow] {
     ]
 }
 
-/// The classes that are decided BEFORE the integration: an endpoint that serves nothing is
-/// `403`, and a request no route key matches is `404` — each computed from the api's own
-/// records, and neither of them the integration's `500`.
+/// The classes that are decided BEFORE the integration: a request the endpoint has nothing
+/// for — no stage, no deployment on the stage it named, or no route key matching it — is
+/// `404`, computed from the api's own records, and none of them the integration's `500`.
 #[tokio::test]
 async fn an_endpoint_that_serves_nothing_and_an_unmatched_request_name_their_own_class() {
     for row in class_rows() {

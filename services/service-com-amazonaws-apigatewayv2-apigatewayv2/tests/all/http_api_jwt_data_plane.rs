@@ -1123,8 +1123,8 @@ async fn what_the_invoke_endpoint_answers_before_any_route_is_reached() {
         answered(case, &answer, status, body);
     }
 
-    // A stage with no deployment released to it serves nothing: `403`, the answer an
-    // `execute-api` endpoint gives for an api it does not serve.
+    // A stage with no deployment released to it is not callable, so the endpoint has nothing
+    // at that address: `404`, the same answer a path naming no stage of the api earns.
     let (status, stage) = call(
         &emulator,
         "POST",
@@ -1140,8 +1140,8 @@ async fn what_the_invoke_endpoint_answers_before_any_route_is_reached() {
     answered(
         "a stage with no deployment released to it",
         &answer,
-        FORBIDDEN,
-        FORBIDDEN_MESSAGE,
+        NOT_FOUND,
+        NOT_FOUND_MESSAGE,
     );
 }
 

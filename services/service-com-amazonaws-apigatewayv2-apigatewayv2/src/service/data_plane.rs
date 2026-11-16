@@ -59,8 +59,11 @@ pub const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 /// emulator or of the api's configuration, never of the caller.
 pub const UNPLACEABLE_STATUS: u16 = 500;
 
-/// The sentence API Gateway's `execute-api` endpoint answers for an api id it does not
-/// serve and for a stage with no deployment: `403` `{"message":"Forbidden"}`.
+/// The sentence every refusal this service makes about the CALLER'S ADMISSION carries: `403`
+/// `{"message":"Forbidden"}`. The classes that word it that way are a call whose credential or
+/// authorization did not admit it, a request to a domain or portal publication that serves it
+/// nothing, and an RFC 6455 opening handshake a WEBSOCKET api's endpoint serves no api or stage
+/// for. A request an HTTP api's endpoint simply has nothing for is [`not_found`] instead.
 pub const FORBIDDEN_MESSAGE: &str = "Forbidden";
 
 /// The status that sentence is answered with.
@@ -141,10 +144,11 @@ pub fn forbidden() -> RtResponse {
 
 /// `404` `{"message":"Not Found"}` — the answer an HTTP api's `execute-api` endpoint gives
 /// for a request it has nothing for: an endpoint whose api id it serves no api of, an api
-/// whose default endpoint is turned off ([`serves_default_endpoint`]), and a method and path
-/// no route of a served stage matches. One function for all three, because they are one fact
-/// to the client — this endpoint serves nothing at that address — and must not be
-/// distinguishable from each other.
+/// whose default endpoint is turned off ([`serves_default_endpoint`]), a path naming no stage
+/// of the api, a stage with no deployment released to it, and a method and path no route of a
+/// served stage matches. One function for all of them, because they are one fact to the
+/// client — this endpoint serves nothing at that address — and must not be distinguishable
+/// from each other.
 pub fn not_found() -> RtResponse {
     json_response(NOT_FOUND_STATUS, NOT_FOUND_MESSAGE, None)
 }

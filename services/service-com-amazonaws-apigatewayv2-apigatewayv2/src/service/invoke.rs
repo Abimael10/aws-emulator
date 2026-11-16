@@ -53,9 +53,11 @@
 //!    "typically" of `Api$ApiEndpoint`. A path naming no stage of the api names nothing this
 //!    endpoint has, so it is `404` `{"message":"Not Found"}` — which is what a stage stops
 //!    serving with once it is deleted;
-//! 3. that stage has a deployment released to it. A stage with none is `403`
-//!    `{"message":"Forbidden"}`, the answer an `execute-api` endpoint gives for a stage it
-//!    has nothing to serve for;
+//! 3. that stage has a deployment released to it — "a Deployment must be associated with a
+//!    Stage for it to be callable over the internet" (`Deployment`). A stage with none holds
+//!    nothing this endpoint can serve, exactly like a path naming no stage at all, so it is
+//!    `404` `{"message":"Not Found"}` ([`not_found`]) and not a refusal about the caller's
+//!    credential;
 //! 4. the method and the remaining path match a `Route` of the api, most specific match
 //!    first ([`matching_route`]); nothing matching is `404` `{"message":"Not Found"}`;
 //! 5. that route's `AuthorizationType` is applied BEFORE anything the route fronts
@@ -1034,7 +1036,13 @@ fn resolve_answer(
             stage = %stage.stage_name,
             "the request names a stage with no deployment released to it"
         );
-        return Answer::Now(Box::new(forbidden()));
+        // A stage with no deployment is "not callable" at all, so what the endpoint has at
+        // that address is nothing — the same fact as a path naming no stage of the api and a
+        // path no route matches, and so the same `404` `{"message":"Not Found"}`. The
+        // `403` `{"message":"Forbidden"}` beside it is the gateway's answer for a caller
+        // whose CREDENTIAL did not admit the call, which is a different class and must stay
+        // distinguishable from this one.
+        return Answer::Now(Box::new(not_found()));
     };
     // The route the request is served by, which is also what decides whether the api's own
     // configuration answers a PREFLIGHT: route matching comes first, and the gateway
