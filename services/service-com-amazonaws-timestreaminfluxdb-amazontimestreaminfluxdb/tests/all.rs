@@ -23,6 +23,8 @@ mod db_cluster_lifecycle;
 mod db_cluster_marketplace_subscription;
 #[path = "all/db_instance_lifecycle.rs"]
 mod db_instance_lifecycle;
+#[path = "all/db_instance_not_found.rs"]
+mod db_instance_not_found;
 #[path = "all/db_instance_reboot.rs"]
 mod db_instance_reboot;
 #[path = "all/db_instance_restore_round_trip.rs"]

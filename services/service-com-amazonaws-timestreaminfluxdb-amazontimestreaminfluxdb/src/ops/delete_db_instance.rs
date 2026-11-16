@@ -225,11 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         let Some(mut record) = state.db_instances.remove(&input.identifier) else {
             return Err(DeleteDbInstanceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("DB instance {} not found", input.identifier),
-                    resource_id: input.identifier.clone(),
-                    resource_type: st::RESOURCE_TYPE_DB_INSTANCE.to_string(),
-                },
+                st::db_instance_not_found(&input.identifier),
             )
             .into());
         };

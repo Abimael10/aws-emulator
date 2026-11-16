@@ -15,7 +15,7 @@ use crate::ops::types::{
     ConflictException, DbBackupConfiguration, DbBackupConfigurationOutput, DbInstanceSummary,
     DbParameterGroupSummary, InfluxDBv2Parameters, InfluxDBv3CoreParameters,
     InfluxDBv3EnterpriseParameters, LogDeliveryConfiguration, MaintenanceSchedule, Parameters,
-    ValidationException,
+    ResourceNotFoundException, ValidationException,
 };
 
 /// The DB-backup records and the helpers the backup operations share. A backup is a
@@ -131,6 +131,25 @@ pub fn name_already_exists(
         ),
         resource_id: existing_id.to_string(),
         resource_type: resource.resource_type.to_string(),
+    }
+}
+
+/// The refusal every call aimed at a single DB instance gets when the `identifier` it
+/// names resolves to no record this account and Region holds — an id nothing ever minted
+/// just as much as one whose instance a delete has already removed, since a removed record
+/// resolves to nothing either way.
+///
+/// The sentence is the whole fixed text this service answers a DB-instance lookup miss
+/// with: it names no id, no name and no time, so nothing in it is interpolated from the
+/// request or from state. The `resourceId` and `resourceType` members the model marks
+/// required on `ResourceNotFoundException` carry the identifier the request asked for and
+/// the DB-instance resource type.
+#[must_use]
+pub fn db_instance_not_found(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: "The DB instance with db id does not exist".to_string(),
+        resource_id: identifier.to_string(),
+        resource_type: RESOURCE_TYPE_DB_INSTANCE.to_string(),
     }
 }
 
