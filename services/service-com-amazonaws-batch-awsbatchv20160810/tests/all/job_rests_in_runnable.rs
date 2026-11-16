@@ -100,9 +100,10 @@ fn assert_nothing_ran(case: &str, detail: &Value) {
             "case {case}: a job nothing ran reports no {member}, got {detail}"
         );
     }
-    assert!(
-        detail["attempts"].is_null(),
-        "case {case}: no attempt is invented for a job nothing placed, got {detail}"
+    assert_eq!(
+        detail["attempts"].as_array().map(Vec::len),
+        Some(0),
+        "case {case}: a job nothing placed reports its attempts as the empty list, got {detail}"
     );
     assert!(
         detail["container"]["exitCode"].is_null(),

@@ -33,6 +33,8 @@ mod consumable_resource_update_concurrency;
 mod consumable_resource_updates;
 #[path = "all/consumable_resources.rs"]
 mod consumable_resources;
+#[path = "all/described_empty_collections.rs"]
+mod described_empty_collections;
 #[path = "all/enum_membership_refusals.rs"]
 mod enum_membership_refusals;
 #[path = "all/fargate_job_definition_contract.rs"]

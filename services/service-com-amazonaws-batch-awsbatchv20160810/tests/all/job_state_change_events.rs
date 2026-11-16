@@ -512,14 +512,15 @@ async fn every_job_state_change_is_published_to_the_matching_rule_only() {
             "case {case}: no container ran, so attempts must be empty, got {:?}",
             last.detail["attempts"]
         );
-        // A DELIBERATE difference between the two projections, pinned here so it
-        // cannot drift unnoticed: the event detail carries `attempts` present and
-        // empty (the "AWS Batch events" sample event shows `"attempts": []`), while
-        // `JobDetail` leaves the member out for a job with no attempt — which that
-        // operation's own suite pins.
-        assert!(
-            reported.get("attempts").is_none(),
-            "case {case}: DescribeJobs reports no attempts for a job nothing ran, got {detail:?}"
+        // The two projections AGREE on it, which is what this pins: the event detail
+        // carries `attempts` present and empty (the "AWS Batch events" sample event shows
+        // `"attempts": []`), and so does the `JobDetail` the reader reports for a job no
+        // placement has taken.
+        assert_eq!(
+            reported.get("attempts"),
+            Some(&json!([])),
+            "case {case}: DescribeJobs reports the empty attempts list for a job nothing \
+             ran, got {detail:?}"
         );
         assert_eq!(
             last.detail["container"]["image"],

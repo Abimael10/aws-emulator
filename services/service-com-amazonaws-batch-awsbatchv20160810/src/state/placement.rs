@@ -21,7 +21,8 @@
 //! attempt receives a task ARN when they reach the `STARTING` status" — so every placement
 //! records one [`JobAttempt`] carrying that ARN, and `JobDetail$attempts` ("a list of job
 //! attempts that are associated with this job") reports them in order. A job nothing has
-//! placed has had no attempt, so it reports none.
+//! placed has had no attempt, so the list it reports is EMPTY — present, because an empty
+//! list is what "nothing has run yet" looks like, and a missing member is not that answer.
 //!
 //! What a placed job can report of the RUN is where the engine contract binds
 //! (`vendor/engine/src/lib.rs`): containers are not available in-process, so the attempt a

@@ -219,7 +219,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 state: Some(environment.state),
                 status: Some(environment.status),
                 status_reason: environment.status_reason,
-                compute_resources: environment.compute_resources,
+                // Always materialised: the modelled collections of the compute resources
+                // are reported present and EMPTY where the environment holds nothing in
+                // them — a Fargate environment's EC2-only lists, for one — never with the
+                // member missing ([`batch::described_compute_resource`]).
+                compute_resources: environment
+                    .compute_resources
+                    .as_ref()
+                    .map(batch::described_compute_resource),
                 service_role: environment.service_role,
                 // The infrastructure update policy the last `UpdateComputeEnvironment`
                 // set, which AWS Batch reports back here; `None` until one sets it.

@@ -13,7 +13,9 @@
 //! The projection lives here, once, because every reader of a stored revision owes the
 //! same document: the maps the definition itself carries (`parameters`, `tags`) and every
 //! list member of each `ContainerProperties` object it carries — its own lists and those of
-//! the structures it nests — wherever it carries it.
+//! the structures it nests — wherever it carries it. The rule it applies is the one the
+//! read projection beside it states for every document this service describes, and it
+//! materialises each list through that module's helper.
 //! Nothing is invented by it — an empty collection says exactly what the sparse member
 //! said — and nothing is written: it projects a CLONE of the stored record.
 //!
@@ -133,12 +135,5 @@ fn materialize_container_collections(container: &mut ContainerProperties) {
         for mount in parameters.tmpfs.iter_mut().flatten() {
             materialize_list(&mut mount.mount_options);
         }
-    }
-}
-
-/// One list member, reported as the empty list when nothing was supplied for it.
-fn materialize_list<T>(member: &mut Option<Vec<T>>) {
-    if member.is_none() {
-        *member = Some(Vec::new());
     }
 }

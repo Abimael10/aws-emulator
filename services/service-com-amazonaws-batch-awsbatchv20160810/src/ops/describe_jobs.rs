@@ -23,11 +23,19 @@
 //! `AttemptDetail` per time the scheduler PLACED this job's container, read off the
 //! record the placement wrote ([`crate::state::JobAttempt`]), so the attempt reports the
 //! ARN of the task the job was placed as, the log stream that task's container writes to
-//! and the reason that attempt ended. The member is absent for a job no placement has
-//! started an attempt for. No `startedAt` or `exitCode` is reported for any of them: this
+//! and the reason that attempt ended. The member is ALWAYS reported: a job no placement has
+//! started an attempt for has had none, and that is the EMPTY list — the evidence that
+//! nothing has run yet — never a missing member. No `startedAt` or `exitCode` is reported
+//! for any of them: this
 //! emulator has no container runtime, nothing ran, and the engine contract forbids
 //! inventing a result for work that did not happen. The run ends in the modelled `FAILED`
 //! status whose `statusReason` says exactly that.
+//!
+//! The same holds for every other collection of the document: `attempts`, `dependsOn`,
+//! `parameters` and `tags` are materialised, so a client that indexes a modelled collection
+//! of a described job never has to guard against a member that is not there — the same
+//! members the `Batch Job State Change` detail materialises, which AWS documents as the
+//! job's details "in the same form as the `DescribeJobs` API returns them".
 //!
 //! `JobDetail$startedAt` is a KNOWN DEPARTURE forced by the model: it is `@required`
 //! (`smithy_query(query="shape",shape="JobDetail")`), so a value is always serialized,
@@ -205,18 +213,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     share_identifier: job.share_identifier.clone(),
                     scheduling_priority: job.scheduling_priority,
                     // "A list of job attempts that are associated with this job"
-                    // (`JobDetail$attempts`): one entry per placement this job has had,
-                    // and the member absent for a job that has had none.
-                    attempts: (!job.attempts.is_empty()).then(|| {
-                        job.attempts.iter().map(batch::JobAttempt::detail).collect()
-                    }),
+                    // (`JobDetail$attempts`): one entry per placement this job has had, and
+                    // ALWAYS present — a job no placement has started an attempt for has
+                    // had none, which is the EMPTY list, not a missing member. The empty
+                    // list is the evidence that nothing has run yet, and it is what the
+                    // `Batch Job State Change` event for such a job carries too.
+                    attempts: Some(job.attempts.iter().map(batch::JobAttempt::detail).collect()),
                     status_reason: job.status_reason.clone(),
                     created_at: Some(job.created_at),
                     retry_strategy: job.retry_strategy.clone(),
                     stopped_at: job.stopped_at,
-                    depends_on: job.depends_on.clone(),
+                    // Materialised like the other collections of a described job — and like
+                    // the same two members of the `Batch Job State Change` detail, which
+                    // AWS documents as "the job's details, in the same form as the
+                    // `DescribeJobs` API returns them": the jobs this one depends on and
+                    // the parameters it was submitted with come back present and empty
+                    // where it has none.
+                    depends_on: Some(job.depends_on.clone().unwrap_or_default()),
                     job_definition: job.job_definition_arn.clone(),
-                    parameters: job.parameters.clone(),
+                    parameters: Some(job.parameters.clone().unwrap_or_default()),
+                    // The effective container is reported as the record holds it: the same
+                    // document the job state change event renders from that record, so the
+                    // two projections of one container cannot disagree.
                     container: job.container.clone(),
                     node_details: None,
                     node_properties: job.node_properties.clone(),

@@ -76,6 +76,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod array_jobs;
+mod described_collections;
 mod fargate;
 mod input_rules;
 mod job_definition_projection;
@@ -85,6 +86,7 @@ mod queue_snapshot;
 mod service_job_dispatch;
 
 pub use array_jobs::*;
+pub use described_collections::*;
 pub use fargate::*;
 pub use input_rules::*;
 pub use job_definition_projection::*;

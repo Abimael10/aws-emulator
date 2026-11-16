@@ -848,9 +848,11 @@ async fn job_submission_lifecycle_round_trips_through_persisted_state() {
         Value::Null,
         "case resting job: a job that has not ended has no stoppedAt, got {detail}"
     );
-    assert!(
-        detail["attempts"].is_null(),
-        "case resting job: no attempt is invented for a job nothing placed, got {detail}"
+    assert_eq!(
+        detail["attempts"].as_array().map(Vec::len),
+        Some(0),
+        "case resting job: a job nothing placed reports its attempts as the empty list, got \
+         {detail}"
     );
     // Resting is stable: a second read answers identically.
     let again = describe_job(&batch, &job_id).await;
@@ -1323,32 +1325,39 @@ async fn job_status_only_moves_forward_and_never_because_of_a_read() {
          RUNNABLE and the dependent one in PENDING, got {ranks:?}"
     );
 
-    // Resting is where they STAY: another span of the clock moves neither.
-    tokio::time::sleep(Duration::from_millis(span * 3)).await;
-    for (case, job_id, expected) in [
-        ("independent", &first_id, state::JOB_RUNNABLE),
-        ("dependent", &dependent_id, state::JOB_PENDING),
-    ] {
-        let detail = describe_job(&batch, job_id).await;
-        assert_eq!(
-            detail["status"].as_str(),
-            Some(expected),
-            "case {case} after a further span: expected {expected}, got {detail}"
-        );
-        assert_eq!(
-            detail["stoppedAt"],
-            Value::Null,
-            "case {case}: a job nothing ended carries no stoppedAt, got {detail}"
-        );
-        // Nothing ran, so no attempt and no exit code are reported for it.
-        assert!(
-            detail["attempts"].is_null(),
-            "case {case}: no attempt is invented for work nothing ran, got {detail}"
-        );
-        assert!(
-            detail["container"]["exitCode"].is_null(),
-            "case {case}: no exit code is invented, got {detail}"
-        );
+    // Resting is where they STAY: the two jobs are read again over several further spans of
+    // the clock, and every read must find them exactly where they came to rest. The waiting
+    // happens INSIDE this loop, so what the assertions rest on is the condition holding read
+    // after read rather than one read taken after a fixed wait.
+    for round in 0..6 {
+        tokio::time::sleep(Duration::from_millis(span / 2)).await;
+        for (case, job_id, expected) in [
+            ("independent", &first_id, state::JOB_RUNNABLE),
+            ("dependent", &dependent_id, state::JOB_PENDING),
+        ] {
+            let detail = describe_job(&batch, job_id).await;
+            assert_eq!(
+                detail["status"].as_str(),
+                Some(expected),
+                "case {case} on read {round} past its rest: expected {expected}, got {detail}"
+            );
+            assert_eq!(
+                detail["stoppedAt"],
+                Value::Null,
+                "case {case}: a job nothing ended carries no stoppedAt, got {detail}"
+            );
+            // Nothing ran, so no attempt and no exit code are reported for it: the attempts
+            // the job reports are the empty list.
+            assert_eq!(
+                detail["attempts"].as_array().map(Vec::len),
+                Some(0),
+                "case {case}: no attempt is invented for work nothing ran, got {detail}"
+            );
+            assert!(
+                detail["container"]["exitCode"].is_null(),
+                "case {case}: no exit code is invented, got {detail}"
+            );
+        }
     }
 
     // Only a caller takes a job terminal, and then it is final: the dependent one fails
@@ -1777,8 +1786,9 @@ async fn a_dependent_job_is_released_however_its_dependency_ended() {
             Value::Null,
             "case {case:?}: no startedAt is invented for work nothing ran, got {detail}"
         );
-        assert!(
-            detail["attempts"].is_null(),
+        assert_eq!(
+            detail["attempts"].as_array().map(Vec::len),
+            Some(0),
             "case {case:?}: no attempt is invented for work nothing ran, got {detail}"
         );
 

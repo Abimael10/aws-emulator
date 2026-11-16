@@ -15,7 +15,8 @@
 //! attempt", `startedAt` is the `STARTING` -> `RUNNING` transition and `stoppedAt` the
 //! `RUNNING` -> terminal one — so a placement whose container never ran reports none of
 //! them, only the reason that attempt ended. A job no placement has taken has had no
-//! attempt, so it reports none at all.
+//! attempt, so the list it reports is EMPTY and present — "nothing has run yet" is an empty
+//! list, not a missing member.
 //!
 //! The rows differ along what the rule generalises over: whether the job's queue offers the
 //! scheduler capacity at all, when that capacity is published, what ends the job, and how
@@ -113,7 +114,8 @@ async fn submit(fixture: &Fixture, name: &str, extra: Value) -> String {
         .to_string()
 }
 
-/// The `attempts` of a `JobDetail`, or `None` when the member is absent.
+/// The `attempts` of a `JobDetail`, or `None` when the member is absent — which no reported
+/// job answers, because the member is always there (empty for a job nothing placed).
 fn attempts(detail: &Value) -> Option<Vec<Value>> {
     detail
         .get("attempts")
@@ -301,14 +303,18 @@ async fn a_job_reports_one_attempt_per_placement_and_none_without_one() {
                 let resting =
                     until_status(&fixture.batch, case, &job_id, state::JOB_RUNNABLE).await;
                 // Resting means staying: several further spans place nothing, so no attempt
-                // appears for it either.
+                // appears for it either. The job is read again on each of them, inside the
+                // loop that waits, so what is asserted is the record holding read after read.
                 let span = u64::try_from(state::JOB_PHASE_MILLIS).unwrap_or(500);
-                tokio::time::sleep(Duration::from_millis(span * 4)).await;
-                assert_eq!(
-                    describe_job(&fixture.batch, &job_id).await,
-                    resting,
-                    "case {case}: a resting job must be left exactly as it is"
-                );
+                for round in 0..8 {
+                    tokio::time::sleep(Duration::from_millis(span / 2)).await;
+                    assert_eq!(
+                        describe_job(&fixture.batch, &job_id).await,
+                        resting,
+                        "case {case} on read {round} past its rest: a resting job must be left \
+                         exactly as it is"
+                    );
+                }
                 resting
             }
             Ending::Cancelled | Ending::Terminated => {
@@ -332,33 +338,31 @@ async fn a_job_reports_one_attempt_per_placement_and_none_without_one() {
             }
         };
 
-        match row.attempts {
-            0 => assert!(
-                attempts(&detail).is_none(),
-                "case {case}: a job no placement took reports no attempts, got {detail}"
-            ),
-            wanted => {
-                let listed = attempts(&detail).unwrap_or_else(|| {
-                    panic!("case {case}: expected {wanted} attempt(s), got {detail}")
-                });
-                assert_eq!(
-                    listed.len(),
-                    wanted,
-                    "case {case}: expected {wanted} attempt(s), got {detail}"
-                );
-                assert_eq!(
-                    detail["statusReason"].as_str(),
-                    Some(state::NO_CONTAINER_RUNTIME_REASON),
-                    "case {case}: a placed job whose container nothing ran says so, got {detail}"
-                );
-                assert_placement_attempt(
-                    case,
-                    &fixture.environment_name,
-                    &fixture.definition_name,
-                    &detail,
-                    &listed[0],
-                );
-            }
+        let listed = attempts(&detail).unwrap_or_else(|| {
+            panic!(
+                "case {case}: `attempts` is always reported, empty for a job no placement \
+                 took, got {detail}"
+            )
+        });
+        assert_eq!(
+            listed.len(),
+            row.attempts,
+            "case {case}: expected {} attempt(s), got {detail}",
+            row.attempts
+        );
+        if row.attempts > 0 {
+            assert_eq!(
+                detail["statusReason"].as_str(),
+                Some(state::NO_CONTAINER_RUNTIME_REASON),
+                "case {case}: a placed job whose container nothing ran says so, got {detail}"
+            );
+            assert_placement_attempt(
+                case,
+                &fixture.environment_name,
+                &fixture.definition_name,
+                &detail,
+                &listed[0],
+            );
         }
     }
 }
@@ -470,9 +474,10 @@ async fn array_children_report_their_own_attempts_and_the_parent_reports_none() 
     );
 
     let parent = until_status(&fixture.batch, "the parent", &parent_id, state::JOB_FAILED).await;
-    assert!(
-        attempts(&parent).is_none(),
-        "case the parent: an array parent is never placed, so it reports no attempts, got \
-         {parent}"
+    assert_eq!(
+        attempts(&parent).map(|listed| listed.len()),
+        Some(0),
+        "case the parent: an array parent is never placed, so the attempts it reports are \
+         the empty list, got {parent}"
     );
 }
